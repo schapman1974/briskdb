@@ -17,6 +17,8 @@ current SQLite pass-through API from planned PostgreSQL and MySQL compatibility.
 The [error contract](docs/ERRORS.md) defines stable engine error kinds, safe
 HTTP problem details, and the mappings reserved for future PostgreSQL and MySQL
 adapters.
+The [request-control contract](docs/REQUEST_CONTROLS.md) defines cancellation,
+deadlines, materialized-result budgets, and graceful shutdown.
 Contributions follow the repository's [test-first completion policy](CONTRIBUTING.md).
 The [benchmark baseline](docs/BENCHMARKS.md) defines the reproducible storage
 workloads used to measure the current prototype.
@@ -32,6 +34,9 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Stable BLAKE3 routing from a caller-provided shard key
 - A protocol-neutral async engine with per-request HTTP sessions
 - Bounded, lazy per-shard SQLite connection pools with explicit backpressure
+- Request cancellation and deadlines that interrupt SQLite and await cleanup
+- Finite per-query row/logical-byte budgets with no partial results
+- Explicit graceful drain, forced cancellation, and blocking handle cleanup
 - Protocol-neutral typed values, ordered columns, positional rows, and results
 - A fixed shard count recorded in `manifest.sqlite`
 - One WAL-enabled SQLite database per shard
@@ -67,6 +72,18 @@ active connections and 32 queued operations per shard. Server deployments can
 override them with `--connections-per-shard` /
 `BRISKDB_CONNECTIONS_PER_SHARD` and `--queue-capacity-per-shard` /
 `BRISKDB_QUEUE_CAPACITY_PER_SHARD`.
+
+Queries default to 10,000 rows and 16 MiB of protocol-neutral logical result
+data. Configure these with `--max-result-rows` / `BRISKDB_MAX_RESULT_ROWS` and
+`--max-result-bytes` / `BRISKDB_MAX_RESULT_BYTES`. Requests default to a
+30-second engine deadline; use `--request-timeout-ms` /
+`BRISKDB_REQUEST_TIMEOUT_MS`, where zero disables that default. Graceful
+shutdown allows 30 seconds before cancelling admitted work and is configured by
+`--shutdown-grace-ms` / `BRISKDB_SHUTDOWN_GRACE_MS`. Ctrl-C and, on Unix,
+SIGTERM stop new admissions, drain or cancel admitted SQLite work, close idle
+handles, and then stop the process. Accepted HTTP connections are tracked;
+connections that outlive the grace window are force-closed and joined before
+the server returns.
 
 Create a table on every shard:
 
@@ -139,18 +156,22 @@ A handle that performed an ordinary write may return to the same session,
 preserving SQLite write counters, but is replaced before a different session can
 observe `last_insert_rowid()`, `changes()`, or `total_changes()`. Those functions
 remain uncontracted across calls until sessions gain connection pinning.
-Dropping queued work skips it before SQLite starts; dropping in-flight work does
-not yet cancel it, and it may still commit.
-Cancellation, deadlines, limits, and graceful shutdown remain roadmap work.
+Dropping queued work skips it before SQLite starts. Dropping in-flight work
+interrupts its exact leased handle and retains lifecycle, worker, pool, and
+session permits until SQLite cleanup finishes. Explicit cancellation behaves
+the same way. A near-complete statement may still win the race and return
+success; BriskDB never reports cancellation while a known running write might
+still commit.
+Queries have finite row and logical-byte budgets, account values before cloning
+payloads, and return no partial result on `LimitExceeded`.
 Broadcast changes and future scatter operations are not atomic across shard
 files. The shard count is immutable after database creation, so resharding will
 require an explicit migration workflow. Pooling does not change the manifest
-schema, shard files, or stored-data format. Until graceful pool draining lands
-in issue #11, dropping the final `Engine` may close idle SQLite handles
-synchronously on the dropping thread; server operation dispatch itself remains
-behind the bounded worker boundary.
+schema, shard files, or stored-data format. Embedders should call
+`Engine::shutdown`; merely dropping the final `Engine` is not the explicit
+asynchronous cleanup contract.
 
-Near-term work includes authentication, cancellation, schema migrations,
+Near-term work includes authentication, schema migrations,
 scatter/gather reads, observability, backup tooling, and failure-injection
 tests for multi-shard operations.
 

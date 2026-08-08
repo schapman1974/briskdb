@@ -29,7 +29,9 @@ the human-readable text to identify an error.
 | <a id="read-only"></a>`ReadOnly` | `read_only` | 403 | Read-only storage | The storage is read-only. | `25006` | 1290 | `HY000` | No |
 | <a id="busy"></a>`Busy` | `busy` | 503 | Database busy | The database is busy; retry the operation later. | `55P03` | 1205 | `HY000` | Yes |
 | <a id="cancelled"></a>`Cancelled` | `cancelled` | 500 | Request cancelled | The operation was cancelled. | `57014` | 1317 | `70100` | No |
+| <a id="deadline-exceeded"></a>`DeadlineExceeded` | `deadline_exceeded` | 504 | Request deadline exceeded | The operation exceeded its request deadline. | `57014` | 3024 | `HY000` | No |
 | <a id="limit-exceeded"></a>`LimitExceeded` | `limit_exceeded` | 422 | Limit exceeded | The request exceeds an engine limit. | `54000` | 1105 | `HY000` | No |
+| <a id="shutting-down"></a>`ShuttingDown` | `shutting_down` | 503 | Server shutting down | The server is shutting down and cannot accept the operation. | `57P01` | 1053 | `08S01` | No |
 | <a id="storage-full"></a>`StorageFull` | `storage_full` | 507 | Storage full | The storage has no available space. | `53100` | 1114 | `HY000` | No |
 | <a id="out-of-memory"></a>`OutOfMemory` | `out_of_memory` | 503 | Out of memory | The engine does not have enough memory. | `53200` | 1037 | `HY001` | No |
 | <a id="storage-unavailable"></a>`StorageUnavailable` | `storage_unavailable` | 503 | Storage unavailable | The storage is unavailable. | `58030` | 1105 | `HY000` | No |
@@ -41,7 +43,9 @@ backoff and jitter. No other HTTP status, SQLSTATE, or MySQL error number
 implies retryability in BriskDB; notably, `OutOfMemory` and
 `StorageUnavailable` also use HTTP 503 but are not retryable under this
 contract. Storage-open and I/O failures can be permanent, so BriskDB does not
-guess that a later attempt will recover.
+guess that a later attempt will recover. `ShuttingDown` is also conservative:
+retrying the same draining process cannot make progress, although a caller may
+choose to reconnect to another server or wait for a replacement to start.
 
 Bounded-pool admission uses the existing `Busy` kind; it does not add a separate
 overload error. An operation receives `Busy` when its target shard has all
@@ -53,12 +57,14 @@ their selected pool; broadcast is the intentional exception and reserves one
 slot in every pool. Clients that retry should use the same bounded exponential
 backoff and jitter as for SQLite-originated `Busy` failures.
 
-If a caller drops a future while its operation is queued, the engine skips the
-operation and there is no error response to serialize. Once blocking SQLite
-execution has started, dropping the future does not cancel the operation; it may
-still commit. Issue #11 defines future in-flight cancellation and deadline
-behavior. Queue depth, pool internals, SQL text, and connection-cleanup details
-remain diagnostic data and must not be added to the fixed public problem detail.
+An explicit cancellation is `Cancelled`; expiration of an absolute request
+deadline is `DeadlineExceeded`, even though PostgreSQL represents both with
+SQLSTATE `57014`. MySQL distinguishes them with errors 1317 and 3024. If a
+caller drops an operation future, there is no client left to receive either
+error. Requests rejected after graceful shutdown begins use `ShuttingDown`.
+Queue depth, pool internals, SQL text, deadline values, and connection-cleanup
+details remain diagnostic data and must not be added to the fixed public
+problem detail.
 
 MySQL has separate foreign-key errors for the parent and child directions.
 `ForeignKeyViolation` does not retain that direction, so BriskDB deliberately

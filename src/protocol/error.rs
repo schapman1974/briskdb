@@ -47,8 +47,10 @@ pub const fn http_error(kind: EngineErrorKind) -> HttpErrorMapping {
         EngineErrorKind::PermissionDenied | EngineErrorKind::ReadOnly => 403,
         EngineErrorKind::Busy
         | EngineErrorKind::OutOfMemory
-        | EngineErrorKind::StorageUnavailable => 503,
+        | EngineErrorKind::StorageUnavailable
+        | EngineErrorKind::ShuttingDown => 503,
         EngineErrorKind::Cancelled => 500,
+        EngineErrorKind::DeadlineExceeded => 504,
         EngineErrorKind::LimitExceeded => 422,
         EngineErrorKind::StorageFull => 507,
         EngineErrorKind::DataCorruption | EngineErrorKind::Internal => 500,
@@ -81,7 +83,9 @@ pub const fn postgres_error(kind: EngineErrorKind) -> PostgresErrorMapping {
         EngineErrorKind::ReadOnly => "25006",
         EngineErrorKind::Busy => "55P03",
         EngineErrorKind::Cancelled => "57014",
+        EngineErrorKind::DeadlineExceeded => "57014",
         EngineErrorKind::LimitExceeded => "54000",
+        EngineErrorKind::ShuttingDown => "57P01",
         EngineErrorKind::StorageFull => "53100",
         EngineErrorKind::OutOfMemory => "53200",
         EngineErrorKind::StorageUnavailable => "58030",
@@ -116,7 +120,9 @@ pub const fn mysql_error(kind: EngineErrorKind) -> MysqlErrorMapping {
         EngineErrorKind::ReadOnly => (1290, "HY000"),
         EngineErrorKind::Busy => (1205, "HY000"),
         EngineErrorKind::Cancelled => (1317, "70100"),
+        EngineErrorKind::DeadlineExceeded => (3024, "HY000"),
         EngineErrorKind::LimitExceeded => (1105, "HY000"),
+        EngineErrorKind::ShuttingDown => (1053, "08S01"),
         EngineErrorKind::StorageFull => (1114, "HY000"),
         EngineErrorKind::OutOfMemory => (1037, "HY001"),
         EngineErrorKind::StorageUnavailable
@@ -181,8 +187,14 @@ const fn problem_type(kind: EngineErrorKind) -> &'static str {
         EngineErrorKind::Cancelled => {
             "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#cancelled"
         }
+        EngineErrorKind::DeadlineExceeded => {
+            "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#deadline-exceeded"
+        }
         EngineErrorKind::LimitExceeded => {
             "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#limit-exceeded"
+        }
+        EngineErrorKind::ShuttingDown => {
+            "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#shutting-down"
         }
         EngineErrorKind::StorageFull => {
             "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#storage-full"
@@ -220,7 +232,9 @@ const fn title(kind: EngineErrorKind) -> &'static str {
         EngineErrorKind::ReadOnly => "Read-only storage",
         EngineErrorKind::Busy => "Database busy",
         EngineErrorKind::Cancelled => "Request cancelled",
+        EngineErrorKind::DeadlineExceeded => "Request deadline exceeded",
         EngineErrorKind::LimitExceeded => "Limit exceeded",
+        EngineErrorKind::ShuttingDown => "Server shutting down",
         EngineErrorKind::StorageFull => "Storage full",
         EngineErrorKind::OutOfMemory => "Out of memory",
         EngineErrorKind::StorageUnavailable => "Storage unavailable",
@@ -247,7 +261,11 @@ const fn detail(kind: EngineErrorKind) -> &'static str {
         EngineErrorKind::ReadOnly => "The storage is read-only.",
         EngineErrorKind::Busy => "The database is busy; retry the operation later.",
         EngineErrorKind::Cancelled => "The operation was cancelled.",
+        EngineErrorKind::DeadlineExceeded => "The operation exceeded its request deadline.",
         EngineErrorKind::LimitExceeded => "The request exceeds an engine limit.",
+        EngineErrorKind::ShuttingDown => {
+            "The server is shutting down and cannot accept the operation."
+        }
         EngineErrorKind::StorageFull => "The storage has no available space.",
         EngineErrorKind::OutOfMemory => "The engine does not have enough memory.",
         EngineErrorKind::StorageUnavailable => "The storage is unavailable.",
@@ -335,7 +353,15 @@ mod tests {
             (EngineErrorKind::ReadOnly, 403, "25006", 1290, "HY000"),
             (EngineErrorKind::Busy, 503, "55P03", 1205, "HY000"),
             (EngineErrorKind::Cancelled, 500, "57014", 1317, "70100"),
+            (
+                EngineErrorKind::DeadlineExceeded,
+                504,
+                "57014",
+                3024,
+                "HY000",
+            ),
             (EngineErrorKind::LimitExceeded, 422, "54000", 1105, "HY000"),
+            (EngineErrorKind::ShuttingDown, 503, "57P01", 1053, "08S01"),
             (EngineErrorKind::StorageFull, 507, "53100", 1114, "HY000"),
             (EngineErrorKind::OutOfMemory, 503, "53200", 1037, "HY001"),
             (

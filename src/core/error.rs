@@ -26,7 +26,9 @@ pub enum EngineErrorKind {
     ReadOnly,
     Busy,
     Cancelled,
+    DeadlineExceeded,
     LimitExceeded,
+    ShuttingDown,
     StorageFull,
     OutOfMemory,
     StorageUnavailable,
@@ -53,7 +55,9 @@ impl EngineErrorKind {
         Self::ReadOnly,
         Self::Busy,
         Self::Cancelled,
+        Self::DeadlineExceeded,
         Self::LimitExceeded,
+        Self::ShuttingDown,
         Self::StorageFull,
         Self::OutOfMemory,
         Self::StorageUnavailable,
@@ -80,7 +84,9 @@ impl EngineErrorKind {
             Self::ReadOnly => "read_only",
             Self::Busy => "busy",
             Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
             Self::LimitExceeded => "limit_exceeded",
+            Self::ShuttingDown => "shutting_down",
             Self::StorageFull => "storage_full",
             Self::OutOfMemory => "out_of_memory",
             Self::StorageUnavailable => "storage_unavailable",
@@ -115,6 +121,16 @@ impl EngineError {
             diagnostic: diagnostic.into(),
             source: None,
         }
+    }
+
+    /// Construct a request-deadline failure with trusted diagnostic context.
+    pub fn deadline_exceeded(diagnostic: impl Into<String>) -> Self {
+        Self::new(EngineErrorKind::DeadlineExceeded, diagnostic)
+    }
+
+    /// Construct a failure for work rejected while the engine is shutting down.
+    pub fn shutting_down(diagnostic: impl Into<String>) -> Self {
+        Self::new(EngineErrorKind::ShuttingDown, diagnostic)
     }
 
     pub(crate) fn from_source<E>(
@@ -207,6 +223,21 @@ mod tests {
             .filter(|kind| kind.is_retryable())
             .collect::<Vec<_>>();
         assert_eq!(retryable, [EngineErrorKind::Busy]);
+    }
+
+    #[test]
+    fn lifecycle_constructors_preserve_trusted_diagnostics() {
+        let deadline = EngineError::deadline_exceeded("query exceeded 25 ms");
+        assert_eq!(deadline.kind(), EngineErrorKind::DeadlineExceeded);
+        assert_eq!(deadline.code(), "deadline_exceeded");
+        assert_eq!(deadline.diagnostic(), "query exceeded 25 ms");
+        assert!(!deadline.is_retryable());
+
+        let shutdown = EngineError::shutting_down("engine is draining");
+        assert_eq!(shutdown.kind(), EngineErrorKind::ShuttingDown);
+        assert_eq!(shutdown.code(), "shutting_down");
+        assert_eq!(shutdown.diagnostic(), "engine is draining");
+        assert!(!shutdown.is_retryable());
     }
 
     #[test]

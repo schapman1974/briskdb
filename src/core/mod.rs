@@ -3,18 +3,28 @@
 //! This module owns routing and coordinates storage and SQL execution. It does
 //! not depend on a network protocol.
 
+mod control;
 mod engine;
 mod error;
+mod lifecycle;
 mod options;
 mod session;
 mod types;
 pub(crate) mod worker;
 
+pub(crate) use control::{
+    CancelOnDrop, CancellationReason, OperationControl, wait_for_cancellation, wait_pending,
+};
+pub use control::{CancellationToken, RequestContext};
 pub use engine::{Engine, EngineStatus, Statement};
 pub use error::{EngineError, EngineErrorKind, EngineResult};
+pub use lifecycle::{EngineState, ShutdownReport};
+pub(crate) use lifecycle::{Lifecycle, OperationLease};
 pub use options::{
-    DEFAULT_CONNECTIONS_PER_SHARD, DEFAULT_QUEUE_CAPACITY_PER_SHARD, EngineOptions,
-    MAX_CONNECTIONS_PER_SHARD, MAX_QUEUE_CAPACITY_PER_SHARD,
+    DEFAULT_CONNECTIONS_PER_SHARD, DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_ROWS,
+    DEFAULT_QUEUE_CAPACITY_PER_SHARD, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_SHUTDOWN_GRACE_MS,
+    EngineOptions, MAX_CONNECTIONS_PER_SHARD, MAX_QUEUE_CAPACITY_PER_SHARD, MAX_REQUEST_TIMEOUT_MS,
+    MAX_RESULT_BYTES, MAX_RESULT_ROWS, MAX_SHUTDOWN_GRACE_MS, ResultLimits,
 };
 pub use session::{Session, SessionId, SessionState};
 pub use types::{

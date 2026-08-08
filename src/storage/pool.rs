@@ -1,8 +1,10 @@
 //! Bounded per-shard SQLite connection pools.
 
 use std::{
+    cell::RefCell,
     ops::Deref,
     sync::{Arc, Mutex, MutexGuard, atomic::Ordering},
+    time::{Duration, Instant},
 };
 
 #[cfg(test)]
@@ -11,9 +13,70 @@ use std::sync::atomic::AtomicU64;
 use rusqlite::Connection;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
-use crate::core::{EngineError, EngineErrorKind, EngineResult};
+use crate::{
+    core::{EngineError, EngineErrorKind, EngineResult, OperationControl},
+    sqlite_error,
+};
 
-use super::{ConnectionHygiene, Storage};
+use super::{CONNECTION_BUSY_TIMEOUT, ConnectionHygiene, Storage};
+
+thread_local! {
+    static BUSY_OPERATION: RefCell<Option<BusyOperation>> = const { RefCell::new(None) };
+}
+
+struct BusyOperation {
+    control: Arc<OperationControl>,
+    started: Instant,
+}
+
+struct BusyOperationGuard;
+
+impl BusyOperationGuard {
+    fn install(control: Arc<OperationControl>) -> Self {
+        BUSY_OPERATION.with(|operation| {
+            let previous = operation.replace(Some(BusyOperation {
+                control,
+                started: Instant::now(),
+            }));
+            debug_assert!(previous.is_none(), "SQLite busy controls cannot be nested");
+        });
+        Self
+    }
+}
+
+impl Drop for BusyOperationGuard {
+    fn drop(&mut self) {
+        BUSY_OPERATION.with(|operation| {
+            operation.replace(None);
+        });
+    }
+}
+
+fn cancellable_busy_handler(attempt: i32) -> bool {
+    BUSY_OPERATION.with(|operation| {
+        let operation = operation.borrow();
+        let Some(operation) = operation.as_ref() else {
+            return false;
+        };
+        if operation.control.should_stop() || operation.started.elapsed() >= CONNECTION_BUSY_TIMEOUT
+        {
+            return false;
+        }
+
+        // Poll cancellation frequently without turning a locked database into
+        // a spin loop. The total wait remains bounded by the configured
+        // five-second connection timeout.
+        let delay = match attempt {
+            ..=9 => Duration::from_millis(1),
+            10..=19 => Duration::from_millis(5),
+            _ => Duration::from_millis(10),
+        };
+        std::thread::sleep(
+            delay.min(CONNECTION_BUSY_TIMEOUT.saturating_sub(operation.started.elapsed())),
+        );
+        !operation.control.should_stop() && operation.started.elapsed() < CONNECTION_BUSY_TIMEOUT
+    })
+}
 
 /// Identity of the engine session allowed to observe a connection's write-local state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +96,38 @@ pub(crate) struct ConnectionPools {
     pool_size: usize,
     #[cfg(test)]
     queue_capacity: usize,
+    #[cfg(test)]
+    close_idle_hook: Arc<Mutex<Option<CloseIdleHook>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct CloseIdleHook {
+    started: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ControlledBarrier {
+    started: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl ControlledBarrier {
+    fn wait(self, control: &OperationControl) {
+        let _ = self.started.send(());
+        loop {
+            if control.should_stop() {
+                return;
+            }
+            match self.release.recv_timeout(Duration::from_millis(1)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
 }
 
 impl ConnectionPools {
@@ -74,6 +169,8 @@ impl ConnectionPools {
             pool_size,
             #[cfg(test)]
             queue_capacity,
+            #[cfg(test)]
+            close_idle_hook: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -100,6 +197,103 @@ impl ConnectionPools {
             permits.push((shard, self.acquire_for_owner(shard, owner).await?));
         }
         Ok(permits)
+    }
+
+    /// Drain and close every currently idle SQLite handle.
+    ///
+    /// The engine calls this on a blocking worker only after the lifecycle's
+    /// active-operation count reaches zero, so no checked-out connection can
+    /// race back into these idle vectors.
+    pub(crate) fn close_idle(&self) -> EngineResult<usize> {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .close_idle_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = hook.started.send(());
+            hook.release
+                .recv()
+                .expect("the shutdown-finalizer test releases idle closing");
+        }
+
+        let mut closing = Vec::new();
+        for shard in &self.shards {
+            let mut idle = shard.inner.lock_idle()?;
+            closing.append(&mut idle);
+        }
+        let closed = closing.len();
+        drop(closing);
+        Ok(closed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_next_close_idle(
+        &self,
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let previous = self
+            .close_idle_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(CloseIdleHook { started, release });
+        assert!(previous.is_none(), "only one close-idle hook may be armed");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_next_connection_setup(
+        &self,
+        shard: u16,
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> EngineResult<()> {
+        let previous = self
+            .shard(shard)?
+            .inner
+            .setup_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(ControlledBarrier { started, release });
+        assert!(previous.is_none(), "only one setup hook may be armed");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_next_foreign_probe(
+        &self,
+        shard: u16,
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> EngineResult<()> {
+        let previous = self
+            .shard(shard)?
+            .inner
+            .probe_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(ControlledBarrier { started, release });
+        assert!(previous.is_none(), "only one probe hook may be armed");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_next_control_teardown(
+        &self,
+        shard: u16,
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> EngineResult<()> {
+        let previous = self
+            .shard(shard)?
+            .inner
+            .teardown_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(ControlledBarrier { started, release });
+        assert!(previous.is_none(), "only one teardown hook may be armed");
+        Ok(())
     }
 
     #[cfg(test)]
@@ -169,6 +363,12 @@ impl ShardPool {
                 reused: AtomicU64::new(0),
                 #[cfg(test)]
                 retired: AtomicU64::new(0),
+                #[cfg(test)]
+                setup_hook: Mutex::new(None),
+                #[cfg(test)]
+                probe_hook: Mutex::new(None),
+                #[cfg(test)]
+                teardown_hook: Mutex::new(None),
             }),
         }
     }
@@ -255,6 +455,12 @@ struct ShardPoolInner {
     reused: AtomicU64,
     #[cfg(test)]
     retired: AtomicU64,
+    #[cfg(test)]
+    setup_hook: Mutex<Option<ControlledBarrier>>,
+    #[cfg(test)]
+    probe_hook: Mutex<Option<ControlledBarrier>>,
+    #[cfg(test)]
+    teardown_hook: Mutex<Option<ControlledBarrier>>,
 }
 
 impl ShardPoolInner {
@@ -270,7 +476,11 @@ impl ShardPoolInner {
         })
     }
 
-    fn checkout(&self, owner: ConnectionOwner) -> EngineResult<ManagedConnection> {
+    fn checkout(
+        &self,
+        owner: ConnectionOwner,
+        control: Option<Arc<OperationControl>>,
+    ) -> EngineResult<ManagedConnection> {
         let (reusable, foreign_write_connection) = {
             let mut idle = self.lock_idle()?;
             let reusable_index = idle
@@ -302,23 +512,73 @@ impl ShardPoolInner {
             return Ok(connection);
         }
 
-        self.open_connection()
+        match control {
+            Some(control) => self.open_connection_controlled(control),
+            None => self.open_connection(),
+        }
     }
 
     fn open_connection(&self) -> EngineResult<ManagedConnection> {
         let (connection, hygiene) = self.storage.open_pooled_shard(self.shard)?;
+        Ok(self.managed_connection(connection, hygiene))
+    }
+
+    fn open_connection_controlled(
+        &self,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<ManagedConnection> {
+        let mut connection = self.storage.open_unconfigured_shard(self.shard)?;
+        configure_connection_controlled(
+            &mut connection,
+            Arc::clone(&control),
+            #[cfg(test)]
+            self.take_setup_hook(),
+        )?;
+        let (connection, hygiene) = self.storage.attach_pool_hygiene(connection)?;
+        Ok(self.managed_connection(connection, hygiene))
+    }
+
+    #[cfg(test)]
+    fn take_setup_hook(&self) -> Option<ControlledBarrier> {
+        self.setup_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    #[cfg(test)]
+    fn take_probe_hook(&self) -> Option<ControlledBarrier> {
+        self.probe_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    #[cfg(test)]
+    fn take_teardown_hook(&self) -> Option<ControlledBarrier> {
+        self.teardown_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn managed_connection(
+        &self,
+        connection: Connection,
+        hygiene: ConnectionHygiene,
+    ) -> ManagedConnection {
         #[cfg(test)]
         let id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         self.opened.fetch_add(1, Ordering::Relaxed);
-        Ok(ManagedConnection {
+        ManagedConnection {
             #[cfg(test)]
             id,
             connection,
             hygiene,
             write_owner: None,
             origin_owner: None,
-        })
+        }
     }
 
     fn retire(&self, connection: ManagedConnection) {
@@ -376,14 +636,30 @@ pub(crate) struct PoolPermit {
 
 impl PoolPermit {
     /// Checkout or lazily open a connection. Call this on the blocking worker.
+    #[cfg(test)]
     pub(crate) fn checkout(self) -> EngineResult<PooledConnection> {
+        self.checkout_inner(None)
+    }
+
+    /// Checkout while making lazy SQLite configuration cancellable.
+    pub(crate) fn checkout_controlled(
+        self,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<PooledConnection> {
+        self.checkout_inner(Some(control))
+    }
+
+    fn checkout_inner(
+        self,
+        control: Option<Arc<OperationControl>>,
+    ) -> EngineResult<PooledConnection> {
         let PoolPermit {
             pool,
             owner,
             admission,
             connection,
         } = self;
-        let managed = pool.inner.checkout(owner)?;
+        let managed = pool.inner.checkout(owner, control)?;
         let borrowed_from_other_owner = managed
             .origin_owner
             .is_some_and(|origin_owner| origin_owner != owner);
@@ -395,6 +671,7 @@ impl PoolPermit {
             managed: Some(managed),
             broken: false,
             borrowed_from_other_owner,
+            operation: None,
             _admission: admission,
             _connection: connection,
         })
@@ -409,6 +686,7 @@ pub(crate) struct PooledConnection {
     managed: Option<ManagedConnection>,
     broken: bool,
     borrowed_from_other_owner: bool,
+    operation: Option<Arc<OperationControl>>,
     _admission: OwnedSemaphorePermit,
     _connection: OwnedSemaphorePermit,
 }
@@ -427,6 +705,84 @@ impl PooledConnection {
         self.broken = true;
     }
 
+    /// Run work while cancellation is armed against exactly this leased handle.
+    ///
+    /// The progress hook closes the small race between starting SQLite and an
+    /// interrupt reaching the connection. It is always removed before the
+    /// handle can return to the pool. Interrupted handles are conservatively
+    /// retired so a late SQLite interrupt cannot affect the next owner.
+    pub(crate) fn run_controlled<T, F>(
+        &mut self,
+        control: Arc<OperationControl>,
+        work: F,
+    ) -> EngineResult<T>
+    where
+        F: FnOnce(&mut Self) -> EngineResult<T>,
+    {
+        debug_assert!(self.operation.is_none());
+        let _busy_operation = BusyOperationGuard::install(Arc::clone(&control));
+        if let Err(error) = self.busy_handler(Some(cancellable_busy_handler)) {
+            self.mark_broken();
+            return Err(sqlite_error::storage(error)
+                .context("failed to install the SQLite cancellable busy handler"));
+        }
+        let progress_control = Arc::clone(&control);
+        if let Err(error) =
+            self.progress_handler(1_000, Some(move || progress_control.should_stop()))
+        {
+            let _ = self.busy_timeout(CONNECTION_BUSY_TIMEOUT);
+            self.mark_broken();
+            return Err(sqlite_error::storage(error)
+                .context("failed to install the SQLite request progress hook"));
+        }
+
+        let interrupt_handle = self.get_interrupt_handle();
+        if let Err(reason) = control.arm(Arc::new(move || interrupt_handle.interrupt())) {
+            if self.progress_handler(0, None::<fn() -> bool>).is_err() {
+                self.mark_broken();
+            }
+            if self.busy_timeout(CONNECTION_BUSY_TIMEOUT).is_err() {
+                self.mark_broken();
+            }
+            return Err(reason.error());
+        }
+        self.operation = Some(control);
+
+        let result = work(self);
+        self.finish_controlled(result)
+    }
+
+    fn finish_controlled<T>(&mut self, result: EngineResult<T>) -> EngineResult<T> {
+        let control = self
+            .operation
+            .take()
+            .expect("a controlled SQLite operation is armed");
+        let cleanup = self
+            .progress_handler(0, None::<fn() -> bool>)
+            .map_err(sqlite_error::storage);
+        let busy_cleanup = self
+            .busy_timeout(CONNECTION_BUSY_TIMEOUT)
+            .map_err(sqlite_error::storage);
+        #[cfg(test)]
+        if let Some(barrier) = self.pool.inner.take_teardown_hook() {
+            barrier.wait(&control);
+        }
+        if control.disarm().is_some() {
+            self.mark_broken();
+        }
+        match (result, cleanup, busy_cleanup) {
+            (Ok(_), Err(error), _) => {
+                self.mark_broken();
+                Err(error.context("failed to remove the SQLite request progress hook"))
+            }
+            (Ok(_), Ok(()), Err(error)) => {
+                self.mark_broken();
+                Err(error.context("failed to restore the SQLite busy timeout"))
+            }
+            (result, _, _) => result,
+        }
+    }
+
     /// Ensure foreign SQL cannot inherit connection-local history or write on a
     /// handle whose physical history began under another session.
     ///
@@ -438,37 +794,68 @@ impl PooledConnection {
     /// handle. The probe error itself is never exposed; opening the replacement
     /// can return a storage error, and otherwise the real statement boundary is
     /// authoritative for the SQL result.
+    #[cfg(test)]
     pub(crate) fn isolate_foreign_sql(&mut self, sql: &str) -> EngineResult<()> {
         if !self.borrowed_from_other_owner {
             return Ok(());
         }
 
-        let requires_fresh = {
-            let managed = self
-                .managed
-                .as_ref()
-                .expect("a live pooled connection owns its SQLite handle");
-            let probe = managed.hygiene.begin_probe();
-            let prepared = managed.connection.prepare(sql);
-            let preparation_failed = prepared.is_err();
-            drop(prepared);
-            preparation_failed || probe.requires_fresh_connection()
-        };
+        let requires_fresh = self.foreign_sql_requires_fresh(sql);
         if requires_fresh {
             self.replace_with_fresh()?;
         }
         Ok(())
     }
 
-    /// Give a multi-statement operation a fresh handle when the checked-out
-    /// connection was last used by another session.
-    pub(crate) fn ensure_owner_local(&mut self) -> EngineResult<()> {
-        if self.borrowed_from_other_owner {
-            self.replace_with_fresh()?;
+    /// Probe foreign-owner SQL under the same cancellation hooks as execution.
+    pub(crate) fn isolate_foreign_sql_controlled(
+        &mut self,
+        control: Arc<OperationControl>,
+        sql: &str,
+    ) -> EngineResult<()> {
+        if !self.borrowed_from_other_owner {
+            return Ok(());
+        }
+        let requires_fresh = self.run_controlled(Arc::clone(&control), |connection| {
+            Ok(connection.foreign_sql_requires_fresh(sql))
+        })?;
+        if requires_fresh {
+            self.replace_with_fresh_controlled(control)?;
         }
         Ok(())
     }
 
+    fn foreign_sql_requires_fresh(&self, sql: &str) -> bool {
+        let managed = self
+            .managed
+            .as_ref()
+            .expect("a live pooled connection owns its SQLite handle");
+        let probe = managed.hygiene.begin_probe();
+        #[cfg(test)]
+        if let Some(barrier) = self.pool.inner.take_probe_hook() {
+            barrier.wait(
+                self.operation
+                    .as_deref()
+                    .expect("the foreign-owner probe is cancellation-controlled"),
+            );
+        }
+        let prepared = managed.connection.prepare(sql);
+        let preparation_failed = prepared.is_err();
+        drop(prepared);
+        preparation_failed || probe.requires_fresh_connection()
+    }
+
+    pub(crate) fn ensure_owner_local_controlled(
+        &mut self,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<()> {
+        if self.borrowed_from_other_owner {
+            self.replace_with_fresh_controlled(control)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn replace_with_fresh(&mut self) -> EngineResult<()> {
         let previous = self
             .managed
@@ -478,6 +865,75 @@ impl PooledConnection {
         self.managed = Some(self.pool.inner.open_connection()?);
         self.borrowed_from_other_owner = false;
         Ok(())
+    }
+
+    fn replace_with_fresh_controlled(
+        &mut self,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<()> {
+        let previous = self
+            .managed
+            .take()
+            .expect("a live pooled connection owns its SQLite handle");
+        self.pool.inner.retire(previous);
+        self.managed = Some(self.pool.inner.open_connection_controlled(control)?);
+        self.borrowed_from_other_owner = false;
+        Ok(())
+    }
+}
+
+fn configure_connection_controlled(
+    connection: &mut Connection,
+    control: Arc<OperationControl>,
+    #[cfg(test)] barrier: Option<ControlledBarrier>,
+) -> EngineResult<()> {
+    let _busy_operation = BusyOperationGuard::install(Arc::clone(&control));
+    connection
+        .busy_handler(Some(cancellable_busy_handler))
+        .map_err(sqlite_error::storage)?;
+    let progress_control = Arc::clone(&control);
+    if let Err(error) =
+        connection.progress_handler(1_000, Some(move || progress_control.should_stop()))
+    {
+        let _ = connection.busy_timeout(CONNECTION_BUSY_TIMEOUT);
+        return Err(sqlite_error::storage(error).context(
+            "failed to install the SQLite request progress hook during connection setup",
+        ));
+    }
+    let interrupt_handle = connection.get_interrupt_handle();
+    if let Err(reason) = control.arm(Arc::new(move || interrupt_handle.interrupt())) {
+        let _ = connection.progress_handler(0, None::<fn() -> bool>);
+        let _ = connection.busy_timeout(CONNECTION_BUSY_TIMEOUT);
+        return Err(reason.error());
+    }
+
+    #[cfg(test)]
+    if let Some(barrier) = barrier {
+        barrier.wait(&control);
+    }
+
+    // Do not call the ordinary configuration wrapper here: its fixed busy
+    // timeout would replace the cancellable handler before these pragmas can
+    // encounter a SQLite lock.
+    let result = super::configure_connection_pragmas(connection);
+    let progress_cleanup = connection
+        .progress_handler(0, None::<fn() -> bool>)
+        .map_err(sqlite_error::storage);
+    let busy_cleanup = connection
+        .busy_timeout(CONNECTION_BUSY_TIMEOUT)
+        .map_err(sqlite_error::storage);
+    let reason = control.disarm();
+    match (result, progress_cleanup, busy_cleanup, reason) {
+        (Err(_), _, _, Some(reason)) => Err(reason.error()),
+        (Err(error), _, _, None) => Err(error),
+        (Ok(()), _, _, Some(reason)) => Err(reason.error()),
+        (Ok(()), Err(error), _, None) => {
+            Err(error.context("failed to remove the SQLite request progress hook after setup"))
+        }
+        (Ok(()), Ok(()), Err(error), None) => {
+            Err(error.context("failed to restore the SQLite busy timeout after setup"))
+        }
+        (Ok(()), Ok(()), Ok(()), None) => Ok(()),
     }
 }
 
@@ -495,6 +951,12 @@ impl Deref for PooledConnection {
 
 impl Drop for PooledConnection {
     fn drop(&mut self) {
+        if let Some(control) = self.operation.take() {
+            let _ = self.progress_handler(0, None::<fn() -> bool>);
+            let _ = self.busy_timeout(CONNECTION_BUSY_TIMEOUT);
+            control.disarm();
+            self.broken = true;
+        }
         if let Some(connection) = self.managed.take() {
             self.pool
                 .inner

@@ -6,13 +6,16 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
-use tokio::sync::OwnedMutexGuard;
+use tokio::{sync::OwnedMutexGuard, task::JoinHandle};
 
 use super::{
-    BlockingPool, Database, EngineError, EngineErrorKind, EngineOptions, EngineResult, ResultSet,
-    Routed, Session, SessionInner, Value,
+    BlockingPool, CancelOnDrop, CancellationReason, CancellationToken, Database, EngineError,
+    EngineErrorKind, EngineOptions, EngineResult, EngineState, Lifecycle, OperationControl,
+    OperationLease, RequestContext, ResultLimits, ResultSet, Routed, Session, SessionInner,
+    ShutdownReport, Value, wait_for_cancellation, wait_pending,
 };
 use crate::{
     sql,
@@ -60,6 +63,10 @@ pub struct EngineStatus {
     max_blocking_workers: usize,
     connections_per_shard: usize,
     queue_capacity_per_shard: usize,
+    max_result_rows: u64,
+    max_result_bytes: u64,
+    request_timeout: Option<Duration>,
+    shutdown_grace: Duration,
 }
 
 impl EngineStatus {
@@ -83,6 +90,26 @@ impl EngineStatus {
     pub const fn queue_capacity_per_shard(&self) -> usize {
         self.queue_capacity_per_shard
     }
+
+    /// Return the maximum rows retained by one query.
+    pub const fn max_result_rows(&self) -> u64 {
+        self.max_result_rows
+    }
+
+    /// Return the maximum protocol-neutral logical bytes retained by one query.
+    pub const fn max_result_bytes(&self) -> u64 {
+        self.max_result_bytes
+    }
+
+    /// Return the engine-wide request timeout, if enabled.
+    pub const fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
+    }
+
+    /// Return the graceful-shutdown drain period.
+    pub const fn shutdown_grace(&self) -> Duration {
+        self.shutdown_grace
+    }
 }
 
 #[derive(Debug)]
@@ -92,6 +119,88 @@ struct EngineInner {
     options: EngineOptions,
     workers: BlockingPool,
     connections: ConnectionPools,
+    lifecycle: Arc<Lifecycle>,
+    shutdown_cancel: CancellationToken,
+    shutdown_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct Operation {
+    lease: Option<OperationLease>,
+    control: Arc<OperationControl>,
+    cancellation: CancellationToken,
+    shutdown_cancel: CancellationToken,
+    deadline: Option<Instant>,
+    result_limits: ResultLimits,
+    cancel_on_drop: CancelOnDrop,
+}
+
+impl Operation {
+    async fn wait_pending<T, F>(&self, future: F) -> EngineResult<T>
+    where
+        F: std::future::Future<Output = EngineResult<T>>,
+    {
+        wait_pending(
+            future,
+            &self.cancellation,
+            &self.shutdown_cancel,
+            self.deadline,
+            &self.control,
+        )
+        .await
+    }
+
+    fn check_before_start(&self) -> EngineResult<()> {
+        let reason = if self.cancellation.is_cancelled() || self.shutdown_cancel.is_cancelled() {
+            Some(CancellationReason::Cancelled)
+        } else if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            Some(CancellationReason::DeadlineExceeded)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.control.request_cancel(reason);
+            return Err(reason.error());
+        }
+        Ok(())
+    }
+
+    fn take_lease(&mut self) -> OperationLease {
+        self.lease
+            .take()
+            .expect("an operation moves its lifecycle lease only once")
+    }
+
+    fn finish<T>(&mut self, result: EngineResult<T>) -> EngineResult<T> {
+        let result = self.control.complete(result);
+        self.cancel_on_drop.disarm();
+        result
+    }
+
+    fn finish_started<T>(&mut self, result: EngineResult<T>) -> EngineResult<T> {
+        self.cancel_on_drop.disarm();
+        result
+    }
+
+    async fn wait_started<T>(&self, mut join: JoinHandle<EngineResult<T>>) -> EngineResult<T>
+    where
+        T: Send + 'static,
+    {
+        tokio::select! {
+            biased;
+            result = &mut join => flatten_join(result),
+            reason = wait_for_cancellation(
+                &self.cancellation,
+                &self.shutdown_cancel,
+                self.deadline,
+            ) => {
+                self.control.request_cancel(reason);
+                flatten_join(join.await)
+            }
+        }
+    }
 }
 
 /// Shared asynchronous entry point used by every network frontend.
@@ -158,6 +267,9 @@ impl Engine {
                 options,
                 workers,
                 connections,
+                lifecycle: Lifecycle::new(),
+                shutdown_cancel: CancellationToken::new(),
+                shutdown_gate: Arc::new(tokio::sync::Mutex::new(())),
             }),
         })
     }
@@ -177,15 +289,157 @@ impl Engine {
         self.inner.options
     }
 
+    /// Return the lifecycle state shared by every engine clone.
+    pub fn state(&self) -> EngineState {
+        self.inner.lifecycle.state()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_operations_for_test(&self) -> usize {
+        self.inner.lifecycle.active()
+    }
+
+    /// Stop admitting new work while allowing already-admitted operations to drain.
+    ///
+    /// This transition is synchronous, monotonic, and idempotent. Call
+    /// [`Engine::shutdown`] to await cleanup of SQLite handles.
+    pub fn begin_shutdown(&self) -> EngineState {
+        self.inner.lifecycle.begin_shutdown()
+    }
+
+    /// Drain admitted operations and close idle SQLite handles.
+    ///
+    /// If the configured grace period elapses, admitted requests are cancelled
+    /// and given one additional grace period to finish SQLite cleanup. A second
+    /// timeout leaves the engine safely in `Draining`; a later call resumes the
+    /// shutdown attempt.
+    pub async fn shutdown(&self) -> EngineResult<ShutdownReport> {
+        self.shutdown_with_grace(self.inner.options.shutdown_grace())
+            .await
+    }
+
+    /// Perform shutdown with an explicit finite grace period.
+    pub async fn shutdown_with_grace(&self, grace: Duration) -> EngineResult<ShutdownReport> {
+        if grace.is_zero() {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "shutdown grace period must be greater than zero",
+            ));
+        }
+
+        let shutdown_guard = Arc::clone(&self.inner.shutdown_gate).lock_owned().await;
+        if let Some(report) = self.inner.lifecycle.report() {
+            return Ok(report);
+        }
+        self.begin_shutdown();
+
+        let forced_now = if tokio::time::timeout(grace, self.inner.lifecycle.wait_for_drain())
+            .await
+            .is_ok()
+        {
+            false
+        } else {
+            self.inner.lifecycle.mark_forced();
+            self.inner.shutdown_cancel.cancel();
+            tokio::time::timeout(grace, self.inner.lifecycle.wait_for_drain())
+                .await
+                .map_err(|_| {
+                    EngineError::deadline_exceeded(
+                        "engine shutdown timed out while cancelled operations were cleaning up",
+                    )
+                })?;
+            true
+        };
+
+        let report = if forced_now || self.inner.lifecycle.was_forced() {
+            ShutdownReport::forced_shutdown()
+        } else {
+            ShutdownReport::graceful()
+        };
+        let connections = self.inner.connections.clone();
+        let lifecycle = Arc::clone(&self.inner.lifecycle);
+        self.inner
+            .workers
+            .run(move || {
+                // Once this finalizer starts, the owned gate remains in the
+                // blocking closure even if its async caller is cancelled. A
+                // later shutdown therefore cannot report Stopped before every
+                // SQLite handle from this finalizer has actually closed.
+                let _shutdown_guard = shutdown_guard;
+                connections.close_idle()?;
+                lifecycle.mark_stopped(report);
+                Ok(())
+            })
+            .await?;
+        Ok(report)
+    }
+
+    fn operation(&self, context: RequestContext) -> EngineResult<Operation> {
+        let lease = self.inner.lifecycle.try_acquire()?;
+        let cancellation = context.cancellation_token();
+        let now = Instant::now();
+        let engine_deadline = self
+            .inner
+            .options
+            .request_timeout()
+            .and_then(|timeout| now.checked_add(timeout));
+        let deadline = match (context.deadline(), engine_deadline) {
+            (Some(request), Some(engine)) => Some(request.min(engine)),
+            (Some(request), None) => Some(request),
+            (None, engine) => engine,
+        };
+        let configured = self.inner.options.result_limits();
+        let requested = context.result_limits().unwrap_or(configured);
+        let result_limits = ResultLimits::new(
+            configured.max_rows().min(requested.max_rows()),
+            configured.max_bytes().min(requested.max_bytes()),
+        )
+        .expect("the minimum of validated result limits is valid");
+        let control = OperationControl::new(deadline);
+        let cancel_on_drop = CancelOnDrop::new(Arc::clone(&control));
+        let operation = Operation {
+            lease: Some(lease),
+            control,
+            cancellation,
+            shutdown_cancel: self.inner.shutdown_cancel.clone(),
+            deadline,
+            result_limits,
+            cancel_on_drop,
+        };
+        operation.check_before_start()?;
+        Ok(operation)
+    }
+
     /// Return engine status after validating the calling session.
     pub async fn status(&self, session: &Session) -> EngineResult<EngineStatus> {
-        let _guard = self.ready_session(session).await?;
-        Ok(EngineStatus {
-            shard_count: self.shard_count(),
-            max_blocking_workers: self.inner.workers.limit(),
-            connections_per_shard: self.inner.options.connections_per_shard(),
-            queue_capacity_per_shard: self.inner.options.queue_capacity_per_shard(),
-        })
+        self.status_with_context(session, RequestContext::new())
+            .await
+    }
+
+    /// Return engine status with explicit cancellation and deadline controls.
+    pub async fn status_with_context(
+        &self,
+        session: &Session,
+        context: RequestContext,
+    ) -> EngineResult<EngineStatus> {
+        let mut operation = self.operation(context)?;
+        let result = async {
+            let _guard = operation.wait_pending(self.ready_session(session)).await?;
+            operation.check_before_start()?;
+            let result_limits = self.inner.options.result_limits();
+            Ok(EngineStatus {
+                shard_count: self.shard_count(),
+                max_blocking_workers: self.inner.workers.limit(),
+                connections_per_shard: self.inner.options.connections_per_shard(),
+                queue_capacity_per_shard: self.inner.options.queue_capacity_per_shard(),
+                max_result_rows: result_limits.max_rows(),
+                max_result_bytes: result_limits.max_bytes(),
+                request_timeout: self.inner.options.request_timeout(),
+                shutdown_grace: self.inner.options.shutdown_grace(),
+            })
+        }
+        .await;
+        operation.finish(result)
     }
 
     /// Execute a routed statement and return its selected shard.
@@ -194,18 +448,45 @@ impl Engine {
         session: &Session,
         statement: Statement,
     ) -> EngineResult<Routed<usize>> {
-        let guard = self.ready_session(session).await?;
+        self.execute_with_context(session, statement, RequestContext::new())
+            .await
+    }
+
+    /// Execute a routed statement with explicit request controls.
+    pub async fn execute_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<usize>> {
+        let mut operation = self.operation(context)?;
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
         let owner = ConnectionOwner::new(session.id().get());
-        let routing_key = required_routing_key(&guard)?.to_owned();
+        let routing_key = match required_routing_key(&guard) {
+            Ok(key) => key.to_owned(),
+            Err(error) => return operation.finish(Err(error)),
+        };
         let shard = self.inner.database.shard_for_key(routing_key.as_bytes());
         let (sql, params) = statement.into_parts();
 
         let value = self
-            .run_on_shard(shard, owner, guard, move |connection| {
-                connection.isolate_foreign_sql(&sql)?;
-                sql::execute(connection, &sql, &params)
-            })
-            .await?;
+            .run_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                guard,
+                move |connection, control| {
+                    connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sql)?;
+                    connection.run_controlled(control, |connection| {
+                        sql::execute(connection, &sql, &params)
+                    })
+                },
+            )
+            .await;
+        let value = operation.finish_started(value)?;
         Ok(Routed { shard, value })
     }
 
@@ -215,53 +496,129 @@ impl Engine {
         session: &Session,
         statement: Statement,
     ) -> EngineResult<Routed<ResultSet>> {
-        let guard = self.ready_session(session).await?;
+        self.query_with_context(session, statement, RequestContext::new())
+            .await
+    }
+
+    /// Query a routed statement with explicit cancellation, deadline, and
+    /// result-budget controls.
+    pub async fn query_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<ResultSet>> {
+        let mut operation = self.operation(context)?;
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
         let owner = ConnectionOwner::new(session.id().get());
-        let routing_key = required_routing_key(&guard)?.to_owned();
+        let routing_key = match required_routing_key(&guard) {
+            Ok(key) => key.to_owned(),
+            Err(error) => return operation.finish(Err(error)),
+        };
         let shard = self.inner.database.shard_for_key(routing_key.as_bytes());
         let (sql, params) = statement.into_parts();
+        let limits = operation.result_limits;
 
         let value = self
-            .run_on_shard(shard, owner, guard, move |connection| {
-                connection.isolate_foreign_sql(&sql)?;
-                sql::query(connection, &sql, &params)
-            })
-            .await?;
+            .run_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                guard,
+                move |connection, control| {
+                    connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sql)?;
+                    connection.run_controlled(control, |connection| {
+                        sql::query_with_limits(connection, &sql, &params, limits)
+                    })
+                },
+            )
+            .await;
+        let value = operation.finish_started(value)?;
         Ok(Routed { shard, value })
     }
 
     /// Execute a parameterless SQL batch sequentially on every shard.
     pub async fn broadcast(&self, session: &Session, sql: String) -> EngineResult<Vec<u16>> {
-        let guard = self.ready_session(session).await?;
-        let owner = ConnectionOwner::new(session.id().get());
-        let permits = self.inner.connections.acquire_all_for_owner(owner).await?;
-        let workers = self.inner.workers.clone();
+        self.broadcast_with_context(session, sql, RequestContext::new())
+            .await
+    }
 
-        workers
-            .run(move || {
-                let _guard = guard;
+    /// Execute a parameterless SQL batch on every shard with explicit request controls.
+    ///
+    /// Shards are processed in order. Cancellation stops before the next shard,
+    /// but statements already committed on earlier shards remain committed.
+    pub async fn broadcast_with_context(
+        &self,
+        session: &Session,
+        sql: String,
+        context: RequestContext,
+    ) -> EngineResult<Vec<u16>> {
+        let mut operation = self.operation(context)?;
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let owner = ConnectionOwner::new(session.id().get());
+        let permits = match operation
+            .wait_pending(self.inner.connections.acquire_all_for_owner(owner))
+            .await
+        {
+            Ok(permits) => permits,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if let Err(error) = operation.check_before_start() {
+            return operation.finish(Err(error));
+        }
+        let lease = operation.take_lease();
+        let control = Arc::clone(&operation.control);
+        let worker_control = Arc::clone(&control);
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _session = guard;
+            let result = (|| {
                 let mut completed = Vec::with_capacity(permits.len());
                 for (shard, permit) in permits {
-                    let mut connection = permit.checkout().map_err(|error| {
-                        error.context(format!("broadcast failed to open shard {shard}"))
-                    })?;
-                    connection.ensure_owner_local().map_err(|error| {
-                        error.context(format!("broadcast failed to isolate shard {shard}"))
-                    })?;
-                    let result = sql::execute_batch(&connection, &sql);
+                    if let Some(reason) = worker_control.reason() {
+                        return Err(reason.error());
+                    }
+                    let mut connection = permit
+                        .checkout_controlled(Arc::clone(&worker_control))
+                        .map_err(|error| {
+                            error.context(format!("broadcast failed to open shard {shard}"))
+                        })?;
+                    connection
+                        .ensure_owner_local_controlled(Arc::clone(&worker_control))
+                        .map_err(|error| {
+                            error.context(format!("broadcast failed to isolate shard {shard}"))
+                        })?;
+                    let result = connection
+                        .run_controlled(Arc::clone(&worker_control), |connection| {
+                            sql::execute_batch(connection, &sql)
+                        });
                     retire_if_broken(&mut connection, &result);
-                    result.map_err(|error| {
-                        error.context(format!("broadcast failed on shard {shard}"))
-                    })?;
+                    if let Err(error) = result {
+                        return Err(error.context(format!("broadcast failed on shard {shard}")));
+                    }
                     completed.push(shard);
                 }
                 Ok(completed)
-            })
-            .await
+            })();
+            worker_control.complete(result)
+        });
+        let result = operation.wait_started(join).await;
+        operation.finish_started(result)
     }
 
     async fn run_on_shard<T, F>(
         &self,
+        operation: &mut Operation,
         shard: u16,
         owner: ConnectionOwner,
         session: OwnedMutexGuard<SessionInner>,
@@ -269,23 +626,38 @@ impl Engine {
     ) -> EngineResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut PooledConnection) -> EngineResult<T> + Send + 'static,
+        F: FnOnce(&mut PooledConnection, Arc<OperationControl>) -> EngineResult<T> + Send + 'static,
     {
-        let permit = self
-            .inner
-            .connections
-            .acquire_for_owner(shard, owner)
-            .await?;
-        self.inner
-            .workers
-            .run(move || {
-                let _session = session;
-                let mut connection = permit.checkout()?;
-                let result = work(&mut connection);
-                retire_if_broken(&mut connection, &result);
-                result
-            })
+        let permit = match operation
+            .wait_pending(self.inner.connections.acquire_for_owner(shard, owner))
             .await
+        {
+            Ok(permit) => permit,
+            Err(error) => return operation.control.complete(Err(error)),
+        };
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => return operation.control.complete(Err(error)),
+        };
+        if let Err(error) = operation.check_before_start() {
+            return operation.control.complete(Err(error));
+        }
+        let lease = operation.take_lease();
+        let control = Arc::clone(&operation.control);
+        let worker_control = Arc::clone(&control);
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _session = session;
+            let result = permit
+                .checkout_controlled(Arc::clone(&worker_control))
+                .and_then(|mut connection| {
+                    let result = work(&mut connection, Arc::clone(&worker_control));
+                    retire_if_broken(&mut connection, &result);
+                    result
+                });
+            worker_control.complete(result)
+        });
+        operation.wait_started(join).await
     }
 
     async fn ready_session(
@@ -312,35 +684,102 @@ impl Engine {
         started: tokio::sync::oneshot::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
     ) -> EngineResult<()> {
-        let guard = self.ready_session(session).await?;
+        let mut operation = self.operation(RequestContext::new())?;
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
         let owner = ConnectionOwner::new(session.id().get());
-        self.run_on_shard(shard, owner, guard, move |_| {
-            let _ = started.send(());
-            release.recv().expect("test releases the blocking worker");
-            Ok(())
-        })
-        .await
+        let result = self
+            .run_on_shard(&mut operation, shard, owner, guard, move |_, _| {
+                let _ = started.send(());
+                release.recv().expect("test releases the blocking worker");
+                Ok(())
+            })
+            .await;
+        operation.finish_started(result)
     }
 
     #[cfg(test)]
     async fn panic_worker_for_test(&self, session: &Session, shard: u16) -> EngineResult<()> {
-        let guard = self.ready_session(session).await?;
+        let mut operation = self.operation(RequestContext::new())?;
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
         let owner = ConnectionOwner::new(session.id().get());
-        self.run_on_shard(shard, owner, guard, move |_| {
-            panic!("intentional blocking worker panic")
-        })
-        .await
+        let result = self
+            .run_on_shard(&mut operation, shard, owner, guard, move |_, _| {
+                panic!("intentional blocking worker panic")
+            })
+            .await;
+        operation.finish_started(result)
+    }
+
+    #[cfg(test)]
+    async fn panic_controlled_worker_for_test(
+        &self,
+        session: &Session,
+        shard: u16,
+    ) -> EngineResult<()> {
+        let mut operation = self.operation(RequestContext::new())?;
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let owner = ConnectionOwner::new(session.id().get());
+        let result = self
+            .run_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                guard,
+                move |connection, control| {
+                    connection.run_controlled(control, |_connection| -> EngineResult<()> {
+                        panic!("intentional controlled SQLite worker panic")
+                    })
+                },
+            )
+            .await;
+        operation.finish_started(result)
     }
 
     #[cfg(test)]
     async fn connection_id_for_test(&self, session: &Session, shard: u16) -> EngineResult<u64> {
-        let guard = self.ready_session(session).await?;
-        let owner = ConnectionOwner::new(session.id().get());
-        self.run_on_shard(shard, owner, guard, move |connection| {
-            Ok(connection.connection_id())
-        })
-        .await
+        self.connection_id_with_context_for_test(session, shard, RequestContext::new())
+            .await
     }
+
+    #[cfg(test)]
+    async fn connection_id_with_context_for_test(
+        &self,
+        session: &Session,
+        shard: u16,
+        context: RequestContext,
+    ) -> EngineResult<u64> {
+        let mut operation = self.operation(context)?;
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let owner = ConnectionOwner::new(session.id().get());
+        let result = self
+            .run_on_shard(&mut operation, shard, owner, guard, move |connection, _| {
+                Ok(connection.connection_id())
+            })
+            .await;
+        operation.finish_started(result)
+    }
+}
+
+fn flatten_join<T>(result: Result<EngineResult<T>, tokio::task::JoinError>) -> EngineResult<T> {
+    result.map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::Internal,
+            "blocking engine task failed",
+            error,
+        )
+    })?
 }
 
 fn required_routing_key(session: &SessionInner) -> EngineResult<&str> {
@@ -386,11 +825,25 @@ mod tests {
         connections_per_shard: usize,
         queue_capacity_per_shard: usize,
     ) -> (tempfile::TempDir, Engine) {
+        let options = EngineOptions::new(connections_per_shard, queue_capacity_per_shard).unwrap();
+        engine_with_engine_options(shards, options)
+    }
+
+    fn engine_with_engine_options(
+        shards: u16,
+        options: EngineOptions,
+    ) -> (tempfile::TempDir, Engine) {
         let temp = tempfile::tempdir().unwrap();
         let database = Arc::new(Database::open(temp.path(), shards).unwrap());
-        let options = EngineOptions::new(connections_per_shard, queue_capacity_per_shard).unwrap();
         let engine = Engine::from_database_with_options(database, options).unwrap();
         (temp, engine)
+    }
+
+    fn routing_key_for_shard(engine: &Engine, expected: u16) -> String {
+        (0_u64..)
+            .map(|value| format!("shard-{value}"))
+            .find(|key| engine.inner.database.shard_for_key(key.as_bytes()) == expected)
+            .expect("the finite shard layout has a routing key")
     }
 
     async fn wait_for_pool_occupancy(engine: &Engine, shard: u16, active: usize, queued: usize) {
@@ -406,6 +859,26 @@ mod tests {
         })
         .await
         .expect("pool occupancy should reach the expected state");
+    }
+
+    async fn wait_for_blocking_signal(receiver: mpsc::Receiver<()>, message: &'static str) {
+        timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || receiver.recv().unwrap()),
+        )
+        .await
+        .expect(message)
+        .unwrap();
+    }
+
+    async fn wait_for_worker_capacity(engine: &Engine, expected: usize) {
+        timeout(Duration::from_secs(2), async {
+            while engine.inner.workers.available_permits() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking-worker capacity should be restored");
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -743,7 +1216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborting_a_dispatched_broadcast_does_not_stop_later_shards() {
+    async fn aborting_a_dispatched_broadcast_stops_before_the_blocked_shard() {
         let (_temp, engine) = engine_with_options(2, 1, 1);
         let blocker = engine.inner.database.storage.open_shard(1).unwrap();
         blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
@@ -781,26 +1254,24 @@ mod tests {
 
         broadcast.abort();
         assert!(broadcast.await.unwrap_err().is_cancelled());
-        assert_eq!(
-            engine.inner.connections.snapshot().unwrap().shards[1].active,
-            1
-        );
-        assert_eq!(engine.inner.workers.available_permits(), 1);
+        wait_for_pool_occupancy(&engine, 1, 0, 0).await;
+        wait_for_worker_capacity(&engine, 2).await;
 
-        blocker.execute_batch("COMMIT").unwrap();
         let status = timeout(Duration::from_secs(2), engine.status(&session))
             .await
             .expect("detached broadcast should release its session")
             .unwrap();
         assert_eq!(status.shard_count(), 2);
+        blocker.execute_batch("COMMIT").unwrap();
         assert!(
-            blocker
+            !blocker
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'abort_marker')",
                     [],
                     |row| row.get::<_, bool>(0),
                 )
-                .unwrap()
+                .unwrap(),
+            "the committed shard-zero prefix is retained, but cancellation must not execute shard one"
         );
         for shard in 0..2 {
             wait_for_pool_occupancy(&engine, shard, 0, 0).await;
@@ -1329,6 +1800,10 @@ mod tests {
     async fn a_worker_panic_is_internal_and_releases_the_session() {
         let (_temp, engine) = engine_with_options(2, 1, 1);
         let session = engine.session();
+        session
+            .set_routing_key(routing_key_for_shard(&engine, 0))
+            .await
+            .unwrap();
         let original_id = engine.connection_id_for_test(&session, 0).await.unwrap();
 
         let error = engine.panic_worker_for_test(&session, 0).await.unwrap_err();
@@ -1349,6 +1824,37 @@ mod tests {
         assert_eq!(after_replacement.retired, 1);
         assert_eq!(after_replacement.idle, 1);
         assert_eq!(engine.status(&session).await.unwrap().shard_count(), 2);
+        assert_eq!(session.state().await, SessionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn panic_inside_controlled_sql_cleans_hooks_tls_and_retires_the_handle() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let session = engine.session();
+        session
+            .set_routing_key(routing_key_for_shard(&engine, 0))
+            .await
+            .unwrap();
+        let original_id = engine.connection_id_for_test(&session, 0).await.unwrap();
+
+        let error = engine
+            .panic_controlled_worker_for_test(&session, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Internal);
+        let after_panic = engine.inner.connections.snapshot().unwrap().shards[0];
+        assert_eq!(after_panic.retired, 1);
+        assert_eq!(after_panic.idle, 0);
+        assert_eq!(after_panic.active, 0);
+
+        let replacement_id = engine.connection_id_for_test(&session, 0).await.unwrap();
+        assert_ne!(replacement_id, original_id);
+        let recovered = engine
+            .query(&session, Statement::new("SELECT 9", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(recovered.value.rows()[0].get(0), Some(&Value::from(9_i64)));
+        assert_eq!(engine.inner.workers.available_permits(), 2);
         assert_eq!(session.state().await, SessionState::Ready);
     }
 
@@ -1541,5 +2047,941 @@ mod tests {
         );
         assert_eq!(first.routing_key().await.as_deref(), Some("tenant-a"));
         assert_eq!(second.routing_key().await.as_deref(), Some("tenant-b"));
+    }
+
+    #[tokio::test]
+    async fn explicit_cancellation_interrupts_running_sql_and_retires_only_that_handle() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let session = Arc::new(engine.session());
+        session.set_routing_key("cancel-query").await.unwrap();
+        let shard = engine.inner.database.shard_for_key(b"cancel-query");
+        let original_id = engine
+            .connection_id_for_test(&session, shard)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let context = RequestContext::new().with_cancellation_token(token.clone());
+        let query_engine = engine.clone();
+        let query_session = Arc::clone(&session);
+        let query = tokio::spawn(async move {
+            query_engine
+                .query_with_context(
+                    &query_session,
+                    Statement::new(
+                        "WITH RECURSIVE numbers(value) AS (\
+                         VALUES(0) UNION ALL SELECT value + 1 FROM numbers \
+                         WHERE value < 1000000000) SELECT sum(value) FROM numbers",
+                        vec![],
+                    ),
+                    context,
+                )
+                .await
+        });
+        wait_for_pool_occupancy(&engine, shard, 1, 0).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(token.cancel());
+
+        let error = timeout(Duration::from_secs(2), query)
+            .await
+            .expect("SQLite interrupt should bound cancellation cleanup")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        wait_for_pool_occupancy(&engine, shard, 0, 0).await;
+
+        let replacement_id = engine
+            .connection_id_for_test(&session, shard)
+            .await
+            .unwrap();
+        assert_ne!(replacement_id, original_id);
+        let recovered = engine
+            .query(&session, Statement::new("SELECT 42", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(recovered.value.rows()[0].get(0), Some(&Value::from(42_i64)));
+        let snapshot = engine.inner.connections.snapshot().unwrap().shards[usize::from(shard)];
+        assert_eq!(snapshot.retired, 1);
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.queued, 0);
+    }
+
+    #[tokio::test]
+    async fn request_deadline_interrupts_running_sql_with_its_distinct_kind() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let session = engine.session();
+        session.set_routing_key("deadline-query").await.unwrap();
+        let context = RequestContext::new()
+            .with_timeout(Duration::from_millis(10))
+            .unwrap();
+
+        let error = timeout(
+            Duration::from_secs(2),
+            engine.query_with_context(
+                &session,
+                Statement::new(
+                    "WITH RECURSIVE numbers(value) AS (\
+                     VALUES(0) UNION ALL SELECT value + 1 FROM numbers \
+                     WHERE value < 1000000000) SELECT sum(value) FROM numbers",
+                    vec![],
+                ),
+                context,
+            ),
+        )
+        .await
+        .expect("deadline should interrupt SQLite")
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+
+        let recovered = engine
+            .query(&session, Statement::new("SELECT 7", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(recovered.value.rows()[0].get(0), Some(&Value::from(7_i64)));
+    }
+
+    #[tokio::test]
+    async fn cancelling_atomic_insert_select_returns_only_after_rollback() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let setup = engine.session();
+        engine
+            .broadcast(
+                &setup,
+                "CREATE TABLE cancellation_rows (id INTEGER PRIMARY KEY)".to_owned(),
+            )
+            .await
+            .unwrap();
+
+        let session = Arc::new(engine.session());
+        session.set_routing_key("cancel-write").await.unwrap();
+        let shard = engine.inner.database.shard_for_key(b"cancel-write");
+        let token = CancellationToken::new();
+        let context = RequestContext::new().with_cancellation_token(token.clone());
+        let write_engine = engine.clone();
+        let write_session = Arc::clone(&session);
+        let write = tokio::spawn(async move {
+            write_engine
+                .execute_with_context(
+                    &write_session,
+                    Statement::new(
+                        "WITH RECURSIVE numbers(value) AS (\
+                         VALUES(1) UNION ALL SELECT value + 1 FROM numbers \
+                         WHERE value < 100000000) \
+                         INSERT INTO cancellation_rows SELECT value FROM numbers",
+                        vec![],
+                    ),
+                    context,
+                )
+                .await
+        });
+        wait_for_pool_occupancy(&engine, shard, 1, 0).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        token.cancel();
+        let error = timeout(Duration::from_secs(2), write)
+            .await
+            .expect("cancelled write should finish rollback")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+
+        for _ in 0..2 {
+            let count = engine
+                .query(
+                    &session,
+                    Statement::new("SELECT COUNT(*) FROM cancellation_rows", vec![]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(count.value.rows()[0].get(0), Some(&Value::from(0_i64)));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_atomic_write_future_rolls_back_before_resources_are_reused() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let setup = engine.session();
+        engine
+            .broadcast(
+                &setup,
+                "CREATE TABLE aborted_rows (id INTEGER PRIMARY KEY)".to_owned(),
+            )
+            .await
+            .unwrap();
+
+        let session = Arc::new(engine.session());
+        session.set_routing_key("abort-write").await.unwrap();
+        let shard = engine.inner.database.shard_for_key(b"abort-write");
+        let write_engine = engine.clone();
+        let write_session = Arc::clone(&session);
+        let write = tokio::spawn(async move {
+            write_engine
+                .execute(
+                    &write_session,
+                    Statement::new(
+                        "WITH RECURSIVE numbers(value) AS (\
+                         VALUES(1) UNION ALL SELECT value + 1 FROM numbers \
+                         WHERE value < 100000000) \
+                         INSERT INTO aborted_rows SELECT value FROM numbers",
+                        vec![],
+                    ),
+                )
+                .await
+        });
+        wait_for_pool_occupancy(&engine, shard, 1, 0).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        write.abort();
+        assert!(write.await.unwrap_err().is_cancelled());
+
+        timeout(
+            Duration::from_secs(2),
+            engine.inner.lifecycle.wait_for_drain(),
+        )
+        .await
+        .expect("the detached write should finish rollback");
+        wait_for_pool_occupancy(&engine, shard, 0, 0).await;
+        wait_for_worker_capacity(&engine, 2).await;
+        assert_eq!(engine.inner.lifecycle.active(), 0);
+
+        for _ in 0..2 {
+            let count = engine
+                .query(
+                    &session,
+                    Statement::new("SELECT COUNT(*) FROM aborted_rows", vec![]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(count.value.rows()[0].get(0), Some(&Value::from(0_i64)));
+        }
+        assert_eq!(session.state().await, SessionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn queued_token_cancellation_removes_admission_without_starting_sql() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let holder_session = Arc::new(engine.session());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder_engine = engine.clone();
+        let holder_session_for_task = Arc::clone(&holder_session);
+        let holder = tokio::spawn(async move {
+            holder_engine
+                .hold_session_for_test(&holder_session_for_task, 0, started_tx, release_rx)
+                .await
+        });
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let queued_session = Arc::new(engine.session());
+        queued_session
+            .set_routing_key(routing_key_for_shard(&engine, 0))
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let context = RequestContext::new().with_cancellation_token(token.clone());
+        let queued_engine = engine.clone();
+        let queued_session_for_task = Arc::clone(&queued_session);
+        let queued = tokio::spawn(async move {
+            queued_engine
+                .execute_with_context(
+                    &queued_session_for_task,
+                    Statement::new("CREATE TABLE must_not_start (id INTEGER)", vec![]),
+                    context,
+                )
+                .await
+        });
+        wait_for_pool_occupancy(&engine, 0, 1, 1).await;
+        token.cancel();
+        let error = timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("queued cancellation must not wait for a connection")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        wait_for_pool_occupancy(&engine, 0, 1, 0).await;
+
+        release_tx.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        let shard = engine.inner.database.storage.open_shard(0).unwrap();
+        assert!(
+            !shard
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'must_not_start')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_deadline_expires_without_waiting_for_a_connection_or_running_sql() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let holder_session = Arc::new(engine.session());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder_engine = engine.clone();
+        let holder_session_for_task = Arc::clone(&holder_session);
+        let holder = tokio::spawn(async move {
+            holder_engine
+                .hold_session_for_test(&holder_session_for_task, 0, started_tx, release_rx)
+                .await
+        });
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let queued = engine.session();
+        queued
+            .set_routing_key(routing_key_for_shard(&engine, 0))
+            .await
+            .unwrap();
+        let context = RequestContext::new()
+            .with_timeout(Duration::from_millis(10))
+            .unwrap();
+        let error = timeout(
+            Duration::from_secs(1),
+            engine.execute_with_context(
+                &queued,
+                Statement::new("CREATE TABLE deadline_must_not_start (id INTEGER)", vec![]),
+                context,
+            ),
+        )
+        .await
+        .expect("queued deadline must expire independently of the held connection")
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+        wait_for_pool_occupancy(&engine, 0, 1, 0).await;
+
+        release_tx.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        let shard = engine.inner.database.storage.open_shard(0).unwrap();
+        assert!(
+            !shard
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = \
+                 'deadline_must_not_start')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn late_cancellation_cannot_interrupt_a_reused_connection() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let session = engine.session();
+        session.set_routing_key("late-cancel").await.unwrap();
+        let shard = engine.inner.database.shard_for_key(b"late-cancel");
+        let token = CancellationToken::new();
+        let first = engine
+            .query_with_context(
+                &session,
+                Statement::new("SELECT 1", vec![]),
+                RequestContext::new().with_cancellation_token(token.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.value.rows()[0].get(0), Some(&Value::from(1_i64)));
+        let first_id = engine
+            .connection_id_for_test(&session, shard)
+            .await
+            .unwrap();
+
+        token.cancel();
+        let second = engine
+            .query(&session, Statement::new("SELECT 2", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(second.value.rows()[0].get(0), Some(&Value::from(2_i64)));
+        let second_id = engine
+            .connection_id_for_test(&session, shard)
+            .await
+            .unwrap();
+        assert_eq!(second_id, first_id);
+        assert_eq!(
+            engine.inner.connections.snapshot().unwrap().shards[usize::from(shard)].retired,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_hook_teardown_retires_before_immediate_reuse() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let session = Arc::new(engine.session());
+        session.set_routing_key("teardown-race").await.unwrap();
+        let shard = engine.inner.database.shard_for_key(b"teardown-race");
+        let original_id = engine
+            .connection_id_for_test(&session, shard)
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (_release_tx, release_rx) = mpsc::channel();
+        engine
+            .inner
+            .connections
+            .block_next_control_teardown(shard, started_tx, release_rx)
+            .unwrap();
+        let token = CancellationToken::new();
+        let request_engine = engine.clone();
+        let request_session = Arc::clone(&session);
+        let request_token = token.clone();
+        let request = tokio::spawn(async move {
+            request_engine
+                .query_with_context(
+                    &request_session,
+                    Statement::new("SELECT 1", vec![]),
+                    RequestContext::new().with_cancellation_token(request_token),
+                )
+                .await
+        });
+        wait_for_blocking_signal(started_rx, "hook teardown should reach its race barrier").await;
+        assert!(token.cancel());
+        let completed = timeout(Duration::from_secs(1), request)
+            .await
+            .expect("teardown cancellation should finish promptly")
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.value.rows()[0].get(0), Some(&Value::from(1_i64)));
+
+        let replacement_id = engine
+            .connection_id_for_test(&session, shard)
+            .await
+            .unwrap();
+        assert_ne!(replacement_id, original_id);
+        let recovered = engine
+            .query(&session, Statement::new("SELECT 2", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(recovered.value.rows()[0].get(0), Some(&Value::from(2_i64)));
+        let snapshot = engine.inner.connections.snapshot().unwrap().shards[usize::from(shard)];
+        assert_eq!(snapshot.retired, 1);
+        assert_eq!(snapshot.active, 0);
+    }
+
+    #[tokio::test]
+    async fn deadline_interrupts_lazy_connection_setup_and_capacity_recovers() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let session = Arc::new(engine.session());
+        let key = routing_key_for_shard(&engine, 0);
+        session.set_routing_key(key).await.unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (_release_tx, release_rx) = mpsc::channel();
+        engine
+            .inner
+            .connections
+            .block_next_connection_setup(0, started_tx, release_rx)
+            .unwrap();
+
+        let request_engine = engine.clone();
+        let request_session = Arc::clone(&session);
+        let request = tokio::spawn(async move {
+            request_engine
+                .query_with_context(
+                    &request_session,
+                    Statement::new("SELECT 1", vec![]),
+                    RequestContext::new()
+                        .with_timeout(Duration::from_millis(20))
+                        .unwrap(),
+                )
+                .await
+        });
+        wait_for_blocking_signal(started_rx, "connection setup should become active").await;
+        let error = timeout(Duration::from_secs(1), request)
+            .await
+            .expect("the deadline should interrupt connection setup")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+        assert_eq!(engine.inner.lifecycle.active(), 0);
+        assert_eq!(engine.inner.workers.available_permits(), 2);
+        let failed = engine.inner.connections.snapshot().unwrap().shards[0];
+        assert_eq!(failed.active, 0);
+        assert_eq!(failed.opened, 0);
+
+        let recovered = engine
+            .query(&session, Statement::new("SELECT 2", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(recovered.value.rows()[0].get(0), Some(&Value::from(2_i64)));
+    }
+
+    #[tokio::test]
+    async fn deadline_interrupts_a_real_lock_during_lazy_connection_configuration() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let blocker = engine.inner.database.storage.open_shard(0).unwrap();
+        blocker
+            .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE")
+            .unwrap();
+        let session = engine.session();
+        let context = RequestContext::new()
+            .with_timeout(Duration::from_millis(20))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let error = timeout(
+            Duration::from_secs(1),
+            engine.connection_id_with_context_for_test(&session, 0, context),
+        )
+        .await
+        .expect("the request deadline must preempt SQLite's normal five-second busy wait")
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(engine.inner.lifecycle.active(), 0);
+        wait_for_worker_capacity(&engine, 2).await;
+
+        blocker.execute_batch("COMMIT").unwrap();
+        drop(blocker);
+        assert!(engine.connection_id_for_test(&session, 0).await.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_foreign_owner_probe_and_retires_the_handle() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let key = routing_key_for_shard(&engine, 0);
+        let first = engine.session();
+        first.set_routing_key(key.clone()).await.unwrap();
+        engine
+            .query(&first, Statement::new("SELECT 1", vec![]))
+            .await
+            .unwrap();
+
+        let second = Arc::new(engine.session());
+        second.set_routing_key(key).await.unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (_release_tx, release_rx) = mpsc::channel();
+        engine
+            .inner
+            .connections
+            .block_next_foreign_probe(0, started_tx, release_rx)
+            .unwrap();
+        let token = CancellationToken::new();
+        let request_engine = engine.clone();
+        let request_session = Arc::clone(&second);
+        let request_token = token.clone();
+        let request = tokio::spawn(async move {
+            request_engine
+                .query_with_context(
+                    &request_session,
+                    Statement::new("SELECT 2", vec![]),
+                    RequestContext::new().with_cancellation_token(request_token),
+                )
+                .await
+        });
+        wait_for_blocking_signal(started_rx, "foreign-owner probe should become active").await;
+        assert!(token.cancel());
+        let error = timeout(Duration::from_secs(1), request)
+            .await
+            .expect("cancellation should interrupt the foreign-owner probe")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        let cancelled = engine.inner.connections.snapshot().unwrap().shards[0];
+        assert_eq!(cancelled.active, 0);
+        assert_eq!(cancelled.retired, 1);
+        assert_eq!(engine.inner.workers.available_permits(), 2);
+
+        let recovered = engine
+            .query(&second, Statement::new("SELECT 3", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(recovered.value.rows()[0].get(0), Some(&Value::from(3_i64)));
+    }
+
+    #[tokio::test]
+    async fn per_request_result_limits_can_narrow_but_never_widen_engine_limits() {
+        let engine_limits = ResultLimits::new(2, 1_024).unwrap();
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_result_limits(engine_limits);
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let session = engine.session();
+        session.set_routing_key("result-budget").await.unwrap();
+
+        let wider =
+            RequestContext::new().with_result_limits(ResultLimits::new(100, 1_000_000).unwrap());
+        let error = engine
+            .query_with_context(
+                &session,
+                Statement::new("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3", vec![]),
+                wider,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+
+        let narrower =
+            RequestContext::new().with_result_limits(ResultLimits::new(1, 1_024).unwrap());
+        let error = engine
+            .query_with_context(
+                &session,
+                Statement::new("SELECT 1 UNION ALL SELECT 2", vec![]),
+                narrower,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        let recovered = engine
+            .query(&session, Statement::new("SELECT 1", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(recovered.value.rows().len(), 1);
+
+        let configured_bytes = ResultLimits::new(100, 50).unwrap();
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_result_limits(configured_bytes);
+        let (_byte_temp, byte_engine) = engine_with_engine_options(2, options);
+        let byte_session = byte_engine.session();
+        byte_session
+            .set_routing_key("configured-bytes")
+            .await
+            .unwrap();
+        let wider_bytes =
+            RequestContext::new().with_result_limits(ResultLimits::new(100, 100).unwrap());
+        let error = byte_engine
+            .query_with_context(
+                &byte_session,
+                Statement::new("SELECT 1 AS v", vec![]),
+                wider_bytes,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+
+        let request_options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_result_limits(ResultLimits::new(100, 100).unwrap());
+        let (_request_temp, request_engine) = engine_with_engine_options(2, request_options);
+        let request_session = request_engine.session();
+        request_session
+            .set_routing_key("request-bytes")
+            .await
+            .unwrap();
+        let narrower_bytes =
+            RequestContext::new().with_result_limits(ResultLimits::new(100, 50).unwrap());
+        let error = request_engine
+            .query_with_context(
+                &request_session,
+                Statement::new("SELECT 1 AS v", vec![]),
+                narrower_bytes,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+
+        let exact = RequestContext::new().with_result_limits(ResultLimits::new(100, 51).unwrap());
+        let exact_result = request_engine
+            .query_with_context(
+                &request_session,
+                Statement::new("SELECT 1 AS v", vec![]),
+                exact,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            exact_result.value.rows()[0].get(0),
+            Some(&Value::from(1_i64))
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_admitted_work_rejects_new_work_and_is_idempotent() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let session = Arc::new(engine.session());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let active_engine = engine.clone();
+        let active_session = Arc::clone(&session);
+        let active = tokio::spawn(async move {
+            active_engine
+                .hold_session_for_test(&active_session, 0, started_tx, release_rx)
+                .await
+        });
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(engine.begin_shutdown(), EngineState::Draining);
+        assert_eq!(engine.state(), EngineState::Draining);
+        let rejected = engine.status(&engine.session()).await.unwrap_err();
+        assert_eq!(rejected.kind(), EngineErrorKind::ShuttingDown);
+
+        let shutdown_engine = engine.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_engine.shutdown().await });
+        assert!(
+            timeout(Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        active.await.unwrap().unwrap();
+        let report = shutdown.await.unwrap().unwrap();
+        assert!(!report.forced());
+        assert_eq!(engine.state(), EngineState::Stopped);
+        assert_eq!(engine.shutdown().await.unwrap(), report);
+        let snapshot = engine.inner.connections.snapshot().unwrap();
+        assert!(snapshot.shards.iter().all(|shard| shard.idle == 0));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_work_already_waiting_on_the_same_session() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let session = Arc::new(engine.session());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_engine = engine.clone();
+        let first_session = Arc::clone(&session);
+        let first = tokio::spawn(async move {
+            first_engine
+                .hold_session_for_test(&first_session, 0, started_tx, release_rx)
+                .await
+        });
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let second_engine = engine.clone();
+        let second_session = Arc::clone(&session);
+        let second = tokio::spawn(async move { second_engine.status(&second_session).await });
+        timeout(Duration::from_secs(2), async {
+            while engine.inner.lifecycle.active() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        engine.begin_shutdown();
+        let shutdown_engine = engine.clone();
+        let shutdown = tokio::spawn(async move { shutdown_engine.shutdown().await });
+
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        assert_eq!(second.await.unwrap().unwrap().shard_count(), 2);
+        assert!(!shutdown.await.unwrap().unwrap().forced());
+        assert_eq!(engine.state(), EngineState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn shutdown_force_cancels_running_sql_then_waits_for_cleanup() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap()
+            .with_shutdown_grace(Duration::from_millis(10))
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let session = Arc::new(engine.session());
+        session.set_routing_key("shutdown-cancel").await.unwrap();
+        let shard = engine.inner.database.shard_for_key(b"shutdown-cancel");
+        let query_engine = engine.clone();
+        let query_session = Arc::clone(&session);
+        let query = tokio::spawn(async move {
+            query_engine
+                .query(
+                    &query_session,
+                    Statement::new(
+                        "WITH RECURSIVE numbers(value) AS (\
+                         VALUES(0) UNION ALL SELECT value + 1 FROM numbers \
+                         WHERE value < 1000000000) SELECT sum(value) FROM numbers",
+                        vec![],
+                    ),
+                )
+                .await
+        });
+        wait_for_pool_occupancy(&engine, shard, 1, 0).await;
+
+        let report = timeout(Duration::from_secs(2), engine.shutdown())
+            .await
+            .expect("forced shutdown should interrupt SQLite")
+            .unwrap();
+        assert!(report.forced());
+        assert_eq!(engine.state(), EngineState::Stopped);
+        let error = query.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        assert_eq!(engine.inner.lifecycle.active(), 0);
+        assert_eq!(engine.inner.workers.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn dropped_started_request_is_counted_until_cleanup_and_shutdown_can_resume() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap()
+            .with_shutdown_grace(Duration::from_millis(10))
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let session = Arc::new(engine.session());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let task_engine = engine.clone();
+        let task_session = Arc::clone(&session);
+        let task = tokio::spawn(async move {
+            task_engine
+                .hold_session_for_test(&task_session, 0, started_tx, release_rx)
+                .await
+        });
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(engine.inner.lifecycle.active(), 1);
+
+        let error = engine.shutdown().await.unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+        assert_eq!(engine.state(), EngineState::Draining);
+        assert_eq!(engine.inner.lifecycle.active(), 1);
+
+        release_tx.send(()).unwrap();
+        timeout(
+            Duration::from_secs(2),
+            engine.inner.lifecycle.wait_for_drain(),
+        )
+        .await
+        .unwrap();
+        let report = engine.shutdown().await.unwrap();
+        assert!(report.forced());
+        assert_eq!(engine.state(), EngineState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_shutdown_waiter_does_not_strand_later_shutdown() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap()
+            .with_shutdown_grace(Duration::from_secs(1))
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let session = Arc::new(engine.session());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let active_engine = engine.clone();
+        let active_session = Arc::clone(&session);
+        let active = tokio::spawn(async move {
+            active_engine
+                .hold_session_for_test(&active_session, 0, started_tx, release_rx)
+                .await
+        });
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let first_engine = engine.clone();
+        let first = tokio::spawn(async move { first_engine.shutdown().await });
+        timeout(Duration::from_secs(1), async {
+            while engine.state() != EngineState::Draining {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        release_tx.send(()).unwrap();
+        active.await.unwrap().unwrap();
+        let report = engine.shutdown().await.unwrap();
+        assert!(!report.forced());
+        assert_eq!(engine.state(), EngineState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn cancelled_finalizer_keeps_shutdown_gate_until_handles_are_closed() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap()
+            .with_shutdown_grace(Duration::from_secs(1))
+            .unwrap();
+        let (_temp, engine) = engine_with_engine_options(2, options);
+        let session = engine.session();
+        session
+            .set_routing_key("open-an-idle-handle")
+            .await
+            .unwrap();
+        engine
+            .query(&session, Statement::new("SELECT 1", vec![]))
+            .await
+            .unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        engine
+            .inner
+            .connections
+            .block_next_close_idle(started_tx, release_rx);
+
+        let first_engine = engine.clone();
+        let first = tokio::spawn(async move { first_engine.shutdown().await });
+        wait_for_blocking_signal(started_rx, "the first shutdown finalizer should start").await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second_engine = engine.clone();
+        let mut second = tokio::spawn(async move { second_engine.shutdown().await });
+        assert!(
+            timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
+            "a later shutdown must wait for the detached finalizer"
+        );
+        assert_eq!(engine.state(), EngineState::Draining);
+
+        release_tx.send(()).unwrap();
+        let report = timeout(Duration::from_secs(2), second)
+            .await
+            .expect("the later shutdown should observe finalization")
+            .unwrap()
+            .unwrap();
+        assert!(!report.forced());
+        assert_eq!(engine.state(), EngineState::Stopped);
+        let snapshot = engine.inner.connections.snapshot().unwrap();
+        assert!(snapshot.shards.iter().all(|shard| shard.idle == 0));
     }
 }

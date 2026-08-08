@@ -23,6 +23,13 @@ the same pull request. A supported operating-system runner may be replaced
 before its upstream end of life, also through a tested pull request and policy
 update.
 
+The server installs SIGINT and SIGTERM streams before reporting readiness on
+Unix. A Windows build installs its Ctrl-C stream at the same point, although
+Windows is not currently in the supported tier. Signal handling enters the same
+tested `Engine` drain/cancel/cleanup lifecycle; platform-specific
+service-manager integration beyond those signals is not yet part of the support
+contract.
+
 ## Development-tested targets
 
 Maintainers also develop and run the full suite on `aarch64-apple-darwin`.

@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+};
 
 use super::{EngineError, EngineErrorKind, EngineResult};
 
@@ -41,6 +44,16 @@ impl BlockingPool {
         T: Send + 'static,
         F: FnOnce() -> EngineResult<T> + Send + 'static,
     {
+        join_blocking(self.acquire().await?.spawn(work)).await
+    }
+
+    /// Wait for one blocking-worker slot without starting any work.
+    ///
+    /// Separating admission from spawning lets request cancellation discard a
+    /// queued operation immediately. Once [`BlockingPermit::spawn`] is called,
+    /// the permit moves into the blocking closure and survives a dropped async
+    /// caller until cleanup really finishes.
+    pub(crate) async fn acquire(&self) -> EngineResult<BlockingPermit> {
         let permit = Arc::clone(&self.permits)
             .acquire_owned()
             .await
@@ -51,20 +64,40 @@ impl BlockingPool {
                     error,
                 )
             })?;
+        Ok(BlockingPermit { permit })
+    }
+}
 
+/// One reserved BriskDB blocking-worker slot.
+#[derive(Debug)]
+pub(crate) struct BlockingPermit {
+    permit: OwnedSemaphorePermit,
+}
+
+impl BlockingPermit {
+    pub(crate) fn spawn<T, F>(self, work: F) -> JoinHandle<EngineResult<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> EngineResult<T> + Send + 'static,
+    {
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let _permit = self.permit;
             work()
         })
-        .await
-        .map_err(|error| {
-            EngineError::from_source(
-                EngineErrorKind::Internal,
-                "blocking engine task failed",
-                error,
-            )
-        })?
     }
+}
+
+pub(crate) async fn join_blocking<T>(join: JoinHandle<EngineResult<T>>) -> EngineResult<T>
+where
+    T: Send + 'static,
+{
+    join.await.map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::Internal,
+            "blocking engine task failed",
+            error,
+        )
+    })?
 }
 
 #[cfg(test)]
