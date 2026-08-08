@@ -150,7 +150,7 @@ Status: **in progress**
 - [x] Add initial unit and end-to-end smoke tests.
 - [x] Write `docs/SQL_COMPATIBILITY.md` with supported syntax and explicit
   SQLite/PostgreSQL/MySQL differences.
-- [ ] Add CI for formatting, Clippy, tests, and supported Rust versions.
+- [x] Add CI for formatting, Clippy, tests, and supported Rust versions.
 - [ ] Add a benchmark baseline for point reads, writes, and four-shard
   concurrent writes.
 - [ ] Choose and document the project license and supported-platform policy.

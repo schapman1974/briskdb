@@ -32,12 +32,25 @@ test must explain why the change cannot affect executable behavior.
 
 ## Required local checks
 
+The crate declares Rust 1.85 as its minimum supported Rust version (MSRV).
+Behavior-changing code must compile and pass tests on both the MSRV and current
+stable Rust. The MSRV may only be raised deliberately, with release notes and a
+CI update in the same pull request.
+
 Run these before publishing a branch:
 
 ```bash
-cargo fmt --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all --check
+cargo test --locked --all-targets --all-features
+cargo test --locked --doc --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+```
+
+When Rust 1.85 is installed through `rustup`, also run:
+
+```bash
+cargo +1.85.0 test --locked --all-targets --all-features
+cargo +1.85.0 test --locked --doc --all-features
 ```
 
 Run targeted integration, compatibility, benchmark, or failure suites when the

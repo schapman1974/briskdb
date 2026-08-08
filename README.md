@@ -1,5 +1,7 @@
 # BriskDB
 
+[![CI](https://github.com/schapman1974/briskdb/actions/workflows/ci.yml/badge.svg)](https://github.com/schapman1974/briskdb/actions/workflows/ci.yml)
+
 BriskDB is an experimental Rust server that spreads keyed workloads across
 multiple SQLite databases. It takes the central sharding model proven in
 TinyMongo and makes it available as a small network service.
@@ -11,6 +13,9 @@ planner, APIs, and production-hardening milestones.
 The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
 current SQLite pass-through API from planned PostgreSQL and MySQL compatibility.
 Contributions follow the repository's [test-first completion policy](CONTRIBUTING.md).
+
+BriskDB supports Rust 1.85 and newer stable releases. CI tests the declared
+minimum supported Rust version (MSRV) and the latest stable toolchain.
 
 ## Current foundation
 
