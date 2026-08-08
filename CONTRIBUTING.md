@@ -40,9 +40,10 @@ CI update in the same pull request.
 Run these before publishing a branch:
 
 ```bash
-cargo fmt --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all --check
+cargo test --locked --all-targets --all-features
+cargo test --locked --doc --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
 When Rust 1.85 is installed through `rustup`, also run:
