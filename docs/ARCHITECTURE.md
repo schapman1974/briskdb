@@ -23,7 +23,7 @@ server ---------> protocol::http
 | --- | --- | --- |
 | `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, errors, read-only logical catalog, synchronous bound-value-aware plans, and single-shard routing policy; stable key routing; bounded per-shard admission and connection pools; routed execute/query and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
-| `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, source-preserving placeholder normalization, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, session/write policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
+| `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, session/write policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, listener binding, and tracked Axum HTTP/1 connection lifecycle | SQL parsing or storage implementation details |
@@ -124,9 +124,9 @@ contract](SQL_SUBSET.md).
 
 The current HTTP execute/query and migration paths deliberately remain raw
 SQLite pass-through and call none of the parser, subset validator, placeholder
-normalizer, shard-key inference, or bound statement-planning layers. Issues
-#19 through #24 therefore change no HTTP shape, SQL acceptance, execution
-routing, or storage behavior.
+normalizer, translator, shard-key inference, or bound statement-planning
+layers. Issues #19 through #25 therefore change no HTTP shape, SQL acceptance,
+execution routing, or storage behavior.
 
 ### Placeholder-normalization boundary
 
@@ -152,6 +152,29 @@ filesystem, or execution access and does not decide whether a statement batch
 may execute; issue #27 owns that policy. The normative API, dialect rules,
 limits, errors, and tests are in the [SQL parameter-normalization
 contract](SQL_PARAMETERS.md).
+
+### SQL-translation boundary
+
+`translate_sql(NormalizedSql, SqlTranslationMode)` consumes an owned normalized
+request and returns an owned `TranslatedSql`. Strict mode accepts only SQLite
+source and preserves `sqlite_parameter_sql()` byte-for-byte. Compatibility mode
+clones the validated opaque AST, applies the finite dialect-specific type and
+syntax matrix, resolves every retained placeholder to its existing `?N`
+identity, and renders separate canonical SQLite SQL. Exact original source and
+the complete normalized representation remain retained.
+
+Compatibility integers canonicalize to `BIGINT` rather than exact SQLite
+`INTEGER`, avoiding accidental `INTEGER PRIMARY KEY` rowid-alias behavior.
+Boolean declarations/literals, variable text and binary declarations,
+64-bit-real aliases, backtick identifiers, transaction aliases, and comma-form
+limits have the only documented mappings. Other types and syntax remain
+unsupported. Canonical compatibility rendering may normalize formatting and
+comments; strict mode does not render the AST.
+
+Translation is stateless and protocol-neutral. It accepts no catalog, values,
+session, storage, or routing state and does not prepare or execute SQL. There is
+no configured default mode yet. The full matrix, result, errors, non-goals, and
+tests are normative in the [SQL translation contract](SQL_TRANSLATION.md).
 
 ### Shard-key inference boundary
 
@@ -213,13 +236,13 @@ must establish that the physical schema and routing snapshot remain
 authoritative before using a plan.
 
 The planner is stateless and its assignment is still non-executable. It does
-not translate SQL, mutate a session, cache a prepared statement, apply batch
-policy, open a shard connection, scatter reads, or execute anything. The
+not invoke translation, mutate a session, cache a prepared statement, apply
+batch policy, open a shard connection, scatter reads, or execute anything. The
 normative API, assignment matrix, encoding, provenance, error, boundary, and
 testing rules are in the [bound statement-planning and routing-policy
-contract](SQL_PLANNING.md). Issues #25 through #27 own translation,
-prepared-statement/session lifecycle, and authoritative statement/batch policy
-respectively.
+contract](SQL_PLANNING.md). Translation is the separate implemented issue #25
+branch over the same `NormalizedSql`; issues #26 and #27 own
+prepared-statement/session lifecycle and authoritative statement/batch policy.
 
 ## Manifest storage boundary
 

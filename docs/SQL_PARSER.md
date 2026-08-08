@@ -8,7 +8,9 @@ invent its own routing rules. This record selects the parser dependency and
 defines that boundary. The separate [common SQL subset contract](SQL_SUBSET.md)
 defines the opt-in structural validator, and the [SQL parameter-normalization
 contract](SQL_PARAMETERS.md) defines the opt-in dialect-specific placeholder
-rewrite. None of these layers is in the current HTTP execution path.
+rewrite. The [SQL translation contract](SQL_TRANSLATION.md) defines the
+implemented opt-in strict and finite compatibility modes. None of these layers
+is in the current HTTP execution path.
 
 ## Decision
 
@@ -45,9 +47,11 @@ it through BriskDB-owned interfaces, but protocol adapters must not depend on
 
 `sqlparser`'s formatter is not a source-preserving serializer: it can normalize
 comments, whitespace, quoting, and keyword presentation. BriskDB therefore
-never executes an AST's `Display` output and does not use that output as a
-migration identity. Execution and byte-identity operations retain their exact
-original SQL unless a later, documented translation produces separate SQL.
+never treats an AST's `Display` output as original source or migration identity.
+Strict SQLite translation and byte-identity operations retain exact normalized
+source. The implemented compatibility translator is the one documented layer
+that deliberately renders a cloned validated AST into a separate
+`TranslatedSql::sqlite_sql()` representation.
 
 ## Syntax-only contract
 
@@ -67,7 +71,8 @@ In particular, this layer does not:
 - itself plan bound statements; issue #23 implements that as the separate
   synchronous `Engine::plan_bound_statement` layer, and issue #24 extends that
   call with physical-target comparison and sharded-write policy;
-- translate types or syntax, or choose strict SQLite mode (issue #25);
+- itself translate types or syntax; issue #25 implements that as the separate
+  `translate_sql(NormalizedSql, SqlTranslationMode)` layer;
 - implement prepare/bind/describe/execute state or caches (issue #26); or
 - classify statement behavior or reject unsafe multi-statement combinations
   (issue #27).
@@ -81,11 +86,11 @@ that still does not grant permission to execute an empty or mixed batch.
 
 The existing HTTP execute, query, and migration paths remain raw SQLite
 pass-through surfaces with their existing authorizer and endpoint-specific
-rules. They call neither this parser, the opt-in common-subset validator, nor
-the opt-in placeholder normalizer, shard-key inference, or bound statement
-planner. Connecting those layers before translation, the prepared execution
-lifecycle, and request-level statement policy are implemented would change the
-experimental HTTP SQL surface.
+rules. They call neither this parser, the opt-in common-subset validator,
+placeholder normalizer, translator, shard-key inference, nor bound statement
+planner. Connecting those layers before the prepared execution lifecycle and
+request-level statement policy are implemented would change the experimental
+HTTP SQL surface.
 
 ## Resource and error boundaries
 
@@ -130,7 +135,11 @@ correction is selected, or an equivalently reviewed published dependency is
 available.
 
 BriskDB enables `sqlparser`'s recursive-protection support in addition to
-setting the explicit depth limit. In the dependency graph selected by the
+setting the explicit depth limit. It also enables the dependency's visitor
+derives so the compatibility translator can mutate every identifier and value
+in the already bounded, validated AST without maintaining a second recursive
+expression walker. Upstream visitor types remain private to the SQL module.
+In the dependency graph selected by the
 spike, the newest `psm` release admitted by `stacker` pulls in build
 dependencies that require Rust 1.88. BriskDB supports Rust 1.85, so both
 `Cargo.toml` and `Cargo.lock` constrain `psm` to `0.1.28`, whose dependency

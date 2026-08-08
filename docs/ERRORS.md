@@ -157,6 +157,16 @@ fixed categories and positions and never contain SQL, literal or marker text,
 bound values, formatted AST output, or source locations. See the [SQL
 parameter-normalization contract](SQL_PARAMETERS.md).
 
+The opt-in SQL translator reports `InvalidArgument` when strict SQLite mode is
+requested for PostgreSQL or MySQL input. Compatibility mode reports
+`Unsupported` for a parsed type outside its finite mapping and `InvalidQuery`
+when canonical rendering would contain a NUL byte. A mismatch between retained
+statement, column, or placeholder metadata is `Internal`. Translation
+diagnostics identify only the trusted dialect and one-based statement or
+column position where useful; they never contain SQL, identifier or type
+spelling, literal text, parameters, or formatted AST output. See the [SQL
+translation contract](SQL_TRANSLATION.md).
+
 The opt-in shard-key inference layer reports an out-of-range statement index,
 wrong bound-value count, or missing logical database as `InvalidArgument`; an
 unknown table in the selected database as `InvalidQuery`; an incompatible key

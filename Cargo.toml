@@ -23,7 +23,7 @@ serde_json = "1.0"
 # The exact upstream revision contains the post-0.62.0 `parse_interval`
 # recursion fix. This must remain a direct source pin so downstream BriskDB
 # consumers inherit it; a root-only `[patch]` would not propagate.
-sqlparser = { version = "=0.62.0", git = "https://github.com/apache/datafusion-sqlparser-rs", rev = "33521a534eae72188e06ce0ce4836d19c7f3458a", default-features = false, features = ["std", "recursive-protection"] }
+sqlparser = { version = "=0.62.0", git = "https://github.com/apache/datafusion-sqlparser-rs", rev = "33521a534eae72188e06ce0ce4836d19c7f3458a", default-features = false, features = ["std", "recursive-protection", "visitor"] }
 # `recursive` admits newer `psm` releases whose build dependencies require
 # Rust 1.88. The direct exact constraint preserves BriskDB's Rust 1.85 MSRV for
 # both this repository and downstream consumers until that graph is corrected.

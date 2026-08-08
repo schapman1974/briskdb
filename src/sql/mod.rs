@@ -12,6 +12,7 @@ mod inference;
 mod normalizer;
 mod parser;
 mod subset;
+mod translator;
 
 pub(crate) use dml::{RoutedDml, routed_dml_shape};
 
@@ -24,6 +25,7 @@ pub use parser::{
     SqlDialect, parse,
 };
 pub use subset::{CommonSql, MAX_COMMON_SQL_EXPRESSION_DEPTH, validate_common_subset};
+pub use translator::{SqlTranslationMode, TranslatedSql, translate_sql};
 
 use rusqlite::{
     Connection, params_from_iter,

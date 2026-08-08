@@ -653,23 +653,27 @@ fn validate_limit_clause(
     limit_clause: &LimitClause,
     validation: &mut ValidationState,
 ) -> SubsetResult {
-    let LimitClause::LimitOffset {
-        limit,
-        offset,
-        limit_by,
-    } = limit_clause
-    else {
-        return unsupported("comma-form LIMIT");
-    };
-    let Some(limit) = limit else {
-        return unsupported("LIMIT ALL");
-    };
-    if !limit_by.is_empty() {
-        return unsupported("LIMIT BY");
-    }
-    validate_limit_value(limit, validation)?;
-    if let Some(offset) = offset {
-        validate_limit_value(&offset.value, validation)?;
+    match limit_clause {
+        LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            let Some(limit) = limit else {
+                return unsupported("LIMIT ALL");
+            };
+            if !limit_by.is_empty() {
+                return unsupported("LIMIT BY");
+            }
+            validate_limit_value(limit, validation)?;
+            if let Some(offset) = offset {
+                validate_limit_value(&offset.value, validation)?;
+            }
+        }
+        LimitClause::OffsetCommaLimit { offset, limit } => {
+            validate_limit_value(offset, validation)?;
+            validate_limit_value(limit, validation)?;
+        }
     }
     Ok(())
 }
@@ -1352,7 +1356,13 @@ mod tests {
             SqlDialect::PostgreSql,
             "SELECT COUNT(id, tenant_id) FROM widgets",
         );
-        assert_unsupported(SqlDialect::MySql, "SELECT * FROM widgets LIMIT 10, 20");
+    }
+
+    #[test]
+    fn comma_limit_is_structurally_admitted_for_later_translation() {
+        assert_supported(SqlDialect::MySql, "SELECT * FROM widgets LIMIT 10, 20");
+        assert_supported(SqlDialect::Sqlite, "SELECT * FROM widgets LIMIT 10, 20");
+        assert_supported(SqlDialect::MySql, "SELECT * FROM widgets LIMIT ?, ?");
     }
 
     #[test]

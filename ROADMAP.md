@@ -211,7 +211,7 @@ interrupted schema migration can be diagnosed and resumed.
 - [x] Plan prepared statements at bind/execute time, not parse time, because a
   routing key may be supplied as a bound parameter.
 - [x] Reject conflicting keys and unroutable writes before execution.
-- [ ] Translate a deliberately small set of type names and syntax differences;
+- [x] Translate a deliberately small set of type names and syntax differences;
   preserve a strict mode that exposes SQLite SQL directly.
 - [ ] Implement protocol-neutral prepare/bind/describe/execute lifecycle and a
   bounded per-session prepared-statement cache.
@@ -271,8 +271,9 @@ inside a single-shard transaction, handle errors, and reconnect cleanly.
   `COM_STMT_EXECUTE`, reset, and close.
 - [ ] Map BriskDB types, nulls, status flags, affected rows, generated-key
   behavior, warnings, MySQL error numbers, and SQLSTATE values.
-- [ ] Add selected MySQL syntax normalization: backtick identifiers, boolean
-  conventions, `LIMIT offset,count`, and documented type aliases.
+- [ ] Apply the implemented selected MySQL normalization for backtick
+  identifiers, Boolean conventions, `LIMIT offset,count`, and documented type
+  aliases to the MySQL wire request lifecycle.
 - [ ] Emulate the small session surface that real drivers issue automatically,
   including `SET NAMES`, selected `SHOW VARIABLES`, and selected `SELECT @@...`
   probes; test each shim rather than inventing a broad fake catalog.

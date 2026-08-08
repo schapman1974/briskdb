@@ -17,14 +17,14 @@ document defines the SQL and behavioral contract separately from connectivity.
   promise for it.
 
 The syntax parser, recursive common-subset validator, placeholder normalizer,
-catalog-aware shard-key inference API, and synchronous engine bound-statement
-planner are now available behind BriskDB-owned types. Validation is explicit
-and returns `Unsupported` for a parsed form outside the subset; parser
-acceptance alone is not product support. Normalization, inference, bound
-planning, and routing policy are also explicit. The current experimental HTTP
-interface is still a raw SQLite pass-through and can execute uncontracted
-SQLite syntax because it calls none of these layers. That behavior is not a
-compatibility promise.
+finite SQL translator, catalog-aware shard-key inference API, and synchronous
+engine bound-statement planner are now available behind BriskDB-owned types.
+Validation is explicit and returns `Unsupported` for a parsed form outside the
+subset; parser acceptance alone is not product support. Translation,
+normalization, inference, bound planning, and routing policy are also explicit.
+The current experimental HTTP interface is still a raw SQLite pass-through and
+can execute uncontracted SQLite syntax because it calls none of these layers.
+That behavior is not a compatibility promise.
 
 ## Compatibility layers
 
@@ -33,7 +33,7 @@ BriskDB tracks three independent compatibility layers:
 1. **Wire compatibility** lets an existing driver connect, authenticate,
    prepare and bind statements, receive typed rows, and manage session state.
 2. **SQL compatibility** parses a documented common subset and translates
-   selected PostgreSQL or MySQL syntax into SQLite operations.
+   selected PostgreSQL or MySQL syntax into SQLite SQL.
 3. **Behavioral compatibility** emulates the metadata, type, error, transaction,
    and session behavior needed by specifically tested clients and tools.
 
@@ -44,33 +44,38 @@ than claiming to be a drop-in PostgreSQL or MySQL replacement.
 ## Current implementation
 
 Only the experimental HTTP network interface is implemented today. There is no
-PostgreSQL or MySQL listener or general dialect translation layer yet. The
-public Rust SQL facade can parse an explicitly selected SQLite, PostgreSQL, or
-MySQL dialect, consume that result with
+PostgreSQL or MySQL listener. The public Rust SQL facade can parse an explicitly
+selected SQLite, PostgreSQL, or MySQL dialect, consume that result with
 `validate_common_subset(ParsedSql)`, and then opt into
-`normalize_placeholders(CommonSql)`. That step yields canonical SQLite `?N`
-text and per-statement parameter metadata. Callers may then pass one
-statement's exact bound-value slice and selected logical database to
-`infer_shard_keys`, which returns a typed key classification. Synchronous
+`normalize_placeholders(CommonSql)`. That step yields source-preserving SQLite
+`?N` text and per-statement parameter metadata. A caller can consume the owned
+normalized result with `translate_sql`, explicitly selecting either finite
+compatibility translation or strict SQLite preservation; there is no default
+mode. Translation returns separate SQLite SQL while retaining the exact source
+and normalized bind metadata.
+
+Callers may pass one statement's exact bound-value slice and selected logical
+database from the retained normalized result to `infer_shard_keys`, which
+returns a typed key classification. Synchronous
 `Engine::plan_bound_statement` accepts the same concrete bind plus an optional
 explicit routing byte sequence, retains the inference, and produces owned
 physical routes with schema and routing provenance. It compares finite inferred
 and explicit routes by physical shard, rejects unroutable cataloged sharded
-DML, and records a valid single-shard assignment. It does not generally
-translate, authorize, enforce batch policy, or execute a statement. HTTP
-requests still send SQLite SQL directly to `rusqlite`; they do not pass through
-these opt-in SQL layers.
+DML, and records a valid single-shard assignment. The planner does not invoke
+translation, authorize, enforce batch policy, or execute a statement. HTTP
+requests still send caller-provided SQLite SQL directly to `rusqlite`; they do
+not pass through these opt-in SQL layers.
 
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
 | HTTP `/v1/execute` | Experimental | One SQLite statement with positional parameters | Required caller-provided `shard_key` |
 | HTTP `/v1/query` | Experimental | One prepared SQLite statement executed through the row-returning path | Required caller-provided `shard_key` |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
-| PostgreSQL wire protocol | Planned | Common subset plus documented PostgreSQL normalization | Rust inference and bind-time single-shard routing policy implemented; wire lifecycle and session integration planned |
-| MySQL wire protocol | Planned | Common subset plus documented MySQL normalization | Rust inference and bind-time single-shard routing policy implemented; wire lifecycle and session integration planned |
+| PostgreSQL wire protocol | Planned | Rust parsing, validation, placeholder normalization, and finite compatibility translation implemented; listener adoption planned | Rust inference and bind-time single-shard routing policy implemented; wire lifecycle and session integration planned |
+| MySQL wire protocol | Planned | Rust parsing, validation, placeholder normalization, and finite compatibility translation implemented; listener adoption planned | Rust inference and bind-time single-shard routing policy implemented; wire lifecycle and session integration planned |
 
-The parser, subset validator, placeholder normalizer, shard-key inference
-function, and engine planner are implemented Rust APIs, not network
+The parser, subset validator, placeholder normalizer, SQL translator, shard-key
+inference function, and engine planner are implemented Rust APIs, not network
 interfaces. Each step is opt-in and does not change any current network row in
 this table.
 
@@ -273,8 +278,9 @@ dialect and parsed-batch types. The pinned snapshot contains corrected
 `parse_interval` recursion accounting plus other reviewed upstream changes
 after the `v0.62.0` tag. Callers select SQLite, PostgreSQL, or MySQL explicitly;
 generic parsing, dialect autodetection, and fallback parsing are not available.
-Exact SQL is retained because formatting an AST is not source preserving and
-formatted AST text is never sent to SQLite.
+Exact SQL is retained because formatting an AST is not source preserving.
+Compatibility translation renders a separate canonical SQLite representation;
+the current network paths do not consume that representation.
 
 Parsing establishes only that one dialect recognizes the syntax. It does not
 make a statement part of BriskDB's supported common subset or establish that
@@ -290,26 +296,29 @@ when every top-level statement and nested form is in the first subset. Empty
 and mixed batches may validate because request-level batch policy remains issue
 #27. `normalize_placeholders(CommonSql)` then returns an owned `NormalizedSql`
 with canonical SQLite parameter text and one parameter record per statement.
-`infer_shard_keys` can consume that result with catalog context and a complete
-bound-value slice for one statement. `Engine::plan_bound_statement` consumes
-that same concrete bind when a caller needs physical routes and a validated
-single-shard assignment. The SQL wrapper types retain exact source, dialect,
-and statement count without exposing the upstream AST or rendering SQL in
-`Debug` output.
+`translate_sql` can consume it and return an owned `TranslatedSql` containing a
+separate SQLite representation while retaining the complete normalized result.
+`infer_shard_keys` can use that retained result with catalog context and a
+complete bound-value slice for one statement. `Engine::plan_bound_statement`
+consumes that same concrete bind when a caller needs physical routes and a
+validated single-shard assignment. The SQL wrapper types retain exact source,
+dialect, and statement count without exposing the upstream AST or rendering
+SQL in `Debug` output.
 
-The parser, validator, and normalizer have no routing or storage access. The
-implemented inference layer borrows only the read-only logical catalog and
-protocol-neutral bound values; it consumes structural syntax, never
-regular-expression matches over raw or formatted SQL. See the [SQL parser
-decision record](SQL_PARSER.md) for the dependency and resource contract, the
-[common SQL subset contract](SQL_SUBSET.md) for the normative recursive
-whitelist, and the [SQL parameter-normalization
-contract](SQL_PARAMETERS.md) for numbering and source-preservation rules. The
-[shard-key inference contract](SQL_SHARD_KEYS.md) defines the supported proof
-grammar and typed result. The [bound statement-planning and routing-policy
-contract](SQL_PLANNING.md) defines canonical route bytes, occurrence ordering,
-physical-target comparison, write rejection, provenance, and the
-non-executable planning boundary.
+The parser, validator, normalizer, and translator have no routing or storage
+access. The implemented inference layer borrows only the read-only logical
+catalog and protocol-neutral bound values; it consumes structural syntax,
+never regular-expression matches over raw or formatted SQL. See the [SQL
+parser decision record](SQL_PARSER.md) for the dependency and resource
+contract, the [common SQL subset contract](SQL_SUBSET.md) for the normative
+recursive whitelist, the [SQL parameter-normalization
+contract](SQL_PARAMETERS.md) for numbering and source-preservation rules, and
+the [SQL translation contract](SQL_TRANSLATION.md) for modes and the finite
+type and syntax matrix. The [shard-key inference contract](SQL_SHARD_KEYS.md)
+defines the supported proof grammar and typed result. The [bound
+statement-planning and routing-policy contract](SQL_PLANNING.md) defines
+canonical route bytes, occurrence ordering, physical-target comparison, write
+rejection, provenance, and the non-executable planning boundary.
 
 ### Implemented pass-through surface
 
@@ -351,7 +360,7 @@ The opt-in validator recursively admits these statement families:
 | --- | --- |
 | `CREATE TABLE` | One unqualified persistent table, optional `IF NOT EXISTS`, one or more columns with any explicit parsed type, and the supported literal defaults plus primary-key, unique, and check constraints |
 | `CREATE INDEX` | A named optional-unique index on plain columns of one unqualified table; `IF NOT EXISTS` and `ASC`/`DESC` are accepted |
-| `SELECT` | A nonempty projection with zero or one plain table; optional simple alias, `ALL`/`DISTINCT`, scalar filtering/grouping, `HAVING`, expression ordering, and standard numeric-or-placeholder limit/offset; PostgreSQL `LIMIT ALL` is parser-equivalent to no limit |
+| `SELECT` | A nonempty projection with zero or one plain table; optional simple alias, `ALL`/`DISTINCT`, scalar filtering/grouping, `HAVING`, expression ordering, and standard or MySQL/SQLite comma-form numeric-or-placeholder limit/offset; PostgreSQL `LIMIT ALL` is parser-equivalent to no limit |
 | `INSERT` | One named table, an explicit column list unique under conservative ASCII case folding, and one or more equal-width `VALUES` rows |
 | `UPDATE` | One plain table, single-column assignments whose targets are unique under conservative ASCII case folding, and an optional predicate |
 | `DELETE` | One plain `FROM` table and an optional predicate |
@@ -370,15 +379,18 @@ name, and diagnostic rules are normative in
 [the common SQL subset contract](SQL_SUBSET.md).
 
 This implemented status means structural validation exists and is tested. It
-does not mean the subset is connected to execution. Column type names are only
-required to be explicit; type compatibility and translation remain issue #25.
-Insert/update duplicate checks fold ASCII letter case regardless of quoting but
-do not define general identifier normalization, which also remains issue #25.
+does not mean the subset is connected to execution. Column type names need only
+be explicit at validation; the separate compatibility translator applies its
+finite dialect-specific declaration whitelist. Insert/update duplicate checks
+fold ASCII letter case regardless of quoting. Compatibility translation
+canonicalizes accepted backtick-quoted identifiers, but does not define general
+case folding, Unicode normalization, collation, or catalog equivalence.
 Placeholder normalization is the separate implemented issue #21 layer described
-below, and catalog-aware typed key extraction is the implemented issue #22
-layer. Synchronous bind-time route construction is the implemented issue #23
-layer, and issue #24 adds physical-target comparison, assigned shards, and
-rejection of conflicting or unroutable cataloged sharded writes.
+below, the translator is the implemented issue #25 layer, and catalog-aware
+typed key extraction is the implemented issue #22 layer. Synchronous bind-time
+route construction is the implemented issue #23 layer, and issue #24 adds
+physical-target comparison, assigned shards, and rejection of conflicting or
+unroutable cataloged sharded writes.
 Prepare/bind/describe/execute state remains issue #26, and empty or
 multi-statement execution policy remains issue #27.
 
@@ -413,8 +425,34 @@ error contract are in [SQL parameter normalization](SQL_PARAMETERS.md).
 
 This implemented normalization does not bind or count supplied values, infer a
 shard, translate other dialect syntax, create a prepared statement, classify
-statement behavior, authorize a request, or execute SQL. The HTTP and engine
-paths continue to bind their existing caller-supplied SQLite SQL directly.
+statement behavior, authorize a request, or execute SQL. Translation is the
+separate opt-in layer described next. The HTTP and engine paths continue to
+bind their existing caller-supplied SQLite SQL directly.
+
+### Implemented SQL translation
+
+The public Rust function `translate_sql(NormalizedSql, SqlTranslationMode)` is
+an opt-in, protocol-neutral step. There is deliberately no default mode.
+`StrictSqlite` accepts only SQLite source and returns
+`NormalizedSql::sqlite_parameter_sql()` byte for byte. `Compatibility` clones
+the validated AST, applies the documented finite mappings, and renders a
+separate canonical SQLite string. Both results retain the exact original source
+and complete normalized placeholder metadata.
+
+The compatibility type whitelist is keyed by source dialect. It maps selected
+signed integer declarations to `BIGINT`, Boolean declarations to `BOOLEAN`,
+selected 64-bit floating-point declarations to `REAL`, variable text to `TEXT`,
+and variable binary to `BLOB`. It rejects declarations outside that matrix
+instead of choosing an uncontracted representation. Strict SQLite translation
+continues to preserve arbitrary validated SQLite declared type names.
+
+The syntax mappings cover accepted backtick-quoted identifiers, Boolean
+literals, transaction aliases, and MySQL/SQLite comma-form limits. Placeholder
+indices retain their statement-local source identities even when comma-limit
+operands are reordered. This layer does not implement server-specific value or
+result metadata adapters, identifier case folding, collations, function shims,
+upserts, wire session behavior, preparation, routing, or execution. The exact
+matrix and error contract are in [SQL translation](SQL_TRANSLATION.md).
 
 ### Implemented shard-key inference
 
@@ -481,16 +519,16 @@ not implemented unless listed as implemented in this document.
 | Area | PostgreSQL | BriskDB contract |
 | --- | --- | --- |
 | Parameters | `$1`, `$2`, ... | Implemented opt-in Rust normalization, typed inference, and single-shard routing policy from a supplied bound slice; wire bind lifecycle remains planned |
-| Identifier quoting | Double quotes | Passed through where SQLite semantics agree |
-| Type system | Static types identified by OIDs | Planned loss-aware mapping to BriskDB types and SQLite storage classes |
-| Boolean | Dedicated `boolean` type | Stored as SQLite integer `0` or `1`; protocol adapter returns a Boolean value |
+| Identifier quoting | Double quotes | Retained by opt-in compatibility translation; PostgreSQL case folding and catalog equivalence are not claimed |
+| Type system | Static types identified by OIDs | Opt-in Rust translation maps a finite declaration set to `BIGINT`, `BOOLEAN`, `REAL`, `TEXT`, or `BLOB`; OID and value/result adaptation remain planned |
+| Boolean | Dedicated `boolean` type | Opt-in translation maps the declaration to `BOOLEAN` and literals to `1`/`0`; Boolean wire/result metadata remains planned |
 | `serial`, identity, sequences | Sequence-backed generation | Unsupported until explicit sequence/identity semantics are designed |
-| `bytea` | Binary value | Planned mapping to SQLite `BLOB` |
+| `bytea` | Binary value | Opt-in declaration translation maps it to SQLite `BLOB`; binary value and wire adaptation remain planned |
 | `json` / `jsonb` | Distinct PostgreSQL types | Planned JSON validation; no promise of PostgreSQL `jsonb` storage or operators |
 | Arrays, ranges, enums, domains | Native PostgreSQL types | Unsupported initially |
 | Schemas and `search_path` | Multiple schemas per database | Unsupported initially; compatibility shims may expose one logical schema |
 | `RETURNING` | Common DML feature | Not in the initial common subset |
-| `ON CONFLICT` | PostgreSQL upsert syntax | Supported only after a tested translation contract is defined |
+| `ON CONFLICT` | PostgreSQL upsert syntax | Outside the initial common subset and unsupported |
 | Functions/operators | PostgreSQL catalog | SQLite functions/operators unless an explicit shim is documented |
 | System catalogs | `pg_catalog`, `information_schema` | Only queries required by named, tested clients will be emulated |
 | Error behavior | SQLSTATE and failed transaction state | Stable error-kind-to-SQLSTATE mapping defined; wire encoding and `I`/`T`/`E` transaction states planned |
@@ -509,15 +547,15 @@ engine used by PostgreSQL and HTTP.
 | Area | MySQL | BriskDB contract |
 | --- | --- | --- |
 | Parameters | `?` in prepared statements | Implemented opt-in Rust normalization, typed inference, and single-shard routing policy from a supplied bound slice; wire bind lifecycle remains planned |
-| Identifier quoting | Backticks by default | Planned normalization; double-quoted strict SQL remains available |
-| Type system | Static signed/unsigned column types | BriskDB retains `UInt64` without narrowing; current SQLite binding rejects values above `i64::MAX` until an explicit storage mapping exists |
-| Boolean | Commonly `TINYINT(1)` | Stored as SQLite integer `0` or `1`; protocol adapter returns documented metadata |
+| Identifier quoting | Backticks by default | Opt-in compatibility translation emits safely escaped double-quoted SQLite identifiers; case and collation equivalence are not claimed |
+| Type system | Static signed/unsigned column types | Opt-in Rust translation maps a finite signed integer, Boolean, 64-bit float, text, and binary declaration set; unsigned declarations are rejected, and translation performs no value or result adaptation. Independently, BriskDB retains `UInt64` values without narrowing, while current SQLite binding rejects values above `i64::MAX` until a storage mapping exists |
+| Boolean | Commonly `TINYINT(1)` | Opt-in translation maps exactly `TINYINT(1)` to `BOOLEAN` and Boolean literals to `1`/`0`; wire/result metadata remains planned |
 | `AUTO_INCREMENT` | Table column attribute | Unsupported until generated-key semantics are designed |
-| `UNSIGNED`, display widths | MySQL column attributes | No current SQLite equivalent; unsupported initially |
+| `UNSIGNED`, display widths | MySQL column attributes | Rejected by compatibility translation, except that exactly `TINYINT(1)` is the documented Boolean declaration |
 | `DATETIME`, `TIMESTAMP` | Distinct MySQL temporal behavior | No implicit compatibility; canonical timestamp encoding must be defined first |
 | `JSON` | Native MySQL JSON type | Planned JSON validation stored using the canonical BriskDB representation |
-| `LIMIT offset,count` | MySQL syntax | Planned normalization to canonical limit/offset form |
-| `ON DUPLICATE KEY UPDATE` | MySQL upsert syntax | Unsupported until a tested translation contract is defined |
+| `LIMIT offset,count` | MySQL syntax | Opt-in compatibility translation emits `LIMIT count OFFSET offset` while retaining placeholder identities |
+| `ON DUPLICATE KEY UPDATE` | MySQL upsert syntax | Outside the initial common subset and unsupported |
 | Engines, character sets, collations | Per-table/column options | Engine clauses unsupported; charset/collation behavior must be explicitly mapped |
 | Session probes | `SET NAMES`, `SHOW VARIABLES`, `SELECT @@...` | Only the subset required by named, tested clients will be emulated |
 | Metadata | `information_schema` and MySQL metadata commands | Minimal tested compatibility only |
@@ -528,6 +566,8 @@ engine used by PostgreSQL and HTTP.
 
 SQLite is the execution authority. Unless BriskDB documents a compatibility
 translation, its behavior follows SQLite rather than PostgreSQL or MySQL.
+Compatibility translation is a finite mapping, not a claim of full server
+semantics. `StrictSqlite` preserves normalized SQLite source instead.
 
 - SQLite values use the `NULL`, `INTEGER`, `REAL`, `TEXT`, and `BLOB` storage
   classes. Ordinary tables use type affinity rather than rigid column typing.
@@ -541,8 +581,9 @@ translation, its behavior follows SQLite rather than PostgreSQL or MySQL.
 - Numeric conversion, collation, null ordering, division, and comparison rules
   can differ from both server databases. Distributed merge operations must
   reproduce the chosen SQLite semantics explicitly.
-- `STRICT` tables can provide stronger enforcement, but BriskDB does not enable
-  strict mode implicitly.
+- SQLite `STRICT` tables can provide stronger enforcement, but BriskDB does not
+  enable them implicitly. That table option is unrelated to
+  `SqlTranslationMode::StrictSqlite`.
 
 See SQLite's official [SQL language reference](https://www.sqlite.org/lang.html)
 and [datatype documentation](https://www.sqlite.org/datatype3.html) for the
@@ -641,7 +682,8 @@ and failure tests that establish such a guarantee.
 A syntax or behavior moves from planned to implemented only with tests at the
 right boundary:
 
-- unit tests for parsing, normalization, routing, type conversion, and errors;
+- unit tests for parsing, normalization, translation, routing, type conversion,
+  and errors;
 - golden tests for wire messages, placeholders, type metadata, and error codes;
 - differential tests against a single SQLite reference database for supported
   SQL and scatter/gather behavior;
