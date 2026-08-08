@@ -28,7 +28,8 @@ use crate::{
 
 use super::{
     CONNECTION_BUSY_TIMEOUT, RootSchemaCoordination, SchemaMigrationGuard, Storage,
-    configure_journal_mode, configure_manifest_connection, manifest,
+    configure_journal_mode, configure_manifest_connection,
+    configure_manifest_connection_after_busy_setup, manifest,
     manifest::{SchemaMigration, SchemaMigrationClassification},
     open_existing_manifest, shard,
 };
@@ -42,6 +43,7 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_MANIFEST_COMMIT_CLEANUP: Cell<bool> = const { Cell::new(false) };
+    static CANCEL_AFTER_CONTROLLED_CORRUPTION: Cell<bool> = const { Cell::new(false) };
 }
 
 struct MigrationBusyOperation {
@@ -230,15 +232,20 @@ pub(super) fn apply_schema_migration(
     control: Option<Arc<OperationControl>>,
 ) -> EngineResult<Vec<u16>> {
     #[cfg(test)]
-    {
+    let result = {
         apply_schema_migration_with_hook(storage, sql, guard, control, |point| {
             run_schema_migration_test_block(&storage.root, point)
         })
-    }
+    };
     #[cfg(not(test))]
+    let result = { apply_schema_migration_with_hook(storage, sql, guard, control, |_| Ok(())) };
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
     {
-        apply_schema_migration_with_hook(storage, sql, guard, control, |_| Ok(()))
+        storage.record_schema_degraded();
     }
+    result
 }
 
 fn apply_schema_migration_with_hook<F>(
@@ -257,8 +264,20 @@ where
 
     let manifest_path = storage.root.join("manifest.sqlite");
     let mut manifest_connection = open_existing_manifest(&manifest_path)?;
-    configure_manifest_connection(&manifest_connection)?;
-    configure_journal_mode(&manifest_connection)?;
+    match control.as_ref() {
+        Some(control) => run_connection_controlled(
+            &mut manifest_connection,
+            Arc::clone(control),
+            |connection| {
+                configure_manifest_connection_after_busy_setup(connection)?;
+                configure_journal_mode(connection)
+            },
+        )?,
+        None => {
+            configure_manifest_connection(&manifest_connection)?;
+            configure_journal_mode(&manifest_connection)?;
+        }
+    }
 
     match classify_schema_migration(
         &mut manifest_connection,
@@ -268,10 +287,30 @@ where
         control.as_ref(),
     )? {
         SchemaMigrationClassification::Complete(migration) => {
+            if let Some(integrity) = current_integrity_optional_controlled(
+                &mut manifest_connection,
+                storage.shard_count(),
+                control.as_ref(),
+            )? {
+                storage.schema_coordination.publish_schema_digests(
+                    integrity.committed_schema_digest(),
+                    integrity.target_schema_digest(),
+                )?;
+            }
             finish_completed_schema_migration(storage, &migration, control.as_ref())?;
             return Ok(all_shards(storage.shard_count()));
         }
         SchemaMigrationClassification::Active(migration) => {
+            if let Some(integrity) = current_integrity_optional_controlled(
+                &mut manifest_connection,
+                storage.shard_count(),
+                control.as_ref(),
+            )? {
+                storage.schema_coordination.publish_schema_digests(
+                    integrity.committed_schema_digest(),
+                    integrity.target_schema_digest(),
+                )?;
+            }
             guard.mark_pending_on_drop();
             resume_active_schema_migration(
                 SchemaMigrationCoordinator {
@@ -299,17 +338,22 @@ where
         )
     })?;
     let shards_dir = storage.root.join("shards");
+    let source_digest = storage.schema_coordination.committed_schema_digest()?;
+    let mut target_digest = None;
     for shard_id in 0..storage.shard_count() {
         check_cancelled(control.as_deref())?;
         let path = shard_path(&shards_dir, shard_id);
-        let state = preflight_one_shard(
-            &path,
-            shard_id,
-            source_generation,
-            target_generation,
-            &storage.shard_layout,
-            sql,
-            control.as_ref(),
+        let (state, observed_target_digest) = preflight_one_shard(
+            ShardMigrationRequest {
+                path: &path,
+                shard_id,
+                source_generation,
+                target_generation,
+                layout: &storage.shard_layout,
+                sql,
+                control: control.as_ref(),
+            },
+            &source_digest,
         )
         .map_err(|error| sanitized_shard_error(error, "preflight", shard_id))?;
         if state != shard::SchemaMigrationShardState::Source {
@@ -320,18 +364,38 @@ where
                 ),
             ));
         }
+        if target_digest.is_some_and(|expected| expected != observed_target_digest) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "schema migration produced inconsistent target fingerprints across shards",
+            ));
+        }
+        target_digest = Some(observed_target_digest);
     }
     check_cancelled(control.as_deref())?;
+    let target_digest = target_digest.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "schema migration preflight did not inspect any shards",
+        )
+    })?;
 
     let migration = begin_schema_migration(
         &mut manifest_connection,
-        storage.shard_count(),
-        &storage.shard_layout,
-        source_generation,
-        sql,
-        control.as_ref(),
+        BeginSchemaMigrationRequest {
+            requested_shards: storage.shard_count(),
+            layout: &storage.shard_layout,
+            source_generation,
+            sql,
+            source_digest,
+            target_digest,
+            control: control.as_ref(),
+        },
         guard,
     )?;
+    storage
+        .schema_coordination
+        .publish_schema_digests(Some(source_digest), Some(target_digest))?;
     if migration.is_complete() {
         finish_completed_schema_migration(storage, &migration, control.as_ref())?;
         return Ok(all_shards(storage.shard_count()));
@@ -369,23 +433,53 @@ fn classify_schema_migration(
     Ok(classification)
 }
 
-fn begin_schema_migration(
+fn current_integrity_optional_controlled(
     connection: &mut Connection,
     requested_shards: u16,
-    layout: &shard::ShardLayout,
-    source_generation: u64,
-    sql: &str,
     control: Option<&Arc<OperationControl>>,
+) -> EngineResult<Option<manifest::ManifestIntegrity>> {
+    match control {
+        Some(control) => run_connection_controlled(connection, Arc::clone(control), |connection| {
+            manifest::current_integrity_optional(connection, requested_shards)
+        }),
+        None => manifest::current_integrity_optional(connection, requested_shards),
+    }
+}
+
+struct BeginSchemaMigrationRequest<'a> {
+    requested_shards: u16,
+    layout: &'a shard::ShardLayout,
+    source_generation: u64,
+    sql: &'a str,
+    source_digest: [u8; 32],
+    target_digest: [u8; 32],
+    control: Option<&'a Arc<OperationControl>>,
+}
+
+fn begin_schema_migration(
+    connection: &mut Connection,
+    request: BeginSchemaMigrationRequest<'_>,
     guard: &mut SchemaMigrationGuard,
 ) -> EngineResult<SchemaMigration> {
+    let BeginSchemaMigrationRequest {
+        requested_shards,
+        layout,
+        source_generation,
+        sql,
+        source_digest,
+        target_digest,
+        control,
+    } = request;
     let mut transaction = ManifestTransaction::begin(connection, control)?;
     let migration = transaction.run(|connection| {
         manifest::ensure_schema_migration_layout(connection, requested_shards, layout)?;
-        manifest::begin_schema_migration_in_transaction(
+        manifest::begin_schema_migration_with_digests_in_transaction(
             connection,
             requested_shards,
             source_generation,
             sql,
+            source_digest,
+            target_digest,
         )
     })?;
     transaction.commit_with_durability_boundary(|| guard.mark_pending_on_drop())?;
@@ -511,15 +605,61 @@ where
     } = coordinator;
     ensure_active_matches_catalog(&migration, catalog, requested_shards)?;
     let shards_dir = root.join("shards");
-    validate_schema_migration_prefix(
-        &shards_dir,
+    let integrity = current_integrity_optional_controlled(
+        manifest_connection,
         requested_shards,
-        migration.next_shard(),
-        migration.source_generation(),
-        migration.target_generation(),
-        layout,
         control.as_ref(),
     )?;
+    let schema_digests = if let Some(integrity) = integrity {
+        if integrity.state() != manifest::DatabaseIntegrityState::Migrating {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "active schema migration is not in its durable migrating state",
+            ));
+        }
+        let source = integrity.committed_schema_digest().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "active schema migration is missing its source fingerprint",
+            )
+        })?;
+        let target = integrity.target_schema_digest().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "active schema migration is missing its target fingerprint",
+            )
+        })?;
+        schema_coordination.publish_schema_digests(Some(source), Some(target))?;
+        let target = schema_coordination.target_schema_digest()?.ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "root coordination did not publish the migration target fingerprint",
+            )
+        })?;
+        validate_schema_migration_prefix_with_digests(
+            &shards_dir,
+            requested_shards,
+            migration.next_shard(),
+            migration.source_generation(),
+            migration.target_generation(),
+            layout,
+            &source,
+            &target,
+            control.as_ref(),
+        )?;
+        Some((source, target))
+    } else {
+        validate_schema_migration_prefix(
+            &shards_dir,
+            requested_shards,
+            migration.next_shard(),
+            migration.source_generation(),
+            migration.target_generation(),
+            layout,
+            control.as_ref(),
+        )?;
+        None
+    };
 
     while migration.next_shard() < requested_shards {
         check_cancelled(control.as_deref())?;
@@ -549,13 +689,16 @@ where
         let shard_id = migration.next_shard();
         let path = shard_path(&shards_dir, shard_id);
         apply_one_shard(
-            &path,
-            shard_id,
-            migration.source_generation(),
-            migration.target_generation(),
-            layout,
-            migration.sql_text(),
-            control.as_ref(),
+            ShardMigrationRequest {
+                path: &path,
+                shard_id,
+                source_generation: migration.source_generation(),
+                target_generation: migration.target_generation(),
+                layout,
+                sql: migration.sql_text(),
+                control: control.as_ref(),
+            },
+            schema_digests.as_ref().map(|(_, target)| target),
         )
         .map_err(|error| sanitized_shard_error(error, "apply", shard_id))?;
         hook(SchemaMigrationCoordinatorPoint::ShardCommitted(shard_id))?;
@@ -576,15 +719,29 @@ where
     }
 
     check_cancelled(control.as_deref())?;
-    validate_schema_migration_prefix(
-        &shards_dir,
-        requested_shards,
-        requested_shards,
-        migration.source_generation(),
-        migration.target_generation(),
-        layout,
-        control.as_ref(),
-    )?;
+    if let Some((source_digest, target_digest)) = schema_digests.as_ref() {
+        validate_schema_migration_prefix_with_digests(
+            &shards_dir,
+            requested_shards,
+            requested_shards,
+            migration.source_generation(),
+            migration.target_generation(),
+            layout,
+            source_digest,
+            target_digest,
+            control.as_ref(),
+        )?;
+    } else {
+        validate_schema_migration_prefix(
+            &shards_dir,
+            requested_shards,
+            requested_shards,
+            migration.source_generation(),
+            migration.target_generation(),
+            layout,
+            control.as_ref(),
+        )?;
+    }
 
     let mut transaction = ManifestTransaction::begin(manifest_connection, control.as_ref())?;
     let Some(locked) = transaction.run(|connection| {
@@ -610,7 +767,11 @@ where
     transaction.commit()?;
     hook(SchemaMigrationCoordinatorPoint::FinalizationCommitted)?;
     schema_coordination
-        .publish_schema_generation(completed.source_generation(), completed.target_generation())
+        .publish_schema_generation(completed.source_generation(), completed.target_generation())?;
+    if let Some((_, target_digest)) = schema_digests {
+        schema_coordination.publish_schema_digests(Some(target_digest), None)?;
+    }
+    Ok(())
 }
 
 fn finish_completed_by_sql(
@@ -637,15 +798,38 @@ fn finish_completed_by_sql(
             ));
         }
     };
-    validate_schema_migration_prefix(
-        shards_dir,
-        requested_shards,
-        requested_shards,
-        completed.source_generation(),
-        completed.target_generation(),
-        layout,
-        control,
-    )?;
+    if let Some(integrity) =
+        current_integrity_optional_controlled(manifest_connection, requested_shards, control)?
+    {
+        let target_digest = integrity.committed_schema_digest().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "completed schema migration is missing its committed fingerprint",
+            )
+        })?;
+        validate_schema_migration_prefix_with_digests(
+            shards_dir,
+            requested_shards,
+            requested_shards,
+            completed.source_generation(),
+            completed.target_generation(),
+            layout,
+            &target_digest,
+            &target_digest,
+            control,
+        )?;
+        schema_coordination.publish_schema_digests(Some(target_digest), None)?;
+    } else {
+        validate_schema_migration_prefix(
+            shards_dir,
+            requested_shards,
+            requested_shards,
+            completed.source_generation(),
+            completed.target_generation(),
+            layout,
+            control,
+        )?;
+    }
     schema_coordination
         .publish_schema_generation(completed.source_generation(), completed.target_generation())
 }
@@ -663,13 +847,16 @@ fn finish_completed_schema_migration(
                 "completed schema migration does not match the loaded catalog generation",
             ));
         }
-        validate_schema_migration_prefix(
+        let target_digest = storage.schema_coordination.committed_schema_digest()?;
+        validate_schema_migration_prefix_with_digests(
             &storage.root.join("shards"),
             storage.shard_count(),
             storage.shard_count(),
             migration.source_generation(),
             migration.target_generation(),
             &storage.shard_layout,
+            &target_digest,
+            &target_digest,
             control,
         )?;
         return storage.publish_schema_generation(
@@ -739,28 +926,119 @@ fn validate_schema_migration_prefix(
     )
 }
 
-fn preflight_one_shard(
-    path: &Path,
-    shard_id: u16,
+#[allow(clippy::too_many_arguments)]
+fn validate_schema_migration_prefix_with_digests(
+    shards_dir: &Path,
+    shard_count: u16,
+    next_shard: u16,
     source_generation: u64,
     target_generation: u64,
     layout: &shard::ShardLayout,
-    sql: &str,
+    source_digest: &[u8; 32],
+    target_digest: &[u8; 32],
     control: Option<&Arc<OperationControl>>,
-) -> EngineResult<shard::SchemaMigrationShardState> {
+) -> EngineResult<Option<shard::SchemaMigrationShardState>> {
+    shard::validate_schema_migration_prefix_with(
+        shards_dir,
+        shard_count,
+        next_shard,
+        source_generation,
+        target_generation,
+        layout,
+        |path, shard_id| {
+            let mut connection = shard::open_required_file(path)?;
+            let validate = |connection: &mut Connection| {
+                let state = shard::validate_schema_migration_connection(
+                    connection,
+                    path,
+                    shard_id,
+                    source_generation,
+                    target_generation,
+                    layout,
+                )?;
+                let (generation, expected) = match state {
+                    shard::SchemaMigrationShardState::Source => (source_generation, source_digest),
+                    shard::SchemaMigrationShardState::Target => (target_generation, target_digest),
+                };
+                shard::verify_schema_digest(connection, generation, expected)?;
+                Ok(state)
+            };
+            match control {
+                Some(control) => {
+                    run_connection_controlled(&mut connection, Arc::clone(control), validate)
+                }
+                None => {
+                    connection
+                        .busy_timeout(CONNECTION_BUSY_TIMEOUT)
+                        .map_err(sqlite_error::storage)?;
+                    validate(&mut connection)
+                }
+            }
+        },
+    )
+}
+
+struct ShardMigrationRequest<'a> {
+    path: &'a Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &'a shard::ShardLayout,
+    sql: &'a str,
+    control: Option<&'a Arc<OperationControl>>,
+}
+
+fn preflight_one_shard(
+    request: ShardMigrationRequest<'_>,
+    expected_source_digest: &[u8; 32],
+) -> EngineResult<(shard::SchemaMigrationShardState, [u8; 32])> {
+    let ShardMigrationRequest {
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+        control,
+    } = request;
     match control {
-        None => shard::preflight_schema_migration(
-            path,
-            shard_id,
-            source_generation,
-            target_generation,
-            layout,
-            sql,
-        ),
+        None => {
+            let mut connection = shard::open_required_file(path)?;
+            connection
+                .busy_timeout(CONNECTION_BUSY_TIMEOUT)
+                .map_err(sqlite_error::storage)?;
+            shard::validate_schema_migration_connection(
+                &connection,
+                path,
+                shard_id,
+                source_generation,
+                target_generation,
+                layout,
+            )?;
+            shard::verify_schema_digest(&connection, source_generation, expected_source_digest)?;
+            shard::preflight_schema_migration_on_connection_with_digest(
+                &mut connection,
+                path,
+                shard_id,
+                source_generation,
+                target_generation,
+                layout,
+                sql,
+            )
+        }
         Some(control) => {
             let mut connection = shard::open_required_file(path)?;
             run_connection_controlled(&mut connection, Arc::clone(control), |connection| {
-                shard::preflight_schema_migration_on_connection(
+                shard::validate_schema_migration_connection(
+                    connection,
+                    path,
+                    shard_id,
+                    source_generation,
+                    target_generation,
+                    layout,
+                )?;
+                shard::verify_schema_digest(connection, source_generation, expected_source_digest)?;
+                shard::preflight_schema_migration_on_connection_with_digest(
                     connection,
                     path,
                     shard_id,
@@ -775,37 +1053,66 @@ fn preflight_one_shard(
 }
 
 fn apply_one_shard(
-    path: &Path,
-    shard_id: u16,
-    source_generation: u64,
-    target_generation: u64,
-    layout: &shard::ShardLayout,
-    sql: &str,
-    control: Option<&Arc<OperationControl>>,
+    request: ShardMigrationRequest<'_>,
+    expected_target_digest: Option<&[u8; 32]>,
 ) -> EngineResult<()> {
+    let ShardMigrationRequest {
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+        control,
+    } = request;
     match control {
-        None => shard::apply_schema_migration(
-            path,
-            shard_id,
-            source_generation,
-            target_generation,
-            layout,
-            sql,
-        )
-        .map(|_| ()),
+        None => match expected_target_digest {
+            Some(expected) => shard::apply_schema_migration_with_digest(
+                path,
+                shard_id,
+                source_generation,
+                target_generation,
+                layout,
+                sql,
+                expected,
+            )
+            .map(|_| ()),
+            None => shard::apply_schema_migration(
+                path,
+                shard_id,
+                source_generation,
+                target_generation,
+                layout,
+                sql,
+            )
+            .map(|_| ()),
+        },
         Some(control) => {
             let mut connection = shard::open_required_file(path)?;
             run_connection_controlled(&mut connection, Arc::clone(control), |connection| {
-                shard::apply_schema_migration_on_connection(
-                    connection,
-                    path,
-                    shard_id,
-                    source_generation,
-                    target_generation,
-                    layout,
-                    sql,
-                )
-                .map(|_| ())
+                match expected_target_digest {
+                    Some(expected) => shard::apply_schema_migration_on_connection_with_digest(
+                        connection,
+                        path,
+                        shard_id,
+                        source_generation,
+                        target_generation,
+                        layout,
+                        sql,
+                        expected,
+                    )
+                    .map(|_| ()),
+                    None => shard::apply_schema_migration_on_connection(
+                        connection,
+                        path,
+                        shard_id,
+                        source_generation,
+                        target_generation,
+                        layout,
+                        sql,
+                    )
+                    .map(|_| ()),
+                }
             })
         }
     }
@@ -839,6 +1146,14 @@ where
     }
 
     let outcome = catch_unwind(AssertUnwindSafe(|| work(connection)));
+    #[cfg(test)]
+    if matches!(
+        &outcome,
+        Ok(Err(error)) if error.kind() == EngineErrorKind::DataCorruption
+    ) && CANCEL_AFTER_CONTROLLED_CORRUPTION.with(|cancel| cancel.replace(false))
+    {
+        control.request_cancel(CancellationReason::Cancelled);
+    }
     let progress_cleanup = connection
         .progress_handler(0, None::<fn() -> bool>)
         .map_err(sqlite_error::storage);
@@ -863,6 +1178,7 @@ where
             Err(error.context("failed to restore the schema-migration busy timeout"))
         }
         (Ok(value), Ok(()), Ok(()), _) => Ok(value),
+        (Err(error), _, _, _) if error.kind() == EngineErrorKind::DataCorruption => Err(error),
         (Err(_), _, _, Some(reason)) => Err(reason.error()),
         (Err(error), _, _, None) => Err(error),
     }
@@ -1081,6 +1397,60 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MigratingManifestSnapshot {
+        catalog_generation: i64,
+        target_generation: i64,
+        source_generation: i64,
+        migration_id: Vec<u8>,
+        digest_version: i64,
+        sql_text: String,
+        shard_count: i64,
+        migration_state: i64,
+        next_shard: i64,
+        committed_schema_digest: Vec<u8>,
+        target_schema_digest: Vec<u8>,
+    }
+
+    fn migrating_manifest_snapshot(root: &Path) -> MigratingManifestSnapshot {
+        Connection::open(root.join("manifest.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT c.schema_generation,
+                        m.target_generation,
+                        m.source_generation,
+                        m.migration_id,
+                        m.digest_version,
+                        m.sql_text,
+                        m.shard_count,
+                        m.migration_state,
+                        m.next_shard,
+                        i.committed_schema_digest,
+                        i.target_schema_digest
+                 FROM briskdb_schema_catalog AS c
+                 JOIN briskdb_schema_migrations AS m ON m.migration_state = 1
+                 JOIN briskdb_integrity AS i ON i.singleton = 1
+                 WHERE c.singleton = 1",
+                [],
+                |row| {
+                    Ok(MigratingManifestSnapshot {
+                        catalog_generation: row.get(0)?,
+                        target_generation: row.get(1)?,
+                        source_generation: row.get(2)?,
+                        migration_id: row.get(3)?,
+                        digest_version: row.get(4)?,
+                        sql_text: row.get(5)?,
+                        shard_count: row.get(6)?,
+                        migration_state: row.get(7)?,
+                        next_shard: row.get(8)?,
+                        committed_schema_digest: row.get(9)?,
+                        target_schema_digest: row.get(10)?,
+                    })
+                },
+            )
+            .unwrap()
+    }
+
     fn manifest_generation_and_history(root: &Path, file_name: &str) -> (i64, i64) {
         Connection::open(root.join(file_name))
             .unwrap()
@@ -1143,6 +1513,130 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    fn assert_file_backed_migrating_startup_rejects_schema_tamper(
+        tampered_shard: u16,
+        drift_table: &str,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let failure = run_with_hook(
+            &storage,
+            fail_at(SchemaMigrationCoordinatorPoint::ShardCommitted(0)),
+        )
+        .unwrap_err();
+        assert_eq!(failure.kind(), EngineErrorKind::Internal);
+        assert_eq!(
+            storage.schema_gate_snapshot().state,
+            SchemaGateState::Pending
+        );
+        assert_eq!(active_journal_snapshot(temp.path()), Some((0, 1, 0)));
+        assert_eq!(shard_generations(temp.path()), [1, 0]);
+
+        let trusted = migrating_manifest_snapshot(temp.path());
+        assert_eq!(trusted.catalog_generation, 0);
+        assert_eq!(
+            (trusted.source_generation, trusted.target_generation),
+            (0, 1)
+        );
+        assert_eq!((trusted.migration_state, trusted.next_shard), (1, 0));
+        assert_eq!(trusted.committed_schema_digest.len(), 32);
+        assert_eq!(trusted.target_schema_digest.len(), 32);
+        assert_eq!(
+            Connection::open(temp.path().join("manifest.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT database_state FROM briskdb_integrity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        drop(storage);
+
+        Connection::open(
+            temp.path()
+                .join("shards")
+                .join(format!("{tampered_shard:04}.sqlite")),
+        )
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TABLE {drift_table}(id INTEGER PRIMARY KEY)"
+        ))
+        .unwrap();
+
+        let error = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            migrating_manifest_snapshot(temp.path()),
+            trusted,
+            "startup must preserve the complete active journal and both trusted digests"
+        );
+        assert_eq!(active_journal_snapshot(temp.path()), Some((0, 1, 0)));
+        assert_eq!(
+            shard_generations(temp.path()),
+            [1, 0],
+            "startup must not acknowledge or apply another shard"
+        );
+
+        let manifest_path = temp.path().join("manifest.sqlite");
+        let manifest_connection = Connection::open(&manifest_path).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        let degraded = manifest::current_integrity(&manifest_connection, 2).unwrap();
+        assert_eq!(degraded.state(), manifest::DatabaseIntegrityState::Degraded);
+        assert_eq!(
+            degraded.committed_schema_digest().unwrap().as_slice(),
+            trusted.committed_schema_digest.as_slice()
+        );
+        assert_eq!(
+            degraded.target_schema_digest().unwrap().as_slice(),
+            trusted.target_schema_digest.as_slice()
+        );
+        drop(manifest_connection);
+
+        for shard_id in 0..2 {
+            let connection = Connection::open(
+                temp.path()
+                    .join("shards")
+                    .join(format!("{shard_id:04}.sqlite")),
+            )
+            .unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM sqlite_schema
+                            WHERE type = 'table' AND name = 'migration_marker'
+                         )",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap(),
+                shard_id == 0,
+                "startup advanced the commit-before-ack migration prefix"
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM sqlite_schema
+                            WHERE type = 'table' AND name = ?1
+                         )",
+                        [drift_table],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap(),
+                shard_id == tampered_shard,
+                "startup changed the injected schema drift"
+            );
+        }
+
+        let terminal = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(terminal.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(migrating_manifest_snapshot(temp.path()), trusted);
+        assert_eq!(shard_generations(temp.path()), [1, 0]);
     }
 
     #[test]
@@ -1216,6 +1710,22 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_migrating_startup_degrades_without_advancing_on_source_schema_tamper() {
+        assert_file_backed_migrating_startup_rejects_schema_tamper(
+            1,
+            "injected_source_schema_drift",
+        );
+    }
+
+    #[test]
+    fn file_backed_migrating_startup_degrades_without_advancing_on_target_schema_tamper() {
+        assert_file_backed_migrating_startup_rejects_schema_tamper(
+            0,
+            "injected_target_schema_drift",
+        );
+    }
+
+    #[test]
     fn cancellation_after_journal_commit_leaves_pending_and_retry_completes() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Storage::open(temp.path(), 2).unwrap();
@@ -1247,6 +1757,62 @@ mod tests {
 
         assert_eq!(run_with_hook(&storage, |_| Ok(())).unwrap(), [0, 1]);
         assert_complete(&storage, temp.path());
+    }
+
+    #[test]
+    fn cancellation_cannot_mask_corruption_before_terminal_degradation_is_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        Connection::open(temp.path().join("shards/0000.sqlite"))
+            .unwrap()
+            .execute_batch("CREATE TABLE injected_checksum_drift(value TEXT)")
+            .unwrap();
+
+        CANCEL_AFTER_CONTROLLED_CORRUPTION.with(|cancel| cancel.set(true));
+        let control = OperationControl::new(None);
+        let mut guard = storage.begin_schema_migration().unwrap();
+        guard.wait_for_quiescence_blocking();
+        let result = apply_schema_migration(
+            &storage,
+            MIGRATION_SQL,
+            &mut guard,
+            Some(Arc::clone(&control)),
+        );
+        assert_eq!(
+            result.as_ref().unwrap_err().kind(),
+            EngineErrorKind::DataCorruption,
+            "the storage wrapper must observe corruption before client cancellation mapping"
+        );
+        drop(guard);
+        assert_eq!(
+            storage.schema_gate_snapshot().state,
+            SchemaGateState::Degraded
+        );
+        assert_eq!(
+            control.complete(result).unwrap_err().kind(),
+            EngineErrorKind::Cancelled,
+            "the outer request boundary may still report the accepted cancellation"
+        );
+
+        let manifest_connection = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        assert_eq!(
+            manifest::current_integrity(&manifest_connection, 2)
+                .unwrap()
+                .state(),
+            manifest::DatabaseIntegrityState::Degraded
+        );
+        assert_eq!(
+            manifest_connection
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "preflight corruption must not publish a migration journal"
+        );
     }
 
     #[test]
@@ -1294,7 +1860,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let storage = Storage::open(temp.path(), 2).unwrap();
         let owner = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
-        owner.execute_batch("BEGIN IMMEDIATE").unwrap();
+        owner
+            .execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode = DELETE;
+                 BEGIN EXCLUSIVE;",
+            )
+            .unwrap();
 
         let control = OperationControl::new(Some(Instant::now() + Duration::from_millis(50)));
         let mut guard = storage.begin_schema_migration().unwrap();
@@ -1343,14 +1915,31 @@ mod tests {
         configure_journal_mode(&manifest_connection).unwrap();
         let control = OperationControl::new(None);
         FAIL_NEXT_MANIFEST_COMMIT_CLEANUP.with(|fail| fail.set(true));
+        let source_digest = storage
+            .schema_coordination
+            .committed_schema_digest()
+            .unwrap();
+        let (_, target_digest) = shard::preflight_schema_migration_with_digest(
+            &temp.path().join("shards/0000.sqlite"),
+            0,
+            0,
+            1,
+            &storage.shard_layout,
+            MIGRATION_SQL,
+        )
+        .unwrap();
 
         let error = begin_schema_migration(
             &mut manifest_connection,
-            2,
-            &storage.shard_layout,
-            0,
-            MIGRATION_SQL,
-            Some(&control),
+            BeginSchemaMigrationRequest {
+                requested_shards: 2,
+                layout: &storage.shard_layout,
+                source_generation: 0,
+                sql: MIGRATION_SQL,
+                source_digest,
+                target_digest,
+                control: Some(&control),
+            },
             &mut guard,
         )
         .unwrap_err();
@@ -1377,7 +1966,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let storage = Storage::open(temp.path(), 2).unwrap();
         let layout = storage.shard_layout;
-        drop(storage);
         let mut manifest_connection =
             Connection::open(temp.path().join("manifest.sqlite")).unwrap();
         configure_manifest_connection(&manifest_connection).unwrap();
@@ -1419,6 +2007,7 @@ mod tests {
             )
             .unwrap();
         manifest_connection.execute_batch("COMMIT").unwrap();
+        manifest::reseal_manifest_for_test(&manifest_connection).unwrap();
 
         let control = OperationControl::new(Some(Instant::now() + Duration::from_millis(5)));
         let started = Instant::now();
@@ -1433,6 +2022,37 @@ mod tests {
         assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(manifest_connection.is_autocommit());
+
+        let integrity_control =
+            OperationControl::new(Some(Instant::now() + Duration::from_millis(5)));
+        let integrity_started = Instant::now();
+        let integrity_error = current_integrity_optional_controlled(
+            &mut manifest_connection,
+            2,
+            Some(&integrity_control),
+        )
+        .unwrap_err();
+        assert_eq!(integrity_error.kind(), EngineErrorKind::DeadlineExceeded);
+        assert!(integrity_started.elapsed() < Duration::from_secs(1));
+        assert!(manifest_connection.is_autocommit());
+
+        let public_control = OperationControl::new(Some(Instant::now() + Duration::from_millis(5)));
+        let mut guard = storage.begin_schema_migration().unwrap();
+        guard.wait_for_quiescence_blocking();
+        let public_started = Instant::now();
+        let public_error = apply_schema_migration_with_hook(
+            &storage,
+            "SELECT absent_migration",
+            &mut guard,
+            Some(public_control),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(public_error.kind(), EngineErrorKind::DeadlineExceeded);
+        assert!(public_started.elapsed() < Duration::from_secs(1));
+        drop(guard);
+        assert_eq!(storage.schema_gate_snapshot().state, SchemaGateState::Ready);
+
         assert_eq!(
             manifest::classify_schema_migration(
                 &mut manifest_connection,
@@ -1722,9 +2342,39 @@ mod tests {
 
         fs::remove_file(&manifest_path).unwrap();
         fs::copy(second_root.path().join("manifest.sqlite"), &manifest_path).unwrap();
-        let replacement_error = run_with_hook(&first, |_| Ok(())).unwrap_err();
+        let replacement_integrity_before: (i64, Vec<u8>) = Connection::open(&manifest_path)
+            .unwrap()
+            .query_row(
+                "SELECT database_state, manifest_digest
+                 FROM briskdb_integrity WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let mut guard = first.begin_schema_migration().unwrap();
+        guard.wait_for_quiescence_blocking();
+        let replacement_error = first
+            .apply_schema_migration(MIGRATION_SQL, &mut guard, None)
+            .unwrap_err();
         assert_eq!(replacement_error.kind(), EngineErrorKind::DataCorruption);
-        assert_eq!(first.schema_gate_snapshot().state, SchemaGateState::Ready);
+        drop(guard);
+        assert_eq!(
+            first.schema_gate_snapshot().state,
+            SchemaGateState::Degraded
+        );
+        assert_eq!(
+            Connection::open(&manifest_path)
+                .unwrap()
+                .query_row(
+                    "SELECT database_state, manifest_digest
+                     FROM briskdb_integrity WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .unwrap(),
+            replacement_integrity_before,
+            "a rejected foreign manifest must not be marked or resealed"
+        );
         assert_eq!(
             manifest_generation_and_history(first_root.path(), "manifest.sqlite"),
             (0, 0)

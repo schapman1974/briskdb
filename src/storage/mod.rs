@@ -42,6 +42,13 @@ pub(crate) const CONNECTION_BUSY_TIMEOUT: std::time::Duration = std::time::Durat
 struct RootSchemaCoordination {
     gate: schema_gate::SchemaGate,
     catalogs: Mutex<Vec<Weak<CatalogSnapshot>>>,
+    schema_digests: Mutex<RuntimeSchemaDigests>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RuntimeSchemaDigests {
+    committed: Option<[u8; 32]>,
+    target: Option<[u8; 32]>,
 }
 
 impl RootSchemaCoordination {
@@ -49,7 +56,58 @@ impl RootSchemaCoordination {
         Self {
             gate: schema_gate::SchemaGate::new(),
             catalogs: Mutex::new(Vec::new()),
+            schema_digests: Mutex::new(RuntimeSchemaDigests::default()),
         }
+    }
+
+    fn mark_degraded(&self) {
+        self.gate.mark_degraded();
+    }
+
+    fn publish_schema_digests(
+        &self,
+        committed: Option<[u8; 32]>,
+        target: Option<[u8; 32]>,
+    ) -> EngineResult<()> {
+        let mut digests = self.schema_digests.lock().map_err(|error| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                format!("root schema checksum coordination is poisoned: {error}"),
+            )
+        })?;
+        *digests = RuntimeSchemaDigests { committed, target };
+        Ok(())
+    }
+
+    fn committed_schema_digest(&self) -> EngineResult<[u8; 32]> {
+        self.schema_digests
+            .lock()
+            .map_err(|error| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    format!("root schema checksum coordination is poisoned: {error}"),
+                )
+            })?
+            .committed
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    "application schema has not completed integrity verification",
+                )
+            })
+    }
+
+    fn target_schema_digest(&self) -> EngineResult<Option<[u8; 32]>> {
+        Ok(self
+            .schema_digests
+            .lock()
+            .map_err(|error| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    format!("root schema checksum coordination is poisoned: {error}"),
+                )
+            })?
+            .target)
     }
 
     fn register_catalog(&self, loaded: CatalogSnapshot) -> EngineResult<Arc<CatalogSnapshot>> {
@@ -193,6 +251,66 @@ fn begin_startup_coordination(
     }
 }
 
+fn validate_schema_migration_checksum_prefix(
+    shards_dir: &Path,
+    shard_count: u16,
+    layout: &shard::ShardLayout,
+    migration: &manifest::SchemaMigration,
+    integrity: manifest::ManifestIntegrity,
+) -> EngineResult<()> {
+    if integrity.state() != manifest::DatabaseIntegrityState::Migrating {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "active schema migration has an inconsistent database integrity state",
+        ));
+    }
+    let source_digest = integrity.committed_schema_digest().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "active schema migration is missing its source checksum",
+        )
+    })?;
+    let target_digest = integrity.target_schema_digest().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "active schema migration is missing its target checksum",
+        )
+    })?;
+    shard::validate_schema_migration_prefix_with(
+        shards_dir,
+        shard_count,
+        migration.next_shard(),
+        migration.source_generation(),
+        migration.target_generation(),
+        layout,
+        |path, shard_id| {
+            let connection = shard::open_required_file(path)?;
+            connection
+                .busy_timeout(CONNECTION_BUSY_TIMEOUT)
+                .map_err(sqlite_error::storage)?;
+            let state = shard::validate_schema_migration_connection(
+                &connection,
+                path,
+                shard_id,
+                migration.source_generation(),
+                migration.target_generation(),
+                layout,
+            )?;
+            let (generation, expected) = match state {
+                shard::SchemaMigrationShardState::Source => {
+                    (migration.source_generation(), &source_digest)
+                }
+                shard::SchemaMigrationShardState::Target => {
+                    (migration.target_generation(), &target_digest)
+                }
+            };
+            shard::verify_schema_digest(&connection, generation, expected)?;
+            Ok(state)
+        },
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Storage {
     root: PathBuf,
@@ -219,31 +337,104 @@ impl Storage {
         let fresh_layout_allowed = physical_layout_is_empty(&shards_dir)?;
         let manifest_path = root.join("manifest.sqlite");
         let mut manifest = open_manifest_for_startup(&manifest_path)?;
-        configure_manifest_connection(&manifest)?;
-        let loaded = manifest::load_or_create_manifest_with_fresh_layout(
-            &mut manifest,
-            requested_shards,
-            fresh_layout_allowed,
-        )?;
-        configure_journal_mode(&manifest)?;
-        let (catalog, shard_layout, active_migration) = loaded.into_parts_with_migration();
-        let catalog = schema_coordination.register_catalog(catalog)?;
-
-        if let Some(active_migration) = active_migration {
+        if let Err(error) = configure_manifest_connection(&manifest) {
+            if error.kind() == EngineErrorKind::DataCorruption {
+                schema_coordination.mark_degraded();
+            }
+            return Err(error);
+        }
+        let v6_active = match manifest::load_v6_active_migration(&manifest, requested_shards) {
+            Ok(active) => active,
+            Err(error) => {
+                if error.kind() == EngineErrorKind::DataCorruption {
+                    schema_coordination.mark_degraded();
+                }
+                return Err(error);
+            }
+        };
+        if let Some(v6_active) = v6_active {
+            configure_journal_mode(&manifest)?;
+            let (v6_catalog, v6_layout, active_migration) = v6_active.into_parts();
+            let v6_catalog = schema_coordination.register_catalog(v6_catalog)?;
             startup.mark_pending_on_drop();
-            migration::resume_schema_migration_on_startup(
+            if let Err(error) = migration::resume_schema_migration_on_startup(
                 &root,
                 &mut manifest,
                 requested_shards,
-                &catalog,
-                &shard_layout,
+                &v6_catalog,
+                &v6_layout,
                 &schema_coordination,
                 active_migration,
-            )?;
+            ) {
+                if error.kind() == EngineErrorKind::DataCorruption {
+                    schema_coordination.mark_degraded();
+                }
+                return Err(error);
+            }
+        }
+
+        let loaded = match manifest::load_or_create_manifest_with_fresh_layout(
+            &mut manifest,
+            requested_shards,
+            fresh_layout_allowed,
+        ) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                if error.kind() == EngineErrorKind::DataCorruption {
+                    schema_coordination.mark_degraded();
+                }
+                return Err(error);
+            }
+        };
+        let (catalog, shard_layout, active_migration, mut integrity) =
+            loaded.into_parts_with_migration();
+        let catalog = schema_coordination.register_catalog(catalog)?;
+        schema_coordination.publish_schema_digests(
+            integrity.committed_schema_digest(),
+            integrity.target_schema_digest(),
+        )?;
+
+        if integrity.state() == manifest::DatabaseIntegrityState::Degraded {
+            schema_coordination.mark_degraded();
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "database is persistently degraded and requires a complete known-good restore",
+            ));
+        }
+        configure_journal_mode(&manifest)?;
+
+        if let Some(active_migration) = active_migration {
+            startup.mark_pending_on_drop();
+            let recovery = (|| {
+                validate_schema_migration_checksum_prefix(
+                    &root.join("shards"),
+                    requested_shards,
+                    &shard_layout,
+                    &active_migration,
+                    integrity,
+                )?;
+                migration::resume_schema_migration_on_startup(
+                    &root,
+                    &mut manifest,
+                    requested_shards,
+                    &catalog,
+                    &shard_layout,
+                    &schema_coordination,
+                    active_migration,
+                )
+            })();
+            if let Err(error) = recovery {
+                if error.kind() == EngineErrorKind::DataCorruption {
+                    schema_coordination.mark_degraded();
+                    let _ = manifest::mark_degraded(&mut manifest, requested_shards, &shard_layout);
+                }
+                return Err(error);
+            }
+            integrity = manifest::current_integrity(&manifest, requested_shards)?;
         }
         let schema_generation = catalog.logical().schema_generation();
 
-        let ready_layout = manifest::reconcile_shard_layout(
+        let ready_layout = match manifest::reconcile_shard_layout(
             &mut manifest,
             requested_shards,
             &shard_layout,
@@ -255,7 +446,16 @@ impl Storage {
                     locked_layout,
                 )
             },
-        )?;
+        ) {
+            Ok(layout) => layout,
+            Err(error) => {
+                if error.kind() == EngineErrorKind::DataCorruption {
+                    schema_coordination.mark_degraded();
+                    let _ = manifest::mark_degraded(&mut manifest, requested_shards, &shard_layout);
+                }
+                return Err(error);
+            }
+        };
 
         let storage = Self {
             root,
@@ -263,9 +463,43 @@ impl Storage {
             shard_layout: ready_layout,
             schema_coordination,
         };
-        for shard in 0..storage.shard_count() {
-            storage.open_shard(shard)?;
-        }
+        let verification = storage.verify_current_schema_consensus(integrity);
+        let observed_digest = match verification {
+            Ok(digest) => digest,
+            Err(error) => {
+                if error.kind() == EngineErrorKind::DataCorruption {
+                    storage.mark_schema_degraded();
+                    let _ = manifest::mark_degraded(
+                        &mut manifest,
+                        requested_shards,
+                        &storage.shard_layout,
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let sealed = match manifest::seal_verified_schema(
+            &mut manifest,
+            requested_shards,
+            observed_digest,
+        ) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                if error.kind() == EngineErrorKind::DataCorruption {
+                    storage.mark_schema_degraded();
+                    let _ = manifest::mark_degraded(
+                        &mut manifest,
+                        requested_shards,
+                        &storage.shard_layout,
+                    );
+                }
+                return Err(error);
+            }
+        };
+        storage.schema_coordination.publish_schema_digests(
+            sealed.committed_schema_digest(),
+            sealed.target_schema_digest(),
+        )?;
         storage
             .schema_coordination
             .reconcile_validated_catalog_generation(&storage.catalog)?;
@@ -295,6 +529,41 @@ impl Storage {
 
     pub(crate) fn begin_schema_migration(&self) -> EngineResult<SchemaMigrationGuard> {
         self.schema_coordination.gate.begin_migration()
+    }
+
+    pub(crate) fn mark_schema_degraded(&self) {
+        self.schema_coordination.mark_degraded();
+    }
+
+    /// Fail closed immediately and make one zero-busy-wait best-effort attempt
+    /// to persist terminal `Degraded` state in an already-trusted manifest.
+    pub(crate) fn record_schema_degraded(&self) {
+        self.mark_schema_degraded();
+        if let Ok(mut manifest_connection) =
+            open_existing_manifest(&self.root.join("manifest.sqlite"))
+        {
+            let configured = manifest_connection
+                .busy_timeout(std::time::Duration::ZERO)
+                .map_err(sqlite_error::storage)
+                .and_then(|_| configure_manifest_connection_after_busy_setup(&manifest_connection));
+            if configured.is_ok() {
+                let _ = manifest::mark_degraded(
+                    &mut manifest_connection,
+                    self.catalog.routing().shard_count(),
+                    &self.shard_layout,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn fail_closed_on_corruption<T>(&self, result: EngineResult<T>) -> EngineResult<T> {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+        {
+            self.record_schema_degraded();
+        }
+        result
     }
 
     #[cfg(test)]
@@ -335,16 +604,67 @@ impl Storage {
     }
 
     pub(crate) fn open_shard(&self, shard: u16) -> EngineResult<Connection> {
-        self.ensure_shard_in_range(shard)?;
-        let path = self.shard_path(shard);
-        let connection = shard::open_existing(
-            &path,
-            shard,
-            self.catalog.logical().schema_generation(),
-            &self.shard_layout,
-        )?;
-        attach_storage_authorizer(&connection)?;
-        Ok(connection)
+        let result = (|| {
+            self.ensure_shard_in_range(shard)?;
+            let path = self.shard_path(shard);
+            let connection = shard::open_existing(
+                &path,
+                shard,
+                self.catalog.logical().schema_generation(),
+                &self.shard_layout,
+            )?;
+            let expected_digest = self.schema_coordination.committed_schema_digest()?;
+            shard::verify_schema_digest(
+                &connection,
+                self.catalog.logical().schema_generation(),
+                &expected_digest,
+            )?;
+            attach_storage_authorizer(&connection)?;
+            Ok(connection)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn verify_current_schema_consensus(
+        &self,
+        integrity: manifest::ManifestIntegrity,
+    ) -> EngineResult<[u8; 32]> {
+        if matches!(
+            integrity.state(),
+            manifest::DatabaseIntegrityState::Migrating
+        ) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "database remained in migrating state after startup recovery",
+            ));
+        }
+        let generation = self.catalog.logical().schema_generation();
+        let trusted = integrity.committed_schema_digest();
+        let mut consensus = None;
+        for shard_id in 0..self.shard_count() {
+            let path = self.shard_path(shard_id);
+            let connection = shard::open_existing(&path, shard_id, generation, &self.shard_layout)?;
+            let observed = shard::calculate_schema_digest(&connection, generation)?;
+            if trusted.is_some_and(|expected| expected != observed) {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    "a shard application schema does not match the trusted checksum",
+                ));
+            }
+            if consensus.is_some_and(|expected| expected != observed) {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    "shard application schemas do not have one consistent fingerprint",
+                ));
+            }
+            consensus = Some(observed);
+        }
+        consensus.ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "schema verification requires at least one configured shard",
+            )
+        })
     }
 
     fn open_unconfigured_shard(&self, shard: u16) -> EngineResult<Connection> {
@@ -353,14 +673,23 @@ impl Storage {
     }
 
     fn validate_unconfigured_shard(&self, connection: &Connection, shard: u16) -> EngineResult<()> {
-        self.ensure_shard_in_range(shard)?;
-        shard::validate_open_connection(
-            connection,
-            &self.shard_path(shard),
-            shard,
-            self.catalog.logical().schema_generation(),
-            &self.shard_layout,
-        )
+        let result = (|| {
+            self.ensure_shard_in_range(shard)?;
+            shard::validate_open_connection(
+                connection,
+                &self.shard_path(shard),
+                shard,
+                self.catalog.logical().schema_generation(),
+                &self.shard_layout,
+            )?;
+            let expected_digest = self.schema_coordination.committed_schema_digest()?;
+            shard::verify_schema_digest(
+                connection,
+                self.catalog.logical().schema_generation(),
+                &expected_digest,
+            )
+        })();
+        self.fail_closed_on_corruption(result)
     }
 
     fn ensure_shard_in_range(&self, shard: u16) -> EngineResult<()> {
@@ -561,6 +890,23 @@ fn configure_manifest_connection(connection: &Connection) -> EngineResult<()> {
     connection
         .busy_timeout(CONNECTION_BUSY_TIMEOUT)
         .map_err(sqlite_error::storage)?;
+    configure_manifest_connection_after_busy_setup(connection)
+}
+
+fn configure_manifest_connection_after_busy_setup(connection: &Connection) -> EngineResult<()> {
+    connection
+        .pragma_update(None, "cell_size_check", "ON")
+        .map_err(sqlite_error::storage)?;
+    let cell_size_check = connection
+        .pragma_query_value(None, "cell_size_check", |row| row.get::<_, i64>(0))
+        .map_err(sqlite_error::storage)?;
+    if cell_size_check != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "SQLite did not enable manifest b-tree cell-size checking",
+        ));
+    }
+    validate_manifest_integrity_check(connection)?;
     connection
         .pragma_update(None, "synchronous", "FULL")
         .map_err(sqlite_error::storage)?;
@@ -568,6 +914,25 @@ fn configure_manifest_connection(connection: &Connection) -> EngineResult<()> {
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(sqlite_error::storage)?;
     Ok(())
+}
+
+fn validate_manifest_integrity_check(connection: &Connection) -> EngineResult<()> {
+    let mut statement = connection
+        .prepare("PRAGMA main.integrity_check(1)")
+        .map_err(sqlite_error::storage)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sqlite_error::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error::storage)?;
+    if rows == ["ok"] {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "SQLite manifest integrity verification failed",
+        ))
+    }
 }
 
 fn open_manifest_for_startup(path: &Path) -> EngineResult<Connection> {
@@ -694,6 +1059,24 @@ mod tests {
 
     fn shard_file(root: &Path, shard: u16) -> PathBuf {
         root.join("shards").join(format!("{shard:04}.sqlite"))
+    }
+
+    #[test]
+    fn manifest_configuration_enables_and_reads_back_cell_size_checks() {
+        let connection = Connection::open_in_memory().unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "cell_size_check", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        configure_manifest_connection(&connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "cell_size_check", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     fn manifest_layout_row(root: &Path) -> (Vec<u8>, i64, i64, i64) {
@@ -886,6 +1269,498 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_and_symlink_roots_share_sticky_degraded_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = Storage::open(temp.path(), 2).unwrap();
+        let alias_parent = tempfile::tempdir().unwrap();
+        let alias_path = alias_parent.path().join("database-alias");
+        std::os::unix::fs::symlink(temp.path(), &alias_path).unwrap();
+        let alias = Storage::open(&alias_path, 2).unwrap();
+
+        alias.mark_schema_degraded();
+
+        for storage in [&original, &alias] {
+            assert_eq!(
+                storage.schema_gate_snapshot(),
+                SchemaGateSnapshot {
+                    state: SchemaGateState::Degraded,
+                    active_operations: 0,
+                }
+            );
+            assert_eq!(
+                storage.enter_schema_operation().unwrap_err().kind(),
+                EngineErrorKind::DataCorruption
+            );
+            assert_eq!(
+                storage.begin_schema_migration().unwrap_err().kind(),
+                EngineErrorKind::DataCorruption
+            );
+        }
+
+        assert_eq!(
+            Storage::open(temp.path(), 2).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
+
+    #[test]
+    fn runtime_schema_drift_is_sticky_and_persisted_until_a_complete_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let shard_path = temp.path().join("shards/0000.sqlite");
+        Connection::open(&shard_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE unexpected_drift(id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let detected = storage.open_shard(0).unwrap_err();
+        assert_eq!(detected.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            storage.schema_gate_snapshot().state,
+            SchemaGateState::Degraded
+        );
+        assert_eq!(
+            storage.enter_schema_operation().unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+        assert_eq!(
+            Connection::open(temp.path().join("manifest.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT database_state FROM briskdb_integrity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            4
+        );
+
+        Connection::open(&shard_path)
+            .unwrap()
+            .execute_batch("DROP TABLE unexpected_drift")
+            .unwrap();
+        assert_eq!(
+            storage.enter_schema_operation().unwrap_err().kind(),
+            EngineErrorKind::DataCorruption,
+            "repair without releasing the live canonical-root coordination must stay degraded"
+        );
+        drop(storage);
+
+        let restart = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(restart.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            Connection::open(temp.path().join("manifest.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT database_state FROM briskdb_integrity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn terminal_degraded_startup_does_not_change_manifest_journal_mode_or_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let layout = storage.shard_layout;
+        drop(storage);
+        let manifest_path = temp.path().join("manifest.sqlite");
+        let mut manifest_connection = Connection::open(&manifest_path).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        manifest::mark_degraded(&mut manifest_connection, 2, &layout).unwrap();
+        manifest_connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            manifest_connection
+                .pragma_update_and_check(None, "journal_mode", "DELETE", |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .to_ascii_lowercase(),
+            "delete"
+        );
+        drop(manifest_connection);
+        let before = fs::read(&manifest_path).unwrap();
+
+        let error = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+        let observed_mode = Connection::open(&manifest_path)
+            .unwrap()
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .unwrap();
+        assert_eq!(observed_mode.to_ascii_lowercase(), "delete");
+        assert!(!temp.path().join("manifest.sqlite-wal").exists());
+    }
+
+    #[test]
+    fn failed_emergency_marker_write_still_leaves_live_admission_degraded() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let manifest_path = temp.path().join("manifest.sqlite");
+        let owner = Connection::open(&manifest_path).unwrap();
+        owner
+            .execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode = DELETE;
+                 BEGIN EXCLUSIVE;",
+            )
+            .unwrap();
+
+        let started = Instant::now();
+        storage.record_schema_degraded();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "best-effort degradation persistence must not inherit the normal busy timeout"
+        );
+        assert_eq!(
+            storage.enter_schema_operation().unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+        owner.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            Connection::open(manifest_path)
+                .unwrap()
+                .query_row(
+                    "SELECT database_state FROM briskdb_integrity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2,
+            "the blocked emergency write must not claim it committed Degraded"
+        );
+    }
+
+    #[test]
+    fn identical_offline_schema_drift_on_every_shard_is_not_rebaselined() {
+        let temp = tempfile::tempdir().unwrap();
+        drop(Storage::open(temp.path(), 2).unwrap());
+        for shard_id in 0..2 {
+            Connection::open(temp.path().join(format!("shards/{shard_id:04}.sqlite")))
+                .unwrap()
+                .execute_batch("CREATE TABLE coordinated_drift(id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+
+        let error = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            Connection::open(temp.path().join("manifest.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT database_state FROM briskdb_integrity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn a_manifest_root_mismatch_degrades_live_aliases_without_signing_the_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let manifest_path = temp.path().join("manifest.sqlite");
+        let manifest = Connection::open(&manifest_path).unwrap();
+        let trusted_root: Vec<u8> = manifest
+            .query_row(
+                "SELECT manifest_digest FROM briskdb_integrity WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        manifest
+            .execute(
+                "UPDATE briskdb_virtual_buckets
+                 SET physical_shard_id = 1 - physical_shard_id
+                 WHERE bucket_id = 0",
+                [],
+            )
+            .unwrap();
+        drop(manifest);
+
+        let error = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            storage.enter_schema_operation().unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+        let manifest = Connection::open(manifest_path).unwrap();
+        assert_eq!(
+            manifest
+                .query_row(
+                    "SELECT manifest_digest FROM briskdb_integrity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .unwrap(),
+            trusted_root
+        );
+        assert_eq!(
+            manifest
+                .query_row(
+                    "SELECT database_state FROM briskdb_integrity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2,
+            "an untrusted manifest must never write or reseal its own degraded marker"
+        );
+    }
+
+    #[test]
+    fn every_v6_active_prefix_finishes_before_v7_checksum_bootstrap() {
+        const SQL: &str = "CREATE TABLE recovered_v6(id INTEGER PRIMARY KEY)";
+        for (target_shards, acknowledged) in [(0_u16, 0_u16), (1, 0), (1, 1), (2, 1), (2, 2)] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let layout = storage.shard_layout;
+            drop(storage);
+
+            let manifest_path = temp.path().join("manifest.sqlite");
+            let mut manifest = Connection::open(&manifest_path).unwrap();
+            manifest
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     DROP TABLE briskdb_integrity;
+                     DROP TABLE briskdb_metadata;
+                     CREATE TABLE briskdb_metadata (
+                         requires_manifest_version INTEGER NOT NULL
+                             CHECK (requires_manifest_version >= 6)
+                     ) STRICT;
+                     INSERT INTO briskdb_metadata VALUES (6);
+                     PRAGMA user_version = 6;
+                     COMMIT;",
+                )
+                .unwrap();
+            let mut migration = manifest::begin_schema_migration(&mut manifest, 2, 0, SQL).unwrap();
+            for shard_id in 0..target_shards {
+                shard::apply_schema_migration(
+                    &temp.path().join(format!("shards/{shard_id:04}.sqlite")),
+                    shard_id,
+                    0,
+                    1,
+                    &layout,
+                    SQL,
+                )
+                .unwrap();
+            }
+            while migration.next_shard() < acknowledged {
+                let next = migration.next_shard() + 1;
+                migration =
+                    manifest::advance_schema_migration(&mut manifest, 2, &migration, next).unwrap();
+            }
+            drop(manifest);
+
+            let recovered = Storage::open(temp.path(), 2).unwrap();
+            assert_eq!(recovered.current_schema_generation(), 1);
+            for shard_id in 0..2 {
+                let connection = recovered.open_shard(shard_id).unwrap();
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM sqlite_schema
+                             WHERE type = 'table' AND name = 'recovered_v6'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    1
+                );
+            }
+            let manifest = Connection::open(manifest_path).unwrap();
+            assert_eq!(
+                manifest
+                    .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                i64::from(manifest::CURRENT_SCHEMA_VERSION)
+            );
+            assert_eq!(
+                manifest
+                    .query_row(
+                        "SELECT database_state,
+                                length(committed_schema_digest),
+                                target_schema_digest IS NULL
+                         FROM briskdb_integrity",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, bool>(2)?,
+                            ))
+                        },
+                    )
+                    .unwrap(),
+                (2, 32, true),
+                "shape targets={target_shards} acknowledged={acknowledged}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_backed_v7_verifying_interruption_reopens_to_ready_without_metadata_or_schema_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let catalog_before = storage.catalog.as_ref().clone();
+        let layout_before = storage.shard_layout;
+        let schema_generation = storage.current_schema_generation();
+        let schema_digests_before: [[u8; 32]; 2] = std::array::from_fn(|shard_id| {
+            let connection = storage
+                .open_shard(u16::try_from(shard_id).unwrap())
+                .unwrap();
+            shard::calculate_schema_digest(&connection, schema_generation).unwrap()
+        });
+        assert_eq!(schema_digests_before[0], schema_digests_before[1]);
+        drop(storage);
+
+        let manifest_path = temp.path().join("manifest.sqlite");
+        Connection::open(&manifest_path)
+            .unwrap()
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_integrity;
+                 DROP TABLE briskdb_metadata;
+                 CREATE TABLE briskdb_metadata (
+                     requires_manifest_version INTEGER NOT NULL
+                         CHECK (requires_manifest_version >= 6)
+                 ) STRICT;
+                 INSERT INTO briskdb_metadata VALUES (6);
+                 PRAGMA user_version = 6;
+                 COMMIT;",
+            )
+            .unwrap();
+
+        let mut manifest_connection = Connection::open(&manifest_path).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        let verifying =
+            manifest::load_or_create_manifest_with_fresh_layout(&mut manifest_connection, 2, false)
+                .unwrap();
+        assert!(manifest_connection.is_autocommit());
+        let (verifying_catalog, verifying_layout, active_migration, verifying_integrity) =
+            verifying.into_parts_with_migration();
+        assert_eq!(
+            verifying_catalog, catalog_before,
+            "the committed v7 Verifying upgrade changed catalog or routing metadata"
+        );
+        assert_eq!(verifying_layout, layout_before);
+        assert!(active_migration.is_none());
+        assert_eq!(
+            verifying_integrity.state(),
+            manifest::DatabaseIntegrityState::Verifying
+        );
+        assert_eq!(verifying_integrity.committed_schema_digest(), None);
+        assert_eq!(verifying_integrity.target_schema_digest(), None);
+        assert_eq!(
+            manifest::current_integrity(&manifest_connection, 2)
+                .unwrap()
+                .state(),
+            manifest::DatabaseIntegrityState::Verifying,
+            "the file-backed v7 upgrade must be durably valid before restart verification"
+        );
+        drop(manifest_connection);
+
+        let reopened = Storage::open(temp.path(), 2).unwrap();
+        assert_eq!(
+            reopened.catalog.as_ref(),
+            &catalog_before,
+            "restart verification changed catalog or routing metadata"
+        );
+        assert_eq!(reopened.shard_layout, layout_before);
+        assert_eq!(reopened.current_schema_generation(), schema_generation);
+        let schema_digests_after: [[u8; 32]; 2] = std::array::from_fn(|shard_id| {
+            let connection = reopened
+                .open_shard(u16::try_from(shard_id).unwrap())
+                .unwrap();
+            shard::calculate_schema_digest(&connection, schema_generation).unwrap()
+        });
+        assert_eq!(
+            schema_digests_after, schema_digests_before,
+            "restart verification changed an application schema"
+        );
+
+        let manifest_connection = Connection::open(manifest_path).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        let ready = manifest::current_integrity(&manifest_connection, 2).unwrap();
+        assert_eq!(ready.state(), manifest::DatabaseIntegrityState::Ready);
+        assert_eq!(
+            ready.committed_schema_digest(),
+            Some(schema_digests_before[0])
+        );
+        assert_eq!(ready.target_schema_digest(), None);
+        assert_eq!(
+            manifest_connection
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn divergent_v6_bootstrap_persists_terminal_degraded_without_a_new_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        drop(Storage::open(temp.path(), 2).unwrap());
+
+        let manifest_path = temp.path().join("manifest.sqlite");
+        Connection::open(&manifest_path)
+            .unwrap()
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_integrity;
+                 DROP TABLE briskdb_metadata;
+                 CREATE TABLE briskdb_metadata (
+                     requires_manifest_version INTEGER NOT NULL
+                         CHECK (requires_manifest_version >= 6)
+                 ) STRICT;
+                 INSERT INTO briskdb_metadata VALUES (6);
+                 PRAGMA user_version = 6;
+                 COMMIT;",
+            )
+            .unwrap();
+        Connection::open(temp.path().join("shards/0000.sqlite"))
+            .unwrap()
+            .execute_batch("CREATE TABLE divergent_bootstrap(id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let first = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(first.kind(), EngineErrorKind::DataCorruption);
+        let mut manifest_connection = Connection::open(&manifest_path).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        let degraded = manifest::current_integrity(&manifest_connection, 2).unwrap();
+        assert_eq!(degraded.state(), manifest::DatabaseIntegrityState::Degraded);
+        assert_eq!(degraded.committed_schema_digest(), None);
+        drop(manifest_connection);
+
+        Connection::open(temp.path().join("shards/0001.sqlite"))
+            .unwrap()
+            .execute_batch("CREATE TABLE divergent_bootstrap(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let second = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(second.kind(), EngineErrorKind::DataCorruption);
+
+        manifest_connection = Connection::open(manifest_path).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        let still_degraded = manifest::current_integrity(&manifest_connection, 2).unwrap();
+        assert_eq!(
+            still_degraded.state(),
+            manifest::DatabaseIntegrityState::Degraded
+        );
+        assert_eq!(still_degraded.committed_schema_digest(), None);
     }
 
     #[cfg(unix)]
@@ -1319,7 +2194,8 @@ mod tests {
             assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
             assert_eq!(
                 error.to_string(),
-                format!("manifest shard count {invalid} is outside the supported range")
+                "SQLite manifest integrity verification failed",
+                "invalid shard count {invalid}"
             );
         }
     }

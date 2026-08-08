@@ -428,7 +428,12 @@ impl Engine {
         context: RequestContext,
     ) -> EngineResult<EngineStatus> {
         let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
         let result = async {
+            let _schema_operation = schema_operation;
             let _guard = operation.wait_pending(self.ready_session(session)).await?;
             operation.check_before_start()?;
             let result_limits = self.inner.options.result_limits();
@@ -658,6 +663,7 @@ impl Engine {
         let lease = operation.take_lease();
         let control = Arc::clone(&operation.control);
         let worker_control = Arc::clone(&control);
+        let storage = self.inner.database.storage.clone();
         let join = worker.spawn(move || {
             let _lease = lease;
             let _session = session;
@@ -669,6 +675,15 @@ impl Engine {
                     retire_if_broken(&mut connection, &result);
                     result
                 });
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                // Query execution can surface corruption outside the schema
+                // fingerprint's coverage. Persist terminal Degraded state so a
+                // restart cannot reopen admission without a complete restore.
+                storage.record_schema_degraded();
+            }
             worker_control.complete(result)
         });
         operation.wait_started(join).await
@@ -739,6 +754,37 @@ impl Engine {
                 schema_operation,
                 guard,
                 move |_, _| panic!("intentional blocking worker panic"),
+            )
+            .await;
+        operation.finish_started(result)
+    }
+
+    #[cfg(test)]
+    async fn data_corruption_worker_for_test(
+        &self,
+        session: &Session,
+        shard: u16,
+    ) -> EngineResult<()> {
+        let mut operation = self.operation(RequestContext::new())?;
+        let schema_operation = self.inner.database.storage.enter_schema_operation()?;
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let owner = ConnectionOwner::new(session.id().get());
+        let result = self
+            .run_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                schema_operation,
+                guard,
+                move |_, _| {
+                    Err(EngineError::new(
+                        EngineErrorKind::DataCorruption,
+                        "injected SQLite data corruption",
+                    ))
+                },
             )
             .await;
         operation.finish_started(result)
@@ -954,6 +1000,124 @@ mod tests {
         assert_eq!(status.connections_per_shard(), 4);
         assert_eq!(status.queue_capacity_per_shard(), 32);
         assert_eq!(session.state().await, SessionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn status_obeys_migrating_and_degraded_schema_admission_before_session_waits() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let session = Arc::new(engine.session());
+        let (holder_started_tx, holder_started_rx) = oneshot::channel();
+        let (holder_release_tx, holder_release_rx) = mpsc::channel();
+        let holder_engine = engine.clone();
+        let holder_session = Arc::clone(&session);
+        let holder = tokio::spawn(async move {
+            holder_engine
+                .hold_session_for_test(&holder_session, 0, holder_started_tx, holder_release_rx)
+                .await
+        });
+        timeout(Duration::from_secs(2), holder_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let migration = engine
+            .inner
+            .database
+            .storage
+            .begin_schema_migration()
+            .unwrap();
+        assert_eq!(
+            engine.inner.database.storage.schema_gate_snapshot(),
+            crate::storage::SchemaGateSnapshot {
+                state: crate::storage::SchemaGateState::Migrating,
+                active_operations: 1,
+            }
+        );
+        let busy = timeout(Duration::from_secs(2), engine.status(&session))
+            .await
+            .expect("schema admission should reject status before its busy session is awaited")
+            .unwrap_err();
+        assert_eq!(busy.kind(), EngineErrorKind::Busy);
+        assert!(busy.is_retryable());
+        assert_eq!(engine.active_operations_for_test(), 1);
+
+        drop(migration);
+        holder_release_tx.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        assert_eq!(engine.status(&session).await.unwrap().shard_count(), 2);
+
+        engine.inner.database.storage.mark_schema_degraded();
+        let corruption = engine.status(&session).await.unwrap_err();
+        assert_eq!(corruption.kind(), EngineErrorKind::DataCorruption);
+        assert!(!corruption.is_retryable());
+        assert_eq!(session.state().await, SessionState::Ready);
+        assert_eq!(engine.active_operations_for_test(), 0);
+        assert_eq!(
+            engine.inner.database.storage.schema_gate_snapshot(),
+            crate::storage::SchemaGateSnapshot {
+                state: crate::storage::SchemaGateState::Degraded,
+                active_operations: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_data_corruption_persists_sticky_fail_closed_admission() {
+        let (temp, engine) = engine_with_options(2, 1, 1);
+        let session = engine.session();
+        session.set_routing_key("corrupt-worker").await.unwrap();
+
+        let detected = engine
+            .data_corruption_worker_for_test(&session, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(detected.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(detected.to_string(), "injected SQLite data corruption");
+        assert_eq!(engine.active_operations_for_test(), 0);
+        assert_eq!(
+            engine.inner.database.storage.schema_gate_snapshot(),
+            crate::storage::SchemaGateSnapshot {
+                state: crate::storage::SchemaGateState::Degraded,
+                active_operations: 0,
+            }
+        );
+
+        for error in [
+            engine.status(&session).await.unwrap_err(),
+            engine
+                .execute(
+                    &session,
+                    Statement::new("CREATE TABLE denied(id INTEGER)", vec![]),
+                )
+                .await
+                .unwrap_err(),
+            engine
+                .broadcast(
+                    &session,
+                    "CREATE TABLE denied_everywhere(id INTEGER)".into(),
+                )
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+            assert!(!error.is_retryable());
+        }
+
+        let manifest = rusqlite::Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+        let state: i64 = manifest
+            .query_row(
+                "SELECT database_state FROM briskdb_integrity WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, 4, "runtime corruption must persist Degraded");
+
+        drop(manifest);
+        drop(session);
+        drop(engine);
+        let restart = Database::open(temp.path(), 2).unwrap_err();
+        assert_eq!(restart.kind(), EngineErrorKind::DataCorruption);
     }
 
     #[tokio::test]

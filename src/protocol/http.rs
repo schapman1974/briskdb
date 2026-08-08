@@ -397,6 +397,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detected_schema_drift_makes_health_fail_closed_with_a_redacted_problem() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(temp.path(), 2).unwrap());
+        let application = engine_router(database);
+        for shard_id in 0..2 {
+            rusqlite::Connection::open(temp.path().join(format!("shards/{shard_id:04}.sqlite")))
+                .unwrap()
+                .execute_batch("CREATE TABLE secret_drift(value TEXT)")
+                .unwrap();
+        }
+
+        let expected = json!({
+            "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#data-corruption",
+            "title": "Data corruption",
+            "status": 500,
+            "detail": "Stored data failed an integrity check.",
+            "code": "data_corruption"
+        });
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/query",
+                Some(json!({
+                    "shard_key": "detect-drift",
+                    "sql": "SELECT 1",
+                    "params": []
+                })),
+            )
+            .await,
+            (StatusCode::INTERNAL_SERVER_ERROR, expected.clone())
+        );
+        let (status, body) = request_json(&application, Method::GET, "/health", None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, expected);
+        let serialized = body.to_string();
+        assert!(!serialized.contains("secret_drift"));
+        assert!(!serialized.contains(temp.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
     async fn legacy_database_router_is_a_behavior_preserving_engine_wrapper() {
         let temp = tempfile::tempdir().unwrap();
         let application = router(Arc::new(Database::open(temp.path(), 4).unwrap()));

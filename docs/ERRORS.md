@@ -70,6 +70,15 @@ returns an engine. `Cancelled` and `DeadlineExceeded` themselves remain
 non-retryable classifications even though an operator may deliberately submit
 the exact migration again.
 
+If an integrity check fails, the gate for every in-process handle sharing that
+canonical root becomes sticky `Degraded`. Ordinary execute/query work, status,
+and schema migration then return non-retryable `DataCorruption` (HTTP 500); an
+outstanding migration guard cannot restore admission when it drops. There is no
+public repair or rebaseline operation, and startup never clears a persisted
+`Degraded` marker from the same manifest. Service can return only after an
+operator restores the complete manifest-and-shard set from one consistent,
+known-good copy.
+
 An explicit cancellation is `Cancelled`; expiration of an absolute request
 deadline is `DeadlineExceeded`, even though PostgreSQL represents both with
 SQLSTATE `57014`. MySQL distinguishes them with errors 1317 and 3024. If a
@@ -141,6 +150,19 @@ than the coordinator can safely interpret is `FailedPrecondition`. Lock
 contention during preflight, apply, progress, or startup recovery remains
 retryable `Busy`.
 
+Manifest v7 adds the same classification to integrity state. An unsupported
+manifest-root or shard-schema digest encoding version is
+`FailedPrecondition`; this binary will not reinterpret or rewrite it. A
+recognized encoding with a semantic-root mismatch, malformed checksum blob,
+invalid durable-state/checksum/journal combination, failed SQLite manifest or
+shard-metadata integrity check, inconsistent shard-schema consensus, or source
+or target fingerprint in the wrong migration-prefix position is
+`DataCorruption`. BriskDB persists `Degraded` only when it can first validate
+the existing manifest root, and that emergency write is best-effort because
+lock, disk, or process failure can prevent it. The in-process gate remains
+sticky even if persistence fails; a restart is never a supported repair. An
+altered manifest payload is never blessed while handling its mismatch.
+
 For submitted migration input, an empty batch, a batch over 65,536 UTF-8 bytes,
 or a NUL byte is `InvalidArgument`. SQLite syntax or statement-shape failures
 retain the normal SQL classification, and attempts to reach the reserved
@@ -163,9 +185,10 @@ BriskDB-owned metadata or mutation of a storage-control PRAGMA is
 serialized directly by an adapter.
 
 The earlier taxonomy change affected reporting only. Manifest v5 later added
-identity metadata to shard files; manifest v6 adds retained, crash-resumable
-application-schema history. Both preserve legacy application tables, rows,
-routing, SQL results, and wire configuration during format upgrade.
+identity metadata to shard files, manifest v6 added retained crash-resumable
+application-schema history, and manifest v7 added semantic and schema
+fingerprints plus explicit integrity state. Their format upgrades preserve
+legacy application tables, rows, routing, SQL results, and wire configuration.
 
 This is a pre-1.0 Rust API migration: public `Database` operations now return
 `EngineResult<T>` instead of `anyhow::Result<T>`. The `?` operator still

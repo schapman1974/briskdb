@@ -192,7 +192,7 @@ existing tests pass through the shared engine.
   application ID/user version, and matches the cataloged schema generation.
 - [x] Implement a crash-resumable schema migration journal instead of the
   previous unjournaled broadcast behavior.
-- [ ] Add checksums/integrity checks and explicit states for degraded or
+- [x] Add checksums/integrity checks and explicit states for degraded or
   partially migrated databases.
 
 Exit criterion: restarts and upgrades cannot silently change routing, and an

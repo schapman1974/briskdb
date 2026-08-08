@@ -86,13 +86,15 @@ Startup and runtime migration opens disable symbolic-link following; a runtime
 open will not create a missing manifest and rechecks the opened layout identity
 before journal mutation.
 
-Manifest v6 retains each migration's exact SQL text for idempotency and startup
-recovery. Treat the data directory accordingly and do not include credentials,
-tokens, or other sensitive literals in migration SQL.
+Manifest v7 retains the v6 journal's exact migration SQL for idempotency and
+startup recovery. Treat the data directory accordingly and do not include
+credentials, tokens, or other sensitive literals in migration SQL.
 
 Manifest and shard application IDs plus the random 16-byte layout ID guard
-against accidental wrong-file placement. They are not authentication, checksums,
-or protection from a process that can write the data directory. Targeted
+against accidental wrong-file placement. They are not authentication or
+protection from a process that can write the data directory. The v7 semantic
+and schema checksums are likewise unkeyed corruption detectors, not
+authentication, and do not checksum application row values. Targeted
 subprocess-abort tests cover schema-journal persistence boundaries, but
 arbitrary process-kill timing, power-loss, and filesystem-fault certification
 remain later hardening work.

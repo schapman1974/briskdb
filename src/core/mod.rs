@@ -92,7 +92,9 @@ impl Database {
         let _schema_operation = self.storage.enter_schema_operation()?;
         let shard = self.shard_for_key(shard_key.as_bytes());
         let connection = self.storage.open_shard(shard)?;
-        let value = sql::execute(&connection, statement, params)?;
+        let value =
+            self.storage
+                .fail_closed_on_corruption(sql::execute(&connection, statement, params))?;
         Ok(Routed { shard, value })
     }
 
@@ -105,7 +107,9 @@ impl Database {
         let _schema_operation = self.storage.enter_schema_operation()?;
         let shard = self.shard_for_key(shard_key.as_bytes());
         let connection = self.storage.open_shard(shard)?;
-        let value = sql::query(&connection, statement, params)?;
+        let value =
+            self.storage
+                .fail_closed_on_corruption(sql::query(&connection, statement, params))?;
         Ok(Routed { shard, value })
     }
 
@@ -140,7 +144,53 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::OpenOptions,
+        io::{Seek, SeekFrom, Write},
+        sync::{Arc, mpsc},
+        thread,
+        time::Duration,
+    };
+
     use super::*;
+
+    fn routing_key_for_shard(database: &Database, expected: u16) -> String {
+        (0_u64..)
+            .map(|value| format!("sync-corruption-{value}"))
+            .find(|key| database.shard_for_key(key.as_bytes()) == expected)
+            .expect("the finite shard layout has a routing key")
+    }
+
+    fn corrupt_application_table_root(root: &Path, shard: u16, table: &str) {
+        let path = root.join(format!("shards/{shard:04}.sqlite"));
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let page_size = u64::try_from(
+            connection
+                .pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))
+                .unwrap(),
+        )
+        .unwrap();
+        let root_page = u64::try_from(
+            connection
+                .query_row(
+                    "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        drop(connection);
+
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start((root_page - 1) * page_size))
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+        file.sync_all().unwrap();
+    }
 
     #[test]
     fn routing_is_stable() {
@@ -328,6 +378,167 @@ mod tests {
         assert_eq!(
             Database::open(temp.path(), 1).unwrap_err().kind(),
             EngineErrorKind::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn synchronous_query_and_execute_corruption_persist_terminal_degraded_state() {
+        for operation in ["query", "execute"] {
+            let temp = tempfile::tempdir().unwrap();
+            let database = Database::open(temp.path(), 2).unwrap();
+            database
+                .broadcast(
+                    "CREATE TABLE corrupt_application_page (
+                         id INTEGER PRIMARY KEY,
+                         value TEXT NOT NULL
+                     )",
+                )
+                .unwrap();
+            let routing_key = routing_key_for_shard(&database, 0);
+            database
+                .execute(
+                    &routing_key,
+                    "INSERT INTO corrupt_application_page(value) VALUES (?1)",
+                    &[Value::from("before-corruption")],
+                )
+                .unwrap();
+            corrupt_application_table_root(temp.path(), 0, "corrupt_application_page");
+
+            let error = match operation {
+                "query" => database
+                    .query(
+                        &routing_key,
+                        "SELECT value FROM corrupt_application_page",
+                        &[],
+                    )
+                    .map(|_| ()),
+                "execute" => database
+                    .execute(
+                        &routing_key,
+                        "INSERT INTO corrupt_application_page(value) VALUES (?1)",
+                        &[Value::from("after-corruption")],
+                    )
+                    .map(|_| ()),
+                _ => unreachable!(),
+            }
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::DataCorruption, "{operation}");
+            assert_eq!(
+                database
+                    .query(&routing_key, "SELECT 1", &[])
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::DataCorruption,
+                "{operation} must leave shared admission fail-closed"
+            );
+
+            let manifest = rusqlite::Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+            assert_eq!(
+                manifest
+                    .query_row(
+                        "SELECT database_state FROM briskdb_integrity WHERE singleton = 1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                4,
+                "{operation} must persist Degraded"
+            );
+            drop(manifest);
+            drop(database);
+            assert_eq!(
+                Database::open(temp.path(), 2).unwrap_err().kind(),
+                EngineErrorKind::DataCorruption,
+                "{operation} restart must remain fail-closed"
+            );
+        }
+    }
+
+    #[test]
+    fn public_broadcast_corruption_preserves_checksummed_journal_in_terminal_degraded() {
+        const SQL: &str = "CREATE TABLE durable_migration(id INTEGER PRIMARY KEY)";
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(temp.path(), 2).unwrap());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        database
+            .storage
+            .install_schema_migration_test_block(
+                crate::storage::SchemaMigrationCoordinatorPoint::JournalCommitted,
+                started_tx,
+                release_rx,
+            )
+            .unwrap();
+
+        let worker_database = Arc::clone(&database);
+        let worker = thread::spawn(move || worker_database.broadcast(SQL));
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("migration should commit its journal before shard application");
+
+        let manifest_path = temp.path().join("manifest.sqlite");
+        let manifest = rusqlite::Connection::open(&manifest_path).unwrap();
+        let trusted_digests: (Vec<u8>, Vec<u8>) = manifest
+            .query_row(
+                "SELECT committed_schema_digest, target_schema_digest
+                 FROM briskdb_integrity WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(trusted_digests.0.len(), 32);
+        assert_eq!(trusted_digests.1.len(), 32);
+        drop(manifest);
+
+        rusqlite::Connection::open(temp.path().join("shards/0000.sqlite"))
+            .unwrap()
+            .execute_batch("CREATE TABLE injected_migration_drift(value TEXT)")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+
+        let manifest = rusqlite::Connection::open(&manifest_path).unwrap();
+        let persisted: (i64, Vec<u8>, Vec<u8>, i64, i64) = manifest
+            .query_row(
+                "SELECT i.database_state,
+                        i.committed_schema_digest,
+                        i.target_schema_digest,
+                        m.migration_state,
+                        m.next_shard
+                 FROM briskdb_integrity AS i
+                 JOIN briskdb_schema_migrations AS m
+                   ON m.migration_state = 1
+                 WHERE i.singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(persisted.0, 4);
+        assert_eq!((persisted.1, persisted.2), trusted_digests);
+        assert_eq!((persisted.3, persisted.4), (1, 0));
+        drop(manifest);
+
+        assert_eq!(
+            database
+                .query("blocked", "SELECT 1", &[])
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+        drop(database);
+        assert_eq!(
+            Database::open(temp.path(), 2).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
         );
     }
 

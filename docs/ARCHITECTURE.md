@@ -119,6 +119,18 @@ history is contiguous and retained permanently; at most one active row may
 target the generation immediately after the committed catalog. Exact SQL is
 therefore operational metadata that may reveal sensitive literals.
 
+Version 7 adds the `briskdb_integrity` singleton. It stores a canonical BLAKE3
+semantic root over authoritative manifest values, a generation-bound BLAKE3
+fingerprint for the committed application schema, an optional migration-target
+fingerprint, and one of four durable states: `Verifying`, `Ready`, `Migrating`,
+or `Degraded`. Manifest mutations reseal the semantic root inside their own
+transaction. Startup establishes the first fingerprint or requires the existing
+trusted value, and every later shard connection verifies it. A migration stores
+source and target fingerprints before its first shard commit and verifies the
+exact journal prefix during recovery. The full input encodings and state
+invariants are frozen in the
+[manifest storage format](STORAGE_FORMAT.md).
+
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4
 migration remains manifest-atomic. The v4-to-v5 step first validates the v4
@@ -132,8 +144,10 @@ safe.
 
 The v5-to-v6 step is manifest-only: it preserves layout state, routing, logical
 metadata, and data while rebuilding the schema-generation constraint, creating
-an empty journal, and fencing v5 readers. There is no automatic downgrade; an
-older binary requires a pre-v6 backup.
+an empty journal, and fencing v5 readers. The v6-to-v7 step is also
+manifest-only and begins in `Verifying`; it cannot manufacture a historical
+checksum that v6 never stored. There is no automatic downgrade; an older binary
+requires a backup from before the newer format.
 
 Startup first canonicalizes the data-directory path and joins the process-wide
 root coordination keyed by that path. It acquires the shared schema gate before
@@ -141,13 +155,15 @@ loading the manifest, so independent `Storage`, `Database`, and `Engine` handles
 in one process serialize startup and migration against ordinary admission and
 share catalog-generation publication.
 
-Manifest loading acquires `BEGIN IMMEDIATE` before making a format migration or
-layout-state decision. Numbered manifest-only steps rewrite schema/data, stamp
-and read back their target identity/version, validate the destination, and
-commit in their own transaction. If the resulting v6 manifest contains an
-`Applying` schema migration, startup validates and resumes it immediately. A
-journal can exist only with a durable `Ready` layout, and recovery publishes its
-target generation before ordinary layout reconciliation or final shard opens.
+Each manifest connection enables and reads back SQLite cell-size checks and
+requires a full manifest integrity check before parsing control-plane state.
+Manifest loading then acquires `BEGIN IMMEDIATE` before making a format
+migration or layout-state decision. Numbered manifest-only steps rewrite
+schema/data, stamp and read back their target identity/version, validate the
+destination, and commit in their own transaction. An `Applying` v6 migration is
+finished under v6 rules before v7 establishes checksum authority. An active v7
+migration is resumed only after every shard matches the preserved source or
+target fingerprint for its exact journal-prefix position.
 
 Layout reconciliation then acquires a new immediate manifest transaction,
 re-reads and validates the layout state under that write lock, and holds the
@@ -157,7 +173,11 @@ from a stale `Creating` observation. Only a locked, durable `Creating` state
 permits missing canonical shard files to be created and WAL to be enabled. The
 final strict shard opens and catalog reconciliation complete before the startup
 guard publishes `Ready`; ordinary work is never served against a persisted
-mixed-generation prefix.
+mixed-generation prefix. A first v7 open treats the consensus across all strict
+generation-bound shard-schema fingerprints as its trust-on-first-upgrade
+baseline. Later opens require that existing trusted fingerprint. A durable
+`Degraded` state is terminal; recovery replaces the complete manifest and
+shard set from one known-good consistent copy rather than rebaselining it.
 
 `Adopting` recognizes only existing legacy shard files with exact zero
 application-ID/user-version headers and an existing WAL mode. It writes current
@@ -166,8 +186,10 @@ runtime connection opens use read-write, no-create, no-follow SQLite flags and
 require the exact path, layout ID, shard ID, application ID, metadata encoding,
 schema generation, and WAL mode. Missing, extra canonical, foreign, non-WAL,
 and wrong-generation files fail closed, as do swapped files and files cloned
-into a wrong slot or layout. WAL and shared-memory sidecars are transient and
-are not required layout members.
+into a wrong slot or layout. Every shard open also enables cell-size checks,
+checks the BriskDB metadata table with SQLite's table-scoped integrity check,
+and verifies the persistent application-schema fingerprint. WAL and
+shared-memory sidecars are transient and are not required layout members.
 
 This is an internal storage-open concern, is unreachable from client SQL, and
 is atomic only within `manifest.sqlite`. Validation returns routing and logical
@@ -180,8 +202,10 @@ The logical catalog remains advisory: there is no catalog mutation API,
 planner integration, or schema enforcement yet. Fresh manifests and upgrades
 originating before v4 contain no table rows; a v4-to-v5 upgrade retains every
 validated v4 logical-catalog row. Schema migration does not inspect, infer, or
-mutate `briskdb_tables`, nor does it prove physical schema equivalence. Existing
-tables remain reachable through the explicit-key execute/query surfaces. Core
+mutate `briskdb_tables`; instead, v7 independently requires the exact
+`sqlite_schema` fingerprint to agree across shards without claiming the
+advisory catalog describes it. Existing tables remain reachable through the
+explicit-key execute/query surfaces. Core
 routing still hashes the exact caller-provided key bytes, derives a versioned
 virtual bucket, and reads the final physical shard from the snapshot without
 querying SQLite. The generation-1 ranges reproduce prior modulo placement for
@@ -205,8 +229,12 @@ objects, and reserved-state access. Because SQLite does not reveal an
 compares the reserved schema before and after the batch. The exact format,
 numeric codes, downgrade policy, recovery cases, and tests are documented in
 [manifest storage format](STORAGE_FORMAT.md).
-Schema checksums and explicit degraded states remain issue #18; richer
-migration administration and status surfaces remain issue #53.
+Integrity failure marks the canonical-root admission gate sticky `Degraded`;
+ordinary operations, status calls, and migrations then fail with
+`DataCorruption`, and a trusted manifest records that terminal state when
+possible. BriskDB exposes no repair, rebaseline, or detailed integrity status
+API here; richer migration administration and status surfaces remain issue
+#53.
 
 ## Session and asynchronous engine boundary
 

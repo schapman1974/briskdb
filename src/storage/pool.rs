@@ -1069,18 +1069,27 @@ mod tests {
         target_generation: u64,
     ) {
         let target_user_version = i64::try_from(target_generation).unwrap();
+        let mut target_digest = None;
         for shard in 0..pools.shards.len() {
             let path = temp.path().join(format!("shards/{shard:04}.sqlite"));
-            Connection::open(path)
-                .unwrap()
+            let connection = Connection::open(path).unwrap();
+            connection
                 .pragma_update(None, "user_version", target_user_version)
                 .unwrap();
+            let observed =
+                crate::storage::shard::calculate_schema_digest(&connection, target_generation)
+                    .unwrap();
+            assert!(target_digest.is_none_or(|expected| expected == observed));
+            target_digest = Some(observed);
         }
-        pools.shards[0]
-            .inner
-            .storage
+        let storage = &pools.shards[0].inner.storage;
+        storage
             .logical_catalog()
             .publish_schema_generation(source_generation, target_generation)
+            .unwrap();
+        storage
+            .schema_coordination
+            .publish_schema_digests(target_digest, None)
             .unwrap();
     }
 

@@ -143,8 +143,9 @@ exact SQL remain in the manifest, so callers must not include credentials or
 other sensitive literals. A byte-identical retry of completed SQL is
 idempotent and does not advance the schema generation again.
 The migration does not infer or update advisory `briskdb_tables` rows. Richer
-migration/history APIs remain issue #53, and schema-equivalence checks,
-checksums, and explicit degraded states remain issue #18.
+migration/history APIs remain issue #53. Manifest v7 independently requires a
+generation-bound persistent-schema fingerprint to agree across every shard; it
+does not claim the advisory catalog describes that schema.
 
 The schema gate admits no new routed work after migration begins and waits for
 previously admitted operations to drain. During active preflight or apply,
@@ -370,9 +371,9 @@ underlying execution semantics.
   prefix selects one of 4,096 virtual buckets through the versioned
   compatibility algorithm.
 - The final physical shard is read from the validated, generation-stamped
-  bucket map retained in manifest version 6. Routing generation 1 preserves
+  bucket map retained in manifest version 7. Routing generation 1 preserves
   the earlier modulo placement for every supported shard count.
-- Manifest version 6 retains the read-only logical catalog introduced in v4,
+- Manifest version 7 retains the read-only logical catalog introduced in v4,
   with a journaled schema generation from 0 through 2,147,483,647 and default
   database ID 1 named `default`. Its optional table rows can describe sharded,
   global, or catalog placement and a sharded table's `Int64`, text, or binary
@@ -391,7 +392,9 @@ underlying execution semantics.
 - Unique constraints and transactions are local to one SQLite shard.
 - Schema migration preflights every shard, then commits an ascending prefix
   under a retained journal. Each shard is atomic; the shard set is not one
-  transaction, and startup resumes a partial prefix before serving work.
+  transaction. The manifest preserves committed-source and target schema
+  fingerprints, and startup resumes only an exact checksummed prefix before
+  serving work.
 
 ### Planned stable contract
 
@@ -429,7 +432,9 @@ identity metadata. Version 6 adds the application-schema journal. A migration
 batch and generation are atomic within each shard, and final journal state plus
 catalog generation are atomic within the manifest, but no transaction spans
 those files. Ascending-prefix validation and replay provide recovery rather
-than cross-file atomicity.
+than cross-file atomicity. Version 7 adds the semantic manifest root, explicit
+integrity states, and generation-bound shard-schema fingerprints; journal,
+state, checksum, and catalog changes reseal atomically within the manifest.
 See the [manifest storage-format contract](STORAGE_FORMAT.md).
 
 Scatter reads will combine committed results from multiple SQLite files. They
