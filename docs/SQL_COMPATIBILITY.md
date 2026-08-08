@@ -16,10 +16,11 @@ document defines the SQL and behavioral contract separately from connectivity.
 - **Unsupported** means BriskDB rejects the behavior or makes no compatibility
   promise for it.
 
-The stable parser and protocol adapters will fail explicitly for unsupported
+The syntax parser is now available behind a BriskDB-owned boundary. Later
+subset validation and protocol adapters will fail explicitly for unsupported
 syntax and must not silently reinterpret a statement with materially different
-semantics. The current experimental HTTP interface is a raw SQLite pass-through
-and can still execute uncontracted SQLite syntax; that behavior is not a
+semantics. The current experimental HTTP interface is still a raw SQLite
+pass-through and can execute uncontracted SQLite syntax; that behavior is not a
 compatibility promise.
 
 ## Compatibility layers
@@ -40,8 +41,11 @@ than claiming to be a drop-in PostgreSQL or MySQL replacement.
 ## Current implementation
 
 Only the experimental HTTP interface is implemented today. There is no
-PostgreSQL or MySQL listener yet, and there is no SQL parser or dialect
-translation layer. HTTP requests send SQLite SQL directly to `rusqlite`.
+PostgreSQL or MySQL listener or dialect translation layer yet. A bounded syntax
+parser can produce an opaque AST for an explicitly selected SQLite,
+PostgreSQL, or MySQL dialect, but it does not validate the supported subset,
+plan, route, or execute a statement. HTTP requests still send SQLite SQL
+directly to `rusqlite`; they do not pass through the parser.
 
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
@@ -240,6 +244,29 @@ They do not make either wire-protocol listener available. See the complete
 
 ## SQL surface
 
+### Implemented syntax boundary
+
+BriskDB uses an exact post-0.62 upstream `sqlparser` snapshot behind its own
+dialect and parsed-batch types. The pinned snapshot contains corrected
+`parse_interval` recursion accounting plus other reviewed upstream changes
+after the `v0.62.0` tag. Callers select SQLite, PostgreSQL, or MySQL explicitly;
+generic parsing, dialect autodetection, and fallback parsing are not available.
+Exact SQL is retained because formatting an AST is not source preserving and
+formatted AST text is never sent to SQLite.
+
+Parsing establishes only that one dialect recognizes the syntax. It does not
+make a statement part of BriskDB's supported common subset or establish that
+its behavior matches SQLite. Inputs are bounded to 65,536 UTF-8 bytes, 256
+statements, and recursion depth 32. The parser can represent an ordered batch,
+but the current execution surfaces retain their existing endpoint-specific
+single-statement and migration rules; later classification will decide which
+multi-statement combinations are safe.
+
+The parser has no routing or storage access. Future shard inference and
+statement classification consume structural syntax, never regular-expression
+matches over raw or formatted SQL. See the [SQL parser decision
+record](SQL_PARSER.md) for the dependency, error, MSRV, and non-goal contract.
+
 ### Implemented pass-through surface
 
 The following operations work when expressed in syntax accepted by the bundled
@@ -282,9 +309,11 @@ The first driver-capable SQL subset will include:
 - `BEGIN`, `COMMIT`, and `ROLLBACK` for transactions pinned to one shard; and
 - protocol-neutral prepare, bind, describe, execute, and close operations.
 
-The parser and planner will classify statements before execution. Writes with
-no provable shard, writes with conflicting shard keys, unsafe multi-statement
-requests, and cross-shard transactions will be rejected before changing data.
+The implemented parser supplies structured syntax without deciding support or
+routing. Later subset validation and planning will classify statements before
+execution. Writes with no provable shard, writes with conflicting shard keys,
+unsafe multi-statement requests, and cross-shard transactions will be rejected
+before changing data.
 
 ## PostgreSQL differences
 

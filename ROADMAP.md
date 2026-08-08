@@ -200,7 +200,7 @@ interrupted schema migration can be diagnosed and resumed.
 
 ### 3. SQL frontend and query planner
 
-- [ ] Parse SQL into an AST using a maintained parser after a focused parser
+- [x] Parse SQL into an AST using a maintained parser after a focused parser
   spike; do not route by regular expression.
 - [ ] Define the first common SQL subset: `CREATE TABLE`, indexes, `SELECT`,
   `INSERT`, `UPDATE`, `DELETE`, `BEGIN`, `COMMIT`, and `ROLLBACK`.

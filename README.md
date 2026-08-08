@@ -14,6 +14,8 @@ boundaries and dependency direction.
 
 The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
 current SQLite pass-through API from planned PostgreSQL and MySQL compatibility.
+The [SQL parser decision record](docs/SQL_PARSER.md) defines the shared,
+dialect-explicit syntax boundary and its resource and dependency limits.
 The [error contract](docs/ERRORS.md) defines stable engine error kinds, safe
 HTTP problem details, and the mappings reserved for future PostgreSQL and MySQL
 adapters.
@@ -40,6 +42,8 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Finite per-query row/logical-byte budgets with no partial results
 - Explicit graceful drain, forced cancellation, and blocking handle cleanup
 - Protocol-neutral typed values, ordered columns, positional rows, and results
+- A bounded SQL AST parser for explicit SQLite, PostgreSQL, and MySQL dialects,
+  isolated from the current raw SQLite HTTP execution path
 - A transactionally versioned `manifest.sqlite` with durable 4,096-bucket
   routing plus logical-database and table metadata
 - Identity-bound, WAL-enabled SQLite shard files that are never silently

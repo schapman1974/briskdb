@@ -23,7 +23,7 @@ server ---------> protocol::http
 | --- | --- | --- |
 | `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, errors, and read-only logical catalog; stable key routing; bounded per-shard admission and connection pools; routed execute/query and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
-| `sql` | SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, filesystem layout, or protocol responses |
+| `sql` | Dialect-explicit SQL syntax parsing behind BriskDB-owned opaque types; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, filesystem layout, protocol responses, or independent support policy |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, listener binding, and tracked Axum HTTP/1 connection lifecycle | SQL parsing or storage implementation details |
@@ -80,6 +80,33 @@ request controls, and explicit shutdown lifecycle are now in place. The
 synchronous `Database` API remains available as a Rust compatibility surface;
 existing engine and server entry points retain their signatures and delegate to
 the controlled defaults.
+
+## SQL parser boundary
+
+The SQL module owns a single parser entry point with explicit SQLite,
+PostgreSQL, and MySQL dialect selection. It retains exact source text and wraps
+the selected parser's ordered AST without exposing dependency-owned AST types
+to protocols or the engine's public request model. There is no generic dialect,
+autodetection, or fallback parse. This makes a frontend's dialect choice
+deterministic and keeps the dependency replaceable.
+
+Parsing is syntax recognition, not support validation or planning. The parser
+has no session, parameter, catalog, storage, or routing access. The later common
+subset, normalization, and planner layers will consume structural syntax
+through BriskDB-owned interfaces; shard-key inference must not inspect raw or
+formatted SQL with regular expressions. Exact input remains authoritative
+because AST formatting is lossy and is never executed.
+
+Inputs are bounded to 65,536 UTF-8 bytes, 256 statements, and recursion depth
+32. The dependency's recursive-protection feature remains enabled. Parse and
+limit failures use protocol-neutral engine error kinds, whose diagnostics stay
+internal. The full dependency, error, testing, and non-goal contract is in the
+[SQL parser decision record](SQL_PARSER.md).
+
+The current HTTP execute/query and migration paths deliberately remain raw
+SQLite pass-through. Connecting this parser to execution would define
+common-subset and strict-mode behavior owned by later roadmap issues, so issue
+#19 changes no HTTP shape, SQL acceptance, routing, or storage behavior.
 
 ## Manifest storage boundary
 
