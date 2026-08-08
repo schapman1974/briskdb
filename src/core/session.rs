@@ -8,7 +8,7 @@ use std::{
 
 use tokio::sync::Mutex;
 
-use super::{EngineError, EngineErrorKind, EngineResult};
+use super::{EngineError, EngineErrorKind, EngineResult, PreparedState, PreparedStatementLimits};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -20,6 +20,11 @@ impl SessionId {
     /// Return the numeric session identifier.
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
     }
 }
 
@@ -43,10 +48,10 @@ pub enum SessionState {
     Closed,
 }
 
-#[derive(Debug)]
 pub(crate) struct SessionInner {
     state: SessionState,
     routing_key: Option<String>,
+    prepared: PreparedState,
 }
 
 impl SessionInner {
@@ -60,6 +65,25 @@ impl SessionInner {
 
     pub(crate) fn routing_key(&self) -> Option<&str> {
         self.routing_key.as_deref()
+    }
+
+    pub(crate) const fn prepared(&self) -> &PreparedState {
+        &self.prepared
+    }
+
+    pub(crate) fn prepared_mut(&mut self) -> &mut PreparedState {
+        &mut self.prepared
+    }
+}
+
+impl fmt::Debug for SessionInner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionInner")
+            .field("state", &self.state)
+            .field("has_routing_key", &self.routing_key.is_some())
+            .field("prepared", &self.prepared)
+            .finish()
     }
 }
 
@@ -75,13 +99,15 @@ pub struct Session {
 }
 
 impl Session {
-    pub(crate) fn new(owner: u64) -> Self {
+    pub(crate) fn new(owner: u64, prepared_limits: PreparedStatementLimits) -> Self {
+        let id = SessionId(NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed));
         Self {
-            id: SessionId(NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)),
+            id,
             owner,
             inner: Arc::new(Mutex::new(SessionInner {
                 state: SessionState::Ready,
                 routing_key: None,
+                prepared: PreparedState::new(id, prepared_limits),
             })),
         }
     }
@@ -120,11 +146,13 @@ impl Session {
 
     /// Close the session.
     ///
-    /// Closing is terminal and idempotent. It also clears routing context.
+    /// Closing is terminal and idempotent. It also clears routing context,
+    /// prepared statements, and bound portals.
     pub async fn close(&self) -> EngineResult<()> {
         let mut inner = self.inner.lock().await;
         inner.state = SessionState::Closed;
         inner.routing_key = None;
+        inner.prepared.clear();
         Ok(())
     }
 }
@@ -148,8 +176,8 @@ mod tests {
 
     #[tokio::test]
     async fn sessions_have_unique_ids_and_start_ready_without_routing_context() {
-        let first = Session::new(7);
-        let second = Session::new(7);
+        let first = Session::new(7, PreparedStatementLimits::default());
+        let second = Session::new(7, PreparedStatementLimits::default());
 
         assert_ne!(first.id(), second.id());
         assert!(first.id().get() > 0);
@@ -160,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn routing_context_can_be_set_replaced_and_cleared() {
-        let session = Session::new(7);
+        let session = Session::new(7, PreparedStatementLimits::default());
 
         session.set_routing_key("tenant-a").await.unwrap();
         assert_eq!(session.routing_key().await.as_deref(), Some("tenant-a"));
@@ -173,7 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_is_idempotent_terminal_and_clears_routing_context() {
-        let session = Session::new(7);
+        let session = Session::new(7, PreparedStatementLimits::default());
         session.set_routing_key("tenant-a").await.unwrap();
 
         session.close().await.unwrap();

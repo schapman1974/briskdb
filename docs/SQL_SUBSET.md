@@ -46,10 +46,11 @@ A successful `CommonSql` does not mean that the SQL:
 
 Those responsibilities remain with the implemented issue #21 normalization,
 issue #22 inference, issues #23/#24 bound planning and routing-policy layers,
-the separate issue #25 translation layer, issues #26/#27, and the later wire
-frontends. Validation never consults parameters, a session, the logical
-catalog, storage, routing state, the filesystem, or SQLite. It never formats or
-searches SQL text to make a structural decision.
+the separate issue #25 translation layer, the implemented issue #26 prepared
+lifecycle, issue #27 classification/batch policy, and the later wire frontends.
+Validation never consults parameters, a session, the logical catalog, storage,
+routing state, the filesystem, or SQLite. It never formats or searches SQL text
+to make a structural decision.
 
 Empty and comment-only parsed batches validate successfully. Every statement in
 a mixed batch is checked independently and source order is retained, but that

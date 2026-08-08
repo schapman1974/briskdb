@@ -62,22 +62,26 @@ explicit routing byte sequence, retains the inference, and produces owned
 physical routes with schema and routing provenance. It compares finite inferred
 and explicit routes by physical shard, rejects unroutable cataloged sharded
 DML, and records a valid single-shard assignment. The planner does not invoke
-translation, authorize, enforce batch policy, or execute a statement. HTTP
-requests still send caller-provided SQLite SQL directly to `rusqlite`; they do
-not pass through these opt-in SQL layers.
+translation, authorize, enforce batch policy, or execute a statement. The
+protocol-neutral prepared lifecycle composes these SQL stages for exactly one
+statement, binds typed values into a session-scoped portal, refreshes stale
+description metadata, plans freshly at every execution, and executes supported
+physical targets. HTTP requests still send caller-provided SQLite SQL directly
+to the raw engine path; they do not
+pass through these opt-in SQL layers.
 
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
 | HTTP `/v1/execute` | Experimental | One SQLite statement with positional parameters | Required caller-provided `shard_key` |
-| HTTP `/v1/query` | Experimental | One prepared SQLite statement executed through the row-returning path | Required caller-provided `shard_key` |
+| HTTP `/v1/query` | Experimental | One raw SQLite statement prepared transiently by the row-returning path; no session cache | Required caller-provided `shard_key` |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
-| PostgreSQL wire protocol | Planned | Rust parsing, validation, placeholder normalization, and finite compatibility translation implemented; listener adoption planned | Rust inference and bind-time single-shard routing policy implemented; wire lifecycle and session integration planned |
-| MySQL wire protocol | Planned | Rust parsing, validation, placeholder normalization, and finite compatibility translation implemented; listener adoption planned | Rust inference and bind-time single-shard routing policy implemented; wire lifecycle and session integration planned |
+| PostgreSQL wire protocol | Planned | Rust parsing, validation, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
+| MySQL wire protocol | Planned | Rust parsing, validation, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
 The parser, subset validator, placeholder normalizer, SQL translator, shard-key
-inference function, and engine planner are implemented Rust APIs, not network
-interfaces. Each step is opt-in and does not change any current network row in
-this table.
+inference function, engine planner, and prepared lifecycle are implemented Rust
+APIs, not PostgreSQL or MySQL network interfaces. They do not change any
+current HTTP row in this table.
 
 Every HTTP operation now calls the same protocol-neutral async engine intended
 for future PostgreSQL and MySQL adapters. Execute and query requests create a
@@ -319,6 +323,10 @@ defines the supported proof grammar and typed result. The [bound
 statement-planning and routing-policy contract](SQL_PLANNING.md) defines
 canonical route bytes, occurrence ordering, physical-target comparison, write
 rejection, provenance, and the non-executable planning boundary.
+The [prepared statements and bound portals
+contract](SQL_PREPARED_STATEMENTS.md) defines the composed exact-one-statement
+lifecycle, session limits, metadata, routing snapshots, current execution
+planning, and supported physical targets.
 
 ### Implemented pass-through surface
 
@@ -391,20 +399,20 @@ typed key extraction is the implemented issue #22 layer. Synchronous bind-time
 route construction is the implemented issue #23 layer, and issue #24 adds
 physical-target comparison, assigned shards, and rejection of conflicting or
 unroutable cataloged sharded writes.
-Prepare/bind/describe/execute state remains issue #26, and empty or
-multi-statement execution policy remains issue #27.
+Issue #26 adds the prepared/bind/describe/execute state described below. Empty
+or multi-statement request policy remains issue #27; a prepared handle requires
+exactly one statement as its own cardinality rule.
 
 The validator independently caps recursive expression AST depth at 128. This
 also bounds flat operator chains that parse iteratively; exceeding the limit is
 reported as `LimitExceeded`.
 
-The future driver-capable execution path will send `CREATE TABLE` and
-`CREATE INDEX` through journaled schema migrations, consume only an accepted
-single-shard write or supported read plan, revalidate its provenance, and
-implement real transactions through protocol-neutral session state. The
-implemented planning API already rejects unroutable or conflicting cataloged
-writes; unsafe statement combinations and cross-shard transactions remain
-later request/session policy.
+The driver-capable Rust execution path now consumes accepted sharded writes and
+supported read targets and creates a fresh plan under every execution's current
+schema guard. Persistent `CREATE TABLE` and `CREATE INDEX` must still use
+journaled schema migrations, and real transactions still require
+protocol-neutral transaction state. Unsafe statement combinations and
+cross-shard transactions remain later request/session policy.
 
 ### Implemented placeholder normalization
 
@@ -425,9 +433,10 @@ error contract are in [SQL parameter normalization](SQL_PARAMETERS.md).
 
 This implemented normalization does not bind or count supplied values, infer a
 shard, translate other dialect syntax, create a prepared statement, classify
-statement behavior, authorize a request, or execute SQL. Translation is the
-separate opt-in layer described next. The HTTP and engine paths continue to
-bind their existing caller-supplied SQLite SQL directly.
+statement behavior, authorize a request, or execute SQL by itself. Translation
+is the separate opt-in layer described next. The prepared lifecycle composes
+both layers, while the raw HTTP paths continue to bind caller-supplied SQLite
+SQL directly.
 
 ### Implemented SQL translation
 
@@ -510,6 +519,35 @@ statement, apply complete statement/batch policy, scatter reads, or execute
 SQLite. The exact matrix and error precedence are in [bound statement planning
 and routing policy](SQL_PLANNING.md).
 
+### Implemented prepared-statement lifecycle
+
+The public async Rust engine accepts a `PrepareRequest` with one logical
+database, explicit source dialect, explicit translation mode, and SQL string.
+Prepare runs parsing through translation, requires exactly one top-level
+statement, and transiently compiles parameter/column metadata on shard 0. A
+session retains only BriskDB-owned translated SQL and owned metadata; no SQLite
+statement or connection is cached.
+
+Binding validates a complete typed `Value` slice with a transient plan,
+snapshots the session's current routing key, and returns an opaque
+session-scoped `PortalId`. The portal retains the values and routing snapshot,
+not a plan. Describe returns ordered columns and one `Unknown` type per
+parameter/result column and refreshes metadata after schema migration. Every
+execution creates a fresh plan under its current schema guard. It runs accepted
+sharded work on its assigned shard and safe
+column-producing `NotApplicable`/`Global` reads on deterministic shard 0;
+catalog reads and sharded reads requiring scatter remain unsupported. Results
+are the same protocol-neutral routed rowset or affected-row count for SQLite,
+PostgreSQL, and MySQL source.
+
+Per-session statement, portal, retained-bound-value, and per-bind planning
+limits are finite and have no implicit eviction. Planning preflight charges the
+captured route once and each marker occurrence twice. Explicit close releases
+entries; closing a statement also invalidates all dependent portals. The API,
+defaults, logical byte accounting, request controls, errors, and storage
+boundary are normative in
+[prepared statements and bound portals](SQL_PREPARED_STATEMENTS.md).
+
 ## PostgreSQL differences
 
 The PostgreSQL listener will target the frontend/backend wire protocol and a
@@ -518,7 +556,7 @@ not implemented unless listed as implemented in this document.
 
 | Area | PostgreSQL | BriskDB contract |
 | --- | --- | --- |
-| Parameters | `$1`, `$2`, ... | Implemented opt-in Rust normalization, typed inference, and single-shard routing policy from a supplied bound slice; wire bind lifecycle remains planned |
+| Parameters | `$1`, `$2`, ... | Rust normalization and session-scoped prepare/bind/describe/execute are implemented; PostgreSQL message/name/type mapping remains planned |
 | Identifier quoting | Double quotes | Retained by opt-in compatibility translation; PostgreSQL case folding and catalog equivalence are not claimed |
 | Type system | Static types identified by OIDs | Opt-in Rust translation maps a finite declaration set to `BIGINT`, `BOOLEAN`, `REAL`, `TEXT`, or `BLOB`; OID and value/result adaptation remain planned |
 | Boolean | Dedicated `boolean` type | Opt-in translation maps the declaration to `BOOLEAN` and literals to `1`/`0`; Boolean wire/result metadata remains planned |
@@ -546,7 +584,7 @@ engine used by PostgreSQL and HTTP.
 
 | Area | MySQL | BriskDB contract |
 | --- | --- | --- |
-| Parameters | `?` in prepared statements | Implemented opt-in Rust normalization, typed inference, and single-shard routing policy from a supplied bound slice; wire bind lifecycle remains planned |
+| Parameters | `?` in prepared statements | Rust normalization and session-scoped prepare/bind/describe/execute are implemented; MySQL command/type mapping remains planned |
 | Identifier quoting | Backticks by default | Opt-in compatibility translation emits safely escaped double-quoted SQLite identifiers; case and collation equivalence are not claimed |
 | Type system | Static signed/unsigned column types | Opt-in Rust translation maps a finite signed integer, Boolean, 64-bit float, text, and binary declaration set; unsigned declarations are rejected, and translation performs no value or result adaptation. Independently, BriskDB retains `UInt64` values without narrowing, while current SQLite binding rejects values above `i64::MAX` until a storage mapping exists |
 | Boolean | Commonly `TINYINT(1)` | Opt-in translation maps exactly `TINYINT(1)` to `BOOLEAN` and Boolean literals to `1`/`0`; wire/result metadata remains planned |
@@ -620,8 +658,12 @@ underlying execution semantics.
 - Opt-in bound planning converts every inferred occurrence to an owned route,
   retains an independent explicit route, and records catalog/routing
   provenance. It compares finite routes by physical shard, rejects unroutable
-  cataloged sharded writes, and records an accepted single-shard assignment;
-  it does not make a plan executable or change current HTTP behavior.
+  cataloged sharded writes, and records an accepted single-shard assignment.
+- The Rust prepared lifecycle snapshots bound values and session routing in an
+  immutable portal, transiently validates at bind, plans on every execution,
+  executes accepted sharded targets, and uses shard 0 for supported
+  replicated-schema reads. It does not change current HTTP behavior or
+  implement scatter reads.
 - Point queries and writes visit only that shard.
 - No scatter/gather query path exists.
 - Unique constraints and transactions are local to one SQLite shard.
@@ -636,9 +678,6 @@ underlying execution semantics.
 - Every sharded table declares one non-null shard-key column in the catalog.
 - Canonical key encoding, hash version, virtual bucket count, and bucket map are
   persisted in the manifest.
-- Execution validates bound-plan provenance, consumes the implemented
-  single-shard write/read assignment, and uses session routing state only
-  through the prepared execution lifecycle.
 - A transaction is pinned to its first shard. Targeting another shard returns a
   stable cross-shard-transaction error.
 - Read-only plans may scatter with bounded concurrency and deterministic merge.

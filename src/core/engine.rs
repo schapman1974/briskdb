@@ -13,9 +13,11 @@ use tokio::{sync::OwnedMutexGuard, task::JoinHandle};
 
 use super::{
     BlockingPool, BoundStatementPlan, CancelOnDrop, CancellationReason, CancellationToken,
-    Database, EngineError, EngineErrorKind, EngineOptions, EngineResult, EngineState, Lifecycle,
-    LogicalDatabaseId, OperationControl, OperationLease, RequestContext, ResultLimits, ResultSet,
-    Routed, Session, SessionInner, ShutdownReport, Value, wait_for_cancellation, wait_pending,
+    Database, DescribeTarget, EngineError, EngineErrorKind, EngineOptions, EngineResult,
+    EngineState, Lifecycle, LogicalDatabaseId, OperationControl, OperationLease, PortalId,
+    PrepareRequest, PreparedExecution, PreparedStatementDescription, PreparedStatementId,
+    PreparedStatementLimits, RequestContext, ResultLimits, ResultSet, Routed, Session,
+    SessionInner, ShutdownReport, TablePlacement, Value, wait_for_cancellation, wait_pending,
 };
 use crate::{
     sql,
@@ -65,6 +67,7 @@ pub struct EngineStatus {
     queue_capacity_per_shard: usize,
     max_result_rows: u64,
     max_result_bytes: u64,
+    prepared_statement_limits: PreparedStatementLimits,
     request_timeout: Option<Duration>,
     shutdown_grace: Duration,
 }
@@ -99,6 +102,11 @@ impl EngineStatus {
     /// Return the maximum protocol-neutral logical bytes retained by one query.
     pub const fn max_result_bytes(&self) -> u64 {
         self.max_result_bytes
+    }
+
+    /// Return the finite per-session prepared-statement and portal limits.
+    pub const fn prepared_statement_limits(&self) -> PreparedStatementLimits {
+        self.prepared_statement_limits
     }
 
     /// Return the engine-wide request timeout, if enabled.
@@ -276,7 +284,10 @@ impl Engine {
 
     /// Create a new frontend-owned session.
     pub fn session(&self) -> Session {
-        Session::new(self.inner.id)
+        Session::new(
+            self.inner.id,
+            self.inner.options.prepared_statement_limits(),
+        )
     }
 
     /// Return the configured physical shard count.
@@ -305,6 +316,23 @@ impl Engine {
         explicit_routing_key: Option<&[u8]>,
     ) -> EngineResult<BoundStatementPlan> {
         let _schema_operation = self.inner.database.storage.enter_schema_operation()?;
+        self.plan_bound_statement_admitted(
+            database,
+            normalized,
+            statement_index,
+            parameters,
+            explicit_routing_key,
+        )
+    }
+
+    fn plan_bound_statement_admitted(
+        &self,
+        database: LogicalDatabaseId,
+        normalized: &sql::NormalizedSql,
+        statement_index: usize,
+        parameters: &[Value],
+        explicit_routing_key: Option<&[u8]>,
+    ) -> EngineResult<BoundStatementPlan> {
         let (hash_version, key_encoding_version, bucket_algorithm_version, map_generation) =
             self.inner.database.routing_provenance();
         super::planner::plan_bound_statement(
@@ -481,12 +509,331 @@ impl Engine {
                 queue_capacity_per_shard: self.inner.options.queue_capacity_per_shard(),
                 max_result_rows: result_limits.max_rows(),
                 max_result_bytes: result_limits.max_bytes(),
+                prepared_statement_limits: self.inner.options.prepared_statement_limits(),
                 request_timeout: self.inner.options.request_timeout(),
                 shutdown_grace: self.inner.options.shutdown_grace(),
             })
         }
         .await;
         operation.finish(result)
+    }
+
+    /// Parse, validate, translate, and transiently compile one prepared statement.
+    pub async fn prepare_statement(
+        &self,
+        session: &Session,
+        request: PrepareRequest,
+    ) -> EngineResult<PreparedStatementId> {
+        self.prepare_statement_with_context(session, request, RequestContext::new())
+            .await
+    }
+
+    /// Prepare one statement with explicit cancellation and deadline controls.
+    pub async fn prepare_statement_with_context(
+        &self,
+        session: &Session,
+        request: PrepareRequest,
+        context: RequestContext,
+    ) -> EngineResult<PreparedStatementId> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if self.catalog().database_by_id(request.database()).is_none() {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "selected logical database does not exist",
+            )));
+        }
+        let (database, translated) = match prepare_translated_request(request) {
+            Ok(prepared) => prepared,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if let Err(error) = guard.prepared().ensure_statement_capacity() {
+            return operation.finish(Err(error));
+        }
+        let parameter_count = translated.statement_parameters()[0].parameter_count();
+        let sqlite_sql = translated.sqlite_sql().to_owned();
+        let schema_generation = self.catalog().schema_generation();
+        let owner = ConnectionOwner::new(session.id().get());
+
+        let result = self
+            .run_on_shard(
+                &mut operation,
+                0,
+                owner,
+                schema_operation,
+                guard,
+                move |connection, session, control| {
+                    connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sqlite_sql)?;
+                    let metadata = connection.run_controlled(control, |connection| {
+                        sql::describe_statement(connection, &sqlite_sql)
+                    })?;
+                    ensure_parameter_metadata(parameter_count, metadata.parameter_count())?;
+                    let description = PreparedStatementDescription::new(
+                        parameter_count,
+                        metadata.columns().to_vec(),
+                        schema_generation,
+                    );
+                    session
+                        .prepared_mut()
+                        .insert_statement(database, translated, description)
+                },
+            )
+            .await;
+        operation.finish_started(result)
+    }
+
+    /// Bind typed values and the session's current routing context into a portal.
+    pub async fn bind_statement(
+        &self,
+        session: &Session,
+        statement: PreparedStatementId,
+        parameters: Vec<Value>,
+    ) -> EngineResult<PortalId> {
+        self.bind_statement_with_context(session, statement, parameters, RequestContext::new())
+            .await
+    }
+
+    /// Bind a prepared statement with explicit cancellation and deadline controls.
+    pub async fn bind_statement_with_context(
+        &self,
+        session: &Session,
+        statement: PreparedStatementId,
+        parameters: Vec<Value>,
+        context: RequestContext,
+    ) -> EngineResult<PortalId> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let mut guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let result = (|| {
+            let routing_key = guard.routing_key().map(str::as_bytes);
+            let template = guard.prepared().statement(statement)?;
+            let parameter_layout = &template.translated().statement_parameters()[0];
+            let expected_parameters = parameter_layout.parameter_count();
+            if parameters.len() != expected_parameters {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!(
+                        "prepared statement requires exactly {expected_parameters} bound parameters"
+                    ),
+                ));
+            }
+            sql::validate_parameters(&parameters)?;
+            guard
+                .prepared()
+                .ensure_portal_capacity(&parameters, routing_key)?;
+            guard.prepared().ensure_planning_capacity(
+                &parameters,
+                parameter_layout.parameter_indices(),
+                routing_key,
+            )?;
+            self.plan_bound_statement_admitted(
+                template.database(),
+                template.translated().normalized_sql(),
+                0,
+                &parameters,
+                routing_key,
+            )?;
+            operation.check_before_start()?;
+            let routing_key = routing_key.map(<[u8]>::to_vec);
+            guard
+                .prepared_mut()
+                .insert_portal(statement, parameters, routing_key)
+        })();
+        drop(schema_operation);
+        operation.finish(result)
+    }
+
+    /// Describe one prepared statement or bound portal.
+    pub async fn describe_prepared(
+        &self,
+        session: &Session,
+        target: DescribeTarget,
+    ) -> EngineResult<PreparedStatementDescription> {
+        self.describe_prepared_with_context(session, target, RequestContext::new())
+            .await
+    }
+
+    /// Describe a prepared object with explicit cancellation and deadline controls.
+    pub async fn describe_prepared_with_context(
+        &self,
+        session: &Session,
+        target: DescribeTarget,
+        context: RequestContext,
+    ) -> EngineResult<PreparedStatementDescription> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let statement = match target {
+            DescribeTarget::Statement(statement) => statement,
+            DescribeTarget::Portal(portal) => match guard.prepared().portal(portal) {
+                Ok(portal) => portal.statement(),
+                Err(error) => return operation.finish(Err(error)),
+            },
+        };
+        let template = match guard.prepared().statement(statement) {
+            Ok(template) => template,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let schema_generation = self.catalog().schema_generation();
+        if template.description().schema_generation() == schema_generation {
+            let result = operation
+                .check_before_start()
+                .map(|()| template.description().clone());
+            drop(guard);
+            drop(schema_operation);
+            return operation.finish(result);
+        }
+
+        let parameter_count = template.translated().statement_parameters()[0].parameter_count();
+        let sqlite_sql = template.translated().sqlite_sql().to_owned();
+        let owner = ConnectionOwner::new(session.id().get());
+        let result = self
+            .run_on_shard(
+                &mut operation,
+                0,
+                owner,
+                schema_operation,
+                guard,
+                move |connection, session, control| {
+                    connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sqlite_sql)?;
+                    let metadata = connection.run_controlled(control, |connection| {
+                        sql::describe_statement(connection, &sqlite_sql)
+                    })?;
+                    ensure_parameter_metadata(parameter_count, metadata.parameter_count())?;
+                    let description = PreparedStatementDescription::new(
+                        parameter_count,
+                        metadata.columns().to_vec(),
+                        schema_generation,
+                    );
+                    session
+                        .prepared_mut()
+                        .statement_mut(statement)?
+                        .replace_description(description.clone());
+                    Ok(description)
+                },
+            )
+            .await;
+        operation.finish_started(result)
+    }
+
+    /// Execute one immutable bound portal on the shard selected by a fresh plan.
+    pub async fn execute_portal(
+        &self,
+        session: &Session,
+        portal: PortalId,
+    ) -> EngineResult<Routed<PreparedExecution>> {
+        self.execute_portal_with_context(session, portal, RequestContext::new())
+            .await
+    }
+
+    /// Execute a bound portal with explicit request and result-budget controls.
+    pub async fn execute_portal_with_context(
+        &self,
+        session: &Session,
+        portal: PortalId,
+        context: RequestContext,
+    ) -> EngineResult<Routed<PreparedExecution>> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let portal_snapshot = match guard.prepared().portal(portal) {
+            Ok(portal) => portal.clone(),
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let template = match guard.prepared().statement(portal_snapshot.statement()) {
+            Ok(template) => template,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let plan = match self.plan_bound_statement_admitted(
+            template.database(),
+            template.translated().normalized_sql(),
+            0,
+            portal_snapshot.parameters(),
+            portal_snapshot.routing_key(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let sqlite_sql = template.translated().sqlite_sql().to_owned();
+        let shard = match prepared_execution_shard(&plan, template.description(), self.catalog()) {
+            Ok(shard) => shard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let result_limits = operation.result_limits;
+        let owner = ConnectionOwner::new(session.id().get());
+        let result = self
+            .run_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                schema_operation,
+                guard,
+                move |connection, _session, control| {
+                    connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sqlite_sql)?;
+                    connection.run_controlled(control, |connection| {
+                        sql::execute_statement_with_limits(
+                            connection,
+                            &sqlite_sql,
+                            portal_snapshot.parameters(),
+                            result_limits,
+                        )
+                        .map(|execution| match execution {
+                            sql::StatementExecution::Rows(rows) => PreparedExecution::Rows(rows),
+                            sql::StatementExecution::AffectedRows(rows) => {
+                                PreparedExecution::AffectedRows(rows)
+                            }
+                        })
+                    })
+                },
+            )
+            .await;
+        let value = operation.finish_started(result)?;
+        Ok(Routed { shard, value })
+    }
+
+    /// Close a prepared statement and every portal bound from it.
+    ///
+    /// This in-memory cleanup remains available while the engine is draining.
+    pub async fn close_prepared_statement(
+        &self,
+        session: &Session,
+        statement: PreparedStatementId,
+    ) -> EngineResult<bool> {
+        let mut guard = self.ready_session(session).await?;
+        guard.prepared_mut().close_statement(statement)
+    }
+
+    /// Close one bound portal without closing its prepared statement.
+    ///
+    /// This in-memory cleanup remains available while the engine is draining.
+    pub async fn close_portal(&self, session: &Session, portal: PortalId) -> EngineResult<bool> {
+        let mut guard = self.ready_session(session).await?;
+        guard.prepared_mut().close_portal(portal)
     }
 
     /// Execute a routed statement and return its selected shard.
@@ -530,7 +877,7 @@ impl Engine {
                 owner,
                 schema_operation,
                 guard,
-                move |connection, control| {
+                move |connection, _session, control| {
                     connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sql)?;
                     connection.run_controlled(control, |connection| {
                         sql::execute(connection, &sql, &params)
@@ -585,7 +932,7 @@ impl Engine {
                 owner,
                 schema_operation,
                 guard,
-                move |connection, control| {
+                move |connection, _session, control| {
                     connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sql)?;
                     connection.run_controlled(control, |connection| {
                         sql::query_with_limits(connection, &sql, &params, limits)
@@ -676,12 +1023,18 @@ impl Engine {
         shard: u16,
         owner: ConnectionOwner,
         schema_operation: SchemaOperationGuard,
-        session: OwnedMutexGuard<SessionInner>,
+        mut session: OwnedMutexGuard<SessionInner>,
         work: F,
     ) -> EngineResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut PooledConnection, Arc<OperationControl>) -> EngineResult<T> + Send + 'static,
+        F: FnOnce(
+                &mut PooledConnection,
+                &mut SessionInner,
+                Arc<OperationControl>,
+            ) -> EngineResult<T>
+            + Send
+            + 'static,
     {
         let permit = match operation
             .wait_pending(self.inner.connections.acquire_for_owner(shard, owner))
@@ -703,12 +1056,11 @@ impl Engine {
         let storage = self.inner.database.storage.clone();
         let join = worker.spawn(move || {
             let _lease = lease;
-            let _session = session;
             let _schema_operation = schema_operation;
             let result = permit
                 .checkout_controlled(Arc::clone(&worker_control))
                 .and_then(|mut connection| {
-                    let result = work(&mut connection, Arc::clone(&worker_control));
+                    let result = work(&mut connection, &mut session, Arc::clone(&worker_control));
                     retire_if_broken(&mut connection, &result);
                     result
                 });
@@ -764,7 +1116,7 @@ impl Engine {
                 owner,
                 schema_operation,
                 guard,
-                move |_, _| {
+                move |_, _, _| {
                     let _ = started.send(());
                     release.recv().expect("test releases the blocking worker");
                     Ok(())
@@ -790,7 +1142,7 @@ impl Engine {
                 owner,
                 schema_operation,
                 guard,
-                move |_, _| panic!("intentional blocking worker panic"),
+                move |_, _, _| panic!("intentional blocking worker panic"),
             )
             .await;
         operation.finish_started(result)
@@ -816,7 +1168,7 @@ impl Engine {
                 owner,
                 schema_operation,
                 guard,
-                move |_, _| {
+                move |_, _, _| {
                     Err(EngineError::new(
                         EngineErrorKind::DataCorruption,
                         "injected SQLite data corruption",
@@ -847,7 +1199,7 @@ impl Engine {
                 owner,
                 schema_operation,
                 guard,
-                move |connection, control| {
+                move |connection, _session, control| {
                     connection.run_controlled(control, |_connection| -> EngineResult<()> {
                         panic!("intentional controlled SQLite worker panic")
                     })
@@ -884,11 +1236,89 @@ impl Engine {
                 owner,
                 schema_operation,
                 guard,
-                move |connection, _| Ok(connection.connection_id()),
+                move |connection, _, _| Ok(connection.connection_id()),
             )
             .await;
         operation.finish_started(result)
     }
+}
+
+fn prepare_translated_request(
+    request: PrepareRequest,
+) -> EngineResult<(LogicalDatabaseId, sql::TranslatedSql)> {
+    let (database, dialect, translation_mode, source) = request.into_parts();
+    let parsed = sql::parse(dialect, source)?;
+    if parsed.statement_count() != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "a prepared statement must contain exactly one top-level SQL statement",
+        ));
+    }
+    let common = sql::validate_common_subset(parsed)?;
+    let normalized = sql::normalize_placeholders(common)?;
+    let translated = sql::translate_sql(normalized, translation_mode)?;
+    Ok((database, translated))
+}
+
+fn ensure_parameter_metadata(expected: usize, actual: usize) -> EngineResult<()> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "normalized and SQLite prepared-parameter counts disagree",
+        ))
+    }
+}
+
+fn prepared_execution_shard(
+    plan: &BoundStatementPlan,
+    description: &PreparedStatementDescription,
+    catalog: &super::Catalog,
+) -> EngineResult<u16> {
+    if let Some(shard) = plan.assigned_shard() {
+        return Ok(shard);
+    }
+
+    match plan.inference().kind() {
+        sql::ShardKeyInferenceKind::NotApplicable if description.returns_rows() => Ok(0),
+        sql::ShardKeyInferenceKind::NotApplicable => Err(unassigned_prepared_statement()),
+        sql::ShardKeyInferenceKind::NotSharded => {
+            let table = plan
+                .inference()
+                .table_id()
+                .and_then(|table| catalog.table_by_id(table))
+                .ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "non-sharded prepared planning lost its catalog table",
+                    )
+                })?;
+            match table.placement() {
+                TablePlacement::Global if description.returns_rows() => Ok(0),
+                TablePlacement::Global => Err(unassigned_prepared_statement()),
+                TablePlacement::Catalog => Err(EngineError::new(
+                    EngineErrorKind::PermissionDenied,
+                    "catalog-placed tables cannot execute as client SQL",
+                )),
+                TablePlacement::Sharded(_) => Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "non-sharded prepared planning resolved a sharded table",
+                )),
+            }
+        }
+        sql::ShardKeyInferenceKind::Unconstrained
+        | sql::ShardKeyInferenceKind::Contradiction
+        | sql::ShardKeyInferenceKind::Exact
+        | sql::ShardKeyInferenceKind::Multiple => Err(unassigned_prepared_statement()),
+    }
+}
+
+fn unassigned_prepared_statement() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::Unsupported,
+        "the bound statement does not have one executable physical shard",
+    )
 }
 
 fn flatten_join<T>(result: Result<EngineResult<T>, tokio::task::JoinError>) -> EngineResult<T> {
@@ -958,6 +1388,61 @@ mod tests {
         (temp, engine)
     }
 
+    fn engine_with_prepared_catalog(
+        options: EngineOptions,
+    ) -> (tempfile::TempDir, Engine, LogicalDatabaseId) {
+        let temp = tempfile::tempdir().unwrap();
+        drop(Database::open(temp.path(), 4).unwrap());
+        let manifest = rusqlite::Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+        manifest
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_integrity;
+                 DROP TABLE briskdb_metadata;
+                 CREATE TABLE briskdb_metadata (
+                     requires_manifest_version INTEGER NOT NULL
+                         CHECK (requires_manifest_version >= 6)
+                 ) STRICT;
+                 INSERT INTO briskdb_metadata VALUES (6);
+                 INSERT INTO briskdb_tables (
+                    table_id,
+                    database_id,
+                    table_name,
+                    placement,
+                    shard_key_column,
+                    shard_key_type
+                 ) VALUES
+                    (4, 1, 'events', 1, 'tenant_id', 1),
+                    (5, 1, 'global_events', 2, NULL, NULL),
+                    (6, 1, 'catalog_records', 3, NULL, NULL),
+                    (7, 1, 'text_events', 1, 'tenant_key', 2);
+                 PRAGMA user_version = 6;
+                 COMMIT;",
+            )
+            .unwrap();
+        drop(manifest);
+
+        let database = Arc::new(Database::open(temp.path(), 4).unwrap());
+        database
+            .broadcast(
+                "CREATE TABLE events (
+                    tenant_id INTEGER PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 );
+                 CREATE TABLE global_events (code INTEGER NOT NULL);
+                 CREATE TABLE catalog_records (code INTEGER NOT NULL);
+                 CREATE TABLE text_events (
+                    tenant_key TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        let engine = Engine::from_database_with_options(database, options).unwrap();
+        (temp, engine, logical_database)
+    }
+
     fn routing_key_for_shard(engine: &Engine, expected: u16) -> String {
         (0_u64..)
             .map(|value| format!("shard-{value}"))
@@ -1010,6 +1495,12 @@ mod tests {
     fn owned_public_types_have_expected_thread_safety_and_accessors() {
         assert_send_sync::<Engine>();
         assert_send_sync::<Session>();
+        assert_send_sync::<PrepareRequest>();
+        assert_send_sync::<PreparedStatementId>();
+        assert_send_sync::<PortalId>();
+        assert_send_sync::<DescribeTarget>();
+        assert_send_sync::<PreparedStatementDescription>();
+        assert_send_sync::<PreparedExecution>();
 
         let statement = Statement::new("SELECT ?1", vec![Value::from(42_i64)]);
         assert_eq!(statement.sql(), "SELECT ?1");
@@ -1036,6 +1527,10 @@ mod tests {
         assert_eq!(status.max_blocking_workers(), 16);
         assert_eq!(status.connections_per_shard(), 4);
         assert_eq!(status.queue_capacity_per_shard(), 32);
+        assert_eq!(
+            status.prepared_statement_limits(),
+            PreparedStatementLimits::default()
+        );
         assert_eq!(session.state().await, SessionState::Ready);
     }
 
@@ -1096,6 +1591,1077 @@ mod tests {
                 active_operations: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_lifecycle_returns_the_same_typed_result_for_every_sql_dialect() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+
+        let insert = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                ),
+            )
+            .await
+            .unwrap();
+        let insert_description = engine
+            .describe_prepared(&session, DescribeTarget::Statement(insert))
+            .await
+            .unwrap();
+        assert_eq!(
+            insert_description.parameter_types(),
+            [DataType::Unknown, DataType::Unknown]
+        );
+        assert!(insert_description.columns().is_empty());
+        assert!(!insert_description.returns_rows());
+
+        let insert_portal = engine
+            .bind_statement(
+                &session,
+                insert,
+                vec![Value::from(7_i64), Value::from("seven")],
+            )
+            .await
+            .unwrap();
+        let inserted = engine
+            .execute_portal(&session, insert_portal)
+            .await
+            .unwrap();
+        assert_eq!(inserted.value, PreparedExecution::AffectedRows(1));
+        assert_eq!(inserted.shard, engine.inner.database.shard_for_key(b"7"));
+
+        let requests = [
+            (
+                sql::SqlDialect::Sqlite,
+                sql::SqlTranslationMode::StrictSqlite,
+                "SELECT tenant_id, payload FROM events WHERE tenant_id = ?1",
+            ),
+            (
+                sql::SqlDialect::PostgreSql,
+                sql::SqlTranslationMode::Compatibility,
+                "SELECT tenant_id, payload FROM events WHERE tenant_id = $1",
+            ),
+            (
+                sql::SqlDialect::MySql,
+                sql::SqlTranslationMode::Compatibility,
+                "SELECT tenant_id, payload FROM events WHERE tenant_id = ?",
+            ),
+        ];
+        let expected = ResultSet::new(
+            vec![
+                Column::new("tenant_id", DataType::Unknown),
+                Column::new("payload", DataType::Unknown),
+            ],
+            vec![Row::new(vec![Value::from(7_i64), Value::from("seven")])],
+        )
+        .unwrap();
+        let mut observed = Vec::new();
+        for (dialect, mode, source) in requests {
+            let statement = engine
+                .prepare_statement(
+                    &session,
+                    PrepareRequest::new(database, dialect, mode, source),
+                )
+                .await
+                .unwrap();
+            let description = engine
+                .describe_prepared(&session, DescribeTarget::Statement(statement))
+                .await
+                .unwrap();
+            assert_eq!(description.parameter_types(), [DataType::Unknown]);
+            assert_eq!(description.columns(), expected.columns());
+            assert!(description.returns_rows());
+            let portal = engine
+                .bind_statement(&session, statement, vec![Value::from(7_i64)])
+                .await
+                .unwrap();
+            assert_eq!(
+                engine
+                    .describe_prepared(&session, DescribeTarget::Portal(portal))
+                    .await
+                    .unwrap(),
+                description
+            );
+            observed.push(engine.execute_portal(&session, portal).await.unwrap());
+            assert!(engine.close_portal(&session, portal).await.unwrap());
+            assert!(
+                engine
+                    .close_prepared_statement(&session, statement)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(observed.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(observed[0].value, PreparedExecution::Rows(expected));
+
+        assert!(engine.close_portal(&session, insert_portal).await.unwrap());
+        assert!(
+            engine
+                .close_prepared_statement(&session, insert)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_cache_and_portal_limits_are_session_local_without_eviction() {
+        let limits = PreparedStatementLimits::new(1, 1, 64).unwrap();
+        let options = EngineOptions::default().with_prepared_statement_limits(limits);
+        let (_temp, engine, database) = engine_with_prepared_catalog(options);
+        let first_session = engine.session();
+        let second_session = engine.session();
+        let request = || {
+            PrepareRequest::new(
+                database,
+                sql::SqlDialect::Sqlite,
+                sql::SqlTranslationMode::StrictSqlite,
+                "SELECT payload FROM events WHERE tenant_id = ?1",
+            )
+        };
+
+        let first = engine
+            .prepare_statement(&first_session, request())
+            .await
+            .unwrap();
+        let duplicate_error = engine
+            .prepare_statement(&first_session, request())
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate_error.kind(), EngineErrorKind::LimitExceeded);
+        assert!(
+            engine
+                .describe_prepared(&first_session, DescribeTarget::Statement(first))
+                .await
+                .is_ok()
+        );
+
+        let independent = engine
+            .prepare_statement(&second_session, request())
+            .await
+            .unwrap();
+        assert_ne!(first, independent);
+        assert_eq!(
+            engine
+                .describe_prepared(&second_session, DescribeTarget::Statement(first))
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+
+        let first_portal = engine
+            .bind_statement(&first_session, first, vec![Value::from(1_i64)])
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .bind_statement(&first_session, first, vec![Value::from(2_i64)])
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        assert!(
+            engine
+                .describe_prepared(&first_session, DescribeTarget::Portal(first_portal))
+                .await
+                .is_ok()
+        );
+        assert!(
+            engine
+                .close_portal(&first_session, first_portal)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !engine
+                .close_portal(&first_session, first_portal)
+                .await
+                .unwrap()
+        );
+        let replacement_portal = engine
+            .bind_statement(&first_session, first, vec![Value::from(2_i64)])
+            .await
+            .unwrap();
+
+        assert!(
+            engine
+                .close_prepared_statement(&first_session, first)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            engine
+                .execute_portal(&first_session, replacement_portal)
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert!(
+            !engine
+                .close_prepared_statement(&first_session, first)
+                .await
+                .unwrap()
+        );
+        let replacement = engine
+            .prepare_statement(&first_session, request())
+            .await
+            .unwrap();
+        assert!(replacement > first);
+
+        assert!(
+            engine
+                .close_prepared_statement(&first_session, replacement)
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .close_prepared_statement(&second_session, independent)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_markers_are_bounded_before_planning_and_bind_recovers() {
+        let limits = PreparedStatementLimits::new(2, 2, 64).unwrap();
+        let options = EngineOptions::default().with_prepared_statement_limits(limits);
+        let (_temp, engine, database) = engine_with_prepared_catalog(options);
+        let session = engine.session();
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "INSERT INTO text_events (tenant_key, payload) VALUES (?1, ?1)",
+                ),
+            )
+            .await
+            .unwrap();
+
+        let error = engine
+            .bind_statement(
+                &session,
+                statement,
+                vec![Value::from("abcdefghijklmnopqrst")],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        assert_eq!(session.inner.lock().await.prepared().portal_count(), 0);
+
+        let portal = engine
+            .bind_statement(&session, statement, vec![Value::from("a")])
+            .await
+            .unwrap();
+        assert_eq!(session.inner.lock().await.prepared().portal_count(), 1);
+        assert_eq!(
+            engine.execute_portal(&session, portal).await.unwrap().value,
+            PreparedExecution::AffectedRows(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_physical_prepare_does_not_consume_statement_capacity() {
+        let limits = PreparedStatementLimits::new(1, 1, 64).unwrap();
+        let options = EngineOptions::default().with_prepared_statement_limits(limits);
+        let (_temp, engine, database) = engine_with_prepared_catalog(options);
+        let session = engine.session();
+
+        let error = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT * FROM missing_table",
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+        assert_eq!(session.inner.lock().await.prepared().statement_count(), 0);
+
+        engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT 1",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.inner.lock().await.prepared().statement_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_errors_are_atomic_and_recover_without_losing_valid_handles() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+
+        for source in [
+            "",
+            "SELECT 1; SELECT 2",
+            "SELECT 1; PRAGMA user_version",
+            "SELECT 1; SELECT ?0",
+        ] {
+            let error = engine
+                .prepare_statement(
+                    &session,
+                    PrepareRequest::new(
+                        database,
+                        sql::SqlDialect::Sqlite,
+                        sql::SqlTranslationMode::StrictSqlite,
+                        source,
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+            assert_eq!(
+                error.diagnostic(),
+                "a prepared statement must contain exactly one top-level SQL statement"
+            );
+        }
+        let unknown_database = LogicalDatabaseId::new(999).unwrap();
+        assert_eq!(
+            engine
+                .prepare_statement(
+                    &session,
+                    PrepareRequest::new(
+                        unknown_database,
+                        sql::SqlDialect::Sqlite,
+                        sql::SqlTranslationMode::StrictSqlite,
+                        "SELECT 1",
+                    ),
+                )
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT payload FROM events WHERE tenant_id = ?1 AND payload = ?2",
+                ),
+            )
+            .await
+            .unwrap();
+        for parameters in [
+            vec![Value::from(1_i64)],
+            vec![Value::from(1_i64), Value::from("value"), Value::Null],
+        ] {
+            assert_eq!(
+                engine
+                    .bind_statement(&session, statement, parameters)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::InvalidArgument
+            );
+        }
+        let too_large = u64::try_from(i64::MAX).unwrap() + 1;
+        assert_eq!(
+            engine
+                .bind_statement(
+                    &session,
+                    statement,
+                    vec![Value::from(1_i64), Value::from(too_large)],
+                )
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::NumericOutOfRange
+        );
+        let portal = engine
+            .bind_statement(
+                &session,
+                statement,
+                vec![Value::from(1_i64), Value::from("missing")],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine.execute_portal(&session, portal).await.unwrap().value,
+            PreparedExecution::Rows(result) if result.is_empty()
+        ));
+
+        let scalar = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT 1 AS value",
+                ),
+            )
+            .await
+            .unwrap();
+        let scalar_portal = engine
+            .bind_statement(&session, scalar, vec![])
+            .await
+            .unwrap();
+        let scalar_result = engine
+            .execute_portal(&session, scalar_portal)
+            .await
+            .unwrap();
+        assert_eq!(scalar_result.shard, 0);
+        assert!(matches!(
+            scalar_result.value,
+            PreparedExecution::Rows(result)
+                if result.rows()[0].get(0) == Some(&Value::from(1_i64))
+        ));
+
+        let global = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT code FROM global_events ORDER BY code",
+                ),
+            )
+            .await
+            .unwrap();
+        let global_portal = engine
+            .bind_statement(&session, global, vec![])
+            .await
+            .unwrap();
+        let global_result = engine
+            .execute_portal(&session, global_portal)
+            .await
+            .unwrap();
+        assert_eq!(global_result.shard, 0);
+        assert!(matches!(
+            global_result.value,
+            PreparedExecution::Rows(result) if result.is_empty()
+        ));
+
+        let catalog_statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT code FROM catalog_records",
+                ),
+            )
+            .await
+            .unwrap();
+        let catalog_portal = engine
+            .bind_statement(&session, catalog_statement, vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_portal(&session, catalog_portal)
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::PermissionDenied
+        );
+        let catalog_update = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "UPDATE catalog_records SET code = 1",
+                ),
+            )
+            .await
+            .unwrap();
+        let catalog_update_portal = engine
+            .bind_statement(&session, catalog_update, vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_portal(&session, catalog_update_portal)
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::PermissionDenied
+        );
+
+        let scatter = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT payload FROM events",
+                ),
+            )
+            .await
+            .unwrap();
+        let scatter_portal = engine
+            .bind_statement(&session, scatter, vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_portal(&session, scatter_portal)
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Unsupported
+        );
+        assert!(
+            engine
+                .describe_prepared(&session, DescribeTarget::Statement(statement))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_replans_and_description_refreshes_after_schema_migration() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+        session.set_routing_key("7").await.unwrap();
+        engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                    vec![Value::from(7_i64), Value::from("seven")],
+                ),
+            )
+            .await
+            .unwrap();
+        session.clear_routing_key().await.unwrap();
+
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT * FROM events WHERE tenant_id = ?1",
+                ),
+            )
+            .await
+            .unwrap();
+        let before = engine
+            .describe_prepared(&session, DescribeTarget::Statement(statement))
+            .await
+            .unwrap();
+        assert_eq!(before.columns().len(), 2);
+        let portal = engine
+            .bind_statement(&session, statement, vec![Value::from(7_i64)])
+            .await
+            .unwrap();
+
+        engine
+            .broadcast(
+                &session,
+                "ALTER TABLE events ADD COLUMN extra TEXT".to_owned(),
+            )
+            .await
+            .unwrap();
+
+        let executed = engine.execute_portal(&session, portal).await.unwrap();
+        assert_eq!(executed.shard, engine.inner.database.shard_for_key(b"7"));
+        let PreparedExecution::Rows(rows) = executed.value else {
+            panic!("the prepared SELECT must return rows");
+        };
+        assert_eq!(rows.columns().len(), 3);
+        assert_eq!(
+            rows.rows()[0].values(),
+            [Value::from(7_i64), Value::from("seven"), Value::Null,]
+        );
+
+        let after = engine
+            .describe_prepared(&session, DescribeTarget::Portal(portal))
+            .await
+            .unwrap();
+        assert_eq!(after.columns().len(), 3);
+        assert!(after.schema_generation() > before.schema_generation());
+        assert_eq!(rows.columns(), after.columns());
+        assert_eq!(
+            engine
+                .describe_prepared(&session, DescribeTarget::Portal(portal))
+                .await
+                .unwrap()
+                .schema_generation(),
+            after.schema_generation()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_description_refresh_preserves_cached_metadata_and_can_retry() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT * FROM events",
+                ),
+            )
+            .await
+            .unwrap();
+        let before = engine
+            .describe_prepared(&session, DescribeTarget::Statement(statement))
+            .await
+            .unwrap();
+        assert_eq!(before.columns().len(), 2);
+
+        engine
+            .broadcast(&session, "DROP TABLE events".to_owned())
+            .await
+            .unwrap();
+        let error = engine
+            .describe_prepared(&session, DescribeTarget::Statement(statement))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+        let cached = session
+            .inner
+            .lock()
+            .await
+            .prepared()
+            .statement(statement)
+            .unwrap()
+            .description()
+            .clone();
+        assert_eq!(cached, before);
+
+        engine
+            .broadcast(
+                &session,
+                "CREATE TABLE events (
+                    tenant_id INTEGER PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    restored TEXT
+                 )"
+                .to_owned(),
+            )
+            .await
+            .unwrap();
+        let refreshed = engine
+            .describe_prepared(&session, DescribeTarget::Statement(statement))
+            .await
+            .unwrap();
+        assert_eq!(refreshed.columns().len(), 3);
+        assert!(refreshed.schema_generation() > before.schema_generation());
+    }
+
+    #[tokio::test]
+    async fn portal_execution_result_limit_failure_is_retryable_with_the_same_handle() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+        engine
+            .broadcast(
+                &session,
+                "INSERT INTO global_events (code) VALUES (1), (2)".to_owned(),
+            )
+            .await
+            .unwrap();
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT code FROM global_events ORDER BY code",
+                ),
+            )
+            .await
+            .unwrap();
+
+        let portal = engine
+            .bind_statement(&session, statement, vec![])
+            .await
+            .unwrap();
+
+        let narrow = RequestContext::new().with_result_limits(ResultLimits::new(1, 1_024).unwrap());
+        let error = engine
+            .execute_portal_with_context(&session, portal, narrow)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        assert_eq!(session.inner.lock().await.prepared().portal_count(), 1);
+
+        let first = engine.execute_portal(&session, portal).await.unwrap();
+        let second = engine.execute_portal(&session, portal).await.unwrap();
+        assert_eq!(first, second);
+        assert!(matches!(
+            first.value,
+            PreparedExecution::Rows(result)
+                if result.rows().len() == 2
+                    && result.rows()[0].get(0) == Some(&Value::from(1_i64))
+                    && result.rows()[1].get(0) == Some(&Value::from(2_i64))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_bind_publishes_no_portal_and_normal_bind_recovers() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = Arc::new(engine.session());
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT payload FROM events WHERE tenant_id = ?1",
+                ),
+            )
+            .await
+            .unwrap();
+        let (holder_started_tx, holder_started_rx) = oneshot::channel();
+        let (holder_release_tx, holder_release_rx) = mpsc::channel();
+        let holder_engine = engine.clone();
+        let holder_session = Arc::clone(&session);
+        let holder = tokio::spawn(async move {
+            holder_engine
+                .hold_session_for_test(&holder_session, 0, holder_started_tx, holder_release_rx)
+                .await
+        });
+        holder_started_rx.await.unwrap();
+
+        let cancellation = CancellationToken::new();
+        let context = RequestContext::new().with_cancellation_token(cancellation.clone());
+        let waiting_engine = engine.clone();
+        let waiting_session = Arc::clone(&session);
+        let waiting = tokio::spawn(async move {
+            waiting_engine
+                .bind_statement_with_context(
+                    &waiting_session,
+                    statement,
+                    vec![Value::from(1_i64)],
+                    context,
+                )
+                .await
+        });
+        timeout(Duration::from_secs(2), async {
+            while engine.active_operations_for_test() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        assert_eq!(
+            waiting.await.unwrap().unwrap_err().kind(),
+            EngineErrorKind::Cancelled
+        );
+        holder_release_tx.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        assert_eq!(session.inner.lock().await.prepared().portal_count(), 0);
+
+        engine
+            .bind_statement(&session, statement, vec![Value::from(1_i64)])
+            .await
+            .unwrap();
+        assert_eq!(session.inner.lock().await.prepared().portal_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn bound_portals_keep_their_routing_snapshot_when_session_context_changes() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+        session.set_routing_key("7").await.unwrap();
+        engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                    vec![Value::from(7_i64), Value::from("delete-me")],
+                ),
+            )
+            .await
+            .unwrap();
+
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "DELETE FROM events WHERE payload = ?1",
+                ),
+            )
+            .await
+            .unwrap();
+        let portal = engine
+            .bind_statement(&session, statement, vec![Value::from("delete-me")])
+            .await
+            .unwrap();
+        let expected_shard = engine.inner.database.shard_for_key(b"7");
+        let different_route = (8_u64..)
+            .map(|value| value.to_string())
+            .find(|key| engine.inner.database.shard_for_key(key.as_bytes()) != expected_shard)
+            .unwrap();
+        session.set_routing_key(different_route).await.unwrap();
+
+        let deleted = engine.execute_portal(&session, portal).await.unwrap();
+        assert_eq!(deleted.shard, expected_shard);
+        assert_eq!(deleted.value, PreparedExecution::AffectedRows(1));
+        session.set_routing_key("7").await.unwrap();
+        let remaining = engine
+            .query(
+                &session,
+                Statement::new(
+                    "SELECT tenant_id FROM events WHERE tenant_id = ?1",
+                    vec![Value::from(7_i64)],
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(remaining.value.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_session_concurrency_cancellation_and_close_are_linearized() {
+        let limits = PreparedStatementLimits::new(1, 2, 1_024).unwrap();
+        let options = EngineOptions::new(1, 2)
+            .unwrap()
+            .with_prepared_statement_limits(limits)
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine, database) = engine_with_prepared_catalog(options);
+        let session = Arc::new(engine.session());
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let prepares = ["SELECT 1 FROM events", "SELECT 2 FROM events"]
+            .into_iter()
+            .map(|source| {
+                let engine = engine.clone();
+                let session = Arc::clone(&session);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    engine
+                        .prepare_statement(
+                            &session,
+                            PrepareRequest::new(
+                                database,
+                                sql::SqlDialect::Sqlite,
+                                sql::SqlTranslationMode::StrictSqlite,
+                                source,
+                            ),
+                        )
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait().await;
+        let mut prepared = Vec::new();
+        let mut failures = Vec::new();
+        for task in prepares {
+            match task.await.unwrap() {
+                Ok(statement) => prepared.push(statement),
+                Err(error) => failures.push(error.kind()),
+            }
+        }
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(failures, [EngineErrorKind::LimitExceeded]);
+        assert!(
+            engine
+                .close_prepared_statement(&session, prepared[0])
+                .await
+                .unwrap()
+        );
+
+        let (holder_started_tx, holder_started_rx) = oneshot::channel();
+        let (holder_release_tx, holder_release_rx) = mpsc::channel();
+        let holder_engine = engine.clone();
+        let holder_session = Arc::clone(&session);
+        let holder = tokio::spawn(async move {
+            holder_engine
+                .hold_session_for_test(&holder_session, 0, holder_started_tx, holder_release_rx)
+                .await
+        });
+        holder_started_rx.await.unwrap();
+
+        let cancellation = CancellationToken::new();
+        let context = RequestContext::new().with_cancellation_token(cancellation.clone());
+        let waiting_engine = engine.clone();
+        let waiting_session = Arc::clone(&session);
+        let waiting = tokio::spawn(async move {
+            waiting_engine
+                .prepare_statement_with_context(
+                    &waiting_session,
+                    PrepareRequest::new(
+                        database,
+                        sql::SqlDialect::Sqlite,
+                        sql::SqlTranslationMode::StrictSqlite,
+                        "SELECT 3 FROM events",
+                    ),
+                    context,
+                )
+                .await
+        });
+        timeout(Duration::from_secs(2), async {
+            while engine.active_operations_for_test() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        assert_eq!(
+            waiting.await.unwrap().unwrap_err().kind(),
+            EngineErrorKind::Cancelled
+        );
+        holder_release_tx.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        assert_eq!(session.inner.lock().await.prepared().statement_count(), 0);
+
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT payload FROM events WHERE tenant_id = ?1",
+                ),
+            )
+            .await
+            .unwrap();
+        let portal = engine
+            .bind_statement(&session, statement, vec![Value::from(1_i64)])
+            .await
+            .unwrap();
+        assert_eq!(session.inner.lock().await.prepared().portal_count(), 1);
+
+        let (close_holder_started_tx, close_holder_started_rx) = oneshot::channel();
+        let (close_holder_release_tx, close_holder_release_rx) = mpsc::channel();
+        let holder_engine = engine.clone();
+        let holder_session = Arc::clone(&session);
+        let holder = tokio::spawn(async move {
+            holder_engine
+                .hold_session_for_test(
+                    &holder_session,
+                    0,
+                    close_holder_started_tx,
+                    close_holder_release_rx,
+                )
+                .await
+        });
+        close_holder_started_rx.await.unwrap();
+        let closing_session = Arc::clone(&session);
+        let mut close = tokio::spawn(async move { closing_session.close().await });
+        assert!(
+            timeout(Duration::from_millis(20), &mut close)
+                .await
+                .is_err()
+        );
+        close_holder_release_tx.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        close.await.unwrap().unwrap();
+        assert_eq!(session.state().await, SessionState::Closed);
+        let guard = session.inner.lock().await;
+        assert_eq!(guard.prepared().statement_count(), 0);
+        assert_eq!(guard.prepared().portal_count(), 0);
+        drop(guard);
+        assert_eq!(
+            engine
+                .execute_portal(&session, portal)
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_rejects_prepared_work_but_allows_explicit_cleanup() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+        let request = || {
+            PrepareRequest::new(
+                database,
+                sql::SqlDialect::Sqlite,
+                sql::SqlTranslationMode::StrictSqlite,
+                "SELECT 1",
+            )
+        };
+        let statement = engine.prepare_statement(&session, request()).await.unwrap();
+        let portal = engine
+            .bind_statement(&session, statement, vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(engine.begin_shutdown(), EngineState::Draining);
+        assert_eq!(
+            engine
+                .prepare_statement(&session, request())
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::ShuttingDown
+        );
+        assert_eq!(
+            engine
+                .bind_statement(&session, statement, vec![])
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::ShuttingDown
+        );
+        assert_eq!(
+            engine
+                .describe_prepared(&session, DescribeTarget::Statement(statement))
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::ShuttingDown
+        );
+        assert_eq!(
+            engine
+                .execute_portal(&session, portal)
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::ShuttingDown
+        );
+
+        assert!(engine.close_portal(&session, portal).await.unwrap());
+        assert!(
+            engine
+                .close_prepared_statement(&session, statement)
+                .await
+                .unwrap()
+        );
+        session.close().await.unwrap();
+        engine.shutdown().await.unwrap();
+        assert_eq!(engine.state(), EngineState::Stopped);
     }
 
     #[tokio::test]

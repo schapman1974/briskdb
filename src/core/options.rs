@@ -22,6 +22,15 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// Default graceful-shutdown drain period in milliseconds.
 pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 30_000;
 
+/// Default maximum number of prepared statements retained by one session.
+pub const DEFAULT_MAX_PREPARED_STATEMENTS_PER_SESSION: usize = 128;
+
+/// Default maximum number of bound portals retained by one session.
+pub const DEFAULT_MAX_PORTALS_PER_SESSION: usize = 128;
+
+/// Default maximum accounted bound-value bytes retained by one session (16 MiB).
+pub const DEFAULT_MAX_RETAINED_BOUND_VALUE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Maximum configurable connections per shard.
 pub const MAX_CONNECTIONS_PER_SHARD: usize = 16;
 
@@ -39,6 +48,15 @@ pub const MAX_REQUEST_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 
 /// Maximum configured graceful-shutdown period (24 hours).
 pub const MAX_SHUTDOWN_GRACE_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// Maximum configurable prepared statements retained by one session.
+pub const MAX_PREPARED_STATEMENTS_PER_SESSION: usize = 1_024;
+
+/// Maximum configurable bound portals retained by one session.
+pub const MAX_PORTALS_PER_SESSION: usize = 1_024;
+
+/// Maximum configurable accounted bound-value bytes retained by one session (1 GiB).
+pub const MAX_RETAINED_BOUND_VALUE_BYTES: u64 = 1024 * 1024 * 1024;
 
 const MAX_TOTAL_ACTIVE_CONNECTIONS: usize = 512;
 
@@ -98,16 +116,101 @@ impl Default for ResultLimits {
     }
 }
 
+/// Validated per-session limits for prepared statements and bound portals.
+///
+/// The retained byte limit accounts for protocol-neutral logical values owned
+/// by all portals in a session. The same ceiling conservatively bounds one
+/// bind's planning expansion by charging the captured route once and every
+/// normalized marker occurrence twice, once for typed inference and once for
+/// canonical routing. It is independent of the materialized query-result byte
+/// limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedStatementLimits {
+    max_statements_per_session: usize,
+    max_portals_per_session: usize,
+    max_retained_bound_value_bytes: u64,
+}
+
+impl PreparedStatementLimits {
+    /// Construct validated finite per-session prepared-statement limits.
+    pub fn new(
+        max_statements_per_session: usize,
+        max_portals_per_session: usize,
+        max_retained_bound_value_bytes: u64,
+    ) -> EngineResult<Self> {
+        if !(1..=MAX_PREPARED_STATEMENTS_PER_SESSION).contains(&max_statements_per_session) {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!(
+                    "maximum prepared statements per session must be between 1 and \
+                     {MAX_PREPARED_STATEMENTS_PER_SESSION}"
+                ),
+            ));
+        }
+        if !(1..=MAX_PORTALS_PER_SESSION).contains(&max_portals_per_session) {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!(
+                    "maximum portals per session must be between 1 and \
+                     {MAX_PORTALS_PER_SESSION}"
+                ),
+            ));
+        }
+        if !(1..=MAX_RETAINED_BOUND_VALUE_BYTES).contains(&max_retained_bound_value_bytes) {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!(
+                    "maximum retained bound-value bytes must be between 1 and \
+                     {MAX_RETAINED_BOUND_VALUE_BYTES}"
+                ),
+            ));
+        }
+
+        Ok(Self {
+            max_statements_per_session,
+            max_portals_per_session,
+            max_retained_bound_value_bytes,
+        })
+    }
+
+    /// Return the maximum prepared statements retained by one session.
+    pub const fn max_statements_per_session(self) -> usize {
+        self.max_statements_per_session
+    }
+
+    /// Return the maximum bound portals retained by one session.
+    pub const fn max_portals_per_session(self) -> usize {
+        self.max_portals_per_session
+    }
+
+    /// Return the maximum accounted retained and per-bind planning bytes.
+    pub const fn max_retained_bound_value_bytes(self) -> u64 {
+        self.max_retained_bound_value_bytes
+    }
+}
+
+impl Default for PreparedStatementLimits {
+    fn default() -> Self {
+        Self {
+            max_statements_per_session: DEFAULT_MAX_PREPARED_STATEMENTS_PER_SESSION,
+            max_portals_per_session: DEFAULT_MAX_PORTALS_PER_SESSION,
+            max_retained_bound_value_bytes: DEFAULT_MAX_RETAINED_BOUND_VALUE_BYTES,
+        }
+    }
+}
+
 /// Resource limits for the asynchronous engine.
 ///
 /// These limits bound active SQLite connections, admitted work, materialized
-/// results, request duration, and graceful-shutdown draining. A caller can
-/// narrow the result and time limits for one request through `RequestContext`.
+/// results, session-owned prepared state, request duration, and
+/// graceful-shutdown draining. A caller can narrow the result and time limits
+/// for one request through `RequestContext`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineOptions {
     connections_per_shard: usize,
     queue_capacity_per_shard: usize,
     result_limits: ResultLimits,
+    prepared_statement_limits: PreparedStatementLimits,
     request_timeout: Option<Duration>,
     shutdown_grace: Duration,
 }
@@ -137,6 +240,7 @@ impl EngineOptions {
             connections_per_shard,
             queue_capacity_per_shard,
             result_limits: ResultLimits::default(),
+            prepared_statement_limits: PreparedStatementLimits::default(),
             request_timeout: Some(Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS)),
             shutdown_grace: Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS),
         })
@@ -161,6 +265,21 @@ impl EngineOptions {
     #[must_use]
     pub const fn with_result_limits(mut self, result_limits: ResultLimits) -> Self {
         self.result_limits = result_limits;
+        self
+    }
+
+    /// Return the finite per-session prepared-statement limits.
+    pub const fn prepared_statement_limits(&self) -> PreparedStatementLimits {
+        self.prepared_statement_limits
+    }
+
+    /// Replace the finite per-session prepared-statement limits.
+    #[must_use]
+    pub const fn with_prepared_statement_limits(
+        mut self,
+        prepared_statement_limits: PreparedStatementLimits,
+    ) -> Self {
+        self.prepared_statement_limits = prepared_statement_limits;
         self
     }
 
@@ -222,6 +341,11 @@ impl Default for EngineOptions {
                 max_rows: DEFAULT_MAX_RESULT_ROWS,
                 max_bytes: DEFAULT_MAX_RESULT_BYTES,
             },
+            prepared_statement_limits: PreparedStatementLimits {
+                max_statements_per_session: DEFAULT_MAX_PREPARED_STATEMENTS_PER_SESSION,
+                max_portals_per_session: DEFAULT_MAX_PORTALS_PER_SESSION,
+                max_retained_bound_value_bytes: DEFAULT_MAX_RETAINED_BOUND_VALUE_BYTES,
+            },
             request_timeout: Some(Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS)),
             shutdown_grace: Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS),
         }
@@ -261,6 +385,28 @@ mod tests {
         assert_eq!(options.result_limits(), ResultLimits::default());
         assert_eq!(options.result_limits().max_rows(), 10_000);
         assert_eq!(options.result_limits().max_bytes(), 16 * 1024 * 1024);
+        assert_eq!(
+            options.prepared_statement_limits(),
+            PreparedStatementLimits::default()
+        );
+        assert_eq!(
+            options
+                .prepared_statement_limits()
+                .max_statements_per_session(),
+            128
+        );
+        assert_eq!(
+            options
+                .prepared_statement_limits()
+                .max_portals_per_session(),
+            128
+        );
+        assert_eq!(
+            options
+                .prepared_statement_limits()
+                .max_retained_bound_value_bytes(),
+            16 * 1024 * 1024
+        );
         assert_eq!(options.request_timeout(), Some(Duration::from_secs(30)));
         assert_eq!(options.shutdown_grace(), Duration::from_secs(30));
         assert_eq!(options.worker_limit(2).unwrap(), 8);
@@ -296,6 +442,14 @@ mod tests {
         assert_eq!(maximum.queue_capacity_per_shard(), 1_024);
         assert_eq!(minimum.result_limits(), ResultLimits::default());
         assert_eq!(maximum.result_limits(), ResultLimits::default());
+        assert_eq!(
+            minimum.prepared_statement_limits(),
+            PreparedStatementLimits::default()
+        );
+        assert_eq!(
+            maximum.prepared_statement_limits(),
+            PreparedStatementLimits::default()
+        );
     }
 
     #[test]
@@ -323,6 +477,40 @@ mod tests {
     }
 
     #[test]
+    fn prepared_statement_limit_constructor_preserves_inclusive_boundaries() {
+        let minimum = PreparedStatementLimits::new(1, 1, 1).unwrap();
+        assert_eq!(minimum.max_statements_per_session(), 1);
+        assert_eq!(minimum.max_portals_per_session(), 1);
+        assert_eq!(minimum.max_retained_bound_value_bytes(), 1);
+
+        let maximum = PreparedStatementLimits::new(
+            MAX_PREPARED_STATEMENTS_PER_SESSION,
+            MAX_PORTALS_PER_SESSION,
+            MAX_RETAINED_BOUND_VALUE_BYTES,
+        )
+        .unwrap();
+        assert_eq!(maximum.max_statements_per_session(), 1_024);
+        assert_eq!(maximum.max_portals_per_session(), 1_024);
+        assert_eq!(maximum.max_retained_bound_value_bytes(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn prepared_statement_limit_constructor_rejects_each_invalid_value() {
+        for (max_statements, max_portals, max_bound_bytes) in [
+            (0, 1, 1),
+            (MAX_PREPARED_STATEMENTS_PER_SESSION + 1, 1, 1),
+            (1, 0, 1),
+            (1, MAX_PORTALS_PER_SESSION + 1, 1),
+            (1, 1, 0),
+            (1, 1, MAX_RETAINED_BOUND_VALUE_BYTES + 1),
+        ] {
+            let error = PreparedStatementLimits::new(max_statements, max_portals, max_bound_bytes)
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+        }
+    }
+
+    #[test]
     fn engine_options_builder_replaces_only_result_limits() {
         let limits = ResultLimits::new(37, 4_096).unwrap();
         let options = EngineOptions::new(2, 7).unwrap().with_result_limits(limits);
@@ -330,6 +518,25 @@ mod tests {
         assert_eq!(options.connections_per_shard(), 2);
         assert_eq!(options.queue_capacity_per_shard(), 7);
         assert_eq!(options.result_limits(), limits);
+        assert_eq!(
+            options.prepared_statement_limits(),
+            PreparedStatementLimits::default()
+        );
+        assert_eq!(options.request_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(options.shutdown_grace(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn engine_options_builder_replaces_only_prepared_statement_limits() {
+        let limits = PreparedStatementLimits::new(37, 41, 4_096).unwrap();
+        let options = EngineOptions::new(2, 7)
+            .unwrap()
+            .with_prepared_statement_limits(limits);
+
+        assert_eq!(options.connections_per_shard(), 2);
+        assert_eq!(options.queue_capacity_per_shard(), 7);
+        assert_eq!(options.result_limits(), ResultLimits::default());
+        assert_eq!(options.prepared_statement_limits(), limits);
         assert_eq!(options.request_timeout(), Some(Duration::from_secs(30)));
         assert_eq!(options.shutdown_grace(), Duration::from_secs(30));
     }

@@ -73,7 +73,8 @@ In particular, this layer does not:
   call with physical-target comparison and sharded-write policy;
 - itself translate types or syntax; issue #25 implements that as the separate
   `translate_sql(NormalizedSql, SqlTranslationMode)` layer;
-- implement prepare/bind/describe/execute state or caches (issue #26); or
+- implement prepare/bind/describe/execute state or caches (issue #26 provides
+  those as a separate core layer); or
 - classify statement behavior or reject unsafe multi-statement combinations
   (issue #27).
 
@@ -88,9 +89,10 @@ The existing HTTP execute, query, and migration paths remain raw SQLite
 pass-through surfaces with their existing authorizer and endpoint-specific
 rules. They call neither this parser, the opt-in common-subset validator,
 placeholder normalizer, translator, shard-key inference, nor bound statement
-planner. Connecting those layers before the prepared execution lifecycle and
-request-level statement policy are implemented would change the experimental
-HTTP SQL surface.
+planner. The separate Rust
+[prepared lifecycle](SQL_PREPARED_STATEMENTS.md) now connects those layers for
+an exact-one-statement handle without changing the experimental HTTP SQL
+surface. Request-level statement and batch policy remains issue #27.
 
 ## Resource and error boundaries
 
