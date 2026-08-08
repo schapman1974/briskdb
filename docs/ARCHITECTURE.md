@@ -74,13 +74,16 @@ the controlled defaults.
 
 ## Manifest storage boundary
 
-The storage module now owns an ordered manifest-format migration runner. It
+The storage module owns an ordered manifest-format migration runner. It
 identifies a current manifest with SQLite `application_id = 0x42524442` and uses
-`user_version` as the single authoritative schema version. Version 2 replaces
-the legacy key/value configuration with a strict singleton shard-count table
-and retains an intentionally incompatible `briskdb_metadata` table as a
-downgrade fence. This prevents the shipped legacy opener—which did not check a
-version marker—from silently accepting the new format.
+`user_version` as the single authoritative schema version. Version 2 replaced
+the legacy key/value configuration with a strict singleton shard-count table.
+Version 3 adds the durable routing catalog: independently versioned hash, key
+encoding, and bucket derivation; the initial map generation; exactly 4,096
+virtual buckets; and contiguous, active physical-shard records. Each version
+retains an intentionally incompatible `briskdb_metadata` definition and row as
+a downgrade fence. Shipped version-1 and version-2 readers therefore fail
+closed instead of interpreting a newer manifest.
 
 Startup acquires `BEGIN IMMEDIATE` before making any migration decision. Each
 registered numbered step rewrites schema/data, stamps and reads back its target
@@ -93,10 +96,14 @@ manifest does not rewrite its journal mode or touch shard files.
 
 This is an internal storage-open concern. It changes no core or adapter
 signature, is unreachable from client SQL, and is atomic only within
-`manifest.sqlite`. It neither changes current modulo routing nor implements the
-future cross-shard application-schema migration journal. The exact format,
-downgrade policy, recovery cases, and tests are documented in
-[manifest storage format](STORAGE_FORMAT.md).
+`manifest.sqlite`. Runtime routing still uses the legacy BLAKE3 modulo path;
+catalog lookup is the next isolated roadmap item. The generation-1 bucket ranges
+and versioned derivation are constructed to reproduce that placement for every
+supported initial shard count, including counts that do not divide 4,096. The
+catalog does not yet validate shard-file presence, identity, WAL, or schema
+generation, and it is not the future cross-shard application-schema migration
+journal. The exact format, downgrade policy, recovery cases, and tests are
+documented in [manifest storage format](STORAGE_FORMAT.md).
 
 ## Session and asynchronous engine boundary
 
