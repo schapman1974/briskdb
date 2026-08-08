@@ -249,4 +249,25 @@ mod tests {
             vec![json!({"id": "widget-1", "name": "First widget"})]
         );
     }
+
+    #[test]
+    fn json_number_conversion_matches_the_http_compatibility_contract() {
+        assert_eq!(json_to_sql(&json!(42)), SqlValue::Integer(42));
+        assert_eq!(json_to_sql(&json!(1.5)), SqlValue::Real(1.5));
+
+        let above_signed_i64_range = json!(9_223_372_036_854_775_809_u64);
+        assert_eq!(
+            json_to_sql(&above_signed_i64_range),
+            SqlValue::Real(9_223_372_036_854_775_808.0)
+        );
+        assert!(serde_json::from_str::<Value>("1e400").is_err());
+    }
+
+    #[test]
+    fn sqlite_text_with_invalid_utf8_is_converted_lossily() {
+        assert_eq!(
+            sql_to_json(ValueRef::Text(&[b'f', 0x80])),
+            Value::String("f\u{fffd}".to_owned())
+        );
+    }
 }

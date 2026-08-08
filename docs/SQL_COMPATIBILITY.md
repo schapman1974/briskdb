@@ -16,8 +16,11 @@ document defines the SQL and behavioral contract separately from connectivity.
 - **Unsupported** means BriskDB rejects the behavior or makes no compatibility
   promise for it.
 
-Unsupported syntax must fail explicitly. BriskDB must not silently reinterpret
-a statement with materially different semantics.
+The stable parser and protocol adapters will fail explicitly for unsupported
+syntax and must not silently reinterpret a statement with materially different
+semantics. The current experimental HTTP interface is a raw SQLite pass-through
+and can still execute uncontracted SQLite syntax; that behavior is not a
+compatibility promise.
 
 ## Compatibility layers
 
@@ -43,14 +46,16 @@ translation layer. HTTP requests send SQLite SQL directly to `rusqlite`.
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
 | HTTP `/v1/execute` | Experimental | One SQLite statement with positional parameters | Required caller-provided `shard_key` |
-| HTTP `/v1/query` | Experimental | One SQLite query with positional parameters | Required caller-provided `shard_key` |
+| HTTP `/v1/query` | Experimental | One prepared SQLite statement executed through the row-returning path | Required caller-provided `shard_key` |
 | HTTP `/v1/admin/broadcast` | Experimental | A parameterless SQLite statement batch | Sequentially applied to every shard |
 | PostgreSQL wire protocol | Planned | Common subset plus documented PostgreSQL normalization | SQL/bound-parameter inference with explicit session fallback |
 | MySQL wire protocol | Planned | Common subset plus documented MySQL normalization | SQL/bound-parameter inference with explicit session fallback |
 
 The current HTTP calls open a SQLite connection per request. A transaction
-cannot span requests. Broadcast execution is not atomic across shard files: a
-failure can occur after earlier shards have committed their schema change.
+cannot span requests. Broadcast execution is not atomic: its parameterless SQL
+batch is not wrapped in a transaction on each shard, and shards are processed
+sequentially. A failure can therefore leave earlier statements committed on the
+failing shard as well as leave earlier shards fully or partially updated.
 
 ### Current parameter and result conversion
 
@@ -62,16 +67,17 @@ interpolated into SQL text.
 | `null` | `NULL` |
 | `true` / `false` | `INTEGER` `1` / `0` |
 | Signed integer representable as `i64` | `INTEGER` |
-| Other JSON number representable as `f64` | `REAL` |
-| Number outside those representations | Decimal text |
+| Other accepted JSON number | `REAL` through `f64`; large integers can lose precision |
+| Number outside `serde_json`'s accepted range | Request decoding fails before SQLite binding |
 | String | `TEXT` |
 | Array or object | Compact JSON stored as `TEXT` |
 
-SQLite results currently map `NULL`, `INTEGER`, `REAL`, and `TEXT` directly to
-their JSON counterparts. A `BLOB` is returned as an array of byte-valued JSON
+SQLite results currently map `NULL`, `INTEGER`, and `REAL` directly to their
+JSON counterparts. `TEXT` is decoded as UTF-8 with invalid byte sequences
+replaced by U+FFFD. A `BLOB` is returned as an array of byte-valued JSON
 integers. Query results are currently JSON objects keyed by column name, so a
 later duplicate column name overwrites an earlier one. The protocol-neutral
-row model will replace this lossy representation before the API is stable.
+row model will replace these lossy representations before the API is stable.
 
 ## SQL surface
 
@@ -92,7 +98,9 @@ Other SQLite syntax may happen to pass through, but it is not a stable BriskDB
 contract until it appears in this table and has conformance tests. In
 particular, multi-request transactions, multi-shard writes, `RETURNING`,
 multiple statements outside the broadcast endpoint, and attached-database
-operations are unsupported public API behavior today.
+operations are uncontracted public API behavior today. The experimental raw
+HTTP path might accept some of them; clients must not rely on acceptance,
+rejection, or unchanged semantics.
 
 ### Planned common subset
 
