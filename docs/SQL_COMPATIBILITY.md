@@ -357,6 +357,13 @@ describe sequential commits to several shard files as atomic. The initial SQL
 session contract will therefore pin explicit transactions to one shard and
 reject cross-shard access.
 
+Manifest-format migrations are separate from application SQL migrations. They
+run internally during storage open, are transactional only within
+`manifest.sqlite`, and cannot be requested through any protocol or SQL
+statement. The version-2 manifest upgrade does not change shard schemas,
+supported SQLite syntax, result conversion, routing, or broadcast semantics.
+See the [manifest storage-format contract](STORAGE_FORMAT.md).
+
 Scatter reads will combine committed results from multiple SQLite files. They
 will not claim an atomic cross-file snapshot until BriskDB has an implementation
 and failure tests that establish such a guarantee.

@@ -181,7 +181,7 @@ existing tests pass through the shared engine.
 
 ### 2. Durable shard catalog and routing
 
-- [ ] Version the manifest schema with transactional migrations.
+- [x] Version the manifest schema with transactional migrations.
 - [ ] Persist hash/key-encoding versions, 4,096 virtual buckets, physical shard
   records, map generation, and lifecycle state.
 - [ ] Replace modulo routing with virtual-bucket lookup and add golden routing

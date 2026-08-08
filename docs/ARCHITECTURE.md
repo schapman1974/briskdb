@@ -72,6 +72,32 @@ synchronous `Database` API remains available as a Rust compatibility surface;
 existing engine and server entry points retain their signatures and delegate to
 the controlled defaults.
 
+## Manifest storage boundary
+
+The storage module now owns an ordered manifest-format migration runner. It
+identifies a current manifest with SQLite `application_id = 0x42524442` and uses
+`user_version` as the single authoritative schema version. Version 2 replaces
+the legacy key/value configuration with a strict singleton shard-count table
+and retains an intentionally incompatible `briskdb_metadata` table as a
+downgrade fence. This prevents the shipped legacy opener—which did not check a
+version marker—from silently accepting the new format.
+
+Startup acquires `BEGIN IMMEDIATE` before making any migration decision. Each
+registered numbered step rewrites schema/data, stamps and reads back its target
+identity/version, validates the destination, and commits in its own transaction.
+Concurrent openers therefore serialize and re-evaluate committed state. A
+failed or interrupted step rolls back to the previous complete version and can
+be retried. Persistent WAL configuration and shard creation occur only after a
+compatible current manifest is committed, so rejecting a foreign or future
+manifest does not rewrite its journal mode or touch shard files.
+
+This is an internal storage-open concern. It changes no core or adapter
+signature, is unreachable from client SQL, and is atomic only within
+`manifest.sqlite`. It neither changes current modulo routing nor implements the
+future cross-shard application-schema migration journal. The exact format,
+downgrade policy, recovery cases, and tests are documented in
+[manifest storage format](STORAGE_FORMAT.md).
+
 ## Session and asynchronous engine boundary
 
 `Session` is protocol-neutral mutable state owned by one frontend connection or

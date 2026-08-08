@@ -19,6 +19,8 @@ HTTP problem details, and the mappings reserved for future PostgreSQL and MySQL
 adapters.
 The [request-control contract](docs/REQUEST_CONTROLS.md) defines cancellation,
 deadlines, materialized-result budgets, and graceful shutdown.
+The [manifest storage-format contract](docs/STORAGE_FORMAT.md) defines versioned
+startup migrations, downgrade behavior, and recovery boundaries.
 Contributions follow the repository's [test-first completion policy](CONTRIBUTING.md).
 The [benchmark baseline](docs/BENCHMARKS.md) defines the reproducible storage
 workloads used to measure the current prototype.
@@ -38,7 +40,7 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Finite per-query row/logical-byte budgets with no partial results
 - Explicit graceful drain, forced cancellation, and blocking handle cleanup
 - Protocol-neutral typed values, ordered columns, positional rows, and results
-- A fixed shard count recorded in `manifest.sqlite`
+- A transactionally versioned `manifest.sqlite` with a fixed shard count
 - One WAL-enabled SQLite database per shard
 - Routed execute and query endpoints
 - A broadcast endpoint for initializing schema on every shard
@@ -166,12 +168,17 @@ Queries have finite row and logical-byte budgets, account values before cloning
 payloads, and return no partial result on `LimitExceeded`.
 Broadcast changes and future scatter operations are not atomic across shard
 files. The shard count is immutable after database creation, so resharding will
-require an explicit migration workflow. Pooling does not change the manifest
-schema, shard files, or stored-data format. Embedders should call
+require an explicit migration workflow. Opening now upgrades the exact legacy
+manifest format to version 2 atomically; newer or malformed manifests fail
+closed, and an intentional downgrade fence prevents the shipped legacy opener
+from silently reading version 2. This changes only `manifest.sqlite`, not shard
+files, routing, SQL behavior, or wire contracts. The complete format and
+upgrade contract is in [manifest storage format](docs/STORAGE_FORMAT.md).
+Embedders should call
 `Engine::shutdown`; merely dropping the final `Engine` is not the explicit
 asynchronous cleanup contract.
 
-Near-term work includes authentication, schema migrations,
+Near-term work includes authentication, application-schema migrations,
 scatter/gather reads, observability, backup tooling, and failure-injection
 tests for multi-shard operations.
 
