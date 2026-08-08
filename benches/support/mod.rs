@@ -63,11 +63,11 @@ impl BenchmarkFixture {
 
     pub fn point_read(&self) -> anyhow::Result<ResultSet> {
         let key = &self.keys_by_shard[0];
-        self.database.query(
+        Ok(self.database.query(
             key,
             "SELECT id, writes, payload FROM benchmark_items WHERE id = ?1",
             &[Value::from(key.clone())],
-        )
+        )?)
     }
 
     pub fn point_write(&self) -> anyhow::Result<usize> {
@@ -125,11 +125,11 @@ impl BenchmarkFixture {
 }
 
 fn update_key(database: &Database, key: &str) -> anyhow::Result<usize> {
-    database.execute(
+    Ok(database.execute(
         key,
         "UPDATE benchmark_items SET writes = writes + 1 WHERE id = ?1",
         &[Value::from(key)],
-    )
+    )?)
 }
 
 fn find_key_for_each_shard(

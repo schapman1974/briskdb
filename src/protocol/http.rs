@@ -5,14 +5,17 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
-use crate::core::{DataType, Database, ResultSet, Routed, Value};
+use crate::{
+    core::{DataType, Database, EngineError, EngineErrorKind, ResultSet, Routed, Value},
+    protocol::error::http_error,
+};
 
 pub fn router(database: Arc<Database>) -> Router {
     Router::new()
@@ -99,7 +102,7 @@ async fn query(
             shard,
             value: result,
         } = database.query_routed(&request.shard_key, &request.sql, &params)?;
-        Ok::<_, anyhow::Error>(result_set_to_query_response(shard, result))
+        Ok::<_, EngineError>(result_set_to_query_response(shard, result))
     })
     .await??;
 
@@ -188,29 +191,68 @@ const fn data_type_name(data_type: DataType) -> &'static str {
     }
 }
 
-struct ApiError(anyhow::Error);
+#[derive(Debug)]
+struct ApiError(EngineError);
 
-impl<E> From<E> for ApiError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(error: E) -> Self {
-        Self(error.into())
+impl From<EngineError> for ApiError {
+    fn from(error: EngineError) -> Self {
+        Self(error)
     }
+}
+
+impl From<tokio::task::JoinError> for ApiError {
+    fn from(error: tokio::task::JoinError) -> Self {
+        Self(EngineError::from_source(
+            EngineErrorKind::Internal,
+            "blocking engine task failed",
+            error,
+        ))
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ProblemDetails {
+    #[serde(rename = "type")]
+    problem_type: &'static str,
+    title: &'static str,
+    status: u16,
+    detail: &'static str,
+    code: &'static str,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": self.0.to_string()})),
+        let mapping = http_error(self.0.kind());
+        tracing::error!(
+            error = ?self.0,
+            error_code = self.0.code(),
+            "engine request failed"
+        );
+        let status = StatusCode::from_u16(mapping.status)
+            .expect("the exhaustive HTTP error mapping contains valid status codes");
+        let mut response = (
+            status,
+            Json(ProblemDetails {
+                problem_type: mapping.problem_type,
+                title: mapping.title,
+                status: mapping.status,
+                detail: mapping.detail,
+                code: self.0.code(),
+            }),
         )
-            .into_response()
+            .into_response();
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/problem+json"),
+        );
+        response
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use axum::{
         body::{Body, to_bytes},
         http::{Method, Request},
@@ -220,12 +262,12 @@ mod tests {
     use super::*;
     use crate::core::{Column, DataType, Row};
 
-    async fn request_json(
+    async fn send_json(
         router: &Router,
         method: Method,
         uri: &str,
         body: Option<JsonValue>,
-    ) -> (StatusCode, JsonValue) {
+    ) -> Response {
         let mut request = Request::builder().method(method).uri(uri);
         let body = match body {
             Some(value) => {
@@ -234,14 +276,26 @@ mod tests {
             }
             None => Body::empty(),
         };
-        let response = router
+        router
             .clone()
             .oneshot(request.body(body).unwrap())
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    async fn response_json(response: Response) -> (StatusCode, JsonValue) {
         let status = response.status();
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn request_json(
+        router: &Router,
+        method: Method,
+        uri: &str,
+        body: Option<JsonValue>,
+    ) -> (StatusCode, JsonValue) {
+        response_json(send_json(router, method, uri, body).await).await
     }
 
     #[tokio::test]
@@ -311,11 +365,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_errors_keep_the_json_500_contract() {
+    async fn invalid_queries_use_safe_problem_details() {
         let temp = tempfile::tempdir().unwrap();
         let application = router(Arc::new(Database::open(temp.path(), 4).unwrap()));
 
-        let (status, body) = request_json(
+        let response = send_json(
             &application,
             Method::POST,
             "/v1/query",
@@ -325,9 +379,24 @@ mod tests {
             })),
         )
         .await;
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+        let (status, body) = response_json(response).await;
 
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(body["error"].as_str().unwrap().contains("no such table"));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body,
+            json!({
+                "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#invalid-query",
+                "title": "Invalid query",
+                "status": 422,
+                "detail": "The query could not be processed.",
+                "code": "invalid_query"
+            })
+        );
+        assert!(!body.to_string().contains("missing_table"));
     }
 
     #[tokio::test]
@@ -348,10 +417,120 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
-            body["error"],
-            format!("unsigned integer {too_large} exceeds SQLite INTEGER range")
+            body,
+            json!({
+                "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#numeric-out-of-range",
+                "title": "Numeric value out of range",
+                "status": 422,
+                "detail": "A numeric value is outside the supported range.",
+                "code": "numeric_out_of_range"
+            })
+        );
+        assert!(!body.to_string().contains(&too_large.to_string()));
+    }
+
+    #[tokio::test]
+    async fn constraint_failures_keep_their_precise_safe_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let application = router(Arc::new(Database::open(temp.path(), 4).unwrap()));
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/admin/broadcast",
+                Some(json!({"sql": "CREATE TABLE widgets (id TEXT PRIMARY KEY)"})),
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let insert = || {
+            send_json(
+                &application,
+                Method::POST,
+                "/v1/execute",
+                Some(json!({
+                    "shard_key": "widget-1",
+                    "sql": "INSERT INTO widgets (id) VALUES (?1)",
+                    "params": ["private-value"]
+                })),
+            )
+        };
+        assert_eq!(response_json(insert().await).await.0, StatusCode::OK);
+
+        let response = insert().await;
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+        assert_eq!(
+            response_json(response).await,
+            (
+                StatusCode::CONFLICT,
+                json!({
+                    "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#unique-violation",
+                    "title": "Unique constraint violation",
+                    "status": 409,
+                    "detail": "A unique constraint was violated.",
+                    "code": "unique_violation"
+                })
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn every_problem_kind_uses_its_exact_mapping_and_redacts_sources() {
+        let secret = "password=hunter2 /private/customer.sqlite SELECT secret_value";
+        for &kind in EngineErrorKind::ALL {
+            let mapping = http_error(kind);
+            let error = EngineError::from_source(kind, secret, io::Error::other(secret));
+            let response = ApiError(error).into_response();
+
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE).unwrap(),
+                "application/problem+json"
+            );
+            let (status, body) = response_json(response).await;
+            assert_eq!(status.as_u16(), mapping.status, "{} status", kind.code());
+            assert_eq!(
+                body,
+                json!({
+                    "type": mapping.problem_type,
+                    "title": mapping.title,
+                    "status": mapping.status,
+                    "detail": mapping.detail,
+                    "code": kind.code()
+                }),
+                "{} body",
+                kind.code()
+            );
+            assert!(!body.to_string().contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_task_panics_become_redacted_internal_problems() {
+        let join_error = tokio::spawn(async {
+            panic!("password=hunter2 /private/customer.sqlite SELECT secret_value")
+        })
+        .await
+        .unwrap_err();
+        let response = ApiError::from(join_error).into_response();
+
+        assert_eq!(
+            response_json(response).await,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#internal",
+                    "title": "Internal error",
+                    "status": 500,
+                    "detail": "An internal engine error occurred.",
+                    "code": "internal"
+                })
+            )
         );
     }
 

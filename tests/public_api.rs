@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use axum::Router;
-use briskdb::{api, core, protocol::http, storage};
+use briskdb::{
+    api, core,
+    protocol::{error, http},
+    storage,
+};
 
 #[test]
 fn legacy_and_explicit_module_paths_are_both_available() {
@@ -21,4 +25,19 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     assert_eq!(core::Value::from(decimal).as_decimal(), Some("12.3400"));
     let _invalid_decimal: core::ParseDecimalError =
         "not-a-number".parse::<core::Decimal>().unwrap_err();
+
+    let engine_error = core::EngineError::new(core::EngineErrorKind::InvalidArgument, "diagnostic");
+    let _engine_result: core::EngineResult<()> = Err(engine_error);
+    assert_eq!(
+        error::http_error(core::EngineErrorKind::InvalidArgument).status,
+        400
+    );
+    assert_eq!(
+        error::postgres_error(core::EngineErrorKind::UniqueViolation).sqlstate,
+        "23505"
+    );
+    assert_eq!(
+        error::mysql_error(core::EngineErrorKind::UniqueViolation).error_number,
+        1062
+    );
 }

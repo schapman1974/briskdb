@@ -3,15 +3,15 @@
 //! This module owns routing and coordinates storage and SQL execution. It does
 //! not depend on a network protocol.
 
+mod error;
 mod types;
 
+pub use error::{EngineError, EngineErrorKind, EngineResult};
 pub use types::{
     Column, DataType, Decimal, ParseDecimalError, ResultSet, ResultSetShapeError, Row, Value,
 };
 
 use std::path::Path;
-
-use anyhow::Context;
 
 use crate::{sql, storage::Storage};
 
@@ -27,7 +27,7 @@ pub struct Routed<T> {
 }
 
 impl Database {
-    pub fn open(root: impl AsRef<Path>, requested_shards: u16) -> anyhow::Result<Self> {
+    pub fn open(root: impl AsRef<Path>, requested_shards: u16) -> EngineResult<Self> {
         Ok(Self {
             storage: Storage::open(root, requested_shards)?,
         })
@@ -50,7 +50,7 @@ impl Database {
         shard_key: &str,
         statement: &str,
         params: &[Value],
-    ) -> anyhow::Result<Routed<usize>> {
+    ) -> EngineResult<Routed<usize>> {
         let shard = self.shard_for_key(shard_key.as_bytes());
         let connection = self.storage.open_shard(shard)?;
         let value = sql::execute(&connection, statement, params)?;
@@ -62,7 +62,7 @@ impl Database {
         shard_key: &str,
         statement: &str,
         params: &[Value],
-    ) -> anyhow::Result<Routed<ResultSet>> {
+    ) -> EngineResult<Routed<ResultSet>> {
         let shard = self.shard_for_key(shard_key.as_bytes());
         let connection = self.storage.open_shard(shard)?;
         let value = sql::query(&connection, statement, params)?;
@@ -74,7 +74,7 @@ impl Database {
         shard_key: &str,
         statement: &str,
         params: &[Value],
-    ) -> anyhow::Result<usize> {
+    ) -> EngineResult<usize> {
         Ok(self.execute_routed(shard_key, statement, params)?.value)
     }
 
@@ -83,16 +83,18 @@ impl Database {
         shard_key: &str,
         statement: &str,
         params: &[Value],
-    ) -> anyhow::Result<ResultSet> {
+    ) -> EngineResult<ResultSet> {
         Ok(self.query_routed(shard_key, statement, params)?.value)
     }
 
-    pub fn broadcast(&self, statement: &str) -> anyhow::Result<Vec<u16>> {
+    pub fn broadcast(&self, statement: &str) -> EngineResult<Vec<u16>> {
         let mut completed = Vec::with_capacity(usize::from(self.shard_count()));
         for shard in 0..self.shard_count() {
-            let connection = self.storage.open_shard(shard)?;
+            let connection = self.storage.open_shard(shard).map_err(|error| {
+                error.context(format!("broadcast failed to open shard {shard}"))
+            })?;
             sql::execute_batch(&connection, statement)
-                .with_context(|| format!("broadcast failed on shard {shard}"))?;
+                .map_err(|error| error.context(format!("broadcast failed on shard {shard}")))?;
             completed.push(shard);
         }
         Ok(completed)
@@ -101,6 +103,8 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
     use super::*;
 
     #[test]
@@ -202,5 +206,63 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn database_preserves_error_kinds_across_the_engine_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Database::open(temp.path(), 4).unwrap();
+
+        assert_eq!(
+            database
+                .query("widget-1", "SELECT * FROM missing_table", &[])
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidQuery
+        );
+        assert_eq!(
+            Database::open(temp.path(), 1).unwrap_err().kind(),
+            EngineErrorKind::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn broadcast_failure_preserves_kind_and_can_recover_remaining_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Database::open(temp.path(), 4).unwrap();
+        let shard_one = database.storage.open_shard(1).unwrap();
+        sql::execute_batch(&shard_one, "CREATE TABLE recovery_marker (id INTEGER);").unwrap();
+
+        let error = database
+            .broadcast("CREATE TABLE recovery_marker (id INTEGER);")
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+        assert_eq!(error.to_string(), "broadcast failed on shard 1");
+        assert!(error.source().is_some());
+
+        let shard_zero = database.storage.open_shard(0).unwrap();
+        let shard_two = database.storage.open_shard(2).unwrap();
+        let table_exists = |connection: &rusqlite::Connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM sqlite_schema
+                        WHERE type = 'table' AND name = 'recovery_marker'
+                    )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        };
+        assert!(table_exists(&shard_zero));
+        assert!(!table_exists(&shard_two));
+
+        assert_eq!(
+            database
+                .broadcast("CREATE TABLE IF NOT EXISTS recovery_marker (id INTEGER);")
+                .unwrap(),
+            [0, 1, 2, 3]
+        );
+        assert!(table_exists(&shard_two));
     }
 }

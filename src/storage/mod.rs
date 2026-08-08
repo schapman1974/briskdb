@@ -5,10 +5,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, bail};
 use rusqlite::{Connection, OptionalExtension};
 
 pub use crate::core::Database;
+use crate::{
+    core::{EngineError, EngineErrorKind, EngineResult},
+    sqlite_error,
+};
 
 const SCHEMA_VERSION: &str = "1";
 
@@ -19,26 +22,34 @@ pub(crate) struct Storage {
 }
 
 impl Storage {
-    pub(crate) fn open(root: impl AsRef<Path>, requested_shards: u16) -> anyhow::Result<Self> {
+    pub(crate) fn open(root: impl AsRef<Path>, requested_shards: u16) -> EngineResult<Self> {
         if !(2..=64).contains(&requested_shards) {
-            bail!("shard count must be between 2 and 64");
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "shard count must be between 2 and 64",
+            ));
         }
 
         let root = root.as_ref().to_path_buf();
         let shards_dir = root.join("shards");
-        fs::create_dir_all(&shards_dir)
-            .with_context(|| format!("failed to create {}", shards_dir.display()))?;
+        fs::create_dir_all(&shards_dir).map_err(|error| {
+            sqlite_error::storage_io(error, format!("failed to create {}", shards_dir.display()))
+        })?;
 
         let manifest_path = root.join("manifest.sqlite");
-        let mut manifest = Connection::open(&manifest_path)
-            .with_context(|| format!("failed to open {}", manifest_path.display()))?;
+        let mut manifest = Connection::open(&manifest_path).map_err(|error| {
+            sqlite_error::storage(error)
+                .context(format!("failed to open {}", manifest_path.display()))
+        })?;
         configure_connection(&manifest)?;
-        manifest.execute_batch(
-            "CREATE TABLE IF NOT EXISTS briskdb_metadata (
+        manifest
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS briskdb_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );",
-        )?;
+            )
+            .map_err(sqlite_error::storage)?;
 
         let existing: Option<String> = manifest
             .query_row(
@@ -46,28 +57,46 @@ impl Storage {
                 [],
                 |row| row.get(0),
             )
-            .optional()?;
+            .optional()
+            .map_err(sqlite_error::storage)?;
 
         if let Some(existing) = existing {
-            let existing: u16 = existing
-                .parse()
-                .context("manifest has an invalid shard count")?;
+            let existing: u16 = existing.parse().map_err(|error| {
+                EngineError::from_source(
+                    EngineErrorKind::DataCorruption,
+                    "manifest has an invalid shard count",
+                    error,
+                )
+            })?;
+            if !(2..=64).contains(&existing) {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!("manifest shard count {existing} is outside the supported range"),
+                ));
+            }
             if existing != requested_shards {
-                bail!(
-                    "database was created with {existing} shards, but {requested_shards} were requested"
-                );
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "database was created with {existing} shards, but {requested_shards} were requested"
+                    ),
+                ));
             }
         } else {
-            let transaction = manifest.transaction()?;
-            transaction.execute(
-                "INSERT INTO briskdb_metadata (key, value) VALUES ('shard_count', ?1)",
-                [requested_shards.to_string()],
-            )?;
-            transaction.execute(
-                "INSERT INTO briskdb_metadata (key, value) VALUES ('schema_version', ?1)",
-                [SCHEMA_VERSION],
-            )?;
-            transaction.commit()?;
+            let transaction = manifest.transaction().map_err(sqlite_error::storage)?;
+            transaction
+                .execute(
+                    "INSERT INTO briskdb_metadata (key, value) VALUES ('shard_count', ?1)",
+                    [requested_shards.to_string()],
+                )
+                .map_err(sqlite_error::storage)?;
+            transaction
+                .execute(
+                    "INSERT INTO briskdb_metadata (key, value) VALUES ('schema_version', ?1)",
+                    [SCHEMA_VERSION],
+                )
+                .map_err(sqlite_error::storage)?;
+            transaction.commit().map_err(sqlite_error::storage)?;
         }
 
         let storage = Self {
@@ -88,28 +117,42 @@ impl Storage {
         self.root.join("shards").join(format!("{shard:04}.sqlite"))
     }
 
-    pub(crate) fn open_shard(&self, shard: u16) -> anyhow::Result<Connection> {
+    pub(crate) fn open_shard(&self, shard: u16) -> EngineResult<Connection> {
         if shard >= self.shard_count {
-            bail!("shard {shard} is outside the configured range");
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                format!("shard {shard} is outside the configured range"),
+            ));
         }
         let path = self.shard_path(shard);
-        let connection = Connection::open(&path)
-            .with_context(|| format!("failed to open shard {}", path.display()))?;
+        let connection = Connection::open(&path).map_err(|error| {
+            sqlite_error::storage(error).context(format!("failed to open shard {}", path.display()))
+        })?;
         configure_connection(&connection)?;
         Ok(connection)
     }
 }
 
-fn configure_connection(connection: &Connection) -> anyhow::Result<()> {
-    connection.busy_timeout(std::time::Duration::from_secs(5))?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.pragma_update(None, "synchronous", "FULL")?;
-    connection.pragma_update(None, "foreign_keys", "ON")?;
+fn configure_connection(connection: &Connection) -> EngineResult<()> {
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(sqlite_error::storage)?;
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .map_err(sqlite_error::storage)?;
+    connection
+        .pragma_update(None, "synchronous", "FULL")
+        .map_err(sqlite_error::storage)?;
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(sqlite_error::storage)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
     use super::*;
 
     #[test]
@@ -138,18 +181,19 @@ mod tests {
     #[test]
     fn rejects_invalid_or_changed_shard_counts() {
         let temp = tempfile::tempdir().unwrap();
-        assert_eq!(
-            Storage::open(temp.path(), 1).unwrap_err().to_string(),
-            "shard count must be between 2 and 64"
-        );
-        assert_eq!(
-            Storage::open(temp.path(), 65).unwrap_err().to_string(),
-            "shard count must be between 2 and 64"
-        );
+        let too_few = Storage::open(temp.path(), 1).unwrap_err();
+        assert_eq!(too_few.kind(), EngineErrorKind::InvalidArgument);
+        assert_eq!(too_few.to_string(), "shard count must be between 2 and 64");
+
+        let too_many = Storage::open(temp.path(), 65).unwrap_err();
+        assert_eq!(too_many.kind(), EngineErrorKind::InvalidArgument);
+        assert_eq!(too_many.to_string(), "shard count must be between 2 and 64");
 
         Storage::open(temp.path(), 4).unwrap();
+        let changed = Storage::open(temp.path(), 8).unwrap_err();
+        assert_eq!(changed.kind(), EngineErrorKind::FailedPrecondition);
         assert_eq!(
-            Storage::open(temp.path(), 8).unwrap_err().to_string(),
+            changed.to_string(),
             "database was created with 4 shards, but 8 were requested"
         );
     }
@@ -159,10 +203,73 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let storage = Storage::open(temp.path(), 4).unwrap();
 
-        assert_eq!(
-            storage.open_shard(4).unwrap_err().to_string(),
-            "shard 4 is outside the configured range"
-        );
+        let error = storage.open_shard(4).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Internal);
+        assert_eq!(error.to_string(), "shard 4 is outside the configured range");
+    }
+
+    #[test]
+    fn rejects_malformed_manifest_metadata_as_data_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        Storage::open(temp.path(), 4).unwrap();
+        let manifest = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+        manifest
+            .execute(
+                "UPDATE briskdb_metadata SET value = 'not-a-number' WHERE key = 'shard_count'",
+                [],
+            )
+            .unwrap();
+
+        let error = Storage::open(temp.path(), 4).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(error.to_string(), "manifest has an invalid shard count");
+        assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn rejects_impossible_numeric_manifest_counts_as_data_corruption() {
+        for invalid in ["0", "1", "65", "65535"] {
+            let temp = tempfile::tempdir().unwrap();
+            Storage::open(temp.path(), 4).unwrap();
+            let manifest = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+            manifest
+                .execute(
+                    "UPDATE briskdb_metadata SET value = ?1 WHERE key = 'shard_count'",
+                    [invalid],
+                )
+                .unwrap();
+
+            let error = Storage::open(temp.path(), 4).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+            assert_eq!(
+                error.to_string(),
+                format!("manifest shard count {invalid} is outside the supported range")
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_corrupt_manifest_database() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("manifest.sqlite"),
+            b"not a sqlite database",
+        )
+        .unwrap();
+
+        let error = Storage::open(temp.path(), 4).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn classifies_invalid_storage_path_shape_as_a_failed_precondition() {
+        let root_file = tempfile::NamedTempFile::new().unwrap();
+        let error = Storage::open(root_file.path(), 4).unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(!error.is_retryable());
+        assert!(error.source().is_some());
     }
 
     #[test]

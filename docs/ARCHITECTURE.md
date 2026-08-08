@@ -21,10 +21,11 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Value`, `DataType`, `Column`, `Row`, and `ResultSet`; stable key routing; routed execute/query and schema broadcast | JSON/HTTP types, listeners, or Axum handlers |
+| `core` | Protocol-neutral values, results, and `EngineError`; stable key routing; routed execute/query and schema broadcast | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Manifest and shard layout, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `sql` | SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, filesystem layout, or protocol responses |
-| `protocol::http` | HTTP request extraction plus JSON/BriskDB value and response/error encoding | BLAKE3 routing, shard files, or rusqlite calls |
+| `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
+| `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, listener binding, and Axum lifecycle | SQL parsing or storage implementation details |
 
 Implementation dependencies flow one way: adapters call `core`; `core`
@@ -50,15 +51,41 @@ response from name-keyed row objects to ordered column metadata and positional
 row arrays. This is a pre-1.0 response-contract break needed to keep duplicate
 and empty column names representable.
 
+The structured-error follow-up likewise replaces the experimental blanket 500
+response and `error`-member JSON body with kind-specific status codes and RFC
+9457 problem details. Routes, request fields, routing, and persistence are
+unchanged. Public Rust `Database` methods now return `EngineResult<T>` instead
+of `anyhow::Result<T>`; this intentional pre-1.0 source migration gives callers
+stable error identity while retaining automatic `?` conversion into `anyhow`.
+
 Automated HTTP contract tests cover health, schema broadcast, routed writes,
-routed reads, and SQLite error serialization. Unit tests remain colocated with
-routing, storage, SQL conversion, CLI, and server assembly.
+routed reads, and structured problem-detail serialization. Unit tests remain
+colocated with routing, storage, SQL conversion, CLI, and server assembly.
 
 The module names are stable boundaries, not a claim that later roadmap work is
-already complete. The structured error taxonomy, session state, the async
-`Engine` interface, connection pools, cancellation, and limits are separate
-issues. Until those land, the core intentionally retains the current
-synchronous execution interface.
+already complete. Session state, the async `Engine` interface, connection
+pools, cancellation, and limits are separate issues. Until those land, the
+core intentionally retains the current synchronous execution interface.
+
+## Error boundary
+
+The core exposes a stable `EngineErrorKind` without importing any protocol
+response type. SQL and storage classify SQLite failures from primary and
+extended result codes plus operation context; they never parse SQLite error
+messages. Protocol-owned tables map each kind to an HTTP status and safe RFC
+9457 problem, a PostgreSQL SQLSTATE, and a MySQL error number/SQLSTATE pair.
+The PostgreSQL and MySQL entries are mapping contracts for future adapters, not
+implemented listeners.
+
+Client responses use fixed, safe text for the error kind. Diagnostic display
+text and source chains stay available internally but are never serialized, so
+SQLite messages, SQL text, and filesystem paths do not leak through an adapter.
+Only `Busy` advertises that retrying may succeed; a 5xx status alone is not a
+retry signal. The complete taxonomy and mapping table are in the
+[error contract](ERRORS.md).
+
+This boundary changes reporting, not persistence: the manifest schema, shard
+files, stored values, routing, and configuration formats are unchanged.
 
 ## Typed result boundary
 
