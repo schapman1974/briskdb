@@ -6,8 +6,9 @@ BriskDB needs one syntax boundary that PostgreSQL, MySQL, HTTP, and future
 frontends can share without making a protocol adapter understand SQLite or
 invent its own routing rules. This record selects the parser dependency and
 defines that boundary. The separate [common SQL subset contract](SQL_SUBSET.md)
-defines the opt-in structural validator; neither layer is in the current HTTP
-execution path.
+defines the opt-in structural validator, and the [SQL parameter-normalization
+contract](SQL_PARAMETERS.md) defines the opt-in dialect-specific placeholder
+rewrite. None of these layers is in the current HTTP execution path.
 
 ## Decision
 
@@ -38,9 +39,9 @@ SQLite.
 
 The SQL module retains the exact input text alongside an ordered parsed batch.
 The upstream AST stays opaque outside BriskDB's SQL boundary. The implemented
-common-subset validator and later normalizers and planners inspect it through
-BriskDB-owned interfaces, but protocol adapters must not depend on `sqlparser`
-AST types.
+common-subset validator and placeholder normalizer, and later planners, inspect
+it through BriskDB-owned interfaces, but protocol adapters must not depend on
+`sqlparser` AST types.
 
 `sqlparser`'s formatter is not a source-preserving serializer: it can normalize
 comments, whitespace, quoting, and keyword presentation. BriskDB therefore
@@ -59,7 +60,8 @@ In particular, this layer does not:
 
 - itself define or enforce the common SQL subset; issue #20 implements that as
   the separate `validate_common_subset(ParsedSql)` layer;
-- normalize placeholders (issue #21);
+- normalize placeholders; issue #21 implements that as the separate
+  `normalize_placeholders(CommonSql)` layer;
 - infer shard keys or inspect bound values (issue #22);
 - plan prepared statements at bind time (issue #23);
 - reject conflicting keys or unroutable writes (issue #24);
@@ -77,10 +79,10 @@ that still does not grant permission to execute an empty or mixed batch.
 
 The existing HTTP execute, query, and migration paths remain raw SQLite
 pass-through surfaces with their existing authorizer and endpoint-specific
-rules. They call neither this parser nor the opt-in common-subset validator.
-Connecting those layers before normalization, planning, translation, and
-request-level statement policy are implemented would change the experimental
-HTTP SQL surface.
+rules. They call neither this parser, the opt-in common-subset validator, nor
+the opt-in placeholder normalizer. Connecting those layers before planning,
+translation, and request-level statement policy are implemented would change
+the experimental HTTP SQL surface.
 
 ## Resource and error boundaries
 

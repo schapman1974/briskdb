@@ -146,6 +146,17 @@ exceeding that limit is `LimitExceeded`. Empty and mixed batches can pass
 structural validation; later request-level classification decides whether they
 may execute. See the [common SQL subset contract](SQL_SUBSET.md).
 
+The opt-in placeholder normalizer classifies a zero positional index or marker
+spelling incompatible with the selected PostgreSQL or MySQL dialect as
+`InvalidQuery`. A named SQLite parameter is deliberately `Unsupported`.
+Assigning an index greater than `MAX_SQL_PARAMETERS` (32,766) within one
+statement is `LimitExceeded`; numbering restarts at each statement. A mismatch
+between a retained placeholder span and the retained exact source violates an
+internal SQL-layer invariant and is `Internal`. Normalization diagnostics use
+fixed categories and positions and never contain SQL, literal or marker text,
+bound values, formatted AST output, or source locations. See the [SQL
+parameter-normalization contract](SQL_PARAMETERS.md).
+
 The core contains no HTTP, PostgreSQL, or MySQL response types. Conversely,
 protocol adapters do not inspect SQLite errors. This lets every frontend share
 one error identity while retaining its own response encoding.

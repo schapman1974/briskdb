@@ -227,6 +227,71 @@ fn common_sql_subset_validation_is_public_owned_and_opt_in() {
 }
 
 #[test]
+fn placeholder_normalization_is_public_owned_bounded_and_opt_in() {
+    fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
+    assert_owned_public::<sql::NormalizedSql>();
+    assert_owned_public::<sql::StatementParameters>();
+    assert_eq!(sql::MAX_SQL_PARAMETERS, 32_766);
+
+    for (dialect, source, expected, count, indices) in [
+        (
+            sql::SqlDialect::Sqlite,
+            "SELECT ?2, ?, ?1",
+            "SELECT ?2, ?3, ?1",
+            3,
+            vec![2, 3, 1],
+        ),
+        (
+            sql::SqlDialect::PostgreSql,
+            "SELECT $2, $1, $2",
+            "SELECT ?2, ?1, ?2",
+            2,
+            vec![2, 1, 2],
+        ),
+        (
+            sql::SqlDialect::MySql,
+            "SELECT ?, ?",
+            "SELECT ?1, ?2",
+            2,
+            vec![1, 2],
+        ),
+    ] {
+        let common = sql::validate_common_subset(sql::parse(dialect, source).unwrap()).unwrap();
+        let normalized = sql::normalize_placeholders(common).unwrap();
+        let parameters = &normalized.statement_parameters()[0];
+
+        assert_eq!(normalized.dialect(), dialect);
+        assert_eq!(normalized.source(), source);
+        assert_eq!(normalized.sqlite_parameter_sql(), expected);
+        assert_eq!(normalized.statement_count(), 1);
+        assert!(!normalized.is_empty());
+        assert_eq!(parameters.parameter_count(), count);
+        assert_eq!(parameters.occurrence_count(), indices.len());
+        assert_eq!(parameters.parameter_indices(), indices);
+    }
+
+    let named =
+        sql::validate_common_subset(sql::parse(sql::SqlDialect::Sqlite, "SELECT :value").unwrap())
+            .unwrap();
+    let unsupported = sql::normalize_placeholders(named).unwrap_err();
+    assert_eq!(unsupported.kind(), core::EngineErrorKind::Unsupported);
+
+    // Normalization is opt-in infrastructure. Existing raw SQLite callers keep
+    // their current marker behavior until the planned prepare/bind path adopts
+    // the normalized representation.
+    let temp = tempfile::tempdir().unwrap();
+    let database = core::Database::open(temp.path(), 2).unwrap();
+    let result = database
+        .query(
+            "normalizer-opt-in",
+            "SELECT :value",
+            &[core::Value::Int64(9)],
+        )
+        .unwrap();
+    assert_eq!(result.rows()[0].get(0), Some(&core::Value::Int64(9)));
+}
+
+#[test]
 fn logical_catalog_types_and_access_are_public_and_protocol_neutral() {
     fn assert_public_metadata<T: Clone + Send + Sync + 'static>() {}
 

@@ -1,13 +1,19 @@
 //! Protocol-neutral SQL parsing, SQLite execution, and value conversion.
 //!
 //! The parser facade produces a bounded, dialect-explicit opaque AST. The
-//! common-subset validator recursively admits only protocol-neutral SQL shapes
-//! for later planning work. Current execution remains deliberate SQLite
-//! pass-through; neither layer gates, rewrites, routes, or executes statements.
+//! common-subset validator recursively admits only protocol-neutral SQL shapes,
+//! and the placeholder normalizer produces a separate source-preserving SQLite
+//! parameter representation for later planning work. Current execution remains
+//! deliberate SQLite pass-through; these opt-in layers do not gate, route, or
+//! execute statements.
 
+mod normalizer;
 mod parser;
 mod subset;
 
+pub use normalizer::{
+    MAX_SQL_PARAMETERS, NormalizedSql, StatementParameters, normalize_placeholders,
+};
 pub use parser::{
     MAX_PARSED_SQL_BYTES, MAX_PARSED_SQL_STATEMENTS, ParsedSql, SQL_PARSE_RECURSION_LIMIT,
     SqlDialect, parse,

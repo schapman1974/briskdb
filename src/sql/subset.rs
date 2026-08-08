@@ -10,6 +10,7 @@ use sqlparser::ast::{
     TableConstraint, TableFactor, TableObject, TableWithJoins, UnaryOperator, UniqueConstraint,
     Update, Value, WildcardAdditionalOptions,
 };
+use sqlparser::tokenizer::Span;
 
 use super::{ParsedSql, SqlDialect};
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
@@ -28,6 +29,7 @@ pub const MAX_COMMON_SQL_EXPRESSION_DEPTH: usize = 128;
 #[derive(Clone, PartialEq, Eq)]
 pub struct CommonSql {
     parsed: ParsedSql,
+    statement_placeholders: Vec<Vec<CommonPlaceholder>>,
 }
 
 impl CommonSql {
@@ -50,6 +52,16 @@ impl CommonSql {
     pub fn is_empty(&self) -> bool {
         self.parsed.is_empty()
     }
+
+    pub(super) fn statement_placeholders(&self) -> &[Vec<CommonPlaceholder>] {
+        &self.statement_placeholders
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct CommonPlaceholder {
+    pub(super) marker: String,
+    pub(super) span: Span,
 }
 
 impl fmt::Debug for CommonSql {
@@ -69,8 +81,10 @@ impl fmt::Debug for CommonSql {
 /// Empty batches and otherwise-valid statement combinations are accepted here;
 /// a later classification layer owns request-level batch policy.
 pub fn validate_common_subset(parsed: ParsedSql) -> EngineResult<CommonSql> {
+    let mut statement_placeholders = Vec::with_capacity(parsed.statement_count());
     for (index, statement) in parsed.statements().iter().enumerate() {
-        validate_statement(statement).map_err(|violation| {
+        let mut validation = ValidationState::default();
+        validate_statement(statement, &mut validation).map_err(|violation| {
             let diagnostic = if violation.kind == EngineErrorKind::LimitExceeded {
                 format!(
                     "statement {} exceeds the common SQL expression depth limit of {}",
@@ -86,9 +100,27 @@ pub fn validate_common_subset(parsed: ParsedSql) -> EngineResult<CommonSql> {
             };
             EngineError::new(violation.kind, diagnostic)
         })?;
+        statement_placeholders.push(validation.placeholders);
     }
 
-    Ok(CommonSql { parsed })
+    Ok(CommonSql {
+        parsed,
+        statement_placeholders,
+    })
+}
+
+#[derive(Default)]
+struct ValidationState {
+    placeholders: Vec<CommonPlaceholder>,
+}
+
+impl ValidationState {
+    fn record_placeholder(&mut self, marker: &str, span: Span) {
+        self.placeholders.push(CommonPlaceholder {
+            marker: marker.to_owned(),
+            span,
+        });
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,14 +145,14 @@ const fn expression_depth_exceeded<T>() -> SubsetResult<T> {
     })
 }
 
-fn validate_statement(statement: &AstStatement) -> SubsetResult {
+fn validate_statement(statement: &AstStatement, validation: &mut ValidationState) -> SubsetResult {
     match statement {
         AstStatement::CreateTable(table) => validate_create_table(table),
         AstStatement::CreateIndex(index) => validate_create_index(index),
-        AstStatement::Query(query) => validate_query(query),
-        AstStatement::Insert(insert) => validate_insert(insert),
-        AstStatement::Update(update) => validate_update(update),
-        AstStatement::Delete(delete) => validate_delete(delete),
+        AstStatement::Query(query) => validate_query(query, validation),
+        AstStatement::Insert(insert) => validate_insert(insert, validation),
+        AstStatement::Update(update) => validate_update(update, validation),
+        AstStatement::Delete(delete) => validate_delete(delete, validation),
         AstStatement::StartTransaction {
             modes,
             begin,
@@ -387,7 +419,11 @@ fn validate_check(constraint: &CheckConstraint) -> SubsetResult {
     if constraint.enforced.is_some() {
         return unsupported("CHECK enforcement modifiers");
     }
-    validate_expression(constraint.expr.as_ref(), ExprContext::CHECK)
+    validate_expression(
+        constraint.expr.as_ref(),
+        ExprContext::CHECK,
+        &mut ValidationState::default(),
+    )
 }
 
 fn validate_create_index(index: &CreateIndex) -> SubsetResult {
@@ -431,7 +467,7 @@ fn validate_index_column(column: &IndexColumn) -> SubsetResult {
     Ok(())
 }
 
-fn validate_query(query: &Query) -> SubsetResult {
+fn validate_query(query: &Query, validation: &mut ValidationState) -> SubsetResult {
     let Query {
         with,
         body,
@@ -461,17 +497,17 @@ fn validate_query(query: &Query) -> SubsetResult {
     let SetExpr::Select(select) = body.as_ref() else {
         return unsupported("set operations, VALUES, or nested queries");
     };
-    validate_select(select)?;
+    validate_select(select, validation)?;
     if let Some(order_by) = order_by {
-        validate_order_by(order_by)?;
+        validate_order_by(order_by, validation)?;
     }
     if let Some(limit_clause) = limit_clause {
-        validate_limit_clause(limit_clause)?;
+        validate_limit_clause(limit_clause, validation)?;
     }
     Ok(())
 }
 
-fn validate_select(select: &Select) -> SubsetResult {
+fn validate_select(select: &Select, validation: &mut ValidationState) -> SubsetResult {
     let Select {
         select_token: _,
         optimizer_hints,
@@ -532,15 +568,15 @@ fn validate_select(select: &Select) -> SubsetResult {
         validate_simple_table(table, true)?;
     }
     for item in projection {
-        validate_select_item(item)?;
+        validate_select_item(item, validation)?;
     }
     if let Some(selection) = selection {
-        validate_expression(selection, ExprContext::SCALAR)?;
+        validate_expression(selection, ExprContext::SCALAR, validation)?;
     }
     match group_by {
         GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => {
             for expression in expressions {
-                validate_expression(expression, ExprContext::SCALAR)?;
+                validate_expression(expression, ExprContext::SCALAR, validation)?;
             }
         }
         GroupByExpr::Expressions(_, _) | GroupByExpr::All(_) => {
@@ -548,16 +584,18 @@ fn validate_select(select: &Select) -> SubsetResult {
         }
     }
     if let Some(having) = having {
-        validate_expression(having, ExprContext::SELECT)?;
+        validate_expression(having, ExprContext::SELECT, validation)?;
     }
     Ok(())
 }
 
-fn validate_select_item(item: &SelectItem) -> SubsetResult {
+fn validate_select_item(item: &SelectItem, validation: &mut ValidationState) -> SubsetResult {
     match item {
-        SelectItem::UnnamedExpr(expression) => validate_expression(expression, ExprContext::SELECT),
+        SelectItem::UnnamedExpr(expression) => {
+            validate_expression(expression, ExprContext::SELECT, validation)
+        }
         SelectItem::ExprWithAlias { expr, alias: _ } => {
-            validate_expression(expr, ExprContext::SELECT)
+            validate_expression(expr, ExprContext::SELECT, validation)
         }
         SelectItem::Wildcard(options) if wildcard_options_are_empty(options) => Ok(()),
         SelectItem::QualifiedWildcard(
@@ -581,7 +619,7 @@ fn wildcard_options_are_empty(options: &WildcardAdditionalOptions) -> bool {
         && options.opt_alias.is_none()
 }
 
-fn validate_order_by(order_by: &OrderBy) -> SubsetResult {
+fn validate_order_by(order_by: &OrderBy, validation: &mut ValidationState) -> SubsetResult {
     if order_by.interpolate.is_some() {
         return unsupported("ORDER BY interpolation");
     }
@@ -589,22 +627,28 @@ fn validate_order_by(order_by: &OrderBy) -> SubsetResult {
         return unsupported("ORDER BY ALL");
     };
     for expression in expressions {
-        validate_order_by_expression(expression)?;
+        validate_order_by_expression(expression, validation)?;
     }
     Ok(())
 }
 
-fn validate_order_by_expression(order_by: &OrderByExpr) -> SubsetResult {
+fn validate_order_by_expression(
+    order_by: &OrderByExpr,
+    validation: &mut ValidationState,
+) -> SubsetResult {
     if order_by.with_fill.is_some()
         || order_by.options.nulls_first.is_some()
         || matches!(order_by.options.sort, Some(OrderBySort::Using(_)))
     {
         return unsupported("ORDER BY options");
     }
-    validate_expression(&order_by.expr, ExprContext::SELECT)
+    validate_expression(&order_by.expr, ExprContext::SELECT, validation)
 }
 
-fn validate_limit_clause(limit_clause: &LimitClause) -> SubsetResult {
+fn validate_limit_clause(
+    limit_clause: &LimitClause,
+    validation: &mut ValidationState,
+) -> SubsetResult {
     let LimitClause::LimitOffset {
         limit,
         offset,
@@ -619,14 +663,14 @@ fn validate_limit_clause(limit_clause: &LimitClause) -> SubsetResult {
     if !limit_by.is_empty() {
         return unsupported("LIMIT BY");
     }
-    validate_limit_value(limit)?;
+    validate_limit_value(limit, validation)?;
     if let Some(offset) = offset {
-        validate_limit_value(&offset.value)?;
+        validate_limit_value(&offset.value, validation)?;
     }
     Ok(())
 }
 
-fn validate_insert(insert: &Insert) -> SubsetResult {
+fn validate_insert(insert: &Insert, validation: &mut ValidationState) -> SubsetResult {
     let Insert {
         insert_token: _,
         optimizer_hints,
@@ -698,10 +742,14 @@ fn validate_insert(insert: &Insert) -> SubsetResult {
     let Some(source) = source else {
         return unsupported("INSERT without VALUES");
     };
-    validate_insert_values(source, columns.len())
+    validate_insert_values(source, columns.len(), validation)
 }
 
-fn validate_insert_values(query: &Query, column_count: usize) -> SubsetResult {
+fn validate_insert_values(
+    query: &Query,
+    column_count: usize,
+    validation: &mut ValidationState,
+) -> SubsetResult {
     if query.with.is_some()
         || query.order_by.is_some()
         || query.limit_clause.is_some()
@@ -725,13 +773,13 @@ fn validate_insert_values(query: &Query, column_count: usize) -> SubsetResult {
             return unsupported("INSERT row width mismatch");
         }
         for expression in row.iter() {
-            validate_expression(expression, ExprContext::INSERT_VALUE)?;
+            validate_expression(expression, ExprContext::INSERT_VALUE, validation)?;
         }
     }
     Ok(())
 }
 
-fn validate_update(update: &Update) -> SubsetResult {
+fn validate_update(update: &Update, validation: &mut ValidationState) -> SubsetResult {
     if !update.optimizer_hints.is_empty()
         || update.from.is_some()
         || update.returning.is_some()
@@ -755,15 +803,15 @@ fn validate_update(update: &Update) -> SubsetResult {
         if !seen.insert(key) {
             return unsupported("duplicate UPDATE assignment targets");
         }
-        validate_expression(&assignment.value, ExprContext::SCALAR)?;
+        validate_expression(&assignment.value, ExprContext::SCALAR, validation)?;
     }
     if let Some(selection) = &update.selection {
-        validate_expression(selection, ExprContext::SCALAR)?;
+        validate_expression(selection, ExprContext::SCALAR, validation)?;
     }
     Ok(())
 }
 
-fn validate_delete(delete: &Delete) -> SubsetResult {
+fn validate_delete(delete: &Delete, validation: &mut ValidationState) -> SubsetResult {
     if !delete.optimizer_hints.is_empty()
         || !delete.tables.is_empty()
         || delete.using.is_some()
@@ -782,7 +830,7 @@ fn validate_delete(delete: &Delete) -> SubsetResult {
     };
     validate_simple_table(table, true)?;
     if let Some(selection) = &delete.selection {
-        validate_expression(selection, ExprContext::SCALAR)?;
+        validate_expression(selection, ExprContext::SCALAR, validation)?;
     }
     Ok(())
 }
@@ -860,14 +908,19 @@ impl ExprContext {
     }
 }
 
-fn validate_expression(expression: &Expr, context: ExprContext) -> SubsetResult {
-    validate_expression_at_depth(expression, context, 1)
+fn validate_expression(
+    expression: &Expr,
+    context: ExprContext,
+    validation: &mut ValidationState,
+) -> SubsetResult {
+    validate_expression_at_depth(expression, context, 1, validation)
 }
 
 fn validate_expression_at_depth(
     expression: &Expr,
     context: ExprContext,
     depth: usize,
+    validation: &mut ValidationState,
 ) -> SubsetResult {
     if depth > MAX_COMMON_SQL_EXPRESSION_DEPTH {
         return expression_depth_exceeded();
@@ -877,7 +930,13 @@ fn validate_expression_at_depth(
     match expression {
         Expr::Identifier(_) if context.identifiers => Ok(()),
         Expr::CompoundIdentifier(parts) if context.identifiers && parts.len() == 2 => Ok(()),
-        Expr::Value(value) => validate_value(&value.value, context.placeholders),
+        Expr::Value(value) => {
+            validate_value(&value.value, context.placeholders)?;
+            if let Value::Placeholder(marker) = &value.value {
+                validation.record_placeholder(marker, value.span);
+            }
+            Ok(())
+        }
         Expr::Nested(expression)
         | Expr::IsNull(expression)
         | Expr::IsNotNull(expression)
@@ -885,15 +944,15 @@ fn validate_expression_at_depth(
         | Expr::IsNotTrue(expression)
         | Expr::IsFalse(expression)
         | Expr::IsNotFalse(expression) => {
-            validate_expression_at_depth(expression, context, child_depth)
+            validate_expression_at_depth(expression, context, child_depth, validation)
         }
         Expr::UnaryOp {
             op: UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::Not,
             expr,
-        } => validate_expression_at_depth(expr, context, child_depth),
+        } => validate_expression_at_depth(expr, context, child_depth, validation),
         Expr::BinaryOp { left, op, right } if binary_operator_is_common(op) => {
-            validate_expression_at_depth(left, context, child_depth)?;
-            validate_expression_at_depth(right, context, child_depth)
+            validate_expression_at_depth(left, context, child_depth, validation)?;
+            validate_expression_at_depth(right, context, child_depth, validation)
         }
         Expr::Between {
             expr,
@@ -901,18 +960,18 @@ fn validate_expression_at_depth(
             low,
             high,
         } => {
-            validate_expression_at_depth(expr, context, child_depth)?;
-            validate_expression_at_depth(low, context, child_depth)?;
-            validate_expression_at_depth(high, context, child_depth)
+            validate_expression_at_depth(expr, context, child_depth, validation)?;
+            validate_expression_at_depth(low, context, child_depth, validation)?;
+            validate_expression_at_depth(high, context, child_depth, validation)
         }
         Expr::InList {
             expr,
             list,
             negated: _,
         } if !list.is_empty() => {
-            validate_expression_at_depth(expr, context, child_depth)?;
+            validate_expression_at_depth(expr, context, child_depth, validation)?;
             for item in list {
-                validate_expression_at_depth(item, context, child_depth)?;
+                validate_expression_at_depth(item, context, child_depth, validation)?;
             }
             Ok(())
         }
@@ -923,8 +982,8 @@ fn validate_expression_at_depth(
             escape_char,
             negated: _,
         } if !any && escape_char.is_none() => {
-            validate_expression_at_depth(expr, context, child_depth)?;
-            validate_expression_at_depth(pattern, context, child_depth)
+            validate_expression_at_depth(expr, context, child_depth, validation)?;
+            validate_expression_at_depth(pattern, context, child_depth, validation)
         }
         Expr::Case {
             case_token: _,
@@ -934,20 +993,23 @@ fn validate_expression_at_depth(
             else_result,
         } => {
             if let Some(operand) = operand {
-                validate_expression_at_depth(operand, context, child_depth)?;
+                validate_expression_at_depth(operand, context, child_depth, validation)?;
             }
             for branch in conditions {
-                validate_expression_at_depth(&branch.condition, context, child_depth)?;
-                validate_expression_at_depth(&branch.result, context, child_depth)?;
+                validate_expression_at_depth(&branch.condition, context, child_depth, validation)?;
+                validate_expression_at_depth(&branch.result, context, child_depth, validation)?;
             }
             if let Some(else_result) = else_result {
-                validate_expression_at_depth(else_result, context, child_depth)?;
+                validate_expression_at_depth(else_result, context, child_depth, validation)?;
             }
             Ok(())
         }
-        Expr::Function(function) if context.aggregates => {
-            validate_aggregate(function, context.without_aggregates(), child_depth)
-        }
+        Expr::Function(function) if context.aggregates => validate_aggregate(
+            function,
+            context.without_aggregates(),
+            child_depth,
+            validation,
+        ),
         _ => unsupported("expression form"),
     }
 }
@@ -987,6 +1049,7 @@ fn validate_aggregate(
     function: &Function,
     argument_context: ExprContext,
     argument_depth: usize,
+    validation: &mut ValidationState,
 ) -> SubsetResult {
     let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
         return unsupported("qualified aggregate functions");
@@ -1017,7 +1080,7 @@ fn validate_aggregate(
     };
     match argument {
         FunctionArgExpr::Expr(expression) => {
-            validate_expression_at_depth(expression, argument_context, argument_depth)
+            validate_expression_at_depth(expression, argument_context, argument_depth, validation)
         }
         FunctionArgExpr::Wildcard
             if aggregate == "COUNT" && arguments.duplicate_treatment.is_none() =>
@@ -1056,13 +1119,16 @@ fn is_numeric_literal(expression: &Expr) -> bool {
     }
 }
 
-fn validate_limit_value(expression: &Expr) -> SubsetResult {
+fn validate_limit_value(expression: &Expr, validation: &mut ValidationState) -> SubsetResult {
     match expression {
         Expr::Value(value) => match &value.value {
             Value::Number(number, false) if number.bytes().all(|byte| byte.is_ascii_digit()) => {
                 Ok(())
             }
-            Value::Placeholder(_) => Ok(()),
+            Value::Placeholder(marker) => {
+                validation.record_placeholder(marker, value.span);
+                Ok(())
+            }
             _ => unsupported("LIMIT or OFFSET value"),
         },
         _ => unsupported("LIMIT or OFFSET value"),
