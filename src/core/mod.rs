@@ -3,10 +3,15 @@
 //! This module owns routing and coordinates storage and SQL execution. It does
 //! not depend on a network protocol.
 
+mod types;
+
+pub use types::{
+    Column, DataType, Decimal, ParseDecimalError, ResultSet, ResultSetShapeError, Row, Value,
+};
+
 use std::path::Path;
 
 use anyhow::Context;
-use serde_json::Value;
 
 use crate::{sql, storage::Storage};
 
@@ -57,7 +62,7 @@ impl Database {
         shard_key: &str,
         statement: &str,
         params: &[Value],
-    ) -> anyhow::Result<Routed<Vec<Value>>> {
+    ) -> anyhow::Result<Routed<ResultSet>> {
         let shard = self.shard_for_key(shard_key.as_bytes());
         let connection = self.storage.open_shard(shard)?;
         let value = sql::query(&connection, statement, params)?;
@@ -78,7 +83,7 @@ impl Database {
         shard_key: &str,
         statement: &str,
         params: &[Value],
-    ) -> anyhow::Result<Vec<Value>> {
+    ) -> anyhow::Result<ResultSet> {
         Ok(self.query_routed(shard_key, statement, params)?.value)
     }
 
@@ -96,8 +101,6 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
 
     #[test]
@@ -122,14 +125,14 @@ mod tests {
             .execute_routed(
                 "widget-1",
                 "INSERT INTO widgets (id, name) VALUES (?1, ?2)",
-                &[json!("widget-1"), json!("First widget")],
+                &[Value::from("widget-1"), Value::from("First widget")],
             )
             .unwrap();
         let read = database
             .query_routed(
                 "widget-1",
                 "SELECT id, name FROM widgets WHERE id = ?1",
-                &[json!("widget-1")],
+                &[Value::from("widget-1")],
             )
             .unwrap();
 
@@ -144,7 +147,17 @@ mod tests {
         assert_eq!(read.shard, expected_shard);
         assert_eq!(
             read.value,
-            vec![json!({"id": "widget-1", "name": "First widget"})]
+            ResultSet::new(
+                vec![
+                    Column::new("id", DataType::Unknown),
+                    Column::new("name", DataType::Unknown),
+                ],
+                vec![Row::new(vec![
+                    Value::from("widget-1"),
+                    Value::from("First widget"),
+                ])],
+            )
+            .unwrap()
         );
     }
 
@@ -164,7 +177,7 @@ mod tests {
                 .execute(
                     "widget-1",
                     "INSERT INTO widgets (id, name) VALUES (?1, ?2)",
-                    &[json!("widget-1"), json!("First widget")],
+                    &[Value::from("widget-1"), Value::from("First widget")],
                 )
                 .unwrap(),
             1
@@ -174,10 +187,20 @@ mod tests {
                 .query(
                     "widget-1",
                     "SELECT id, name FROM widgets WHERE id = ?1",
-                    &[json!("widget-1")],
+                    &[Value::from("widget-1")],
                 )
                 .unwrap(),
-            vec![json!({"id": "widget-1", "name": "First widget"})]
+            ResultSet::new(
+                vec![
+                    Column::new("id", DataType::Unknown),
+                    Column::new("name", DataType::Unknown),
+                ],
+                vec![Row::new(vec![
+                    Value::from("widget-1"),
+                    Value::from("First widget"),
+                ])],
+            )
+            .unwrap()
         );
     }
 }

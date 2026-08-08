@@ -27,6 +27,7 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 ## Current foundation
 
 - Stable BLAKE3 routing from a caller-provided shard key
+- Protocol-neutral typed values, ordered columns, positional rows, and results
 - A fixed shard count recorded in `manifest.sqlite`
 - One WAL-enabled SQLite database per shard
 - Routed execute and query endpoints
