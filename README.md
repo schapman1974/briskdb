@@ -15,6 +15,9 @@ current SQLite pass-through API from planned PostgreSQL and MySQL compatibility.
 Contributions follow the repository's [test-first completion policy](CONTRIBUTING.md).
 The [benchmark baseline](docs/BENCHMARKS.md) defines the reproducible storage
 workloads used to measure the current prototype.
+BriskDB is available under the [MIT License](LICENSE). The
+[supported-platform policy](docs/SUPPORTED_PLATFORMS.md) defines the tested
+operating-system, Rust, and filesystem boundaries.
 
 BriskDB supports Rust 1.85 and newer stable releases. CI tests the declared
 minimum supported Rust version (MSRV) and the latest stable toolchain.
@@ -94,3 +97,8 @@ explicit migration workflow.
 Near-term work includes authentication, connection pools, schema migrations,
 scatter/gather reads, observability, backup tooling, and failure-injection
 tests for multi-shard operations.
+
+## License
+
+Copyright (c) 2026 Stephen Chapman. BriskDB is distributed under the
+[MIT License](LICENSE).

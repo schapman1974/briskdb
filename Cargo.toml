@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A small, fast, sharded SQLite server"
+license = "MIT"
+repository = "https://github.com/schapman1974/briskdb"
 
 [dependencies]
 anyhow = "1.0"
