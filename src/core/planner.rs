@@ -4,7 +4,7 @@ use std::{collections::HashMap, fmt, sync::Arc};
 
 use crate::sql::{
     NormalizedSql, RoutedDml, ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue,
-    infer_shard_keys, routed_dml_shape,
+    StatementBehavior, classify_normalized_statements, infer_shard_keys, routed_dml_shape,
 };
 
 use super::{
@@ -46,8 +46,9 @@ impl fmt::Debug for PlannedRoute {
 /// [`ShardKeyInference::values`], including duplicate `INSERT` row values. An
 /// explicit route is retained independently even after routing policy compares
 /// it with inferred routes. A successful plan records the one assigned shard
-/// when the statement has a valid single-shard route. It does not translate SQL
-/// or execute anything.
+/// when the statement has a valid single-shard route and retains its classified
+/// behavior. The complete normalized batch must first satisfy statement-batch
+/// policy. A plan does not translate SQL or execute anything.
 #[derive(Clone, PartialEq, Eq)]
 pub struct BoundStatementPlan {
     database: LogicalDatabaseId,
@@ -57,6 +58,7 @@ pub struct BoundStatementPlan {
     bucket_algorithm_version: u32,
     map_generation: u64,
     statement_index: usize,
+    behavior: StatementBehavior,
     inference: ShardKeyInference,
     inferred_routes: Vec<PlannedRoute>,
     explicit_route: Option<PlannedRoute>,
@@ -99,6 +101,11 @@ impl BoundStatementPlan {
         self.statement_index
     }
 
+    /// Return the authoritative behavior of the selected statement.
+    pub const fn behavior(&self) -> StatementBehavior {
+        self.behavior
+    }
+
     /// Return the typed shard-key inference retained by this plan.
     pub const fn inference(&self) -> &ShardKeyInference {
         &self.inference
@@ -135,6 +142,7 @@ impl fmt::Debug for BoundStatementPlan {
             .field("bucket_algorithm_version", &self.bucket_algorithm_version)
             .field("map_generation", &self.map_generation)
             .field("statement_index", &self.statement_index)
+            .field("behavior", &self.behavior)
             .field("inference", &self.inference)
             .field("inferred_route_count", &self.inferred_routes.len())
             .field("has_explicit_route", &self.explicit_route.is_some())
@@ -212,6 +220,13 @@ where
         parameters,
         explicit_routing_key,
     } = input;
+    let classification = classify_normalized_statements(normalized)?;
+    let behavior = classification.behavior(statement_index).ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "SQL statement index is outside the normalized batch",
+        )
+    })?;
     let schema_generation = catalog.schema_generation();
     let inference = infer_shard_keys(catalog, database, normalized, statement_index, parameters)?;
     validate_inference_shape(&inference)?;
@@ -277,6 +292,7 @@ where
         bucket_algorithm_version: provenance.bucket_algorithm_version,
         map_generation: provenance.map_generation,
         statement_index,
+        behavior,
         inference,
         inferred_routes,
         explicit_route,
@@ -654,6 +670,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.clone(), plan);
+        assert_eq!(
+            plan.behavior(),
+            StatementBehavior::Write(crate::sql::WriteBehavior::Insert)
+        );
         assert_eq!(plan.inferred_routes()[0].key_bytes(), b"private-tenant");
         assert_eq!(
             plan.explicit_route().unwrap().key_bytes(),
@@ -1348,7 +1368,7 @@ mod tests {
             "UPDATE events SET payload = 1 WHERE tenant_id = 7; \
              UPDATE events SET tenant_id = 8 WHERE tenant_id = 7",
         );
-        let first = plan_with_router(
+        let batch_error = plan_with_router(
             &catalog,
             DEFAULT_DATABASE,
             &batch,
@@ -1357,14 +1377,35 @@ mod tests {
             None,
             split_test_router,
         )
+        .unwrap_err();
+        assert_eq!(batch_error.kind(), EngineErrorKind::Unsupported);
+
+        let first_update = normalize(
+            SqlDialect::Sqlite,
+            "UPDATE events SET payload = 1 WHERE tenant_id = 7",
+        );
+        let first = plan_with_router(
+            &catalog,
+            DEFAULT_DATABASE,
+            &first_update,
+            0,
+            &[],
+            None,
+            split_test_router,
+        )
         .unwrap();
         assert_eq!(first.assigned_shard(), Some(1));
+
+        let shard_key_update = normalize(
+            SqlDialect::Sqlite,
+            "UPDATE events SET tenant_id = 8 WHERE tenant_id = 7",
+        );
         assert_eq!(
             plan_with_router(
                 &catalog,
                 DEFAULT_DATABASE,
-                &batch,
-                1,
+                &shard_key_update,
+                0,
                 &[],
                 None,
                 split_test_router,
@@ -1606,6 +1647,118 @@ mod tests {
     }
 
     #[test]
+    fn whole_batch_policy_precedes_member_planning_and_allows_read_batches() {
+        let catalog = sample_catalog();
+
+        let empty = normalize(SqlDialect::Sqlite, "-- no statements");
+        let empty_error = plan(&catalog, DEFAULT_DATABASE, &empty, 0, &[], None).unwrap_err();
+        assert_eq!(empty_error.kind(), EngineErrorKind::InvalidArgument);
+        assert_eq!(
+            empty_error.diagnostic(),
+            "a SQL request must contain at least one top-level statement"
+        );
+
+        let schema_batch = normalize(
+            SqlDialect::Sqlite,
+            "SELECT 1; CREATE TABLE later_table (id INTEGER)",
+        );
+        let schema_error = plan(
+            &catalog,
+            DEFAULT_DATABASE,
+            &schema_batch,
+            usize::MAX,
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(schema_error.kind(), EngineErrorKind::Unsupported);
+        assert_eq!(
+            schema_error.diagnostic(),
+            "statement 2 has schema behavior; multi-statement requests may contain only read statements"
+        );
+
+        let session_batch = normalize(
+            SqlDialect::Sqlite,
+            "SELECT payload FROM events WHERE tenant_id = ?1; BEGIN",
+        );
+        let parameter_error = plan_with_router(
+            &catalog,
+            DEFAULT_DATABASE,
+            &session_batch,
+            0,
+            &[],
+            None,
+            split_test_router,
+        )
+        .unwrap_err();
+        assert_eq!(parameter_error.kind(), EngineErrorKind::Unsupported);
+        assert_eq!(
+            parameter_error.diagnostic(),
+            "statement 2 has session behavior; multi-statement requests may contain only read statements"
+        );
+
+        let routing_error = plan_with_router(
+            &catalog,
+            DEFAULT_DATABASE,
+            &session_batch,
+            0,
+            &[Value::Int64(7)],
+            Some(b"8"),
+            split_test_router,
+        )
+        .unwrap_err();
+        assert_eq!(routing_error.kind(), EngineErrorKind::Unsupported);
+        assert_eq!(routing_error.diagnostic(), parameter_error.diagnostic());
+
+        let read_batch = normalize(
+            SqlDialect::Sqlite,
+            "SELECT payload FROM events WHERE tenant_id = ?1; \
+             SELECT payload FROM events WHERE tenant_id = ?1",
+        );
+        let first = plan_with_router(
+            &catalog,
+            DEFAULT_DATABASE,
+            &read_batch,
+            0,
+            &[Value::Int64(7)],
+            None,
+            split_test_router,
+        )
+        .unwrap();
+        let second = plan_with_router(
+            &catalog,
+            DEFAULT_DATABASE,
+            &read_batch,
+            1,
+            &[Value::Int64(8)],
+            None,
+            split_test_router,
+        )
+        .unwrap();
+        assert_eq!(first.behavior(), StatementBehavior::Read);
+        assert_eq!(second.behavior(), StatementBehavior::Read);
+        assert_eq!(first.statement_index(), 0);
+        assert_eq!(second.statement_index(), 1);
+        assert_eq!(first.assigned_shard(), Some(1));
+        assert_eq!(second.assigned_shard(), Some(2));
+
+        let index_error = plan(
+            &catalog,
+            DEFAULT_DATABASE,
+            &read_batch,
+            2,
+            &[Value::Int64(7)],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(index_error.kind(), EngineErrorKind::InvalidArgument);
+        assert_eq!(
+            index_error.diagnostic(),
+            "SQL statement index is outside the normalized batch"
+        );
+    }
+
+    #[test]
     fn statement_local_batch_indexes_use_statement_local_parameters() {
         let catalog = sample_catalog();
         let normalized = normalize(
@@ -1633,6 +1786,8 @@ mod tests {
         .unwrap();
         assert_eq!(first.statement_index(), 0);
         assert_eq!(second.statement_index(), 1);
+        assert_eq!(first.behavior(), StatementBehavior::Read);
+        assert_eq!(second.behavior(), StatementBehavior::Read);
         assert_eq!(first.inferred_routes()[0].key_bytes(), b"12");
         assert_eq!(second.inferred_routes()[0].key_bytes(), b"34");
 

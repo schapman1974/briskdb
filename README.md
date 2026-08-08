@@ -18,6 +18,9 @@ The [SQL parser decision record](docs/SQL_PARSER.md) defines the shared,
 dialect-explicit syntax boundary and its resource and dependency limits.
 The [common SQL subset contract](docs/SQL_SUBSET.md) defines the opt-in,
 protocol-neutral structural validator and its exact accepted statement forms.
+The [statement-classification contract](docs/SQL_STATEMENT_CLASSIFICATION.md)
+defines the shared read/write/schema/session taxonomy, conservative batch gate,
+and behavior metadata consumed by planning and prepared execution.
 The [SQL parameter-normalization contract](docs/SQL_PARAMETERS.md) defines the
 opt-in dialect-specific rewrite to canonical SQLite positional parameters and
 its per-statement binding metadata.
@@ -60,13 +63,14 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Protocol-neutral typed values, ordered columns, positional rows, and results
 - A bounded per-session prepared-statement and immutable bound-portal lifecycle
   with transient shard-0 metadata compilation, bind-time routing snapshots,
-  fresh execute-time planning, and supported physical-target execution
+  retained logical behavior, fresh execute-time planning, and supported
+  physical-target execution
 - A bounded SQL AST parser plus recursive common-subset validator for explicit
   SQLite, PostgreSQL, and MySQL dialects, followed by opt-in source-preserving
-  placeholder normalization, per-statement binding metadata, and catalog-aware
-  typed shard-key inference plus synchronous bound-value-aware routing plans
-  with single-shard write policy, all isolated from the current raw SQLite HTTP
-  execution path
+  statement/batch classification, placeholder normalization, per-statement
+  binding metadata, and catalog-aware typed shard-key inference plus
+  synchronous bound-value-aware routing plans with single-shard write policy,
+  all isolated from the current raw SQLite HTTP execution path
 - A transactionally versioned `manifest.sqlite` with durable 4,096-bucket
   routing plus logical-database and table metadata
 - Identity-bound, WAL-enabled SQLite shard files that are never silently
@@ -202,7 +206,11 @@ connections rather than reserving every shard pool.
 
 Rust callers may explicitly parse SQL and consume the result with
 `validate_common_subset(ParsedSql)`, receiving an owned opaque `CommonSql` on
-success. They may then opt into `normalize_placeholders(CommonSql)`, receiving
+success. Before consuming it, callers may borrow it with
+`classify_statements(&CommonSql)`, receiving an ordered, source-redacted
+read/write/schema/session classification. Empty input is `InvalidArgument`;
+multi-statement input is accepted only when every statement is a read. They may
+then opt into `normalize_placeholders(CommonSql)`, receiving
 canonical SQLite `?N` text and per-statement occurrence-to-index metadata
 without supplying parameter values. Callers can consume that result with
 `translate_sql(NormalizedSql, SqlTranslationMode)`: explicit compatibility mode
@@ -221,27 +229,30 @@ parameters, explicit_routing_key)` to retain the inference and produce one
 owned canonical route per inferred value plus an independent explicit route.
 That call compares finite inferred and explicit routes by physical shard,
 rejects cross-shard or otherwise unroutable cataloged sharded DML, prevents
-shard-key updates, and exposes the accepted `assigned_shard()`. The synchronous
-plan API records schema and routing provenance but does not classify complete
-request behavior or execute anything.
+shard-key updates, applies the complete batch gate, and exposes both the
+selected `behavior()` and accepted `assigned_shard()`. The synchronous plan API
+records schema and routing provenance but does not execute anything. Direct
+shard-key inference remains statement-local and does not grant batch permission.
 
 Rust callers can instead create a `PrepareRequest` with an explicit logical
 database, dialect, translation mode, and SQL string. `Engine::prepare_statement`
 runs the complete frontend pipeline, requires exactly one top-level statement,
-transiently compiles metadata on shard 0, and caches only BriskDB-owned SQL and
-metadata in the session. `bind_statement` snapshots typed values and the
-session's current route into an immutable portal after transiently validating a
-plan from those concrete values. `describe_prepared` returns owned `Unknown`
-parameter/result types and refreshes column metadata after a schema-generation
-change.
+classifies it, transiently compiles metadata on shard 0, and caches only
+BriskDB-owned SQL, behavior, and metadata in the session. Persistent schema SQL
+is denied during that compile and publishes no handle. `bind_statement`
+snapshots typed values and the session's current route into an immutable portal
+after transiently validating a plan from those concrete values.
+`describe_prepared` returns owned `Unknown` parameter/result types and refreshes
+column metadata after a schema-generation change.
 `execute_portal` always plans again from the retained values and route snapshot
-under the current schema guard. It runs accepted sharded work on its assigned
-shard and safe column-producing `NotApplicable`/`Global` reads on deterministic
-shard 0, returning routed rows or an affected-row count. There is no implicit
-cache eviction, no retained plan, `rusqlite` statement, or connection, and
-closing a statement closes all of its portals. Complete statement behavior and
-batch classification remain issue #27; sharded reads requiring scatter do not
-execute through this lifecycle.
+under the current schema guard. Logical behavior, rather than SQLite result
+columns, decides whether the target is a read, write, schema change, or session
+control. It runs accepted sharded work on its assigned shard and safe
+`NotApplicable`/`Global` reads on deterministic shard 0, returning routed rows
+or an affected-row count. Schema/session execution and sharded reads requiring
+scatter remain unsupported. There is no implicit cache eviction, no retained
+plan, `rusqlite` statement, or connection, and closing a statement closes all
+of its portals.
 
 Translation and planning remain independently callable branches over the same
 normalized request. The HTTP execute, query, and migration endpoints invoke
@@ -353,9 +364,9 @@ Independent `Database` and `Engine` handles in one process that resolve to the
 same canonical data directory share schema coordination. Separate BriskDB
 server processes must not use the same data directory.
 
-Near-term work includes authoritative statement and batch classification,
-authentication, richer migration administration and status APIs in issue #53,
-scatter/gather reads, observability, and backup tooling.
+Near-term work includes authentication, richer migration administration and
+status APIs in issue #53, scatter/gather reads, observability, and backup
+tooling.
 
 ## License
 

@@ -260,6 +260,106 @@ fn common_sql_subset_validation_is_public_owned_and_opt_in() {
 }
 
 #[test]
+fn statement_classification_is_public_typed_ordered_and_conservative() {
+    fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
+    fn assert_copy_public<T: Copy + Eq + std::hash::Hash + Send + Sync + 'static>() {}
+
+    assert_owned_public::<sql::StatementBatchClassification>();
+    assert_copy_public::<sql::StatementBehavior>();
+    assert_copy_public::<sql::WriteBehavior>();
+    assert_copy_public::<sql::SchemaBehavior>();
+    assert_copy_public::<sql::SessionBehavior>();
+
+    let families = [
+        ("SELECT 1", sql::StatementBehavior::Read),
+        (
+            "INSERT INTO widgets (id) VALUES (1)",
+            sql::StatementBehavior::Write(sql::WriteBehavior::Insert),
+        ),
+        (
+            "UPDATE widgets SET id = 2 WHERE id = 1",
+            sql::StatementBehavior::Write(sql::WriteBehavior::Update),
+        ),
+        (
+            "DELETE FROM widgets WHERE id = 1",
+            sql::StatementBehavior::Write(sql::WriteBehavior::Delete),
+        ),
+        (
+            "CREATE TABLE widgets (id INTEGER)",
+            sql::StatementBehavior::Schema(sql::SchemaBehavior::CreateTable),
+        ),
+        (
+            "CREATE INDEX widgets_id ON widgets (id)",
+            sql::StatementBehavior::Schema(sql::SchemaBehavior::CreateIndex),
+        ),
+        (
+            "BEGIN",
+            sql::StatementBehavior::Session(sql::SessionBehavior::Begin),
+        ),
+        (
+            "COMMIT",
+            sql::StatementBehavior::Session(sql::SessionBehavior::Commit),
+        ),
+        (
+            "ROLLBACK",
+            sql::StatementBehavior::Session(sql::SessionBehavior::Rollback),
+        ),
+    ];
+
+    for dialect in sql::SqlDialect::ALL.iter().copied() {
+        for &(source, expected) in &families {
+            let common = sql::validate_common_subset(sql::parse(dialect, source).unwrap()).unwrap();
+            let classification = sql::classify_statements(&common).unwrap();
+            assert_eq!(classification.statement_count(), 1);
+            assert_eq!(classification.behaviors(), [expected]);
+            assert_eq!(classification.behavior(0), Some(expected));
+            assert_eq!(classification.behavior(1), None);
+            assert_eq!(
+                classification.is_read_only(),
+                expected == sql::StatementBehavior::Read
+            );
+            assert_eq!(
+                expected.is_read_only(),
+                expected == sql::StatementBehavior::Read
+            );
+        }
+
+        let private_source =
+            "SELECT 'private-read-one' AS value; SELECT 'private-read-two' AS value";
+        let common =
+            sql::validate_common_subset(sql::parse(dialect, private_source).unwrap()).unwrap();
+        let classification = sql::classify_statements(&common).unwrap();
+        assert_eq!(
+            classification.behaviors(),
+            [sql::StatementBehavior::Read, sql::StatementBehavior::Read]
+        );
+        assert!(classification.is_read_only());
+        let debug = format!("{classification:?}");
+        assert!(!debug.contains("private-read-one"));
+        assert!(!debug.contains("private-read-two"));
+
+        let blocked_source =
+            "SELECT 'private-batch-value'; INSERT INTO private_table (id) VALUES (1)";
+        let blocked_common =
+            sql::validate_common_subset(sql::parse(dialect, blocked_source).unwrap()).unwrap();
+        let blocked = sql::classify_statements(&blocked_common).unwrap_err();
+        assert_eq!(blocked.kind(), core::EngineErrorKind::Unsupported);
+        assert!(blocked.diagnostic().contains("statement 2"));
+        assert!(!blocked.diagnostic().contains("private-batch-value"));
+        assert!(!blocked.diagnostic().contains("private_table"));
+        assert_eq!(blocked_common.source(), blocked_source);
+    }
+
+    let empty = sql::validate_common_subset(
+        sql::parse(sql::SqlDialect::Sqlite, "-- private empty batch").unwrap(),
+    )
+    .unwrap();
+    let error = sql::classify_statements(&empty).unwrap_err();
+    assert_eq!(error.kind(), core::EngineErrorKind::InvalidArgument);
+    assert!(!error.diagnostic().contains("private empty batch"));
+}
+
+#[test]
 fn placeholder_normalization_is_public_owned_bounded_and_opt_in() {
     fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
     assert_owned_public::<sql::NormalizedSql>();
@@ -569,6 +669,10 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
     assert_eq!(plan.bucket_algorithm_version(), 1);
     assert_eq!(plan.map_generation(), 1);
     assert_eq!(plan.statement_index(), 0);
+    assert_eq!(
+        plan.behavior(),
+        sql::StatementBehavior::Write(sql::WriteBehavior::Insert)
+    );
     assert_eq!(
         plan.inference().kind(),
         sql::ShardKeyInferenceKind::Multiple
@@ -974,6 +1078,10 @@ async fn prepared_lifecycle_is_public_owned_and_protocol_neutral() {
         .await
         .unwrap();
     assert_eq!(
+        insert_description.behavior(),
+        sql::StatementBehavior::Write(sql::WriteBehavior::Insert)
+    );
+    assert_eq!(
         insert_description.parameter_types(),
         [core::DataType::Unknown]
     );
@@ -1008,6 +1116,7 @@ async fn prepared_lifecycle_is_public_owned_and_protocol_neutral() {
         .describe_prepared(&session, core::DescribeTarget::Portal(select_portal))
         .await
         .unwrap();
+    assert_eq!(description.behavior(), sql::StatementBehavior::Read);
     assert_eq!(description.parameter_types(), [core::DataType::Unknown]);
     assert_eq!(
         description.columns(),

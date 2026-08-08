@@ -94,14 +94,16 @@ Preparation runs the same ordered frontend pipeline for every protocol:
 
 ```text
 parse -> exact-one top-level statement check -> common-subset validation ->
-placeholder normalization -> explicit translation -> transient SQLite compile
+statement classification -> placeholder normalization -> explicit translation
+-> transient SQLite compile
 ```
 
 The request must contain exactly one top-level SQL statement. Empty,
 comment-only, and multi-statement input returns `InvalidArgument`. This is a
-prepared-handle cardinality rule, not the general request classifier: issue
-#27 remains authoritative for empty and multi-statement request policy and for
-read/write/schema/session behavior.
+prepared-handle cardinality rule, not the general request classifier. The
+implemented [statement/batch classifier](SQL_STATEMENT_CLASSIFICATION.md)
+accepts a general multi-statement request only when every member is a read and
+supplies the singleton's precise read/write/schema/session behavior here.
 
 ## Logical cache and handle ownership
 
@@ -147,6 +149,7 @@ and verified to match across shards.
 `PreparedStatementDescription` is owned, cloneable, `Send`, and `Sync`. It
 reports:
 
+- the authoritative parsed `StatementBehavior` retained at prepare time;
 - one `DataType::Unknown` entry for every normalized one-based parameter index;
 - ordered result `Column` values copied from SQLite, preserving duplicate and
   empty names;
@@ -163,7 +166,8 @@ according to its own documented wire rules.
 `DescribeTarget::Portal` describes its underlying statement. A description at
 the current schema generation is returned from owned memory. After a completed
 schema migration changes the generation, describe recompiles the SQL on shard
-0 and atomically replaces the cached metadata. A normalized-versus-SQLite
+0 and atomically replaces the cached column metadata while preserving the
+classified behavior. A normalized-versus-SQLite
 parameter-count mismatch is an `Internal` invariant failure and does not
 publish mismatched metadata.
 
@@ -277,41 +281,49 @@ contains the current schema generation, routing-map generation, hash version,
 key-encoding version, and bucket-algorithm version. The engine keeps that same
 guard through target selection and SQLite completion, then discards the plan.
 
-Target selection is intentionally narrow:
+Target selection is intentionally narrow and starts from the retained logical
+behavior rather than SQLite result-column metadata:
 
-- accepted cataloged sharded work uses the current plan's one
+- accepted cataloged sharded reads and writes use the current plan's one
   `assigned_shard()`;
-- a safe column-producing statement with `NotApplicable` inference, such as
-  `SELECT 1`, uses deterministic shard 0;
-- a safe column-producing read of a `Global` table uses deterministic shard 0;
+- a classified `Read` with `NotApplicable` inference, such as `SELECT 1`, uses
+  deterministic shard 0;
+- a classified `Read` of a `Global` table uses deterministic shard 0;
 - `Catalog` placement is `PermissionDenied`; and
-- an unassigned sharded read that requires scatter is `Unsupported`.
+- an unassigned sharded read, a `Global` write, or `Session` behavior is
+  `Unsupported`.
 
 Shard 0 is valid for the two replicated-schema read cases because every ready
 shard has the same generation-bound application schema and `Global` declares
 replicated lookup placement. This initial path reads one deterministic replica;
 it does not compare replicas.
 
-These paths remain outside issue #26:
+These paths remain outside the current lifecycle:
 
 - scatter/gather or otherwise multi-shard reads;
 - contradictory reads that might later become an empty result without SQLite;
 - global writes, schema and session-statement execution paths;
 - persistent DDL outside the journaled schema-migration API;
-- complete read/write/schema/session classification and safe batch policy; and
 - explicit transaction state and shard pinning.
 
 Cataloged sharded DML must already satisfy the single-shard policy in
 [SQL planning](SQL_PLANNING.md). A cataloged read with finite inference, or one
 accepted through the bind-time routing fallback, can execute when it has one
-assigned shard. Issue #27 will publish the authoritative statement classifier;
-issue #26 does not infer permission merely from SQLite's ability to compile a
-statement.
+assigned shard. The shared classifier is authoritative; SQLite's ability to
+compile a statement or report columns never grants execution permission.
+
+Persistent `CREATE TABLE` and `CREATE INDEX` are classified as `Schema`, but
+ordinary shard authorizer policy denies them during transient preparation with
+`PermissionDenied`, so no prepared handle or description is published. A
+session-control singleton can be prepared and described, but portal execution
+returns `Unsupported` before SQLite is stepped and leaves the session usable.
 
 SQLite transiently prepares and executes the retained canonical SQLite SQL on
-the selected target. Read-only statements produce
+the selected target. Classified reads must produce
 `Routed<PreparedExecution::Rows(ResultSet)>`; commands produce
-`Routed<PreparedExecution::AffectedRows(usize)>`. Row results preserve ordered
+`Routed<PreparedExecution::AffectedRows(usize)>` only for classified writes. A
+disagreement between classified behavior and SQLite execution metadata is an
+`Internal` invariant failure. Row results preserve ordered
 metadata, duplicate names, positional values, and the normal exact result row
 and logical-byte limits. Row-producing writes are rejected rather than partly
 materialized. The returned `Routed` value always names the physical shard that
@@ -349,8 +361,8 @@ The lifecycle preserves the existing stable `EngineErrorKind` taxonomy:
 | --- | --- |
 | Unknown logical database, empty/multi-statement prepare, wrong bind arity, or conflicting explicit/inferred route | `InvalidArgument` |
 | SQL parse/SQLite compile failure or planner write-policy rejection where documented | `InvalidQuery` |
-| Unsupported subset/translation form, unsupported execution target, or row-producing write | `Unsupported` or the narrower documented SQL-path kind |
-| Execution with `Catalog` placement, whether a read or command | `PermissionDenied` |
+| Unsupported subset/translation form, session execution, unsupported physical target, or row-producing write | `Unsupported` or the narrower documented SQL-path kind |
+| Persistent schema prepare, or execution with `Catalog` placement | `PermissionDenied` |
 | Incompatible key/value type | `TypeMismatch` |
 | Out-of-range unsigned integer or inferred integer | `NumericOutOfRange` |
 | Invalid text value | `InvalidTextEncoding` |
@@ -359,11 +371,11 @@ The lifecycle preserves the existing stable `EngineErrorKind` taxonomy:
 | Pool/schema admission contention | `Busy` |
 | Request cancellation or deadline | `Cancelled` / `DeadlineExceeded` |
 | Degraded storage state | `DataCorruption` |
-| Retained metadata or accounting invariant mismatch | `Internal` |
+| Retained metadata/accounting mismatch, or classified behavior disagreeing with SQLite execution metadata | `Internal` |
 
-Parsing, validation, normalization, translation, inference, planning, SQLite,
-request-control, and storage errors retain the precedence and kind defined by
-their normative contracts. Cache-limit failures do not evict older entries.
+Parsing, validation, classification, normalization, translation, inference,
+planning, SQLite, request-control, and storage errors retain the precedence and
+kind defined by their normative contracts. Cache-limit failures do not evict older entries.
 Failed prepare does not publish an ID; failed bind does not publish a portal;
 failed describe does not replace valid current metadata; and failed execution
 retains the portal for inspection, retry where independently appropriate, or
@@ -417,11 +429,14 @@ or prepared-cache recovery step is required.
 
 Tests cover the complete SQLite/PostgreSQL/MySQL typed lifecycle; exact
 single-statement enforcement; unknown databases; transient shard-0 metadata;
-parameter and column descriptions; schema-generation refresh; fresh planning
+classified behavior and parameter/column descriptions; schema-generation
+behavior preservation; fresh planning
 after schema/routing changes; routing snapshots; affected-row and row results;
 result limits; session ownership; statement, portal, and retained-byte limits without
 eviction; repeated-marker planning expansion before allocation; exact close and
-cascading invalidation; invalid arity/value recovery; unassigned execution;
+cascading invalidation; invalid arity/value recovery; behavior-based unassigned
+execution; schema-prepare denial and session-execution rejection without state
+changes;
 deterministic concurrent capacity races; cancellation while waiting for a
 session; session close during admitted work; diagnostics and safe protocol
 mapping; targeted request/cache/portal/plan/description `Debug` redaction;

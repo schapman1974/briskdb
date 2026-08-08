@@ -23,7 +23,7 @@ server ---------> protocol::http
 | --- | --- | --- |
 | `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only logical catalog, synchronous bound-value-aware plans, prepared lifecycle, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
-| `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, session/write policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
+| `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, listener binding, and tracked Axum HTTP/1 connection lifecycle | SQL parsing or storage implementation details |
@@ -92,11 +92,11 @@ deterministic and keeps the dependency replaceable.
 
 Parsing is syntax recognition, not support validation or planning. The parser
 has no session, parameter, catalog, storage, or routing access. The separate
-common-subset validator, placeholder normalizer, shard-key inference layer, and
-later planner layers consume structural syntax through BriskDB-owned
-interfaces; shard-key inference does not inspect raw or formatted SQL with
-regular expressions. Exact input remains authoritative because AST formatting
-is lossy and is never executed.
+common-subset validator, statement classifier, placeholder normalizer,
+shard-key inference layer, and later planner layers consume structural syntax
+through BriskDB-owned interfaces; shard-key inference does not inspect raw or
+formatted SQL with regular expressions. Exact input remains authoritative
+because AST formatting is lossy and is never executed.
 
 Inputs are bounded to 65,536 UTF-8 bytes, 256 statements, and recursion depth
 32. The dependency's recursive-protection feature remains enabled. Parse and
@@ -116,18 +116,43 @@ failures retain their existing kinds.
 Validation is structural and stateless. It does not normalize placeholders,
 translate type names or syntax, inspect parameters or the catalog, infer a
 shard, build a plan, classify statement behavior, authorize an endpoint, or
-execute SQL. Empty and mixed batches can validate because issue #27 owns
-request-level batch policy. Recursive expression validation has an independent
-depth limit of 128 so iteratively parsed flat operator chains remain bounded.
+execute SQL. Empty and mixed batches can validate because the separate
+classifier owns request-level batch policy. Recursive expression validation has
+an independent depth limit of 128 so iteratively parsed flat operator chains remain bounded.
 The normative accepted forms and exclusions are in the [common SQL subset
 contract](SQL_SUBSET.md).
 
 The current HTTP execute/query and migration paths deliberately remain raw
-SQLite pass-through and call none of the parser, subset validator, placeholder
-normalizer, translator, shard-key inference, bound statement-planning, or
-prepared-lifecycle layers. Issues #19 through #26 therefore change no HTTP
-shape, SQL acceptance, execution routing, or storage behavior. Rust callers can
-now invoke those layers together through the separate prepared API.
+SQLite pass-through and call none of the parser, subset validator, statement
+classifier, placeholder normalizer, translator, shard-key inference, bound
+statement-planning, or prepared-lifecycle layers. Issues #19 through #27
+therefore change no HTTP shape, SQL acceptance, execution routing, or storage
+behavior. Rust callers can now invoke those layers together through the
+separate prepared API.
+
+### Statement-classification boundary
+
+`classify_statements(&CommonSql)` borrows the validated opaque AST and returns
+an owned ordered `StatementBatchClassification`. Each top-level statement is
+classified as `Read`, a precise `Write` (`Insert`, `Update`, or `Delete`), a
+precise `Schema` change (`CreateTable` or `CreateIndex`), or a precise `Session`
+control (`Begin`, `Commit`, or `Rollback`). The result exposes ordered behavior,
+count, indexed lookup, and whether the accepted batch is wholly read-only,
+without exposing or rendering SQL or the dependency-owned AST.
+
+Empty input is `InvalidArgument`. A singleton of any behavior is classified,
+but a batch of two or more statements is accepted only when every member is a
+read; the first non-read member makes the whole batch `Unsupported`. This is
+logical request policy, not execution permission. The classifier has no
+catalog, parameters, routing, session, storage, or SQLite access and opens no
+connection.
+
+The general planner applies this complete batch gate before planning a selected
+member and retains that member's behavior. Direct shard-key inference remains
+statement-local. Prepared statements keep their stricter exact-one rule, then
+retain the singleton behavior for descriptions and execution target policy.
+The normative taxonomy, matrix, errors, integration, and tests are in [SQL
+statement and batch classification](SQL_STATEMENT_CLASSIFICATION.md).
 
 ### Placeholder-normalization boundary
 
@@ -152,7 +177,7 @@ expressions or AST formatting. Every non-marker byte remains exact, including
 comments, literals, whitespace, and UTF-8 text. SQLite named parameters are
 deliberately unsupported. The layer has no session, catalog, storage, routing,
 filesystem, or execution access and does not decide whether a statement batch
-may execute; issue #27 owns that policy. The normative API, dialect rules,
+may execute; the classifier owns that policy. The normative API, dialect rules,
 limits, errors, and tests are in the [SQL parameter-normalization
 contract](SQL_PARAMETERS.md).
 
@@ -207,14 +232,16 @@ contract](SQL_SHARD_KEYS.md).
 
 ### Bound statement-planning boundary
 
-Synchronous `Engine::plan_bound_statement` accepts one `NormalizedSql`
-statement, its complete bound `Value` slice, the selected logical database, and
-an optional explicit routing byte sequence. It invokes inference only after
-the bound values exist, encodes every inferred value, and looks each occurrence
-up through the validated routing catalog. The returned `BoundStatementPlan`
-owns the inference and one `PlannedRoute` per inferred value in matching order,
-including duplicate multi-row values and distinct keys that happen to select
-the same physical shard.
+Synchronous `Engine::plan_bound_statement` accepts a `NormalizedSql` batch, one
+selected statement's complete bound `Value` slice, the selected logical
+database, and an optional explicit routing byte sequence. It first applies the
+complete statement/batch classifier, then invokes statement-local inference
+only after the bound values exist, encodes every inferred value, and looks each
+occurrence up through the validated routing catalog. The returned
+`BoundStatementPlan` owns the selected `StatementBehavior`, inference, and one
+`PlannedRoute` per inferred value in matching order, including duplicate
+multi-row values and distinct keys that happen to select the same physical
+shard.
 
 Canonical version-1 inferred bytes are the shortest signed decimal ASCII form
 for `Int64`, exact UTF-8 for `Text`, and exact bytes for `Binary`. Explicit
@@ -224,12 +251,11 @@ never by opaque bytes, and records `assigned_shard()` when one valid target
 exists. Distinct logical keys co-located on one shard remain separate route
 occurrences but form one physical assignment.
 
-The SQL layer exposes only a crate-private inspection of whether the selected
-AST is `INSERT`, `UPDATE`, or `DELETE` and whether an `UPDATE` targets the
-cataloged shard-key column. Core uses that shape to reject unproven inserts,
-multi-shard writes, broad updates/deletes without explicit fallback, and every
-shard-key assignment. Full read/write/schema/session behavior and batch
-classification remain issue #27.
+The public classifier supplies the precise selected read/write/schema/session
+behavior. SQL also exposes a narrow crate-private DML shape, including whether
+an `UPDATE` targets the cataloged shard-key column. Core uses those shapes to
+reject unproven inserts, multi-shard writes, broad updates/deletes without
+explicit fallback, and every shard-key assignment.
 
 Planning holds the existing schema-operation guard while it reads logical and
 routing state. The owned result records schema generation, map generation, and
@@ -240,21 +266,23 @@ owned bind snapshot under its current schema-operation guard.
 
 The public planner remains stateless and its assignment alone is not execution
 permission. It does not invoke translation, mutate a session, cache a prepared
-statement, apply batch policy, open a shard connection, scatter reads, or
-execute anything. The normative API, assignment matrix, encoding, provenance,
-error, boundary, and testing rules are in the
+statement, open a shard connection, scatter reads, or execute anything. It does
+apply the shared batch gate so a mutating multi-statement request cannot reach
+later planning through this boundary. The normative API, assignment matrix,
+encoding, provenance, error, boundary, and testing rules are in the
 [bound statement-planning and routing-policy
 contract](SQL_PLANNING.md). Translation is the separate implemented issue #25
-branch over the same `NormalizedSql`; issue #26's prepared lifecycle consumes
-both layers, while issue #27 still owns authoritative statement/batch policy.
+branch over the same `NormalizedSql`; the prepared lifecycle consumes the
+classifier, translation, and planning layers.
 
 ### Prepared-statement and portal boundary
 
 `Engine::prepare_statement` accepts an owned `PrepareRequest` with one logical
 database, source dialect, explicit translation mode, and SQL string. It runs
-parse, exact-one top-level validation, subset validation, placeholder
-normalization, and translation, then transiently compiles metadata on shard 0.
-The session cache retains only BriskDB-owned `TranslatedSql` plus owned
+parse, exact-one top-level validation, subset validation, statement
+classification, placeholder normalization, and translation, then transiently
+compiles metadata on shard 0. The session cache retains only BriskDB-owned
+`TranslatedSql`, the precise singleton `StatementBehavior`, and owned
 parameter/column metadata. No `rusqlite::Statement`, rows iterator, SQLite
 connection, pool handle, or protocol buffer crosses the operation boundary.
 
@@ -265,10 +293,13 @@ only that snapshot and the values in an immutable logical portal. Later
 session-route changes do not affect it. Describing after a schema-generation
 change recompiles owned metadata on shard 0. Every execution plans again from
 the portal snapshot under the current schema/routing guard before choosing the
-supported physical target. Safe
-column-producing `NotApplicable` and `Global` reads may use deterministic shard
-0; a sharded read that still needs scatter remains unsupported. Catalog
-placement is never exposed as an application read target.
+supported physical target. Logical behavior, not SQLite result-column metadata,
+distinguishes reads from writes, schema changes, and session control. Safe
+`NotApplicable` and `Global` reads may use deterministic shard 0; a sharded
+read that still needs scatter remains unsupported. Schema/session execution is
+not implemented, and Catalog placement is never exposed as an application
+target. `PreparedStatementDescription::behavior()` gives adapters the same
+retained behavior.
 
 Per-session limits independently bound statement count, portal count, and the
 logical accounted value bytes plus routing bytes retained by all portals. Full
@@ -283,12 +314,12 @@ expansion by charging its captured route once and each normalized marker
 occurrence twice; repeated markers cannot cause unbounded inference/route
 allocation before the check.
 
-The prepared lifecycle integrates the previously independent SQL and planning
-layers but deliberately does not publish the complete statement classifier,
-execute a multi-statement batch, scatter reads, or implement transactions.
-Those remain issue #27 and the later planner/transaction milestones. The
-complete API, accounting, execution, error, adapter, and persistence contract
-is in [prepared statements and bound portals](SQL_PREPARED_STATEMENTS.md).
+The prepared lifecycle integrates the classifier, translation, and planning
+layers but deliberately does not execute a multi-statement batch, scatter
+reads, execute schema/session statements, or implement transactions. Those
+remain later planner/transaction milestones. The complete API, accounting,
+execution, error, adapter, and persistence contract is in [prepared statements
+and bound portals](SQL_PREPARED_STATEMENTS.md).
 
 ## Manifest storage boundary
 

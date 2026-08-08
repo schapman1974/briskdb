@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, fmt, num::NonZeroU64, sync::Arc};
 
-use crate::sql::{SqlDialect, SqlTranslationMode, TranslatedSql};
+use crate::sql::{SqlDialect, SqlTranslationMode, StatementBehavior, TranslatedSql};
 
 use super::{
     Column, DataType, EngineError, EngineErrorKind, EngineResult, LogicalDatabaseId,
@@ -124,9 +124,10 @@ pub enum DescribeTarget {
     Portal(PortalId),
 }
 
-/// Owned parameter and result metadata for a prepared statement.
+/// Owned behavior, parameter, and result metadata for a prepared statement.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PreparedStatementDescription {
+    behavior: StatementBehavior,
     parameter_types: Box<[DataType]>,
     columns: Box<[Column]>,
     schema_generation: u64,
@@ -134,15 +135,22 @@ pub struct PreparedStatementDescription {
 
 impl PreparedStatementDescription {
     pub(crate) fn new(
+        behavior: StatementBehavior,
         parameter_count: usize,
         columns: Vec<Column>,
         schema_generation: u64,
     ) -> Self {
         Self {
+            behavior,
             parameter_types: vec![DataType::Unknown; parameter_count].into_boxed_slice(),
             columns: columns.into_boxed_slice(),
             schema_generation,
         }
+    }
+
+    /// Return the authoritative parsed behavior of this statement.
+    pub const fn behavior(&self) -> StatementBehavior {
+        self.behavior
     }
 
     /// Return one protocol-neutral type for every normalized parameter index.
@@ -173,6 +181,7 @@ impl fmt::Debug for PreparedStatementDescription {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedStatementDescription")
+            .field("behavior", &self.behavior)
             .field("parameter_count", &self.parameter_types.len())
             .field("column_count", &self.columns.len())
             .field("schema_generation", &self.schema_generation)
@@ -224,6 +233,7 @@ impl fmt::Debug for PreparedTemplate {
             .field("translation_mode", &self.translated.mode())
             .field("source_bytes", &self.translated.source().len())
             .field("sqlite_sql_bytes", &self.translated.sqlite_sql().len())
+            .field("behavior", &self.description.behavior)
             .field("parameter_count", &self.description.parameter_types.len())
             .field("column_count", &self.description.columns.len())
             .field("schema_generation", &self.description.schema_generation)
@@ -630,7 +640,12 @@ mod tests {
     }
 
     fn description(parameters: usize) -> PreparedStatementDescription {
-        PreparedStatementDescription::new(parameters, vec![Column::new("v", DataType::Unknown)], 0)
+        PreparedStatementDescription::new(
+            StatementBehavior::Read,
+            parameters,
+            vec![Column::new("v", DataType::Unknown)],
+            0,
+        )
     }
 
     fn state(max_statements: usize, max_portals: usize, max_bytes: u64) -> PreparedState {
@@ -849,6 +864,7 @@ mod tests {
     #[test]
     fn description_accessors_preserve_counts_and_redact_column_names() {
         let description = PreparedStatementDescription::new(
+            StatementBehavior::Read,
             2,
             vec![
                 Column::new("private_a", DataType::Unknown),
@@ -862,9 +878,23 @@ mod tests {
         );
         assert_eq!(description.columns().len(), 2);
         assert_eq!(description.schema_generation(), 7);
+        assert_eq!(description.behavior(), StatementBehavior::Read);
         assert!(description.returns_rows());
         let debug = format!("{description:?}");
         assert!(!debug.contains("private_a"));
         assert!(!debug.contains("private_b"));
+
+        let command = PreparedStatementDescription::new(
+            StatementBehavior::Write(crate::sql::WriteBehavior::Update),
+            0,
+            vec![],
+            7,
+        );
+        assert_eq!(
+            command.behavior(),
+            StatementBehavior::Write(crate::sql::WriteBehavior::Update)
+        );
+        assert!(!command.returns_rows());
+        assert_ne!(command, description);
     }
 }

@@ -2,11 +2,13 @@
 //!
 //! The parser facade produces a bounded, dialect-explicit opaque AST. The
 //! common-subset validator recursively admits only protocol-neutral SQL shapes,
-//! and the placeholder normalizer produces a separate source-preserving SQLite
-//! parameter representation for later planning work. Current execution remains
-//! deliberate SQLite pass-through; these opt-in layers do not gate, route, or
-//! execute statements.
+//! the statement classifier identifies protocol-neutral behavior and enforces
+//! read-only multi-statement batches, and the placeholder normalizer produces a
+//! separate source-preserving SQLite parameter representation for later
+//! planning work. Current HTTP execution remains deliberate SQLite pass-through;
+//! these opt-in layers do not route or execute statements.
 
+mod classifier;
 mod dml;
 mod inference;
 mod normalizer;
@@ -14,8 +16,13 @@ mod parser;
 mod subset;
 mod translator;
 
+pub(crate) use classifier::classify_normalized_statements;
 pub(crate) use dml::{RoutedDml, routed_dml_shape};
 
+pub use classifier::{
+    SchemaBehavior, SessionBehavior, StatementBatchClassification, StatementBehavior,
+    WriteBehavior, classify_statements,
+};
 pub use inference::{ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue, infer_shard_keys};
 pub use normalizer::{
     MAX_SQL_PARAMETERS, NormalizedSql, StatementParameters, normalize_placeholders,

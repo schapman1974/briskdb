@@ -21,8 +21,10 @@ normalizer, and values are never rendered or interpolated into SQL text. The
 current HTTP execute, query, and migration endpoints do not invoke this opt-in
 layer; they retain their existing raw SQLite behavior. The asynchronous
 prepared lifecycle does invoke it and requires exactly one statement before it
-creates a prepared handle. Issue #27 still owns general empty-batch and
-multi-statement request policy.
+creates a prepared handle. Before consuming `CommonSql`, callers can borrow it
+with the implemented [statement/batch
+classifier](SQL_STATEMENT_CLASSIFICATION.md). That separate layer owns general
+empty and multi-statement request policy.
 
 The separate [SQL translation layer](SQL_TRANSLATION.md) can consume the
 result and either expose the normalized SQLite text exactly in strict mode or
@@ -166,7 +168,8 @@ A successful `NormalizedSql` does not establish that:
 - catalog names and types exist or are compatible;
 - non-placeholder PostgreSQL or MySQL syntax has been translated to SQLite
   until the separate `translate_sql` call succeeds;
-- a statement or batch is permitted by an endpoint or session;
+- a statement or batch passed classification, unless it is consumed by the
+  policy-bearing planner or prepared pipeline;
 - a prepared statement has been described, cached, bound, or executed; or
 - execution would preserve all source-dialect semantics.
 
@@ -178,8 +181,10 @@ unroutable cataloged sharded writes, and records a valid single-shard
 assignment. The implemented issue #25 translation layer is separate from this
 normalizer. The implemented
 [prepared-statement lifecycle](SQL_PREPARED_STATEMENTS.md) runs normalization
-during prepare, retains its metadata, and uses it again at bind. Issue #27 owns
-request-level statement classification.
+during prepare after exact-one classification, retains its metadata, and uses
+it again at bind. The planner applies complete batch policy before planning a
+selected normalized statement; direct shard-key inference remains
+statement-local.
 
 ## Verification obligations
 

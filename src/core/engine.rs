@@ -550,7 +550,7 @@ impl Engine {
                 "selected logical database does not exist",
             )));
         }
-        let (database, translated) = match prepare_translated_request(request) {
+        let (database, behavior, translated) = match prepare_translated_request(request) {
             Ok(prepared) => prepared,
             Err(error) => return operation.finish(Err(error)),
         };
@@ -576,6 +576,7 @@ impl Engine {
                     })?;
                     ensure_parameter_metadata(parameter_count, metadata.parameter_count())?;
                     let description = PreparedStatementDescription::new(
+                        behavior,
                         parameter_count,
                         metadata.columns().to_vec(),
                         schema_generation,
@@ -704,6 +705,7 @@ impl Engine {
         }
 
         let parameter_count = template.translated().statement_parameters()[0].parameter_count();
+        let behavior = template.description().behavior();
         let sqlite_sql = template.translated().sqlite_sql().to_owned();
         let owner = ConnectionOwner::new(session.id().get());
         let result = self
@@ -720,6 +722,7 @@ impl Engine {
                     })?;
                     ensure_parameter_metadata(parameter_count, metadata.parameter_count())?;
                     let description = PreparedStatementDescription::new(
+                        behavior,
                         parameter_count,
                         metadata.columns().to_vec(),
                         schema_generation,
@@ -780,10 +783,11 @@ impl Engine {
             Err(error) => return operation.finish(Err(error)),
         };
         let sqlite_sql = template.translated().sqlite_sql().to_owned();
-        let shard = match prepared_execution_shard(&plan, template.description(), self.catalog()) {
+        let shard = match prepared_execution_shard(&plan, self.catalog()) {
             Ok(shard) => shard,
             Err(error) => return operation.finish(Err(error)),
         };
+        let behavior = plan.behavior();
         let result_limits = operation.result_limits;
         let owner = ConnectionOwner::new(session.id().get());
         let result = self
@@ -802,12 +806,7 @@ impl Engine {
                             portal_snapshot.parameters(),
                             result_limits,
                         )
-                        .map(|execution| match execution {
-                            sql::StatementExecution::Rows(rows) => PreparedExecution::Rows(rows),
-                            sql::StatementExecution::AffectedRows(rows) => {
-                                PreparedExecution::AffectedRows(rows)
-                            }
-                        })
+                        .and_then(|execution| prepared_execution(behavior, execution))
                     })
                 },
             )
@@ -1245,7 +1244,11 @@ impl Engine {
 
 fn prepare_translated_request(
     request: PrepareRequest,
-) -> EngineResult<(LogicalDatabaseId, sql::TranslatedSql)> {
+) -> EngineResult<(
+    LogicalDatabaseId,
+    sql::StatementBehavior,
+    sql::TranslatedSql,
+)> {
     let (database, dialect, translation_mode, source) = request.into_parts();
     let parsed = sql::parse(dialect, source)?;
     if parsed.statement_count() != 1 {
@@ -1255,9 +1258,16 @@ fn prepare_translated_request(
         ));
     }
     let common = sql::validate_common_subset(parsed)?;
+    let classification = sql::classify_statements(&common)?;
+    let behavior = classification.behavior(0).ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "prepared statement classification lost its only statement",
+        )
+    })?;
     let normalized = sql::normalize_placeholders(common)?;
     let translated = sql::translate_sql(normalized, translation_mode)?;
-    Ok((database, translated))
+    Ok((database, behavior, translated))
 }
 
 fn ensure_parameter_metadata(expected: usize, actual: usize) -> EngineResult<()> {
@@ -1273,45 +1283,92 @@ fn ensure_parameter_metadata(expected: usize, actual: usize) -> EngineResult<()>
 
 fn prepared_execution_shard(
     plan: &BoundStatementPlan,
-    description: &PreparedStatementDescription,
     catalog: &super::Catalog,
 ) -> EngineResult<u16> {
-    if let Some(shard) = plan.assigned_shard() {
-        return Ok(shard);
+    if matches!(
+        plan.behavior(),
+        sql::StatementBehavior::Schema(_) | sql::StatementBehavior::Session(_)
+    ) {
+        return Err(unsupported_prepared_behavior());
     }
 
-    match plan.inference().kind() {
-        sql::ShardKeyInferenceKind::NotApplicable if description.returns_rows() => Ok(0),
-        sql::ShardKeyInferenceKind::NotApplicable => Err(unassigned_prepared_statement()),
-        sql::ShardKeyInferenceKind::NotSharded => {
-            let table = plan
-                .inference()
-                .table_id()
-                .and_then(|table| catalog.table_by_id(table))
-                .ok_or_else(|| {
-                    EngineError::new(
-                        EngineErrorKind::Internal,
-                        "non-sharded prepared planning lost its catalog table",
-                    )
-                })?;
-            match table.placement() {
-                TablePlacement::Global if description.returns_rows() => Ok(0),
-                TablePlacement::Global => Err(unassigned_prepared_statement()),
-                TablePlacement::Catalog => Err(EngineError::new(
+    let is_global = if plan.inference().kind() == sql::ShardKeyInferenceKind::NotSharded {
+        let table = plan
+            .inference()
+            .table_id()
+            .and_then(|table| catalog.table_by_id(table))
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    "non-sharded prepared planning lost its catalog table",
+                )
+            })?;
+        match table.placement() {
+            TablePlacement::Catalog => {
+                return Err(EngineError::new(
                     EngineErrorKind::PermissionDenied,
                     "catalog-placed tables cannot execute as client SQL",
-                )),
-                TablePlacement::Sharded(_) => Err(EngineError::new(
+                ));
+            }
+            TablePlacement::Global => true,
+            TablePlacement::Sharded(_) => {
+                return Err(EngineError::new(
                     EngineErrorKind::Internal,
                     "non-sharded prepared planning resolved a sharded table",
-                )),
+                ));
             }
         }
-        sql::ShardKeyInferenceKind::Unconstrained
-        | sql::ShardKeyInferenceKind::Contradiction
-        | sql::ShardKeyInferenceKind::Exact
-        | sql::ShardKeyInferenceKind::Multiple => Err(unassigned_prepared_statement()),
+    } else {
+        false
+    };
+
+    match plan.behavior() {
+        sql::StatementBehavior::Read => {
+            if let Some(shard) = plan.assigned_shard() {
+                return Ok(shard);
+            }
+            match plan.inference().kind() {
+                sql::ShardKeyInferenceKind::NotApplicable => Ok(0),
+                sql::ShardKeyInferenceKind::NotSharded if is_global => Ok(0),
+                sql::ShardKeyInferenceKind::NotSharded
+                | sql::ShardKeyInferenceKind::Unconstrained
+                | sql::ShardKeyInferenceKind::Contradiction
+                | sql::ShardKeyInferenceKind::Exact
+                | sql::ShardKeyInferenceKind::Multiple => Err(unassigned_prepared_statement()),
+            }
+        }
+        sql::StatementBehavior::Write(_) => plan
+            .assigned_shard()
+            .ok_or_else(unassigned_prepared_statement),
+        sql::StatementBehavior::Schema(_) | sql::StatementBehavior::Session(_) => {
+            Err(unsupported_prepared_behavior())
+        }
     }
+}
+
+fn prepared_execution(
+    behavior: sql::StatementBehavior,
+    execution: sql::StatementExecution,
+) -> EngineResult<PreparedExecution> {
+    match (behavior, execution) {
+        (sql::StatementBehavior::Read, sql::StatementExecution::Rows(rows)) => {
+            Ok(PreparedExecution::Rows(rows))
+        }
+        (sql::StatementBehavior::Write(_), sql::StatementExecution::AffectedRows(rows)) => {
+            Ok(PreparedExecution::AffectedRows(rows))
+        }
+        _ => Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "classified statement behavior disagrees with SQLite execution metadata",
+        )),
+    }
+}
+
+fn unsupported_prepared_behavior() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::Unsupported,
+        "schema and session statements require a dedicated engine operation",
+    )
 }
 
 fn unassigned_prepared_statement() -> EngineError {
@@ -1448,6 +1505,42 @@ mod tests {
             .map(|value| format!("shard-{value}"))
             .find(|key| engine.inner.database.shard_for_key(key.as_bytes()) == expected)
             .expect("the finite shard layout has a routing key")
+    }
+
+    #[test]
+    fn prepared_execution_shape_must_match_classified_behavior() {
+        let rows = ResultSet::new(vec![Column::new("value", DataType::Int64)], vec![]).unwrap();
+        assert_eq!(
+            prepared_execution(
+                sql::StatementBehavior::Read,
+                sql::StatementExecution::Rows(rows.clone()),
+            )
+            .unwrap(),
+            PreparedExecution::Rows(rows.clone())
+        );
+        assert_eq!(
+            prepared_execution(
+                sql::StatementBehavior::Write(sql::WriteBehavior::Update),
+                sql::StatementExecution::AffectedRows(2),
+            )
+            .unwrap(),
+            PreparedExecution::AffectedRows(2)
+        );
+
+        for error in [
+            prepared_execution(
+                sql::StatementBehavior::Read,
+                sql::StatementExecution::AffectedRows(0),
+            )
+            .unwrap_err(),
+            prepared_execution(
+                sql::StatementBehavior::Write(sql::WriteBehavior::Delete),
+                sql::StatementExecution::Rows(rows),
+            )
+            .unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+        }
     }
 
     async fn wait_for_pool_occupancy(engine: &Engine, shard: u16, active: usize, queued: usize) {
@@ -1598,43 +1691,84 @@ mod tests {
         let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
         let session = engine.session();
 
-        let insert = engine
-            .prepare_statement(
-                &session,
-                PrepareRequest::new(
-                    database,
-                    sql::SqlDialect::Sqlite,
-                    sql::SqlTranslationMode::StrictSqlite,
-                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
-                ),
-            )
-            .await
-            .unwrap();
-        let insert_description = engine
-            .describe_prepared(&session, DescribeTarget::Statement(insert))
-            .await
-            .unwrap();
-        assert_eq!(
-            insert_description.parameter_types(),
-            [DataType::Unknown, DataType::Unknown]
-        );
-        assert!(insert_description.columns().is_empty());
-        assert!(!insert_description.returns_rows());
+        let insert_requests = [
+            (
+                sql::SqlDialect::Sqlite,
+                sql::SqlTranslationMode::StrictSqlite,
+                "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                7_i64,
+                "seven",
+            ),
+            (
+                sql::SqlDialect::PostgreSql,
+                sql::SqlTranslationMode::Compatibility,
+                "INSERT INTO events (tenant_id, payload) VALUES ($1, $2)",
+                8_i64,
+                "eight",
+            ),
+            (
+                sql::SqlDialect::MySql,
+                sql::SqlTranslationMode::Compatibility,
+                "INSERT INTO events (tenant_id, payload) VALUES (?, ?)",
+                9_i64,
+                "nine",
+            ),
+        ];
+        let mut insert_descriptions = Vec::new();
+        for (dialect, mode, source, tenant_id, payload) in insert_requests {
+            let statement = engine
+                .prepare_statement(
+                    &session,
+                    PrepareRequest::new(database, dialect, mode, source),
+                )
+                .await
+                .unwrap();
+            let description = engine
+                .describe_prepared(&session, DescribeTarget::Statement(statement))
+                .await
+                .unwrap();
+            assert_eq!(
+                description.parameter_types(),
+                [DataType::Unknown, DataType::Unknown]
+            );
+            assert_eq!(
+                description.behavior(),
+                sql::StatementBehavior::Write(sql::WriteBehavior::Insert)
+            );
+            assert!(description.columns().is_empty());
+            assert!(!description.returns_rows());
+            insert_descriptions.push(description);
 
-        let insert_portal = engine
-            .bind_statement(
-                &session,
-                insert,
-                vec![Value::from(7_i64), Value::from("seven")],
-            )
-            .await
-            .unwrap();
-        let inserted = engine
-            .execute_portal(&session, insert_portal)
-            .await
-            .unwrap();
-        assert_eq!(inserted.value, PreparedExecution::AffectedRows(1));
-        assert_eq!(inserted.shard, engine.inner.database.shard_for_key(b"7"));
+            let portal = engine
+                .bind_statement(
+                    &session,
+                    statement,
+                    vec![Value::from(tenant_id), Value::from(payload)],
+                )
+                .await
+                .unwrap();
+            let inserted = engine.execute_portal(&session, portal).await.unwrap();
+            assert_eq!(inserted.value, PreparedExecution::AffectedRows(1));
+            assert_eq!(
+                inserted.shard,
+                engine
+                    .inner
+                    .database
+                    .shard_for_key(tenant_id.to_string().as_bytes())
+            );
+            assert!(engine.close_portal(&session, portal).await.unwrap());
+            assert!(
+                engine
+                    .close_prepared_statement(&session, statement)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            insert_descriptions
+                .windows(2)
+                .all(|pair| pair[0] == pair[1])
+        );
 
         let requests = [
             (
@@ -1674,6 +1808,7 @@ mod tests {
                 .describe_prepared(&session, DescribeTarget::Statement(statement))
                 .await
                 .unwrap();
+            assert_eq!(description.behavior(), sql::StatementBehavior::Read);
             assert_eq!(description.parameter_types(), [DataType::Unknown]);
             assert_eq!(description.columns(), expected.columns());
             assert!(description.returns_rows());
@@ -1699,14 +1834,144 @@ mod tests {
         }
         assert!(observed.windows(2).all(|pair| pair[0] == pair[1]));
         assert_eq!(observed[0].value, PreparedExecution::Rows(expected));
+    }
 
-        assert!(engine.close_portal(&session, insert_portal).await.unwrap());
-        assert!(
+    #[tokio::test]
+    async fn prepared_schema_and_session_statements_are_blocked_without_state_changes_and_recover()
+    {
+        let (temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+
+        for (source, expected, object_name) in [
+            (
+                "CREATE TABLE blocked_prepared_schema_table (id INTEGER)",
+                sql::SchemaBehavior::CreateTable,
+                "blocked_prepared_schema_table",
+            ),
+            (
+                "CREATE INDEX blocked_prepared_schema_index ON events (payload)",
+                sql::SchemaBehavior::CreateIndex,
+                "blocked_prepared_schema_index",
+            ),
+        ] {
+            let schema_sql = sql::normalize_placeholders(
+                sql::validate_common_subset(sql::parse(sql::SqlDialect::Sqlite, source).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            let schema_plan = engine
+                .plan_bound_statement(database, &schema_sql, 0, &[], None)
+                .unwrap();
+            assert_eq!(
+                schema_plan.behavior(),
+                sql::StatementBehavior::Schema(expected)
+            );
+            assert_eq!(
+                prepared_execution_shard(&schema_plan, engine.catalog())
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::Unsupported
+            );
+
+            let schema_error = engine
+                .prepare_statement(
+                    &session,
+                    PrepareRequest::new(
+                        database,
+                        sql::SqlDialect::Sqlite,
+                        sql::SqlTranslationMode::StrictSqlite,
+                        source,
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(schema_error.kind(), EngineErrorKind::PermissionDenied);
+            assert_eq!(session.inner.lock().await.prepared().statement_count(), 0);
+            for shard in 0..engine.shard_count() {
+                let connection = rusqlite::Connection::open(
+                    temp.path().join(format!("shards/{shard:04}.sqlite")),
+                )
+                .unwrap();
+                let count = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE name = ?1",
+                        [object_name],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+        }
+
+        for (source, expected) in [
+            ("BEGIN", sql::SessionBehavior::Begin),
+            ("COMMIT", sql::SessionBehavior::Commit),
+            ("ROLLBACK", sql::SessionBehavior::Rollback),
+        ] {
+            let statement = engine
+                .prepare_statement(
+                    &session,
+                    PrepareRequest::new(
+                        database,
+                        sql::SqlDialect::Sqlite,
+                        sql::SqlTranslationMode::StrictSqlite,
+                        source,
+                    ),
+                )
+                .await
+                .unwrap();
+            let description = engine
+                .describe_prepared(&session, DescribeTarget::Statement(statement))
+                .await
+                .unwrap();
+            assert_eq!(
+                description.behavior(),
+                sql::StatementBehavior::Session(expected)
+            );
+            assert!(description.columns().is_empty());
+
+            let portal = engine
+                .bind_statement(&session, statement, vec![])
+                .await
+                .unwrap();
+            let error = engine.execute_portal(&session, portal).await.unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Unsupported);
+            assert_eq!(session.state().await, SessionState::Ready);
+            assert_eq!(session.routing_key().await, None);
+            assert!(engine.close_portal(&session, portal).await.unwrap());
+            assert!(
+                engine
+                    .close_prepared_statement(&session, statement)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        let recovered = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT 1",
+                ),
+            )
+            .await
+            .unwrap();
+        let recovered_portal = engine
+            .bind_statement(&session, recovered, vec![])
+            .await
+            .unwrap();
+        assert!(matches!(
             engine
-                .close_prepared_statement(&session, insert)
+                .execute_portal(&session, recovered_portal)
                 .await
                 .unwrap()
-        );
+                .value,
+            PreparedExecution::Rows(rows)
+                if rows.rows()[0].get(0) == Some(&Value::from(1_i64))
+        ));
     }
 
     #[tokio::test]
@@ -1910,7 +2175,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepared_errors_are_atomic_and_recover_without_losing_valid_handles() {
-        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let (temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
         let session = engine.session();
 
         for source in [
@@ -2059,6 +2324,52 @@ mod tests {
             PreparedExecution::Rows(result) if result.is_empty()
         ));
 
+        let global_update = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "UPDATE global_events SET code = 1",
+                ),
+            )
+            .await
+            .unwrap();
+        let global_update_description = engine
+            .describe_prepared(&session, DescribeTarget::Statement(global_update))
+            .await
+            .unwrap();
+        assert_eq!(
+            global_update_description.behavior(),
+            sql::StatementBehavior::Write(sql::WriteBehavior::Update)
+        );
+        let global_update_portal = engine
+            .bind_statement(&session, global_update, vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_portal(&session, global_update_portal)
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Unsupported
+        );
+        for shard in 0..engine.shard_count() {
+            let connection =
+                rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                    .unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM global_events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0
+            );
+        }
+
         let catalog_statement = engine
             .prepare_statement(
                 &session,
@@ -2173,6 +2484,7 @@ mod tests {
             .describe_prepared(&session, DescribeTarget::Statement(statement))
             .await
             .unwrap();
+        assert_eq!(before.behavior(), sql::StatementBehavior::Read);
         assert_eq!(before.columns().len(), 2);
         let portal = engine
             .bind_statement(&session, statement, vec![Value::from(7_i64)])
@@ -2202,6 +2514,7 @@ mod tests {
             .describe_prepared(&session, DescribeTarget::Portal(portal))
             .await
             .unwrap();
+        assert_eq!(after.behavior(), sql::StatementBehavior::Read);
         assert_eq!(after.columns().len(), 3);
         assert!(after.schema_generation() > before.schema_generation());
         assert_eq!(rows.columns(), after.columns());
@@ -2235,6 +2548,7 @@ mod tests {
             .describe_prepared(&session, DescribeTarget::Statement(statement))
             .await
             .unwrap();
+        assert_eq!(before.behavior(), sql::StatementBehavior::Read);
         assert_eq!(before.columns().len(), 2);
 
         engine
@@ -2273,6 +2587,7 @@ mod tests {
             .describe_prepared(&session, DescribeTarget::Statement(statement))
             .await
             .unwrap();
+        assert_eq!(refreshed.behavior(), sql::StatementBehavior::Read);
         assert_eq!(refreshed.columns().len(), 3);
         assert!(refreshed.schema_generation() > before.schema_generation());
     }

@@ -15,7 +15,9 @@ pub(crate) enum RoutedDml {
 
 /// Inspect only the DML details needed by single-shard routing policy.
 ///
-/// Full statement behavior and batch classification remain a separate layer.
+/// Full statement behavior and batch policy live in the separate public
+/// classifier; this helper retains the extra assignment detail needed only by
+/// sharded-write planning.
 pub(crate) fn routed_dml_shape(
     normalized: &NormalizedSql,
     statement_index: usize,

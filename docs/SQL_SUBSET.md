@@ -47,15 +47,18 @@ A successful `CommonSql` does not mean that the SQL:
 Those responsibilities remain with the implemented issue #21 normalization,
 issue #22 inference, issues #23/#24 bound planning and routing-policy layers,
 the separate issue #25 translation layer, the implemented issue #26 prepared
-lifecycle, issue #27 classification/batch policy, and the later wire frontends.
+lifecycle, the implemented issue #27
+[statement/batch classifier](SQL_STATEMENT_CLASSIFICATION.md), and the later
+wire frontends.
 Validation never consults parameters, a session, the logical catalog, storage,
 routing state, the filesystem, or SQLite. It never formats or searches SQL text
 to make a structural decision.
 
 Empty and comment-only parsed batches validate successfully. Every statement in
 a mixed batch is checked independently and source order is retained, but that
-is not permission to execute the batch. Issue #27 owns empty-request policy,
-statement behavior classification, and safe statement combinations.
+is not permission to execute the batch. The separate classifier returns
+`InvalidArgument` for empty input, precisely classifies each accepted family,
+and accepts a multi-statement request only when every member is a read.
 
 ## Statement forms
 
@@ -87,8 +90,9 @@ validation does not inspect whether an assignment changes a shard-key column.
 The separate inference layer classifies the supported predicate proof. The
 implemented [bound planning and routing-policy layer](SQL_PLANNING.md) performs
 the narrow catalog-aware `UPDATE` target check and rejects conflicting or
-unroutable sharded DML. That does not broaden structural validation or replace
-the complete statement classifier owned by issue #27.
+unroutable sharded DML. That does not broaden structural validation; the
+separate statement classifier supplies the complete logical behavior and batch
+gate.
 
 ### Names, aliases, and types
 

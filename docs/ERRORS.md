@@ -143,8 +143,18 @@ internal diagnostic contains the one-based statement position and a fixed
 feature category, never the submitted SQL, a literal, formatted AST output, or
 a parser diagnostic. Its independent recursive expression-depth limit is 128;
 exceeding that limit is `LimitExceeded`. Empty and mixed batches can pass
-structural validation; later request-level classification decides whether they
-may execute. See the [common SQL subset contract](SQL_SUBSET.md).
+structural validation; the separate request-level classifier decides whether
+they pass batch policy. See the [common SQL subset
+contract](SQL_SUBSET.md).
+
+The statement/batch classifier reports an empty or comment-only validated
+batch as `InvalidArgument`. A batch of two or more statements containing any
+non-read behavior is `Unsupported`; its diagnostic identifies only the first
+such one-based statement ordinal and a fixed coarse behavior category. A
+validated AST family without a classifier mapping is an `Internal` invariant
+failure. Submitted SQL, identifiers, literals, nested behavior details, and AST
+output are never included. See the [statement and batch classification
+contract](SQL_STATEMENT_CLASSIFICATION.md).
 
 The opt-in placeholder normalizer classifies a zero positional index or marker
 spelling incompatible with the selected PostgreSQL or MySQL dialect as
@@ -180,8 +190,10 @@ locations. See the [shard-key inference contract](SQL_SHARD_KEYS.md).
 The synchronous bound statement planner preserves those inference error kinds
 and diagnostics. Before inference it also acquires ordinary schema-operation
 admission, so a migrating gate returns `Busy`, a pending migration returns
-`FailedPrecondition`, and a degraded gate returns `DataCorruption`. Routing
-policy reports an explicit physical-shard conflict, or a sharded
+`FailedPrecondition`, and a degraded gate returns `DataCorruption`. It then
+applies complete batch policy: empty is `InvalidArgument`, a mutating
+multi-statement batch is `Unsupported`, and an out-of-range selected index in
+an accepted batch is `InvalidArgument`. Routing policy reports an explicit physical-shard conflict, or a sharded
 `UPDATE`/`DELETE` missing both finite inference and explicit fallback, as
 `InvalidArgument`. A shard-key `UPDATE`, an `INSERT` without a proven key for
 every row, or a finite write spanning physical shards is `InvalidQuery`.
@@ -194,8 +206,9 @@ contract](SQL_PLANNING.md).
 The prepared lifecycle preserves each earlier frontend/planner kind. Prepare
 adds `InvalidArgument` for an unknown logical database and for anything other
 than exactly one top-level statement, `LimitExceeded` for a full session
-statement cache, and `InvalidQuery` when SQLite cannot transiently compile the
-translated SQL on shard 0. Bind preserves parameter-count, value-conversion,
+statement cache, `PermissionDenied` when ordinary shard policy denies a
+persistent schema statement, and `InvalidQuery` when SQLite otherwise cannot
+transiently compile the translated SQL on shard 0. Bind preserves parameter-count, value-conversion,
 inference, and planning errors, and adds `LimitExceeded` for a full portal cache
 or retained-value byte budget, or when the captured route and repeated
 normalized occurrences exceed the conservative per-bind planning ceiling
@@ -208,11 +221,12 @@ session/engine, a closed session, or an absent statement/portal is
 `FailedPrecondition`; closing an already absent same-session handle instead
 returns `false`. Portal execution reports `PermissionDenied` for catalog
 placement and `Unsupported` for a sharded read that still needs scatter or
-another unimplemented target. Safe column-producing `NotApplicable` and
-`Global` reads use deterministic shard 0; accepted sharded work uses its
-current assigned shard. Cancellation, deadlines, pool admission, schema-gate
-state, SQLite execution, constraints, and result limits retain their existing
-kinds.
+another unimplemented target, including session behavior. Classified safe
+`NotApplicable` and `Global` reads use deterministic shard 0; accepted sharded
+work uses its current assigned shard. A disagreement between retained behavior
+and SQLite execution metadata is `Internal`. Cancellation, deadlines, pool
+admission, schema-gate state, SQLite execution, constraints, and result limits
+retain their existing kinds.
 
 A failed prepare or bind publishes no handle, full caches evict nothing, and an
 execution failure retains its portal. Protocol adapters still serialize only
