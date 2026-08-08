@@ -48,6 +48,22 @@ impl RoutingCatalog {
         self.initial_shard_count
     }
 
+    pub(crate) const fn hash_version(&self) -> u32 {
+        self.hash_version
+    }
+
+    pub(crate) const fn key_encoding_version(&self) -> u32 {
+        self.key_encoding_version
+    }
+
+    pub(crate) const fn bucket_algorithm_version(&self) -> u32 {
+        self.bucket_algorithm_version
+    }
+
+    pub(crate) const fn map_generation(&self) -> u64 {
+        self.map_generation
+    }
+
     pub(crate) fn shard_for_key(&self, key: &[u8]) -> u16 {
         let bucket = usize::from(self.bucket_for_key(key));
         self.buckets[bucket]

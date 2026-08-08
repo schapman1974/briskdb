@@ -160,11 +160,13 @@ The current HTTP execute, query, and migration paths do not invoke parsing,
 common-subset validation, normalization, or inference. They retain their
 existing raw SQLite SQL and caller-provided `shard_key` behavior.
 
-Issue #23 will invoke inference at bind/execute time and turn its result into a
-protocol-neutral plan and routing decision. Issue #24 will enforce the write
-rules for conflicting, multiple, or unconstrained keys. Later work owns syntax
-translation, prepared-statement lifecycle, statement classification, and wire
-protocol integration.
+The implemented synchronous
+[`Engine::plan_bound_statement`](SQL_PLANNING.md) API invokes inference at
+bind/execute time and turns every inferred value into an owned advisory route.
+It retains an optional explicit route separately and does not make the result
+executable. Issue #24 will enforce the write rules for conflicting, multiple,
+or unconstrained keys. Later work owns syntax translation, prepared-statement
+lifecycle, statement classification, and wire-protocol integration.
 
 ## Verification obligations
 

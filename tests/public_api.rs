@@ -343,6 +343,146 @@ fn shard_key_inference_is_public_typed_and_opt_in() {
     assert_eq!(raw.rows()[0].get(0), Some(&core::Value::Int64(23)));
 }
 
+#[tokio::test]
+async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
+    fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
+    assert_owned_public::<core::BoundStatementPlan>();
+    assert_owned_public::<core::PlannedRoute>();
+
+    let temp = tempfile::tempdir().unwrap();
+    drop(core::Database::open(temp.path(), 8).unwrap());
+    insert_catalog_fixture(temp.path());
+    let database = Arc::new(core::Database::open(temp.path(), 8).unwrap());
+    let engine = core::Engine::from_database(Arc::clone(&database));
+    let tenant = database.catalog().database("tenant").unwrap().unwrap();
+
+    let source = "INSERT INTO accounts (tenant_id) VALUES ($1), ($2), ($3)";
+    let parsed = sql::parse(sql::SqlDialect::PostgreSql, source).unwrap();
+    let common = sql::validate_common_subset(parsed).unwrap();
+    let normalized = sql::normalize_placeholders(common).unwrap();
+    let first_keys = [
+        "tenant-alpha-sensitive",
+        "tenant-snowman-☃",
+        "tenant-alpha-sensitive",
+    ];
+    let first_parameters = first_keys
+        .iter()
+        .map(|key| core::Value::Text((*key).to_owned()))
+        .collect::<Vec<_>>();
+    let explicit_key = b"\0explicit-route-sensitive-\xff";
+
+    let plan = engine
+        .plan_bound_statement(
+            tenant.id(),
+            &normalized,
+            0,
+            &first_parameters,
+            Some(explicit_key),
+        )
+        .unwrap();
+
+    assert_eq!(plan.database(), tenant.id());
+    assert_eq!(
+        plan.schema_generation(),
+        database.catalog().schema_generation()
+    );
+    assert_eq!(plan.hash_version(), 1);
+    assert_eq!(plan.key_encoding_version(), 1);
+    assert_eq!(plan.bucket_algorithm_version(), 1);
+    assert_eq!(plan.map_generation(), 1);
+    assert_eq!(plan.statement_index(), 0);
+    assert_eq!(
+        plan.inference().kind(),
+        sql::ShardKeyInferenceKind::Multiple
+    );
+    assert_eq!(plan.inference().values().len(), first_keys.len());
+    assert_eq!(plan.inferred_routes().len(), first_keys.len());
+
+    for ((value, route), expected_key) in plan
+        .inference()
+        .values()
+        .iter()
+        .zip(plan.inferred_routes())
+        .zip(first_keys)
+    {
+        assert_eq!(value.as_str(), Some(expected_key));
+        assert_eq!(route.key_bytes(), expected_key.as_bytes());
+        assert_eq!(
+            route.shard(),
+            database.shard_for_key(expected_key.as_bytes())
+        );
+    }
+    assert_eq!(plan.inferred_routes()[0], plan.inferred_routes()[2]);
+
+    let explicit_route = plan.explicit_route().unwrap();
+    assert_eq!(explicit_route.key_bytes(), explicit_key);
+    assert_eq!(explicit_route.shard(), database.shard_for_key(explicit_key));
+    assert!(
+        plan.inferred_routes()
+            .iter()
+            .all(|route| route.key_bytes() != explicit_route.key_bytes())
+    );
+
+    let plan_debug = format!("{plan:?}");
+    let route_debug = format!("{explicit_route:?}");
+    for sensitive in [
+        "tenant-alpha-sensitive",
+        "tenant-snowman-☃",
+        "explicit-route-sensitive",
+    ] {
+        assert!(!plan_debug.contains(sensitive));
+        assert!(!route_debug.contains(sensitive));
+    }
+
+    let cloned = plan.clone();
+    assert_eq!(cloned, plan);
+    assert_eq!(thread::spawn(move || cloned).join().unwrap(), plan);
+
+    let second_keys = ["tenant-bravo", "tenant-charlie", "tenant-bravo"];
+    let second_parameters = second_keys
+        .iter()
+        .map(|key| core::Value::Text((*key).to_owned()))
+        .collect::<Vec<_>>();
+    let replanned = engine
+        .plan_bound_statement(tenant.id(), &normalized, 0, &second_parameters, None)
+        .unwrap();
+    assert_eq!(replanned.inferred_routes().len(), second_keys.len());
+    assert!(replanned.explicit_route().is_none());
+    for (route, expected_key) in replanned.inferred_routes().iter().zip(second_keys) {
+        assert_eq!(route.key_bytes(), expected_key.as_bytes());
+        assert_eq!(
+            route.shard(),
+            database.shard_for_key(expected_key.as_bytes())
+        );
+    }
+    assert_ne!(replanned.inferred_routes()[0], plan.inferred_routes()[0]);
+
+    // Planning remains opt-in analysis: existing raw Database and Engine
+    // execution paths continue to execute caller-provided SQLite directly.
+    let raw = database
+        .query(
+            "planner-database-regression",
+            "SELECT ?1",
+            &[core::Value::Int64(37)],
+        )
+        .unwrap();
+    assert_eq!(raw.rows()[0].get(0), Some(&core::Value::Int64(37)));
+
+    let session = engine.session();
+    session
+        .set_routing_key("planner-engine-regression")
+        .await
+        .unwrap();
+    let routed = engine
+        .query(
+            &session,
+            core::Statement::new("SELECT ?1", vec![core::Value::Int64(41)]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(routed.value.rows()[0].get(0), Some(&core::Value::Int64(41)));
+}
+
 #[test]
 fn logical_catalog_types_and_access_are_public_and_protocol_neutral() {
     fn assert_public_metadata<T: Clone + Send + Sync + 'static>() {}

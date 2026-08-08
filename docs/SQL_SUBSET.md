@@ -44,11 +44,11 @@ A successful `CommonSql` does not mean that the SQL:
 - is authorized for a particular endpoint or session; or
 - has been executed.
 
-Those responsibilities remain with the implemented issue #21 normalization and
-issue #22 inference layers, issues #23 through #27, and the later wire
-frontends. Validation never consults parameters, a session, the logical
-catalog, storage, routing state, the filesystem, or SQLite. It never formats or
-searches SQL text to make a structural decision.
+Those responsibilities remain with the implemented issue #21 normalization,
+issue #22 inference, and issue #23 advisory planning layers, issues #24 through
+#27, and the later wire frontends. Validation never consults parameters, a
+session, the logical catalog, storage, routing state, the filesystem, or
+SQLite. It never formats or searches SQL text to make a structural decision.
 
 Empty and comment-only parsed batches validate successfully. Every statement in
 a mixed batch is checked independently and source order is retained, but that

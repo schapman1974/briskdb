@@ -12,10 +12,10 @@ use std::{
 use tokio::{sync::OwnedMutexGuard, task::JoinHandle};
 
 use super::{
-    BlockingPool, CancelOnDrop, CancellationReason, CancellationToken, Database, EngineError,
-    EngineErrorKind, EngineOptions, EngineResult, EngineState, Lifecycle, OperationControl,
-    OperationLease, RequestContext, ResultLimits, ResultSet, Routed, Session, SessionInner,
-    ShutdownReport, Value, wait_for_cancellation, wait_pending,
+    BlockingPool, BoundStatementPlan, CancelOnDrop, CancellationReason, CancellationToken,
+    Database, EngineError, EngineErrorKind, EngineOptions, EngineResult, EngineState, Lifecycle,
+    LogicalDatabaseId, OperationControl, OperationLease, RequestContext, ResultLimits, ResultSet,
+    Routed, Session, SessionInner, ShutdownReport, Value, wait_for_cancellation, wait_pending,
 };
 use crate::{
     sql,
@@ -287,6 +287,41 @@ impl Engine {
     /// Return the immutable logical database and table catalog.
     pub fn catalog(&self) -> &super::Catalog {
         self.inner.database.catalog()
+    }
+
+    /// Plan one normalized statement from its actual bound parameter values.
+    ///
+    /// `statement_index` is zero-based. `explicit_routing_key` is retained as
+    /// an independent fallback route; later policy decides whether inferred
+    /// and explicit routes are compatible and executable.
+    pub fn plan_bound_statement(
+        &self,
+        database: LogicalDatabaseId,
+        normalized: &sql::NormalizedSql,
+        statement_index: usize,
+        parameters: &[Value],
+        explicit_routing_key: Option<&[u8]>,
+    ) -> EngineResult<BoundStatementPlan> {
+        let _schema_operation = self.inner.database.storage.enter_schema_operation()?;
+        let (hash_version, key_encoding_version, bucket_algorithm_version, map_generation) =
+            self.inner.database.routing_provenance();
+        super::planner::plan_bound_statement(
+            super::planner::BoundStatementPlanInput::new(
+                self.catalog(),
+                database,
+                normalized,
+                statement_index,
+                parameters,
+                explicit_routing_key,
+            ),
+            super::planner::RoutingProvenance::new(
+                hash_version,
+                key_encoding_version,
+                bucket_algorithm_version,
+                map_generation,
+            ),
+            |key| self.inner.database.shard_for_key(key),
+        )
     }
 
     /// Return the engine's immutable pool and admission options.

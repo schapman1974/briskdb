@@ -515,6 +515,16 @@ impl Storage {
         self.catalog.routing().shard_for_key(key)
     }
 
+    pub(crate) fn routing_provenance(&self) -> (u32, u32, u32, u64) {
+        let routing = self.catalog.routing();
+        (
+            routing.hash_version(),
+            routing.key_encoding_version(),
+            routing.bucket_algorithm_version(),
+            routing.map_generation(),
+        )
+    }
+
     pub(crate) fn logical_catalog(&self) -> &Catalog {
         self.catalog.logical()
     }
