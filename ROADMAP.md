@@ -169,7 +169,7 @@ Status: **in progress**
 - [x] Preserve column order and duplicate column names.
 - [x] Add a structured error taxonomy and mappings for HTTP, PostgreSQL, and
   MySQL.
-- [ ] Introduce a `Session` state machine and an async `Engine` interface used
+- [x] Introduce a `Session` state machine and an async `Engine` interface used
   by every frontend.
 - [ ] Move blocking SQLite work behind a bounded worker/pool abstraction; add
   per-shard connection pools and backpressure.

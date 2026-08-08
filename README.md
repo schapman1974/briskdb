@@ -30,6 +30,7 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 ## Current foundation
 
 - Stable BLAKE3 routing from a caller-provided shard key
+- A protocol-neutral async engine with per-request HTTP sessions
 - Protocol-neutral typed values, ordered columns, positional rows, and results
 - A fixed shard count recorded in `manifest.sqlite`
 - One WAL-enabled SQLite database per shard
@@ -108,11 +109,14 @@ selected shard depends on the routing key; an example response is:
 ## Deliberate boundaries
 
 This is an initial scaffold, not a production database yet. The current API
-accepts SQL and should only be exposed on a trusted network. Each request opens
-a SQLite connection; pooling is the next performance step. Broadcast changes
-and future scatter operations are not atomic across shard files. The shard
-count is immutable after database creation, so resharding will require an
-explicit migration workflow.
+accepts SQL and should only be exposed on a trusted network. The HTTP adapter
+creates an ephemeral session for each data request, so session state and
+transactions cannot span HTTP requests. Each SQL operation currently opens one
+or more SQLite connections on Tokio's blocking workers; bounded workers,
+connection pools, backpressure, cancellation, and deadlines remain roadmap
+work. Broadcast changes and future scatter operations are not atomic across
+shard files. The shard count is immutable after database creation, so
+resharding will require an explicit migration workflow.
 
 Near-term work includes authentication, connection pools, schema migrations,
 scatter/gather reads, observability, backup tooling, and failure-injection
