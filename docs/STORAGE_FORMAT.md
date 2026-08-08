@@ -5,22 +5,23 @@ never exposed through HTTP, PostgreSQL, MySQL, or the SQL execution API. The
 format is pre-1.0, but every format change must still have an ordered migration,
 failure coverage, and an explicit compatibility decision.
 
-## Current format: version 4
+## Current format: version 5
 
 SQLite header fields identify the file and its format:
 
 | Header field | Value | Meaning |
 | --- | --- | --- |
 | `PRAGMA application_id` | `0x42524442` (`BRDB`) | Permanent BriskDB manifest-family marker |
-| `PRAGMA user_version` | `4` | Authoritative manifest schema version |
+| `PRAGMA user_version` | `5` | Authoritative manifest schema version |
 
 The application ID prevents an accidental foreign SQLite file from being
 adopted as a manifest. It is not authentication or tamper protection: a process
 that can write the data directory can forge it. Checksums and explicit degraded
 states remain separate roadmap work.
 
-Version 4 has eight strict tables. The routing tables are unchanged from
-version 3; the downgrade fence and three logical-schema tables are new.
+Version 5 has nine strict manifest tables. It retains the v4 routing and
+logical-schema tables, replaces the downgrade fence, and adds the physical
+shard-layout singleton.
 
 ```sql
 CREATE TABLE briskdb_manifest (
@@ -30,7 +31,7 @@ CREATE TABLE briskdb_manifest (
 
 CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
-        CHECK (requires_manifest_version >= 4)
+        CHECK (requires_manifest_version >= 5)
 ) STRICT;
 
 CREATE TABLE briskdb_routing (
@@ -122,23 +123,33 @@ CREATE TABLE briskdb_tables (
         )
     )
 ) STRICT;
+
+CREATE TABLE briskdb_shard_layout (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    layout_id BLOB NOT NULL
+        CHECK (typeof(layout_id) = 'blob' AND length(layout_id) = 16),
+    shard_application_id INTEGER NOT NULL CHECK (shard_application_id = 1112691528),
+    shard_metadata_version INTEGER NOT NULL CHECK (shard_metadata_version = 1),
+    layout_state INTEGER NOT NULL CHECK (layout_state IN (1, 2, 3))
+) STRICT;
 ```
 
-The manifest, metadata, routing, and schema-catalog tables each contain exactly
-one row. The v4 downgrade-fence row is exactly `4`.
+The manifest, metadata, routing, schema-catalog, and shard-layout tables each
+contain exactly one row. The v5 downgrade-fence row is exactly `5`.
 `briskdb_manifest.shard_count` is immutable and is the initial routing modulus;
 it is also the live physical-shard count. Physical IDs are exactly
 `0..shard_count - 1`. Filenames remain derived by trusted code as
 `shards/{shard_id:04}.sqlite` and are never read from catalog-controlled paths.
-Version 4 supports only the `active` lifecycle state. Adding resumable
-provisioning, draining, or retirement states requires a later format and
-state-machine change.
+Version 5 supports only the `active` physical-shard lifecycle state. Adding
+provisioning, draining, or retirement states to the routing catalog requires a
+later format and state-machine change. The separate shard-layout state governs
+only startup identity reconciliation.
 
 ### Logical catalog
 
-Every fresh or upgraded v4 manifest contains logical database ID `1` named
+Every fresh or upgraded v5 manifest contains logical database ID `1` named
 `default`. The schema-catalog singleton contains identifier encoding version
-`1`, application-schema generation `0`, and default database ID `1`. Version 4
+`1`, application-schema generation `0`, and default database ID `1`. Version 5
 can interpret only schema generation 0. It permits at most 64 logical databases
 and 4,096 table rows. Database and table IDs are positive; table names are
 unique within their owning database, and every table references an existing
@@ -170,14 +181,89 @@ Table placement and shard-key type use stable numeric codes:
 are key-routed. `Global` describes small replicated lookup data. `Catalog`
 describes manifest-owned metadata rather than a user shard table.
 
-The loaded `Catalog` is immutable and read-only. It is advisory in version 4:
-there is no catalog mutation API, planner integration, or enforcement against
-physical shard schemas. Fresh initialization and every v1/v2/v3 upgrade leave
-`briskdb_tables` empty. Migration does not inspect, infer, or adopt tables that
-already exist in shard files. Such tables remain usable through the existing
-explicit-key execute/query API and broadcast API; absence from the catalog does
-not mean physical absence. Version 4 therefore changes no current SQL
-execution, routing result, broadcast behavior, shard file, or wire contract.
+The loaded `Catalog` is immutable and read-only. It remains advisory in version
+5: there is no catalog mutation API, planner integration, or enforcement
+against physical shard schemas. Fresh initialization and every v1/v2/v3
+upgrade leave `briskdb_tables` empty; a v4-to-v5 upgrade retains every validated
+v4 catalog row. Migration does not inspect, infer, or adopt tables that already
+exist in shard files. Such tables remain usable through the existing explicit-
+key execute/query API and broadcast API; absence from the catalog does not mean
+physical absence. Version-5 adoption preserves those tables and rows while
+adding only BriskDB-owned shard identity metadata. It changes no current SQL
+planning, routing result, broadcast ordering, or wire contract.
+
+### Physical shard layout
+
+The `briskdb_shard_layout` row is the durable authority for cross-file startup:
+
+| Field | Value | Contract |
+| --- | --- | --- |
+| `layout_id` | 16 random bytes | Accidental binding shared by this manifest and all of its shards |
+| `shard_application_id` | `0x42525348` (`BRSH`) | Distinguishes a BriskDB shard from `BRDB` manifest and foreign SQLite files |
+| `shard_metadata_version` | `1` | Exact physical-shard metadata encoding described below |
+| `layout_state` | `1` | `Creating`: fresh provisioning may create expected missing shards and enable WAL |
+| `layout_state` | `2` | `Adopting`: existing legacy v4 shards may receive identity metadata |
+| `layout_state` | `3` | `Ready`: only strict validation is allowed |
+
+`layout_id` is generated with SQLite `randomblob(16)` when the v5 manifest row
+is created and never changes. It detects an accidental shard copy from another
+layout. Because the value and all other identity fields are stored in writable
+files, they are not authentication, tamper protection, or proof of provenance.
+
+Every current shard uses these persistent SQLite settings:
+
+| Shard property | Required value | Meaning |
+| --- | --- | --- |
+| `PRAGMA application_id` | `0x42525348` (`BRSH`) | Permanent BriskDB shard-family marker |
+| `PRAGMA user_version` | `0` | Must equal the manifest's committed application-schema generation |
+| `PRAGMA journal_mode` | `wal` | Required persistent journal mode |
+
+Metadata encoding version 1 requires this exact strict identity table:
+
+```sql
+CREATE TABLE briskdb_shard_metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    layout_id BLOB NOT NULL
+        CHECK (typeof(layout_id) = 'blob' AND length(layout_id) = 16),
+    shard_id INTEGER NOT NULL CHECK (shard_id BETWEEN 0 AND 63)
+) STRICT;
+```
+
+It contains exactly `(1, manifest_layout_id, physical_shard_id)`. The physical
+ID is derived from the canonical filename rather than trusted from the table.
+Header identity, frozen table SQL, columns, strict flag, singleton row, value
+types, layout ID, shard ID, and case-insensitive conflicts with the reserved
+metadata name are all validated.
+
+Startup scans the shard directory for the exact expected filenames from
+`0000.sqlite` through the zero-padded final physical ID and rejects an
+unexpected canonical four-digit `.sqlite` shard filename in every layout
+state. Every existing
+shard is opened read-write with SQLite create and symbolic-link following
+disabled; only `Creating` may open a missing canonical path with create enabled.
+An unrelated non-symlink entry with a UTF-8, noncanonical name is ignored for
+an already recognized layout; symlinks and non-UTF-8 names fail closed. Any
+pre-existing entry blocks fresh-manifest initialization because BriskDB cannot
+prove that the physical layout is new.
+Runtime pool opens use the same no-create path and validator, so deleting or
+replacing a shard after startup cannot make a later checkout create or accept a
+new file. A copied shard in a different slot fails its physical ID, a swapped
+pair fails both IDs, and a shard from another data directory fails its layout
+ID.
+
+WAL validation reads `PRAGMA journal_mode` without assigning it. Only
+`Creating` may issue `PRAGMA journal_mode=WAL`; `Adopting` and `Ready` reject a
+different persisted mode. The transient `-wal`, `-shm`, and rollback-journal
+sidecars can be absent and are not counted as canonical shard files.
+
+Creation of new objects in the `briskdb_*` namespace is reserved. The metadata
+table and persistent `application_id`, `user_version`, `journal_mode`,
+`schema_version`, and `writable_schema` controls are BriskDB-owned. The SQL
+authorizer denies client access to the metadata, creation of reserved objects,
+and client mutation of those controls through routed and broadcast paths. It
+also denies all `ALTER TABLE` statements because SQLite does not expose a
+rename destination to the authorizer. A future schema-migration journal, not
+client SQL, must coordinate changes to `user_version`.
 
 ### Routing catalog
 
@@ -189,7 +275,7 @@ The routing singleton contains exactly these generation-1 values:
 | `key_encoding_version` | `1` | Exact caller-supplied bytes; string shard keys contribute their UTF-8 bytes, with no Unicode normalization |
 | `bucket_algorithm_version` | `1` | Compatibility-preserving range algorithm below |
 | `virtual_bucket_count` | `4096` | Fixed virtual bucket space `0..4095` |
-| `map_generation` | `1` | Initial committed bucket map and the only generation version 4 can interpret |
+| `map_generation` | `1` | Initial committed bucket map and the only generation version 5 can interpret |
 
 Every bucket ID exists exactly once and references an active physical shard.
 Every physical shard owns at least one bucket. The generation-1 map partitions
@@ -218,7 +304,7 @@ vectors freeze the exact key bytes, BLAKE3 prefix, little-endian hash integer,
 bucket ID, and persisted physical shard.
 
 `map_generation` is separate from manifest `user_version` and from
-`schema_generation`. Version 4 accepts only routing generation 1 and validates
+`schema_generation`. Version 5 accepts only routing generation 1 and validates
 its exact deterministic assignment; no public map-mutation operation exists
 yet. A future format that can commit a changed map must bump `user_version` and
 its downgrade fence as well as `map_generation`. That requirement makes this
@@ -229,11 +315,35 @@ At each open, BriskDB validates the exact objects, columns, strict flags, frozen
 schema SQL, singleton rows, logical identifiers and limits, metadata codes,
 supported algorithm values, contiguous physical and bucket IDs, active
 lifecycle states, assignments, coverage, and foreign keys. A recognized
-version-4 manifest that violates any invariant is `DataCorruption` and is
+version-5 manifest that violates any invariant is `DataCorruption` and is
 rejected before shard connections are opened. The same locked transaction
 returns routing and logical rows as one immutable in-memory snapshot, so
 request routing performs no manifest query and cannot fall back to modulo after
 a failed validation.
+
+## Previous version 4
+
+Version 4 has the first eight manifest tables shown above and no
+`briskdb_shard_layout` table. Its exact downgrade fence is:
+
+```sql
+CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 4)
+) STRICT;
+```
+
+The fence contains exactly `4`, and `PRAGMA user_version` is `4`. Version 4 did
+not own shard header fields or an identity table: shard files created by shipped
+v4 code have `application_id = 0` and `user_version = 0`, while ordinary storage
+open configured them for WAL. It also opened shards with create-capable flags,
+so a missing file could previously be recreated silently.
+
+A v5 opener fully validates the v4 manifest before committing a random layout
+ID and state `Adopting` in the atomic v4-to-v5 manifest migration. Cross-file
+adoption then accepts only existing WAL shard files with the exact legacy
+zero/zero header or already valid resumable v5 identity. It never infers that a
+missing shard is empty, changes an application table, or adopts a foreign header.
 
 ## Previous version 3
 
@@ -271,7 +381,7 @@ CREATE TABLE briskdb_metadata (
 ```
 
 The fence contains exactly `2`. A current opener validates this complete format
-before applying the numbered v2-to-v3 and v3-to-v4 transactions.
+before applying the numbered v2-to-v3, v3-to-v4, and v4-to-v5 transactions.
 
 ## Legacy version 1
 
@@ -297,8 +407,8 @@ non-canonically encoded legacy states are `DataCorruption`.
 
 ## Upgrade and startup algorithm
 
-Opening a `Database` or `Engine`, including server startup, may automatically
-upgrade the manifest before any shard connection is opened:
+Opening a `Database` or `Engine`, including server startup, may upgrade the
+manifest and reconcile the physical shard layout before returning an engine:
 
 1. Validate the requested shard-count range and open the manifest with a finite
    busy timeout, `synchronous=FULL`, and foreign keys enabled.
@@ -306,58 +416,84 @@ upgrade the manifest before any shard connection is opened:
    configuration under that write lock.
 3. Reject a foreign file, a newer version, a requested shard-count mismatch, or
    an invalid recognized schema before changing it.
-4. Apply one compile-time registered migration using static SQL and bound data.
-5. Write and read back `application_id` and the destination `user_version` as
-   the final mutations, validate the complete destination schema, and commit.
-6. Re-lock and repeat if more than one numbered step is required. Each step has
-   its own transaction, so restart begins at the last committed version.
-7. After a compatible current manifest is committed, enable and verify WAL mode
-   and only then create/open the shard layout.
+4. Apply each compile-time registered manifest migration with static SQL and
+   bound data. The destination application ID and `user_version` are the final
+   mutations; validate the complete destination and commit one numbered step at
+   a time.
+5. Fresh initialization is allowed only beside an otherwise empty physical
+   layout and commits v5 state `Creating`. An existing v1/v2/v3 manifest first
+   advances through v4; the v4-to-v5 transaction commits a random 16-byte
+   layout ID and state `Adopting` before any shard file changes.
+6. Acquire a new `BEGIN IMMEDIATE`, then re-read and validate the committed
+   layout identity and state under that manifest write lock. Reconcile every
+   expected physical ID in ascending order while retaining the lock. Only
+   `Creating` may create a missing file and enable WAL. `Adopting` requires an
+   existing WAL file and accepts either the exact legacy zero/zero header or the
+   exact current metadata left by an earlier attempt. `Ready` accepts only the
+   exact current format.
+7. Still holding the manifest lock, re-scan for unexpected canonical shard
+   filenames and strictly revalidate every expected file. Verify that the
+   layout identity did not change, move its state to `Ready`, revalidate the
+   ready manifest, and commit. A lagging opener then acquires the lock, re-reads
+   `Ready`, and cannot provision from a stale `Creating` observation.
+8. The final strict startup validation pass and every later runtime connection
+   open use read-write, no-create, no-follow flags. Apply connection-local
+   durability and foreign-key settings only after the file passes identity,
+   generation, and WAL checks.
 
-Fresh initialization creates the complete v4 schema and initial rows in one
-transaction before stamping version 4. For an existing manifest, SQLite
-transactional DDL makes each numbered step's schema, catalog rows, downgrade
-fence, and header stamps one transaction within `manifest.sqlite`. A version-1
-upgrade commits version 2, then version 3, then version 4; a version-2 upgrade
-commits version 3 before beginning version 4.
+SQLite transactional DDL keeps each numbered manifest step atomic within
+`manifest.sqlite`. A version-1 upgrade commits versions 2, 3, 4, and then 5; a
+version-2 upgrade begins at 3, and so on. The v3-to-v4 step still creates the
+logical catalog, inserts database ID 1 named `default` plus the
+schema-generation-0 singleton, and leaves the table catalog empty.
 
-The v3-to-v4 step atomically replaces the version-3 fence with the version-4
-fence, creates the three logical-catalog tables, inserts database ID 1 named
-`default` plus the schema-generation-0 singleton, and leaves the table catalog
-empty. The destination is fully validated and the header is stamped last before
-commit. An error or panic rolls the whole step back to the exact v3 source, so a
-later open can retry it. The step never opens or inspects shard files and never
-infers or adopts an existing physical table.
+The v4-to-v5 manifest transaction replaces the downgrade fence, creates the
+shard-layout row in `Adopting`, and stamps version 5 before cross-file work.
+Shard adoption is deliberately not one SQLite transaction across files. Each
+completed shard keeps its metadata, while the durable manifest state remains
+`Adopting`; a later open validates the completed prefix and resumes. The same
+rule applies to partially completed fresh `Creating`. State becomes `Ready`
+only after a full strict revalidation, so a ready manifest certifies the exact
+layout observed at that transition.
 
-Tests prove rollback and retry after injected errors and Rust panic unwinding.
-SQLite is intended to recover an uncommitted transaction after process loss,
-but BriskDB has not yet certified process-kill, power-loss, or filesystem-fault
-recovery. Concurrent open calls within the supported single-process deployment
-serialize on the immediate transaction and re-read the version after acquiring
-it.
+The adoption path changes no application table or row and does not derive
+identity from application schema. A legacy shard with a nonzero header, a
+non-WAL mode, or a missing file is rejected without being repaired or replaced.
+Catalog schema generation remains 0; matching that number validates the shard's
+declared generation, not the advisory table catalog against physical DDL.
 
-This guarantee is manifest-local. The schema generation and table rows are
-read-only advisory metadata, not an application-table migration API. They do
-not make broadcast atomic across shard files and are not the planned
-crash-resumable cross-shard schema migration journal. Catalog validation also
-does not yet establish shard-file health: current startup can recreate a
-missing shard file. No-create opening, per-shard identity/version, WAL, and
-schema-generation checks belong to the later shard-validation milestone.
+Tests prove retry after injected errors and Rust panic unwinding at cross-file
+persistence boundaries. SQLite is intended to recover its own uncommitted
+transactions after process loss, but BriskDB has not yet certified arbitrary
+process-kill, machine power-loss, torn-write, or filesystem-fault recovery.
+The layout state machine is therefore a deterministic software-interruption
+contract, not the later storage-hardening certification.
 
 ## Compatibility and operations
 
-- Version 1 upgrades through versions 2 and 3 to version 4; version 2 upgrades
-  through version 3; version 3 upgrades directly to version 4. Opening is
-  therefore potentially mutating.
+- Version 1 upgrades through versions 2, 3, and 4 to version 5; version 2 begins
+  at version 3, version 3 begins at version 4, and version 4 upgrades directly
+  to version 5. Opening is therefore potentially mutating.
 - There is no automatic downgrade. Older readers are fenced by the incompatible
-  metadata schema and authoritative header; in particular, a version-3 reader
-  rejects `user_version = 4`.
+  metadata schema and authoritative header; in particular, a version-4 reader
+  rejects `user_version = 5` before it can bypass no-create validation.
 - A manifest with the BriskDB application ID and a `user_version` newer than the
   binary supports fails with non-retryable `FailedPrecondition`; it is not
   downgraded or switched to WAL, and shard files are not opened.
 - A foreign nonzero application ID or unrelated unversioned SQLite database is
   a failed precondition. A recognized BriskDB identity whose schema, rows, or
   invariants disagree is `DataCorruption`.
+- In `Ready` or `Adopting`, a missing shard is never created and a non-WAL shard
+  is never switched to WAL. Extra four-digit `.sqlite` shard filenames are
+  rejected rather than ignored. SQLite's transient `-wal` and `-shm` sidecars
+  are not canonical shard files and need not exist after a clean close.
+- The layout ID and application IDs detect accidental wrong-file placement;
+  they are forgeable by anyone who can modify the directory and are not a
+  security or checksum mechanism.
+- BriskDB owns the shard identity table and the persistent `application_id`,
+  `user_version`, and `journal_mode` settings. Client SQL access to the identity
+  table and mutation of those settings is denied. `user_version` is the
+  application-schema generation, not SQLite's internal `schema_version`.
 - SQLite lock contention remains retryable `Busy`; permission, read-only, full,
   and I/O failures retain the storage error taxonomy.
 
@@ -365,23 +501,38 @@ Do not edit the header, tables, or rows manually. Until the checksum milestone,
 a coordinated manual edit that still satisfies every structural invariant
 cannot be distinguished from an intentional catalog update. The current
 deployment boundary remains local storage and one BriskDB process per data
-directory. A formal backup/restore workflow is not implemented; recovery to an
-older binary requires a known-good copy made while BriskDB was stopped.
+directory. A formal backup/restore workflow is not implemented; recovery from
+a missing, swapped, or otherwise incompatible shard—including one cloned into
+the wrong slot or from another layout—requires the correct complete layout or a
+known-good copy made while BriskDB was stopped. Recovery to an older binary
+likewise requires a pre-v5 backup.
+
+A future application-schema migration format must bump the manifest version and
+downgrade fence, journal its source and target generations, and explicitly
+authorize any temporary mixed shard generations. It must update each shard's
+`user_version` atomically with that shard's DDL and advance the committed
+catalog generation only after every shard verifies. A v5 opener has no such
+journal and rejects every generation other than 0.
 
 ## Verification contract
 
-Tests cover fresh and v1/v2/v3-to-v4 catalog creation, the exact default logical
-database and schema singleton, every placement and shard-key type code,
-identifier and relational corruption, catalog row limits, immutable public
-lookups, deterministic and balanced bucket ownership, non-divisor
-compatibility, and no-op reopen. Migration coverage includes both recognized
-legacy headers, the interrupted empty-table state, future and foreign formats,
-old-reader fences, errors and panics on both sides of every version stamp,
-multi-step resume, v3-to-v4 observer atomicity, and concurrent openers with
-matching and conflicting shard counts. Routing tests additionally freeze golden
-hash/bucket/shard vectors, cover every algorithm state for every supported shard
-count, prove the final map lookup with a synthetic reassignment, and exercise
-parallel and reopen stability. Process termination and filesystem faults remain
-part of the later storage-hardening suite. Every new migration must extend the
-registry, destination validator, format documentation, and the same
+Tests cover fresh and v1/v2/v3/v4-to-v5 creation, every manifest layout state,
+the exact shard header and metadata row, application-schema generation 0, and
+no-op ready reopen. Failure coverage includes missing and extra canonical files,
+foreign headers, non-WAL mode, malformed metadata, cross-layout shard clones,
+shard swaps, symlinks, wrong generations, client attempts to reach storage-owned
+state, and runtime pool replacement opens. Injection around each manifest and
+per-shard persistence boundary proves resumability in `Creating` and `Adopting`
+and prevents `Ready` from being published before full strict revalidation.
+Concurrent openers exercise matching and conflicting shard counts and layout
+transitions.
+
+Catalog tests continue to cover default logical metadata, every placement and
+shard-key type code, identifier and relational corruption, row limits, and
+immutable public lookups. Routing tests freeze golden hash/bucket/shard vectors,
+cover every algorithm state for every supported shard count, prove the final
+map lookup with a synthetic reassignment, and exercise parallel and reopen
+stability. Process termination and filesystem faults remain part of the later
+storage-hardening suite. Every new migration must extend the registry,
+destination validator, format documentation, and the same
 normal/error/concurrency/recovery matrix.

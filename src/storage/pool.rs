@@ -531,6 +531,8 @@ impl ShardPoolInner {
         configure_connection_controlled(
             &mut connection,
             Arc::clone(&control),
+            &self.storage,
+            self.shard,
             #[cfg(test)]
             self.take_setup_hook(),
         )?;
@@ -885,6 +887,8 @@ impl PooledConnection {
 fn configure_connection_controlled(
     connection: &mut Connection,
     control: Arc<OperationControl>,
+    storage: &Storage,
+    shard: u16,
     #[cfg(test)] barrier: Option<ControlledBarrier>,
 ) -> EngineResult<()> {
     let _busy_operation = BusyOperationGuard::install(Arc::clone(&control));
@@ -915,7 +919,7 @@ fn configure_connection_controlled(
     // Do not call the ordinary configuration wrapper here: its fixed busy
     // timeout would replace the cancellable handler before these pragmas can
     // encounter a SQLite lock.
-    let result = super::configure_connection_pragmas(connection);
+    let result = storage.validate_unconfigured_shard(connection, shard);
     let progress_cleanup = connection
         .progress_handler(0, None::<fn() -> bool>)
         .map_err(sqlite_error::storage);
@@ -1437,7 +1441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorizer_probe_denies_prepare_time_pragma_effects_until_real_execution() {
+    async fn storage_owned_pragmas_remain_denied_after_probe_isolation() {
         let (temp, pools) = pools(1, 0);
         let first_owner = ConnectionOwner::new(11);
         let second_owner = ConnectionOwner::new(22);
@@ -1476,19 +1480,23 @@ mod tests {
             "the authorizer probe must deny the PRAGMA before any prepare-time effect"
         );
 
-        second.execute_batch("PRAGMA user_version = 7").unwrap();
+        let error = second.execute_batch("PRAGMA user_version = 7").unwrap_err();
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(_, _) | rusqlite::Error::SqlInputError { .. }
+        ));
         assert_eq!(
             control
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            7
+            0
         );
         drop(second);
 
         let snapshot = pools.snapshot().unwrap().shards[0];
         assert_eq!(snapshot.opened, 2);
-        assert_eq!(snapshot.retired, 2);
-        assert_eq!(snapshot.idle, 0);
+        assert_eq!(snapshot.retired, 1);
+        assert_eq!(snapshot.idle, 1);
     }
 
     #[tokio::test]
@@ -1555,7 +1563,7 @@ mod tests {
         let error = second
             .isolate_foreign_sql("PRAGMA data_version")
             .unwrap_err();
-        assert_eq!(error.kind(), EngineErrorKind::StorageUnavailable);
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
         drop(second);
 
         let failed = pools.snapshot().unwrap().shards[0];

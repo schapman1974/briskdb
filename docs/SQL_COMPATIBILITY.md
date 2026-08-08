@@ -88,6 +88,19 @@ without allowing connection-local state or observer metadata such as
 `PRAGMA data_version` to leak into another ephemeral HTTP session; it does not
 add multi-request transactions or promise compatibility for those statements.
 
+The pass-through boundary excludes BriskDB-owned storage identity. Client SQL
+may not read or mutate `briskdb_shard_metadata`, create objects in the reserved
+`briskdb_*` namespace, or mutate `application_id`, `user_version`, persistent
+`journal_mode`, `schema_version`, or `writable_schema`. The SQLite authorizer
+denies those operations through routed and broadcast execution. These controls
+are reserved for startup validation and future schema migrations, so denial is
+stable BriskDB behavior rather than connection-hygiene policy.
+
+`ALTER TABLE` is also denied on every client surface. SQLite reports the source
+table to its authorizer but not a `RENAME TO` destination, so selectively
+allowing it would let a client create a name inside the reserved `briskdb_*`
+namespace. A future schema API can coordinate and validate those changes.
+
 SQLite also retains `last_insert_rowid()`, `changes()`, and `total_changes()` on
 the physical connection after ordinary writes. A write-bearing handle may be
 reused by its owning BriskDB `Session`, but the pool closes and replaces it
@@ -332,14 +345,19 @@ underlying execution semantics.
   prefix selects one of 4,096 virtual buckets through the versioned
   compatibility algorithm.
 - The final physical shard is read from the validated, generation-stamped
-  bucket map retained in manifest version 4. Routing generation 1 preserves
+  bucket map retained in manifest version 5. Routing generation 1 preserves
   the earlier modulo placement for every supported shard count.
-- Manifest version 4 also exposes an immutable logical catalog with schema
-  generation 0 and default database ID 1 named `default`. Its optional table
-  rows can describe sharded, global, or catalog placement and a sharded table's
-  `Int64`, text, or binary key column.
-- Logical metadata is currently read-only and advisory. Fresh and upgraded
-  manifests contain no table rows, existing physical tables are not inferred
+- Manifest version 5 retains the immutable logical catalog introduced in v4,
+  with schema generation 0 and default database ID 1 named `default`. Its
+  optional table rows can describe sharded, global, or catalog placement and a
+  sharded table's `Int64`, text, or binary key column.
+- A ready v5 layout binds every shard to one random 16-byte layout ID and its
+  physical shard ID. Each connection is opened without create or symlink
+  following and must match the `BRSH` application ID, schema-generation-0 user
+  version, exact metadata, and existing WAL mode.
+- Logical metadata is currently read-only and advisory. Fresh manifests and
+  upgrades originating before v4 contain no table rows; v4-to-v5 retains every
+  validated v4 logical-catalog row. Existing physical tables are not inferred
   or adopted, and catalog contents do not alter SQL planning or execution.
 - Point queries and writes visit only that shard.
 - No scatter/gather query path exists.
@@ -375,7 +393,11 @@ run internally during storage open, are transactional only within
 statement. The atomic version-3-to-version-4 manifest upgrade adds only
 read-only advisory logical metadata and its downgrade fence. It does not infer
 or adopt existing physical tables and does not change shard schemas, supported
-SQLite syntax, result conversion, routing, or broadcast semantics.
+SQLite syntax, result conversion, routing, or broadcast semantics. Version 5
+then adds a resumable physical-layout state machine. Its `Adopting` path accepts
+only exact legacy zero-header WAL shards, preserves their tables and rows, and
+adds BriskDB identity metadata. It does not make application-schema changes or
+turn sequential broadcast into an atomic cross-file operation.
 See the [manifest storage-format contract](STORAGE_FORMAT.md).
 
 Scatter reads will combine committed results from multiple SQLite files. They
