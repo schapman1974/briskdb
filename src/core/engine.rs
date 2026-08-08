@@ -2216,7 +2216,7 @@ mod tests {
             2
         );
         wait_for_pool_occupancy(&engine, 0, 0, 0).await;
-        assert_eq!(engine.inner.workers.available_permits(), 2);
+        wait_for_worker_capacity(&engine, 2).await;
     }
 
     #[tokio::test]
