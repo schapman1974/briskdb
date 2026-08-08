@@ -1,0 +1,254 @@
+# SQL compatibility
+
+BriskDB stores data in SQLite and is designed to expose the same database
+engine through HTTP, PostgreSQL, MySQL, and future protocol adapters. A wire
+protocol does not change SQLite into that protocol's namesake database. This
+document defines the SQL and behavioral contract separately from connectivity.
+
+## Status vocabulary
+
+- **Implemented** means the behavior exists in the current source tree and is
+  covered by the repository's tests.
+- **Experimental** means the behavior exists, but its public contract may still
+  change before the first stable release.
+- **Planned** means the roadmap defines the behavior, but clients must not rely
+  on it yet.
+- **Unsupported** means BriskDB rejects the behavior or makes no compatibility
+  promise for it.
+
+Unsupported syntax must fail explicitly. BriskDB must not silently reinterpret
+a statement with materially different semantics.
+
+## Compatibility layers
+
+BriskDB tracks three independent compatibility layers:
+
+1. **Wire compatibility** lets an existing driver connect, authenticate,
+   prepare and bind statements, receive typed rows, and manage session state.
+2. **SQL compatibility** parses a documented common subset and translates
+   selected PostgreSQL or MySQL syntax into SQLite operations.
+3. **Behavioral compatibility** emulates the metadata, type, error, transaction,
+   and session behavior needed by specifically tested clients and tools.
+
+Passing a PostgreSQL or MySQL handshake will establish only wire compatibility.
+BriskDB will publish behavioral compatibility per tested driver or tool rather
+than claiming to be a drop-in PostgreSQL or MySQL replacement.
+
+## Current implementation
+
+Only the experimental HTTP interface is implemented today. There is no
+PostgreSQL or MySQL listener yet, and there is no SQL parser or dialect
+translation layer. HTTP requests send SQLite SQL directly to `rusqlite`.
+
+| Interface | Status | SQL accepted | Routing |
+| --- | --- | --- | --- |
+| HTTP `/v1/execute` | Experimental | One SQLite statement with positional parameters | Required caller-provided `shard_key` |
+| HTTP `/v1/query` | Experimental | One SQLite query with positional parameters | Required caller-provided `shard_key` |
+| HTTP `/v1/admin/broadcast` | Experimental | A parameterless SQLite statement batch | Sequentially applied to every shard |
+| PostgreSQL wire protocol | Planned | Common subset plus documented PostgreSQL normalization | SQL/bound-parameter inference with explicit session fallback |
+| MySQL wire protocol | Planned | Common subset plus documented MySQL normalization | SQL/bound-parameter inference with explicit session fallback |
+
+The current HTTP calls open a SQLite connection per request. A transaction
+cannot span requests. Broadcast execution is not atomic across shard files: a
+failure can occur after earlier shards have committed their schema change.
+
+### Current parameter and result conversion
+
+Use SQLite positional placeholders such as `?1` and `?2`. Values are never
+interpolated into SQL text.
+
+| JSON input | SQLite binding |
+| --- | --- |
+| `null` | `NULL` |
+| `true` / `false` | `INTEGER` `1` / `0` |
+| Signed integer representable as `i64` | `INTEGER` |
+| Other JSON number representable as `f64` | `REAL` |
+| Number outside those representations | Decimal text |
+| String | `TEXT` |
+| Array or object | Compact JSON stored as `TEXT` |
+
+SQLite results currently map `NULL`, `INTEGER`, `REAL`, and `TEXT` directly to
+their JSON counterparts. A `BLOB` is returned as an array of byte-valued JSON
+integers. Query results are currently JSON objects keyed by column name, so a
+later duplicate column name overwrites an earlier one. The protocol-neutral
+row model will replace this lossy representation before the API is stable.
+
+## SQL surface
+
+### Implemented pass-through surface
+
+The following operations work when expressed in syntax accepted by the bundled
+SQLite library and used through the matching HTTP endpoint:
+
+| Operation | Current contract | Important boundary |
+| --- | --- | --- |
+| `CREATE TABLE`, `CREATE INDEX` | Execute through the broadcast endpoint | Sequential, non-atomic across shards |
+| `INSERT`, `UPDATE`, `DELETE` | Execute on the shard selected by `shard_key` | BriskDB does not yet prove that SQL values match the supplied key |
+| `SELECT` | Query the shard selected by `shard_key` | No scatter/gather path |
+| SQLite expressions and functions | Passed through without translation | Semantics are SQLite semantics |
+| SQLite constraints | Enforced inside one shard | No global unique-constraint coordinator |
+
+Other SQLite syntax may happen to pass through, but it is not a stable BriskDB
+contract until it appears in this table and has conformance tests. In
+particular, multi-request transactions, multi-shard writes, `RETURNING`,
+multiple statements outside the broadcast endpoint, and attached-database
+operations are unsupported public API behavior today.
+
+### Planned common subset
+
+The first driver-capable SQL subset will include:
+
+- `CREATE TABLE` and `CREATE INDEX` through cataloged schema migrations;
+- `SELECT`, including documented filters, ordering, limits, and aggregates;
+- `INSERT`, `UPDATE`, and `DELETE` when a single shard can be proven;
+- `BEGIN`, `COMMIT`, and `ROLLBACK` for transactions pinned to one shard; and
+- protocol-neutral prepare, bind, describe, execute, and close operations.
+
+The parser and planner will classify statements before execution. Writes with
+no provable shard, writes with conflicting shard keys, unsafe multi-statement
+requests, and cross-shard transactions will be rejected before changing data.
+
+## PostgreSQL differences
+
+The PostgreSQL listener will target the frontend/backend wire protocol and a
+deliberately small SQL compatibility surface. PostgreSQL-specific behavior is
+not implemented unless listed as implemented in this document.
+
+| Area | PostgreSQL | BriskDB contract |
+| --- | --- | --- |
+| Parameters | `$1`, `$2`, ... | Planned normalization to bound SQLite parameters; routing occurs at bind/execute time |
+| Identifier quoting | Double quotes | Passed through where SQLite semantics agree |
+| Type system | Static types identified by OIDs | Planned loss-aware mapping to BriskDB types and SQLite storage classes |
+| Boolean | Dedicated `boolean` type | Stored as SQLite integer `0` or `1`; protocol adapter returns a Boolean value |
+| `serial`, identity, sequences | Sequence-backed generation | Unsupported until explicit sequence/identity semantics are designed |
+| `bytea` | Binary value | Planned mapping to SQLite `BLOB` |
+| `json` / `jsonb` | Distinct PostgreSQL types | Planned JSON validation; no promise of PostgreSQL `jsonb` storage or operators |
+| Arrays, ranges, enums, domains | Native PostgreSQL types | Unsupported initially |
+| Schemas and `search_path` | Multiple schemas per database | Unsupported initially; compatibility shims may expose one logical schema |
+| `RETURNING` | Common DML feature | Not in the initial common subset |
+| `ON CONFLICT` | PostgreSQL upsert syntax | Supported only after a tested translation contract is defined |
+| Functions/operators | PostgreSQL catalog | SQLite functions/operators unless an explicit shim is documented |
+| System catalogs | `pg_catalog`, `information_schema` | Only queries required by named, tested clients will be emulated |
+| Error behavior | SQLSTATE and failed transaction state | Planned stable SQLSTATE mapping and `I`/`T`/`E` transaction states |
+| `COPY`, replication, `LISTEN/NOTIFY` | PostgreSQL subprotocols/features | Deferred and unsupported initially |
+
+PostgreSQL's static result metadata does not always have an exact equivalent in
+SQLite's dynamic type system. BriskDB will honor declared and bound types where
+safe, infer expression types conservatively, and reject indeterminate binary
+parameters instead of guessing.
+
+## MySQL differences
+
+The MySQL listener will target the client/server protocol and the same core SQL
+engine used by PostgreSQL and HTTP.
+
+| Area | MySQL | BriskDB contract |
+| --- | --- | --- |
+| Parameters | `?` in prepared statements | Planned normalization to bound SQLite parameters; no string interpolation |
+| Identifier quoting | Backticks by default | Planned normalization; double-quoted strict SQL remains available |
+| Type system | Static signed/unsigned column types | Planned loss-aware mapping; integers outside signed 64-bit range need an explicit policy |
+| Boolean | Commonly `TINYINT(1)` | Stored as SQLite integer `0` or `1`; protocol adapter returns documented metadata |
+| `AUTO_INCREMENT` | Table column attribute | Unsupported until generated-key semantics are designed |
+| `UNSIGNED`, display widths | MySQL column attributes | No current SQLite equivalent; unsupported initially |
+| `DATETIME`, `TIMESTAMP` | Distinct MySQL temporal behavior | No implicit compatibility; canonical timestamp encoding must be defined first |
+| `JSON` | Native MySQL JSON type | Planned JSON validation stored using the canonical BriskDB representation |
+| `LIMIT offset,count` | MySQL syntax | Planned normalization to canonical limit/offset form |
+| `ON DUPLICATE KEY UPDATE` | MySQL upsert syntax | Unsupported until a tested translation contract is defined |
+| Engines, character sets, collations | Per-table/column options | Engine clauses unsupported; charset/collation behavior must be explicitly mapped |
+| Session probes | `SET NAMES`, `SHOW VARIABLES`, `SELECT @@...` | Only the subset required by named, tested clients will be emulated |
+| Metadata | `information_schema` and MySQL metadata commands | Minimal tested compatibility only |
+| Errors | MySQL error number plus SQLSTATE | Planned mapping from stable BriskDB error kinds |
+| Stored programs, binlog, `LOAD DATA` | MySQL-specific facilities | Deferred and unsupported initially |
+
+## SQLite semantic differences
+
+SQLite is the execution authority. Unless BriskDB documents a compatibility
+translation, its behavior follows SQLite rather than PostgreSQL or MySQL.
+
+- SQLite values use the `NULL`, `INTEGER`, `REAL`, `TEXT`, and `BLOB` storage
+  classes. Ordinary tables use type affinity rather than rigid column typing.
+- SQLite has no separate Boolean storage class; false and true are represented
+  by integer zero and one.
+- SQLite has no dedicated date/time storage class. Applications can store time
+  values as text, real, or integer values, so BriskDB must choose a canonical
+  representation before promising cross-protocol temporal compatibility.
+- Declared sizes such as `VARCHAR(255)` do not impose the same length behavior
+  as PostgreSQL or MySQL.
+- Numeric conversion, collation, null ordering, division, and comparison rules
+  can differ from both server databases. Distributed merge operations must
+  reproduce the chosen SQLite semantics explicitly.
+- `STRICT` tables can provide stronger enforcement, but BriskDB does not enable
+  strict mode implicitly.
+
+See SQLite's official [SQL language reference](https://www.sqlite.org/lang.html)
+and [datatype documentation](https://www.sqlite.org/datatype3.html) for the
+underlying execution semantics.
+
+## Sharding semantics
+
+### Current
+
+- The caller supplies an opaque `shard_key` independently from the SQL text.
+- BLAKE3 hashing followed by modulo shard count selects one physical shard.
+- Point queries and writes visit only that shard.
+- No scatter/gather query path exists.
+- Unique constraints and transactions are local to one SQLite shard.
+- Schema broadcast applies sequentially and can be partially completed.
+
+### Planned stable contract
+
+- Every sharded table declares one non-null shard-key column in the catalog.
+- Canonical key encoding, hash version, virtual bucket count, and bucket map are
+  persisted in the manifest.
+- The planner extracts equality keys from SQL and bound parameters. An explicit
+  session routing key remains a controlled fallback.
+- A transaction is pinned to its first shard. Targeting another shard returns a
+  stable cross-shard-transaction error.
+- Read-only plans may scatter with bounded concurrency and deterministic merge.
+- Cross-shard writes remain unsupported unless a future coordinator can prove
+  its crash semantics.
+- Global uniqueness is unsupported unless backed by an explicit reservation
+  design; shard-local uniqueness must include the shard key when applications
+  require system-wide uniqueness by construction.
+
+## Transactions and concurrency
+
+SQLite provides atomic transactions within one database file. BriskDB will not
+describe sequential commits to several shard files as atomic. The initial SQL
+session contract will therefore pin explicit transactions to one shard and
+reject cross-shard access.
+
+Scatter reads will combine committed results from multiple SQLite files. They
+will not claim an atomic cross-file snapshot until BriskDB has an implementation
+and failure tests that establish such a guarantee.
+
+## Compatibility verification
+
+A syntax or behavior moves from planned to implemented only with tests at the
+right boundary:
+
+- unit tests for parsing, normalization, routing, type conversion, and errors;
+- golden tests for wire messages, placeholders, type metadata, and error codes;
+- differential tests against a single SQLite reference database for supported
+  SQL and scatter/gather behavior;
+- integration tests using named PostgreSQL, MySQL, and HTTP clients; and
+- regression tests for every corrected compatibility bug.
+
+The compatibility matrix will name the client and version tested. Compatibility
+with an unlisted ORM, administration tool, extension, or server feature is not
+implied.
+
+## Change policy
+
+Changes to SQL behavior, type mappings, sharding semantics, error mappings, or
+the supported client matrix must update this document in the same pull request.
+An implemented claim must not be merged without automated coverage. Removing a
+supported behavior requires a migration or compatibility note before the first
+stable release and follows the project's eventual versioning policy afterward.
+
+## Protocol references
+
+- [PostgreSQL SQL syntax](https://www.postgresql.org/docs/current/sql-syntax.html)
+- [PostgreSQL frontend/backend protocol](https://www.postgresql.org/docs/current/protocol.html)
+- [MySQL SQL statements](https://dev.mysql.com/doc/refman/en/sql-statements.html)
+- [MySQL client/server protocol](https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html)

@@ -8,6 +8,10 @@ See the [development roadmap](ROADMAP.md) for the protocol-neutral engine,
 PostgreSQL and MySQL wire interfaces, durable shard catalog, scatter/gather
 planner, APIs, and production-hardening milestones.
 
+The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
+current SQLite pass-through API from planned PostgreSQL and MySQL compatibility.
+Contributions follow the repository's [test-first completion policy](CONTRIBUTING.md).
+
 ## Current foundation
 
 - Stable BLAKE3 routing from a caller-provided shard key
