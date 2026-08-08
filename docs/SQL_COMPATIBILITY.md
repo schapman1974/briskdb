@@ -125,6 +125,19 @@ object-per-row shape, which collapsed duplicate names. It changes only HTTP
 query serialization; request fields, routing, configuration, the manifest,
 shard files, and stored data are unchanged.
 
+### Current error contract
+
+The engine exposes stable protocol-neutral error kinds. The HTTP adapter maps
+them to safe RFC 9457 problem details without serializing SQLite messages, SQL
+text, filesystem paths, or internal source chains. SQL and storage classify
+SQLite result codes and operation context; error-message text is never parsed
+to choose an error kind.
+
+The same kinds already have defined PostgreSQL SQLSTATE and MySQL error
+number/SQLSTATE mappings, but those are contracts for the planned adapters.
+They do not make either wire-protocol listener available. See the complete
+[error taxonomy and mapping table](ERRORS.md).
+
 ## SQL surface
 
 ### Implemented pass-through surface
@@ -183,7 +196,7 @@ not implemented unless listed as implemented in this document.
 | `ON CONFLICT` | PostgreSQL upsert syntax | Supported only after a tested translation contract is defined |
 | Functions/operators | PostgreSQL catalog | SQLite functions/operators unless an explicit shim is documented |
 | System catalogs | `pg_catalog`, `information_schema` | Only queries required by named, tested clients will be emulated |
-| Error behavior | SQLSTATE and failed transaction state | Planned stable SQLSTATE mapping and `I`/`T`/`E` transaction states |
+| Error behavior | SQLSTATE and failed transaction state | Stable error-kind-to-SQLSTATE mapping defined; wire encoding and `I`/`T`/`E` transaction states planned |
 | `COPY`, replication, `LISTEN/NOTIFY` | PostgreSQL subprotocols/features | Deferred and unsupported initially |
 
 PostgreSQL's static result metadata does not always have an exact equivalent in
@@ -211,7 +224,7 @@ engine used by PostgreSQL and HTTP.
 | Engines, character sets, collations | Per-table/column options | Engine clauses unsupported; charset/collation behavior must be explicitly mapped |
 | Session probes | `SET NAMES`, `SHOW VARIABLES`, `SELECT @@...` | Only the subset required by named, tested clients will be emulated |
 | Metadata | `information_schema` and MySQL metadata commands | Minimal tested compatibility only |
-| Errors | MySQL error number plus SQLSTATE | Planned mapping from stable BriskDB error kinds |
+| Errors | MySQL error number plus SQLSTATE | Stable error-kind mapping defined; listener and wire encoding planned |
 | Stored programs, binlog, `LOAD DATA` | MySQL-specific facilities | Deferred and unsupported initially |
 
 ## SQLite semantic differences
@@ -304,5 +317,7 @@ stable release and follows the project's eventual versioning policy afterward.
 
 - [PostgreSQL SQL syntax](https://www.postgresql.org/docs/current/sql-syntax.html)
 - [PostgreSQL frontend/backend protocol](https://www.postgresql.org/docs/current/protocol.html)
+- [PostgreSQL error codes](https://www.postgresql.org/docs/current/errcodes-appendix.html)
 - [MySQL SQL statements](https://dev.mysql.com/doc/refman/en/sql-statements.html)
 - [MySQL client/server protocol](https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html)
+- [MySQL server error reference](https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html)

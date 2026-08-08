@@ -14,6 +14,9 @@ boundaries and dependency direction.
 
 The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
 current SQLite pass-through API from planned PostgreSQL and MySQL compatibility.
+The [error contract](docs/ERRORS.md) defines stable engine error kinds, safe
+HTTP problem details, and the mappings reserved for future PostgreSQL and MySQL
+adapters.
 Contributions follow the repository's [test-first completion policy](CONTRIBUTING.md).
 The [benchmark baseline](docs/BENCHMARKS.md) defines the reproducible storage
 workloads used to measure the current prototype.
