@@ -270,15 +270,50 @@ mod tests {
     }
 
     #[test]
-    fn empty_results_still_return_ordered_column_metadata() {
+    fn query_preserves_duplicate_column_names_and_positions() {
         let connection = Connection::open_in_memory().unwrap();
-        let result = query(&connection, "SELECT 1 AS first, 2 AS second WHERE 0", &[]).unwrap();
+        let result = query(
+            &connection,
+            "SELECT 1 AS duplicate, 2 AS middle, 3 AS duplicate, 4 AS \"\"",
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(
             result.columns(),
-            vec![
-                Column::new("first", DataType::Unknown),
-                Column::new("second", DataType::Unknown),
+            [
+                Column::new("duplicate", DataType::Unknown),
+                Column::new("middle", DataType::Unknown),
+                Column::new("duplicate", DataType::Unknown),
+                Column::new("", DataType::Unknown),
+            ]
+        );
+        assert_eq!(
+            result.rows(),
+            [Row::new(vec![
+                Value::from(1_i64),
+                Value::from(2_i64),
+                Value::from(3_i64),
+                Value::from(4_i64),
+            ])]
+        );
+    }
+
+    #[test]
+    fn empty_results_still_return_ordered_duplicate_column_metadata() {
+        let connection = Connection::open_in_memory().unwrap();
+        let result = query(
+            &connection,
+            "SELECT 1 AS duplicate, 2 AS duplicate WHERE 0",
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.columns(),
+            [
+                Column::new("duplicate", DataType::Unknown),
+                Column::new("duplicate", DataType::Unknown),
             ]
         );
         assert!(result.is_empty());

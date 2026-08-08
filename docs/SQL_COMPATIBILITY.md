@@ -89,15 +89,41 @@ positional rows are preserved inside `ResultSet`; SQLite result-column metadata
 is marked `Unknown` because dynamic SQLite values do not guarantee one static
 type.
 
-The experimental HTTP adapter still returns `NULL`, `INTEGER`, `REAL`, and
-`TEXT` as their JSON counterparts and a `BLOB` as an array of byte-valued JSON
-integers. It encodes exact `Decimal` values as JSON strings and renders
-`InvalidText` lossily, replacing invalid UTF-8 byte sequences with U+FFFD.
-Because JSON has no non-finite number syntax, it renders infinite or `NaN`
-`Float64` values as `null`. Its current rows are objects keyed by column name,
-so a later duplicate column name overwrites an earlier one. This remaining
-adapter loss is tracked separately; storage and core no longer collapse rows
-into JSON maps.
+The experimental `/v1/query` response exposes the ordered result directly. For
+example:
+
+```json
+{
+  "shard": 0,
+  "columns": [
+    {"name": "value", "data_type": "unknown"},
+    {"name": "value", "data_type": "unknown"}
+  ],
+  "rows": [[1, 2]]
+}
+```
+
+For every row, `rows[row_index][column_index]` is described by
+`columns[column_index]`. Column names may be duplicated or empty and are never
+used as JSON object keys. A query that produces no rows still returns all of its
+ordered column metadata with `"rows": []`. The `data_type` label is one of
+`unknown`, `null`, `boolean`, `int64`, `uint64`, `float64`, `decimal`, `text`,
+or `binary`. SQLite result columns currently report `unknown` because SQLite
+does not guarantee one static result type.
+
+Cell encoding retains the existing HTTP policy: nulls, booleans, signed and
+unsigned integers, finite floats, and valid text use their direct JSON forms;
+binary data is an array of byte-valued JSON integers; and exact decimals are
+JSON strings. `InvalidText` is rendered lossily with invalid UTF-8 byte
+sequences replaced by U+FFFD. Because JSON has no non-finite number syntax,
+infinite or `NaN` `Float64` values become `null`. Consumers that decode every
+JSON number through binary floating point must also account for precision loss
+when reading large `uint64` cells.
+
+This ordered response intentionally replaces the earlier experimental
+object-per-row shape, which collapsed duplicate names. It changes only HTTP
+query serialization; request fields, routing, configuration, the manifest,
+shard files, and stored data are unchanged.
 
 ## SQL surface
 
