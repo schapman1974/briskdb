@@ -118,7 +118,7 @@ impl LogicalDatabaseMetadata {
 pub enum ShardKeyType {
     /// Signed 64-bit integer.
     Int64,
-    /// UTF-8 text, declared without Unicode normalization.
+    /// UTF-8 text, declared without Unicode normalization or collation.
     Text,
     /// Arbitrary bytes.
     Binary,
@@ -150,8 +150,9 @@ impl ShardKeyMetadata {
 
 /// Declared physical placement of a logical table.
 ///
-/// These declarations are advisory in manifest v4. Schema-journal work will
-/// make them authoritative for physical DDL and query planning.
+/// These declarations remain advisory in the current manifest. Future
+/// catalog-driven DDL and physical-schema validation must make them
+/// authoritative before execution planning relies on them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TablePlacement {

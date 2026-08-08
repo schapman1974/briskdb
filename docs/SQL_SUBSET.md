@@ -35,18 +35,20 @@ A successful `CommonSql` does not mean that the SQL:
 - names existing databases, tables, columns, constraints, or types;
 - has normalized or correctly numbered placeholders until the separate
   [`normalize_placeholders`](SQL_PARAMETERS.md) step succeeds;
-- can be routed to one shard or has a bound routing value;
+- has an inferred key until the separate catalog-aware
+  [`infer_shard_keys`](SQL_SHARD_KEYS.md) step succeeds;
+- can be routed to one shard even after inference reports values;
 - is safe to execute as an empty, single-, or multi-statement request;
 - has a prepared-statement plan or protocol result description;
 - has been translated to SQLite or preserves source-dialect semantics;
 - is authorized for a particular endpoint or session; or
 - has been executed.
 
-Those responsibilities remain with the implemented issue #21 normalization
-layer, issues #22 through #27, and the later wire frontends. Validation never
-consults parameters, a session, the logical catalog, storage, routing state,
-the filesystem, or SQLite. It never formats or searches SQL text to make a
-structural decision.
+Those responsibilities remain with the implemented issue #21 normalization and
+issue #22 inference layers, issues #23 through #27, and the later wire
+frontends. Validation never consults parameters, a session, the logical
+catalog, storage, routing state, the filesystem, or SQLite. It never formats or
+searches SQL text to make a structural decision.
 
 Empty and comment-only parsed batches validate successfully. Every statement in
 a mixed batch is checked independently and source order is retained, but that
@@ -79,8 +81,8 @@ pinning, and protocol status reporting remain issues #34 and #47.
 
 An absent `WHERE` on `UPDATE` or `DELETE` is structurally valid. Likewise,
 validation does not inspect whether an assignment changes a shard-key column.
-Catalog-aware key extraction and rejection of conflicting or unroutable writes
-remain issues #22 and #24.
+The separate inference layer classifies the supported predicate proof; issue
+#24 owns rejection of conflicting or unroutable writes and assignment policy.
 
 ### Names, aliases, and types
 
@@ -164,6 +166,10 @@ to distinguish it. Placeholder spelling, numbering, count, and binding are not
 validated or changed here. The separate [SQL parameter-normalization
 contract](SQL_PARAMETERS.md) defines the implemented opt-in numbering step,
 which consumes `CommonSql` without accepting bound values.
+The [shard-key inference contract](SQL_SHARD_KEYS.md) then defines the exact
+catalog-aware predicate and `INSERT` value forms that produce typed key values;
+general expression support here is intentionally broader than that finite
+proof grammar.
 
 Common-subset expression validation has its own maximum recursive AST depth of
 128. This catches long flat operator chains, which the parser can build

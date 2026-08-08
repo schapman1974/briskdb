@@ -245,7 +245,7 @@ Table placement and shard-key type use stable numeric codes:
 | `placement` | `2` | `Global` | Shard-key column and type must both be null |
 | `placement` | `3` | `Catalog` | Shard-key column and type must both be null |
 | `shard_key_type` | `1` | `Int64` | Signed 64-bit integer |
-| `shard_key_type` | `2` | `Text` | UTF-8 text without Unicode normalization |
+| `shard_key_type` | `2` | `Text` | UTF-8 text without Unicode normalization; no comparison collation is declared |
 | `shard_key_type` | `3` | `Binary` | Arbitrary bytes |
 
 `Sharded` means the same logical schema is expected on every shard and rows
@@ -253,17 +253,20 @@ are key-routed. `Global` describes small replicated lookup data. `Catalog`
 describes manifest-owned metadata rather than a user shard table.
 
 The loaded `Catalog` is read-only to callers and remains advisory in version 7:
-there is no table-catalog mutation API, planner integration, or enforcement
-against physical shard schemas. The engine publishes a newly committed schema
-generation into its shared catalog snapshot only after every shard has reached
-that generation. Fresh initialization and every v1/v2/v3 upgrade leave
-`briskdb_tables` empty; a v4-to-v5 upgrade retains every validated v4 catalog
-row. Schema migration does not inspect, infer, or mutate `briskdb_tables` from
-the journaled SQL; the physical-schema fingerprint independently establishes
-exact consensus across shards. Tables that are absent from the advisory catalog
-remain usable through the existing explicit-key execute/query API. Version-5
-adoption preserves existing tables and rows while adding only BriskDB-owned
-shard identity metadata.
+the opt-in SQL inference API may consult its database, table placement, and key
+metadata, but there is no table-catalog mutation API, execution-plan
+integration, routing enforcement, or enforcement against physical shard
+schemas. The engine publishes a newly committed schema generation into its
+shared catalog snapshot only after every shard has reached that generation.
+Fresh initialization and every v1/v2/v3 upgrade leave `briskdb_tables` empty;
+a v4-to-v5 upgrade retains every validated v4 catalog row. Schema migration
+does not inspect, infer, or mutate `briskdb_tables` from the journaled SQL; the
+physical-schema fingerprint independently establishes exact consensus across
+shards. Tables that are absent from the advisory catalog remain usable through
+the existing explicit-key execute/query API. Version-5 adoption preserves
+existing tables and rows while adding only BriskDB-owned shard identity
+metadata. Shard-key inference changes no manifest table, encoding, version, or
+upgrade rule.
 
 ### Application-schema migration journal
 

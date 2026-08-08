@@ -7,10 +7,12 @@
 //! deliberate SQLite pass-through; these opt-in layers do not gate, route, or
 //! execute statements.
 
+mod inference;
 mod normalizer;
 mod parser;
 mod subset;
 
+pub use inference::{ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue, infer_shard_keys};
 pub use normalizer::{
     MAX_SQL_PARAMETERS, NormalizedSql, StatementParameters, normalize_placeholders,
 };

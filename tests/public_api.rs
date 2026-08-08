@@ -292,6 +292,58 @@ fn placeholder_normalization_is_public_owned_bounded_and_opt_in() {
 }
 
 #[test]
+fn shard_key_inference_is_public_typed_and_opt_in() {
+    fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
+    assert_owned_public::<sql::ShardKeyInference>();
+    assert_owned_public::<sql::ShardKeyInferenceKind>();
+    assert_owned_public::<sql::ShardKeyValue>();
+
+    let temp = tempfile::tempdir().unwrap();
+    drop(core::Database::open(temp.path(), 4).unwrap());
+    insert_catalog_fixture(temp.path());
+    let database = core::Database::open(temp.path(), 4).unwrap();
+    let tenant = database.catalog().database("tenant").unwrap().unwrap();
+
+    let source = "INSERT INTO accounts (payload, tenant_id) VALUES ($1, $2), ($3, 'tenant-b')";
+    let parsed = sql::parse(sql::SqlDialect::PostgreSql, source).unwrap();
+    let common = sql::validate_common_subset(parsed).unwrap();
+    let normalized = sql::normalize_placeholders(common).unwrap();
+    let inference = sql::infer_shard_keys(
+        database.catalog(),
+        tenant.id(),
+        &normalized,
+        0,
+        &[
+            core::Value::Text("payload-a".to_owned()),
+            core::Value::Text("tenant-a".to_owned()),
+            core::Value::Text("payload-b".to_owned()),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(inference.table_id().unwrap().get(), 30);
+    assert_eq!(inference.key_type(), Some(core::ShardKeyType::Text));
+    assert_eq!(inference.kind(), sql::ShardKeyInferenceKind::Multiple);
+    assert_eq!(inference.values().len(), 2);
+    assert_eq!(inference.values()[0].key_type(), core::ShardKeyType::Text);
+    assert_eq!(inference.values()[0].as_str(), Some("tenant-a"));
+    assert_eq!(inference.values()[0].as_i64(), None);
+    assert_eq!(inference.values()[0].as_bytes(), None);
+    assert_eq!(inference.values()[1].as_str(), Some("tenant-b"));
+
+    let debug = format!("{inference:?}");
+    assert!(!debug.contains("tenant-a"));
+    assert!(!debug.contains("tenant-b"));
+
+    // Inference is read-only, protocol-neutral analysis. The existing raw
+    // database interface still executes caller-provided SQLite directly.
+    let raw = database
+        .query("inference-opt-in", "SELECT 23", &[])
+        .unwrap();
+    assert_eq!(raw.rows()[0].get(0), Some(&core::Value::Int64(23)));
+}
+
+#[test]
 fn logical_catalog_types_and_access_are_public_and_protocol_neutral() {
     fn assert_public_metadata<T: Clone + Send + Sync + 'static>() {}
 

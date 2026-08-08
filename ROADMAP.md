@@ -206,7 +206,7 @@ interrupted schema migration can be diagnosed and resumed.
   `INSERT`, `UPDATE`, `DELETE`, `BEGIN`, `COMMIT`, and `ROLLBACK`.
 - [x] Normalize placeholders (`$1`, PostgreSQL/MySQL `?`) to SQLite parameters
   without interpolating values into SQL text.
-- [ ] Infer shard keys from predicates and inserted values, including bound
+- [x] Infer shard keys from predicates and inserted values, including bound
   parameters and multi-row inserts.
 - [ ] Plan prepared statements at bind/execute time, not parse time, because a
   routing key may be supplied as a bound parameter.

@@ -56,6 +56,10 @@ impl CommonSql {
     pub(super) fn statement_placeholders(&self) -> &[Vec<CommonPlaceholder>] {
         &self.statement_placeholders
     }
+
+    pub(super) fn statements(&self) -> &[AstStatement] {
+        self.parsed.statements()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
