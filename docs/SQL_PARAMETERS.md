@@ -158,10 +158,11 @@ A successful `NormalizedSql` does not establish that:
 - execution would preserve all source-dialect semantics.
 
 The implemented [shard-key inference contract](SQL_SHARD_KEYS.md) consumes this
-metadata plus a catalog database and exact bound-value slice. Issues #23
-through #27 own bind-time planning and routing, conflicting or unroutable write
-rejection, syntax/type translation, prepared-statement state, and request-level
-statement classification respectively.
+metadata plus a catalog database and exact bound-value slice. The implemented
+[bound statement planner](SQL_PLANNING.md) uses that result to produce advisory
+routes only after values are bound. Issues #24 through #27 own conflicting or
+unroutable write rejection, syntax/type translation, prepared-statement state,
+and request-level statement classification respectively.
 
 ## Verification obligations
 

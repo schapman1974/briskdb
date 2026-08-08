@@ -208,7 +208,7 @@ interrupted schema migration can be diagnosed and resumed.
   without interpolating values into SQL text.
 - [x] Infer shard keys from predicates and inserted values, including bound
   parameters and multi-row inserts.
-- [ ] Plan prepared statements at bind/execute time, not parse time, because a
+- [x] Plan prepared statements at bind/execute time, not parse time, because a
   routing key may be supplied as a bound parameter.
 - [ ] Reject conflicting keys and unroutable writes before execution.
 - [ ] Translate a deliberately small set of type names and syntax differences;

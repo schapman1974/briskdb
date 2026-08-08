@@ -494,7 +494,7 @@ The routing singleton contains exactly these generation-1 values:
 | Field | Value | Contract |
 | --- | --- | --- |
 | `hash_version` | `1` | BLAKE3 of the canonical key bytes, using digest bytes `0..8` as an unsigned little-endian `u64` |
-| `key_encoding_version` | `1` | Exact caller-supplied bytes; string shard keys contribute their UTF-8 bytes, with no Unicode normalization |
+| `key_encoding_version` | `1` | Canonical bytes defined below for raw, explicit, and typed inferred routing keys |
 | `bucket_algorithm_version` | `1` | Compatibility-preserving range algorithm below |
 | `virtual_bucket_count` | `4096` | Fixed virtual bucket space `0..4095` |
 | `map_generation` | `1` | Initial committed bucket map and the only generation version 7 can interpret |
@@ -505,6 +505,16 @@ the 4,096 bucket IDs into contiguous ranges whose sizes differ by at most one.
 For initial shard count `N`, shard `s` owns the range beginning at
 `s * base + min(s, extra)`, where `base = 4096 / N` and
 `extra = 4096 % N`.
+
+Key encoding version 1 preserves every raw `Database`/`Engine` routing key and
+every explicit bound-plan routing key exactly as supplied. The bound statement
+planner converts inferred `Int64` keys to their shortest signed base-10 ASCII
+form, inferred `Text` keys to exact UTF-8 without Unicode normalization or case
+conversion, and inferred `Binary` keys to exact bytes. The encoding adds no
+type, logical-database, table, or column prefix. These typed rules define input
+to the already persisted version-1 hash; issue #23 adds no manifest or shard
+format change. The complete advisory planning contract is in
+[bound statement planning](SQL_PLANNING.md).
 
 Bucket algorithm version 1 deliberately preserves legacy placement even when
 `N` does not divide 4,096. Given the version-1 64-bit hash `H`:

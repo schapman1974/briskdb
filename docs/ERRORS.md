@@ -167,6 +167,15 @@ statement position and a fixed category, but never contain SQL, identifier
 spelling, literal or bound values, key contents, formatted AST output, or source
 locations. See the [shard-key inference contract](SQL_SHARD_KEYS.md).
 
+The synchronous bound statement planner preserves those inference error kinds
+and diagnostics. Before inference it also acquires ordinary schema-operation
+admission, so a migrating gate returns `Busy`, a pending migration returns
+`FailedPrecondition`, and a degraded gate returns `DataCorruption`. A shape
+inconsistency between a successful inference and its route entries is
+`Internal`. Planning adds no new error kind, retains no failed parameters, and
+does not change protocol mappings. See the [bound statement-planning
+contract](SQL_PLANNING.md).
+
 The core contains no HTTP, PostgreSQL, or MySQL response types. Conversely,
 protocol adapters do not inspect SQLite errors. This lets every frontend share
 one error identity while retaining its own response encoding.

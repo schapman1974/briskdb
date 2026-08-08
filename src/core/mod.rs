@@ -9,6 +9,7 @@ mod engine;
 mod error;
 mod lifecycle;
 mod options;
+mod planner;
 mod routing;
 mod session;
 mod types;
@@ -36,6 +37,7 @@ pub use options::{
     EngineOptions, MAX_CONNECTIONS_PER_SHARD, MAX_QUEUE_CAPACITY_PER_SHARD, MAX_REQUEST_TIMEOUT_MS,
     MAX_RESULT_BYTES, MAX_RESULT_ROWS, MAX_SHUTDOWN_GRACE_MS, ResultLimits,
 };
+pub use planner::{BoundStatementPlan, PlannedRoute};
 pub(crate) use routing::{
     BUCKET_ALGORITHM_VERSION, HASH_VERSION, INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION,
     RoutingCatalog, VIRTUAL_BUCKET_COUNT, initial_physical_shard,
@@ -81,6 +83,10 @@ impl Database {
 
     pub fn shard_for_key(&self, key: &[u8]) -> u16 {
         self.storage.shard_for_key(key)
+    }
+
+    pub(crate) fn routing_provenance(&self) -> (u32, u32, u32, u64) {
+        self.storage.routing_provenance()
     }
 
     pub fn execute_routed(
