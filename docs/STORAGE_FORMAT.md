@@ -889,6 +889,15 @@ Prepare/describe do not write application data. A supported portal command has
 only its ordinary one-shard SQLite row effects; persistent schema changes
 remain exclusive to the exact-text journaled migration path.
 
+Issue #27's `StatementBatchClassification`, nested behavior enums, and behavior
+retained by plans/descriptions are likewise process-memory analysis metadata.
+They add no manifest or shard table, format version, header value, routing/key
+encoding, virtual-bucket map, schema fingerprint, journal record, CLI setting,
+or restart-recovery step. The raw migration endpoint keeps its separate
+parameterless schema-batch contract: it still digests and retains the caller's
+exact submitted SQL and does not substitute classified, normalized, or
+translated text as migration identity.
+
 The checksums are corruption detectors, not authentication. Both use unkeyed
 BLAKE3 and are writable by anyone who can modify the data directory. The
 manifest root covers canonical control-plane values, not raw SQLite pages. The

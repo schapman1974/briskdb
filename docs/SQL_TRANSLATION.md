@@ -19,7 +19,9 @@ contains a separate `sqlite_sql()` string for a later SQLite prepare step.
 
 Translation is pure SQL analysis. It accepts no catalog, session, routing key,
 bound values, storage handle, or protocol object. It does not prepare,
-authorize, classify a request batch, route, or execute a statement.
+authorize, classify a request batch, route, or execute a statement. The
+separate [statement classifier](SQL_STATEMENT_CLASSIFICATION.md) borrows
+`CommonSql` before normalization and owns logical behavior and batch policy.
 
 ## Explicit modes
 
@@ -183,12 +185,12 @@ to send caller-provided SQLite SQL directly to their existing engine paths.
 
 The implemented protocol-neutral [prepared lifecycle](SQL_PREPARED_STATEMENTS.md)
 owns prepare/bind/describe/execute state and adopts `sqlite_sql()` only after
-requiring exactly one top-level statement. It transiently compiles metadata,
-caches BriskDB-owned SQL rather than a SQLite handle, and creates a fresh
-current plan from each portal's bind snapshot at execution. Issue #27 still
-owns authoritative statement behavior and general empty, single-, or
-multi-statement request policy. Schema execution must still use the journaled
-migration path.
+requiring and classifying exactly one top-level statement. It transiently
+compiles metadata, caches BriskDB-owned SQL and behavior rather than a SQLite
+handle, and creates a fresh current plan from each portal's bind snapshot at
+execution. The general planner applies the classifier's batch gate before
+planning; translation remains an independently callable syntax branch. Schema
+execution must still use the journaled migration path.
 
 ## Verification obligations
 

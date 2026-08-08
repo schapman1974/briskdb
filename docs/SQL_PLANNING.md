@@ -1,6 +1,6 @@
 # Bound statement planning and routing policy
 
-Status: implemented for roadmap issues #23 and #24
+Status: implemented for roadmap issues #23, #24, and #27 integration
 
 BriskDB exposes one synchronous, protocol-neutral engine call that plans a
 normalized statement from the values actually bound for that execution:
@@ -27,7 +27,8 @@ a new portal and again for every execution.
 The call performs protocol-neutral analysis only. It infers typed shard-key
 values, converts them to canonical routing bytes, looks up physical shards,
 compares optional explicit routing context, applies the first single-shard DML
-rules, and records an assigned shard when one is valid. It does not prepare,
+rules, and records an assigned shard when one is valid. Before selecting a
+statement, it applies the shared complete-batch classifier. It does not prepare,
 translate, authorize, or execute SQL.
 
 ## Result contract
@@ -36,6 +37,8 @@ translate, authorize, or execute SQL.
 
 - `database()`: the logical database used for catalog resolution;
 - `statement_index()`: the selected statement in the normalized batch;
+- `behavior()`: the selected statement's authoritative logical
+  `StatementBehavior`;
 - `inference()`: the complete owned `ShardKeyInference` result;
 - `inferred_routes()`: one `PlannedRoute` for every entry returned by
   `inference().values()`, in the same order;
@@ -60,7 +63,7 @@ The [prepared execution lifecycle](SQL_PREPARED_STATEMENTS.md) consumes this
 result only after values are bound. Bind validates then discards one plan;
 execution creates another under its current schema guard. Execution uses an
 assigned shard for cataloged sharded work and may select deterministic shard 0
-for a safe column-producing `NotApplicable` or `Global` read. It still rejects
+for a classified safe `NotApplicable` or `Global` read. It still rejects
 catalog placement and sharded reads that need scatter. That target-selection
 integration does not change this planner's meaning of `assigned_shard()`.
 
@@ -90,10 +93,10 @@ This preserves their provenance for later session and execution work.
 
 ## Read assignment
 
-This issue deliberately does not publish a full statement-behavior classifier;
-issue #27 owns that API. At this boundary, the retained normalized AST is
-inspected only far enough to identify `INSERT`, `UPDATE`, and `DELETE`. Other
-sharded statements follow the read/deferred-assignment rules:
+The implemented [statement classifier](SQL_STATEMENT_CLASSIFICATION.md)
+publishes the precise read/write/schema/session behavior. Planning applies its
+full batch rule before selecting an index and retains the selected behavior.
+Only statements classified as `Read` follow these deferred-assignment rules:
 
 | Inference result | No explicit route | Compatible explicit route |
 | --- | --- | --- |
@@ -134,8 +137,9 @@ Row movement between shards is not implemented.
 `NotApplicable` and `NotSharded` statements do not become successful sharded
 writes. Global and Catalog placement, plus schema/session statements, retain
 `assigned_shard() == None` at this planning layer. Downstream execution policy
-decides whether a specific unassigned statement can run; the prepared lifecycle
-currently reads Global data on shard 0 and rejects Catalog placement.
+decides whether a specific unassigned singleton can run; the prepared lifecycle
+currently reads Global data on shard 0, rejects Catalog placement, and does not
+execute schema/session behavior.
 
 ## Canonical routing-key bytes
 
@@ -202,11 +206,15 @@ the catalog.
 ## Errors and recovery
 
 The caller reaches this API only after parsing, subset validation, and
-normalization succeed. Planning preserves shard-key inference errors and can
-also return:
+normalization succeed. Planning first classifies the complete retained batch,
+then preserves shard-key inference errors for the selected member and can also
+return:
 
 | Condition | `EngineErrorKind` |
 | --- | --- |
+| Empty normalized batch | `InvalidArgument` |
+| Multi-statement batch containing any non-read behavior | `Unsupported` |
+| Selected statement index is outside an otherwise accepted batch | `InvalidArgument` |
 | Explicit physical shard conflicts with any finite inferred route | `InvalidArgument` |
 | `UPDATE` or `DELETE` has no finite route and no explicit fallback | `InvalidArgument` |
 | A sharded `UPDATE` assigns the cataloged shard-key column | `InvalidQuery` |
@@ -218,12 +226,14 @@ Schema-gate errors retain their existing `Busy`, `FailedPrecondition`, and
 `DataCorruption` classifications. No new error kind or protocol mapping is
 introduced.
 
-Error precedence is deterministic: schema admission and inference happen
-first; an attempted shard-key update is rejected next; finite explicit-route
-conflicts are checked next; remaining write routability is checked last. Thus
-a shard-key update wins over a conflicting explicit key, while a multi-target
-write with an explicit route that disagrees with part of its finite inference
-is `InvalidArgument`.
+Error precedence is deterministic: public engine schema admission happens
+first; complete batch policy is next; the selected index is checked next;
+inference follows; an attempted shard-key update is rejected next; finite
+explicit-route conflicts are checked next; remaining write routability is
+checked last. Thus a blocked mutating batch wins over member-specific parameter
+or route errors. Within an accepted singleton, a shard-key update wins over a
+conflicting explicit key, while a multi-target write with an explicit route
+that disagrees with part of its finite inference is `InvalidArgument`.
 
 Policy diagnostics use fixed categories. They contain no submitted SQL,
 identifier spelling, literal, parameter value, routing-key bytes, or formatted
@@ -250,18 +260,17 @@ path. In particular:
   session cache or `PreparedStatementLimits` to consult;
 - planning does not invoke the separate PostgreSQL/MySQL-to-SQLite translation
   layer;
-- no complete read/write/schema/session or batch classifier is published; and
 - the current HTTP execute, query, and migration paths do not invoke parsing,
-  validation, normalization, inference, or planning.
+  validation, classification, normalization, inference, or planning.
 
 The implemented issue #25 translation API can independently consume the same
 normalized statement, but it neither changes nor executes a bound plan. The
 implemented issue #26 protocol-neutral prepare/bind/describe/execute lifecycle
 integrates translation and planning, validates transiently at bind, and plans
-again from the bounded session portal's snapshot at every execution. Issue #27
-owns the authoritative statement-behavior and empty, single-, and
-multi-statement request policy. Later query-planner work owns scatter/gather
-execution.
+again from the bounded session portal's snapshot at every execution. The
+implemented classifier supplies authoritative statement behavior and the
+empty/single/multi-statement gate. Direct inference remains statement-local;
+later query-planner work owns scatter/gather execution.
 
 ## Verification obligations
 
@@ -273,6 +282,7 @@ contradictory `UPDATE`/`DELETE`; immutable shard-key assignments under all
 source dialects and statement indexes; read deferral; error precedence and
 redaction; policy-error retries; deterministic valid and rejected concurrent
 calls; schema-gate precedence and recovery; owned
-public results; provenance; and equivalent SQLite, PostgreSQL, and MySQL typed
-requests. Raw HTTP regressions prove that opt-in planning still does not change
-existing execution behavior.
+public results; selected behavior; empty, all-read, and rejected mutating batch
+policy; provenance; and equivalent SQLite, PostgreSQL, and MySQL typed requests.
+Raw HTTP regressions prove that opt-in planning still does not change existing
+execution behavior.

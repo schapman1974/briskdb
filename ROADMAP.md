@@ -215,7 +215,7 @@ interrupted schema migration can be diagnosed and resumed.
   preserve a strict mode that exposes SQLite SQL directly.
 - [x] Implement protocol-neutral prepare/bind/describe/execute lifecycle and a
   bounded per-session prepared-statement cache.
-- [ ] Classify statements by read/write/schema/session behavior and block unsafe
+- [x] Classify statements by read/write/schema/session behavior and block unsafe
   multi-statement combinations.
 
 Exit criterion: the same typed request produces the same plan and result through

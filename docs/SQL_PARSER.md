@@ -75,24 +75,26 @@ In particular, this layer does not:
   `translate_sql(NormalizedSql, SqlTranslationMode)` layer;
 - implement prepare/bind/describe/execute state or caches (issue #26 provides
   those as a separate core layer); or
-- classify statement behavior or reject unsafe multi-statement combinations
-  (issue #27).
+- classify statement behavior or apply request-level batch policy; issue #27
+  implements that as the separate
+  `classify_statements(&CommonSql)` layer.
 
 The parser may return several statements in source order. The 256-statement
 limit below is a resource bound, not permission to execute a batch. Whether a
-particular surface accepts one statement or a safe combination remains issue
-#27. The implemented subset validator checks each ordered statement
-independently and returns `Unsupported` for a parsed form outside its contract;
-that still does not grant permission to execute an empty or mixed batch.
+particular surface accepts one statement or a combination is decided by the
+[statement classifier](SQL_STATEMENT_CLASSIFICATION.md): empty input is
+`InvalidArgument`, and a batch of two or more is accepted only when every
+statement is a read. The subset validator first checks each ordered statement
+independently and returns `Unsupported` for a parsed form outside its contract.
 
 The existing HTTP execute, query, and migration paths remain raw SQLite
 pass-through surfaces with their existing authorizer and endpoint-specific
 rules. They call neither this parser, the opt-in common-subset validator,
-placeholder normalizer, translator, shard-key inference, nor bound statement
-planner. The separate Rust
+statement classifier, placeholder normalizer, translator, shard-key inference,
+nor bound statement planner. The separate Rust
 [prepared lifecycle](SQL_PREPARED_STATEMENTS.md) now connects those layers for
 an exact-one-statement handle without changing the experimental HTTP SQL
-surface. Request-level statement and batch policy remains issue #27.
+surface.
 
 ## Resource and error boundaries
 
@@ -106,13 +108,14 @@ work:
 | Parser recursion depth | 32 | `LimitExceeded` |
 
 Empty, whitespace-only, and comment-only input successfully produces an empty
-AST; whether a later request surface permits that is classification policy for
-issue #27. NUL input, malformed tokens, incomplete syntax, and other parse
-failures are `InvalidQuery`. A syntactically valid statement that is outside
-BriskDB's common subset is not a parse failure; `validate_common_subset`
-classifies it as `Unsupported`. Public protocol errors continue to use the fixed
-safe text for the error kind and must not serialize SQL text, parser diagnostics,
-source locations, or internal error chains.
+AST. The general classifier later returns `InvalidArgument` for that empty AST;
+prepared statements apply their own exact-one check, while raw HTTP surfaces
+retain endpoint-specific rules. NUL input, malformed tokens, incomplete syntax,
+and other parse failures are `InvalidQuery`. A syntactically valid statement
+that is outside BriskDB's common subset is not a parse failure;
+`validate_common_subset` classifies it as `Unsupported`. Public protocol errors
+continue to use the fixed safe text for the error kind and must not serialize
+SQL text, parser diagnostics, source locations, or internal error chains.
 
 The parser is stateless and has no catalog, storage, session, parameters,
 filesystem, or routing access. Routing will consume structural AST information

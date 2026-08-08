@@ -83,7 +83,7 @@ impl fmt::Debug for CommonSql {
 ///
 /// The batch is validated atomically and retains its exact source and order.
 /// Empty batches and otherwise-valid statement combinations are accepted here;
-/// a later classification layer owns request-level batch policy.
+/// [`super::classify_statements`] separately owns request-level batch policy.
 pub fn validate_common_subset(parsed: ParsedSql) -> EngineResult<CommonSql> {
     let mut statement_placeholders = Vec::with_capacity(parsed.statement_count());
     for (index, statement) in parsed.statements().iter().enumerate() {

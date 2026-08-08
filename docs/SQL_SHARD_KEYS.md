@@ -25,6 +25,9 @@ indices; values are never interpolated into SQL text.
 This API performs catalog-aware analysis only. It does not encode or hash a
 key, select a virtual bucket or physical shard, build an execution plan,
 authorize a statement, enforce write policy, or execute SQL.
+It is also statement-local: the separate [statement/batch
+classifier](SQL_STATEMENT_CLASSIFICATION.md) owns logical behavior and complete
+request policy.
 
 ## Result contract
 
@@ -171,9 +174,9 @@ translator is a separate opt-in operation over the same normalized SQL; it does
 not change an inference result. The implemented
 [prepared lifecycle](SQL_PREPARED_STATEMENTS.md) validates a transient
 bind-time plan, retains the typed values and routing snapshot, and repeats
-planning under the current execution guard to select a supported target. Later
-work owns authoritative statement classification, scatter/gather, and
-wire-protocol integration.
+planning under the current execution guard to select a supported target. The
+planner applies the implemented batch gate and retains the selected statement's
+behavior; later work still owns scatter/gather and wire-protocol integration.
 
 ## Verification obligations
 
