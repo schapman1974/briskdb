@@ -46,6 +46,8 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
   recreated after initialization
 - Routed execute and query endpoints
 - A crash-resumable, journaled schema-migration endpoint for every shard
+- A checksummed manifest, generation-bound shard-schema fingerprints, and
+  fail-closed `Verifying`/`Ready`/`Migrating`/`Degraded` storage states
 - Full SQLite synchronous durability and a five-second busy timeout
 - Reproducible point-read, point-write, and four-shard write benchmarks
 
@@ -195,8 +197,8 @@ retained permanently for recovery and idempotency, so migration batches must
 not contain passwords, tokens, or other sensitive literals.
 
 The initial shard count is immutable, so resharding will require an explicit
-migration workflow. Opening upgrades exact version-1 through version-5
-manifests to version 6 through ordered, resumable steps.
+migration workflow. Opening upgrades exact version-1 through version-6
+manifests to version 7 through ordered, resumable steps.
 Version 3 introduced the versioned, generation-stamped 4,096-bucket routing
 map. Version 4 adds schema generation 0 and immutable logical metadata with
 default database ID 1 named `default`; identifier encoding version 1 accepts
@@ -220,8 +222,21 @@ application-schema generations from 0 through 2,147,483,647. A fresh migration
 advances exactly one generation. After manifest load or upgrade, startup resumes
 any active schema migration before ordinary physical-layout reconciliation and
 final strict shard validation, then returns an engine. Completed journal rows
-remain as the exact generation history; schema equivalence checks, checksums,
-and explicit degraded states remain issue #18.
+remain as the exact generation history.
+
+Version 7 adds a semantic BLAKE3 manifest root, generation-bound persistent
+schema fingerprints, SQLite integrity checks, and explicit durable database
+states. A v6 migration already in progress is completed under v6 rules before
+the upgrade establishes its first trusted schema consensus. New migrations
+preserve source and target fingerprints so restart recovery accepts only the
+exact journal prefix. Detected corruption makes the shared schema gate fail
+closed to new work with `DataCorruption`. When the trusted manifest is
+writable, BriskDB makes a best-effort transition to terminal `Degraded` so a
+restart also refuses service. Recovery requires stopping BriskDB and restoring
+the complete manifest-and-shard set from one consistent known-good copy rather
+than rewriting checksum values. These unkeyed
+checksums are corruption detectors, not authentication, and they do not cover
+application row values or provide a continuous whole-data scan.
 
 The v3-to-v4 step deliberately leaves the table catalog empty: it neither
 infers nor adopts tables already present in physical shard files. The v4-to-v5
@@ -246,8 +261,8 @@ same canonical data directory share schema coordination. Separate BriskDB
 server processes must not use the same data directory.
 
 Near-term work includes authentication, richer migration administration and
-status APIs in issue #53, schema checksums and degraded-state handling in issue
-#18, scatter/gather reads, observability, and backup tooling.
+status APIs in issue #53, scatter/gather reads, observability, and backup
+tooling.
 
 ## License
 

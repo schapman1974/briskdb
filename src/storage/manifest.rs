@@ -1,6 +1,6 @@
 //! Version detection and transactional upgrades for `manifest.sqlite`.
 
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior, types::ValueRef};
 
 use crate::{
     core::{
@@ -24,7 +24,8 @@ const V3_SCHEMA_VERSION: u32 = 3;
 const V4_SCHEMA_VERSION: u32 = 4;
 const V5_SCHEMA_VERSION: u32 = 5;
 const V6_SCHEMA_VERSION: u32 = 6;
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = V6_SCHEMA_VERSION;
+const V7_SCHEMA_VERSION: u32 = 7;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = V7_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
 
 pub(super) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = 65_536;
@@ -32,6 +33,14 @@ pub(super) const MAX_SCHEMA_GENERATION: u64 = i32::MAX as u64;
 const SCHEMA_MIGRATION_DIGEST_VERSION: u32 = 1;
 const SCHEMA_MIGRATION_APPLYING: i64 = 1;
 const SCHEMA_MIGRATION_COMPLETE: i64 = 2;
+const MANIFEST_DIGEST_VERSION: u32 = 1;
+pub(super) const SCHEMA_DIGEST_VERSION: u32 = 1;
+const MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v1\0";
+
+const DATABASE_STATE_VERIFYING: i64 = 1;
+const DATABASE_STATE_READY: i64 = 2;
+const DATABASE_STATE_MIGRATING: i64 = 3;
+const DATABASE_STATE_DEGRADED: i64 = 4;
 
 const INITIAL_SCHEMA_GENERATION: u64 = 0;
 const SHARDED_PLACEMENT: i64 = 1;
@@ -70,6 +79,10 @@ const V5_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
 const V6_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
         CHECK (requires_manifest_version >= 6)
+) STRICT";
+const V7_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 7)
 ) STRICT";
 const V3_ROUTING_TABLE_SQL: &str = "CREATE TABLE briskdb_routing (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -191,6 +204,44 @@ const V6_SCHEMA_MIGRATIONS_TABLE_SQL: &str = "CREATE TABLE briskdb_schema_migrat
     next_shard INTEGER NOT NULL CHECK (next_shard BETWEEN 0 AND shard_count),
     CHECK (migration_state = 1 OR next_shard = shard_count)
 ) STRICT";
+const V7_INTEGRITY_TABLE_SQL: &str = "CREATE TABLE briskdb_integrity (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    manifest_digest_version INTEGER NOT NULL CHECK (manifest_digest_version > 0),
+    manifest_digest BLOB NOT NULL
+        CHECK (typeof(manifest_digest) = 'blob' AND length(manifest_digest) = 32),
+    schema_digest_version INTEGER NOT NULL CHECK (schema_digest_version > 0),
+    database_state INTEGER NOT NULL CHECK (database_state IN (1, 2, 3, 4)),
+    committed_schema_digest BLOB
+        CHECK (
+            committed_schema_digest IS NULL
+            OR (
+                typeof(committed_schema_digest) = 'blob'
+                AND length(committed_schema_digest) = 32
+            )
+        ),
+    target_schema_digest BLOB
+        CHECK (
+            target_schema_digest IS NULL
+            OR (
+                typeof(target_schema_digest) = 'blob'
+                AND length(target_schema_digest) = 32
+            )
+        ),
+    CHECK (
+        (database_state = 1 AND target_schema_digest IS NULL)
+        OR (
+            database_state = 2
+            AND committed_schema_digest IS NOT NULL
+            AND target_schema_digest IS NULL
+        )
+        OR (
+            database_state = 3
+            AND committed_schema_digest IS NOT NULL
+            AND target_schema_digest IS NOT NULL
+        )
+        OR database_state = 4
+    )
+) STRICT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RoutingConfiguration {
@@ -205,6 +256,61 @@ struct SchemaCatalogConfiguration {
     identifier_encoding_version: u32,
     schema_generation: u64,
     default_database_id: u64,
+}
+
+/// Durable integrity/readiness state stored in the v7 manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DatabaseIntegrityState {
+    Verifying,
+    Ready,
+    Migrating,
+    Degraded,
+}
+
+impl DatabaseIntegrityState {
+    const fn code(self) -> i64 {
+        match self {
+            Self::Verifying => DATABASE_STATE_VERIFYING,
+            Self::Ready => DATABASE_STATE_READY,
+            Self::Migrating => DATABASE_STATE_MIGRATING,
+            Self::Degraded => DATABASE_STATE_DEGRADED,
+        }
+    }
+
+    fn from_code(code: i64) -> EngineResult<Self> {
+        match code {
+            DATABASE_STATE_VERIFYING => Ok(Self::Verifying),
+            DATABASE_STATE_READY => Ok(Self::Ready),
+            DATABASE_STATE_MIGRATING => Ok(Self::Migrating),
+            DATABASE_STATE_DEGRADED => Ok(Self::Degraded),
+            _ => Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "manifest contains an unsupported database integrity state",
+            )),
+        }
+    }
+}
+
+/// Fully validated v7 checksum metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ManifestIntegrity {
+    state: DatabaseIntegrityState,
+    committed_schema_digest: Option<[u8; 32]>,
+    target_schema_digest: Option<[u8; 32]>,
+}
+
+impl ManifestIntegrity {
+    pub(super) const fn state(self) -> DatabaseIntegrityState {
+        self.state
+    }
+
+    pub(super) const fn committed_schema_digest(self) -> Option<[u8; 32]> {
+        self.committed_schema_digest
+    }
+
+    pub(super) const fn target_schema_digest(self) -> Option<[u8; 32]> {
+        self.target_schema_digest
+    }
 }
 
 /// One fully validated application-schema migration journal row.
@@ -296,6 +402,7 @@ struct ManifestSnapshot {
     logical_catalog: Option<Catalog>,
     shard_layout: Option<ShardLayout>,
     active_migration: Option<SchemaMigration>,
+    integrity: Option<ManifestIntegrity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,6 +410,20 @@ pub(super) struct LoadedManifest {
     catalog: CatalogSnapshot,
     shard_layout: ShardLayout,
     active_migration: Option<SchemaMigration>,
+    integrity: ManifestIntegrity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct V6ActiveMigration {
+    catalog: CatalogSnapshot,
+    shard_layout: ShardLayout,
+    migration: SchemaMigration,
+}
+
+impl V6ActiveMigration {
+    pub(super) fn into_parts(self) -> (CatalogSnapshot, ShardLayout, SchemaMigration) {
+        (self.catalog, self.shard_layout, self.migration)
+    }
 }
 
 impl LoadedManifest {
@@ -318,8 +439,18 @@ impl LoadedManifest {
 
     pub(super) fn into_parts_with_migration(
         self,
-    ) -> (CatalogSnapshot, ShardLayout, Option<SchemaMigration>) {
-        (self.catalog, self.shard_layout, self.active_migration)
+    ) -> (
+        CatalogSnapshot,
+        ShardLayout,
+        Option<SchemaMigration>,
+        ManifestIntegrity,
+    ) {
+        (
+            self.catalog,
+            self.shard_layout,
+            self.active_migration,
+            self.integrity,
+        )
     }
 }
 
@@ -359,6 +490,13 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v5_to_v6,
         validate: validate_v6,
     },
+    Migration {
+        from: V6_SCHEMA_VERSION,
+        to: V7_SCHEMA_VERSION,
+        name: "checksummed_integrity_state",
+        apply: migrate_v6_to_v7,
+        validate: validate_v7,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -371,6 +509,15 @@ struct MigrationPlan<'a> {
 
 const CURRENT_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: CURRENT_SCHEMA_VERSION,
+    migrations: MIGRATIONS,
+    initialize_current: create_v7_schema,
+    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v7,
+};
+
+// Startup uses this frozen plan only to finish an already-active v6 journal
+// before the v7 checksum bootstrap. It must never initialize or upgrade data.
+const V6_PLAN: MigrationPlan<'static> = MigrationPlan {
+    current_version: V6_SCHEMA_VERSION,
     migrations: MIGRATIONS,
     initialize_current: create_v6_schema,
     initialize_interrupted_legacy: migrate_interrupted_legacy_to_v6,
@@ -452,11 +599,64 @@ pub(super) fn load_or_create_manifest_with_fresh_layout(
             "current manifest validation did not produce a physical shard layout",
         )
     })?;
+    let integrity = snapshot.integrity.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "current manifest validation did not produce integrity metadata",
+        )
+    })?;
     Ok(LoadedManifest {
         catalog: CatalogSnapshot::from_validated_parts(routing, logical),
         shard_layout,
         active_migration: snapshot.active_migration,
+        integrity,
     })
+}
+
+/// Return an active v6 journal without upgrading it. Startup completes this
+/// recovery under the v6 rules before establishing v7 checksum authority.
+pub(super) fn load_v6_active_migration(
+    connection: &Connection,
+    requested_shards: u16,
+) -> EngineResult<Option<V6ActiveMigration>> {
+    let (application_id, version) = read_identity(connection)?;
+    if application_id != MANIFEST_APPLICATION_ID || version != i64::from(V6_SCHEMA_VERSION) {
+        return Ok(None);
+    }
+    let ManifestState::Versioned { version, snapshot } =
+        inspect_with_plan(connection, requested_shards, V6_PLAN)?
+    else {
+        return Ok(None);
+    };
+    if version != V6_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    let Some(migration) = snapshot.active_migration else {
+        return Ok(None);
+    };
+    let routing = snapshot.routing_catalog.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "v6 recovery validation omitted its routing catalog",
+        )
+    })?;
+    let logical = snapshot.logical_catalog.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "v6 recovery validation omitted its logical catalog",
+        )
+    })?;
+    let shard_layout = snapshot.shard_layout.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "v6 recovery validation omitted its physical shard layout",
+        )
+    })?;
+    Ok(Some(V6ActiveMigration {
+        catalog: CatalogSnapshot::from_validated_parts(routing, logical),
+        shard_layout,
+        migration,
+    }))
 }
 
 #[cfg(test)]
@@ -546,6 +746,157 @@ pub(super) fn ensure_schema_migration_layout(
     Ok(())
 }
 
+pub(super) fn current_integrity(
+    connection: &Connection,
+    requested_shards: u16,
+) -> EngineResult<ManifestIntegrity> {
+    current_manifest_snapshot(connection, requested_shards)?
+        .integrity
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "database manifest predates integrity metadata",
+            )
+        })
+}
+
+pub(super) fn current_integrity_optional(
+    connection: &Connection,
+    requested_shards: u16,
+) -> EngineResult<Option<ManifestIntegrity>> {
+    Ok(current_manifest_snapshot(connection, requested_shards)?.integrity)
+}
+
+/// Seal a freshly verified v7 schema baseline or validate an already-ready
+/// database. Terminal `Degraded` state is never cleared here.
+pub(super) fn seal_verified_schema(
+    connection: &mut Connection,
+    requested_shards: u16,
+    observed_digest: [u8; 32],
+) -> EngineResult<ManifestIntegrity> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    if snapshot.active_migration.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "an active schema migration cannot be published as ready",
+        ));
+    }
+    let integrity = snapshot.integrity.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "database manifest predates integrity metadata",
+        )
+    })?;
+    match integrity.state {
+        DatabaseIntegrityState::Verifying => {
+            if integrity
+                .committed_schema_digest
+                .is_some_and(|expected| expected != observed_digest)
+            {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    "verified application schema does not match the trusted checksum",
+                ));
+            }
+            transaction
+                .execute(
+                    "UPDATE briskdb_integrity
+                     SET database_state = ?1, committed_schema_digest = ?2
+                     WHERE singleton = 1 AND database_state = ?3",
+                    rusqlite::params![
+                        DATABASE_STATE_READY,
+                        observed_digest.as_slice(),
+                        DATABASE_STATE_VERIFYING,
+                    ],
+                )
+                .map_err(sqlite_error::storage)?;
+            refresh_manifest_digest(&transaction)?;
+        }
+        DatabaseIntegrityState::Ready => {
+            if integrity.committed_schema_digest != Some(observed_digest) {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    "application schema checksum does not match the manifest",
+                ));
+            }
+        }
+        DatabaseIntegrityState::Degraded => {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "degraded database requires a complete known-good restore",
+            ));
+        }
+        DatabaseIntegrityState::Migrating => {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "an active schema migration cannot be published as ready",
+            ));
+        }
+    }
+    let sealed = current_integrity(&transaction, requested_shards)?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(sealed)
+}
+
+/// Persist the fail-closed state only after the current semantic root and the
+/// caller's exact shard layout have been validated. A corrupt or replaced
+/// manifest therefore never signs its own altered data.
+pub(super) fn mark_degraded(
+    connection: &mut Connection,
+    requested_shards: u16,
+    expected_layout: &ShardLayout,
+) -> EngineResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    let observed_layout = snapshot.shard_layout.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "manifest degradation requires a validated shard-layout identity",
+        )
+    })?;
+    if observed_layout != *expected_layout {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "manifest shard-layout identity changed before degradation could be recorded",
+        ));
+    }
+    let integrity = snapshot.integrity.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "database manifest predates integrity metadata",
+        )
+    })?;
+    if integrity.state != DatabaseIntegrityState::Degraded {
+        let changed = transaction
+            .execute(
+                "UPDATE briskdb_integrity SET database_state = ?1
+                 WHERE singleton = 1 AND database_state = ?2",
+                rusqlite::params![DATABASE_STATE_DEGRADED, integrity.state.code()],
+            )
+            .map_err(sqlite_error::storage)?;
+        if changed != 1 {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "database integrity state changed before degradation was recorded",
+            ));
+        }
+        refresh_manifest_digest(&transaction)?;
+        let persisted = current_integrity(&transaction, requested_shards)?;
+        if persisted.state != DatabaseIntegrityState::Degraded {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "database degradation state did not persist",
+            ));
+        }
+    }
+    transaction.commit().map_err(sqlite_error::storage)
+}
+
 /// Atomically append a new active journal row after the caller has preflighted
 /// every shard at `expected_source_generation`.
 ///
@@ -571,11 +922,45 @@ pub(super) fn begin_schema_migration(
     Ok(migration)
 }
 
+#[cfg(test)]
 pub(super) fn begin_schema_migration_in_transaction(
     transaction: &Connection,
     requested_shards: u16,
     expected_source_generation: u64,
     sql: &str,
+) -> EngineResult<SchemaMigration> {
+    begin_schema_migration_with_digests_inner(
+        transaction,
+        requested_shards,
+        expected_source_generation,
+        sql,
+        None,
+    )
+}
+
+pub(super) fn begin_schema_migration_with_digests_in_transaction(
+    transaction: &Connection,
+    requested_shards: u16,
+    expected_source_generation: u64,
+    sql: &str,
+    expected_source_digest: [u8; 32],
+    target_digest: [u8; 32],
+) -> EngineResult<SchemaMigration> {
+    begin_schema_migration_with_digests_inner(
+        transaction,
+        requested_shards,
+        expected_source_generation,
+        sql,
+        Some((expected_source_digest, target_digest)),
+    )
+}
+
+fn begin_schema_migration_with_digests_inner(
+    transaction: &Connection,
+    requested_shards: u16,
+    expected_source_generation: u64,
+    sql: &str,
+    schema_digests: Option<([u8; 32], [u8; 32])>,
 ) -> EngineResult<SchemaMigration> {
     let migration_id = schema_migration_id(sql)?;
     let snapshot = current_manifest_snapshot(transaction, requested_shards)?;
@@ -647,6 +1032,30 @@ pub(super) fn begin_schema_migration_in_transaction(
             "schema migration generation is exhausted",
         ));
     }
+    let target_schema_digest = if let Some(integrity) = snapshot.integrity {
+        if integrity.state != DatabaseIntegrityState::Ready {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "schema migration requires a checksum-verified ready database",
+            ));
+        }
+        let committed = integrity.committed_schema_digest.ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "ready manifest is missing its committed application-schema checksum",
+            )
+        })?;
+        let (expected, target) = schema_digests.unwrap_or((committed, committed));
+        if expected != committed {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "schema migration source checksum does not match the manifest",
+            ));
+        }
+        Some(target)
+    } else {
+        None
+    };
     transaction
         .execute(
             "INSERT INTO briskdb_schema_migrations (
@@ -670,6 +1079,27 @@ pub(super) fn begin_schema_migration_in_transaction(
             ],
         )
         .map_err(sqlite_error::storage)?;
+    if let Some(target_schema_digest) = target_schema_digest {
+        let changed = transaction
+            .execute(
+                "UPDATE briskdb_integrity
+                 SET database_state = ?1, target_schema_digest = ?2
+                 WHERE singleton = 1 AND database_state = ?3",
+                rusqlite::params![
+                    DATABASE_STATE_MIGRATING,
+                    target_schema_digest.as_slice(),
+                    DATABASE_STATE_READY,
+                ],
+            )
+            .map_err(sqlite_error::storage)?;
+        if changed != 1 {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "database integrity state changed before migration publication",
+            ));
+        }
+        refresh_manifest_digest(transaction)?;
+    }
     let validated = current_manifest_snapshot(transaction, requested_shards)?
         .active_migration
         .ok_or_else(|| {
@@ -760,6 +1190,7 @@ pub(super) fn advance_schema_migration_in_transaction(
             ],
         )
         .map_err(sqlite_error::storage)?;
+    refresh_manifest_digest_if_v7(transaction)?;
     let advanced = current_manifest_snapshot(transaction, requested_shards)?
         .active_migration
         .ok_or_else(|| {
@@ -845,6 +1276,27 @@ pub(super) fn finalize_schema_migration_in_transaction(
             ],
         )
         .map_err(sqlite_error::storage)?;
+    if snapshot.integrity.is_some() {
+        let changed = transaction
+            .execute(
+                "UPDATE briskdb_integrity
+                 SET committed_schema_digest = target_schema_digest,
+                     target_schema_digest = NULL,
+                     database_state = ?1
+                 WHERE singleton = 1
+                   AND database_state = ?2
+                   AND target_schema_digest IS NOT NULL",
+                rusqlite::params![DATABASE_STATE_READY, DATABASE_STATE_MIGRATING],
+            )
+            .map_err(sqlite_error::storage)?;
+        if changed != 1 {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "schema migration finalization found inconsistent integrity metadata",
+            ));
+        }
+        refresh_manifest_digest(transaction)?;
+    }
     let finalized_snapshot = current_manifest_snapshot(transaction, requested_shards)?;
     if finalized_snapshot.active_migration.is_some()
         || finalized_snapshot
@@ -883,7 +1335,9 @@ fn current_manifest_snapshot(
     requested_shards: u16,
 ) -> EngineResult<ManifestSnapshot> {
     match inspect_with_plan(connection, requested_shards, CURRENT_PLAN)? {
-        ManifestState::Versioned { version, snapshot } if version == CURRENT_SCHEMA_VERSION => {
+        ManifestState::Versioned { version, snapshot }
+            if version == CURRENT_SCHEMA_VERSION || version == V6_SCHEMA_VERSION =>
+        {
             Ok(*snapshot)
         }
         _ => Err(EngineError::new(
@@ -1028,6 +1482,7 @@ where
                 ],
             )
             .map_err(sqlite_error::storage)?;
+        refresh_manifest_digest_if_v7(&transaction)?;
 
         let ready = match inspect_with_plan(&transaction, requested_shards, CURRENT_PLAN)? {
             ManifestState::Versioned { version, snapshot } if version == CURRENT_SCHEMA_VERSION => {
@@ -1215,6 +1670,9 @@ where
     })?;
 
     set_identity(&transaction, change.to)?;
+    if change.to == V7_SCHEMA_VERSION {
+        refresh_manifest_digest(&transaction)?;
+    }
     hook(MigrationPoint {
         from: change.from,
         to: change.to,
@@ -1289,6 +1747,11 @@ fn create_v6_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineRe
     migrate_v5_to_v6(transaction, shard_count)
 }
 
+fn create_v7_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
+    create_v6_schema(transaction, shard_count)?;
+    migrate_v6_to_v7(transaction, shard_count)
+}
+
 fn migrate_interrupted_legacy_to_v6(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -1297,6 +1760,16 @@ fn migrate_interrupted_legacy_to_v6(
         .execute_batch("DROP TABLE briskdb_metadata;")
         .map_err(sqlite_error::storage)?;
     create_v6_schema(transaction, shard_count)
+}
+
+fn migrate_interrupted_legacy_to_v7(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v7_schema(transaction, shard_count)
 }
 
 #[cfg(test)]
@@ -1518,6 +1991,43 @@ fn migrate_v5_to_v6(transaction: &Transaction<'_>, _shard_count: u16) -> EngineR
         .map_err(sqlite_error::storage)?;
     transaction
         .execute_batch(V6_SCHEMA_MIGRATIONS_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
+fn migrate_v6_to_v7(transaction: &Transaction<'_>, _shard_count: u16) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V7_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V7_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V7_INTEGRITY_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_integrity (
+                singleton,
+                manifest_digest_version,
+                manifest_digest,
+                schema_digest_version,
+                database_state,
+                committed_schema_digest,
+                target_schema_digest
+             ) VALUES (1, ?1, zeroblob(32), ?2, ?3, NULL, NULL)",
+            rusqlite::params![
+                MANIFEST_DIGEST_VERSION,
+                SCHEMA_DIGEST_VERSION,
+                DATABASE_STATE_VERIFYING,
+            ],
+        )
         .map_err(sqlite_error::storage)?;
     Ok(())
 }
@@ -1799,6 +2309,18 @@ fn v6_objects() -> Vec<SchemaObject> {
     objects
 }
 
+fn v7_objects() -> Vec<SchemaObject> {
+    let mut objects = v6_objects();
+    objects.push(SchemaObject {
+        object_type: "table".to_owned(),
+        name: "briskdb_integrity".to_owned(),
+    });
+    objects.sort_by(|left, right| {
+        (&left.object_type, &left.name).cmp(&(&right.object_type, &right.name))
+    });
+    objects
+}
+
 fn schema_objects(connection: &Connection) -> EngineResult<Vec<SchemaObject>> {
     let mut statement = connection
         .prepare(
@@ -1903,6 +2425,10 @@ fn validate_table(
         "briskdb_schema_migrations" => {
             "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
              FROM pragma_table_xinfo('briskdb_schema_migrations') LIMIT ?1"
+        }
+        "briskdb_integrity" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_integrity') LIMIT ?1"
         }
         _ => {
             return Err(EngineError::new(
@@ -2092,6 +2618,7 @@ fn validate_v2(
         logical_catalog: None,
         shard_layout: None,
         active_migration: None,
+        integrity: None,
     })
 }
 
@@ -2120,6 +2647,7 @@ fn validate_v3(
         logical_catalog: None,
         shard_layout: None,
         active_migration: None,
+        integrity: None,
     })
 }
 
@@ -2359,6 +2887,453 @@ fn validate_v6(
     Ok(snapshot)
 }
 
+fn validate_v7(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    let mut snapshot = validate_catalog_manifest(
+        connection,
+        requested_shards,
+        objects,
+        CatalogManifestDefinition {
+            version: V7_SCHEMA_VERSION,
+            downgrade_fence_sql: V7_DOWNGRADE_FENCE_SQL,
+            expected_objects: &v7_objects(),
+            schema_catalog_sql: V6_SCHEMA_CATALOG_TABLE_SQL,
+            generation_policy: SchemaGenerationPolicy::Journaled,
+        },
+    )?;
+    validate_table(
+        connection,
+        "briskdb_shard_layout",
+        &[
+            TableColumn::expected(0, "singleton", "INTEGER", false, 1),
+            TableColumn::expected(1, "layout_id", "BLOB", true, 0),
+            TableColumn::expected(2, "shard_application_id", "INTEGER", true, 0),
+            TableColumn::expected(3, "shard_metadata_version", "INTEGER", true, 0),
+            TableColumn::expected(4, "layout_state", "INTEGER", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_shard_layout",
+        V5_SHARD_LAYOUT_TABLE_SQL,
+    )?;
+    let layout = validate_shard_layout(connection)?;
+
+    validate_table(
+        connection,
+        "briskdb_schema_migrations",
+        &[
+            TableColumn::expected(0, "target_generation", "INTEGER", false, 1),
+            TableColumn::expected(1, "source_generation", "INTEGER", true, 0),
+            TableColumn::expected(2, "migration_id", "BLOB", true, 0),
+            TableColumn::expected(3, "digest_version", "INTEGER", true, 0),
+            TableColumn::expected(4, "sql_text", "TEXT", true, 0),
+            TableColumn::expected(5, "shard_count", "INTEGER", true, 0),
+            TableColumn::expected(6, "migration_state", "INTEGER", true, 0),
+            TableColumn::expected(7, "next_shard", "INTEGER", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_schema_migrations",
+        V6_SCHEMA_MIGRATIONS_TABLE_SQL,
+    )?;
+    validate_table(
+        connection,
+        "briskdb_integrity",
+        &[
+            TableColumn::expected(0, "singleton", "INTEGER", false, 1),
+            TableColumn::expected(1, "manifest_digest_version", "INTEGER", true, 0),
+            TableColumn::expected(2, "manifest_digest", "BLOB", true, 0),
+            TableColumn::expected(3, "schema_digest_version", "INTEGER", true, 0),
+            TableColumn::expected(4, "database_state", "INTEGER", true, 0),
+            TableColumn::expected(5, "committed_schema_digest", "BLOB", false, 0),
+            TableColumn::expected(6, "target_schema_digest", "BLOB", false, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(connection, "briskdb_integrity", V7_INTEGRITY_TABLE_SQL)?;
+
+    let catalog_generation = snapshot
+        .logical_catalog
+        .as_ref()
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "current manifest validation omitted its logical catalog",
+            )
+        })?
+        .schema_generation();
+    let active =
+        validate_schema_migration_history(connection, snapshot.shard_count, catalog_generation)?;
+    let integrity = validate_manifest_integrity(connection, &layout, active.as_ref())?;
+    snapshot.shard_layout = Some(layout);
+    snapshot.active_migration = active;
+    snapshot.integrity = Some(integrity);
+    Ok(snapshot)
+}
+
+struct ManifestDigestQuery {
+    table: &'static str,
+    columns: &'static [&'static str],
+    sql: &'static str,
+}
+
+const MANIFEST_DIGEST_QUERIES: &[ManifestDigestQuery] = &[
+    ManifestDigestQuery {
+        table: "briskdb_manifest",
+        columns: &["singleton", "shard_count"],
+        sql: "SELECT singleton, shard_count FROM briskdb_manifest ORDER BY singleton",
+    },
+    ManifestDigestQuery {
+        table: "briskdb_metadata",
+        columns: &["requires_manifest_version"],
+        sql: "SELECT requires_manifest_version FROM briskdb_metadata ORDER BY rowid",
+    },
+    ManifestDigestQuery {
+        table: "briskdb_routing",
+        columns: &[
+            "singleton",
+            "hash_version",
+            "key_encoding_version",
+            "bucket_algorithm_version",
+            "virtual_bucket_count",
+            "map_generation",
+        ],
+        sql: "SELECT singleton, hash_version, key_encoding_version, bucket_algorithm_version, virtual_bucket_count, map_generation FROM briskdb_routing ORDER BY singleton",
+    },
+    ManifestDigestQuery {
+        table: "briskdb_physical_shards",
+        columns: &["shard_id", "lifecycle_state"],
+        sql: "SELECT shard_id, lifecycle_state FROM briskdb_physical_shards ORDER BY shard_id",
+    },
+    ManifestDigestQuery {
+        table: "briskdb_virtual_buckets",
+        columns: &["bucket_id", "physical_shard_id"],
+        sql: "SELECT bucket_id, physical_shard_id FROM briskdb_virtual_buckets ORDER BY bucket_id",
+    },
+    ManifestDigestQuery {
+        table: "briskdb_logical_databases",
+        columns: &["database_id", "database_name"],
+        sql: "SELECT database_id, database_name FROM briskdb_logical_databases ORDER BY database_id",
+    },
+    ManifestDigestQuery {
+        table: "briskdb_schema_catalog",
+        columns: &[
+            "singleton",
+            "identifier_encoding_version",
+            "schema_generation",
+            "default_database_id",
+        ],
+        sql: "SELECT singleton, identifier_encoding_version, schema_generation, default_database_id FROM briskdb_schema_catalog ORDER BY singleton",
+    },
+    ManifestDigestQuery {
+        table: "briskdb_tables",
+        columns: &[
+            "table_id",
+            "database_id",
+            "table_name",
+            "placement",
+            "shard_key_column",
+            "shard_key_type",
+        ],
+        sql: "SELECT table_id, database_id, table_name, placement, shard_key_column, shard_key_type FROM briskdb_tables ORDER BY table_id",
+    },
+    ManifestDigestQuery {
+        table: "briskdb_shard_layout",
+        columns: &[
+            "singleton",
+            "layout_id",
+            "shard_application_id",
+            "shard_metadata_version",
+            "layout_state",
+        ],
+        sql: "SELECT singleton, layout_id, shard_application_id, shard_metadata_version, layout_state FROM briskdb_shard_layout ORDER BY singleton",
+    },
+    ManifestDigestQuery {
+        table: "briskdb_schema_migrations",
+        columns: &[
+            "target_generation",
+            "source_generation",
+            "migration_id",
+            "digest_version",
+            "sql_text",
+            "shard_count",
+            "migration_state",
+            "next_shard",
+        ],
+        sql: "SELECT target_generation, source_generation, migration_id, digest_version, sql_text, shard_count, migration_state, next_shard FROM briskdb_schema_migrations ORDER BY target_generation",
+    },
+    ManifestDigestQuery {
+        table: "briskdb_integrity",
+        columns: &[
+            "singleton",
+            "manifest_digest_version",
+            "schema_digest_version",
+            "database_state",
+            "committed_schema_digest",
+            "target_schema_digest",
+        ],
+        sql: "SELECT singleton, manifest_digest_version, schema_digest_version, database_state, committed_schema_digest, target_schema_digest FROM briskdb_integrity ORDER BY singleton",
+    },
+];
+
+fn manifest_semantic_digest(connection: &Connection) -> EngineResult<[u8; 32]> {
+    let (application_id, user_version) = read_identity(connection)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MANIFEST_DIGEST_DOMAIN);
+    hash_manifest_name(&mut hasher, b"application_id");
+    hash_manifest_value(&mut hasher, ValueRef::Integer(application_id))?;
+    hash_manifest_name(&mut hasher, b"user_version");
+    hash_manifest_value(&mut hasher, ValueRef::Integer(user_version))?;
+
+    for query in MANIFEST_DIGEST_QUERIES {
+        hasher.update(&[0x10]);
+        hash_manifest_name(&mut hasher, query.table.as_bytes());
+        hasher.update(
+            &u64::try_from(query.columns.len())
+                .expect("manifest digest column count fits u64")
+                .to_le_bytes(),
+        );
+        for column in query.columns {
+            hash_manifest_name(&mut hasher, column.as_bytes());
+        }
+        let mut statement = connection.prepare(query.sql).map_err(|error| {
+            manifest_read_error(error, "failed to prepare manifest semantic checksum")
+        })?;
+        let column_count = query.columns.len();
+        let mut rows = statement.query([]).map_err(|error| {
+            manifest_read_error(error, "failed to read manifest semantic checksum")
+        })?;
+        while let Some(row) = rows.next().map_err(|error| {
+            manifest_read_error(error, "failed to read manifest semantic checksum")
+        })? {
+            hasher.update(&[0x11]);
+            for index in 0..column_count {
+                let value = row.get_ref(index).map_err(|error| {
+                    manifest_read_error(error, "failed to decode manifest semantic checksum")
+                })?;
+                hash_manifest_value(&mut hasher, value)?;
+            }
+        }
+        hasher.update(&[0x12]);
+    }
+    hasher.update(&[0xff]);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn hash_manifest_name(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(
+        &u64::try_from(value.len())
+            .expect("manifest digest field length fits u64")
+            .to_le_bytes(),
+    );
+    hasher.update(value);
+}
+
+fn hash_manifest_value(hasher: &mut blake3::Hasher, value: ValueRef<'_>) -> EngineResult<()> {
+    match value {
+        ValueRef::Null => {
+            hasher.update(&[0]);
+        }
+        ValueRef::Integer(value) => {
+            hasher.update(&[1]);
+            hasher.update(&value.to_le_bytes());
+        }
+        ValueRef::Text(value) => {
+            hasher.update(&[2]);
+            hash_manifest_name(hasher, value);
+        }
+        ValueRef::Blob(value) => {
+            hasher.update(&[3]);
+            hash_manifest_name(hasher, value);
+        }
+        ValueRef::Real(_) => {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "manifest semantic checksum encountered an unsupported value type",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn refresh_manifest_digest(connection: &Connection) -> EngineResult<[u8; 32]> {
+    let digest = manifest_semantic_digest(connection)?;
+    let changed = connection
+        .execute(
+            "UPDATE briskdb_integrity SET manifest_digest = ?1 WHERE singleton = 1",
+            [digest.as_slice()],
+        )
+        .map_err(sqlite_error::storage)?;
+    if changed != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "manifest integrity metadata is missing its singleton row",
+        ));
+    }
+    Ok(digest)
+}
+
+fn refresh_manifest_digest_if_v7(connection: &Connection) -> EngineResult<()> {
+    let (application_id, version) = read_identity(connection)?;
+    if application_id == MANIFEST_APPLICATION_ID && version == i64::from(V7_SCHEMA_VERSION) {
+        let _ = refresh_manifest_digest(connection)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn reseal_manifest_for_test(connection: &Connection) -> EngineResult<[u8; 32]> {
+    refresh_manifest_digest(connection)
+}
+
+fn validate_manifest_integrity(
+    connection: &Connection,
+    layout: &ShardLayout,
+    active_migration: Option<&SchemaMigration>,
+) -> EngineResult<ManifestIntegrity> {
+    let rows = connection
+        .prepare(
+            "SELECT singleton,
+                    manifest_digest_version,
+                    manifest_digest,
+                    schema_digest_version,
+                    database_state,
+                    committed_schema_digest,
+                    target_schema_digest
+             FROM briskdb_integrity
+             ORDER BY singleton
+             LIMIT 3",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| {
+            manifest_read_error(error, "failed to read manifest integrity metadata")
+        })?;
+    if rows.len() != 1 || rows[0].0 != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "manifest integrity metadata must contain exactly its singleton row",
+        ));
+    }
+    let (_, manifest_version, stored_root, schema_version, state_code, committed, target) =
+        &rows[0];
+    if *manifest_version <= 0 {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "manifest checksum version must be positive",
+        ));
+    }
+    if *manifest_version > i64::from(MANIFEST_DIGEST_VERSION) {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "manifest checksum version is newer than this BriskDB build supports",
+        ));
+    }
+    if *schema_version <= 0 {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "application-schema checksum version must be positive",
+        ));
+    }
+    if *schema_version > i64::from(SCHEMA_DIGEST_VERSION) {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "application-schema checksum version is newer than this BriskDB build supports",
+        ));
+    }
+    let stored_root = digest_from_blob(stored_root, "manifest semantic checksum")?;
+    let committed = committed
+        .as_deref()
+        .map(|digest| digest_from_blob(digest, "committed application-schema checksum"))
+        .transpose()?;
+    let target = target
+        .as_deref()
+        .map(|digest| digest_from_blob(digest, "target application-schema checksum"))
+        .transpose()?;
+    if manifest_semantic_digest(connection)? != stored_root {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "manifest semantic checksum does not match its authoritative contents",
+        ));
+    }
+    let state = DatabaseIntegrityState::from_code(*state_code)?;
+    match state {
+        DatabaseIntegrityState::Verifying => {
+            if active_migration.is_some() || target.is_some() {
+                return Err(invalid_integrity_state());
+            }
+        }
+        DatabaseIntegrityState::Ready => {
+            if layout.state() != ShardLayoutState::Ready
+                || active_migration.is_some()
+                || committed.is_none()
+                || target.is_some()
+            {
+                return Err(invalid_integrity_state());
+            }
+        }
+        DatabaseIntegrityState::Migrating => {
+            if layout.state() != ShardLayoutState::Ready
+                || active_migration.is_none()
+                || committed.is_none()
+                || target.is_none()
+            {
+                return Err(invalid_integrity_state());
+            }
+        }
+        DatabaseIntegrityState::Degraded => {
+            if active_migration.is_some() {
+                if committed.is_none() || target.is_none() {
+                    return Err(invalid_integrity_state());
+                }
+            } else if target.is_some() {
+                return Err(invalid_integrity_state());
+            }
+        }
+    }
+    Ok(ManifestIntegrity {
+        state,
+        committed_schema_digest: committed,
+        target_schema_digest: target,
+    })
+}
+
+fn digest_from_blob(value: &[u8], description: &'static str) -> EngineResult<[u8; 32]> {
+    value.try_into().map_err(|_| {
+        EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("{description} is not exactly 32 bytes"),
+        )
+    })
+}
+
+fn invalid_integrity_state() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::DataCorruption,
+        "manifest integrity state is inconsistent with durable database metadata",
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SchemaGenerationPolicy {
     InitialOnly,
@@ -2460,6 +3435,7 @@ fn validate_catalog_manifest(
         )),
         shard_layout: None,
         active_migration: None,
+        integrity: None,
     })
 }
 
@@ -3479,6 +4455,7 @@ mod tests {
         if creating.state() != ShardLayoutState::Ready {
             mark_shard_layout_ready(connection, shards, &creating).unwrap();
         }
+        seal_verified_schema(connection, shards, [0x5a; 32]).unwrap();
     }
 
     fn complete_manifest_migration(
@@ -3624,6 +4601,17 @@ mod tests {
             .unwrap()
     }
 
+    fn stored_manifest_digest(connection: &Connection) -> [u8; 32] {
+        let digest = connection
+            .query_row(
+                "SELECT manifest_digest FROM briskdb_integrity WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        digest.try_into().unwrap()
+    }
+
     fn insert_valid_table_catalog(connection: &Connection) {
         connection
             .execute_batch(
@@ -3635,6 +4623,7 @@ mod tests {
                  INSERT INTO briskdb_tables VALUES (55, 9, 'counters', 1, 'counter_id', 1);",
             )
             .unwrap();
+        refresh_manifest_digest_if_v7(connection).unwrap();
     }
 
     fn assert_generation_one_catalog(connection: &Connection, shard_count: u16) {
@@ -3642,7 +4631,7 @@ mod tests {
             identity(connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(connection).unwrap(), v6_objects());
+        assert_eq!(schema_objects(connection).unwrap(), v7_objects());
         assert_eq!(
             connection
                 .query_row(
@@ -3651,7 +4640,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V6_SCHEMA_VERSION)
+            i64::from(V7_SCHEMA_VERSION)
         );
         assert_eq!(
             routing_configuration(connection),
@@ -3796,7 +4785,7 @@ mod tests {
             .unwrap(),
             4
         );
-        assert_eq!(resumed_steps, [(2, 3), (3, 4), (4, 5), (5, 6)]);
+        assert_eq!(resumed_steps, [(2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
         assert_generation_one_catalog(&connection, 4);
         assert_eq!(quick_check(&connection), "ok");
     }
@@ -3821,6 +4810,292 @@ mod tests {
             .pragma_query_value(None, "data_version", |row| row.get(0))
             .unwrap();
         assert_eq!(before, after, "a current-version reopen must not write");
+    }
+
+    #[test]
+    fn v7_integrity_root_is_deterministic_across_reopen_checkpoint_and_vacuum() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.sqlite");
+        let mut connection = Connection::open(&path).unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        let expected = stored_manifest_digest(&connection);
+        assert_eq!(manifest_semantic_digest(&connection).unwrap(), expected);
+
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+            .unwrap();
+        assert_eq!(manifest_semantic_digest(&connection).unwrap(), expected);
+        drop(connection);
+
+        let mut reopened = Connection::open(&path).unwrap();
+        let loaded = load_or_create_manifest(&mut reopened, 4).unwrap();
+        assert_eq!(loaded.integrity.state(), DatabaseIntegrityState::Ready);
+        assert_eq!(stored_manifest_digest(&reopened), expected);
+        assert_eq!(manifest_semantic_digest(&reopened).unwrap(), expected);
+    }
+
+    #[test]
+    fn manifest_semantic_digest_v1_has_a_frozen_golden_vector() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        connection
+            .execute(
+                "UPDATE briskdb_shard_layout
+                 SET layout_id = x'000102030405060708090a0b0c0d0e0f'
+                 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        insert_valid_table_catalog(&connection);
+        let digest = refresh_manifest_digest(&connection).unwrap();
+        assert_eq!(
+            digest,
+            [
+                0x57, 0x9d, 0x8a, 0x78, 0x54, 0xa9, 0xa7, 0xaa, 0x3a, 0xdd, 0x69, 0xdb, 0xb8, 0xc4,
+                0x13, 0xb2, 0x85, 0x1d, 0xb7, 0x4e, 0xdc, 0xe1, 0x9a, 0xd6, 0xde, 0xf2, 0x2a, 0xb9,
+                0x4f, 0x02, 0x9e, 0xd1,
+            ]
+        );
+        assert_eq!(manifest_semantic_digest(&connection).unwrap(), digest);
+    }
+
+    #[test]
+    fn manifest_semantic_digest_orders_catalog_rows_by_frozen_keys() {
+        let mut forward = Connection::open_in_memory().unwrap();
+        let mut reverse = Connection::open_in_memory().unwrap();
+        for connection in [&mut forward, &mut reverse] {
+            create_ready_current_manifest(connection, 4);
+            connection
+                .execute(
+                    "UPDATE briskdb_shard_layout
+                     SET layout_id = x'000102030405060708090a0b0c0d0e0f'
+                     WHERE singleton = 1",
+                    [],
+                )
+                .unwrap();
+        }
+        insert_valid_table_catalog(&forward);
+        reverse
+            .execute_batch(
+                "INSERT INTO briskdb_logical_databases VALUES (9, 'tenant');
+                 INSERT INTO briskdb_tables VALUES (55, 9, 'counters', 1, 'counter_id', 1);
+                 INSERT INTO briskdb_tables VALUES (34, 9, 'binary_keys', 1, 'key_bytes', 3);
+                 INSERT INTO briskdb_tables VALUES (21, 9, 'audit_log', 3, NULL, NULL);
+                 INSERT INTO briskdb_tables VALUES (8, 1, 'countries', 2, NULL, NULL);
+                 INSERT INTO briskdb_tables VALUES (3, 1, 'accounts', 1, 'tenant_id', 2);",
+            )
+            .unwrap();
+
+        assert_eq!(
+            refresh_manifest_digest(&forward).unwrap(),
+            refresh_manifest_digest(&reverse).unwrap()
+        );
+    }
+
+    #[test]
+    fn semantic_root_covers_every_authoritative_manifest_table_and_integrity_state() {
+        let mutations = [
+            "UPDATE briskdb_manifest SET singleton = 2 WHERE singleton = 1",
+            "UPDATE briskdb_metadata SET requires_manifest_version = 8",
+            "UPDATE briskdb_routing SET hash_version = 2 WHERE singleton = 1",
+            "UPDATE briskdb_physical_shards SET lifecycle_state = 'retired' WHERE shard_id = 0",
+            "UPDATE briskdb_virtual_buckets SET physical_shard_id = 1 WHERE bucket_id = 0",
+            "UPDATE briskdb_logical_databases SET database_name = 'primary' WHERE database_id = 1",
+            "UPDATE briskdb_schema_catalog SET identifier_encoding_version = 2 WHERE singleton = 1",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 2, NULL, NULL)",
+            "UPDATE briskdb_shard_layout SET layout_id = randomblob(16) WHERE singleton = 1",
+            "INSERT INTO briskdb_schema_migrations VALUES (1, 0, randomblob(32), 1, 'SELECT 1', 4, 2, 4)",
+            "UPDATE briskdb_integrity SET database_state = 4 WHERE singleton = 1",
+            "UPDATE briskdb_integrity SET committed_schema_digest = randomblob(32) WHERE singleton = 1",
+        ];
+
+        for mutation in mutations {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_ready_current_manifest(&mut connection, 4);
+            let trusted = stored_manifest_digest(&connection);
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     PRAGMA ignore_check_constraints = ON;",
+                )
+                .unwrap();
+            connection.execute_batch(mutation).unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .unwrap();
+
+            assert_ne!(
+                manifest_semantic_digest(&connection).unwrap(),
+                trusted,
+                "{mutation}"
+            );
+            assert_eq!(stored_manifest_digest(&connection), trusted, "{mutation}");
+            assert_eq!(
+                load_or_create_manifest(&mut connection, 4)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::DataCorruption,
+                "{mutation}"
+            );
+            assert_eq!(stored_manifest_digest(&connection), trusted, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn integrity_versions_lengths_and_forged_state_invariants_fail_closed() {
+        for version_column in ["manifest_digest_version", "schema_digest_version"] {
+            let mut unsupported = Connection::open_in_memory().unwrap();
+            create_ready_current_manifest(&mut unsupported, 4);
+            unsupported
+                .execute(
+                    &format!(
+                        "UPDATE briskdb_integrity SET {version_column} = 2 WHERE singleton = 1"
+                    ),
+                    [],
+                )
+                .unwrap();
+            refresh_manifest_digest(&unsupported).unwrap();
+            assert_eq!(
+                load_or_create_manifest(&mut unsupported, 4)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition,
+                "{version_column}"
+            );
+
+            let mut invalid = Connection::open_in_memory().unwrap();
+            create_ready_current_manifest(&mut invalid, 4);
+            invalid
+                .pragma_update(None, "ignore_check_constraints", "ON")
+                .unwrap();
+            invalid
+                .execute(
+                    &format!(
+                        "UPDATE briskdb_integrity SET {version_column} = 0 WHERE singleton = 1"
+                    ),
+                    [],
+                )
+                .unwrap();
+            refresh_manifest_digest(&invalid).unwrap();
+            invalid
+                .pragma_update(None, "ignore_check_constraints", "OFF")
+                .unwrap();
+            assert_eq!(
+                load_or_create_manifest(&mut invalid, 4).unwrap_err().kind(),
+                EngineErrorKind::DataCorruption,
+                "{version_column}"
+            );
+        }
+
+        let mut malformed = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut malformed, 4);
+        malformed
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .unwrap();
+        malformed
+            .execute(
+                "UPDATE briskdb_integrity SET committed_schema_digest = x'01' WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        malformed
+            .pragma_update(None, "ignore_check_constraints", "OFF")
+            .unwrap();
+        assert_eq!(
+            load_or_create_manifest(&mut malformed, 4)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+
+        let mut forged = Connection::open_in_memory().unwrap();
+        load_or_create_manifest(&mut forged, 4).unwrap();
+        forged
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .unwrap();
+        forged
+            .execute(
+                "UPDATE briskdb_integrity
+                 SET database_state = 2, committed_schema_digest = NULL
+                 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        refresh_manifest_digest(&forged).unwrap();
+        forged
+            .pragma_update(None, "ignore_check_constraints", "OFF")
+            .unwrap();
+        assert_eq!(
+            load_or_create_manifest(&mut forged, 4).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
+
+    #[test]
+    fn migration_and_degraded_transitions_reseal_without_rebaselining() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let ready_root = stored_manifest_digest(&connection);
+
+        let mut migration =
+            begin_schema_migration(&mut connection, 4, 0, "CREATE TABLE widgets(id INTEGER)")
+                .unwrap();
+        let journal_root = stored_manifest_digest(&connection);
+        assert_ne!(journal_root, ready_root);
+        assert_eq!(
+            current_integrity(&connection, 4).unwrap().state(),
+            DatabaseIntegrityState::Migrating
+        );
+
+        migration = advance_schema_migration(&mut connection, 4, &migration, 1).unwrap();
+        let progress_root = stored_manifest_digest(&connection);
+        assert_ne!(progress_root, journal_root);
+        while migration.next_shard() < migration.shard_count() {
+            let next = migration.next_shard() + 1;
+            migration = advance_schema_migration(&mut connection, 4, &migration, next).unwrap();
+        }
+        finalize_schema_migration(&mut connection, 4, &migration).unwrap();
+        let completed_root = stored_manifest_digest(&connection);
+        assert_ne!(completed_root, progress_root);
+        assert_eq!(
+            manifest_semantic_digest(&connection).unwrap(),
+            completed_root
+        );
+        assert_eq!(
+            current_integrity(&connection, 4).unwrap().state(),
+            DatabaseIntegrityState::Ready
+        );
+
+        let layout = current_manifest_snapshot(&connection, 4)
+            .unwrap()
+            .shard_layout
+            .unwrap();
+        mark_degraded(&mut connection, 4, &layout).unwrap();
+        let degraded = current_integrity(&connection, 4).unwrap();
+        assert_eq!(degraded.state(), DatabaseIntegrityState::Degraded);
+        assert_eq!(
+            seal_verified_schema(&mut connection, 4, [0x11; 32])
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+        assert_eq!(
+            current_integrity(&connection, 4).unwrap().state(),
+            DatabaseIntegrityState::Degraded
+        );
+        assert_eq!(
+            seal_verified_schema(
+                &mut connection,
+                4,
+                degraded.committed_schema_digest().unwrap(),
+            )
+            .unwrap_err()
+            .kind(),
+            EngineErrorKind::DataCorruption
+        );
     }
 
     #[test]
@@ -3893,9 +5168,9 @@ mod tests {
         assert_eq!(catalog.logical().tables().len(), 5);
         assert_eq!(
             identity(&connection),
-            (MANIFEST_APPLICATION_ID, i64::from(V6_SCHEMA_VERSION))
+            (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v6_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v7_objects());
         assert_eq!(
             shard_layout_row(&connection).3,
             ShardLayoutState::Adopting.code()
@@ -3914,16 +5189,26 @@ mod tests {
 
         let loaded = load_or_create_manifest(&mut connection, 4).unwrap();
         assert!(loaded.active_migration().is_none());
-        let (catalog, layout, active) = loaded.into_parts_with_migration();
+        let (catalog, layout, active, integrity) = loaded.into_parts_with_migration();
 
-        assert_eq!(identity(&connection), (MANIFEST_APPLICATION_ID, 6));
-        assert_eq!(schema_objects(&connection).unwrap(), v6_objects());
+        assert_eq!(
+            identity(&connection),
+            (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
+        );
+        assert_eq!(schema_objects(&connection).unwrap(), v7_objects());
         assert_eq!(layout.state(), ShardLayoutState::Ready);
         assert_eq!(shard_layout_row(&connection), layout_before);
         assert_eq!(catalog.logical().schema_generation(), 0);
         assert_eq!(logical_databases(&connection), databases_before);
         assert_eq!(table_metadata_rows(&connection), tables_before);
         assert!(active.is_none());
+        assert_eq!(integrity.state(), DatabaseIntegrityState::Verifying);
+        assert_eq!(integrity.committed_schema_digest(), None);
+        assert_eq!(integrity.target_schema_digest(), None);
+        assert_eq!(
+            manifest_semantic_digest(&connection).unwrap(),
+            stored_manifest_digest(&connection)
+        );
         assert_eq!(
             connection
                 .query_row(
@@ -3935,6 +5220,40 @@ mod tests {
             0
         );
         assert_eq!(quick_check(&connection), "ok");
+    }
+
+    #[test]
+    fn version_six_upgrade_enters_verifying_without_changing_catalog_or_history() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_v5_manifest(&mut connection, 4);
+        insert_valid_table_catalog(&connection);
+        let mut no_hook = |_| Ok(());
+        let v6 = load_or_create_snapshot_with_plan(&mut connection, 4, V6_PLAN, true, &mut no_hook)
+            .unwrap();
+        assert_eq!(identity(&connection), (MANIFEST_APPLICATION_ID, 6));
+        let databases_before = logical_databases(&connection);
+        let tables_before = table_metadata_rows(&connection);
+        assert!(v6.active_migration.is_none());
+
+        let loaded = load_or_create_manifest(&mut connection, 4).unwrap();
+        assert_eq!(loaded.integrity.state(), DatabaseIntegrityState::Verifying);
+        assert_eq!(loaded.integrity.committed_schema_digest(), None);
+        assert_eq!(logical_databases(&connection), databases_before);
+        assert_eq!(table_metadata_rows(&connection), tables_before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manifest_semantic_digest(&connection).unwrap(),
+            stored_manifest_digest(&connection)
+        );
     }
 
     #[test]
@@ -3965,8 +5284,11 @@ mod tests {
             assert_eq!(quick_check(&connection), "ok");
 
             load_or_create_manifest(&mut connection, 4).unwrap();
-            assert_eq!(identity(&connection), (MANIFEST_APPLICATION_ID, 6));
-            assert_eq!(schema_objects(&connection).unwrap(), v6_objects());
+            assert_eq!(
+                identity(&connection),
+                (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
+            );
+            assert_eq!(schema_objects(&connection).unwrap(), v7_objects());
         }
 
         let mut connection = Connection::open_in_memory().unwrap();
@@ -3985,7 +5307,10 @@ mod tests {
         assert_eq!(identity(&connection), (MANIFEST_APPLICATION_ID, 5));
         assert_eq!(schema_objects(&connection).unwrap(), v5_objects());
         load_or_create_manifest(&mut connection, 4).unwrap();
-        assert_eq!(identity(&connection), (MANIFEST_APPLICATION_ID, 6));
+        assert_eq!(
+            identity(&connection),
+            (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
+        );
     }
 
     #[test]
@@ -5462,7 +6787,7 @@ mod tests {
     }
 
     #[test]
-    fn version_five_reader_rejects_version_six_without_mutating_it() {
+    fn version_five_reader_rejects_current_manifest_without_mutating_it() {
         const OLD_MIGRATIONS: &[Migration] = &[
             Migration {
                 from: LEGACY_SCHEMA_VERSION,
@@ -5518,8 +6843,25 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V6_SCHEMA_VERSION)
+            i64::from(CURRENT_SCHEMA_VERSION)
         );
+    }
+
+    #[test]
+    fn version_six_reader_rejects_version_seven_without_mutating_it() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let identity_before = identity(&connection);
+        let objects_before = schema_objects(&connection).unwrap();
+        let root_before = stored_manifest_digest(&connection);
+
+        let error = inspect_with_plan(&connection, 4, V6_PLAN).unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert_eq!(identity(&connection), identity_before);
+        assert_eq!(schema_objects(&connection).unwrap(), objects_before);
+        assert_eq!(stored_manifest_digest(&connection), root_before);
+        assert_eq!(manifest_semantic_digest(&connection).unwrap(), root_before);
     }
 
     #[test]
@@ -5731,6 +7073,7 @@ mod tests {
             drop(insert);
             transaction.commit().unwrap();
         }
+        refresh_manifest_digest(&databases).unwrap();
         assert_eq!(
             load_or_create_catalog(&mut databases, 4)
                 .unwrap()
@@ -5781,6 +7124,7 @@ mod tests {
             drop(insert);
             transaction.commit().unwrap();
         }
+        refresh_manifest_digest(&tables).unwrap();
         assert_eq!(
             load_or_create_catalog(&mut tables, 4)
                 .unwrap()

@@ -22,8 +22,11 @@ use super::CONNECTION_BUSY_TIMEOUT;
 pub(super) const SHARD_APPLICATION_ID: i64 = 0x4252_5348;
 /// Version of the storage-owned shard metadata table.
 pub(super) const SHARD_METADATA_VERSION: u32 = 1;
+/// Version of the canonical application-schema fingerprint encoding.
+pub(super) const SHARD_SCHEMA_DIGEST_VERSION: u32 = 1;
 
 const SHARD_METADATA_TABLE: &str = "briskdb_shard_metadata";
+const SHARD_SCHEMA_DIGEST_DOMAIN: &[u8] = b"briskdb.shard.application-schema.v1\0";
 const MAX_SHARDS: u16 = 64;
 const MAX_DIRECTORY_ENTRIES: usize = 512;
 const MAX_SCHEMA_SQL_BYTES: usize = 4_096;
@@ -133,6 +136,9 @@ pub(super) enum SchemaMigrationShardOutcome {
     Applied,
     AlreadyApplied,
 }
+
+/// Canonical BLAKE3 fingerprint of one generation's persistent application schema.
+pub(super) type SchemaDigest = [u8; 32];
 
 /// Durable boundaries exposed to storage migration failure-injection tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,11 +278,111 @@ pub(super) fn validate_open_connection(
     schema_generation: u64,
     layout: &ShardLayout,
 ) -> EngineResult<()> {
+    configure_cell_size_check(connection)?;
     validate_shard_id(shard_id)?;
     let expected_user_version = expected_user_version(schema_generation)?;
     require_writable(connection)?;
     validate_exact_shard(connection, path, shard_id, expected_user_version, layout)?;
     configure_connection_pragmas(connection)
+}
+
+/// Calculate the canonical fingerprint of the persistent application schema.
+///
+/// The encoding is domain-separated and generation-bound. Rows are streamed in
+/// binary order from `main.sqlite_schema`; SQLite-owned `sqlite_*` objects and
+/// the one storage-owned shard-metadata table are omitted. Every text field is
+/// length-prefixed, including the nullable SQL field, so no tuple ambiguity is
+/// possible. Application data, root pages, shard identity, and WAL state do not
+/// participate in the fingerprint.
+pub(super) fn calculate_schema_digest(
+    connection: &Connection,
+    schema_generation: u64,
+) -> EngineResult<SchemaDigest> {
+    configure_cell_size_check(connection)?;
+    expected_user_version(schema_generation)?;
+
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, tbl_name, sql
+             FROM main.sqlite_schema
+             ORDER BY
+                 type COLLATE BINARY,
+                 name COLLATE BINARY,
+                 tbl_name COLLATE BINARY,
+                 sql COLLATE BINARY",
+        )
+        .map_err(|error| shard_read_error(error, "failed to inspect shard application schema"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| shard_read_error(error, "failed to inspect shard application schema"))?;
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(SHARD_SCHEMA_DIGEST_DOMAIN);
+    hasher.update(&SHARD_SCHEMA_DIGEST_VERSION.to_le_bytes());
+    hasher.update(&schema_generation.to_le_bytes());
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| shard_read_error(error, "failed to read shard application schema"))?
+    {
+        let object_type = row
+            .get::<_, String>(0)
+            .map_err(|error| shard_read_error(error, "failed to read shard application schema"))?;
+        let name = row
+            .get::<_, String>(1)
+            .map_err(|error| shard_read_error(error, "failed to read shard application schema"))?;
+        let table_name = row
+            .get::<_, String>(2)
+            .map_err(|error| shard_read_error(error, "failed to read shard application schema"))?;
+        let sql = row
+            .get::<_, Option<String>>(3)
+            .map_err(|error| shard_read_error(error, "failed to read shard application schema"))?;
+
+        if is_sqlite_schema_name(&name) {
+            continue;
+        }
+        if is_exact_metadata_schema_object(&object_type, &name, &table_name, sql.as_deref()) {
+            continue;
+        }
+        if is_reserved_name(&name) || is_reserved_name(&table_name) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "shard application schema contains an unexpected reserved object",
+            ));
+        }
+
+        hasher.update(&[1]);
+        hash_schema_text(&mut hasher, &object_type)?;
+        hash_schema_text(&mut hasher, &name)?;
+        hash_schema_text(&mut hasher, &table_name)?;
+        match sql {
+            Some(sql) => {
+                hasher.update(&[1]);
+                hash_schema_text(&mut hasher, &sql)?;
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    hasher.update(&[0]);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// Require the current persistent application schema to match a trusted digest.
+pub(super) fn verify_schema_digest(
+    connection: &Connection,
+    schema_generation: u64,
+    expected: &SchemaDigest,
+) -> EngineResult<()> {
+    if calculate_schema_digest(connection, schema_generation)? == *expected {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "shard application schema does not match its trusted fingerprint",
+        ))
+    }
 }
 
 /// Strictly validate a dedicated migration connection while accepting only
@@ -294,6 +400,7 @@ pub(super) fn validate_schema_migration_connection(
     target_generation: u64,
     layout: &ShardLayout,
 ) -> EngineResult<SchemaMigrationShardState> {
+    configure_cell_size_check(connection)?;
     validate_shard_id(shard_id)?;
     let (source_user_version, target_user_version) =
         validate_schema_migration_inputs(source_generation, target_generation, layout)?;
@@ -400,6 +507,7 @@ where
 
 /// Execute a migration batch in an immediate transaction and always roll it
 /// back. A target-generation shard is strictly validated and skipped.
+#[cfg(test)]
 pub(super) fn preflight_schema_migration(
     path: &Path,
     shard_id: u16,
@@ -408,9 +516,30 @@ pub(super) fn preflight_schema_migration(
     layout: &ShardLayout,
     sql: &str,
 ) -> EngineResult<SchemaMigrationShardState> {
+    preflight_schema_migration_with_digest(
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+    )
+    .map(|(state, _)| state)
+}
+
+/// Preflight a migration and return its generation-bound target-schema digest.
+#[cfg(test)]
+pub(super) fn preflight_schema_migration_with_digest(
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+    sql: &str,
+) -> EngineResult<(SchemaMigrationShardState, SchemaDigest)> {
     let mut connection = open_required_file(path)?;
     configure_busy_timeout(&connection)?;
-    preflight_schema_migration_on_connection(
+    preflight_schema_migration_on_connection_with_digest(
         &mut connection,
         path,
         shard_id,
@@ -421,8 +550,8 @@ pub(super) fn preflight_schema_migration(
     )
 }
 
-/// Connection-level preflight for a coordinator-owned, cancellation-aware handle.
-pub(super) fn preflight_schema_migration_on_connection(
+/// Connection-level digesting preflight for a cancellation-aware coordinator.
+pub(super) fn preflight_schema_migration_on_connection_with_digest(
     connection: &mut Connection,
     path: &Path,
     shard_id: u16,
@@ -430,7 +559,7 @@ pub(super) fn preflight_schema_migration_on_connection(
     target_generation: u64,
     layout: &ShardLayout,
     sql: &str,
-) -> EngineResult<SchemaMigrationShardState> {
+) -> EngineResult<(SchemaMigrationShardState, SchemaDigest)> {
     let initial = validate_schema_migration_connection(
         connection,
         path,
@@ -440,7 +569,8 @@ pub(super) fn preflight_schema_migration_on_connection(
         layout,
     )?;
     if initial == SchemaMigrationShardState::Target {
-        return Ok(initial);
+        let digest = calculate_schema_digest(connection, target_generation)?;
+        return Ok((initial, digest));
     }
 
     let (source_user_version, target_user_version) =
@@ -458,20 +588,23 @@ pub(super) fn preflight_schema_migration_on_connection(
     )?;
     if locked == SchemaMigrationShardState::Target {
         transaction.rollback().map_err(sqlite_error::storage)?;
-        return validate_schema_migration_connection(
+        let state = validate_schema_migration_connection(
             connection,
             path,
             shard_id,
             source_generation,
             target_generation,
             layout,
-        );
+        )?;
+        let digest = calculate_schema_digest(connection, target_generation)?;
+        return Ok((state, digest));
     }
 
     let reserved_before = reserved_schema_snapshot(&transaction)?;
     execute_schema_migration_batch(&transaction, sql)?;
     ensure_reserved_schema_unchanged(&reserved_before, &transaction)?;
     ensure_no_foreign_key_violations(&transaction)?;
+    let target_digest = calculate_schema_digest(&transaction, target_generation)?;
     transaction.rollback().map_err(sqlite_error::storage)?;
 
     let state = validate_schema_migration_connection(
@@ -488,7 +621,7 @@ pub(super) fn preflight_schema_migration_on_connection(
             format!("schema migration preflight changed shard {shard_id} generation"),
         ));
     }
-    Ok(state)
+    Ok((state, target_digest))
 }
 
 /// Atomically apply one journaled batch and its target generation, or strictly
@@ -514,6 +647,30 @@ pub(super) fn apply_schema_migration(
     )
 }
 
+/// Apply one migration while requiring its exact trusted target fingerprint.
+pub(super) fn apply_schema_migration_with_digest(
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+    sql: &str,
+    expected_target_digest: &SchemaDigest,
+) -> EngineResult<SchemaMigrationShardOutcome> {
+    let mut connection = open_required_file(path)?;
+    configure_busy_timeout(&connection)?;
+    apply_schema_migration_on_connection_with_digest(
+        &mut connection,
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+        expected_target_digest,
+    )
+}
+
 /// Connection-level apply for a coordinator-owned, cancellation-aware handle.
 pub(super) fn apply_schema_migration_on_connection(
     connection: &mut Connection,
@@ -532,7 +689,35 @@ pub(super) fn apply_schema_migration_on_connection(
         layout,
         sql,
     );
-    apply_schema_migration_on_connection_inner(connection, migration, |_| Ok(()))
+    apply_schema_migration_on_connection_inner(connection, migration, None, |_| Ok(()))
+}
+
+/// Connection-level digest-verifying apply for a cancellation-aware coordinator.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_schema_migration_on_connection_with_digest(
+    connection: &mut Connection,
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+    sql: &str,
+    expected_target_digest: &SchemaDigest,
+) -> EngineResult<SchemaMigrationShardOutcome> {
+    let migration = SchemaMigrationShard::new(
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+    );
+    apply_schema_migration_on_connection_inner(
+        connection,
+        migration,
+        Some(expected_target_digest),
+        |_| Ok(()),
+    )
 }
 
 /// Test seam for injecting errors, panics, and process termination at the
@@ -546,12 +731,13 @@ pub(super) fn apply_schema_migration_on_connection_with_hook<F>(
 where
     F: FnMut(SchemaMigrationPoint) -> EngineResult<()>,
 {
-    apply_schema_migration_on_connection_inner(connection, migration, hook)
+    apply_schema_migration_on_connection_inner(connection, migration, None, hook)
 }
 
 fn apply_schema_migration_on_connection_inner<F>(
     connection: &mut Connection,
     migration: SchemaMigrationShard<'_>,
+    expected_target_digest: Option<&SchemaDigest>,
     mut hook: F,
 ) -> EngineResult<SchemaMigrationShardOutcome>
 where
@@ -574,6 +760,9 @@ where
         layout,
     )?;
     if initial == SchemaMigrationShardState::Target {
+        if let Some(expected) = expected_target_digest {
+            verify_schema_digest(connection, target_generation, expected)?;
+        }
         return Ok(SchemaMigrationShardOutcome::AlreadyApplied);
     }
 
@@ -600,6 +789,9 @@ where
             target_generation,
             layout,
         )?;
+        if let Some(expected) = expected_target_digest {
+            verify_schema_digest(connection, target_generation, expected)?;
+        }
         return Ok(SchemaMigrationShardOutcome::AlreadyApplied);
     }
 
@@ -626,6 +818,9 @@ where
             format!("schema migration did not stamp shard {shard_id} target generation"),
         ));
     }
+    if let Some(expected) = expected_target_digest {
+        verify_schema_digest(&transaction, target_generation, expected)?;
+    }
 
     transaction.commit().map_err(sqlite_error::storage)?;
     hook(SchemaMigrationPoint::Committed)?;
@@ -642,6 +837,9 @@ where
             EngineErrorKind::Internal,
             format!("committed schema migration did not persist on shard {shard_id}"),
         ));
+    }
+    if let Some(expected) = expected_target_digest {
+        verify_schema_digest(connection, target_generation, expected)?;
     }
     Ok(SchemaMigrationShardOutcome::Applied)
 }
@@ -1076,9 +1274,11 @@ fn open_existing_connection(path: &Path) -> EngineResult<Connection> {
         | OpenFlags::SQLITE_OPEN_NOFOLLOW
         | OpenFlags::SQLITE_OPEN_EXRESCODE;
     let open_path = canonical_open_path(path)?;
-    Connection::open_with_flags(open_path, flags).map_err(|error| {
+    let connection = Connection::open_with_flags(open_path, flags).map_err(|error| {
         sqlite_error::storage(error).context(format!("failed to open shard {}", path.display()))
-    })
+    })?;
+    configure_cell_size_check(&connection)?;
+    Ok(connection)
 }
 
 fn open_creating_connection(path: &Path) -> EngineResult<Connection> {
@@ -1088,9 +1288,11 @@ fn open_creating_connection(path: &Path) -> EngineResult<Connection> {
         | OpenFlags::SQLITE_OPEN_NOFOLLOW
         | OpenFlags::SQLITE_OPEN_EXRESCODE;
     let open_path = canonical_open_path(path)?;
-    Connection::open_with_flags(open_path, flags).map_err(|error| {
+    let connection = Connection::open_with_flags(open_path, flags).map_err(|error| {
         sqlite_error::storage(error).context(format!("failed to create shard {}", path.display()))
-    })
+    })?;
+    configure_cell_size_check(&connection)?;
+    Ok(connection)
 }
 
 // SQLite's NOFOLLOW flag rejects a path containing any symlink component. On
@@ -1145,6 +1347,23 @@ fn configure_busy_timeout(connection: &Connection) -> EngineResult<()> {
     connection
         .busy_timeout(CONNECTION_BUSY_TIMEOUT)
         .map_err(sqlite_error::storage)
+}
+
+fn configure_cell_size_check(connection: &Connection) -> EngineResult<()> {
+    connection
+        .pragma_update(None, "cell_size_check", "ON")
+        .map_err(sqlite_error::storage)?;
+    let enabled = connection
+        .pragma_query_value(None, "cell_size_check", |row| row.get::<_, i64>(0))
+        .map_err(sqlite_error::storage)?;
+    if enabled == 1 {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "SQLite did not enable required shard cell-size checks",
+        ))
+    }
 }
 
 fn require_writable(connection: &Connection) -> EngineResult<()> {
@@ -1595,11 +1814,79 @@ fn validate_metadata(
             ),
         ));
     }
-    Ok(())
+    validate_metadata_integrity(connection)
+}
+
+fn validate_metadata_integrity(connection: &Connection) -> EngineResult<()> {
+    let mut statement = connection
+        .prepare("PRAGMA main.integrity_check('briskdb_shard_metadata')")
+        .map_err(|error| shard_read_error(error, "failed to check shard metadata integrity"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| shard_read_error(error, "failed to check shard metadata integrity"))?;
+    let first = rows
+        .next()
+        .map_err(|error| shard_read_error(error, "failed to check shard metadata integrity"))?
+        .map(|row| row.get::<_, String>(0))
+        .transpose()
+        .map_err(|error| shard_read_error(error, "failed to check shard metadata integrity"))?;
+    let has_additional = rows
+        .next()
+        .map_err(|error| shard_read_error(error, "failed to check shard metadata integrity"))?
+        .is_some();
+    require_single_ok_integrity_result(first.as_deref(), has_additional)
+}
+
+fn require_single_ok_integrity_result(
+    first: Option<&str>,
+    has_additional: bool,
+) -> EngineResult<()> {
+    if first == Some("ok") && !has_additional {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "shard metadata integrity check failed",
+        ))
+    }
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
     sql.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn hash_schema_text(hasher: &mut blake3::Hasher, value: &str) -> EngineResult<()> {
+    let length = u64::try_from(value.len()).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::LimitExceeded,
+            "shard schema field length exceeds its canonical encoding",
+            error,
+        )
+    })?;
+    hasher.update(&length.to_le_bytes());
+    hasher.update(value.as_bytes());
+    Ok(())
+}
+
+fn is_sqlite_schema_name(name: &str) -> bool {
+    name.as_bytes()
+        .get(.."sqlite_".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"sqlite_"))
+}
+
+fn is_exact_metadata_schema_object(
+    object_type: &str,
+    name: &str,
+    table_name: &str,
+    sql: Option<&str>,
+) -> bool {
+    object_type == "table"
+        && name == SHARD_METADATA_TABLE
+        && table_name == SHARD_METADATA_TABLE
+        && sql.is_some_and(|sql| {
+            sql.len() <= MAX_SCHEMA_SQL_BYTES
+                && normalize_schema_sql(sql) == normalize_schema_sql(SHARD_METADATA_TABLE_SQL)
+        })
 }
 
 fn missing_shard(path: &Path, shard_id: u16) -> EngineError {
@@ -1848,6 +2135,278 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn schema_fixture(schema: &str) -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SHARD_METADATA_TABLE_SQL).unwrap();
+        connection.execute_batch(schema).unwrap();
+        connection
+    }
+
+    fn cell_size_check(connection: &Connection) -> i64 {
+        connection
+            .pragma_query_value(None, "cell_size_check", |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn internal_shard_opens_enable_and_read_back_cell_size_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let creating_path = temp.path().join("creating.sqlite");
+        let creating = open_creating_connection(&creating_path).unwrap();
+        assert_eq!(cell_size_check(&creating), 1);
+        drop(creating);
+
+        let (_temp, shards, ready) = create_ready_layout(2);
+        let path = shard_path(&shards, 0);
+        let required = open_required_file(&path).unwrap();
+        assert_eq!(cell_size_check(&required), 1);
+        drop(required);
+
+        let borrowed = Connection::open(&path).unwrap();
+        borrowed
+            .pragma_update(None, "cell_size_check", "OFF")
+            .unwrap();
+        assert_eq!(cell_size_check(&borrowed), 0);
+        validate_open_connection(&borrowed, &path, 0, 0, &ready).unwrap();
+        assert_eq!(cell_size_check(&borrowed), 1);
+
+        let migration = Connection::open(&path).unwrap();
+        migration
+            .pragma_update(None, "cell_size_check", "OFF")
+            .unwrap();
+        assert_eq!(cell_size_check(&migration), 0);
+        validate_schema_migration_connection(&migration, &path, 0, 0, 1, &ready).unwrap();
+        assert_eq!(cell_size_check(&migration), 1);
+    }
+
+    #[test]
+    fn metadata_integrity_requires_exactly_one_ok_row_and_maps_failures_to_corruption() {
+        assert!(require_single_ok_integrity_result(Some("ok"), false).is_ok());
+        for (first, additional) in [
+            (None, false),
+            (Some(""), false),
+            (Some("malformed"), false),
+            (Some("ok"), true),
+        ] {
+            assert_eq!(
+                require_single_ok_integrity_result(first, additional)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::DataCorruption
+            );
+        }
+
+        let (_temp, shards, _) = create_ready_layout(2);
+        validate_metadata_integrity(&Connection::open(shard_path(&shards, 0)).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn schema_digest_has_a_frozen_golden_vector() {
+        let connection = schema_fixture(
+            "CREATE TABLE widgets (
+                 id INTEGER PRIMARY KEY,
+                 value TEXT NOT NULL
+             ) STRICT;
+             CREATE INDEX widgets_value_idx ON widgets (value);",
+        );
+        let digest = calculate_schema_digest(&connection, 7).unwrap();
+        assert_eq!(
+            blake3::Hash::from_bytes(digest).to_hex().as_str(),
+            "5199ef8f79db275ed5b2ff06ef85c2138f6ddf714b0843300356b9efcfb078aa"
+        );
+    }
+
+    #[test]
+    fn schema_digest_ignores_shard_identity_rows_and_application_data() {
+        let (_temp, shards, _) = create_ready_layout(2);
+        let mut digests = Vec::new();
+        for shard_id in 0..2 {
+            let connection = Connection::open(shard_path(&shards, shard_id)).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE widgets (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         value TEXT NOT NULL
+                     ) STRICT;
+                     CREATE INDEX widgets_value_idx ON widgets (value);",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO widgets (value) VALUES (?1)",
+                    [format!("shard-{shard_id}")],
+                )
+                .unwrap();
+            digests.push(calculate_schema_digest(&connection, 0).unwrap());
+        }
+        assert_eq!(digests[0], digests[1]);
+
+        let first = Connection::open(shard_path(&shards, 0)).unwrap();
+        verify_schema_digest(&first, 0, &digests[0]).unwrap();
+        let wrong = [0x5a; 32];
+        assert_eq!(
+            verify_schema_digest(&first, 0, &wrong).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
+
+    #[test]
+    fn schema_digest_is_stable_across_dml_checkpoint_and_vacuum() {
+        let (_temp, shards, _) = create_ready_layout(2);
+        let path = shard_path(&shards, 0);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     value TEXT NOT NULL
+                 ) STRICT;
+                 CREATE INDEX events_value_idx ON events (value);",
+            )
+            .unwrap();
+        let baseline = calculate_schema_digest(&connection, 0).unwrap();
+
+        connection
+            .execute_batch(
+                "INSERT INTO events (value) VALUES ('one'), ('two'), ('three');
+                 UPDATE events SET value = upper(value) WHERE id = 2;
+                 DELETE FROM events WHERE id = 1;",
+            )
+            .unwrap();
+        assert_eq!(calculate_schema_digest(&connection, 0).unwrap(), baseline);
+
+        connection
+            .query_row("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        assert_eq!(calculate_schema_digest(&connection, 0).unwrap(), baseline);
+
+        connection.execute_batch("VACUUM main").unwrap();
+        assert_eq!(calculate_schema_digest(&connection, 0).unwrap(), baseline);
+    }
+
+    #[test]
+    fn every_persistent_application_object_changes_the_schema_digest() {
+        let connection = schema_fixture("");
+        let mut seen = HashSet::new();
+        assert!(seen.insert(calculate_schema_digest(&connection, 0).unwrap()));
+
+        for sql in [
+            "CREATE TABLE widgets (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;",
+            "CREATE INDEX widgets_value_idx ON widgets (value);",
+            "CREATE VIEW widget_values AS SELECT id, value FROM widgets;",
+            "CREATE TRIGGER widgets_after_insert AFTER INSERT ON widgets BEGIN UPDATE widgets SET value = upper(value) WHERE id = NEW.id; END;",
+        ] {
+            connection.execute_batch(sql).unwrap();
+            assert!(seen.insert(calculate_schema_digest(&connection, 0).unwrap()));
+        }
+        assert_eq!(seen.len(), 5);
+    }
+
+    #[test]
+    fn schema_digest_order_is_binary_and_independent_of_creation_order() {
+        let first = schema_fixture(
+            "CREATE TABLE alpha (id INTEGER PRIMARY KEY, value TEXT) STRICT;
+             CREATE TABLE beta (id INTEGER PRIMARY KEY, value TEXT) STRICT;
+             CREATE INDEX alpha_value_idx ON alpha (value);
+             CREATE INDEX beta_value_idx ON beta (value);",
+        );
+        let second = schema_fixture(
+            "CREATE TABLE beta (id INTEGER PRIMARY KEY, value TEXT) STRICT;
+             CREATE TABLE alpha (id INTEGER PRIMARY KEY, value TEXT) STRICT;
+             CREATE INDEX beta_value_idx ON beta (value);
+             CREATE INDEX alpha_value_idx ON alpha (value);",
+        );
+        assert_eq!(
+            calculate_schema_digest(&first, 4).unwrap(),
+            calculate_schema_digest(&second, 4).unwrap()
+        );
+    }
+
+    #[test]
+    fn schema_digest_is_generation_bound_and_rejects_unencodable_generations() {
+        let connection = schema_fixture("CREATE TABLE widgets (id INTEGER PRIMARY KEY) STRICT;");
+        assert_ne!(
+            calculate_schema_digest(&connection, 0).unwrap(),
+            calculate_schema_digest(&connection, 1).unwrap()
+        );
+        assert_eq!(
+            calculate_schema_digest(&connection, i32::MAX as u64 + 1)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn schema_digest_rejects_unexpected_or_incompatible_reserved_objects() {
+        for schema in [
+            "CREATE TABLE briskdb_private (id INTEGER);",
+            "CREATE INDEX metadata_tamper_idx ON briskdb_shard_metadata (shard_id);",
+        ] {
+            let connection = schema_fixture(schema);
+            assert_eq!(
+                calculate_schema_digest(&connection, 0).unwrap_err().kind(),
+                EngineErrorKind::DataCorruption,
+                "{schema}"
+            );
+        }
+
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE briskdb_shard_metadata (singleton INTEGER);")
+            .unwrap();
+        assert_eq!(
+            calculate_schema_digest(&connection, 0).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
+
+    #[test]
+    fn migration_preflight_fingerprints_rollback_target_and_apply_verifies_before_commit() {
+        let (_temp, shards, ready) = create_ready_layout(2);
+        let sql = "CREATE TABLE migrated_widgets (
+                       id INTEGER PRIMARY KEY,
+                       value TEXT NOT NULL
+                   ) STRICT";
+        let mut target = None;
+        for shard_id in 0..2 {
+            let path = shard_path(&shards, shard_id);
+            let (state, digest) =
+                preflight_schema_migration_with_digest(&path, shard_id, 0, 1, &ready, sql).unwrap();
+            assert_eq!(state, SchemaMigrationShardState::Source);
+            assert!(!schema_object_exists(&path, "migrated_widgets"));
+            assert_eq!(identity(&path), (SHARD_APPLICATION_ID, 0));
+            if let Some(expected) = target {
+                assert_eq!(digest, expected);
+            } else {
+                target = Some(digest);
+            }
+        }
+        let target = target.unwrap();
+
+        let first = shard_path(&shards, 0);
+        assert_eq!(
+            apply_schema_migration_with_digest(&first, 0, 0, 1, &ready, sql, &target).unwrap(),
+            SchemaMigrationShardOutcome::Applied
+        );
+        verify_schema_digest(&Connection::open(&first).unwrap(), 1, &target).unwrap();
+        assert_eq!(
+            apply_schema_migration_with_digest(&first, 0, 0, 1, &ready, sql, &target).unwrap(),
+            SchemaMigrationShardOutcome::AlreadyApplied
+        );
+
+        let second = shard_path(&shards, 1);
+        let wrong = [0x5a; 32];
+        assert_eq!(
+            apply_schema_migration_with_digest(&second, 1, 0, 1, &ready, sql, &wrong)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+        assert_eq!(identity(&second), (SHARD_APPLICATION_ID, 0));
+        assert!(!schema_object_exists(&second, "migrated_widgets"));
     }
 
     #[test]

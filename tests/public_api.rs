@@ -18,6 +18,13 @@ fn insert_catalog_fixture(root: &Path) {
         .execute_batch(
             "PRAGMA foreign_keys = ON;
              BEGIN IMMEDIATE;
+             DROP TABLE briskdb_integrity;
+             DROP TABLE briskdb_metadata;
+             CREATE TABLE briskdb_metadata (
+                 requires_manifest_version INTEGER NOT NULL
+                     CHECK (requires_manifest_version >= 6)
+             ) STRICT;
+             INSERT INTO briskdb_metadata VALUES (6);
              INSERT INTO briskdb_logical_databases (database_id, database_name)
              VALUES (9, 'tenant');
              INSERT INTO briskdb_tables (
@@ -31,6 +38,7 @@ fn insert_catalog_fixture(root: &Path) {
                 (20, 1, 'countries', 2, NULL, NULL),
                 (30, 9, 'accounts', 1, 'tenant_id', 2),
                 (40, 9, 'internal_catalog', 3, NULL, NULL);
+             PRAGMA user_version = 6;
              COMMIT;",
         )
         .unwrap();

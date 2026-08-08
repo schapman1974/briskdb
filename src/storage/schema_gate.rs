@@ -16,6 +16,15 @@ pub(crate) enum SchemaGateState {
     Migrating,
     /// A durable partial migration must be resumed before ordinary work can run.
     Pending,
+    /// Integrity validation failed and no further work may be admitted.
+    Degraded,
+}
+
+fn degraded_error() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::DataCorruption,
+        "database integrity verification failed",
+    )
 }
 
 /// One deterministic view of schema admission and current occupancy.
@@ -117,7 +126,17 @@ impl SchemaGate {
                 EngineErrorKind::FailedPrecondition,
                 "a partial application-schema migration must be resumed",
             )),
+            SchemaGateState::Degraded => Err(degraded_error()),
         }
+    }
+
+    /// Permanently reject new work after integrity validation fails.
+    ///
+    /// Operations admitted before degradation retain their guards and may
+    /// drain normally. The degraded state is otherwise sticky for this gate,
+    /// including across outstanding migration-guard publication and drop.
+    pub(crate) fn mark_degraded(&self) {
+        self.inner.lock().state = SchemaGateState::Degraded;
     }
 
     /// Exclude new ordinary work and create the sole migration coordinator.
@@ -136,6 +155,7 @@ impl SchemaGate {
                     "an application-schema migration is already in progress",
                 ));
             }
+            SchemaGateState::Degraded => return Err(degraded_error()),
         };
         data.state = SchemaGateState::Migrating;
         Ok(SchemaMigrationGuard {
@@ -223,11 +243,15 @@ impl SchemaMigrationGuard {
     fn publish(&mut self, target: SchemaGateState) -> EngineResult<()> {
         {
             let mut data = self.inner.lock();
-            if data.state != SchemaGateState::Migrating {
-                return Err(EngineError::new(
-                    EngineErrorKind::Internal,
-                    "application-schema migration guard lost exclusive ownership",
-                ));
+            match data.state {
+                SchemaGateState::Migrating => {}
+                SchemaGateState::Degraded => return Err(degraded_error()),
+                SchemaGateState::Ready | SchemaGateState::Pending => {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "application-schema migration guard lost exclusive ownership",
+                    ));
+                }
             }
             if data.active_operations != 0 {
                 return Err(EngineError::new(
@@ -295,6 +319,48 @@ mod tests {
     }
 
     #[test]
+    fn degraded_rejects_operations_and_migrations_without_losing_occupancy() {
+        let gate = SchemaGate::new();
+        let admitted = gate.try_acquire_operation().unwrap();
+
+        gate.mark_degraded();
+        assert_eq!(
+            gate.snapshot(),
+            SchemaGateSnapshot {
+                state: SchemaGateState::Degraded,
+                active_operations: 1,
+            }
+        );
+        for error in [
+            gate.try_acquire_operation().unwrap_err(),
+            gate.begin_migration().unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+            assert_eq!(error.to_string(), "database integrity verification failed");
+            assert!(!error.is_retryable());
+        }
+
+        gate.mark_degraded();
+        drop(admitted);
+        assert_eq!(
+            gate.snapshot(),
+            SchemaGateSnapshot {
+                state: SchemaGateState::Degraded,
+                active_operations: 0,
+            }
+        );
+
+        let pending_gate = SchemaGate::new();
+        pending_gate
+            .begin_migration()
+            .unwrap()
+            .publish_pending()
+            .unwrap();
+        pending_gate.mark_degraded();
+        assert_eq!(pending_gate.snapshot().state, SchemaGateState::Degraded);
+    }
+
+    #[test]
     fn only_one_migration_guard_exists_and_pending_can_be_resumed() {
         let gate = SchemaGate::new();
         let migration = gate.begin_migration().unwrap();
@@ -323,6 +389,61 @@ mod tests {
 
         drop(gate.begin_migration().unwrap());
         assert_eq!(gate.snapshot().state, SchemaGateState::Pending);
+    }
+
+    #[test]
+    fn degradation_wins_over_migration_guard_drop_and_publication() {
+        let gate = SchemaGate::new();
+        let migration = gate.begin_migration().unwrap();
+        gate.mark_degraded();
+        drop(migration);
+        assert_eq!(gate.snapshot().state, SchemaGateState::Degraded);
+
+        let ready_publish_gate = SchemaGate::new();
+        let migration = ready_publish_gate.begin_migration().unwrap();
+        ready_publish_gate.mark_degraded();
+        let error = migration.publish_ready().unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            ready_publish_gate.snapshot().state,
+            SchemaGateState::Degraded
+        );
+
+        let pending_publish_gate = SchemaGate::new();
+        let migration = pending_publish_gate.begin_migration().unwrap();
+        pending_publish_gate.mark_degraded();
+        let error = migration.publish_pending().unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            pending_publish_gate.snapshot().state,
+            SchemaGateState::Degraded
+        );
+    }
+
+    #[test]
+    fn concurrent_degradation_and_guard_drop_always_leave_the_gate_degraded() {
+        for _ in 0..128 {
+            let gate = SchemaGate::new();
+            let migration = gate.begin_migration().unwrap();
+            let rendezvous = Arc::new(Barrier::new(3));
+
+            let marker_gate = gate.clone();
+            let marker_rendezvous = Arc::clone(&rendezvous);
+            let marker = std::thread::spawn(move || {
+                marker_rendezvous.wait();
+                marker_gate.mark_degraded();
+            });
+            let drop_rendezvous = Arc::clone(&rendezvous);
+            let dropper = std::thread::spawn(move || {
+                drop_rendezvous.wait();
+                drop(migration);
+            });
+
+            rendezvous.wait();
+            marker.join().unwrap();
+            dropper.join().unwrap();
+            assert_eq!(gate.snapshot().state, SchemaGateState::Degraded);
+        }
     }
 
     #[tokio::test]
