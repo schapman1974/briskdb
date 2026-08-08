@@ -5,8 +5,9 @@ Status: accepted for roadmap issue #19
 BriskDB needs one syntax boundary that PostgreSQL, MySQL, HTTP, and future
 frontends can share without making a protocol adapter understand SQLite or
 invent its own routing rules. This record selects the parser dependency and
-defines that boundary. It does not define the supported BriskDB SQL subset or
-put the parser in the current HTTP execution path.
+defines that boundary. The separate [common SQL subset contract](SQL_SUBSET.md)
+defines the opt-in structural validator; neither layer is in the current HTTP
+execution path.
 
 ## Decision
 
@@ -36,9 +37,10 @@ MySQL adapter will select MySQL, and a strict SQLite surface will select
 SQLite.
 
 The SQL module retains the exact input text alongside an ordered parsed batch.
-The upstream AST stays opaque outside BriskDB's SQL boundary. Later validators,
-normalizers, and planners can inspect it through BriskDB-owned interfaces, but
-protocol adapters must not depend on `sqlparser` AST types.
+The upstream AST stays opaque outside BriskDB's SQL boundary. The implemented
+common-subset validator and later normalizers and planners inspect it through
+BriskDB-owned interfaces, but protocol adapters must not depend on `sqlparser`
+AST types.
 
 `sqlparser`'s formatter is not a source-preserving serializer: it can normalize
 comments, whitespace, quoting, and keyword presentation. BriskDB therefore
@@ -55,7 +57,8 @@ executing it on SQLite would preserve the source dialect's semantics.
 
 In particular, this layer does not:
 
-- define or enforce the common SQL subset (issue #20);
+- itself define or enforce the common SQL subset; issue #20 implements that as
+  the separate `validate_common_subset(ParsedSql)` layer;
 - normalize placeholders (issue #21);
 - infer shard keys or inspect bound values (issue #22);
 - plan prepared statements at bind time (issue #23);
@@ -68,14 +71,16 @@ In particular, this layer does not:
 The parser may return several statements in source order. The 256-statement
 limit below is a resource bound, not permission to execute a batch. Whether a
 particular surface accepts one statement or a safe combination remains issue
-#27. Likewise, later subset validation must return an explicit unsupported
-error instead of treating parser acceptance as product support.
+#27. The implemented subset validator checks each ordered statement
+independently and returns `Unsupported` for a parsed form outside its contract;
+that still does not grant permission to execute an empty or mixed batch.
 
 The existing HTTP execute, query, and migration paths remain raw SQLite
 pass-through surfaces with their existing authorizer and endpoint-specific
-rules. They do not call this parser yet. Gating them now would silently replace
-SQLite's accepted syntax with `sqlparser`'s coverage before strict-mode and
-common-subset policy is defined.
+rules. They call neither this parser nor the opt-in common-subset validator.
+Connecting those layers before normalization, planning, translation, and
+request-level statement policy are implemented would change the experimental
+HTTP SQL surface.
 
 ## Resource and error boundaries
 
@@ -92,10 +97,10 @@ Empty, whitespace-only, and comment-only input successfully produces an empty
 AST; whether a later request surface permits that is classification policy for
 issue #27. NUL input, malformed tokens, incomplete syntax, and other parse
 failures are `InvalidQuery`. A syntactically valid statement that is outside
-BriskDB's eventual common subset is not a parse failure; subset validation will
-classify it later. Public protocol errors continue to use the fixed safe text
-for the error kind and must not serialize SQL text, parser diagnostics, source
-locations, or internal error chains.
+BriskDB's common subset is not a parse failure; `validate_common_subset`
+classifies it as `Unsupported`. Public protocol errors continue to use the fixed
+safe text for the error kind and must not serialize SQL text, parser diagnostics,
+source locations, or internal error chains.
 
 The parser is stateless and has no catalog, storage, session, parameters,
 filesystem, or routing access. Routing will consume structural AST information
@@ -155,5 +160,6 @@ regular-expression crate elsewhere in `Cargo.lock` is not evidence of SQL
 routing; the architectural proof is that this layer returns structured syntax
 and makes no routing decision.
 
-This decision changes no HTTP request or response shape, routing result,
-configuration, manifest schema, shard file, or stored data.
+This decision and the later opt-in subset validator change no HTTP request or
+response shape, routing result, configuration, manifest schema, shard file, or
+stored data.

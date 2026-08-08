@@ -137,6 +137,15 @@ location, and submitted SQL remain trusted diagnostics only. Protocol adapters
 serialize the fixed mapping for the BriskDB error kind and never expose those
 diagnostics to a client.
 
+The opt-in common-subset validator classifies a parsed top-level statement or
+nested form outside its documented structural contract as `Unsupported`. Its
+internal diagnostic contains the one-based statement position and a fixed
+feature category, never the submitted SQL, a literal, formatted AST output, or
+a parser diagnostic. Its independent recursive expression-depth limit is 128;
+exceeding that limit is `LimitExceeded`. Empty and mixed batches can pass
+structural validation; later request-level classification decides whether they
+may execute. See the [common SQL subset contract](SQL_SUBSET.md).
+
 The core contains no HTTP, PostgreSQL, or MySQL response types. Conversely,
 protocol adapters do not inspect SQLite errors. This lets every frontend share
 one error identity while retaining its own response encoding.

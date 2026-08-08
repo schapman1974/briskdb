@@ -83,6 +83,10 @@ impl ParsedSql {
     pub fn is_empty(&self) -> bool {
         self.statements.is_empty()
     }
+
+    pub(super) fn statements(&self) -> &[AstStatement] {
+        &self.statements
+    }
 }
 
 impl fmt::Debug for ParsedSql {

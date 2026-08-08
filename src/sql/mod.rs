@@ -1,15 +1,18 @@
 //! Protocol-neutral SQL parsing, SQLite execution, and value conversion.
 //!
-//! The parser facade produces a bounded, dialect-explicit opaque AST for later
-//! planning work. Current execution remains deliberate SQLite pass-through;
-//! parsing does not yet gate, rewrite, classify, route, or execute statements.
+//! The parser facade produces a bounded, dialect-explicit opaque AST. The
+//! common-subset validator recursively admits only protocol-neutral SQL shapes
+//! for later planning work. Current execution remains deliberate SQLite
+//! pass-through; neither layer gates, rewrites, routes, or executes statements.
 
 mod parser;
+mod subset;
 
 pub use parser::{
     MAX_PARSED_SQL_BYTES, MAX_PARSED_SQL_STATEMENTS, ParsedSql, SQL_PARSE_RECURSION_LIMIT,
     SqlDialect, parse,
 };
+pub use subset::{CommonSql, MAX_COMMON_SQL_EXPRESSION_DEPTH, validate_common_subset};
 
 use rusqlite::{
     Connection, params_from_iter,

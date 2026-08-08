@@ -16,12 +16,12 @@ document defines the SQL and behavioral contract separately from connectivity.
 - **Unsupported** means BriskDB rejects the behavior or makes no compatibility
   promise for it.
 
-The syntax parser is now available behind a BriskDB-owned boundary. Later
-subset validation and protocol adapters will fail explicitly for unsupported
-syntax and must not silently reinterpret a statement with materially different
-semantics. The current experimental HTTP interface is still a raw SQLite
-pass-through and can execute uncontracted SQLite syntax; that behavior is not a
-compatibility promise.
+The syntax parser and recursive common-subset validator are now available behind
+BriskDB-owned opaque types. Validation is explicit and returns `Unsupported`
+for a parsed form outside the subset; parser acceptance alone is not product
+support. The current experimental HTTP interface is still a raw SQLite
+pass-through and can execute uncontracted SQLite syntax because it calls neither
+layer. That behavior is not a compatibility promise.
 
 ## Compatibility layers
 
@@ -40,12 +40,14 @@ than claiming to be a drop-in PostgreSQL or MySQL replacement.
 
 ## Current implementation
 
-Only the experimental HTTP interface is implemented today. There is no
-PostgreSQL or MySQL listener or dialect translation layer yet. A bounded syntax
-parser can produce an opaque AST for an explicitly selected SQLite,
-PostgreSQL, or MySQL dialect, but it does not validate the supported subset,
-plan, route, or execute a statement. HTTP requests still send SQLite SQL
-directly to `rusqlite`; they do not pass through the parser.
+Only the experimental HTTP network interface is implemented today. There is no
+PostgreSQL or MySQL listener or dialect translation layer yet. The public Rust
+SQL facade can parse an explicitly selected SQLite, PostgreSQL, or MySQL dialect
+and can consume that result with `validate_common_subset(ParsedSql)`, yielding
+an opaque `CommonSql` after recursive structural validation. Neither operation
+plans, routes, translates, authorizes, or executes a statement. HTTP requests
+still send SQLite SQL directly to `rusqlite`; they do not pass through the
+parser or subset validator.
 
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
@@ -54,6 +56,10 @@ directly to `rusqlite`; they do not pass through the parser.
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
 | PostgreSQL wire protocol | Planned | Common subset plus documented PostgreSQL normalization | SQL/bound-parameter inference with explicit session fallback |
 | MySQL wire protocol | Planned | Common subset plus documented MySQL normalization | SQL/bound-parameter inference with explicit session fallback |
+
+The parser and subset validator are implemented Rust APIs, not network
+interfaces. Structural validation is opt-in and does not change any row in this
+table.
 
 Every HTTP operation now calls the same protocol-neutral async engine intended
 for future PostgreSQL and MySQL adapters. Execute and query requests create a
@@ -262,10 +268,19 @@ but the current execution surfaces retain their existing endpoint-specific
 single-statement and migration rules; later classification will decide which
 multi-statement combinations are safe.
 
-The parser has no routing or storage access. Future shard inference and
-statement classification consume structural syntax, never regular-expression
-matches over raw or formatted SQL. See the [SQL parser decision
-record](SQL_PARSER.md) for the dependency, error, MSRV, and non-goal contract.
+`validate_common_subset(ParsedSql)` is the separate support-validation step. It
+consumes the opaque parsed result and returns an owned opaque `CommonSql` only
+when every top-level statement and nested form is in the first subset. Empty
+and mixed batches may validate because request-level batch policy remains issue
+#27. Both marker types retain exact source, dialect, and statement count without
+exposing the upstream AST or rendering SQL in `Debug` output.
+
+The parser and validator have no routing or storage access. Future shard
+inference and statement classification consume structural syntax, never
+regular-expression matches over raw or formatted SQL. See the [SQL parser
+decision record](SQL_PARSER.md) for the dependency and resource contract and
+the [common SQL subset contract](SQL_SUBSET.md) for the normative recursive
+whitelist.
 
 ### Implemented pass-through surface
 
@@ -299,21 +314,53 @@ The synchronous public Rust `Database` methods remain available for source
 compatibility. Network frontends use `Engine`; retaining `Database` does not
 authorize an adapter to bypass the shared asynchronous boundary.
 
-### Planned common subset
+### Implemented structural common subset
 
-The first driver-capable SQL subset will include:
+The opt-in validator recursively admits these statement families:
 
-- `CREATE TABLE` and `CREATE INDEX` through journaled schema migrations;
-- `SELECT`, including documented filters, ordering, limits, and aggregates;
-- `INSERT`, `UPDATE`, and `DELETE` when a single shard can be proven;
-- `BEGIN`, `COMMIT`, and `ROLLBACK` for transactions pinned to one shard; and
-- protocol-neutral prepare, bind, describe, execute, and close operations.
+| Family | Structural contract |
+| --- | --- |
+| `CREATE TABLE` | One unqualified persistent table, optional `IF NOT EXISTS`, one or more columns with any explicit parsed type, and the supported literal defaults plus primary-key, unique, and check constraints |
+| `CREATE INDEX` | A named optional-unique index on plain columns of one unqualified table; `IF NOT EXISTS` and `ASC`/`DESC` are accepted |
+| `SELECT` | A nonempty projection with zero or one plain table; optional simple alias, `ALL`/`DISTINCT`, scalar filtering/grouping, `HAVING`, expression ordering, and standard numeric-or-placeholder limit/offset; PostgreSQL `LIMIT ALL` is parser-equivalent to no limit |
+| `INSERT` | One named table, an explicit column list unique under conservative ASCII case folding, and one or more equal-width `VALUES` rows |
+| `UPDATE` | One plain table, single-column assignments whose targets are unique under conservative ASCII case folding, and an optional predicate |
+| `DELETE` | One plain `FROM` table and an optional predicate |
+| Transactions | Plain `BEGIN`/`BEGIN TRANSACTION`/`BEGIN WORK`; the semantic commit AST including parser-accepted `TRANSACTION`/`WORK`/`TRAN` suffix aliases and explicit `AND NO CHAIN`; and the equivalent full-rollback AST including those forms and `ABORT`; no modes, `AND CHAIN`, blocks, or savepoints |
 
-The implemented parser supplies structured syntax without deciding support or
-routing. Later subset validation and planning will classify statements before
-execution. Writes with no provable shard, writes with conflicting shard keys,
-unsafe multi-statement requests, and cross-shard transactions will be rejected
-before changing data.
+Scalar expressions include the documented literals and placeholders,
+one-/two-part column references, arithmetic/comparison/Boolean operators,
+null/Boolean predicates, nonempty `IN`, `BETWEEN`, `LIKE` without `ESCAPE`, and
+`CASE`. Projection, `HAVING`, and ordering also admit unqualified, unquoted
+`COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` with one expression argument, including
+duplicate treatment; `COUNT(*)` is supported. Scalar functions, casts,
+subqueries, joins, CTEs, set operations, windows, DML `RETURNING`, upserts,
+foreign keys, generated columns, expression/partial indexes, and all other
+forms are outside this first subset. The exact clause, expression, constraint,
+name, and diagnostic rules are normative in
+[the common SQL subset contract](SQL_SUBSET.md).
+
+This implemented status means structural validation exists and is tested. It
+does not mean the subset is connected to execution. Column type names are only
+required to be explicit; type compatibility and translation remain issue #25.
+Insert/update duplicate checks fold ASCII letter case regardless of quoting but
+do not define general identifier normalization, which also remains issue #25.
+Placeholders remain unchanged for issue #21. Catalog-aware key extraction,
+single-shard proof, bind-time planning, and rejection of conflicting or
+unroutable writes remain issues #22 through #24. Prepare/bind/describe/execute
+state remains issue #26, and empty or multi-statement execution policy remains
+issue #27.
+
+The validator independently caps recursive expression AST depth at 128. This
+also bounds flat operator chains that parse iteratively; exceeding the limit is
+reported as `LimitExceeded`.
+
+The future driver-capable execution path will send `CREATE TABLE` and
+`CREATE INDEX` through journaled schema migrations, route accepted CRUD only after its
+single-shard or supported read plan is established, and implement real
+transactions through protocol-neutral session state. Writes with no provable
+shard, conflicting shard keys, unsafe statement combinations, and cross-shard
+transactions will be rejected before changing data.
 
 ## PostgreSQL differences
 

@@ -181,14 +181,49 @@ fn protocol_neutral_sql_parser_facade_is_public_bounded_and_opt_in() {
     assert_eq!(sql::MAX_PARSED_SQL_STATEMENTS, 256);
     assert_eq!(sql::SQL_PARSE_RECURSION_LIMIT, 32);
 
-    // The facade is infrastructure for the later common-subset planner. The
-    // existing raw SQLite path deliberately does not invoke it yet.
+    // Parsing and subset validation are opt-in infrastructure. The existing
+    // raw SQLite path deliberately does not invoke either layer yet.
     let temp = tempfile::tempdir().unwrap();
     let database = core::Database::open(temp.path(), 2).unwrap();
     let mut raw_sql = "SELECT 1".to_owned();
     raw_sql.push_str(&" ".repeat(sql::MAX_PARSED_SQL_BYTES));
     let result = database.query("parser-opt-in", &raw_sql, &[]).unwrap();
     assert_eq!(result.rows()[0].get(0), Some(&core::Value::Int64(1)));
+}
+
+#[test]
+fn common_sql_subset_validation_is_public_owned_and_opt_in() {
+    fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
+    assert_owned_public::<sql::CommonSql>();
+    assert_eq!(sql::MAX_COMMON_SQL_EXPRESSION_DEPTH, 128);
+
+    for (dialect, source) in [
+        (sql::SqlDialect::Sqlite, "SELECT ?1 AS value"),
+        (sql::SqlDialect::PostgreSql, "SELECT $1 AS value"),
+        (sql::SqlDialect::MySql, "SELECT ? AS value"),
+    ] {
+        let common = sql::validate_common_subset(sql::parse(dialect, source).unwrap()).unwrap();
+        assert_eq!(common.dialect(), dialect);
+        assert_eq!(common.source(), source);
+        assert_eq!(common.statement_count(), 1);
+        assert!(!common.is_empty());
+    }
+
+    let cte = "WITH answer(value) AS (VALUES (9)) SELECT value FROM answer";
+    let unsupported =
+        sql::validate_common_subset(sql::parse(sql::SqlDialect::Sqlite, cte.to_owned()).unwrap())
+            .unwrap_err();
+    assert_eq!(unsupported.kind(), core::EngineErrorKind::Unsupported);
+    assert!(!unsupported.diagnostic().contains(cte));
+
+    let malformed = sql::parse(sql::SqlDialect::Sqlite, "SELECT +").unwrap_err();
+    assert_eq!(malformed.kind(), core::EngineErrorKind::InvalidQuery);
+
+    // The structural validator does not alter the current execution path.
+    let temp = tempfile::tempdir().unwrap();
+    let database = core::Database::open(temp.path(), 2).unwrap();
+    let result = database.query("subset-opt-in", cte, &[]).unwrap();
+    assert_eq!(result.rows()[0].get(0), Some(&core::Value::Int64(9)));
 }
 
 #[test]

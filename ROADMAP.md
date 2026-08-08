@@ -202,7 +202,7 @@ interrupted schema migration can be diagnosed and resumed.
 
 - [x] Parse SQL into an AST using a maintained parser after a focused parser
   spike; do not route by regular expression.
-- [ ] Define the first common SQL subset: `CREATE TABLE`, indexes, `SELECT`,
+- [x] Define the first common SQL subset: `CREATE TABLE`, indexes, `SELECT`,
   `INSERT`, `UPDATE`, `DELETE`, `BEGIN`, `COMMIT`, and `ROLLBACK`.
 - [ ] Normalize placeholders (`$1`, PostgreSQL/MySQL `?`) to SQLite parameters
   without interpolating values into SQL text.
@@ -370,7 +370,8 @@ The first buildable slices should be small and merge independently:
 4. Define manifest schema v2 and golden routing vectors.
 5. Add the virtual-bucket map while test data can still be discarded.
 6. Add `Session`, transaction state, and one-shard pinning.
-7. Add SQL parsing and plan classification without syntax translation.
+7. Add SQL parsing and structural common-subset validation without syntax
+   translation.
 8. Infer routing for one-table equality CRUD and reject unroutable writes.
 9. Spike PostgreSQL simple-query connectivity end to end.
 10. Add PostgreSQL extended query flow, then reuse the same conformance suite
