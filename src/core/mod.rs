@@ -3,6 +3,7 @@
 //! This module owns routing and coordinates storage and SQL execution. It does
 //! not depend on a network protocol.
 
+mod catalog;
 mod control;
 mod engine;
 mod error;
@@ -13,6 +14,14 @@ mod session;
 mod types;
 pub(crate) mod worker;
 
+pub use catalog::{
+    Catalog, LogicalDatabaseId, LogicalDatabaseMetadata, ShardKeyMetadata, ShardKeyType, TableId,
+    TableMetadata, TablePlacement,
+};
+pub(crate) use catalog::{
+    CatalogSnapshot, DEFAULT_LOGICAL_DATABASE_ID, DEFAULT_LOGICAL_DATABASE_NAME,
+    IDENTIFIER_ENCODING_VERSION, MAX_LOGICAL_DATABASES, MAX_TABLES, validate_catalog_identifier,
+};
 pub(crate) use control::{
     CancelOnDrop, CancellationReason, OperationControl, wait_for_cancellation, wait_pending,
 };
@@ -63,6 +72,11 @@ impl Database {
 
     pub fn shard_count(&self) -> u16 {
         self.storage.shard_count()
+    }
+
+    /// Return the immutable logical database and table catalog.
+    pub fn catalog(&self) -> &Catalog {
+        self.storage.logical_catalog()
     }
 
     pub fn shard_for_key(&self, key: &[u8]) -> u16 {

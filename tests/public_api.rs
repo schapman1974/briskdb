@@ -1,5 +1,7 @@
 use std::{
+    path::Path,
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -9,6 +11,85 @@ use briskdb::{
     protocol::{error, http},
     server, storage,
 };
+
+fn insert_catalog_fixture(root: &Path) {
+    let manifest = rusqlite::Connection::open(root.join("manifest.sqlite")).unwrap();
+    manifest
+        .execute_batch(
+            "PRAGMA foreign_keys = ON;
+             BEGIN IMMEDIATE;
+             INSERT INTO briskdb_logical_databases (database_id, database_name)
+             VALUES (9, 'tenant');
+             INSERT INTO briskdb_tables (
+                table_id,
+                database_id,
+                table_name,
+                placement,
+                shard_key_column,
+                shard_key_type
+             ) VALUES
+                (20, 1, 'countries', 2, NULL, NULL),
+                (30, 9, 'accounts', 1, 'tenant_id', 2),
+                (40, 9, 'internal_catalog', 3, NULL, NULL);
+             COMMIT;",
+        )
+        .unwrap();
+}
+
+fn assert_catalog_fixture(catalog: &core::Catalog) {
+    assert_eq!(catalog.identifier_encoding_version(), 1);
+    assert_eq!(catalog.schema_generation(), 0);
+    assert_eq!(catalog.default_database().id().get(), 1);
+    assert_eq!(catalog.default_database().name(), "default");
+    assert_eq!(catalog.logical_databases().len(), 2);
+    assert_eq!(catalog.tables().len(), 3);
+
+    let tenant = catalog.database("tenant").unwrap().unwrap();
+    assert_eq!(tenant.id().get(), 9);
+    assert_eq!(tenant.id().to_string(), "9");
+    assert_eq!(catalog.database_by_id(tenant.id()), Some(tenant));
+
+    let countries = catalog.table("default", "countries").unwrap().unwrap();
+    assert_eq!(countries.id().get(), 20);
+    assert_eq!(countries.id().to_string(), "20");
+    assert_eq!(countries.database_id().get(), 1);
+    assert!(matches!(
+        countries.placement(),
+        core::TablePlacement::Global
+    ));
+    assert_eq!(
+        catalog.table_by_id(core::TableId::new(countries.id().get()).unwrap()),
+        Some(countries)
+    );
+
+    let accounts = catalog.table("tenant", "accounts").unwrap().unwrap();
+    assert_eq!(accounts.id().get(), 30);
+    assert_eq!(accounts.database_id(), tenant.id());
+    match accounts.placement() {
+        core::TablePlacement::Sharded(shard_key) => {
+            assert_eq!(shard_key.column(), "tenant_id");
+            assert_eq!(shard_key.key_type(), core::ShardKeyType::Text);
+        }
+        placement => panic!("unexpected accounts placement: {placement:?}"),
+    }
+
+    assert!(matches!(
+        catalog
+            .table("tenant", "internal_catalog")
+            .unwrap()
+            .unwrap()
+            .placement(),
+        core::TablePlacement::Catalog
+    ));
+    assert_eq!(
+        catalog
+            .tables()
+            .iter()
+            .map(|table| (table.database_id().get(), table.name()))
+            .collect::<Vec<_>>(),
+        [(1, "countries"), (9, "accounts"), (9, "internal_catalog")]
+    );
+}
 
 #[test]
 fn legacy_and_explicit_module_paths_are_both_available() {
@@ -58,6 +139,60 @@ fn legacy_and_explicit_module_paths_are_both_available() {
         error::mysql_error(core::EngineErrorKind::UniqueViolation).error_number,
         1062
     );
+}
+
+#[test]
+fn logical_catalog_types_and_access_are_public_and_protocol_neutral() {
+    fn assert_public_metadata<T: Clone + Send + Sync + 'static>() {}
+
+    assert_public_metadata::<core::Catalog>();
+    assert_public_metadata::<core::LogicalDatabaseId>();
+    assert_public_metadata::<core::LogicalDatabaseMetadata>();
+    assert_public_metadata::<core::TableId>();
+    assert_public_metadata::<core::TableMetadata>();
+    assert_public_metadata::<core::TablePlacement>();
+    assert_public_metadata::<core::ShardKeyMetadata>();
+    assert_public_metadata::<core::ShardKeyType>();
+
+    let _signed = core::ShardKeyType::Int64;
+    let _text = core::ShardKeyType::Text;
+    let _binary = core::ShardKeyType::Binary;
+    let _global = core::TablePlacement::Global;
+    let _catalog = core::TablePlacement::Catalog;
+
+    let temp = tempfile::tempdir().unwrap();
+    let database = Arc::new(core::Database::open(temp.path(), 4).unwrap());
+    let catalog: &core::Catalog = database.catalog();
+    let default: &core::LogicalDatabaseMetadata = catalog.default_database();
+    let default_id: core::LogicalDatabaseId = default.id();
+    let reconstructed_default = core::LogicalDatabaseId::new(default_id.get()).unwrap();
+
+    assert_eq!(catalog.identifier_encoding_version(), 1);
+    assert_eq!(catalog.schema_generation(), 0);
+    assert_eq!(default_id.get(), 1);
+    assert_eq!(default_id.to_string(), "1");
+    assert_eq!(catalog.database_by_id(reconstructed_default), Some(default));
+    assert_eq!(default.name(), "default");
+    assert_eq!(catalog.logical_databases(), std::slice::from_ref(default));
+    assert!(catalog.tables().is_empty());
+    assert_eq!(catalog.database_by_id(default_id), Some(default));
+    assert_eq!(catalog.database("missing").unwrap(), None);
+    assert_eq!(catalog.table("default", "missing").unwrap(), None);
+    assert_eq!(
+        core::LogicalDatabaseId::new(0).unwrap_err().kind(),
+        core::EngineErrorKind::InvalidArgument
+    );
+    assert_eq!(
+        core::TableId::new(0).unwrap_err().kind(),
+        core::EngineErrorKind::InvalidArgument
+    );
+    assert_eq!(
+        catalog.database("NotCanonical").unwrap_err().kind(),
+        core::EngineErrorKind::InvalidArgument
+    );
+
+    let engine = core::Engine::from_database(Arc::clone(&database));
+    assert!(std::ptr::eq(engine.catalog(), database.catalog()));
 }
 
 #[test]
@@ -199,4 +334,142 @@ async fn default_and_wrapped_database_engine_constructors_remain_available() {
     assert_eq!(status.max_blocking_workers(), 12);
     assert_eq!(status.connections_per_shard(), 3);
     assert_eq!(status.queue_capacity_per_shard(), 11);
+}
+
+#[test]
+fn catalog_snapshot_is_immutable_and_reopen_observes_only_valid_commits() {
+    let temp = tempfile::tempdir().unwrap();
+    let keys: [&[u8]; 5] = [
+        b"",
+        b"customer-42",
+        b"a\0b",
+        &[0, 1, 2, 0xff],
+        "snowman-☃".as_bytes(),
+    ];
+    let database = core::Database::open(temp.path(), 10).unwrap();
+    let expected_routes = keys.map(|key| database.shard_for_key(key));
+    assert_eq!(database.catalog().logical_databases().len(), 1);
+    assert!(database.catalog().tables().is_empty());
+
+    insert_catalog_fixture(temp.path());
+
+    assert_eq!(database.catalog().logical_databases().len(), 1);
+    assert!(database.catalog().tables().is_empty());
+    assert_eq!(database.catalog().database("tenant").unwrap(), None);
+    assert_eq!(keys.map(|key| database.shard_for_key(key)), expected_routes);
+
+    let reopened = core::Database::open(temp.path(), 10).unwrap();
+    assert_catalog_fixture(reopened.catalog());
+    assert_eq!(keys.map(|key| reopened.shard_for_key(key)), expected_routes);
+
+    let manifest = rusqlite::Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+    manifest
+        .execute_batch(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE briskdb_tables SET placement = 99 WHERE table_id = 30;
+             PRAGMA ignore_check_constraints = OFF;",
+        )
+        .unwrap();
+    drop(manifest);
+
+    assert_catalog_fixture(reopened.catalog());
+    assert_eq!(keys.map(|key| reopened.shard_for_key(key)), expected_routes);
+    let error = core::Database::open(temp.path(), 10).unwrap_err();
+    assert_eq!(error.kind(), core::EngineErrorKind::DataCorruption);
+
+    assert_eq!(database.catalog().logical_databases().len(), 1);
+    assert!(database.catalog().tables().is_empty());
+    assert_eq!(keys.map(|key| database.shard_for_key(key)), expected_routes);
+}
+
+#[test]
+fn database_and_engine_catalog_reads_are_deterministic_in_parallel() {
+    let temp = tempfile::tempdir().unwrap();
+    drop(core::Database::open(temp.path(), 6).unwrap());
+    insert_catalog_fixture(temp.path());
+
+    let database = Arc::new(core::Database::open(temp.path(), 6).unwrap());
+    let engine = core::Engine::from_database(Arc::clone(&database));
+    assert!(std::ptr::eq(database.catalog(), engine.catalog()));
+    assert_catalog_fixture(database.catalog());
+
+    let expected_catalog = Arc::new(database.catalog().clone());
+    let expected_shard = database.shard_for_key(b"parallel-catalog");
+    let workers = (0..8)
+        .map(|_| {
+            let database = Arc::clone(&database);
+            let engine = engine.clone();
+            let expected_catalog = Arc::clone(&expected_catalog);
+            thread::spawn(move || {
+                for _ in 0..2_000 {
+                    assert_eq!(database.catalog(), expected_catalog.as_ref());
+                    assert_eq!(engine.catalog(), expected_catalog.as_ref());
+                    assert_eq!(
+                        database
+                            .catalog()
+                            .table("tenant", "accounts")
+                            .unwrap()
+                            .unwrap()
+                            .id()
+                            .get(),
+                        30
+                    );
+                    assert_eq!(database.shard_for_key(b"parallel-catalog"), expected_shard);
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn broadcast_created_shard_tables_are_not_inferred_into_the_catalog() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = core::Database::open(temp.path(), 4).unwrap();
+    database
+        .broadcast(
+            "CREATE TABLE physical_widgets (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+    database
+        .execute(
+            "tenant-1",
+            "INSERT INTO physical_widgets (id, tenant_id) VALUES (?1, ?2)",
+            &[core::Value::from("widget-1"), core::Value::from("tenant-1")],
+        )
+        .unwrap();
+
+    assert!(database.catalog().tables().is_empty());
+    assert_eq!(
+        database
+            .catalog()
+            .table("default", "physical_widgets")
+            .unwrap(),
+        None
+    );
+    drop(database);
+
+    let reopened = core::Database::open(temp.path(), 4).unwrap();
+    assert!(reopened.catalog().tables().is_empty());
+    assert_eq!(
+        reopened
+            .catalog()
+            .table("default", "physical_widgets")
+            .unwrap(),
+        None
+    );
+    let rows = reopened
+        .query(
+            "tenant-1",
+            "SELECT id, tenant_id FROM physical_widgets WHERE id = ?1",
+            &[core::Value::from("widget-1")],
+        )
+        .unwrap();
+    assert_eq!(rows.rows().len(), 1);
 }

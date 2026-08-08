@@ -186,7 +186,7 @@ existing tests pass through the shared engine.
   records, map generation, and lifecycle state.
 - [x] Replace modulo routing with virtual-bucket lookup and add golden routing
   vectors so upgrades cannot silently move keys.
-- [ ] Add logical databases and table metadata, including table placement and
+- [x] Add logical databases and table metadata, including table placement and
   shard-key column/type.
 - [ ] Validate at startup that every shard is present, uses WAL, has the expected
   application ID/user version, and matches the cataloged schema generation.

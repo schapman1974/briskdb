@@ -21,8 +21,8 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, and errors; stable key routing; bounded per-shard admission and connection pools; routed execute/query and schema broadcast | JSON/HTTP types, listeners, or Axum handlers |
-| `storage` | Manifest and shard layout, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, errors, and immutable logical catalog; stable key routing; bounded per-shard admission and connection pools; routed execute/query and schema broadcast | JSON/HTTP types, listeners, or Axum handlers |
+| `storage` | Versioned routing/logical manifest, shard layout, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `sql` | SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, filesystem layout, or protocol responses |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
@@ -78,12 +78,24 @@ The storage module owns an ordered manifest-format migration runner. It
 identifies a current manifest with SQLite `application_id = 0x42524442` and uses
 `user_version` as the single authoritative schema version. Version 2 replaced
 the legacy key/value configuration with a strict singleton shard-count table.
-Version 3 adds the durable routing catalog: independently versioned hash, key
+Version 3 added the durable routing catalog: independently versioned hash, key
 encoding, and bucket derivation; the initial map generation; exactly 4,096
-virtual buckets; and contiguous, active physical-shard records. Each version
-retains an intentionally incompatible `briskdb_metadata` definition and row as
-a downgrade fence. Shipped version-1 and version-2 readers therefore fail
-closed instead of interpreting a newer manifest.
+virtual buckets; and contiguous, active physical-shard records. Version 4 adds
+logical databases, table metadata, and an application-schema generation. Its
+initial catalog has schema generation 0, identifier encoding version 1, and
+default logical database ID 1 named `default`. Version-1 identifiers are 1 to
+63 bytes of lowercase ASCII, begin with a letter or underscore, and exclude
+the reserved `briskdb`, `briskdb_*`, and `sqlite_*` namespaces. Table metadata
+records a stable positive ID, owning database, name, and one of sharded,
+global, or catalog placement; only a sharded table also records one `Int64`,
+text, or binary shard-key column.
+
+Each version retains an intentionally incompatible `briskdb_metadata`
+definition and row as a downgrade fence. The v3-to-v4 migration replaces that
+fence, creates the logical tables and initial rows, validates the complete v4
+destination, and stamps version 4 in the same manifest transaction. Failure
+rolls the step back to the exact committed v3 state; a v3 binary rejects a
+committed v4 manifest rather than interpreting it.
 
 Startup acquires `BEGIN IMMEDIATE` before making any migration decision. Each
 registered numbered step rewrites schema/data, stamps and reads back its target
@@ -94,18 +106,29 @@ be retried. Persistent WAL configuration and shard creation occur only after a
 compatible current manifest is committed, so rejecting a foreign or future
 manifest does not rewrite its journal mode or touch shard files.
 
-This is an internal storage-open concern. It changes no core or adapter
-signature, is unreachable from client SQL, and is atomic only within
-`manifest.sqlite`. Validation returns an immutable catalog snapshot from the
-same locked transaction; `Storage` shares it across clones. Core routing hashes
-the exact key bytes, derives a versioned virtual bucket, and reads the final
-physical shard from that snapshot without querying SQLite. The generation-1
-bucket ranges reproduce prior modulo placement for every supported initial
-shard count, including counts that do not divide 4,096. The catalog does not yet
-validate shard-file presence, identity, WAL, or schema
-generation, and it is not the future cross-shard application-schema migration
-journal. The exact format, downgrade policy, recovery cases, and tests are
-documented in [manifest storage format](STORAGE_FORMAT.md).
+This is an internal storage-open concern, is unreachable from client SQL, and
+is atomic only within `manifest.sqlite`. Validation returns routing and logical
+metadata from the same locked transaction as one immutable snapshot that
+`Storage` shares across clones. `Database::catalog()` and `Engine::catalog()`
+expose the logical portion as a read-only `Catalog` with lookup accessors.
+
+The version-4 logical catalog is advisory: there is no catalog mutation API,
+planner integration, or schema enforcement yet. Fresh and upgraded manifests
+contain no table rows, and migration does not inspect, infer, or adopt physical
+tables already present in shard files. Those tables remain reachable through
+the existing explicit-key execute/query and broadcast surfaces. Core routing
+still hashes the exact caller-provided key bytes, derives a versioned virtual
+bucket, and reads the final physical shard from the snapshot without querying
+SQLite. The generation-1 ranges reproduce prior modulo placement for every
+supported initial shard count, including counts that do not divide 4,096.
+Consequently v4 changes no current SQL execution, HTTP behavior, routing result,
+or shard file.
+
+The catalog does not yet validate shard-file presence, identity, WAL, or the
+cataloged schema generation against shard files, and it is not the future
+cross-shard application-schema migration journal. The exact format, numeric
+codes, downgrade policy, recovery cases, and tests are documented in
+[manifest storage format](STORAGE_FORMAT.md).
 
 ## Session and asynchronous engine boundary
 

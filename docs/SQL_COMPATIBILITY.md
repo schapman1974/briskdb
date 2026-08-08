@@ -332,8 +332,15 @@ underlying execution semantics.
   prefix selects one of 4,096 virtual buckets through the versioned
   compatibility algorithm.
 - The final physical shard is read from the validated, generation-stamped
-  bucket map loaded from manifest version 3. Generation 1 preserves the earlier
-  modulo placement for every supported shard count.
+  bucket map retained in manifest version 4. Routing generation 1 preserves
+  the earlier modulo placement for every supported shard count.
+- Manifest version 4 also exposes an immutable logical catalog with schema
+  generation 0 and default database ID 1 named `default`. Its optional table
+  rows can describe sharded, global, or catalog placement and a sharded table's
+  `Int64`, text, or binary key column.
+- Logical metadata is currently read-only and advisory. Fresh and upgraded
+  manifests contain no table rows, existing physical tables are not inferred
+  or adopted, and catalog contents do not alter SQL planning or execution.
 - Point queries and writes visit only that shard.
 - No scatter/gather query path exists.
 - Unique constraints and transactions are local to one SQLite shard.
@@ -365,8 +372,10 @@ reject cross-shard access.
 Manifest-format migrations are separate from application SQL migrations. They
 run internally during storage open, are transactional only within
 `manifest.sqlite`, and cannot be requested through any protocol or SQL
-statement. The version-3 manifest upgrade does not change shard schemas,
-supported SQLite syntax, result conversion, routing, or broadcast semantics.
+statement. The atomic version-3-to-version-4 manifest upgrade adds only
+read-only advisory logical metadata and its downgrade fence. It does not infer
+or adopt existing physical tables and does not change shard schemas, supported
+SQLite syntax, result conversion, routing, or broadcast semantics.
 See the [manifest storage-format contract](STORAGE_FORMAT.md).
 
 Scatter reads will combine committed results from multiple SQLite files. They
