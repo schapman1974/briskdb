@@ -56,6 +56,18 @@ cargo +1.85.0 test --locked --doc --all-features
 Run targeted integration, compatibility, benchmark, or failure suites when the
 change touches those areas. The pull request must list every check performed.
 
+Storage-path changes must also run the benchmark correctness tests and smoke
+mode before publishing:
+
+```bash
+cargo test --locked --test benchmark_workloads
+cargo test --locked --bench storage
+```
+
+Run `cargo bench --locked --bench storage` on a quiet machine when collecting
+timings. Performance comparisons are meaningful only on the same machine and
+filesystem; see [the benchmark contract](docs/BENCHMARKS.md).
+
 ## Pull request loop
 
 1. Confirm the issue scope and acceptance criteria.

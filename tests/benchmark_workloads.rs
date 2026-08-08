@@ -1,0 +1,47 @@
+#[path = "../benches/support/mod.rs"]
+mod support;
+
+use support::{BENCHMARK_SHARDS, BenchmarkFixture};
+
+#[test]
+fn point_read_returns_the_seeded_row() {
+    let fixture = BenchmarkFixture::new().unwrap();
+
+    let rows = fixture.point_read().unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], fixture.keys_by_shard()[0]);
+    assert_eq!(rows[0]["writes"], 0);
+    assert_eq!(rows[0]["payload"], "baseline payload");
+}
+
+#[test]
+fn point_write_updates_exactly_one_row() {
+    let fixture = BenchmarkFixture::new().unwrap();
+
+    assert_eq!(fixture.point_write().unwrap(), 1);
+    assert_eq!(fixture.point_write().unwrap(), 1);
+
+    assert_eq!(fixture.write_count(0).unwrap(), 2);
+}
+
+#[test]
+fn concurrent_write_wave_updates_one_key_on_every_shard() {
+    let fixture = BenchmarkFixture::new().unwrap();
+    for (shard, key) in fixture.keys_by_shard().iter().enumerate() {
+        assert_eq!(usize::from(fixture.shard_for_key(key)), shard);
+    }
+
+    assert_eq!(
+        fixture.four_shard_concurrent_write_wave().unwrap(),
+        [1; BENCHMARK_SHARDS as usize]
+    );
+    assert_eq!(
+        fixture.four_shard_concurrent_write_wave().unwrap(),
+        [1; BENCHMARK_SHARDS as usize]
+    );
+
+    for shard in 0..BENCHMARK_SHARDS as usize {
+        assert_eq!(fixture.write_count(shard).unwrap(), 2);
+    }
+}
