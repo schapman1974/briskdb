@@ -8,6 +8,7 @@ mod engine;
 mod error;
 mod lifecycle;
 mod options;
+mod routing;
 mod session;
 mod types;
 pub(crate) mod worker;
@@ -25,6 +26,10 @@ pub use options::{
     DEFAULT_QUEUE_CAPACITY_PER_SHARD, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_SHUTDOWN_GRACE_MS,
     EngineOptions, MAX_CONNECTIONS_PER_SHARD, MAX_QUEUE_CAPACITY_PER_SHARD, MAX_REQUEST_TIMEOUT_MS,
     MAX_RESULT_BYTES, MAX_RESULT_ROWS, MAX_SHUTDOWN_GRACE_MS, ResultLimits,
+};
+pub(crate) use routing::{
+    BUCKET_ALGORITHM_VERSION, HASH_VERSION, INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION,
+    RoutingCatalog, VIRTUAL_BUCKET_COUNT, initial_physical_shard,
 };
 pub use session::{Session, SessionId, SessionState};
 pub use types::{
@@ -61,11 +66,7 @@ impl Database {
     }
 
     pub fn shard_for_key(&self, key: &[u8]) -> u16 {
-        let digest = blake3::hash(key);
-        let prefix: [u8; 8] = digest.as_bytes()[..8]
-            .try_into()
-            .expect("BLAKE3 digest always contains eight bytes");
-        (u64::from_le_bytes(prefix) % u64::from(self.shard_count())) as u16
+        self.storage.shard_for_key(key)
     }
 
     pub fn execute_routed(
@@ -141,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_creation_does_not_activate_bucket_routing_early() {
+    fn catalog_lookup_preserves_legacy_v1_placement() {
         let keys: [&[u8]; 6] = [
             b"",
             b"customer-42",
@@ -150,7 +151,7 @@ mod tests {
             &[0, 1, 2, 0xff],
             "snowman-☃".as_bytes(),
         ];
-        for shard_count in [3_u16, 5, 7, 63] {
+        for shard_count in [3_u16, 5, 6, 10, 63, 64] {
             let temp = tempfile::tempdir().unwrap();
             let database = Database::open(temp.path(), shard_count).unwrap();
             for key in keys {
@@ -162,6 +163,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn routing_is_stable_across_close_and_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys: [&[u8]; 6] = [
+            b"",
+            b"customer-42",
+            b"tenant/alpha",
+            b"a\0b",
+            &[0, 1, 2, 0xff],
+            "snowman-☃".as_bytes(),
+        ];
+        let before = {
+            let database = Database::open(temp.path(), 10).unwrap();
+            keys.map(|key| database.shard_for_key(key))
+        };
+
+        let reopened = Database::open(temp.path(), 10).unwrap();
+        assert_eq!(
+            keys.map(|key| reopened.shard_for_key(key)),
+            before,
+            "reopening must load the same persisted routing snapshot"
+        );
+    }
+
+    #[test]
+    fn an_open_database_routes_from_its_immutable_validated_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Database::open(temp.path(), 4).unwrap();
+        let keys: [&[u8]; 4] = [b"alpha", b"beta", b"a\0b", &[0, 1, 2, 0xff]];
+        let expected = keys.map(|key| database.shard_for_key(key));
+
+        let manifest = rusqlite::Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+        manifest
+            .execute(
+                "UPDATE briskdb_virtual_buckets
+                 SET physical_shard_id = (physical_shard_id + 1) % 4",
+                [],
+            )
+            .unwrap();
+        drop(manifest);
+
+        assert_eq!(keys.map(|key| database.shard_for_key(key)), expected);
+        let error = Database::open(temp.path(), 4).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
     }
 
     #[test]

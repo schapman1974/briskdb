@@ -184,7 +184,7 @@ existing tests pass through the shared engine.
 - [x] Version the manifest schema with transactional migrations.
 - [x] Persist hash/key-encoding versions, 4,096 virtual buckets, physical shard
   records, map generation, and lifecycle state.
-- [ ] Replace modulo routing with virtual-bucket lookup and add golden routing
+- [x] Replace modulo routing with virtual-bucket lookup and add golden routing
   vectors so upgrades cannot silently move keys.
 - [ ] Add logical databases and table metadata, including table placement and
   shard-key column/type.

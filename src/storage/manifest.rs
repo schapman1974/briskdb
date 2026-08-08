@@ -3,7 +3,11 @@
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::{
-    core::{EngineError, EngineErrorKind, EngineResult},
+    core::{
+        BUCKET_ALGORITHM_VERSION, EngineError, EngineErrorKind, EngineResult, HASH_VERSION,
+        INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION, RoutingCatalog, VIRTUAL_BUCKET_COUNT,
+        initial_physical_shard,
+    },
     sqlite_error,
 };
 
@@ -14,12 +18,6 @@ const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
 pub(super) const CURRENT_SCHEMA_VERSION: u32 = V3_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
-
-pub(super) const HASH_VERSION: u32 = 1;
-pub(super) const KEY_ENCODING_VERSION: u32 = 1;
-pub(super) const BUCKET_ALGORITHM_VERSION: u32 = 1;
-pub(super) const VIRTUAL_BUCKET_COUNT: u16 = 4_096;
-pub(super) const INITIAL_MAP_GENERATION: u64 = 1;
 
 const ACTIVE_LIFECYCLE_STATE: &str = "active";
 
@@ -57,13 +55,27 @@ const V3_VIRTUAL_BUCKETS_TABLE_SQL: &str = "CREATE TABLE briskdb_virtual_buckets
     FOREIGN KEY (physical_shard_id) REFERENCES briskdb_physical_shards (shard_id)
 ) STRICT";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoutingConfiguration {
+    hash_version: u32,
+    key_encoding_version: u32,
+    bucket_algorithm_version: u32,
+    map_generation: u64,
+}
+
 #[derive(Clone, Copy)]
 struct Migration {
     from: u32,
     to: u32,
     name: &'static str,
     apply: fn(&Transaction<'_>, u16) -> EngineResult<()>,
-    validate: fn(&Connection, u16, &[SchemaObject]) -> EngineResult<u16>,
+    validate: fn(&Connection, u16, &[SchemaObject]) -> EngineResult<ManifestSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestSnapshot {
+    shard_count: u16,
+    routing_catalog: Option<RoutingCatalog>,
 }
 
 const MIGRATIONS: &[Migration] = &[
@@ -116,12 +128,17 @@ struct MigrationPoint {
     phase: MigrationPhase,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ManifestState {
     Empty,
     LegacyUninitialized,
-    LegacyV1 { shard_count: u16 },
-    Versioned { version: u32, shard_count: u16 },
+    LegacyV1 {
+        shard_count: u16,
+    },
+    Versioned {
+        version: u32,
+        snapshot: ManifestSnapshot,
+    },
 }
 
 /// Initialize or advance the manifest under an immediate transaction.
@@ -129,6 +146,20 @@ enum ManifestState {
 /// The state is inspected again after the write lock is acquired, so two
 /// concurrent openers cannot both act on a stale version. Each numbered
 /// migration owns its transaction and stamps the new version last.
+pub(super) fn load_or_create_catalog(
+    connection: &mut Connection,
+    requested_shards: u16,
+) -> EngineResult<RoutingCatalog> {
+    let snapshot = load_or_create_snapshot_with_hook(connection, requested_shards, |_| Ok(()))?;
+    snapshot.routing_catalog.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "current manifest validation did not produce a routing catalog",
+        )
+    })
+}
+
+#[cfg(test)]
 pub(super) fn load_or_create(
     connection: &mut Connection,
     requested_shards: u16,
@@ -136,6 +167,7 @@ pub(super) fn load_or_create(
     load_or_create_with_hook(connection, requested_shards, |_| Ok(()))
 }
 
+#[cfg(test)]
 fn load_or_create_with_hook<F>(
     connection: &mut Connection,
     requested_shards: u16,
@@ -144,15 +176,27 @@ fn load_or_create_with_hook<F>(
 where
     F: FnMut(MigrationPoint) -> EngineResult<()>,
 {
-    load_or_create_with_plan(connection, requested_shards, CURRENT_PLAN, &mut hook)
+    load_or_create_snapshot_with_plan(connection, requested_shards, CURRENT_PLAN, &mut hook)
+        .map(|snapshot| snapshot.shard_count)
 }
 
-fn load_or_create_with_plan<F>(
+fn load_or_create_snapshot_with_hook<F>(
+    connection: &mut Connection,
+    requested_shards: u16,
+    mut hook: F,
+) -> EngineResult<ManifestSnapshot>
+where
+    F: FnMut(MigrationPoint) -> EngineResult<()>,
+{
+    load_or_create_snapshot_with_plan(connection, requested_shards, CURRENT_PLAN, &mut hook)
+}
+
+fn load_or_create_snapshot_with_plan<F>(
     connection: &mut Connection,
     requested_shards: u16,
     plan: MigrationPlan<'_>,
     hook: &mut F,
-) -> EngineResult<u16>
+) -> EngineResult<ManifestSnapshot>
 where
     F: FnMut(MigrationPoint) -> EngineResult<()>,
 {
@@ -162,12 +206,9 @@ where
             .map_err(sqlite_error::storage)?;
 
         let (from, shard_count) = match inspect_with_plan(&transaction, requested_shards, plan)? {
-            ManifestState::Versioned {
-                version,
-                shard_count,
-            } if version == plan.current_version => {
+            ManifestState::Versioned { version, snapshot } if version == plan.current_version => {
                 transaction.commit().map_err(sqlite_error::storage)?;
-                return Ok(shard_count);
+                return Ok(snapshot);
             }
             ManifestState::Empty => {
                 return apply_schema_change(
@@ -184,10 +225,7 @@ where
             }
             ManifestState::LegacyUninitialized => (LEGACY_SCHEMA_VERSION, requested_shards),
             ManifestState::LegacyV1 { shard_count } => (LEGACY_SCHEMA_VERSION, shard_count),
-            ManifestState::Versioned {
-                version,
-                shard_count,
-            } => (version, shard_count),
+            ManifestState::Versioned { version, snapshot } => (version, snapshot.shard_count),
         };
 
         let migration = migration_from(plan.migrations, from)?;
@@ -236,7 +274,7 @@ fn apply_schema_change<F>(
     change: SchemaChange,
     plan: MigrationPlan<'_>,
     hook: &mut F,
-) -> EngineResult<u16>
+) -> EngineResult<ManifestSnapshot>
 where
     F: FnMut(MigrationPoint) -> EngineResult<()>,
 {
@@ -255,12 +293,9 @@ where
     })?;
 
     match inspect_with_plan(&transaction, shard_count, plan)? {
-        ManifestState::Versioned {
-            version,
-            shard_count: validated,
-        } if version == change.to => {
+        ManifestState::Versioned { version, snapshot } if version == change.to => {
             transaction.commit().map_err(sqlite_error::storage)?;
-            Ok(validated)
+            Ok(snapshot)
         }
         _ => Err(EngineError::new(
             EngineErrorKind::Internal,
@@ -393,30 +428,6 @@ fn migrate_v2_to_v3(transaction: &Transaction<'_>, shard_count: u16) -> EngineRe
     Ok(())
 }
 
-/// Partition the virtual bucket space into deterministic contiguous ranges.
-///
-/// Hash version 1 will choose a range using the legacy `hash % shard_count`
-/// result, then choose a bucket within that range. Consequently, activating
-/// catalog lookup can preserve every existing placement even when the shard
-/// count does not divide 4,096.
-fn initial_physical_shard(bucket_id: u16, shard_count: u16) -> u16 {
-    debug_assert!((2..=64).contains(&shard_count));
-    debug_assert!(bucket_id < VIRTUAL_BUCKET_COUNT);
-
-    let bucket_count = u32::from(VIRTUAL_BUCKET_COUNT);
-    let shard_count = u32::from(shard_count);
-    let bucket_id = u32::from(bucket_id);
-    let base_size = bucket_count / shard_count;
-    let wider_shards = bucket_count % shard_count;
-    let wider_span = (base_size + 1) * wider_shards;
-    let shard = if bucket_id < wider_span {
-        bucket_id / (base_size + 1)
-    } else {
-        wider_shards + (bucket_id - wider_span) / base_size
-    };
-    u16::try_from(shard).expect("a virtual bucket maps to a supported shard")
-}
-
 fn set_identity(connection: &Connection, version: u32) -> EngineResult<()> {
     connection
         .pragma_update(None, "application_id", MANIFEST_APPLICATION_ID)
@@ -479,12 +490,8 @@ fn inspect_with_plan(
                     ),
                 )
             })?;
-        return validator(connection, requested_shards, &objects).map(|shard_count| {
-            ManifestState::Versioned {
-                version,
-                shard_count,
-            }
-        });
+        return validator(connection, requested_shards, &objects)
+            .map(|snapshot| ManifestState::Versioned { version, snapshot });
     }
 
     if application_id != 0 {
@@ -836,7 +843,7 @@ fn validate_v2(
     connection: &Connection,
     requested_shards: u16,
     objects: &[SchemaObject],
-) -> EngineResult<u16> {
+) -> EngineResult<ManifestSnapshot> {
     if objects != v2_objects() {
         return Err(EngineError::new(
             EngineErrorKind::DataCorruption,
@@ -869,14 +876,17 @@ fn validate_v2(
 
     let shard_count = validate_manifest_configuration(connection, requested_shards)?;
     validate_downgrade_fence(connection, V2_SCHEMA_VERSION)?;
-    Ok(shard_count)
+    Ok(ManifestSnapshot {
+        shard_count,
+        routing_catalog: None,
+    })
 }
 
 fn validate_v3(
     connection: &Connection,
     requested_shards: u16,
     objects: &[SchemaObject],
-) -> EngineResult<u16> {
+) -> EngineResult<ManifestSnapshot> {
     if objects != v3_objects() {
         return Err(EngineError::new(
             EngineErrorKind::DataCorruption,
@@ -952,11 +962,21 @@ fn validate_v3(
 
     let shard_count = validate_manifest_configuration(connection, requested_shards)?;
     validate_downgrade_fence(connection, V3_SCHEMA_VERSION)?;
-    validate_routing_configuration(connection)?;
+    let routing = validate_routing_configuration(connection)?;
     validate_physical_shards(connection, shard_count)?;
-    validate_virtual_buckets(connection, shard_count)?;
+    let buckets = validate_virtual_buckets(connection, shard_count)?;
     validate_foreign_keys(connection)?;
-    Ok(shard_count)
+    Ok(ManifestSnapshot {
+        shard_count,
+        routing_catalog: Some(RoutingCatalog::from_validated_parts(
+            shard_count,
+            routing.hash_version,
+            routing.key_encoding_version,
+            routing.bucket_algorithm_version,
+            routing.map_generation,
+            buckets,
+        )),
+    })
 }
 
 fn validate_manifest_configuration(
@@ -1008,7 +1028,7 @@ fn validate_downgrade_fence(connection: &Connection, expected_version: u32) -> E
     Ok(())
 }
 
-fn validate_routing_configuration(connection: &Connection) -> EngineResult<()> {
+fn validate_routing_configuration(connection: &Connection) -> EngineResult<RoutingConfiguration> {
     let mut statement = connection
         .prepare(
             "SELECT singleton,
@@ -1088,7 +1108,12 @@ fn validate_routing_configuration(connection: &Connection) -> EngineResult<()> {
             format!("manifest has unsupported map generation {map_generation}"),
         ));
     }
-    Ok(())
+    Ok(RoutingConfiguration {
+        hash_version: HASH_VERSION,
+        key_encoding_version: KEY_ENCODING_VERSION,
+        bucket_algorithm_version: BUCKET_ALGORITHM_VERSION,
+        map_generation,
+    })
 }
 
 fn validate_physical_shards(connection: &Connection, shard_count: u16) -> EngineResult<()> {
@@ -1133,7 +1158,7 @@ fn validate_physical_shards(connection: &Connection, shard_count: u16) -> Engine
     Ok(())
 }
 
-fn validate_virtual_buckets(connection: &Connection, shard_count: u16) -> EngineResult<()> {
+fn validate_virtual_buckets(connection: &Connection, shard_count: u16) -> EngineResult<Box<[u16]>> {
     let mut statement = connection
         .prepare(
             "SELECT bucket_id, physical_shard_id
@@ -1158,6 +1183,7 @@ fn validate_virtual_buckets(connection: &Connection, shard_count: u16) -> Engine
     }
 
     let mut assignments = vec![0_u16; usize::from(shard_count)];
+    let mut buckets = Vec::with_capacity(usize::from(VIRTUAL_BUCKET_COUNT));
     for (expected, (stored_bucket, stored_shard)) in (0..VIRTUAL_BUCKET_COUNT).zip(rows) {
         if stored_bucket != i64::from(expected) {
             return Err(EngineError::new(
@@ -1185,6 +1211,7 @@ fn validate_virtual_buckets(connection: &Connection, shard_count: u16) -> Engine
             ));
         }
         assignments[usize::from(stored_shard)] += 1;
+        buckets.push(stored_shard);
     }
     if let Some(unassigned) = assignments.iter().position(|count| *count == 0) {
         return Err(EngineError::new(
@@ -1192,7 +1219,7 @@ fn validate_virtual_buckets(connection: &Connection, shard_count: u16) -> Engine
             format!("active physical shard {unassigned} has no virtual buckets"),
         ));
     }
-    Ok(())
+    Ok(buckets.into_boxed_slice())
 }
 
 fn validate_foreign_keys(connection: &Connection) -> EngineResult<()> {
@@ -1519,19 +1546,28 @@ mod tests {
     fn fresh_and_v2_upgraded_catalogs_are_identical_for_every_shard_count() {
         for shard_count in 2..=64 {
             let mut fresh = Connection::open_in_memory().unwrap();
-            assert_eq!(
-                load_or_create(&mut fresh, shard_count).unwrap(),
-                shard_count
-            );
+            let fresh_catalog = load_or_create_catalog(&mut fresh, shard_count).unwrap();
+            assert_eq!(fresh_catalog.shard_count(), shard_count);
             assert_generation_one_catalog(&fresh, shard_count);
 
             let mut upgraded = Connection::open_in_memory().unwrap();
             create_v2_manifest(&mut upgraded, shard_count);
-            assert_eq!(
-                load_or_create(&mut upgraded, shard_count).unwrap(),
-                shard_count
-            );
+            let upgraded_catalog = load_or_create_catalog(&mut upgraded, shard_count).unwrap();
+            assert_eq!(upgraded_catalog.shard_count(), shard_count);
             assert_generation_one_catalog(&upgraded, shard_count);
+            assert_eq!(fresh_catalog, upgraded_catalog);
+            for key in [
+                b"".as_slice(),
+                b"customer-42".as_slice(),
+                b"a\0b".as_slice(),
+                [0_u8, 1, 2, 0xff].as_slice(),
+                "snowman-☃".as_bytes(),
+            ] {
+                assert_eq!(
+                    fresh_catalog.shard_for_key(key),
+                    upgraded_catalog.shard_for_key(key)
+                );
+            }
             assert_eq!(
                 routing_configuration(&fresh),
                 routing_configuration(&upgraded)

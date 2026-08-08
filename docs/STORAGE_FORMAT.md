@@ -91,10 +91,11 @@ bucket = offset + ((H / N) % size)
 ```
 
 The generation-1 catalog maps that bucket back to `s`, so
-`map[bucket(H)] == H % N` for every supported shard count. This issue persists
-and validates the catalog but deliberately leaves runtime routing on the legacy
-direct-modulo path. The next routing change can activate catalog lookup without
-moving existing keys, and golden vectors must freeze the full calculation.
+`map[bucket(H)] == H % N` for every supported shard count. Runtime routing uses
+the complete calculation and always obtains its final physical shard from
+`map[bucket(H)]`; it does not recompute modulo as the final routing step. Golden
+vectors freeze the exact key bytes, BLAKE3 prefix, little-endian hash integer,
+bucket ID, and persisted physical shard.
 
 `map_generation` is separate from manifest `user_version` and from the future
 application-schema generation. Version 3 accepts only generation 1 and validates
@@ -108,7 +109,10 @@ At each open, BriskDB validates the exact objects, columns, strict flags, frozen
 schema SQL, singleton rows, supported algorithm values, contiguous physical and
 bucket IDs, active lifecycle states, assignments, coverage, and foreign keys.
 A recognized version-3 manifest that violates any of these invariants is
-`DataCorruption` and is rejected before shard connections are opened.
+`DataCorruption` and is rejected before shard connections are opened. The same
+locked transaction returns the validated routing rows as an immutable in-memory
+snapshot, so request routing performs no manifest query and cannot fall back to
+modulo after a failed validation.
 
 ## Previous version 2
 
@@ -218,8 +222,10 @@ no-op reopen, both recognized legacy headers, the interrupted empty-table state,
 exact schema and relational corruption, future and foreign formats, both old-
 reader fences, errors and panics on both sides of the version stamp, multi-step
 resume, observer atomicity, and concurrent openers with matching and conflicting
-shard counts. They also prove catalog persistence does not activate routing one
-issue early. Process termination and filesystem faults remain part of the later
+shard counts. Routing tests additionally freeze golden hash/bucket/shard vectors,
+cover every algorithm state for every supported shard count, prove the final map
+lookup with a synthetic reassignment, and exercise parallel and reopen stability.
+Process termination and filesystem faults remain part of the later
 storage-hardening suite. Every new migration must extend the registry,
 destination validator, format documentation, and the same
 normal/error/concurrency/recovery matrix.
