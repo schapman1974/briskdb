@@ -30,6 +30,15 @@ tested `Engine` drain/cancel/cleanup lifecycle; platform-specific
 service-manager integration beyond those signals is not yet part of the support
 contract.
 
+The supported runner tests separate Tokio TCP listeners on numeric IPv4
+loopback addresses, concurrent HTTP and PostgreSQL-placeholder acceptance,
+disabled PostgreSQL binding, bind-failure cleanup, and shutdown of both
+listeners. Numeric IPv6 `SocketAddr` parsing is part of the CLI contract; an
+individual host must still provide the requested address family. The
+PostgreSQL endpoint is currently an accept/close lifecycle scaffold, not a wire
+compatibility claim. Its exact process behavior is documented in
+[PostgreSQL listener lifecycle](POSTGRES_LISTENER.md).
+
 ## Development-tested targets
 
 Maintainers also develop and run the full suite on `aarch64-apple-darwin`.
@@ -74,9 +83,10 @@ application-schema migration step; see the
 [manifest storage-format contract](STORAGE_FORMAT.md). After manifest load or
 upgrade, an active schema migration is resumed before ordinary layout
 reconciliation and final strict shard validation. All startup work finishes
-before the server accepts requests. Outside the explicit `Creating` state,
-every shard is opened read-write with SQLite create and symbolic-link following
-disabled. A missing, extra canonical, swapped, foreign, non-WAL, or
+before either server listener accepts requests. Outside the explicit
+`Creating` state, every shard is opened read-write with SQLite create and
+symbolic-link following disabled. A missing, extra canonical, swapped,
+foreign, non-WAL, or
 wrong-generation shard file is rejected, as is a shard cloned into another slot
 or layout. It is not recreated, reassigned, or silently reconfigured. Recovery
 requires restoring the correct complete layout.

@@ -21,8 +21,40 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub listen: SocketAddr,
+    pub postgres_listen: Option<SocketAddr>,
     pub data_dir: PathBuf,
     pub shards: u16,
+}
+
+#[derive(Debug)]
+struct BoundListeners {
+    http: tokio::net::TcpListener,
+    postgres: Option<tokio::net::TcpListener>,
+}
+
+impl BoundListeners {
+    async fn bind(config: &Config) -> anyhow::Result<Self> {
+        let http = tokio::net::TcpListener::bind(config.listen)
+            .await
+            .with_context(|| format!("failed to bind {}", config.listen))?;
+        let postgres = match config.postgres_listen {
+            Some(address) => Some(
+                tokio::net::TcpListener::bind(address)
+                    .await
+                    .with_context(|| format!("failed to bind PostgreSQL listener {address}"))?,
+            ),
+            None => None,
+        };
+        Ok(Self { http, postgres })
+    }
+
+    #[cfg(test)]
+    fn http_only(http: tokio::net::TcpListener) -> Self {
+        Self {
+            http,
+            postgres: None,
+        }
+    }
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -36,11 +68,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// [`EngineOptions::default`].
 pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> anyhow::Result<()> {
     let engine = Engine::open_with_options(&config.data_dir, config.shards, options).await?;
-    let listener = match tokio::net::TcpListener::bind(config.listen)
-        .await
-        .with_context(|| format!("failed to bind {}", config.listen))
-    {
-        Ok(listener) => listener,
+    let listeners = match BoundListeners::bind(&config).await {
+        Ok(listeners) => listeners,
         Err(error) => {
             engine.begin_shutdown();
             if let Err(shutdown_error) = engine.shutdown().await {
@@ -65,6 +94,7 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
 
     info!(
         listen = %config.listen,
+        postgres_listen = ?config.postgres_listen,
         data_dir = %config.data_dir.display(),
         shards = engine.shard_count(),
         max_blocking_workers = engine.options().connections_per_shard()
@@ -93,22 +123,41 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
         "BriskDB is ready"
     );
 
-    serve_with_shutdown(listener, engine, signal).await
+    serve_listeners_with_shutdown(listeners, engine, signal).await
 }
 
-async fn serve_with_shutdown<F>(
-    listener: tokio::net::TcpListener,
+async fn serve_listeners_with_shutdown<F>(
+    listeners: BoundListeners,
     engine: Engine,
     signal: F,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send,
 {
-    serve_with_shutdown_observed(listener, engine, signal, None).await
+    serve_listeners_with_shutdown_observed(listeners, engine, signal, None).await
 }
 
+#[cfg(test)]
 async fn serve_with_shutdown_observed<F>(
     listener: tokio::net::TcpListener,
+    engine: Engine,
+    signal: F,
+    accepted: Option<Arc<Notify>>,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    serve_listeners_with_shutdown_observed(
+        BoundListeners::http_only(listener),
+        engine,
+        signal,
+        accepted,
+    )
+    .await
+}
+
+async fn serve_listeners_with_shutdown_observed<F>(
+    listeners: BoundListeners,
     engine: Engine,
     signal: F,
     accepted: Option<Arc<Notify>>,
@@ -130,37 +179,49 @@ where
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 log_connection_join(result, false);
             }
-            accepted_connection = listener.accept() => {
-                let (stream, peer) = match accepted_connection {
-                    Ok(connection) => connection,
-                    Err(error) => {
+            accepted_connection = accept_next_connection(&listeners) => {
+                match accepted_connection {
+                    ListenerAccept::Http(Ok((stream, peer))) => {
+                        let accepted = accepted.clone();
+                        let service = TowerToHyperService::new(router.clone().map_request(
+                            move |request: Request<Incoming>| {
+                                if let Some(accepted) = &accepted {
+                                    accepted.notify_one();
+                                }
+                                request.map(Body::new)
+                            },
+                        ));
+                        let graceful_rx = graceful_tx.subscribe();
+                        connections.spawn(async move {
+                            serve_http_connection(stream, peer, service, graceful_rx).await;
+                        });
+                    }
+                    ListenerAccept::Http(Err(error)) => {
                         server_error = Some(
                             anyhow::Error::from(error).context("HTTP listener accept failed")
                         );
                         break;
                     }
-                };
-                let accepted = accepted.clone();
-                let service = TowerToHyperService::new(router.clone().map_request(
-                    move |request: Request<Incoming>| {
-                        if let Some(accepted) = &accepted {
-                            accepted.notify_one();
-                        }
-                        request.map(Body::new)
-                    },
-                ));
-                let graceful_rx = graceful_tx.subscribe();
-                connections.spawn(async move {
-                    serve_http_connection(stream, peer, service, graceful_rx).await;
-                });
+                    ListenerAccept::Postgres(Ok((stream, peer))) => {
+                        debug!(%peer, "closing connection before PostgreSQL wire support is enabled");
+                        drop(stream);
+                    }
+                    ListenerAccept::Postgres(Err(error)) => {
+                        server_error = Some(
+                            anyhow::Error::from(error)
+                                .context("PostgreSQL listener accept failed")
+                        );
+                        break;
+                    }
+                }
             }
         }
     }
 
-    // Admission must close before the listener and connection signals so an
+    // Admission must close before the listeners and connection signals so an
     // already-accepted request cannot enter the core after draining starts.
     engine.begin_shutdown();
-    drop(listener);
+    drop(listeners);
     let http_grace = engine.options().shutdown_grace();
     let core_shutdown = engine.shutdown();
     let http_shutdown = drain_http_connections(graceful_tx, &mut connections, http_grace);
@@ -173,6 +234,27 @@ where
         return Err(server_error);
     }
     Ok(())
+}
+
+enum ListenerAccept {
+    Http(std::io::Result<(tokio::net::TcpStream, SocketAddr)>),
+    Postgres(std::io::Result<(tokio::net::TcpStream, SocketAddr)>),
+}
+
+async fn accept_next_connection(listeners: &BoundListeners) -> ListenerAccept {
+    tokio::select! {
+        accepted = listeners.http.accept() => ListenerAccept::Http(accepted),
+        accepted = accept_optional(&listeners.postgres) => ListenerAccept::Postgres(accepted),
+    }
+}
+
+async fn accept_optional(
+    listener: &Option<tokio::net::TcpListener>,
+) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn serve_http_connection<S>(
@@ -352,7 +434,30 @@ mod tests {
             }
         })
         .await
-        .expect("the tracked HTTP peer should be closed");
+        .expect("the peer should be closed");
+    }
+
+    async fn assert_peer_closes_without_bytes(stream: &mut tokio::net::TcpStream) {
+        let mut buffer = [0_u8; 1_024];
+        match timeout(Duration::from_secs(1), stream.read(&mut buffer)).await {
+            Ok(Ok(0) | Err(_)) => {}
+            Ok(Ok(bytes)) => panic!("the placeholder wrote {bytes} unexpected bytes"),
+            Err(_) => panic!("the placeholder should close without writing bytes"),
+        }
+    }
+
+    async fn read_http_health(address: SocketAddr) -> Vec<u8> {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
+            .await
+            .expect("the HTTP health response should complete")
+            .unwrap();
+        response
     }
 
     fn partial_json_request(content_length: usize) -> Vec<u8> {
@@ -370,6 +475,7 @@ mod tests {
         let (_occupied_listener, listen) = unavailable_address();
         let error = run(Config {
             listen,
+            postgres_listen: None,
             data_dir: data_dir.clone(),
             shards: 1,
         })
@@ -389,6 +495,7 @@ mod tests {
         let error = run_with_engine_options(
             Config {
                 listen,
+                postgres_listen: None,
                 data_dir: data_dir.clone(),
                 shards: 64,
             },
@@ -406,7 +513,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_signal_stops_the_listener_and_fully_stops_the_engine() {
+    async fn configured_listeners_bind_enabled_and_disabled_postgres_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let enabled = BoundListeners::bind(&Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            postgres_listen: Some("127.0.0.1:0".parse().unwrap()),
+            data_dir: temp.path().to_path_buf(),
+            shards: 2,
+        })
+        .await
+        .unwrap();
+        let http_address = enabled.http.local_addr().unwrap();
+        let postgres_address = enabled.postgres.as_ref().unwrap().local_addr().unwrap();
+        assert_ne!(http_address, postgres_address);
+        drop(enabled);
+
+        let disabled = BoundListeners::bind(&Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            postgres_listen: None,
+            data_dir: temp.path().to_path_buf(),
+            shards: 2,
+        })
+        .await
+        .unwrap();
+        assert!(disabled.postgres.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_bind_failure_precedes_postgres_bind_and_cleans_up_the_engine() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_http_reservation, http_address) = unavailable_address();
+        let (_postgres_reservation, postgres_address) = unavailable_address();
+
+        let error = run(Config {
+            listen: http_address,
+            postgres_listen: Some(postgres_address),
+            data_dir: temp.path().to_path_buf(),
+            shards: 2,
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), format!("failed to bind {http_address}"));
+
+        let reopened = Engine::open(temp.path(), 2)
+            .await
+            .expect("the startup engine should complete cleanup after the HTTP bind failure");
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_bind_failure_releases_http_listener_and_engine() {
+        let temp = tempfile::tempdir().unwrap();
+        let (http_reservation, http_address) = unavailable_address();
+        drop(http_reservation);
+        let (postgres_reservation, postgres_address) = unavailable_address();
+        let config = Config {
+            listen: http_address,
+            postgres_listen: Some(postgres_address),
+            data_dir: temp.path().to_path_buf(),
+            shards: 2,
+        };
+
+        let error = run(config.clone()).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("failed to bind PostgreSQL listener {postgres_address}")
+        );
+
+        let rebound = std::net::TcpListener::bind(http_address)
+            .expect("the partially started HTTP listener should be released");
+        drop(rebound);
+        let reopened = Engine::open(temp.path(), 2)
+            .await
+            .expect("the startup engine should complete cleanup after the bind failure");
+        drop(postgres_reservation);
+        let rebound = BoundListeners::bind(&config)
+            .await
+            .expect("both listeners should bind on a clean retry");
+        drop(rebound);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn injected_signal_stops_both_listeners_and_fully_stops_the_engine() {
         let temp = tempfile::tempdir().unwrap();
         let options = EngineOptions::default()
             .with_shutdown_grace(Duration::from_millis(50))
@@ -415,8 +604,10 @@ mod tests {
             .await
             .unwrap();
         let observer = engine.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_address = http.local_addr().unwrap();
+        let postgres = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let postgres_address = postgres.local_addr().unwrap();
         let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
         let send_signal = tokio::spawn(async move {
             // Let the serve and signal futures both register before firing the
@@ -426,9 +617,16 @@ mod tests {
         });
         timeout(
             Duration::from_secs(2),
-            serve_with_shutdown(listener, engine, async move {
-                let _ = signal_rx.await;
-            }),
+            serve_listeners_with_shutdown(
+                BoundListeners {
+                    http,
+                    postgres: Some(postgres),
+                },
+                engine,
+                async move {
+                    let _ = signal_rx.await;
+                },
+            ),
         )
         .await
         .unwrap_or_else(|_| {
@@ -441,11 +639,16 @@ mod tests {
         send_signal.await.unwrap();
 
         assert_eq!(observer.state(), crate::core::EngineState::Stopped);
-        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        assert!(tokio::net::TcpStream::connect(http_address).await.is_err());
+        assert!(
+            tokio::net::TcpStream::connect(postgres_address)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
-    async fn already_ready_shutdown_signal_has_no_startup_lost_wakeup() {
+    async fn postgres_accept_loop_recovers_after_concurrent_connections_and_http_stays_live() {
         let temp = tempfile::tempdir().unwrap();
         let options = EngineOptions::default()
             .with_shutdown_grace(Duration::from_millis(50))
@@ -454,16 +657,96 @@ mod tests {
             .await
             .unwrap();
         let observer = engine.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_address = http.local_addr().unwrap();
+        let postgres = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let postgres_address = postgres.local_addr().unwrap();
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_listeners_with_shutdown(
+            BoundListeners {
+                http,
+                postgres: Some(postgres),
+            },
+            engine,
+            async move {
+                let _ = signal_rx.await;
+            },
+        ));
+
+        let clients = (0..32)
+            .map(|_| {
+                tokio::spawn(async move {
+                    let mut stream = tokio::net::TcpStream::connect(postgres_address)
+                        .await
+                        .unwrap();
+                    let _ = stream.write_all(b"placeholder input").await;
+                    assert_peer_closes_without_bytes(&mut stream).await;
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = read_http_health(http_address).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        for client in clients {
+            client.await.unwrap();
+        }
+
+        for _ in 0..3 {
+            let mut stream = tokio::net::TcpStream::connect(postgres_address)
+                .await
+                .unwrap();
+            assert_peer_closes_without_bytes(&mut stream).await;
+        }
+        assert!(
+            read_http_health(http_address)
+                .await
+                .starts_with(b"HTTP/1.1 200 OK\r\n")
+        );
+
+        signal_tx.send(()).unwrap();
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("both listeners should finish shutdown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(observer.state(), crate::core::EngineState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn already_ready_shutdown_signal_closes_both_listeners_without_lost_wakeup() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = EngineOptions::default()
+            .with_shutdown_grace(Duration::from_millis(50))
+            .unwrap();
+        let engine = Engine::open_with_options(temp.path(), 2, options)
+            .await
+            .unwrap();
+        let observer = engine.clone();
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_address = http.local_addr().unwrap();
+        let postgres = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let postgres_address = postgres.local_addr().unwrap();
 
         timeout(
             Duration::from_secs(2),
-            serve_with_shutdown(listener, engine, async {}),
+            serve_listeners_with_shutdown(
+                BoundListeners {
+                    http,
+                    postgres: Some(postgres),
+                },
+                engine,
+                async {},
+            ),
         )
         .await
         .expect("ready signal should shut down immediately")
         .unwrap();
         assert_eq!(observer.state(), crate::core::EngineState::Stopped);
+        assert!(tokio::net::TcpStream::connect(http_address).await.is_err());
+        assert!(
+            tokio::net::TcpStream::connect(postgres_address)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -528,10 +811,15 @@ mod tests {
         let observer = engine.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let postgres = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let postgres_address = postgres.local_addr().unwrap();
         let accepted = Arc::new(Notify::new());
         let accepted_for_server = Arc::clone(&accepted);
-        let server = tokio::spawn(serve_with_shutdown_observed(
-            listener,
+        let server = tokio::spawn(serve_listeners_with_shutdown_observed(
+            BoundListeners {
+                http: listener,
+                postgres: Some(postgres),
+            },
             engine,
             std::future::pending(),
             Some(accepted_for_server),
@@ -550,6 +838,11 @@ mod tests {
         assert_eq!(observer.state(), crate::core::EngineState::Draining);
         assert_peer_closes(&mut client).await;
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        assert!(
+            tokio::net::TcpStream::connect(postgres_address)
+                .await
+                .is_err()
+        );
 
         timeout(Duration::from_secs(2), observer.shutdown())
             .await

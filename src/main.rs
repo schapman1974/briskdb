@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
 use briskdb::{
     core::{
@@ -13,12 +13,57 @@ use briskdb::{
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+const DEFAULT_POSTGRES_LISTEN: &str = "127.0.0.1:5433";
+
+/// Command-line representation of an optional TCP listener.
+///
+/// Keeping the `disabled` sentinel at the process boundary means the public
+/// server API can use `Option<SocketAddr>` without carrying CLI spelling into
+/// Rust callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerSetting {
+    Address(SocketAddr),
+    Disabled,
+}
+
+impl ListenerSetting {
+    const fn into_option(self) -> Option<SocketAddr> {
+        match self {
+            Self::Address(address) => Some(address),
+            Self::Disabled => None,
+        }
+    }
+}
+
+impl FromStr for ListenerSetting {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "disabled" {
+            return Ok(Self::Disabled);
+        }
+
+        value.parse::<SocketAddr>().map(Self::Address).map_err(|_| {
+            format!("expected a socket address or the exact value 'disabled', got '{value}'")
+        })
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
     /// Address on which the HTTP server listens.
     #[arg(long, env = "BRISKDB_LISTEN", default_value = "127.0.0.1:7654")]
     listen: SocketAddr,
+
+    /// PostgreSQL TCP listener address, or `disabled` to turn it off.
+    #[arg(
+        long,
+        env = "BRISKDB_POSTGRES_LISTEN",
+        default_value = DEFAULT_POSTGRES_LISTEN,
+        value_name = "SOCKET_ADDR|disabled"
+    )]
+    postgres_listen: ListenerSetting,
 
     /// Directory containing the manifest and shard files.
     #[arg(long, env = "BRISKDB_DATA_DIR", default_value = "./briskdb-data")]
@@ -123,6 +168,7 @@ impl Args {
                 .with_shutdown_grace(Duration::from_millis(self.shutdown_grace_ms))?;
         let config = Config {
             listen: self.listen,
+            postgres_listen: self.postgres_listen.into_option(),
             data_dir: self.data_dir,
             shards: self.shards,
         };
@@ -155,6 +201,10 @@ mod tests {
         let args = Args::try_parse_from(["briskdb"]).unwrap();
 
         assert_eq!(args.listen, "127.0.0.1:7654".parse().unwrap());
+        assert_eq!(
+            args.postgres_listen,
+            ListenerSetting::Address(DEFAULT_POSTGRES_LISTEN.parse().unwrap())
+        );
         assert_eq!(args.data_dir, PathBuf::from("./briskdb-data"));
         assert_eq!(args.shards, 4);
         assert_eq!(args.connections_per_shard, DEFAULT_CONNECTIONS_PER_SHARD);
@@ -186,6 +236,8 @@ mod tests {
             "briskdb",
             "--listen",
             "127.0.0.1:9000",
+            "--postgres-listen",
+            "127.0.0.1:9543",
             "--data-dir",
             "/tmp/briskdb-test-data",
             "--shards",
@@ -212,6 +264,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.listen, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(
+            args.postgres_listen,
+            ListenerSetting::Address("127.0.0.1:9543".parse().unwrap())
+        );
         assert_eq!(args.data_dir, PathBuf::from("/tmp/briskdb-test-data"));
         assert_eq!(args.shards, 8);
         assert_eq!(args.connections_per_shard, 3);
@@ -231,6 +287,8 @@ mod tests {
             "briskdb",
             "--listen",
             "127.0.0.1:9000",
+            "--postgres-listen",
+            "127.0.0.1:9543",
             "--data-dir",
             "/tmp/briskdb-test-data",
             "--shards",
@@ -261,6 +319,7 @@ mod tests {
             config,
             Config {
                 listen: "127.0.0.1:9000".parse().unwrap(),
+                postgres_listen: Some("127.0.0.1:9543".parse().unwrap()),
                 data_dir: PathBuf::from("/tmp/briskdb-test-data"),
                 shards: 8,
             }
@@ -332,8 +391,53 @@ mod tests {
     }
 
     #[test]
+    fn postgres_listener_can_be_disabled_explicitly() {
+        let args = Args::try_parse_from(["briskdb", "--postgres-listen", "disabled"]).unwrap();
+        assert_eq!(args.postgres_listen, ListenerSetting::Disabled);
+
+        let (config, _) = args.into_server_parts().unwrap();
+        assert_eq!(config.postgres_listen, None);
+    }
+
+    #[test]
+    fn postgres_listener_accepts_ipv4_and_ipv6_socket_addresses() {
+        for (input, expected) in [
+            ("127.0.0.1:6543", "127.0.0.1:6543"),
+            ("[::1]:6543", "[::1]:6543"),
+        ] {
+            let args = Args::try_parse_from(["briskdb", "--postgres-listen", input]).unwrap();
+            assert_eq!(
+                args.postgres_listen,
+                ListenerSetting::Address(expected.parse().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_postgres_listener_values_fail_during_cli_parsing() {
+        for value in [
+            "",
+            "off",
+            "none",
+            "DISABLED",
+            "localhost:5433",
+            "127.0.0.1",
+            "127.0.0.1:not-a-port",
+        ] {
+            assert!(
+                Args::try_parse_from(["briskdb", "--postgres-listen", value]).is_err(),
+                "value should be rejected: {value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn resource_flags_are_bound_to_the_documented_environment_variables() {
         let command = Args::command();
+        let postgres_listener = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "postgres_listen")
+            .unwrap();
         let connections = command
             .get_arguments()
             .find(|argument| argument.get_id() == "connections_per_shard")
@@ -371,6 +475,10 @@ mod tests {
             .find(|argument| argument.get_id() == "shutdown_grace_ms")
             .unwrap();
 
+        assert_eq!(
+            postgres_listener.get_env(),
+            Some(OsStr::new("BRISKDB_POSTGRES_LISTEN"))
+        );
         assert_eq!(
             connections.get_env(),
             Some(OsStr::new("BRISKDB_CONNECTIONS_PER_SHARD"))
@@ -412,6 +520,10 @@ mod tests {
 
         if std::env::var_os(CHILD_MARKER).is_some() {
             let args = Args::try_parse_from(["briskdb"]).unwrap();
+            assert_eq!(
+                args.postgres_listen,
+                ListenerSetting::Address("127.0.0.1:6543".parse().unwrap())
+            );
             assert_eq!(args.connections_per_shard, 6);
             assert_eq!(args.queue_capacity_per_shard, 41);
             assert_eq!(args.max_result_rows, 500);
@@ -431,6 +543,7 @@ mod tests {
             ])
             .env(CHILD_MARKER, "1")
             .env("BRISKDB_LISTEN", "127.0.0.1:7654")
+            .env("BRISKDB_POSTGRES_LISTEN", "127.0.0.1:6543")
             .env("BRISKDB_DATA_DIR", "./briskdb-env-test-data")
             .env("BRISKDB_SHARDS", "4")
             .env("BRISKDB_CONNECTIONS_PER_SHARD", "6")
@@ -446,5 +559,98 @@ mod tests {
             .unwrap();
 
         assert!(status.success());
+    }
+
+    #[test]
+    fn postgres_listener_address_and_disabled_state_parse_from_environment() {
+        const CHILD_MARKER: &str = "BRISKDB_POSTGRES_LISTENER_ENV_TEST_CHILD";
+
+        if let Some(expected) = std::env::var_os(CHILD_MARKER) {
+            let args = Args::try_parse_from(["briskdb"]).unwrap();
+            match expected.to_str().unwrap() {
+                "address" => assert_eq!(
+                    args.postgres_listen,
+                    ListenerSetting::Address("127.0.0.1:7543".parse().unwrap())
+                ),
+                "disabled" => assert_eq!(args.postgres_listen, ListenerSetting::Disabled),
+                unexpected => panic!("unexpected child case {unexpected}"),
+            }
+            return;
+        }
+
+        for (value, expected) in [("127.0.0.1:7543", "address"), ("disabled", "disabled")] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::postgres_listener_address_and_disabled_state_parse_from_environment",
+                ])
+                .env(CHILD_MARKER, expected)
+                .env("BRISKDB_POSTGRES_LISTEN", value)
+                .status()
+                .unwrap();
+            assert!(status.success(), "environment case failed: {expected}");
+        }
+    }
+
+    #[test]
+    fn explicit_postgres_listener_cli_value_overrides_environment() {
+        const CHILD_MARKER: &str = "BRISKDB_POSTGRES_LISTENER_PRECEDENCE_TEST_CHILD";
+
+        if let Some(expected) = std::env::var_os(CHILD_MARKER) {
+            match expected.to_str().unwrap() {
+                "disabled" => {
+                    let args =
+                        Args::try_parse_from(["briskdb", "--postgres-listen", "disabled"]).unwrap();
+                    assert_eq!(args.postgres_listen, ListenerSetting::Disabled);
+                }
+                "address" => {
+                    let args =
+                        Args::try_parse_from(["briskdb", "--postgres-listen", "127.0.0.1:9543"])
+                            .unwrap();
+                    assert_eq!(
+                        args.postgres_listen,
+                        ListenerSetting::Address("127.0.0.1:9543".parse().unwrap())
+                    );
+                }
+                unexpected => panic!("unexpected child case {unexpected}"),
+            }
+            return;
+        }
+
+        for (environment, expected) in [("127.0.0.1:8543", "disabled"), ("disabled", "address")] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::explicit_postgres_listener_cli_value_overrides_environment",
+                ])
+                .env(CHILD_MARKER, expected)
+                .env("BRISKDB_POSTGRES_LISTEN", environment)
+                .status()
+                .unwrap();
+            assert!(status.success(), "precedence case failed: {expected}");
+        }
+    }
+
+    #[test]
+    fn malformed_postgres_listener_environment_value_is_rejected() {
+        const CHILD_MARKER: &str = "BRISKDB_POSTGRES_LISTENER_BAD_ENV_TEST_CHILD";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            assert!(Args::try_parse_from(["briskdb"]).is_err());
+            return;
+        }
+
+        for value in ["", "localhost:5433"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::malformed_postgres_listener_environment_value_is_rejected",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env("BRISKDB_POSTGRES_LISTEN", value)
+                .status()
+                .unwrap();
+            assert!(status.success(), "environment value should fail: {value:?}");
+        }
     }
 }

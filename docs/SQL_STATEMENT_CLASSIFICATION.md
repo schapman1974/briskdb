@@ -219,6 +219,8 @@ query, and migration endpoints remain raw SQLite surfaces and do not invoke the
 opt-in common frontend. In particular, the journaled migration endpoint keeps
 its own bounded, parameterless SQLite batch contract and can accept a schema
 batch that the general common-SQL classifier deliberately rejects.
+Issue #28 subsequently adds only the PostgreSQL TCP accept/close scaffold; it
+does not connect that socket to classification or any other SQL layer.
 
 ## Storage-format and configuration boundary
 
