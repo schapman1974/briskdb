@@ -16,6 +16,8 @@ The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
 current SQLite pass-through API from planned PostgreSQL and MySQL compatibility.
 The [SQL parser decision record](docs/SQL_PARSER.md) defines the shared,
 dialect-explicit syntax boundary and its resource and dependency limits.
+The [common SQL subset contract](docs/SQL_SUBSET.md) defines the opt-in,
+protocol-neutral structural validator and its exact accepted statement forms.
 The [error contract](docs/ERRORS.md) defines stable engine error kinds, safe
 HTTP problem details, and the mappings reserved for future PostgreSQL and MySQL
 adapters.
@@ -42,8 +44,9 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Finite per-query row/logical-byte budgets with no partial results
 - Explicit graceful drain, forced cancellation, and blocking handle cleanup
 - Protocol-neutral typed values, ordered columns, positional rows, and results
-- A bounded SQL AST parser for explicit SQLite, PostgreSQL, and MySQL dialects,
-  isolated from the current raw SQLite HTTP execution path
+- A bounded SQL AST parser plus recursive common-subset validator for explicit
+  SQLite, PostgreSQL, and MySQL dialects, isolated from the current raw SQLite
+  HTTP execution path
 - A transactionally versioned `manifest.sqlite` with durable 4,096-bucket
   routing plus logical-database and table metadata
 - Identity-bound, WAL-enabled SQLite shard files that are never silently
@@ -161,6 +164,12 @@ growing work without bound. Connections are opened lazily and reused. Broadcast
 is now a journaled schema migration: it excludes new ordinary work, waits for
 previously admitted operations to drain, and uses dedicated migration
 connections rather than reserving every shard pool.
+
+Rust callers may explicitly parse SQL and consume the result with
+`validate_common_subset(ParsedSql)`, receiving an owned opaque `CommonSql` on
+success. This validation step does not normalize, route, plan, authorize, or
+execute SQL. The HTTP execute, query, and migration endpoints do not invoke it
+and retain their existing raw SQLite behavior.
 
 `EngineOptions` permits 1–16 active connections and 1–1,024 queued operations
 per shard, with at most 512 active connections across all shards.

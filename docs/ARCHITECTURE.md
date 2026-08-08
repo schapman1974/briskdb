@@ -23,7 +23,7 @@ server ---------> protocol::http
 | --- | --- | --- |
 | `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, errors, and read-only logical catalog; stable key routing; bounded per-shard admission and connection pools; routed execute/query and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
-| `sql` | Dialect-explicit SQL syntax parsing behind BriskDB-owned opaque types; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, filesystem layout, protocol responses, or independent support policy |
+| `sql` | Dialect-explicit SQL syntax parsing and recursive common-subset validation behind BriskDB-owned opaque types; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, catalog lookup, filesystem layout, protocol responses, or protocol-specific support policy |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, listener binding, and tracked Axum HTTP/1 connection lifecycle | SQL parsing or storage implementation details |
@@ -91,11 +91,11 @@ autodetection, or fallback parse. This makes a frontend's dialect choice
 deterministic and keeps the dependency replaceable.
 
 Parsing is syntax recognition, not support validation or planning. The parser
-has no session, parameter, catalog, storage, or routing access. The later common
-subset, normalization, and planner layers will consume structural syntax
-through BriskDB-owned interfaces; shard-key inference must not inspect raw or
-formatted SQL with regular expressions. Exact input remains authoritative
-because AST formatting is lossy and is never executed.
+has no session, parameter, catalog, storage, or routing access. The separate
+common-subset validator and later normalization and planner layers consume
+structural syntax through BriskDB-owned interfaces; shard-key inference must not
+inspect raw or formatted SQL with regular expressions. Exact input remains
+authoritative because AST formatting is lossy and is never executed.
 
 Inputs are bounded to 65,536 UTF-8 bytes, 256 statements, and recursion depth
 32. The dependency's recursive-protection feature remains enabled. Parse and
@@ -103,10 +103,28 @@ limit failures use protocol-neutral engine error kinds, whose diagnostics stay
 internal. The full dependency, error, testing, and non-goal contract is in the
 [SQL parser decision record](SQL_PARSER.md).
 
+### Common-subset boundary
+
+`validate_common_subset(ParsedSql)` consumes an opaque parsed batch and returns
+an owned opaque `CommonSql` only when every statement recursively uses the
+documented first subset. The marker retains the exact source, dialect, and
+statement count without exposing the upstream AST. Parsed but unsupported
+statement or expression forms return `Unsupported`; parse and parser-limit
+failures retain their existing kinds.
+
+Validation is structural and stateless. It does not normalize placeholders,
+translate type names or syntax, inspect parameters or the catalog, infer a
+shard, build a plan, classify statement behavior, authorize an endpoint, or
+execute SQL. Empty and mixed batches can validate because issue #27 owns
+request-level batch policy. Recursive expression validation has an independent
+depth limit of 128 so iteratively parsed flat operator chains remain bounded.
+The normative accepted forms and exclusions are in the [common SQL subset
+contract](SQL_SUBSET.md).
+
 The current HTTP execute/query and migration paths deliberately remain raw
-SQLite pass-through. Connecting this parser to execution would define
-common-subset and strict-mode behavior owned by later roadmap issues, so issue
-#19 changes no HTTP shape, SQL acceptance, routing, or storage behavior.
+SQLite pass-through and call neither the parser nor the subset validator.
+Issues #19 and #20 therefore change no HTTP shape, SQL acceptance, routing, or
+storage behavior.
 
 ## Manifest storage boundary
 

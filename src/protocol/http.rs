@@ -268,7 +268,7 @@ mod tests {
     use super::*;
     use crate::{
         core::{Column, DataType, EngineErrorKind, EngineOptions, ResultLimits, Row},
-        sql::MAX_PARSED_SQL_BYTES,
+        sql::{MAX_PARSED_SQL_BYTES, SqlDialect, parse, validate_common_subset},
     };
 
     fn engine_router(database: Arc<Database>) -> Router {
@@ -494,6 +494,40 @@ mod tests {
                     "shard": expected_shard,
                     "columns": [{"name": "value", "data_type": "unknown"}],
                     "rows": [[7]]
+                })
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn common_subset_validation_does_not_change_the_current_http_query_path() {
+        let source = "WITH answer(value) AS (VALUES (9)) SELECT value FROM answer";
+        let validation_error =
+            validate_common_subset(parse(SqlDialect::Sqlite, source).unwrap()).unwrap_err();
+        assert_eq!(validation_error.kind(), EngineErrorKind::Unsupported);
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(temp.path(), 2).unwrap());
+        let expected_shard = database.shard_for_key(b"subset-http-boundary");
+        let application = engine_router(database);
+
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/query",
+                Some(json!({
+                    "shard_key": "subset-http-boundary",
+                    "sql": source
+                })),
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({
+                    "shard": expected_shard,
+                    "columns": [{"name": "value", "data_type": "unknown"}],
+                    "rows": [[9]]
                 })
             )
         );
