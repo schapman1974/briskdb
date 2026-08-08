@@ -230,16 +230,19 @@ execution path. In particular:
 - no read scatter, merge, contradiction short circuit, or write executes here;
 - no transaction pinning or cross-call routing context is applied;
 - no per-session or global prepared-statement cache is created;
-- no PostgreSQL or MySQL syntax or type is translated;
+- planning does not invoke the separate PostgreSQL/MySQL-to-SQLite translation
+  layer;
 - no complete read/write/schema/session or batch classifier is published; and
 - the current HTTP execute, query, and migration paths do not invoke parsing,
   validation, normalization, inference, or planning.
 
-Issue #25 owns selected syntax and type translation. Issue #26 owns the
-protocol-neutral prepare/bind/describe/execute lifecycle, session integration,
-provenance revalidation, and bounded per-session cache. Issue #27 owns the
-authoritative statement-behavior and empty, single-, and multi-statement
-request policy. Later query-planner work owns scatter/gather execution.
+The implemented issue #25 translation API can independently consume the same
+normalized statement, but it neither changes nor executes a bound plan. Issue
+#26 owns the protocol-neutral prepare/bind/describe/execute lifecycle, session
+integration, provenance revalidation, and bounded per-session cache. Issue #27
+owns the authoritative statement-behavior and empty, single-, and
+multi-statement request policy. Later query-planner work owns scatter/gather
+execution.
 
 ## Verification obligations
 

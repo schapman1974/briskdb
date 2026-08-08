@@ -292,6 +292,119 @@ fn placeholder_normalization_is_public_owned_bounded_and_opt_in() {
 }
 
 #[test]
+fn sql_translation_is_public_owned_dialect_equivalent_and_opt_in() {
+    fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
+    assert_owned_public::<sql::SqlTranslationMode>();
+    assert_owned_public::<sql::TranslatedSql>();
+
+    let ddl = [
+        (
+            sql::SqlDialect::Sqlite,
+            "CREATE TABLE \"typed\" (\"id\" INTEGER PRIMARY KEY, \"enabled\" BOOLEAN, \"payload\" BLOB)",
+        ),
+        (
+            sql::SqlDialect::PostgreSql,
+            "CREATE TABLE \"typed\" (\"id\" INT8 PRIMARY KEY, \"enabled\" BOOL, \"payload\" BYTEA)",
+        ),
+        (
+            sql::SqlDialect::MySql,
+            "CREATE TABLE `typed` (`id` BIGINT PRIMARY KEY, `enabled` TINYINT(1), `payload` VARBINARY(64))",
+        ),
+    ];
+    for (dialect, source) in ddl {
+        let normalized = sql::normalize_placeholders(
+            sql::validate_common_subset(sql::parse(dialect, source).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let translated =
+            sql::translate_sql(normalized, sql::SqlTranslationMode::Compatibility).unwrap();
+        assert_eq!(translated.dialect(), dialect);
+        assert_eq!(translated.mode(), sql::SqlTranslationMode::Compatibility);
+        assert_eq!(translated.source(), source);
+        assert_eq!(
+            translated.sqlite_sql(),
+            "CREATE TABLE \"typed\" (\"id\" BIGINT PRIMARY KEY, \"enabled\" BOOLEAN, \"payload\" BLOB)"
+        );
+    }
+
+    let strict_source = "-- exact SQLite\r\nSELECT ?2, ?, 'private ?';\r\n";
+    let strict = sql::translate_sql(
+        sql::normalize_placeholders(
+            sql::validate_common_subset(
+                sql::parse(sql::SqlDialect::Sqlite, strict_source).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        sql::SqlTranslationMode::StrictSqlite,
+    )
+    .unwrap();
+    assert_eq!(
+        strict.sqlite_sql(),
+        "-- exact SQLite\r\nSELECT ?2, ?3, 'private ?';\r\n"
+    );
+    assert!(!format!("{strict:?}").contains("private"));
+
+    let temp = tempfile::tempdir().unwrap();
+    drop(core::Database::open(temp.path(), 4).unwrap());
+    insert_catalog_fixture(temp.path());
+    let database = Arc::new(core::Database::open(temp.path(), 4).unwrap());
+    let engine = core::Engine::from_database(Arc::clone(&database));
+    let tenant = database.catalog().database("tenant").unwrap().unwrap();
+    let parameter = [core::Value::Text("tenant-public-translation".to_owned())];
+    let requests = [
+        (
+            sql::SqlDialect::Sqlite,
+            "SELECT tenant_id FROM accounts WHERE tenant_id = ?1",
+        ),
+        (
+            sql::SqlDialect::PostgreSql,
+            "SELECT tenant_id FROM accounts WHERE tenant_id = $1",
+        ),
+        (
+            sql::SqlDialect::MySql,
+            "SELECT tenant_id FROM accounts WHERE tenant_id = ?",
+        ),
+    ];
+    let plans = requests.map(|(dialect, source)| {
+        let translated = sql::translate_sql(
+            sql::normalize_placeholders(
+                sql::validate_common_subset(sql::parse(dialect, source).unwrap()).unwrap(),
+            )
+            .unwrap(),
+            sql::SqlTranslationMode::Compatibility,
+        )
+        .unwrap();
+        assert_eq!(
+            translated.sqlite_sql(),
+            "SELECT tenant_id FROM accounts WHERE tenant_id = ?1"
+        );
+        engine
+            .plan_bound_statement(
+                tenant.id(),
+                translated.normalized_sql(),
+                0,
+                &parameter,
+                None,
+            )
+            .unwrap()
+    });
+    assert_eq!(plans[0], plans[1]);
+    assert_eq!(plans[1], plans[2]);
+
+    // Translation remains opt-in. Existing raw SQLite execution continues to
+    // accept its current named-parameter behavior directly.
+    let raw = database
+        .query(
+            "translation-opt-in",
+            "SELECT :value",
+            &[core::Value::Int64(29)],
+        )
+        .unwrap();
+    assert_eq!(raw.rows()[0].get(0), Some(&core::Value::Int64(29)));
+}
+
+#[test]
 fn shard_key_inference_is_public_typed_and_opt_in() {
     fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
     assert_owned_public::<sql::ShardKeyInference>();

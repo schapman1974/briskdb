@@ -75,6 +75,17 @@ impl NormalizedSql {
             .ok()
             .map(|index| placeholders[index].index)
     }
+
+    #[cfg(test)]
+    pub(super) fn corrupt_first_placeholder_for_test(&mut self) {
+        if let Some(placeholders) = self
+            .statement_placeholders
+            .iter_mut()
+            .find(|placeholders| !placeholders.is_empty())
+        {
+            placeholders.remove(0);
+        }
+    }
 }
 
 impl fmt::Debug for NormalizedSql {

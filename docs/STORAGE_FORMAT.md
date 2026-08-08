@@ -872,6 +872,12 @@ later storage-hardening certification.
 - SQLite lock contention remains retryable `Busy`; permission, read-only, full,
   and I/O failures retain the storage error taxonomy.
 
+Issue #25's SQL translation API is an in-memory, opt-in SQL-layer operation. It
+does not change the manifest version, shard files, stored schema text, migration
+digest, or migration identity. Schema migration continues to retain and compare
+the caller's exact submitted SQL; canonical compatibility output is never used
+as storage identity.
+
 The checksums are corruption detectors, not authentication. Both use unkeyed
 BLAKE3 and are writable by anyone who can modify the data directory. The
 manifest root covers canonical control-plane values, not raw SQLite pages. The

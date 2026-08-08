@@ -45,11 +45,11 @@ A successful `CommonSql` does not mean that the SQL:
 - has been executed.
 
 Those responsibilities remain with the implemented issue #21 normalization,
-issue #22 inference, and issues #23/#24 bound planning and routing-policy
-layers, issues #25 through #27, and the later wire frontends. Validation never
-consults parameters, a session, the logical catalog, storage, routing state,
-the filesystem, or SQLite. It never formats or searches SQL text to make a
-structural decision.
+issue #22 inference, issues #23/#24 bound planning and routing-policy layers,
+the separate issue #25 translation layer, issues #26/#27, and the later wire
+frontends. Validation never consults parameters, a session, the logical
+catalog, storage, routing state, the filesystem, or SQLite. It never formats or
+searches SQL text to make a structural decision.
 
 Empty and comment-only parsed batches validate successfully. Every statement in
 a mixed batch is checked independently and source order is retained, but that
@@ -62,7 +62,7 @@ statement behavior classification, and safe statement combinations.
 | --- | --- | --- |
 | `CREATE TABLE` | One unqualified, persistent table; optional `IF NOT EXISTS`; one or more columns, each with an explicit parsed type; the column and table constraints described below | Qualified names, temporary or other table modifiers, table-as-query, `LIKE`/clone, storage/lifecycle/vendor options, partitioning/inheritance, SQLite `STRICT` or `WITHOUT ROWID` |
 | `CREATE INDEX` | A named, unqualified index on one unqualified table; optional `UNIQUE` and `IF NOT EXISTS`; one or more plain columns with optional `ASC` or `DESC` | Unnamed, qualified, expression, or partial indexes; `USING`, operator classes, `INCLUDE`, null-order, concurrent/async, storage, or vendor options |
-| `SELECT` | A nonempty projection with no `FROM` or one unqualified base table; optional simple table alias, `ALL`/`DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, expression `ORDER BY`, and standard `LIMIT`/`OFFSET` | CTEs, set operations, nested queries, multiple tables, joins, derived/table functions, `DISTINCT ON`, `SELECT INTO`, windows, locks, `FETCH`, `TOP`, query hints/settings/formats, MySQL comma-form limit |
+| `SELECT` | A nonempty projection with no `FROM` or one unqualified base table; optional simple table alias, `ALL`/`DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, expression `ORDER BY`, and either standard `LIMIT`/`OFFSET` or the MySQL/SQLite comma-form limit | CTEs, set operations, nested queries, multiple tables, joins, derived/table functions, `DISTINCT ON`, `SELECT INTO`, windows, locks, `FETCH`, `TOP`, query hints/settings/formats |
 | `INSERT` | `INSERT INTO` one unqualified named table with a nonempty explicit column list whose names are unique under ASCII case folding, plus one or more equal-width `VALUES` rows | Omitted, exact-duplicate, or ASCII-case-only duplicate columns; row-width mismatch; `DEFAULT VALUES`; `INSERT ... SELECT`; aliases; conflict/upsert/ignore/replace forms; partitioning; `RETURNING`; output; multi-table, format, or settings clauses |
 | `UPDATE` | One unqualified base table with an optional simple alias, one or more single-column assignments whose targets are unique under ASCII case folding, and an optional `WHERE` | Joins, qualified or tuple assignment targets, exact-duplicate or ASCII-case-only duplicate targets, `FROM`, conflict modes, `RETURNING`, output, `ORDER BY`, or `LIMIT` |
 | `DELETE` | `DELETE FROM` exactly one unqualified base table with an optional simple alias and optional `WHERE` | Missing `FROM`, multiple tables, joins, `USING`, `RETURNING`, output, `ORDER BY`, or `LIMIT` |
@@ -76,9 +76,10 @@ an explicit `AND NO CHAIN`, to the same semantic AST forms. The validator
 deliberately accepts that AST family and does not search retained source text to
 distinguish equivalent spellings; the explicit source dialect must still parse
 a spelling first. `BEGIN`, `COMMIT`, and `ROLLBACK` remain syntax families only
-at this boundary. Canonical syntax translation remains issue #25. Real
-multi-call transaction state, failed-transaction behavior, connection and shard
-pinning, and protocol status reporting remain issues #34 and #47.
+at this boundary. The separate issue #25 compatibility translator canonicalizes
+the accepted aliases to SQLite SQL. Real multi-call transaction state,
+failed-transaction behavior, connection and shard pinning, and protocol status
+reporting remain issues #34 and #47.
 
 An absent `WHERE` on `UPDATE` or `DELETE` is structurally valid. Likewise,
 validation does not inspect whether an assignment changes a shard-key column.
@@ -100,14 +101,17 @@ wildcard modifiers.
 Insert column lists and update assignment targets reject exact duplicates and
 names that differ only by ASCII letter case, regardless of quoting. This is a
 conservative common key for duplicate detection, not full PostgreSQL, MySQL,
-SQLite, Unicode, quoted-identifier, or catalog normalization. General
-identifier normalization and translation remain issue #25.
+SQLite, Unicode, quoted-identifier, or catalog normalization. The separate
+compatibility translator converts accepted MySQL backtick quoting to SQLite
+double quoting; it does not add general case, Unicode, or catalog-name
+normalization.
 
 The validator requires every `CREATE TABLE` column to have an explicit parsed
 type, but it deliberately does not restrict the type name. Acceptance therefore
 does not promise a cross-protocol representation or SQLite translation for that
-type. Canonical type aliases, dialect differences, and strict SQLite mode remain
-issue #25.
+type. The separate [SQL translation contract](SQL_TRANSLATION.md) defines the
+finite type whitelist used by compatibility mode and the exact preservation
+provided by strict SQLite mode.
 
 ### Table constraints and defaults
 
@@ -162,12 +166,15 @@ unknown function are rejected.
 
 `WHERE`, assignment, and `GROUP BY` expressions cannot contain aggregates.
 Insert row expressions use the same scalar grammar but cannot reference a
-column. A retained `LIMIT` or `OFFSET` value accepts only an unsigned digit-only
-numeric literal or a placeholder. The pinned parser represents PostgreSQL
-`LIMIT ALL` as the same absent-limit AST as omitting the clause, so structural
-validation accepts that AST-equivalent spelling and does not inspect source text
-to distinguish it. Placeholder spelling, numbering, count, and binding are not
-validated or changed here. The separate [SQL parameter-normalization
+column. A retained standard `LIMIT`/`OFFSET` operand or comma-form offset/count
+operand accepts only an unsigned digit-only numeric literal or a placeholder.
+The validator retains operand identity; compatibility translation later
+rewrites comma form to `LIMIT count OFFSET offset`. The pinned parser represents
+PostgreSQL `LIMIT ALL` as the same absent-limit AST as omitting the clause, so
+structural validation accepts that AST-equivalent spelling and does not inspect
+source text to distinguish it. Placeholder spelling, numbering, count, and
+binding are not validated or changed here. The separate [SQL
+parameter-normalization
 contract](SQL_PARAMETERS.md) defines the implemented opt-in numbering step,
 which consumes `CommonSql` without accepting bound values.
 The [shard-key inference contract](SQL_SHARD_KEYS.md) then defines the exact

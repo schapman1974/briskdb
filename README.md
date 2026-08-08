@@ -182,8 +182,13 @@ Rust callers may explicitly parse SQL and consume the result with
 `validate_common_subset(ParsedSql)`, receiving an owned opaque `CommonSql` on
 success. They may then opt into `normalize_placeholders(CommonSql)`, receiving
 canonical SQLite `?N` text and per-statement occurrence-to-index metadata
-without supplying parameter values. Given a complete bound-value slice and a
-logical catalog database, callers may then invoke
+without supplying parameter values. Callers can consume that result with
+`translate_sql(NormalizedSql, SqlTranslationMode)`: explicit compatibility mode
+maps the documented finite type and syntax set to separate canonical SQLite
+SQL, while strict mode requires SQLite input and preserves the
+placeholder-normalized SQLite text exactly. The translated result retains its
+`NormalizedSql` for routing analysis. Given a complete bound-value slice and a
+logical catalog database, callers may invoke
 `infer_shard_keys(&Catalog, LogicalDatabaseId, &NormalizedSql, statement_index,
 parameters)` to classify the statement as not applicable, not sharded,
 unconstrained, contradictory, exact, or multiple and inspect any typed inferred
@@ -196,9 +201,11 @@ That call compares finite inferred and explicit routes by physical shard,
 rejects cross-shard or otherwise unroutable cataloged sharded DML, prevents
 shard-key updates, and exposes the accepted `assigned_shard()`. The plan
 records schema and routing provenance but does not classify complete request
-behavior, translate SQL, or execute anything. The HTTP execute, query, and
+behavior or execute anything. Translation and planning remain independent
+opt-in branches over the same normalized request. The HTTP execute, query, and
 migration endpoints invoke none of these opt-in layers and retain their
-existing raw SQLite behavior.
+existing raw SQLite behavior. The exact translation matrix and strict-mode
+boundary are in [`docs/SQL_TRANSLATION.md`](docs/SQL_TRANSLATION.md).
 
 `EngineOptions` permits 1–16 active connections and 1–1,024 queued operations
 per shard, with at most 512 active connections across all shards.

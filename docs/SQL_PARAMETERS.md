@@ -23,6 +23,11 @@ engine do not invoke this opt-in layer; they retain their existing raw SQLite
 behavior. Issue #27 owns whether an empty batch, one statement, or a particular
 multi-statement combination may execute.
 
+The separate [SQL translation layer](SQL_TRANSLATION.md) can consume the
+result and either expose the normalized SQLite text exactly in strict mode or
+render the documented finite compatibility subset as canonical SQLite SQL.
+Translation remains an explicit additional call.
+
 ## Public result
 
 `NormalizedSql` retains both representations:
@@ -148,11 +153,12 @@ A successful `NormalizedSql` does not establish that:
 
 - the caller supplied exactly `parameter_count()` values until the separate
   shard-key inference call validates that count;
-- non-shard-key parameters have types compatible with later translation and
+- non-shard-key parameters have types compatible with translation and
   execution;
 - an inferred value has been encoded, hashed, or routed to one shard;
 - catalog names and types exist or are compatible;
-- non-placeholder PostgreSQL or MySQL syntax has been translated to SQLite;
+- non-placeholder PostgreSQL or MySQL syntax has been translated to SQLite
+  until the separate `translate_sql` call succeeds;
 - a statement or batch is permitted by an endpoint or session;
 - a prepared statement has been described, cached, bound, or executed; or
 - execution would preserve all source-dialect semantics.
@@ -162,9 +168,9 @@ metadata plus a catalog database and exact bound-value slice. The implemented
 [bound statement planner and routing policy](SQL_PLANNING.md) uses that result
 only after values are bound, compares finite physical targets, rejects
 unroutable cataloged sharded writes, and records a valid single-shard
-assignment. Issues #25 through #27 own syntax/type translation,
-prepared-statement state, and request-level statement classification
-respectively.
+assignment. The implemented issue #25 translation layer is separate from this
+normalizer. Issues #26 and #27 own prepared-statement state and request-level
+statement classification respectively.
 
 ## Verification obligations
 
