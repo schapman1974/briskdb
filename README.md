@@ -88,6 +88,20 @@ curl -X POST http://127.0.0.1:7654/v1/query \
   }'
 ```
 
+The response keeps column metadata and row values in matching index order. The
+selected shard depends on the routing key; an example response is:
+
+```json
+{
+  "shard": 0,
+  "columns": [
+    {"name": "id", "data_type": "unknown"},
+    {"name": "name", "data_type": "unknown"}
+  ],
+  "rows": [["widget-1", "First widget"]]
+}
+```
+
 ## Deliberate boundaries
 
 This is an initial scaffold, not a production database yet. The current API

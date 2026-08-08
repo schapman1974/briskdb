@@ -166,7 +166,7 @@ Status: **in progress**
   `server` modules without changing externally visible behavior.
 - [x] Replace `serde_json::Value` in storage with BriskDB `Value`, `DataType`,
   `Column`, `Row`, and `ResultSet` types.
-- [ ] Preserve column order and duplicate column names.
+- [x] Preserve column order and duplicate column names.
 - [ ] Add a structured error taxonomy and mappings for HTTP, PostgreSQL, and
   MySQL.
 - [ ] Introduce a `Session` state machine and an async `Engine` interface used

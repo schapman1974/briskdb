@@ -10,9 +10,9 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value as JsonValue, json};
+use serde_json::{Value as JsonValue, json};
 
-use crate::core::{Database, ResultSet, Routed, Value};
+use crate::core::{DataType, Database, ResultSet, Routed, Value};
 
 pub fn router(database: Arc<Database>) -> Router {
     Router::new()
@@ -49,6 +49,19 @@ struct ExecuteResponse {
     rows_affected: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct QueryResponse {
+    shard: u16,
+    columns: Vec<QueryColumn>,
+    rows: Vec<Vec<JsonValue>>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryColumn {
+    name: String,
+    data_type: &'static str,
+}
+
 async fn execute(
     State(database): State<Arc<Database>>,
     Json(request): Json<RoutedSqlRequest>,
@@ -75,8 +88,8 @@ async fn execute(
 async fn query(
     State(database): State<Arc<Database>>,
     Json(request): Json<RoutedSqlRequest>,
-) -> Result<Json<JsonValue>, ApiError> {
-    let (shard, rows) = tokio::task::spawn_blocking(move || {
+) -> Result<Json<QueryResponse>, ApiError> {
+    let response = tokio::task::spawn_blocking(move || {
         let params = request
             .params
             .into_iter()
@@ -86,11 +99,11 @@ async fn query(
             shard,
             value: result,
         } = database.query_routed(&request.shard_key, &request.sql, &params)?;
-        Ok::<_, anyhow::Error>((shard, result_set_to_json_rows(result)))
+        Ok::<_, anyhow::Error>(result_set_to_query_response(shard, result))
     })
     .await??;
 
-    Ok(Json(json!({"shard": shard, "rows": rows})))
+    Ok(Json(response))
 }
 
 async fn broadcast(
@@ -140,17 +153,39 @@ fn value_to_json(value: Value) -> JsonValue {
     }
 }
 
-fn result_set_to_json_rows(result: ResultSet) -> Vec<JsonValue> {
+fn result_set_to_query_response(shard: u16, result: ResultSet) -> QueryResponse {
     let (columns, rows) = result.into_parts();
-    rows.into_iter()
-        .map(|row| {
-            let mut object = Map::with_capacity(columns.len());
-            for (column, value) in columns.iter().zip(row.into_values()) {
-                object.insert(column.name.clone(), value_to_json(value));
-            }
-            JsonValue::Object(object)
+    let columns = columns
+        .into_iter()
+        .map(|column| QueryColumn {
+            name: column.name,
+            data_type: data_type_name(column.data_type),
         })
-        .collect()
+        .collect();
+    let rows = rows
+        .into_iter()
+        .map(|row| row.into_values().into_iter().map(value_to_json).collect())
+        .collect();
+
+    QueryResponse {
+        shard,
+        columns,
+        rows,
+    }
+}
+
+const fn data_type_name(data_type: DataType) -> &'static str {
+    match data_type {
+        DataType::Unknown => "unknown",
+        DataType::Null => "null",
+        DataType::Boolean => "boolean",
+        DataType::Int64 => "int64",
+        DataType::UInt64 => "uint64",
+        DataType::Float64 => "float64",
+        DataType::Decimal => "decimal",
+        DataType::Text => "text",
+        DataType::Binary => "binary",
+    }
 }
 
 struct ApiError(anyhow::Error);
@@ -210,7 +245,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_contract_is_preserved_across_all_endpoints() {
+    async fn all_http_endpoints_follow_the_current_contract() {
         let temp = tempfile::tempdir().unwrap();
         let database = Arc::new(Database::open(temp.path(), 4).unwrap());
         let expected_shard = database.shard_for_key(b"widget-1");
@@ -265,7 +300,11 @@ mod tests {
                 StatusCode::OK,
                 json!({
                     "shard": expected_shard,
-                    "rows": [{"id": "widget-1", "name": "First widget"}]
+                    "columns": [
+                        {"name": "id", "data_type": "unknown"},
+                        {"name": "name", "data_type": "unknown"}
+                    ],
+                    "rows": [["widget-1", "First widget"]]
                 }),
             )
         );
@@ -334,15 +373,21 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            body["rows"],
-            json!([{"positive_infinity": null, "negative_infinity": null}])
+            body["columns"],
+            json!([
+                {"name": "positive_infinity", "data_type": "unknown"},
+                {"name": "negative_infinity", "data_type": "unknown"}
+            ])
         );
+        assert_eq!(body["rows"], json!([[null, null]]));
     }
 
     #[tokio::test]
     async fn typed_core_keeps_legacy_http_parameter_and_blob_shapes() {
         let temp = tempfile::tempdir().unwrap();
-        let application = router(Arc::new(Database::open(temp.path(), 4).unwrap()));
+        let database = Arc::new(Database::open(temp.path(), 4).unwrap());
+        let expected_shard = database.shard_for_key(b"typed-row");
+        let application = router(database);
 
         let (status, body) = request_json(
             &application,
@@ -358,13 +403,83 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            body["rows"],
-            json!([{
-                "enabled": 1,
-                "object_text": "{\"nested\":true}",
-                "array_text": "[1,\"two\"]",
-                "data": [0, 255]
-            }])
+            body,
+            json!({
+                "shard": expected_shard,
+                "columns": [
+                    {"name": "enabled", "data_type": "unknown"},
+                    {"name": "object_text", "data_type": "unknown"},
+                    {"name": "array_text", "data_type": "unknown"},
+                    {"name": "data", "data_type": "unknown"}
+                ],
+                "rows": [[1, "{\"nested\":true}", "[1,\"two\"]", [0, 255]]]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn query_preserves_duplicate_column_names_and_positions() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(temp.path(), 4).unwrap());
+        let expected_shard = database.shard_for_key(b"duplicate-row");
+        let application = router(database);
+
+        let (status, body) = request_json(
+            &application,
+            Method::POST,
+            "/v1/query",
+            Some(json!({
+                "shard_key": "duplicate-row",
+                "sql": "SELECT 1 AS duplicate, 2 AS middle, 3 AS duplicate, 4 AS \"\""
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "shard": expected_shard,
+                "columns": [
+                    {"name": "duplicate", "data_type": "unknown"},
+                    {"name": "middle", "data_type": "unknown"},
+                    {"name": "duplicate", "data_type": "unknown"},
+                    {"name": "", "data_type": "unknown"}
+                ],
+                "rows": [[1, 2, 3, 4]]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_query_results_keep_duplicate_column_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(temp.path(), 4).unwrap());
+        let expected_shard = database.shard_for_key(b"empty-row");
+        let application = router(database);
+
+        let (status, body) = request_json(
+            &application,
+            Method::POST,
+            "/v1/query",
+            Some(json!({
+                "shard_key": "empty-row",
+                "sql": "SELECT 1 AS duplicate, 2 AS duplicate WHERE 0"
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "shard": expected_shard,
+                "columns": [
+                    {"name": "duplicate", "data_type": "unknown"},
+                    {"name": "duplicate", "data_type": "unknown"}
+                ],
+                "rows": []
+            })
         );
     }
 
@@ -412,30 +527,87 @@ mod tests {
     }
 
     #[test]
-    fn legacy_result_encoding_keeps_json_shapes_and_duplicate_overwrite() {
+    fn every_data_type_has_a_stable_http_metadata_name() {
+        assert_eq!(
+            [
+                DataType::Unknown,
+                DataType::Null,
+                DataType::Boolean,
+                DataType::Int64,
+                DataType::UInt64,
+                DataType::Float64,
+                DataType::Decimal,
+                DataType::Text,
+                DataType::Binary,
+            ]
+            .map(data_type_name),
+            [
+                "unknown", "null", "boolean", "int64", "uint64", "float64", "decimal", "text",
+                "binary",
+            ]
+        );
+    }
+
+    #[test]
+    fn result_encoding_keeps_column_order_duplicate_names_and_row_positions() {
         let result = ResultSet::new(
             vec![
                 Column::new("duplicate", DataType::Unknown),
-                Column::new("duplicate", DataType::Unknown),
-                Column::new("blob", DataType::Unknown),
-                Column::new("flag", DataType::Unknown),
+                Column::new("duplicate", DataType::Text),
+                Column::new("blob", DataType::Binary),
+                Column::new("flag", DataType::Boolean),
+                Column::new("", DataType::Null),
             ],
-            vec![Row::new(vec![
-                Value::from(1_i64),
-                Value::from("last value wins"),
-                Value::from(vec![0_u8, 255]),
-                Value::from(true),
-            ])],
+            vec![
+                Row::new(vec![
+                    Value::from(1_i64),
+                    Value::from("second position"),
+                    Value::from(vec![0_u8, 255]),
+                    Value::from(true),
+                    Value::Null,
+                ]),
+                Row::new(vec![
+                    Value::from(2_i64),
+                    Value::from("still separate"),
+                    Value::from(vec![1_u8, 2]),
+                    Value::from(false),
+                    Value::Null,
+                ]),
+            ],
         )
         .unwrap();
 
         assert_eq!(
-            result_set_to_json_rows(result),
-            vec![json!({
-                "duplicate": "last value wins",
-                "blob": [0, 255],
-                "flag": true
-            })]
+            serde_json::to_value(result_set_to_query_response(3, result)).unwrap(),
+            json!({
+                "shard": 3,
+                "columns": [
+                    {"name": "duplicate", "data_type": "unknown"},
+                    {"name": "duplicate", "data_type": "text"},
+                    {"name": "blob", "data_type": "binary"},
+                    {"name": "flag", "data_type": "boolean"},
+                    {"name": "", "data_type": "null"}
+                ],
+                "rows": [
+                    [1, "second position", [0, 255], true, null],
+                    [2, "still separate", [1, 2], false, null]
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn result_encoding_keeps_valid_zero_column_shapes() {
+        let empty = ResultSet::new(Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            serde_json::to_value(result_set_to_query_response(1, empty)).unwrap(),
+            json!({"shard": 1, "columns": [], "rows": []})
+        );
+
+        let empty_row = ResultSet::new(Vec::new(), vec![Row::new(Vec::new())]).unwrap();
+        assert_eq!(
+            serde_json::to_value(result_set_to_query_response(2, empty_row)).unwrap(),
+            json!({"shard": 2, "columns": [], "rows": [[]]})
         );
     }
 }

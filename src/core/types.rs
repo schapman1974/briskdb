@@ -442,6 +442,55 @@ mod tests {
     }
 
     #[test]
+    fn result_sets_keep_duplicate_names_in_their_original_positions() {
+        let result = ResultSet::new(
+            vec![
+                Column::new("duplicate", DataType::Int64),
+                Column::new("middle", DataType::Text),
+                Column::new("duplicate", DataType::Boolean),
+            ],
+            vec![Row::new(vec![
+                Value::from(1_i64),
+                Value::from("two"),
+                Value::from(true),
+            ])],
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .columns()
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["duplicate", "middle", "duplicate"]
+        );
+        assert_eq!(
+            result.rows()[0].values(),
+            [Value::from(1_i64), Value::from("two"), Value::from(true)]
+        );
+    }
+
+    #[test]
+    fn result_sets_accept_all_valid_empty_shapes() {
+        let completely_empty = ResultSet::new(Vec::new(), Vec::new()).unwrap();
+        assert!(completely_empty.columns().is_empty());
+        assert!(completely_empty.rows().is_empty());
+
+        let empty_row = ResultSet::new(Vec::new(), vec![Row::new(Vec::new())]).unwrap();
+        assert!(empty_row.columns().is_empty());
+        assert_eq!(empty_row.rows(), [Row::new(Vec::new())]);
+
+        let metadata_only =
+            ResultSet::new(vec![Column::new("value", DataType::Unknown)], Vec::new()).unwrap();
+        assert_eq!(
+            metadata_only.columns(),
+            [Column::new("value", DataType::Unknown)]
+        );
+        assert!(metadata_only.rows().is_empty());
+    }
+
+    #[test]
     fn result_sets_reject_short_and_long_rows() {
         let columns = vec![
             Column::new("first", DataType::Unknown),
