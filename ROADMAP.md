@@ -171,7 +171,7 @@ Status: **in progress**
   MySQL.
 - [x] Introduce a `Session` state machine and an async `Engine` interface used
   by every frontend.
-- [ ] Move blocking SQLite work behind a bounded worker/pool abstraction; add
+- [x] Move blocking SQLite work behind a bounded worker/pool abstraction; add
   per-shard connection pools and backpressure.
 - [ ] Add cancellation, request deadlines, result row/byte limits, and graceful
   shutdown hooks to the core interface.

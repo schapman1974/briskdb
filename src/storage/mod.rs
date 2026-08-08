@@ -1,11 +1,21 @@
 //! SQLite file layout, manifest initialization, and connection configuration.
 
+pub(crate) mod pool;
+pub(crate) use pool::{ConnectionOwner, ConnectionPools, PooledConnection};
+
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{
+    Connection, OptionalExtension,
+    hooks::{AuthAction, AuthContext, Authorization},
+};
 
 pub use crate::core::Database;
 use crate::{
@@ -15,7 +25,7 @@ use crate::{
 
 const SCHEMA_VERSION: &str = "1";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Storage {
     root: PathBuf,
     shard_count: u16,
@@ -23,12 +33,7 @@ pub(crate) struct Storage {
 
 impl Storage {
     pub(crate) fn open(root: impl AsRef<Path>, requested_shards: u16) -> EngineResult<Self> {
-        if !(2..=64).contains(&requested_shards) {
-            return Err(EngineError::new(
-                EngineErrorKind::InvalidArgument,
-                "shard count must be between 2 and 64",
-            ));
-        }
+        validate_shard_count(requested_shards)?;
 
         let root = root.as_ref().to_path_buf();
         let shards_dir = root.join("shards");
@@ -131,6 +136,131 @@ impl Storage {
         configure_connection(&connection)?;
         Ok(connection)
     }
+
+    pub(crate) fn open_pooled_shard(
+        &self,
+        shard: u16,
+    ) -> EngineResult<(Connection, ConnectionHygiene)> {
+        let connection = self.open_shard(shard)?;
+        let tainted = Arc::new(AtomicBool::new(false));
+        let wrote = Arc::new(AtomicBool::new(false));
+        let probing = Arc::new(AtomicBool::new(false));
+        let probe_tainted = Arc::new(AtomicBool::new(false));
+        let probe_wrote = Arc::new(AtomicBool::new(false));
+        let authorizer_taint = Arc::clone(&tainted);
+        let authorizer_wrote = Arc::clone(&wrote);
+        let authorizer_probing = Arc::clone(&probing);
+        let authorizer_probe_tainted = Arc::clone(&probe_tainted);
+        let authorizer_probe_wrote = Arc::clone(&probe_wrote);
+        connection
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if action_taints_connection(context.action) {
+                    if authorizer_probing.load(Ordering::Relaxed) {
+                        authorizer_probe_tainted.store(true, Ordering::Relaxed);
+                        return Authorization::Deny;
+                    }
+                    authorizer_taint.store(true, Ordering::Relaxed);
+                }
+                if action_writes_connection(context.action) {
+                    if authorizer_probing.load(Ordering::Relaxed) {
+                        authorizer_probe_wrote.store(true, Ordering::Relaxed);
+                        return Authorization::Deny;
+                    }
+                    authorizer_wrote.store(true, Ordering::Relaxed);
+                }
+                Authorization::Allow
+            }))
+            .map_err(sqlite_error::storage)?;
+        Ok((
+            connection,
+            ConnectionHygiene {
+                tainted,
+                wrote,
+                probing,
+                probe_tainted,
+                probe_wrote,
+            },
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ConnectionHygiene {
+    pub(crate) tainted: Arc<AtomicBool>,
+    pub(crate) wrote: Arc<AtomicBool>,
+    probing: Arc<AtomicBool>,
+    probe_tainted: Arc<AtomicBool>,
+    probe_wrote: Arc<AtomicBool>,
+}
+
+impl ConnectionHygiene {
+    /// Enter a non-executing authorizer probe. Tainting and write actions are
+    /// denied at prepare time so they cannot affect a foreign physical handle.
+    pub(crate) fn begin_probe(&self) -> ConnectionProbe<'_> {
+        self.probe_tainted.store(false, Ordering::Relaxed);
+        self.probe_wrote.store(false, Ordering::Relaxed);
+        let was_probing = self.probing.swap(true, Ordering::Relaxed);
+        debug_assert!(!was_probing, "connection hygiene probes cannot be nested");
+        ConnectionProbe { hygiene: self }
+    }
+}
+
+/// Restores the normal authorizer mode even if statement preparation unwinds.
+pub(crate) struct ConnectionProbe<'a> {
+    hygiene: &'a ConnectionHygiene,
+}
+
+impl ConnectionProbe<'_> {
+    pub(crate) fn requires_fresh_connection(&self) -> bool {
+        self.hygiene.probe_tainted.load(Ordering::Relaxed)
+            || self.hygiene.probe_wrote.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for ConnectionProbe<'_> {
+    fn drop(&mut self) {
+        self.hygiene.probing.store(false, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn validate_shard_count(requested_shards: u16) -> EngineResult<()> {
+    if (2..=64).contains(&requested_shards) {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "shard count must be between 2 and 64",
+        ))
+    }
+}
+
+fn action_taints_connection(action: AuthAction<'_>) -> bool {
+    matches!(
+        action,
+        AuthAction::Unknown { .. }
+            | AuthAction::CreateTempIndex { .. }
+            | AuthAction::CreateTempTable { .. }
+            | AuthAction::CreateTempTrigger { .. }
+            | AuthAction::CreateTempView { .. }
+            | AuthAction::DropTempIndex { .. }
+            | AuthAction::DropTempTable { .. }
+            | AuthAction::DropTempTrigger { .. }
+            | AuthAction::DropTempView { .. }
+            | AuthAction::Pragma { .. }
+            | AuthAction::Transaction { .. }
+            | AuthAction::Attach { .. }
+            | AuthAction::Detach { .. }
+            | AuthAction::CreateVtable { .. }
+            | AuthAction::DropVtable { .. }
+            | AuthAction::Savepoint { .. }
+    )
+}
+
+fn action_writes_connection(action: AuthAction<'_>) -> bool {
+    matches!(
+        action,
+        AuthAction::Insert { .. } | AuthAction::Update { .. } | AuthAction::Delete { .. }
+    )
 }
 
 fn configure_connection(connection: &Connection) -> EngineResult<()> {

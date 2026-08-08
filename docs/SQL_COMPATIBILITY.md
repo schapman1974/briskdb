@@ -55,19 +55,57 @@ Every HTTP operation now calls the same protocol-neutral async engine intended
 for future PostgreSQL and MySQL adapters. Execute and query requests create a
 fresh `Ready` session, put the request's `shard_key` in its routing context, and
 submit an owned statement. The engine, rather than the HTTP adapter, selects the
-shard and opens the SQLite connection. The session is discarded when that HTTP
-request finishes, so a transaction cannot span requests.
+shard and acquires a pooled SQLite connection. The session is discarded when
+that HTTP request finishes, so a transaction cannot span requests.
 
-The asynchronous boundary currently delegates each operation to Tokio's
-blocking workers, and each SQL operation still opens one or more SQLite
-connections. It does not yet provide the bounded per-shard pools and
-backpressure planned in issue #10, or the cancellation and deadline behavior
-planned in issue #11. Dropping a request future does not interrupt an in-flight
-SQLite operation; the operation may still commit after the client disconnects.
-Broadcast execution remains non-atomic: its parameterless SQL batch is not
-wrapped in a transaction on each shard, and shards are processed sequentially.
-A failure can therefore leave earlier statements committed on the failing shard
-as well as leave earlier shards fully or partially updated.
+The asynchronous boundary admits work to an independent bounded pool for each
+shard before dispatching blocking SQLite work. The default pool permits four
+active connections and 32 queued operations per shard. Public `EngineOptions`
+accepts 1–16 active connections and 1–1,024 queued operations per shard,
+provided the configured shard count and per-shard active limit do not exceed
+512 total active connections. Connections are opened lazily and reused. A full
+queue returns the retryable `Busy` error (HTTP 503), while single-shard routed
+work waiting on one shard does not consume another shard's capacity. Broadcast
+intentionally reserves one slot in every shard pool before it dispatches.
+
+SQLite forms that can leave connection-local state remain allowed by the
+current one-call pass-through, but they are uncontracted. The pool observes
+transaction and savepoint control, `PRAGMA`, `ATTACH`/`DETACH`, and temporary
+objects and marks the connection tainted. A clean read handle can be reused by
+another session for ordinary SQL without transferring the handle's recorded
+first-owner history. Before connection-local routed SQL executes on such a
+foreign handle, a deny-only authorizer probe identifies it without permitting
+prepare-time effects. The probe also identifies writes, so a cross-owner write
+starts with fresh SQLite counter state. The real statement then runs once on the
+fresh handle. Any other probe error also fails closed to a fresh handle, after
+which replacement acquisition can return a storage error; otherwise the normal
+statement boundary produces the public SQL result or error. Broadcast batches
+instead receive a fresh handle up front when ownership changes, avoiding any
+multi-statement preflight. After the call, a tainted connection is closed instead
+of being reused. A connection left in a transaction is also retired after
+rollback cleanup is attempted. This preserves existing one-call SQLite behavior
+without allowing connection-local state or observer metadata such as
+`PRAGMA data_version` to leak into another ephemeral HTTP session; it does not
+add multi-request transactions or promise compatibility for those statements.
+
+SQLite also retains `last_insert_rowid()`, `changes()`, and `total_changes()` on
+the physical connection after ordinary writes. A write-bearing handle may be
+reused by its owning BriskDB `Session`, but the pool closes and replaces it
+before checkout by a different session. Read-only handles can cross sessions.
+This preserves same-session write metadata without exposing one HTTP request's
+connection-local counters to the next request when the owned handle remains
+available. It does not pin that handle, so these observer functions remain
+uncontracted across calls in the current SQL surface.
+
+Dropping a request future before its queued operation starts causes that work to
+be skipped. Dropping it after blocking execution begins does not interrupt
+SQLite, and the operation may still commit after the client disconnects.
+Cancellation and deadline behavior remain planned in issue #11. Broadcast
+execution remains non-atomic: its parameterless SQL batch is not wrapped in a
+transaction on each shard, and shards are processed sequentially. A failure can
+therefore leave earlier statements committed on the failing shard as well as
+leave earlier shards fully or partially updated. Pooling does not change the
+manifest schema, shard files, or stored-data format.
 
 ### Current parameter and result conversion
 

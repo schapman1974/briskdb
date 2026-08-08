@@ -21,7 +21,7 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, and errors; stable key routing; routed execute/query and schema broadcast | JSON/HTTP types, listeners, or Axum handlers |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, and errors; stable key routing; bounded per-shard admission and connection pools; routed execute/query and schema broadcast | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Manifest and shard layout, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `sql` | SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, filesystem layout, or protocol responses |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
@@ -67,9 +67,10 @@ routing, storage, SQL conversion, CLI, and server assembly.
 
 The module names are stable boundaries, not a claim that later roadmap work is
 already complete. The async engine and initial session lifecycle are now in
-place; connection pools, cancellation, and limits are separate issues. The
-synchronous `Database` API remains available as a Rust compatibility surface
-and is the implementation used behind the asynchronous boundary.
+place, including bounded per-shard connection pools. Cancellation, deadlines,
+limits, and graceful shutdown are separate work. The synchronous `Database` API
+remains available as a Rust compatibility surface; existing engine and server
+entry points retain their signatures and default behavior.
 
 ## Session and asynchronous engine boundary
 
@@ -95,24 +96,84 @@ Consequently, session settings and transactions cannot span HTTP requests.
 Schema broadcast and status calls also go through the shared engine, but do not
 perform a routing decision in the adapter.
 
-The local engine currently uses Tokio blocking workers around the existing
-synchronous `Database` operations. Those workers are not BriskDB's planned
-bounded execution pool, and each SQL operation still opens one or more shard
-connections. Bounded per-shard pools and backpressure are issue #10;
-cancellation, deadlines, limits, and graceful shutdown are issue #11. Real
-`BEGIN`/`COMMIT`/`ROLLBACK`,
-failed-transaction state, and single-shard pinning are deliberately deferred to
-the PostgreSQL and MySQL transaction work in issues #34 and #47. `Ready` and
-`Closed` therefore describe session lifecycle, not SQL transaction state.
+### Bounded worker and connection-pool boundary
 
-Dropping an engine future does not cancel SQLite work in this phase. The
-blocking worker retains the session lock until that work ends, so another call
-cannot overlap it on the same session; an operation may still commit after its
-frontend disconnects. Issue #11 owns interruption and cancellation semantics.
+The local engine owns one independent pool per physical shard. `EngineOptions`
+defaults each pool to four active connections and a queue of 32 admitted
+operations. Connections are created lazily, up to the active limit, and are
+reused after successful cleanup. Admission occurs on the asynchronous side
+before work is handed to a Tokio blocking worker, so waiting for a shard slot
+does not occupy an unbounded set of blocking threads.
 
-This boundary changes Rust orchestration only. It does not change command-line
-or environment configuration, HTTP routes or JSON shapes, shard routing,
-manifest schema, SQLite files, WAL or synchronous settings, or any stored data.
+Custom options allow 1–16 active connections and 1–1,024 queued operations per
+shard. Construction also enforces an aggregate limit of 512
+active connections (`shard_count * connections_per_shard`). Existing
+constructors and server assembly use the defaults, so their APIs and behavior
+remain compatible. Server configuration exposes
+`--connections-per-shard` / `BRISKDB_CONNECTIONS_PER_SHARD` and
+`--queue-capacity-per-shard` / `BRISKDB_QUEUE_CAPACITY_PER_SHARD`.
+
+When a shard has no active slot and its admission queue is full, a new operation
+fails immediately with retryable `Busy`, which the HTTP adapter maps to 503.
+Capacity for routed work belongs to its selected shard: saturation on shard A
+neither consumes shard B's slots nor delays work already admitted there. Schema
+broadcast is the deliberate cross-shard exception. It reserves one slot from
+every shard in ascending order before dispatch, so it can occupy capacity in
+several pools while waiting; it then checks out each connection only when that
+shard's turn arrives. The deterministic reservation order prevents concurrent
+broadcasts from deadlocking each other.
+
+Pool checkout also establishes a connection-hygiene boundary. SQLite authorizer
+events identify operations that can persist connection-local state, including
+transaction and savepoint control, `PRAGMA`, `ATTACH`/`DETACH`, and temporary
+objects. The operation is allowed under the current one-call SQLite
+pass-through behavior, but that behavior remains uncontracted. Clean read
+handles may cross sessions for ordinary statements. The pool retains the first
+session associated with each physical handle; an ordinary foreign read does not
+relabel that history. Before a routed statement uses such a foreign handle, the
+engine prepares it under a deny-only authorizer probe. The first
+connection-local or write action is rejected before it can run—even for PRAGMAs
+with prepare-time effects—and the real statement is then executed once on a
+fresh handle. This also gives every cross-owner write clean SQLite counter state.
+The expected probe error is never exposed to the caller. Any other probe error
+also fails closed to a fresh handle. Opening that replacement can surface its own
+storage error; otherwise only the real execution determines the caller-visible
+SQL result. Broadcast batches are not preflighted because later statements can
+depend on earlier schema changes; instead, a foreign handle is replaced before
+the batch begins.
+
+A connection marked tainted by real execution is closed after the call instead
+of returning to the pool. If a call leaves a transaction open, rollback is
+attempted for cleanup and the connection is likewise retired; cleanup failures
+also prevent reuse. Thus connection-local state and observer metadata such as
+`PRAGMA data_version` cannot leak from one ephemeral HTTP `Session` to another.
+
+Ordinary writes require a narrower rule because SQLite exposes per-connection
+`last_insert_rowid()`, `changes()`, and `total_changes()` state. The pool records
+the owning BriskDB session after any authorizer-observed insert, update, or
+delete. That physical handle remains reusable by the same session, preserving
+its SQLite semantics, but a checkout for any other session retires and replaces
+it before SQL runs. Handles used only for reads remain reusable across sessions.
+This ownership is a leakage-prevention rule, not connection pinning: a competing
+session can replace an idle write-bearing handle, so write-counter functions
+remain uncontracted across calls until transaction/session pinning is added.
+
+Dropping an engine future while it is still queued removes that work before it
+starts. Once work is running on a blocking worker, dropping the future does not
+interrupt SQLite; the operation may still commit after its frontend disconnects.
+Issue #11 owns in-flight cancellation, deadlines, result limits, and graceful
+shutdown. In particular, implicit Rust destruction is not yet an asynchronous
+shutdown operation: dropping the final `Engine` may close idle SQLite handles
+synchronously on the dropping thread. Issue #11 will add an explicit bounded
+drain path. Real multi-call `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction
+state, and single-shard pinning remain deferred to the PostgreSQL and MySQL
+transaction work in issues #34 and #47. `Ready` and `Closed` therefore describe
+session lifecycle, not SQL transaction state.
+
+This boundary changes Rust orchestration and adds opt-in `EngineOptions` plus
+pool-sizing CLI/environment configuration. It does not change existing option
+defaults, HTTP routes or JSON shapes, shard routing, manifest schema, SQLite
+files, WAL or synchronous settings, or any stored data.
 
 ## Error boundary
 

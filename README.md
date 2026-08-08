@@ -31,6 +31,7 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 
 - Stable BLAKE3 routing from a caller-provided shard key
 - A protocol-neutral async engine with per-request HTTP sessions
+- Bounded, lazy per-shard SQLite connection pools with explicit backpressure
 - Protocol-neutral typed values, ordered columns, positional rows, and results
 - A fixed shard count recorded in `manifest.sqlite`
 - One WAL-enabled SQLite database per shard
@@ -59,6 +60,13 @@ cargo run -- --data-dir ./briskdb-data --shards 4
 
 The default listener is `127.0.0.1:7654`. Configuration can also be supplied
 with `BRISKDB_LISTEN`, `BRISKDB_DATA_DIR`, and `BRISKDB_SHARDS`.
+
+Rust embedders can customize pool sizing through the public `EngineOptions`
+type. Existing engine constructors and server startup keep the defaults of four
+active connections and 32 queued operations per shard. Server deployments can
+override them with `--connections-per-shard` /
+`BRISKDB_CONNECTIONS_PER_SHARD` and `--queue-capacity-per-shard` /
+`BRISKDB_QUEUE_CAPACITY_PER_SHARD`.
 
 Create a table on every shard:
 
@@ -111,14 +119,38 @@ selected shard depends on the routing key; an example response is:
 This is an initial scaffold, not a production database yet. The current API
 accepts SQL and should only be exposed on a trusted network. The HTTP adapter
 creates an ephemeral session for each data request, so session state and
-transactions cannot span HTTP requests. Each SQL operation currently opens one
-or more SQLite connections on Tokio's blocking workers; bounded workers,
-connection pools, backpressure, cancellation, and deadlines remain roadmap
-work. Broadcast changes and future scatter operations are not atomic across
-shard files. The shard count is immutable after database creation, so
-resharding will require an explicit migration workflow.
+transactions cannot span HTTP requests. Each shard has its own bounded pool, so
+routed work queued for one shard does not consume another shard's capacity.
+Pool admission happens before blocking SQLite work: once a shard's active slots
+and queue are full, the engine returns retryable `Busy` (HTTP 503) instead of
+growing work without bound. Connections are opened lazily and reused. Broadcast
+is the deliberate cross-shard exception: it reserves one slot from every shard
+before dispatch and can therefore occupy capacity in several pools at once.
 
-Near-term work includes authentication, connection pools, schema migrations,
+`EngineOptions` permits 1–16 active connections and 1–1,024 queued operations
+per shard, with at most 512 active connections across all shards.
+SQLite statements that can leave connection-local state remain uncontracted
+pass-through behavior. Such connections, and connections left in a transaction,
+are retired rather than reused by another session. Clean read handles can be
+shared for ordinary SQL, but a deny-only authorizer probe moves connection-local
+SQL such as `PRAGMA data_version`, plus any cross-owner write, to a fresh
+disposable handle before execution.
+A handle that performed an ordinary write may return to the same session,
+preserving SQLite write counters, but is replaced before a different session can
+observe `last_insert_rowid()`, `changes()`, or `total_changes()`. Those functions
+remain uncontracted across calls until sessions gain connection pinning.
+Dropping queued work skips it before SQLite starts; dropping in-flight work does
+not yet cancel it, and it may still commit.
+Cancellation, deadlines, limits, and graceful shutdown remain roadmap work.
+Broadcast changes and future scatter operations are not atomic across shard
+files. The shard count is immutable after database creation, so resharding will
+require an explicit migration workflow. Pooling does not change the manifest
+schema, shard files, or stored-data format. Until graceful pool draining lands
+in issue #11, dropping the final `Engine` may close idle SQLite handles
+synchronously on the dropping thread; server operation dispatch itself remains
+behind the bounded worker boundary.
+
+Near-term work includes authentication, cancellation, schema migrations,
 scatter/gather reads, observability, backup tooling, and failure-injection
 tests for multi-shard operations.
 
