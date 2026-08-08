@@ -40,8 +40,8 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Finite per-query row/logical-byte budgets with no partial results
 - Explicit graceful drain, forced cancellation, and blocking handle cleanup
 - Protocol-neutral typed values, ordered columns, positional rows, and results
-- A transactionally versioned `manifest.sqlite` with a durable 4,096-bucket
-  shard catalog
+- A transactionally versioned `manifest.sqlite` with durable 4,096-bucket
+  routing plus logical-database and table metadata
 - One WAL-enabled SQLite database per shard
 - Routed execute and query endpoints
 - A broadcast endpoint for initializing schema on every shard
@@ -169,18 +169,26 @@ Queries have finite row and logical-byte budgets, account values before cloning
 payloads, and return no partial result on `LimitExceeded`.
 Broadcast changes and future scatter operations are not atomic across shard
 files. The initial shard count is immutable, so resharding will require an
-explicit migration workflow. Opening upgrades exact version-1 and version-2
-manifests to version 3 through one transaction per numbered step. Version 3
-persists hash, key-encoding, and bucket-algorithm versions, a generation-stamped
-4,096-bucket map, and active physical-shard lifecycle records. Newer or malformed
-manifests fail closed, and downgrade fences reject shipped version-1 and
-version-2 readers. Startup loads the validated catalog into one immutable
-snapshot, and runtime routing hashes the exact key bytes, derives a virtual
-bucket, then reads that bucket's persisted physical-shard assignment. The
-generation-1 ranges preserve every earlier modulo placement, including
-non-power-of-two shard counts. This changes only routing internals, not shard
-files, SQL behavior, or wire contracts. The complete format and upgrade
-contract is in [manifest storage format](docs/STORAGE_FORMAT.md).
+explicit migration workflow. Opening upgrades exact version-1, version-2, and
+version-3 manifests to version 4 through one transaction per numbered step.
+Version 3 introduced the versioned, generation-stamped 4,096-bucket routing
+map. Version 4 adds schema generation 0 and immutable logical metadata with
+default database ID 1 named `default`; identifier encoding version 1 accepts
+only canonical lowercase ASCII names. Table rows can describe sharded, global,
+or catalog placement and a sharded table's `Int64`, text, or binary key.
+
+The v3-to-v4 step is atomic within `manifest.sqlite` and installs a version-4
+downgrade fence. It deliberately leaves the table catalog empty: it neither
+infers nor adopts tables already present in physical shard files. The public
+catalog returned by `Database::catalog()` and `Engine::catalog()` is an
+immutable, read-only advisory view. Current execute, query, broadcast, routing,
+shard files, SQLite behavior, HTTP shapes, and wire contracts are unchanged.
+Startup loads routing and logical metadata in one validated immutable snapshot;
+runtime routing continues to hash the exact key bytes, derive a virtual bucket,
+and read its persisted physical-shard assignment. The generation-1 ranges
+preserve every earlier modulo placement, including non-power-of-two shard
+counts. Newer or malformed manifests fail closed. The complete format and
+upgrade contract is in [manifest storage format](docs/STORAGE_FORMAT.md).
 Embedders should call
 `Engine::shutdown`; merely dropping the final `Engine` is not the explicit
 asynchronous cleanup contract.

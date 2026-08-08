@@ -4,9 +4,12 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::{
     core::{
-        BUCKET_ALGORITHM_VERSION, EngineError, EngineErrorKind, EngineResult, HASH_VERSION,
-        INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION, RoutingCatalog, VIRTUAL_BUCKET_COUNT,
-        initial_physical_shard,
+        BUCKET_ALGORITHM_VERSION, Catalog, CatalogSnapshot, DEFAULT_LOGICAL_DATABASE_ID,
+        DEFAULT_LOGICAL_DATABASE_NAME, EngineError, EngineErrorKind, EngineResult, HASH_VERSION,
+        IDENTIFIER_ENCODING_VERSION, INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION,
+        LogicalDatabaseMetadata, MAX_LOGICAL_DATABASES, MAX_TABLES, RoutingCatalog,
+        ShardKeyMetadata, ShardKeyType, TableMetadata, TablePlacement, VIRTUAL_BUCKET_COUNT,
+        initial_physical_shard, validate_catalog_identifier,
     },
     sqlite_error,
 };
@@ -16,8 +19,17 @@ pub(super) const MANIFEST_APPLICATION_ID: i64 = 0x4252_4442;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = V3_SCHEMA_VERSION;
+const V4_SCHEMA_VERSION: u32 = 4;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = V4_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
+
+const INITIAL_SCHEMA_GENERATION: u64 = 0;
+const SHARDED_PLACEMENT: i64 = 1;
+const GLOBAL_PLACEMENT: i64 = 2;
+const CATALOG_PLACEMENT: i64 = 3;
+const INT64_SHARD_KEY_TYPE: i64 = 1;
+const TEXT_SHARD_KEY_TYPE: i64 = 2;
+const BINARY_SHARD_KEY_TYPE: i64 = 3;
 
 const ACTIVE_LIFECYCLE_STATE: &str = "active";
 
@@ -37,6 +49,10 @@ const V3_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
         CHECK (requires_manifest_version >= 3)
 ) STRICT";
+const V4_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 4)
+) STRICT";
 const V3_ROUTING_TABLE_SQL: &str = "CREATE TABLE briskdb_routing (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     hash_version INTEGER NOT NULL CHECK (hash_version = 1),
@@ -54,6 +70,73 @@ const V3_VIRTUAL_BUCKETS_TABLE_SQL: &str = "CREATE TABLE briskdb_virtual_buckets
     physical_shard_id INTEGER NOT NULL,
     FOREIGN KEY (physical_shard_id) REFERENCES briskdb_physical_shards (shard_id)
 ) STRICT";
+const V4_LOGICAL_DATABASES_TABLE_SQL: &str = "CREATE TABLE briskdb_logical_databases (
+    database_id INTEGER PRIMARY KEY CHECK (database_id > 0),
+    database_name TEXT NOT NULL COLLATE BINARY UNIQUE
+        CHECK (
+            length(database_name) BETWEEN 1 AND 63
+            AND instr(database_name, char(0)) = 0
+            AND database_name NOT GLOB '*[^a-z0-9_]*'
+            AND substr(database_name, 1, 1) GLOB '[a-z_]'
+            AND database_name <> 'briskdb'
+            AND database_name NOT GLOB 'briskdb_*'
+            AND database_name NOT GLOB 'sqlite_*'
+        )
+) STRICT";
+const V4_SCHEMA_CATALOG_TABLE_SQL: &str = "CREATE TABLE briskdb_schema_catalog (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    identifier_encoding_version INTEGER NOT NULL CHECK (identifier_encoding_version = 1),
+    schema_generation INTEGER NOT NULL CHECK (schema_generation = 0),
+    default_database_id INTEGER NOT NULL CHECK (default_database_id = 1),
+    FOREIGN KEY (default_database_id)
+        REFERENCES briskdb_logical_databases (database_id)
+) STRICT";
+const V4_TABLES_TABLE_SQL: &str = "CREATE TABLE briskdb_tables (
+    table_id INTEGER PRIMARY KEY CHECK (table_id > 0),
+    database_id INTEGER NOT NULL,
+    table_name TEXT NOT NULL COLLATE BINARY
+        CHECK (
+            length(table_name) BETWEEN 1 AND 63
+            AND instr(table_name, char(0)) = 0
+            AND table_name NOT GLOB '*[^a-z0-9_]*'
+            AND substr(table_name, 1, 1) GLOB '[a-z_]'
+            AND table_name <> 'briskdb'
+            AND table_name NOT GLOB 'briskdb_*'
+            AND table_name NOT GLOB 'sqlite_*'
+        ),
+    placement INTEGER NOT NULL CHECK (placement IN (1, 2, 3)),
+    shard_key_column TEXT COLLATE BINARY
+        CHECK (
+            shard_key_column IS NULL OR (
+                length(shard_key_column) BETWEEN 1 AND 63
+                AND instr(shard_key_column, char(0)) = 0
+                AND shard_key_column NOT GLOB '*[^a-z0-9_]*'
+                AND substr(shard_key_column, 1, 1) GLOB '[a-z_]'
+                AND shard_key_column <> 'briskdb'
+                AND shard_key_column NOT GLOB 'briskdb_*'
+                AND shard_key_column NOT GLOB 'sqlite_*'
+            )
+        ),
+    shard_key_type INTEGER
+        CHECK (shard_key_type IS NULL OR shard_key_type IN (1, 2, 3)),
+    UNIQUE (database_id, table_name),
+    FOREIGN KEY (database_id)
+        REFERENCES briskdb_logical_databases (database_id)
+        ON DELETE RESTRICT,
+    CHECK (
+        (
+            placement = 1
+            AND shard_key_column IS NOT NULL
+            AND shard_key_type IS NOT NULL
+        )
+        OR
+        (
+            placement IN (2, 3)
+            AND shard_key_column IS NULL
+            AND shard_key_type IS NULL
+        )
+    )
+) STRICT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RoutingConfiguration {
@@ -61,6 +144,13 @@ struct RoutingConfiguration {
     key_encoding_version: u32,
     bucket_algorithm_version: u32,
     map_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SchemaCatalogConfiguration {
+    identifier_encoding_version: u32,
+    schema_generation: u64,
+    default_database_id: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +166,7 @@ struct Migration {
 struct ManifestSnapshot {
     shard_count: u16,
     routing_catalog: Option<RoutingCatalog>,
+    logical_catalog: Option<Catalog>,
 }
 
 const MIGRATIONS: &[Migration] = &[
@@ -93,6 +184,13 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v2_to_v3,
         validate: validate_v3,
     },
+    Migration {
+        from: V3_SCHEMA_VERSION,
+        to: V4_SCHEMA_VERSION,
+        name: "logical_database_and_table_catalog",
+        apply: migrate_v3_to_v4,
+        validate: validate_v4,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -105,7 +203,7 @@ struct MigrationPlan<'a> {
 const CURRENT_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: CURRENT_SCHEMA_VERSION,
     migrations: MIGRATIONS,
-    initialize_current: create_v3_schema,
+    initialize_current: create_v4_schema,
 };
 
 #[derive(Clone, Copy)]
@@ -149,14 +247,21 @@ enum ManifestState {
 pub(super) fn load_or_create_catalog(
     connection: &mut Connection,
     requested_shards: u16,
-) -> EngineResult<RoutingCatalog> {
+) -> EngineResult<CatalogSnapshot> {
     let snapshot = load_or_create_snapshot_with_hook(connection, requested_shards, |_| Ok(()))?;
-    snapshot.routing_catalog.ok_or_else(|| {
+    let routing = snapshot.routing_catalog.ok_or_else(|| {
         EngineError::new(
             EngineErrorKind::Internal,
             "current manifest validation did not produce a routing catalog",
         )
-    })
+    })?;
+    let logical = snapshot.logical_catalog.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "current manifest validation did not produce a logical catalog",
+        )
+    })?;
+    Ok(CatalogSnapshot::from_validated_parts(routing, logical))
 }
 
 #[cfg(test)]
@@ -345,6 +450,11 @@ fn create_v3_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineRe
     migrate_v2_to_v3(transaction, shard_count)
 }
 
+fn create_v4_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
+    create_v3_schema(transaction, shard_count)?;
+    migrate_v3_to_v4(transaction, shard_count)
+}
+
 fn migrate_v2_to_v3(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
     transaction
         .execute_batch("DROP TABLE briskdb_metadata;")
@@ -424,6 +534,61 @@ fn migrate_v2_to_v3(transaction: &Transaction<'_>, shard_count: u16) -> EngineRe
                 .map_err(sqlite_error::storage)?;
         }
     }
+
+    Ok(())
+}
+
+fn migrate_v3_to_v4(transaction: &Transaction<'_>, _shard_count: u16) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V4_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V4_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+
+    transaction
+        .execute_batch(V4_LOGICAL_DATABASES_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_logical_databases (database_id, database_name)
+             VALUES (?1, ?2)",
+            rusqlite::params![
+                i64::try_from(DEFAULT_LOGICAL_DATABASE_ID)
+                    .expect("default logical database ID fits in SQLite"),
+                DEFAULT_LOGICAL_DATABASE_NAME
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V4_SCHEMA_CATALOG_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_schema_catalog (
+                singleton,
+                identifier_encoding_version,
+                schema_generation,
+                default_database_id
+             ) VALUES (1, ?1, ?2, ?3)",
+            rusqlite::params![
+                i64::from(IDENTIFIER_ENCODING_VERSION),
+                i64::try_from(INITIAL_SCHEMA_GENERATION)
+                    .expect("initial schema generation fits in SQLite"),
+                i64::try_from(DEFAULT_LOGICAL_DATABASE_ID)
+                    .expect("default logical database ID fits in SQLite"),
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V4_TABLES_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
 
     Ok(())
 }
@@ -609,6 +774,43 @@ fn v3_objects() -> Vec<SchemaObject> {
     ]
 }
 
+fn v4_objects() -> Vec<SchemaObject> {
+    vec![
+        SchemaObject {
+            object_type: "table".to_owned(),
+            name: "briskdb_logical_databases".to_owned(),
+        },
+        SchemaObject {
+            object_type: "table".to_owned(),
+            name: "briskdb_manifest".to_owned(),
+        },
+        SchemaObject {
+            object_type: "table".to_owned(),
+            name: "briskdb_metadata".to_owned(),
+        },
+        SchemaObject {
+            object_type: "table".to_owned(),
+            name: "briskdb_physical_shards".to_owned(),
+        },
+        SchemaObject {
+            object_type: "table".to_owned(),
+            name: "briskdb_routing".to_owned(),
+        },
+        SchemaObject {
+            object_type: "table".to_owned(),
+            name: "briskdb_schema_catalog".to_owned(),
+        },
+        SchemaObject {
+            object_type: "table".to_owned(),
+            name: "briskdb_tables".to_owned(),
+        },
+        SchemaObject {
+            object_type: "table".to_owned(),
+            name: "briskdb_virtual_buckets".to_owned(),
+        },
+    ]
+}
+
 fn schema_objects(connection: &Connection) -> EngineResult<Vec<SchemaObject>> {
     let mut statement = connection
         .prepare(
@@ -693,6 +895,18 @@ fn validate_table(
         "briskdb_virtual_buckets" => {
             "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
              FROM pragma_table_xinfo('briskdb_virtual_buckets') LIMIT ?1"
+        }
+        "briskdb_logical_databases" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_logical_databases') LIMIT ?1"
+        }
+        "briskdb_schema_catalog" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_schema_catalog') LIMIT ?1"
+        }
+        "briskdb_tables" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_tables') LIMIT ?1"
         }
         _ => {
             return Err(EngineError::new(
@@ -879,6 +1093,7 @@ fn validate_v2(
     Ok(ManifestSnapshot {
         shard_count,
         routing_catalog: None,
+        logical_catalog: None,
     })
 }
 
@@ -894,6 +1109,26 @@ fn validate_v3(
         ));
     }
 
+    let (shard_count, routing_catalog) = validate_routing_manifest(
+        connection,
+        requested_shards,
+        V3_SCHEMA_VERSION,
+        V3_DOWNGRADE_FENCE_SQL,
+    )?;
+    validate_foreign_keys(connection)?;
+    Ok(ManifestSnapshot {
+        shard_count,
+        routing_catalog: Some(routing_catalog),
+        logical_catalog: None,
+    })
+}
+
+fn validate_routing_manifest(
+    connection: &Connection,
+    requested_shards: u16,
+    expected_version: u32,
+    downgrade_fence_sql: &str,
+) -> EngineResult<(u16, RoutingCatalog)> {
     validate_table(
         connection,
         "briskdb_manifest",
@@ -916,7 +1151,7 @@ fn validate_v3(
         )],
         true,
     )?;
-    validate_table_sql(connection, "briskdb_metadata", V3_DOWNGRADE_FENCE_SQL)?;
+    validate_table_sql(connection, "briskdb_metadata", downgrade_fence_sql)?;
     validate_table(
         connection,
         "briskdb_routing",
@@ -961,22 +1196,383 @@ fn validate_v3(
     )?;
 
     let shard_count = validate_manifest_configuration(connection, requested_shards)?;
-    validate_downgrade_fence(connection, V3_SCHEMA_VERSION)?;
+    validate_downgrade_fence(connection, expected_version)?;
     let routing = validate_routing_configuration(connection)?;
     validate_physical_shards(connection, shard_count)?;
     let buckets = validate_virtual_buckets(connection, shard_count)?;
-    validate_foreign_keys(connection)?;
-    Ok(ManifestSnapshot {
+    Ok((
         shard_count,
-        routing_catalog: Some(RoutingCatalog::from_validated_parts(
+        RoutingCatalog::from_validated_parts(
             shard_count,
             routing.hash_version,
             routing.key_encoding_version,
             routing.bucket_algorithm_version,
             routing.map_generation,
             buckets,
+        ),
+    ))
+}
+
+fn validate_v4(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    if objects != v4_objects() {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "manifest schema version 4 has unexpected database objects",
+        ));
+    }
+
+    let (shard_count, routing_catalog) = validate_routing_manifest(
+        connection,
+        requested_shards,
+        V4_SCHEMA_VERSION,
+        V4_DOWNGRADE_FENCE_SQL,
+    )?;
+    validate_table(
+        connection,
+        "briskdb_logical_databases",
+        &[
+            TableColumn::expected(0, "database_id", "INTEGER", false, 1),
+            TableColumn::expected(1, "database_name", "TEXT", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_logical_databases",
+        V4_LOGICAL_DATABASES_TABLE_SQL,
+    )?;
+    validate_table(
+        connection,
+        "briskdb_schema_catalog",
+        &[
+            TableColumn::expected(0, "singleton", "INTEGER", false, 1),
+            TableColumn::expected(1, "identifier_encoding_version", "INTEGER", true, 0),
+            TableColumn::expected(2, "schema_generation", "INTEGER", true, 0),
+            TableColumn::expected(3, "default_database_id", "INTEGER", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_schema_catalog",
+        V4_SCHEMA_CATALOG_TABLE_SQL,
+    )?;
+    validate_table(
+        connection,
+        "briskdb_tables",
+        &[
+            TableColumn::expected(0, "table_id", "INTEGER", false, 1),
+            TableColumn::expected(1, "database_id", "INTEGER", true, 0),
+            TableColumn::expected(2, "table_name", "TEXT", true, 0),
+            TableColumn::expected(3, "placement", "INTEGER", true, 0),
+            TableColumn::expected(4, "shard_key_column", "TEXT", false, 0),
+            TableColumn::expected(5, "shard_key_type", "INTEGER", false, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(connection, "briskdb_tables", V4_TABLES_TABLE_SQL)?;
+
+    let catalog_configuration = validate_schema_catalog_configuration(connection)?;
+    let databases =
+        validate_logical_databases(connection, catalog_configuration.default_database_id)?;
+    let tables = validate_table_metadata(connection, &databases)?;
+    validate_foreign_keys(connection)?;
+
+    Ok(ManifestSnapshot {
+        shard_count,
+        routing_catalog: Some(routing_catalog),
+        logical_catalog: Some(Catalog::from_validated_parts(
+            catalog_configuration.identifier_encoding_version,
+            catalog_configuration.schema_generation,
+            catalog_configuration.default_database_id,
+            databases,
+            tables,
         )),
     })
+}
+
+fn validate_schema_catalog_configuration(
+    connection: &Connection,
+) -> EngineResult<SchemaCatalogConfiguration> {
+    let mut statement = connection
+        .prepare(
+            "SELECT singleton,
+                    identifier_encoding_version,
+                    schema_generation,
+                    default_database_id
+             FROM briskdb_schema_catalog
+             ORDER BY singleton
+             LIMIT 3",
+        )
+        .map_err(|error| {
+            manifest_read_error(error, "failed to read schema catalog configuration")
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|error| manifest_read_error(error, "failed to read schema catalog configuration"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            manifest_read_error(error, "failed to read schema catalog configuration")
+        })?;
+    if rows.len() != 1 || rows[0].0 != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "schema catalog configuration must contain exactly its singleton row",
+        ));
+    }
+
+    let (_, identifier_encoding_version, schema_generation, default_database_id) = rows[0];
+    if identifier_encoding_version != i64::from(IDENTIFIER_ENCODING_VERSION) {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!(
+                "manifest has unsupported identifier-encoding version {identifier_encoding_version}"
+            ),
+        ));
+    }
+    let schema_generation = u64::try_from(schema_generation).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "schema generation is outside the supported numeric range",
+            error,
+        )
+    })?;
+    if schema_generation != INITIAL_SCHEMA_GENERATION {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("manifest has unsupported schema generation {schema_generation}"),
+        ));
+    }
+    let default_database_id = u64::try_from(default_database_id).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "default logical database ID is outside the supported numeric range",
+            error,
+        )
+    })?;
+    if default_database_id != DEFAULT_LOGICAL_DATABASE_ID {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("manifest has unsupported default logical database ID {default_database_id}"),
+        ));
+    }
+
+    Ok(SchemaCatalogConfiguration {
+        identifier_encoding_version: IDENTIFIER_ENCODING_VERSION,
+        schema_generation,
+        default_database_id,
+    })
+}
+
+fn validate_logical_databases(
+    connection: &Connection,
+    default_database_id: u64,
+) -> EngineResult<Box<[LogicalDatabaseMetadata]>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT database_id, database_name
+             FROM briskdb_logical_databases
+             ORDER BY database_id
+             LIMIT ?1",
+        )
+        .map_err(|error| manifest_read_error(error, "failed to read logical database catalog"))?;
+    let limit = i64::try_from(MAX_LOGICAL_DATABASES + 1)
+        .expect("logical database inspection limit fits in SQLite");
+    let rows = statement
+        .query_map([limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| manifest_read_error(error, "failed to read logical database catalog"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| manifest_read_error(error, "failed to read logical database catalog"))?;
+    if rows.is_empty() || rows.len() > MAX_LOGICAL_DATABASES {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!(
+                "logical database catalog must contain between 1 and {MAX_LOGICAL_DATABASES} rows"
+            ),
+        ));
+    }
+
+    let mut databases = Vec::with_capacity(rows.len());
+    for (stored_id, name) in rows {
+        let id = u64::try_from(stored_id).map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::DataCorruption,
+                "logical database ID is outside the supported numeric range",
+                error,
+            )
+        })?;
+        if id == 0 {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "logical database IDs must be positive",
+            ));
+        }
+        if !validate_catalog_identifier(&name) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("logical database {id} has an invalid catalog name"),
+            ));
+        }
+        databases.push(LogicalDatabaseMetadata::from_validated(id, name));
+    }
+
+    let default = databases
+        .iter()
+        .find(|database| database.id().get() == default_database_id)
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "logical database catalog is missing its configured default",
+            )
+        })?;
+    if default.name() != DEFAULT_LOGICAL_DATABASE_NAME {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("default logical database must be named {DEFAULT_LOGICAL_DATABASE_NAME}"),
+        ));
+    }
+
+    Ok(databases.into_boxed_slice())
+}
+
+fn validate_table_metadata(
+    connection: &Connection,
+    databases: &[LogicalDatabaseMetadata],
+) -> EngineResult<Box<[TableMetadata]>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT table_id,
+                    database_id,
+                    table_name,
+                    placement,
+                    shard_key_column,
+                    shard_key_type
+             FROM briskdb_tables
+             ORDER BY database_id, table_name, table_id
+             LIMIT ?1",
+        )
+        .map_err(|error| manifest_read_error(error, "failed to read table metadata catalog"))?;
+    let limit = i64::try_from(MAX_TABLES + 1).expect("table inspection limit fits in SQLite");
+    let rows = statement
+        .query_map([limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })
+        .map_err(|error| manifest_read_error(error, "failed to read table metadata catalog"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| manifest_read_error(error, "failed to read table metadata catalog"))?;
+    if rows.len() > MAX_TABLES {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("table metadata catalog exceeds its {MAX_TABLES}-row limit"),
+        ));
+    }
+
+    let mut tables = Vec::with_capacity(rows.len());
+    for (stored_table_id, stored_database_id, name, placement, column, key_type) in rows {
+        let table_id = positive_catalog_id(stored_table_id, "table")?;
+        let database_id = positive_catalog_id(stored_database_id, "logical database")?;
+        if databases
+            .binary_search_by_key(&database_id, |database| database.id().get())
+            .is_err()
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("table {table_id} references unknown logical database {database_id}"),
+            ));
+        }
+        if !validate_catalog_identifier(&name) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("table {table_id} has an invalid catalog name"),
+            ));
+        }
+
+        let placement = match (placement, column, key_type) {
+            (SHARDED_PLACEMENT, Some(column), Some(key_type)) => {
+                if !validate_catalog_identifier(&column) {
+                    return Err(EngineError::new(
+                        EngineErrorKind::DataCorruption,
+                        format!("table {table_id} has an invalid shard-key column"),
+                    ));
+                }
+                TablePlacement::Sharded(ShardKeyMetadata::from_validated(
+                    column,
+                    decode_shard_key_type(key_type, table_id)?,
+                ))
+            }
+            (GLOBAL_PLACEMENT, None, None) => TablePlacement::Global,
+            (CATALOG_PLACEMENT, None, None) => TablePlacement::Catalog,
+            (placement, _, _) if !matches!(placement, 1..=3) => {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!("table {table_id} has unsupported placement code {placement}"),
+                ));
+            }
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!("table {table_id} has inconsistent placement and shard-key metadata"),
+                ));
+            }
+        };
+        tables.push(TableMetadata::from_validated(
+            table_id,
+            database_id,
+            name,
+            placement,
+        ));
+    }
+
+    Ok(tables.into_boxed_slice())
+}
+
+fn positive_catalog_id(value: i64, entity: &str) -> EngineResult<u64> {
+    let id = u64::try_from(value).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            format!("{entity} ID is outside the supported numeric range"),
+            error,
+        )
+    })?;
+    if id == 0 {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("{entity} IDs must be positive"),
+        ));
+    }
+    Ok(id)
+}
+
+fn decode_shard_key_type(code: i64, table_id: u64) -> EngineResult<ShardKeyType> {
+    match code {
+        INT64_SHARD_KEY_TYPE => Ok(ShardKeyType::Int64),
+        TEXT_SHARD_KEY_TYPE => Ok(ShardKeyType::Text),
+        BINARY_SHARD_KEY_TYPE => Ok(ShardKeyType::Binary),
+        code => Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("table {table_id} has unsupported shard-key type code {code}"),
+        )),
+    }
 }
 
 fn validate_manifest_configuration(
@@ -1295,6 +1891,8 @@ mod tests {
 
     use super::*;
 
+    type StoredTableMetadataRow = (i64, i64, String, i64, Option<String>, Option<i64>);
+
     fn create_legacy_manifest(connection: &Connection, shards: u16, version: u32) {
         create_empty_legacy_manifest(connection);
         connection
@@ -1329,6 +1927,13 @@ mod tests {
         let transaction = connection.transaction().unwrap();
         create_v2_schema(&transaction, shards).unwrap();
         set_identity(&transaction, V2_SCHEMA_VERSION).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    fn create_v3_manifest(connection: &mut Connection, shards: u16) {
+        let transaction = connection.transaction().unwrap();
+        create_v3_schema(&transaction, shards).unwrap();
+        set_identity(&transaction, V3_SCHEMA_VERSION).unwrap();
         transaction.commit().unwrap();
     }
 
@@ -1387,12 +1992,93 @@ mod tests {
             .unwrap()
     }
 
+    fn schema_catalog_configuration(connection: &Connection) -> (i64, i64, i64, i64) {
+        connection
+            .query_row(
+                "SELECT singleton,
+                        identifier_encoding_version,
+                        schema_generation,
+                        default_database_id
+                 FROM briskdb_schema_catalog",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    fn logical_databases(connection: &Connection) -> Vec<(i64, String)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT database_id, database_name
+                 FROM briskdb_logical_databases
+                 ORDER BY database_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn table_metadata_rows(connection: &Connection) -> Vec<StoredTableMetadataRow> {
+        let mut statement = connection
+            .prepare(
+                "SELECT table_id,
+                        database_id,
+                        table_name,
+                        placement,
+                        shard_key_column,
+                        shard_key_type
+                 FROM briskdb_tables
+                 ORDER BY database_id, table_name, table_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn insert_valid_table_catalog(connection: &Connection) {
+        connection
+            .execute_batch(
+                "INSERT INTO briskdb_logical_databases VALUES (9, 'tenant');
+                 INSERT INTO briskdb_tables VALUES (3, 1, 'accounts', 1, 'tenant_id', 2);
+                 INSERT INTO briskdb_tables VALUES (8, 1, 'countries', 2, NULL, NULL);
+                 INSERT INTO briskdb_tables VALUES (21, 9, 'audit_log', 3, NULL, NULL);
+                 INSERT INTO briskdb_tables VALUES (34, 9, 'binary_keys', 1, 'key_bytes', 3);
+                 INSERT INTO briskdb_tables VALUES (55, 9, 'counters', 1, 'counter_id', 1);",
+            )
+            .unwrap();
+    }
+
     fn assert_generation_one_catalog(connection: &Connection, shard_count: u16) {
         assert_eq!(
             identity(connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(connection).unwrap(), v3_objects());
+        assert_eq!(schema_objects(connection).unwrap(), v4_objects());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT requires_manifest_version FROM briskdb_metadata",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            i64::from(V4_SCHEMA_VERSION)
+        );
         assert_eq!(
             routing_configuration(connection),
             (
@@ -1426,6 +2112,12 @@ mod tests {
         let largest = assignments.iter().max().unwrap();
         assert!(*smallest > 0);
         assert!(*largest - *smallest <= 1);
+        assert_eq!(schema_catalog_configuration(connection), (1, 1, 0, 1));
+        assert_eq!(
+            logical_databases(connection),
+            [(1, DEFAULT_LOGICAL_DATABASE_NAME.to_owned())]
+        );
+        assert!(table_metadata_rows(connection).is_empty());
         validate_foreign_keys(connection).unwrap();
     }
 
@@ -1515,7 +2207,7 @@ mod tests {
             .unwrap(),
             4
         );
-        assert_eq!(resumed_steps, [(2, 3)]);
+        assert_eq!(resumed_steps, [(2, 3), (3, 4)]);
         assert_generation_one_catalog(&connection, 4);
         assert_eq!(quick_check(&connection), "ok");
     }
@@ -1543,17 +2235,115 @@ mod tests {
     }
 
     #[test]
-    fn fresh_and_v2_upgraded_catalogs_are_identical_for_every_shard_count() {
+    fn valid_logical_database_and_table_metadata_round_trips_all_supported_codes() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        load_or_create(&mut connection, 4).unwrap();
+        insert_valid_table_catalog(&connection);
+
+        let first = load_or_create_catalog(&mut connection, 4).unwrap();
+        let catalog = first.logical();
+        assert_eq!(catalog.identifier_encoding_version(), 1);
+        assert_eq!(catalog.schema_generation(), 0);
+        assert_eq!(catalog.default_database().name(), "default");
+        assert_eq!(catalog.logical_databases().len(), 2);
+        assert_eq!(catalog.tables().len(), 5);
+        assert_eq!(
+            catalog
+                .table("default", "accounts")
+                .unwrap()
+                .unwrap()
+                .id()
+                .get(),
+            3
+        );
+        assert!(matches!(
+            catalog
+                .table("default", "countries")
+                .unwrap()
+                .unwrap()
+                .placement(),
+            TablePlacement::Global
+        ));
+        assert!(matches!(
+            catalog
+                .table("tenant", "audit_log")
+                .unwrap()
+                .unwrap()
+                .placement(),
+            TablePlacement::Catalog
+        ));
+        for (table, expected_type) in [
+            ("binary_keys", ShardKeyType::Binary),
+            ("counters", ShardKeyType::Int64),
+        ] {
+            match catalog.table("tenant", table).unwrap().unwrap().placement() {
+                TablePlacement::Sharded(shard_key) => {
+                    assert_eq!(shard_key.key_type(), expected_type);
+                }
+                placement => panic!("unexpected placement {placement:?}"),
+            }
+        }
+
+        let reopened = load_or_create_catalog(&mut connection, 4).unwrap();
+        assert_eq!(first, reopened);
+        assert_eq!(quick_check(&connection), "ok");
+    }
+
+    #[test]
+    fn logical_catalog_sql_constraints_reject_invalid_rows() {
+        for invalid_insert in [
+            "INSERT INTO briskdb_logical_databases VALUES (2, 'Tenant')",
+            "INSERT INTO briskdb_logical_databases VALUES (2, '9tenant')",
+            "INSERT INTO briskdb_logical_databases VALUES (2, 'briskdb_private')",
+            "INSERT INTO briskdb_logical_databases VALUES (2, 'sqlite_private')",
+            "INSERT INTO briskdb_logical_databases VALUES (2, 'a' || char(0) || 'UPPER')",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'Widgets', 2, NULL, NULL)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'a' || char(0) || 'UPPER', 2, NULL, NULL)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 4, NULL, NULL)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 1, NULL, NULL)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 2, 'tenant_id', 2)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 1, 'TenantId', 2)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 1, 'a' || char(0) || 'UPPER', 2)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 1, 'tenant_id', 4)",
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            load_or_create(&mut connection, 4).unwrap();
+
+            assert!(
+                connection.execute_batch(invalid_insert).is_err(),
+                "SQLite accepted invalid catalog row: {invalid_insert}"
+            );
+            assert_generation_one_catalog(&connection, 4);
+        }
+
+        let mut foreign_key = Connection::open_in_memory().unwrap();
+        foreign_key
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        load_or_create(&mut foreign_key, 4).unwrap();
+        assert!(
+            foreign_key
+                .execute_batch(
+                    "INSERT INTO briskdb_tables
+                     VALUES (1, 9, 'widgets', 2, NULL, NULL)"
+                )
+                .is_err()
+        );
+        assert_generation_one_catalog(&foreign_key, 4);
+    }
+
+    #[test]
+    fn fresh_v2_and_v3_upgraded_catalogs_are_identical_for_every_shard_count() {
         for shard_count in 2..=64 {
             let mut fresh = Connection::open_in_memory().unwrap();
             let fresh_catalog = load_or_create_catalog(&mut fresh, shard_count).unwrap();
-            assert_eq!(fresh_catalog.shard_count(), shard_count);
+            assert_eq!(fresh_catalog.routing().shard_count(), shard_count);
             assert_generation_one_catalog(&fresh, shard_count);
 
             let mut upgraded = Connection::open_in_memory().unwrap();
             create_v2_manifest(&mut upgraded, shard_count);
             let upgraded_catalog = load_or_create_catalog(&mut upgraded, shard_count).unwrap();
-            assert_eq!(upgraded_catalog.shard_count(), shard_count);
+            assert_eq!(upgraded_catalog.routing().shard_count(), shard_count);
             assert_generation_one_catalog(&upgraded, shard_count);
             assert_eq!(fresh_catalog, upgraded_catalog);
             for key in [
@@ -1564,8 +2354,8 @@ mod tests {
                 "snowman-☃".as_bytes(),
             ] {
                 assert_eq!(
-                    fresh_catalog.shard_for_key(key),
-                    upgraded_catalog.shard_for_key(key)
+                    fresh_catalog.routing().shard_for_key(key),
+                    upgraded_catalog.routing().shard_for_key(key)
                 );
             }
             assert_eq!(
@@ -1574,6 +2364,13 @@ mod tests {
             );
             assert_eq!(physical_shards(&fresh), physical_shards(&upgraded));
             assert_eq!(virtual_buckets(&fresh), virtual_buckets(&upgraded));
+
+            let mut version_three = Connection::open_in_memory().unwrap();
+            create_v3_manifest(&mut version_three, shard_count);
+            let version_three_catalog =
+                load_or_create_catalog(&mut version_three, shard_count).unwrap();
+            assert_eq!(fresh_catalog, version_three_catalog);
+            assert_generation_one_catalog(&version_three, shard_count);
         }
     }
 
@@ -1844,6 +2641,77 @@ mod tests {
     }
 
     #[test]
+    fn logical_catalog_migration_failures_roll_back_to_exact_v3_and_retry() {
+        for failing_phase in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_v3_manifest(&mut connection, 5);
+            let routing_before = routing_configuration(&connection);
+            let shards_before = physical_shards(&connection);
+            let buckets_before = virtual_buckets(&connection);
+
+            let error = load_or_create_with_hook(&mut connection, 5, |point| {
+                if point.from == V3_SCHEMA_VERSION && point.phase == failing_phase {
+                    Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "injected logical catalog migration failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+            assert_eq!(
+                identity(&connection),
+                (MANIFEST_APPLICATION_ID, i64::from(V3_SCHEMA_VERSION))
+            );
+            assert_eq!(schema_objects(&connection).unwrap(), v3_objects());
+            assert_eq!(routing_configuration(&connection), routing_before);
+            assert_eq!(physical_shards(&connection), shards_before);
+            assert_eq!(virtual_buckets(&connection), buckets_before);
+            assert_eq!(quick_check(&connection), "ok");
+
+            assert_eq!(load_or_create(&mut connection, 5).unwrap(), 5);
+            assert_generation_one_catalog(&connection, 5);
+        }
+    }
+
+    #[test]
+    fn panics_on_both_sides_of_the_logical_catalog_stamp_roll_back_and_retry() {
+        for failing_phase in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_v3_manifest(&mut connection, 3);
+            let buckets_before = virtual_buckets(&connection);
+
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                let _ = load_or_create_with_hook(&mut connection, 3, |point| {
+                    if point.from == V3_SCHEMA_VERSION && point.phase == failing_phase {
+                        panic!("injected logical catalog migration panic");
+                    }
+                    Ok(())
+                });
+            }));
+            assert!(panic.is_err());
+            assert_eq!(
+                identity(&connection),
+                (MANIFEST_APPLICATION_ID, i64::from(V3_SCHEMA_VERSION))
+            );
+            assert_eq!(schema_objects(&connection).unwrap(), v3_objects());
+            assert_eq!(virtual_buckets(&connection), buckets_before);
+            assert_eq!(quick_check(&connection), "ok");
+
+            assert_eq!(load_or_create(&mut connection, 3).unwrap(), 3);
+            assert_generation_one_catalog(&connection, 3);
+        }
+    }
+
+    #[test]
     fn panic_during_fresh_initialization_rolls_back_and_retry_succeeds() {
         let mut connection = Connection::open_in_memory().unwrap();
 
@@ -1892,6 +2760,46 @@ mod tests {
         let observer = Connection::open(&path).unwrap();
         assert_eq!(identity(&observer), (MANIFEST_APPLICATION_ID, 2));
         assert_eq!(schema_objects(&observer).unwrap(), v2_objects());
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap();
+
+        assert_generation_one_catalog(&observer, 4);
+    }
+
+    #[test]
+    fn an_observer_sees_exact_v3_until_the_logical_catalog_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.sqlite");
+        let mut connection = Connection::open(&path).unwrap();
+        create_v3_manifest(&mut connection, 4);
+        let buckets_before = virtual_buckets(&connection);
+        drop(connection);
+
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let migration_path = path.clone();
+        let worker = thread::spawn(move || {
+            let mut connection = Connection::open(migration_path).unwrap();
+            load_or_create_with_hook(&mut connection, 4, |point| {
+                if point.from == V3_SCHEMA_VERSION
+                    && point.phase == MigrationPhase::AfterVersionStamp
+                {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+        });
+
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let observer = Connection::open(&path).unwrap();
+        assert_eq!(
+            identity(&observer),
+            (MANIFEST_APPLICATION_ID, i64::from(V3_SCHEMA_VERSION))
+        );
+        assert_eq!(schema_objects(&observer).unwrap(), v3_objects());
+        assert_eq!(virtual_buckets(&observer), buckets_before);
         resume_tx.send(()).unwrap();
         worker.join().unwrap();
 
@@ -1963,6 +2871,65 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_version_three_openers_share_one_complete_logical_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.sqlite");
+        let mut connection = Connection::open(&path).unwrap();
+        create_v3_manifest(&mut connection, 5);
+        drop(connection);
+
+        let barrier = Arc::new(Barrier::new(4));
+        let workers = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut connection = Connection::open(path).unwrap();
+                    connection
+                        .busy_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    barrier.wait();
+                    load_or_create_catalog(&mut connection, 5)
+                })
+            })
+            .collect::<Vec<_>>();
+        let snapshots = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(snapshots.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(snapshots[0].logical().default_database().name(), "default");
+        assert!(snapshots[0].logical().tables().is_empty());
+
+        let connection = Connection::open(path).unwrap();
+        assert_generation_one_catalog(&connection, 5);
+        assert_eq!(quick_check(&connection), "ok");
+    }
+
+    #[test]
+    fn v3_upgrade_lock_contention_is_retryable_and_leaves_v3_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.sqlite");
+        let mut owner = Connection::open(&path).unwrap();
+        create_v3_manifest(&mut owner, 4);
+        owner.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let mut contender = Connection::open(&path).unwrap();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        let error = load_or_create(&mut contender, 4).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+        owner.execute_batch("ROLLBACK;").unwrap();
+
+        assert_eq!(
+            identity(&contender),
+            (MANIFEST_APPLICATION_ID, i64::from(V3_SCHEMA_VERSION))
+        );
+        assert_eq!(schema_objects(&contender).unwrap(), v3_objects());
+        assert_eq!(load_or_create(&mut contender, 4).unwrap(), 4);
+        assert_generation_one_catalog(&contender, 4);
+    }
+
+    #[test]
     fn concurrent_initializers_choose_exactly_one_shard_count() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("manifest.sqlite");
@@ -2023,7 +2990,7 @@ mod tests {
     }
 
     #[test]
-    fn version_two_reader_rejects_version_three_without_mutating_it() {
+    fn version_two_reader_rejects_current_manifest_without_mutating_it() {
         const OLD_MIGRATIONS: &[Migration] = &[Migration {
             from: LEGACY_SCHEMA_VERSION,
             to: V2_SCHEMA_VERSION,
@@ -2045,6 +3012,42 @@ mod tests {
         assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
         assert_generation_one_catalog(&connection, 4);
         assert_eq!(virtual_buckets(&connection), before);
+    }
+
+    #[test]
+    fn version_three_reader_rejects_version_four_without_mutating_it() {
+        const OLD_MIGRATIONS: &[Migration] = &[
+            Migration {
+                from: LEGACY_SCHEMA_VERSION,
+                to: V2_SCHEMA_VERSION,
+                name: "typed_manifest_and_downgrade_fence",
+                apply: migrate_v1_to_v2,
+                validate: validate_v2,
+            },
+            Migration {
+                from: V2_SCHEMA_VERSION,
+                to: V3_SCHEMA_VERSION,
+                name: "durable_shard_catalog",
+                apply: migrate_v2_to_v3,
+                validate: validate_v3,
+            },
+        ];
+        const OLD_PLAN: MigrationPlan<'static> = MigrationPlan {
+            current_version: V3_SCHEMA_VERSION,
+            migrations: OLD_MIGRATIONS,
+            initialize_current: create_v3_schema,
+        };
+
+        let mut connection = Connection::open_in_memory().unwrap();
+        load_or_create(&mut connection, 4).unwrap();
+        let objects = schema_objects(&connection).unwrap();
+        let databases = logical_databases(&connection);
+        let error = inspect_with_plan(&connection, 4, OLD_PLAN).unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert_eq!(schema_objects(&connection).unwrap(), objects);
+        assert_eq!(logical_databases(&connection), databases);
+        assert_generation_one_catalog(&connection, 4);
     }
 
     #[test]
@@ -2090,7 +3093,7 @@ mod tests {
         for mutation in [
             "DELETE FROM briskdb_metadata",
             "DELETE FROM briskdb_manifest",
-            "INSERT INTO briskdb_metadata VALUES (3)",
+            "INSERT INTO briskdb_metadata VALUES (4)",
             "DELETE FROM briskdb_routing",
             "DELETE FROM briskdb_virtual_buckets WHERE bucket_id = 4095",
             "DELETE FROM briskdb_physical_shards WHERE shard_id = 3",
@@ -2191,6 +3194,142 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_logical_catalog_values_when_sql_checks_are_bypassed() {
+        for mutation in [
+            "UPDATE briskdb_schema_catalog SET singleton = 2",
+            "UPDATE briskdb_schema_catalog SET identifier_encoding_version = 2",
+            "UPDATE briskdb_schema_catalog SET schema_generation = 1",
+            "UPDATE briskdb_schema_catalog SET default_database_id = 2",
+            "DELETE FROM briskdb_logical_databases WHERE database_id = 1",
+            "UPDATE briskdb_logical_databases SET database_name = 'Default'",
+            "UPDATE briskdb_logical_databases SET database_name = 'a' || char(0) || 'UPPER'",
+            "UPDATE briskdb_logical_databases SET database_name = 'briskdb_internal'",
+            "INSERT INTO briskdb_logical_databases VALUES (0, 'zero')",
+            "INSERT INTO briskdb_logical_databases VALUES (2, CAST(x'80' AS TEXT))",
+            "INSERT INTO briskdb_tables VALUES (0, 1, 'widgets', 2, NULL, NULL)",
+            "INSERT INTO briskdb_tables VALUES (1, 9, 'widgets', 2, NULL, NULL)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'Widgets', 2, NULL, NULL)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'a' || char(0) || 'UPPER', 2, NULL, NULL)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 4, NULL, NULL)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 1, NULL, NULL)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 2, 'tenant_id', 2)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 1, 'TenantId', 2)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 1, 'a' || char(0) || 'UPPER', 2)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 1, 'tenant_id', 4)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, CAST(x'80' AS TEXT), 2, NULL, NULL)",
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            load_or_create(&mut connection, 4).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     PRAGMA ignore_check_constraints = ON;",
+                )
+                .unwrap();
+            connection.execute_batch(mutation).unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .unwrap();
+
+            let error = load_or_create(&mut connection, 4).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::DataCorruption, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn logical_database_and_table_catalog_limits_are_exact_and_bounded() {
+        let mut databases = Connection::open_in_memory().unwrap();
+        load_or_create(&mut databases, 4).unwrap();
+        {
+            let transaction = databases.transaction().unwrap();
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO briskdb_logical_databases (database_id, database_name)
+                     VALUES (?1, ?2)",
+                )
+                .unwrap();
+            for id in 2..=MAX_LOGICAL_DATABASES {
+                insert
+                    .execute(rusqlite::params![
+                        i64::try_from(id).unwrap(),
+                        format!("db_{id:02}")
+                    ])
+                    .unwrap();
+            }
+            drop(insert);
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            load_or_create_catalog(&mut databases, 4)
+                .unwrap()
+                .logical()
+                .logical_databases()
+                .len(),
+            MAX_LOGICAL_DATABASES
+        );
+        databases
+            .execute(
+                "INSERT INTO briskdb_logical_databases (database_id, database_name)
+                 VALUES (?1, ?2)",
+                rusqlite::params![
+                    i64::try_from(MAX_LOGICAL_DATABASES + 1).unwrap(),
+                    "one_too_many"
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            load_or_create(&mut databases, 4).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+
+        let mut tables = Connection::open_in_memory().unwrap();
+        load_or_create(&mut tables, 4).unwrap();
+        {
+            let transaction = tables.transaction().unwrap();
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO briskdb_tables (
+                        table_id,
+                        database_id,
+                        table_name,
+                        placement,
+                        shard_key_column,
+                        shard_key_type
+                     ) VALUES (?1, 1, ?2, 2, NULL, NULL)",
+                )
+                .unwrap();
+            for id in 1..=MAX_TABLES {
+                insert
+                    .execute(rusqlite::params![
+                        i64::try_from(id).unwrap(),
+                        format!("table_{id:04}")
+                    ])
+                    .unwrap();
+            }
+            drop(insert);
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            load_or_create_catalog(&mut tables, 4)
+                .unwrap()
+                .logical()
+                .tables()
+                .len(),
+            MAX_TABLES
+        );
+        tables
+            .execute(
+                "INSERT INTO briskdb_tables VALUES (?1, 1, ?2, 2, NULL, NULL)",
+                rusqlite::params![i64::try_from(MAX_TABLES + 1).unwrap(), "one_too_many"],
+            )
+            .unwrap();
+        assert_eq!(
+            load_or_create(&mut tables, 4).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
+
+    #[test]
     fn rejects_altered_catalog_table_definitions() {
         for mutation in [
             "DROP TABLE briskdb_routing;
@@ -2211,6 +3350,27 @@ mod tests {
              CREATE TABLE briskdb_physical_shards (
                 shard_id INTEGER PRIMARY KEY,
                 lifecycle_state TEXT NOT NULL
+             ) STRICT;",
+            "DROP TABLE briskdb_logical_databases;
+             CREATE TABLE briskdb_logical_databases (
+                database_id INTEGER PRIMARY KEY,
+                database_name TEXT NOT NULL UNIQUE
+             ) STRICT;",
+            "DROP TABLE briskdb_schema_catalog;
+             CREATE TABLE briskdb_schema_catalog (
+                singleton INTEGER PRIMARY KEY,
+                identifier_encoding_version INTEGER NOT NULL,
+                schema_generation INTEGER NOT NULL,
+                default_database_id INTEGER NOT NULL
+             ) STRICT;",
+            "DROP TABLE briskdb_tables;
+             CREATE TABLE briskdb_tables (
+                table_id INTEGER PRIMARY KEY,
+                database_id INTEGER NOT NULL,
+                table_name TEXT NOT NULL,
+                placement INTEGER NOT NULL,
+                shard_key_column TEXT,
+                shard_key_type INTEGER
              ) STRICT;",
         ] {
             let mut connection = Connection::open_in_memory().unwrap();

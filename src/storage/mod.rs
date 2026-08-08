@@ -21,7 +21,7 @@ use rusqlite::{
 
 pub use crate::core::Database;
 use crate::{
-    core::{EngineError, EngineErrorKind, EngineResult, RoutingCatalog},
+    core::{Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult},
     sqlite_error,
 };
 
@@ -30,7 +30,7 @@ pub(crate) const CONNECTION_BUSY_TIMEOUT: std::time::Duration = std::time::Durat
 #[derive(Debug, Clone)]
 pub(crate) struct Storage {
     root: PathBuf,
-    catalog: Arc<RoutingCatalog>,
+    catalog: Arc<CatalogSnapshot>,
 }
 
 impl Storage {
@@ -66,11 +66,15 @@ impl Storage {
     }
 
     pub(crate) fn shard_count(&self) -> u16 {
-        self.catalog.shard_count()
+        self.catalog.routing().shard_count()
     }
 
     pub(crate) fn shard_for_key(&self, key: &[u8]) -> u16 {
-        self.catalog.shard_for_key(key)
+        self.catalog.routing().shard_for_key(key)
+    }
+
+    pub(crate) fn logical_catalog(&self) -> &Catalog {
+        self.catalog.logical()
     }
 
     fn shard_path(&self, shard: u16) -> PathBuf {

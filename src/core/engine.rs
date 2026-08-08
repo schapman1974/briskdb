@@ -284,6 +284,11 @@ impl Engine {
         self.inner.database.shard_count()
     }
 
+    /// Return the immutable logical database and table catalog.
+    pub fn catalog(&self) -> &super::Catalog {
+        self.inner.database.catalog()
+    }
+
     /// Return the engine's immutable pool and admission options.
     pub fn options(&self) -> EngineOptions {
         self.inner.options
