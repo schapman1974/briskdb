@@ -20,10 +20,11 @@ The syntax parser, recursive common-subset validator, placeholder normalizer,
 catalog-aware shard-key inference API, and synchronous engine bound-statement
 planner are now available behind BriskDB-owned types. Validation is explicit
 and returns `Unsupported` for a parsed form outside the subset; parser
-acceptance alone is not product support. Normalization, inference, and advisory
-planning are also explicit. The current experimental HTTP interface is still a
-raw SQLite pass-through and can execute uncontracted SQLite syntax because it
-calls none of these layers. That behavior is not a compatibility promise.
+acceptance alone is not product support. Normalization, inference, bound
+planning, and routing policy are also explicit. The current experimental HTTP
+interface is still a raw SQLite pass-through and can execute uncontracted
+SQLite syntax because it calls none of these layers. That behavior is not a
+compatibility promise.
 
 ## Compatibility layers
 
@@ -53,18 +54,20 @@ statement's exact bound-value slice and selected logical database to
 `infer_shard_keys`, which returns a typed key classification. Synchronous
 `Engine::plan_bound_statement` accepts the same concrete bind plus an optional
 explicit routing byte sequence, retains the inference, and produces owned
-advisory physical routes with schema and routing provenance. It does not choose
-between inferred and explicit routes, generally translate, authorize, enforce
-write or batch policy, or execute a statement. HTTP requests still send SQLite
-SQL directly to `rusqlite`; they do not pass through these opt-in SQL layers.
+physical routes with schema and routing provenance. It compares finite inferred
+and explicit routes by physical shard, rejects unroutable cataloged sharded
+DML, and records a valid single-shard assignment. It does not generally
+translate, authorize, enforce batch policy, or execute a statement. HTTP
+requests still send SQLite SQL directly to `rusqlite`; they do not pass through
+these opt-in SQL layers.
 
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
 | HTTP `/v1/execute` | Experimental | One SQLite statement with positional parameters | Required caller-provided `shard_key` |
 | HTTP `/v1/query` | Experimental | One prepared SQLite statement executed through the row-returning path | Required caller-provided `shard_key` |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
-| PostgreSQL wire protocol | Planned | Common subset plus documented PostgreSQL normalization | Rust inference and advisory bind-time planning implemented; wire lifecycle, routing policy, and session fallback planned |
-| MySQL wire protocol | Planned | Common subset plus documented MySQL normalization | Rust inference and advisory bind-time planning implemented; wire lifecycle, routing policy, and session fallback planned |
+| PostgreSQL wire protocol | Planned | Common subset plus documented PostgreSQL normalization | Rust inference and bind-time single-shard routing policy implemented; wire lifecycle and session integration planned |
+| MySQL wire protocol | Planned | Common subset plus documented MySQL normalization | Rust inference and bind-time single-shard routing policy implemented; wire lifecycle and session integration planned |
 
 The parser, subset validator, placeholder normalizer, shard-key inference
 function, and engine planner are implemented Rust APIs, not network
@@ -289,9 +292,10 @@ and mixed batches may validate because request-level batch policy remains issue
 with canonical SQLite parameter text and one parameter record per statement.
 `infer_shard_keys` can consume that result with catalog context and a complete
 bound-value slice for one statement. `Engine::plan_bound_statement` consumes
-that same concrete bind when a caller needs advisory routes. The SQL wrapper
-types retain exact source, dialect, and statement count without exposing the
-upstream AST or rendering SQL in `Debug` output.
+that same concrete bind when a caller needs physical routes and a validated
+single-shard assignment. The SQL wrapper types retain exact source, dialect,
+and statement count without exposing the upstream AST or rendering SQL in
+`Debug` output.
 
 The parser, validator, and normalizer have no routing or storage access. The
 implemented inference layer borrows only the read-only logical catalog and
@@ -302,9 +306,10 @@ decision record](SQL_PARSER.md) for the dependency and resource contract, the
 whitelist, and the [SQL parameter-normalization
 contract](SQL_PARAMETERS.md) for numbering and source-preservation rules. The
 [shard-key inference contract](SQL_SHARD_KEYS.md) defines the supported proof
-grammar and typed result. The [bound statement-planning
+grammar and typed result. The [bound statement-planning and routing-policy
 contract](SQL_PLANNING.md) defines canonical route bytes, occurrence ordering,
-routing provenance, and the advisory execution boundary.
+physical-target comparison, write rejection, provenance, and the
+non-executable planning boundary.
 
 ### Implemented pass-through surface
 
@@ -371,9 +376,10 @@ Insert/update duplicate checks fold ASCII letter case regardless of quoting but
 do not define general identifier normalization, which also remains issue #25.
 Placeholder normalization is the separate implemented issue #21 layer described
 below, and catalog-aware typed key extraction is the implemented issue #22
-layer. Synchronous advisory bind-time planning and routing are the implemented
-issue #23 layer; rejection of conflicting or unroutable writes remains issue
-#24. Prepare/bind/describe/execute state remains issue #26, and empty or
+layer. Synchronous bind-time route construction is the implemented issue #23
+layer, and issue #24 adds physical-target comparison, assigned shards, and
+rejection of conflicting or unroutable cataloged sharded writes.
+Prepare/bind/describe/execute state remains issue #26, and empty or
 multi-statement execution policy remains issue #27.
 
 The validator independently caps recursive expression AST depth at 128. This
@@ -381,11 +387,12 @@ also bounds flat operator chains that parse iteratively; exceeding the limit is
 reported as `LimitExceeded`.
 
 The future driver-capable execution path will send `CREATE TABLE` and
-`CREATE INDEX` through journaled schema migrations, route accepted CRUD only after its
-single-shard or supported read plan is established, and implement real
-transactions through protocol-neutral session state. Writes with no provable
-shard, conflicting shard keys, unsafe statement combinations, and cross-shard
-transactions will be rejected before changing data.
+`CREATE INDEX` through journaled schema migrations, consume only an accepted
+single-shard write or supported read plan, revalidate its provenance, and
+implement real transactions through protocol-neutral session state. The
+implemented planning API already rejects unroutable or conflicting cataloged
+writes; unsafe statement combinations and cross-shard transactions remain
+later request/session policy.
 
 ### Implemented placeholder normalization
 
@@ -430,9 +437,9 @@ inference](SQL_SHARD_KEYS.md).
 
 Inference does not encode, hash, route, plan, authorize, enforce, or execute.
 The implemented planner described below uses the result at bind/execute time to
-construct advisory routes. Issue #24 will decide which conflicting, multiple,
-or unconstrained write outcomes must be rejected before execution. The raw
-HTTP execution paths do not invoke inference.
+construct routes, validate physical-target compatibility, and reject
+unroutable sharded DML. The raw HTTP execution paths do not invoke inference or
+that policy.
 
 ### Implemented bound statement planning
 
@@ -448,14 +455,22 @@ order, including duplicate multi-row values and distinct keys that choose the
 same shard. Its explicit route remains separate even when it agrees with an
 inferred key or shard.
 
+Finite inferred routes take precedence. Optional explicit context must select
+the same physical shard as every inferred occurrence; matching raw bytes are
+not required. Multiple logical keys are accepted for a write only when they
+co-locate on one physical shard. `INSERT` must prove every row's key;
+unconstrained or contradictory `UPDATE`/`DELETE` requires explicit fallback;
+and every assignment to a cataloged shard-key column is rejected. A successful
+single-shard plan exposes `assigned_shard()`.
+
 Planning holds the schema-operation guard while consulting the catalog. The
 result records schema generation, routing-map generation, and hash,
 key-encoding, and bucket-algorithm versions. Those fields describe the snapshot
 used to build the plan; they do not reserve that snapshot for future execution.
-The method does not choose routing precedence, reject a classification,
-translate SQL, mutate a session, cache a prepared statement, apply write or
-batch policy, or execute SQLite. The exact contract is in [bound statement
-planning](SQL_PLANNING.md).
+The method does not translate SQL, mutate a session, cache a prepared
+statement, apply complete statement/batch policy, scatter reads, or execute
+SQLite. The exact matrix and error precedence are in [bound statement planning
+and routing policy](SQL_PLANNING.md).
 
 ## PostgreSQL differences
 
@@ -465,7 +480,7 @@ not implemented unless listed as implemented in this document.
 
 | Area | PostgreSQL | BriskDB contract |
 | --- | --- | --- |
-| Parameters | `$1`, `$2`, ... | Implemented opt-in Rust normalization, typed inference, and advisory routing from a supplied bound slice; wire bind lifecycle and routing policy remain planned |
+| Parameters | `$1`, `$2`, ... | Implemented opt-in Rust normalization, typed inference, and single-shard routing policy from a supplied bound slice; wire bind lifecycle remains planned |
 | Identifier quoting | Double quotes | Passed through where SQLite semantics agree |
 | Type system | Static types identified by OIDs | Planned loss-aware mapping to BriskDB types and SQLite storage classes |
 | Boolean | Dedicated `boolean` type | Stored as SQLite integer `0` or `1`; protocol adapter returns a Boolean value |
@@ -493,7 +508,7 @@ engine used by PostgreSQL and HTTP.
 
 | Area | MySQL | BriskDB contract |
 | --- | --- | --- |
-| Parameters | `?` in prepared statements | Implemented opt-in Rust normalization, typed inference, and advisory routing from a supplied bound slice; wire bind lifecycle and routing policy remain planned |
+| Parameters | `?` in prepared statements | Implemented opt-in Rust normalization, typed inference, and single-shard routing policy from a supplied bound slice; wire bind lifecycle remains planned |
 | Identifier quoting | Backticks by default | Planned normalization; double-quoted strict SQL remains available |
 | Type system | Static signed/unsigned column types | BriskDB retains `UInt64` without narrowing; current SQLite binding rejects values above `i64::MAX` until an explicit storage mapping exists |
 | Boolean | Commonly `TINYINT(1)` | Stored as SQLite integer `0` or `1`; protocol adapter returns documented metadata |
@@ -557,14 +572,15 @@ underlying execution semantics.
 - Logical metadata is currently read-only and advisory. Fresh manifests and
   upgrades originating before v4 contain no table rows; v4-to-v5 retains every
   validated v4 logical-catalog row. Existing physical tables are not inferred
-  or adopted. The opt-in Rust inference and advisory planning APIs can consult
+  or adopted. The opt-in Rust inference and planning/policy APIs can consult
   catalog contents, but they do not alter current HTTP routing or execution.
 - Opt-in inference can extract typed cataloged keys from supported equality
   predicates and every row of a supported `INSERT`.
 - Opt-in bound planning converts every inferred occurrence to an owned route,
   retains an independent explicit route, and records catalog/routing
-  provenance; it does not make a plan executable or change current HTTP
-  behavior.
+  provenance. It compares finite routes by physical shard, rejects unroutable
+  cataloged sharded writes, and records an accepted single-shard assignment;
+  it does not make a plan executable or change current HTTP behavior.
 - Point queries and writes visit only that shard.
 - No scatter/gather query path exists.
 - Unique constraints and transactions are local to one SQLite shard.
@@ -579,9 +595,9 @@ underlying execution semantics.
 - Every sharded table declares one non-null shard-key column in the catalog.
 - Canonical key encoding, hash version, virtual bucket count, and bucket map are
   persisted in the manifest.
-- Execution validates bound-plan provenance, applies write/read assignment
-  policy, and uses an explicit session routing key only as a controlled
-  fallback.
+- Execution validates bound-plan provenance, consumes the implemented
+  single-shard write/read assignment, and uses session routing state only
+  through the prepared execution lifecycle.
 - A transaction is pinned to its first shard. Targeting another shard returns a
   stable cross-shard-transaction error.
 - Read-only plans may scatter with bounded concurrency and deterministic merge.

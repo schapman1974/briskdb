@@ -3,10 +3,13 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use crate::sql::{
-    NormalizedSql, ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue, infer_shard_keys,
+    NormalizedSql, RoutedDml, ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue,
+    infer_shard_keys, routed_dml_shape,
 };
 
-use super::{Catalog, EngineError, EngineErrorKind, EngineResult, LogicalDatabaseId, Value};
+use super::{
+    Catalog, EngineError, EngineErrorKind, EngineResult, LogicalDatabaseId, TablePlacement, Value,
+};
 
 /// One owned canonical routing key and its selected physical shard.
 #[derive(Clone, PartialEq, Eq)]
@@ -41,9 +44,10 @@ impl fmt::Debug for PlannedRoute {
 ///
 /// Inferred routes remain aligned one-for-one with
 /// [`ShardKeyInference::values`], including duplicate `INSERT` row values. An
-/// explicit route is retained independently so the later write-policy layer
-/// can compare it with inferred routes. This plan does not choose between
-/// those sources, reject a plan, translate SQL, or execute anything.
+/// explicit route is retained independently even after routing policy compares
+/// it with inferred routes. A successful plan records the one assigned shard
+/// when the statement has a valid single-shard route. It does not translate SQL
+/// or execute anything.
 #[derive(Clone, PartialEq, Eq)]
 pub struct BoundStatementPlan {
     database: LogicalDatabaseId,
@@ -56,6 +60,7 @@ pub struct BoundStatementPlan {
     inference: ShardKeyInference,
     inferred_routes: Vec<PlannedRoute>,
     explicit_route: Option<PlannedRoute>,
+    assigned_shard: Option<u16>,
 }
 
 impl BoundStatementPlan {
@@ -108,6 +113,15 @@ impl BoundStatementPlan {
     pub const fn explicit_route(&self) -> Option<&PlannedRoute> {
         self.explicit_route.as_ref()
     }
+
+    /// Return the physical shard assigned by routing policy, if any.
+    ///
+    /// `None` is retained for non-sharded statements and reads that still need
+    /// later scatter or empty-result planning. Every accepted sharded write has
+    /// an assigned shard.
+    pub const fn assigned_shard(&self) -> Option<u16> {
+        self.assigned_shard
+    }
 }
 
 impl fmt::Debug for BoundStatementPlan {
@@ -124,6 +138,7 @@ impl fmt::Debug for BoundStatementPlan {
             .field("inference", &self.inference)
             .field("inferred_route_count", &self.inferred_routes.len())
             .field("has_explicit_route", &self.explicit_route.is_some())
+            .field("assigned_shard", &self.assigned_shard)
             .finish()
     }
 }
@@ -223,6 +238,37 @@ where
         key_bytes: Arc::from(key),
     });
 
+    let shard_key_column = sharded_key_column(catalog, database, &inference)?;
+    let dml = shard_key_column
+        .map(|column| routed_dml_shape(normalized, statement_index, column))
+        .transpose()?
+        .flatten();
+    let inferred_shards = inferred_shards(&inferred_routes);
+
+    if matches!(
+        dml,
+        Some(RoutedDml::Update {
+            assigns_shard_key: true
+        })
+    ) {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidQuery,
+            "sharded UPDATE cannot assign the shard-key column",
+        ));
+    }
+    validate_explicit_route(&inferred_routes, explicit_route.as_ref())?;
+    validate_sharded_write(dml, inferred_shards, explicit_route.as_ref())?;
+
+    let assigned_shard = if shard_key_column.is_some() {
+        match inferred_shards {
+            InferredShards::None => explicit_route.as_ref().map(PlannedRoute::shard),
+            InferredShards::One(shard) => Some(shard),
+            InferredShards::Multiple => None,
+        }
+    } else {
+        None
+    };
+
     Ok(BoundStatementPlan {
         database,
         schema_generation,
@@ -234,7 +280,113 @@ where
         inference,
         inferred_routes,
         explicit_route,
+        assigned_shard,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InferredShards {
+    None,
+    One(u16),
+    Multiple,
+}
+
+fn inferred_shards(routes: &[PlannedRoute]) -> InferredShards {
+    let Some(first) = routes.first() else {
+        return InferredShards::None;
+    };
+    if routes.iter().all(|route| route.shard == first.shard) {
+        InferredShards::One(first.shard)
+    } else {
+        InferredShards::Multiple
+    }
+}
+
+fn validate_explicit_route(
+    inferred_routes: &[PlannedRoute],
+    explicit_route: Option<&PlannedRoute>,
+) -> EngineResult<()> {
+    let Some(explicit_route) = explicit_route else {
+        return Ok(());
+    };
+    if inferred_routes
+        .iter()
+        .all(|inferred| inferred.shard == explicit_route.shard)
+    {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "explicit routing key conflicts with inferred statement routing",
+        ))
+    }
+}
+
+fn validate_sharded_write(
+    dml: Option<RoutedDml>,
+    inferred_shards: InferredShards,
+    explicit_route: Option<&PlannedRoute>,
+) -> EngineResult<()> {
+    match dml {
+        Some(RoutedDml::Insert) => match inferred_shards {
+            InferredShards::One(_) => Ok(()),
+            InferredShards::None | InferredShards::Multiple => Err(EngineError::new(
+                EngineErrorKind::InvalidQuery,
+                "sharded INSERT requires a proven routing key for every row",
+            )),
+        },
+        Some(RoutedDml::Update {
+            assigns_shard_key: false,
+        })
+        | Some(RoutedDml::Delete) => match inferred_shards {
+            InferredShards::One(_) => Ok(()),
+            InferredShards::None if explicit_route.is_some() => Ok(()),
+            InferredShards::None => Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "sharded write requires an inferred or explicit routing key",
+            )),
+            InferredShards::Multiple => Err(EngineError::new(
+                EngineErrorKind::InvalidQuery,
+                "sharded write targets more than one physical shard",
+            )),
+        },
+        Some(RoutedDml::Update {
+            assigns_shard_key: true,
+        }) => Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "routing policy accepted an invalid shard-key update",
+        )),
+        None => Ok(()),
+    }
+}
+
+fn sharded_key_column<'a>(
+    catalog: &'a Catalog,
+    database: LogicalDatabaseId,
+    inference: &ShardKeyInference,
+) -> EngineResult<Option<&'a str>> {
+    let sharded = matches!(
+        inference.kind(),
+        ShardKeyInferenceKind::Unconstrained
+            | ShardKeyInferenceKind::Contradiction
+            | ShardKeyInferenceKind::Exact
+            | ShardKeyInferenceKind::Multiple
+    );
+    if !sharded {
+        return Ok(None);
+    }
+    let table = inference
+        .table_id()
+        .and_then(|id| catalog.table_by_id(id))
+        .filter(|table| table.database_id() == database)
+        .ok_or_else(planning_invariant)?;
+    let TablePlacement::Sharded(shard_key) = table.placement() else {
+        return Err(planning_invariant());
+    };
+    if inference.key_type() != Some(shard_key.key_type()) {
+        return Err(planning_invariant());
+    }
+    Ok(Some(shard_key.column()))
 }
 
 fn validate_inference_shape(inference: &ShardKeyInference) -> EngineResult<()> {
@@ -250,11 +402,15 @@ fn validate_inference_shape(inference: &ShardKeyInference) -> EngineResult<()> {
     if valid {
         Ok(())
     } else {
-        Err(EngineError::new(
-            EngineErrorKind::Internal,
-            "shard-key inference is inconsistent during bound statement planning",
-        ))
+        Err(planning_invariant())
     }
+}
+
+fn planning_invariant() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::Internal,
+        "shard-key inference is inconsistent during bound statement planning",
+    )
 }
 
 fn canonical_key_bytes(value: &ShardKeyValue) -> Arc<[u8]> {
@@ -268,6 +424,7 @@ fn canonical_key_bytes(value: &ShardKeyValue) -> Arc<[u8]> {
 #[cfg(test)]
 mod tests {
     use std::{
+        path::Path,
         sync::{Arc, Barrier},
         thread,
     };
@@ -346,6 +503,33 @@ mod tests {
         )
     }
 
+    fn insert_engine_catalog_fixture(root: &Path) {
+        let manifest = rusqlite::Connection::open(root.join("manifest.sqlite")).unwrap();
+        manifest
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_integrity;
+                 DROP TABLE briskdb_metadata;
+                 CREATE TABLE briskdb_metadata (
+                     requires_manifest_version INTEGER NOT NULL
+                         CHECK (requires_manifest_version >= 6)
+                 ) STRICT;
+                 INSERT INTO briskdb_metadata VALUES (6);
+                 INSERT INTO briskdb_tables (
+                    table_id,
+                    database_id,
+                    table_name,
+                    placement,
+                    shard_key_column,
+                    shard_key_type
+                 ) VALUES (4, 1, 'events', 1, 'tenant_id', 1);
+                 PRAGMA user_version = 6;
+                 COMMIT;",
+            )
+            .unwrap();
+    }
+
     fn normalize(dialect: SqlDialect, source: &str) -> NormalizedSql {
         normalize_placeholders(validate_common_subset(parse(dialect, source).unwrap()).unwrap())
             .unwrap()
@@ -369,6 +553,33 @@ mod tests {
         )
     }
 
+    fn distinct_key_with_same_shard(routing: &RoutingCatalog, reference: &[u8]) -> Vec<u8> {
+        let shard = routing.shard_for_key(reference);
+        (0_u64..)
+            .map(|candidate| format!("same-shard-{candidate}").into_bytes())
+            .find(|candidate| {
+                candidate.as_slice() != reference && routing.shard_for_key(candidate) == shard
+            })
+            .unwrap()
+    }
+
+    fn same_shard_int_pair(routing: &RoutingCatalog) -> (i64, i64) {
+        let first = 0_i64;
+        let shard = routing.shard_for_key(first.to_string().as_bytes());
+        let second = (1_i64..)
+            .find(|candidate| routing.shard_for_key(candidate.to_string().as_bytes()) == shard)
+            .unwrap();
+        (first, second)
+    }
+
+    fn split_test_router(key: &[u8]) -> u16 {
+        match key {
+            b"7" | b"same-shard-context" => 1,
+            b"8" => 2,
+            _ => 3,
+        }
+    }
+
     fn plan(
         catalog: &Catalog,
         database: u64,
@@ -378,6 +589,29 @@ mod tests {
         explicit_routing_key: Option<&[u8]>,
     ) -> EngineResult<BoundStatementPlan> {
         let routing = routing_catalog(4);
+        plan_with_router(
+            catalog,
+            database,
+            normalized,
+            statement_index,
+            parameters,
+            explicit_routing_key,
+            |key| routing.shard_for_key(key),
+        )
+    }
+
+    fn plan_with_router<F>(
+        catalog: &Catalog,
+        database: u64,
+        normalized: &NormalizedSql,
+        statement_index: usize,
+        parameters: &[Value],
+        explicit_routing_key: Option<&[u8]>,
+        shard_for_key: F,
+    ) -> EngineResult<BoundStatementPlan>
+    where
+        F: FnMut(&[u8]) -> u16,
+    {
         plan_bound_statement(
             BoundStatementPlanInput::new(
                 catalog,
@@ -388,12 +622,12 @@ mod tests {
                 explicit_routing_key,
             ),
             RoutingProvenance::new(
-                routing.hash_version(),
-                routing.key_encoding_version(),
-                routing.bucket_algorithm_version(),
-                routing.map_generation(),
+                HASH_VERSION,
+                KEY_ENCODING_VERSION,
+                BUCKET_ALGORITHM_VERSION,
+                INITIAL_MAP_GENERATION,
             ),
-            |key| routing.shard_for_key(key),
+            shard_for_key,
         )
     }
 
@@ -408,26 +642,32 @@ mod tests {
             SqlDialect::PostgreSql,
             "INSERT INTO accounts (tenant_id) VALUES ('private-tenant')",
         );
+        let routing = routing_catalog(4);
+        let explicit_routing_key = distinct_key_with_same_shard(&routing, b"private-tenant");
         let plan = plan(
             &catalog,
             TENANT_DATABASE,
             &normalized,
             0,
             &[],
-            Some(b"private-explicit-key"),
+            Some(&explicit_routing_key),
         )
         .unwrap();
         assert_eq!(plan.clone(), plan);
         assert_eq!(plan.inferred_routes()[0].key_bytes(), b"private-tenant");
         assert_eq!(
             plan.explicit_route().unwrap().key_bytes(),
-            b"private-explicit-key"
+            explicit_routing_key
         );
 
         let debug = format!("{plan:?} {:?}", plan.explicit_route().unwrap());
         assert!(!debug.contains("private-tenant"));
-        assert!(!debug.contains("private-explicit-key"));
+        assert!(!debug.contains(std::str::from_utf8(&explicit_routing_key).unwrap()));
         assert!(debug.contains("<redacted>"));
+        assert_eq!(
+            plan.assigned_shard(),
+            Some(plan.inferred_routes()[0].shard())
+        );
     }
 
     #[test]
@@ -589,7 +829,7 @@ mod tests {
                 &normalize(dialect, source),
                 0,
                 &[Value::Int64(42)],
-                Some(b"frontend-independent-route"),
+                Some(b"42"),
             )
             .unwrap()
         });
@@ -600,7 +840,44 @@ mod tests {
     }
 
     #[test]
-    fn every_inference_kind_keeps_explicit_routing_independent() {
+    fn equivalent_typed_writes_produce_equal_assignments_across_dialects() {
+        let catalog = sample_catalog();
+        let plans = [
+            (
+                SqlDialect::Sqlite,
+                "UPDATE events SET payload = ?1 WHERE tenant_id = ?2",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "UPDATE events SET payload = $1 WHERE tenant_id = $2",
+            ),
+            (
+                SqlDialect::MySql,
+                "UPDATE events SET payload = ? WHERE tenant_id = ?",
+            ),
+        ]
+        .map(|(dialect, source)| {
+            plan(
+                &catalog,
+                DEFAULT_DATABASE,
+                &normalize(dialect, source),
+                0,
+                &[Value::Text("same-write".to_owned()), Value::Int64(42)],
+                Some(b"42"),
+            )
+            .unwrap()
+        });
+
+        assert_eq!(plans[0], plans[1]);
+        assert_eq!(plans[1], plans[2]);
+        assert_eq!(
+            plans[0].assigned_shard(),
+            Some(plans[0].inferred_routes()[0].shard())
+        );
+    }
+
+    #[test]
+    fn every_inference_kind_has_a_stable_read_assignment() {
         let catalog = sample_catalog();
         let cases = [
             ("SELECT 1", ShardKeyInferenceKind::NotApplicable, 0_usize),
@@ -633,18 +910,39 @@ mod tests {
 
         for (source, kind, route_count) in cases {
             let normalized = normalize(SqlDialect::Sqlite, source);
-            for explicit in [None, Some(b"".as_slice()), Some(b"fallback".as_slice())] {
-                let plan = plan(&catalog, DEFAULT_DATABASE, &normalized, 0, &[], explicit).unwrap();
-                assert_eq!(plan.inference().kind(), kind, "{source}");
-                assert_eq!(plan.inferred_routes().len(), route_count, "{source}");
-                assert_eq!(
-                    plan.explicit_route().is_some(),
-                    explicit.is_some(),
-                    "{source}"
-                );
-                if let Some(explicit) = explicit {
-                    assert_eq!(plan.explicit_route().unwrap().key_bytes(), explicit);
-                }
+            let without_explicit =
+                plan(&catalog, DEFAULT_DATABASE, &normalized, 0, &[], None).unwrap();
+            assert_eq!(without_explicit.inference().kind(), kind, "{source}");
+            assert_eq!(
+                without_explicit.inferred_routes().len(),
+                route_count,
+                "{source}"
+            );
+            let inferred_shards = inferred_shards(without_explicit.inferred_routes());
+            let expected = match inferred_shards {
+                InferredShards::One(shard) => Some(shard),
+                InferredShards::None | InferredShards::Multiple => None,
+            };
+            assert_eq!(without_explicit.assigned_shard(), expected, "{source}");
+
+            if route_count == 0 {
+                let explicit = b"fallback";
+                let plan = plan(
+                    &catalog,
+                    DEFAULT_DATABASE,
+                    &normalized,
+                    0,
+                    &[],
+                    Some(explicit),
+                )
+                .unwrap();
+                assert_eq!(plan.explicit_route().unwrap().key_bytes(), explicit);
+                let expected = matches!(
+                    kind,
+                    ShardKeyInferenceKind::Unconstrained | ShardKeyInferenceKind::Contradiction
+                )
+                .then_some(plan.explicit_route().unwrap().shard());
+                assert_eq!(plan.assigned_shard(), expected, "{source}");
             }
         }
     }
@@ -656,12 +954,18 @@ mod tests {
             SqlDialect::MySql,
             "INSERT INTO events (tenant_id) VALUES (?), (?), (?)",
         );
+        let routing = routing_catalog(4);
+        let (first, second) = same_shard_int_pair(&routing);
         let plan = plan(
             &catalog,
             DEFAULT_DATABASE,
             &normalized,
             0,
-            &[Value::Int64(11), Value::Int64(22), Value::Int64(11)],
+            &[
+                Value::Int64(first),
+                Value::Int64(second),
+                Value::Int64(first),
+            ],
             None,
         )
         .unwrap();
@@ -672,13 +976,21 @@ mod tests {
                 .iter()
                 .map(PlannedRoute::key_bytes)
                 .collect::<Vec<_>>(),
-            [b"11".as_slice(), b"22".as_slice(), b"11".as_slice()]
+            [
+                first.to_string().as_bytes(),
+                second.to_string().as_bytes(),
+                first.to_string().as_bytes()
+            ]
         );
         assert!(Arc::ptr_eq(
             &plan.inferred_routes[0].key_bytes,
             &plan.inferred_routes[2].key_bytes
         ));
         assert_eq!(plan.inferred_routes[0], plan.inferred_routes[2]);
+        assert_eq!(
+            plan.assigned_shard(),
+            Some(plan.inferred_routes()[0].shard())
+        );
     }
 
     #[test]
@@ -712,6 +1024,452 @@ mod tests {
                 .all(|route| route.shard() == 3)
         );
         assert_eq!(plan.explicit_route().unwrap().shard(), 3);
+        assert_eq!(plan.assigned_shard(), Some(3));
+    }
+
+    #[test]
+    fn explicit_routes_compare_physical_shards_and_never_key_bytes() {
+        let catalog = sample_catalog();
+        let normalized = normalize(
+            SqlDialect::PostgreSql,
+            "UPDATE events SET payload = 1 WHERE tenant_id = 7",
+        );
+
+        for explicit in [b"7".as_slice(), b"same-shard-context".as_slice()] {
+            let plan = plan_with_router(
+                &catalog,
+                DEFAULT_DATABASE,
+                &normalized,
+                0,
+                &[],
+                Some(explicit),
+                split_test_router,
+            )
+            .unwrap();
+            assert_eq!(plan.inferred_routes()[0].shard(), 1);
+            assert_eq!(plan.explicit_route().unwrap().key_bytes(), explicit);
+            assert_eq!(plan.explicit_route().unwrap().shard(), 1);
+            assert_eq!(plan.assigned_shard(), Some(1));
+        }
+
+        for explicit in [
+            b"different-shard-context".as_slice(),
+            b"".as_slice(),
+            b"private\0\xffcontext".as_slice(),
+        ] {
+            let error = plan_with_router(
+                &catalog,
+                DEFAULT_DATABASE,
+                &normalized,
+                0,
+                &[],
+                Some(explicit),
+                split_test_router,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+            let diagnostic = error.to_string();
+            assert!(!diagnostic.contains("different-shard-context"));
+            assert!(!diagnostic.contains("private"));
+        }
+    }
+
+    #[test]
+    fn multi_key_writes_require_one_physical_shard_while_reads_defer_scatter() {
+        let catalog = sample_catalog();
+        let writes = [
+            "INSERT INTO events (tenant_id) VALUES (7), (8)",
+            "UPDATE events SET payload = 1 WHERE tenant_id = 7 OR tenant_id = 8",
+            "DELETE FROM events WHERE tenant_id = 7 OR tenant_id = 8",
+        ];
+
+        for dialect in SqlDialect::ALL.iter().copied() {
+            for source in writes {
+                let normalized = normalize(dialect, source);
+                let error = plan_with_router(
+                    &catalog,
+                    DEFAULT_DATABASE,
+                    &normalized,
+                    0,
+                    &[],
+                    None,
+                    split_test_router,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    EngineErrorKind::InvalidQuery,
+                    "{dialect}: {source}"
+                );
+
+                let conflict = plan_with_router(
+                    &catalog,
+                    DEFAULT_DATABASE,
+                    &normalized,
+                    0,
+                    &[],
+                    Some(b"7"),
+                    split_test_router,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    conflict.kind(),
+                    EngineErrorKind::InvalidArgument,
+                    "{dialect}: {source}"
+                );
+
+                let co_located = plan_with_router(
+                    &catalog,
+                    DEFAULT_DATABASE,
+                    &normalized,
+                    0,
+                    &[],
+                    Some(b"different-logical-key"),
+                    |_| 2,
+                )
+                .unwrap();
+                assert_eq!(co_located.inferred_routes().len(), 2);
+                assert!(
+                    co_located
+                        .inferred_routes()
+                        .iter()
+                        .all(|route| route.shard() == 2)
+                );
+                assert_eq!(co_located.assigned_shard(), Some(2));
+            }
+        }
+
+        let read = normalize(
+            SqlDialect::Sqlite,
+            "SELECT * FROM events WHERE tenant_id = 7 OR tenant_id = 8",
+        );
+        let deferred = plan_with_router(
+            &catalog,
+            DEFAULT_DATABASE,
+            &read,
+            0,
+            &[],
+            None,
+            split_test_router,
+        )
+        .unwrap();
+        assert_eq!(deferred.inference().kind(), ShardKeyInferenceKind::Multiple);
+        assert_eq!(deferred.assigned_shard(), None);
+        assert_eq!(
+            deferred
+                .inferred_routes()
+                .iter()
+                .map(PlannedRoute::shard)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(
+            plan_with_router(
+                &catalog,
+                DEFAULT_DATABASE,
+                &read,
+                0,
+                &[],
+                Some(b"7"),
+                split_test_router,
+            )
+            .unwrap_err()
+            .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn predicate_writes_need_explicit_fallback_when_inference_has_no_route() {
+        let catalog = sample_catalog();
+        let statements = [
+            (
+                "UPDATE events SET payload = 1",
+                ShardKeyInferenceKind::Unconstrained,
+            ),
+            (
+                "UPDATE events SET payload = 1 WHERE tenant_id = NULL",
+                ShardKeyInferenceKind::Contradiction,
+            ),
+            ("DELETE FROM events", ShardKeyInferenceKind::Unconstrained),
+            (
+                "DELETE FROM events WHERE tenant_id = NULL",
+                ShardKeyInferenceKind::Contradiction,
+            ),
+        ];
+
+        for dialect in SqlDialect::ALL.iter().copied() {
+            for (source, kind) in statements {
+                let normalized = normalize(dialect, source);
+                let error = plan_with_router(
+                    &catalog,
+                    DEFAULT_DATABASE,
+                    &normalized,
+                    0,
+                    &[],
+                    None,
+                    split_test_router,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    EngineErrorKind::InvalidArgument,
+                    "{dialect}: {source}"
+                );
+
+                for explicit in [b"".as_slice(), b"fallback\0\xff".as_slice()] {
+                    let plan = plan_with_router(
+                        &catalog,
+                        DEFAULT_DATABASE,
+                        &normalized,
+                        0,
+                        &[],
+                        Some(explicit),
+                        split_test_router,
+                    )
+                    .unwrap();
+                    assert_eq!(plan.inference().kind(), kind);
+                    assert!(plan.inferred_routes().is_empty());
+                    assert_eq!(
+                        plan.assigned_shard(),
+                        Some(plan.explicit_route().unwrap().shard())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inserts_without_a_proven_row_key_reject_even_with_explicit_context() {
+        let catalog = sample_catalog();
+        let sources = [
+            "INSERT INTO events (payload) VALUES (1)",
+            "INSERT INTO events (tenant_id) VALUES (1 + 0)",
+        ];
+
+        for dialect in SqlDialect::ALL.iter().copied() {
+            for source in sources {
+                let normalized = normalize(dialect, source);
+                for explicit in [None, Some(b"fallback".as_slice())] {
+                    let error = plan_with_router(
+                        &catalog,
+                        DEFAULT_DATABASE,
+                        &normalized,
+                        0,
+                        &[],
+                        explicit,
+                        split_test_router,
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        error.kind(),
+                        EngineErrorKind::InvalidQuery,
+                        "{dialect}: {source}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shard_key_updates_are_rejected_before_other_routing_errors() {
+        let catalog = sample_catalog();
+        let sources = [
+            "UPDATE events SET tenant_id = tenant_id WHERE tenant_id = 7",
+            "UPDATE events SET TENANT_ID = 7 WHERE tenant_id = 7",
+            "UPDATE events SET payload = 1, tenant_id = 8 WHERE tenant_id = NULL",
+        ];
+
+        for dialect in SqlDialect::ALL.iter().copied() {
+            for source in sources {
+                let error = plan_with_router(
+                    &catalog,
+                    DEFAULT_DATABASE,
+                    &normalize(dialect, source),
+                    0,
+                    &[],
+                    Some(b"different-shard-context"),
+                    split_test_router,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    EngineErrorKind::InvalidQuery,
+                    "{dialect}: {source}"
+                );
+                assert!(!error.to_string().contains("tenant_id"));
+            }
+        }
+
+        for (dialect, source) in [
+            (
+                SqlDialect::Sqlite,
+                "UPDATE events SET tenant_id = ?1 WHERE tenant_id = ?2",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "UPDATE events SET tenant_id = $1 WHERE tenant_id = $2",
+            ),
+            (
+                SqlDialect::MySql,
+                "UPDATE events SET tenant_id = ? WHERE tenant_id = ?",
+            ),
+        ] {
+            let error = plan_with_router(
+                &catalog,
+                DEFAULT_DATABASE,
+                &normalize(dialect, source),
+                0,
+                &[Value::Int64(7), Value::Int64(7)],
+                None,
+                split_test_router,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidQuery, "{dialect}");
+        }
+
+        let inference_first = plan_with_router(
+            &catalog,
+            DEFAULT_DATABASE,
+            &normalize(
+                SqlDialect::PostgreSql,
+                "UPDATE events SET tenant_id = $1 WHERE tenant_id = $2",
+            ),
+            0,
+            &[Value::Int64(7)],
+            None,
+            split_test_router,
+        )
+        .unwrap_err();
+        assert_eq!(inference_first.kind(), EngineErrorKind::InvalidArgument);
+
+        let batch = normalize(
+            SqlDialect::Sqlite,
+            "UPDATE events SET payload = 1 WHERE tenant_id = 7; \
+             UPDATE events SET tenant_id = 8 WHERE tenant_id = 7",
+        );
+        let first = plan_with_router(
+            &catalog,
+            DEFAULT_DATABASE,
+            &batch,
+            0,
+            &[],
+            None,
+            split_test_router,
+        )
+        .unwrap();
+        assert_eq!(first.assigned_shard(), Some(1));
+        assert_eq!(
+            plan_with_router(
+                &catalog,
+                DEFAULT_DATABASE,
+                &batch,
+                1,
+                &[],
+                None,
+                split_test_router,
+            )
+            .unwrap_err()
+            .kind(),
+            EngineErrorKind::InvalidQuery
+        );
+
+        let global = plan_with_router(
+            &catalog,
+            DEFAULT_DATABASE,
+            &normalize(SqlDialect::Sqlite, "UPDATE countries SET tenant_id = 1"),
+            0,
+            &[],
+            None,
+            split_test_router,
+        )
+        .unwrap();
+        assert_eq!(global.inference().kind(), ShardKeyInferenceKind::NotSharded);
+        assert_eq!(global.assigned_shard(), None);
+    }
+
+    #[test]
+    fn routing_policy_errors_are_stateless_and_concurrent() {
+        let catalog = Arc::new(sample_catalog());
+        let normalized = Arc::new(normalize(
+            SqlDialect::PostgreSql,
+            "INSERT INTO events (tenant_id) VALUES (7), (8)",
+        ));
+        let barrier = Arc::new(Barrier::new(9));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let catalog = Arc::clone(&catalog);
+            let normalized = Arc::clone(&normalized);
+            let barrier = Arc::clone(&barrier);
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                plan_with_router(
+                    &catalog,
+                    DEFAULT_DATABASE,
+                    &normalized,
+                    0,
+                    &[],
+                    None,
+                    split_test_router,
+                )
+                .unwrap_err()
+            }));
+        }
+        barrier.wait();
+        let errors = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.kind() == EngineErrorKind::InvalidQuery)
+        );
+        assert!(
+            errors
+                .windows(2)
+                .all(|pair| pair[0].to_string() == pair[1].to_string())
+        );
+
+        let recovered = plan_with_router(
+            &catalog,
+            DEFAULT_DATABASE,
+            &normalized,
+            0,
+            &[],
+            Some(b"same-shard-context"),
+            |_| 1,
+        )
+        .unwrap();
+        assert_eq!(recovered.assigned_shard(), Some(1));
+
+        let broad = normalize(SqlDialect::PostgreSql, "DELETE FROM events");
+        assert_eq!(
+            plan_with_router(
+                &catalog,
+                DEFAULT_DATABASE,
+                &broad,
+                0,
+                &[],
+                None,
+                split_test_router,
+            )
+            .unwrap_err()
+            .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        assert!(
+            plan_with_router(
+                &catalog,
+                DEFAULT_DATABASE,
+                &broad,
+                0,
+                &[],
+                Some(b"fallback"),
+                split_test_router,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -897,6 +1655,8 @@ mod tests {
     #[test]
     fn concurrent_planning_is_deterministic_and_read_only() {
         let catalog = Arc::new(sample_catalog());
+        let routing = routing_catalog(4);
+        let (first, second) = same_shard_int_pair(&routing);
         let normalized = Arc::new(normalize(
             SqlDialect::PostgreSql,
             "INSERT INTO events (tenant_id) VALUES ($1), ($2), ($1)",
@@ -914,8 +1674,8 @@ mod tests {
                     DEFAULT_DATABASE,
                     &normalized,
                     0,
-                    &[Value::Int64(7), Value::Int64(8)],
-                    Some(b"parallel-explicit"),
+                    &[Value::Int64(first), Value::Int64(second)],
+                    None,
                 )
                 .unwrap()
             }));
@@ -1014,6 +1774,67 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             EngineErrorKind::DataCorruption
+        );
+    }
+
+    #[test]
+    fn schema_gate_precedes_write_policy_and_a_later_valid_plan_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        drop(Database::open(temp.path(), 2).unwrap());
+        insert_engine_catalog_fixture(temp.path());
+        let database = Arc::new(Database::open(temp.path(), 2).unwrap());
+        let engine = Engine::from_database(Arc::clone(&database));
+        let logical_database = engine.catalog().default_database().id();
+        let broad_write = normalize(SqlDialect::Sqlite, "DELETE FROM events");
+        let invalid_bind = normalize(
+            SqlDialect::Sqlite,
+            "UPDATE events SET payload = ?1 WHERE tenant_id = ?2",
+        );
+
+        let migration = database.storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        assert_eq!(
+            engine
+                .plan_bound_statement(logical_database, &broad_write, 0, &[], None)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Busy
+        );
+        assert_eq!(
+            engine
+                .plan_bound_statement(logical_database, &invalid_bind, 0, &[Value::Int64(1)], None,)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Busy
+        );
+        drop(migration);
+
+        assert_eq!(
+            engine
+                .plan_bound_statement(logical_database, &invalid_bind, 0, &[Value::Int64(1)], None,)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            engine
+                .plan_bound_statement(logical_database, &broad_write, 0, &[], None)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        let recovered = engine
+            .plan_bound_statement(
+                logical_database,
+                &normalize(SqlDialect::Sqlite, "DELETE FROM events WHERE tenant_id = 7"),
+                0,
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            recovered.assigned_shard(),
+            Some(database.shard_for_key(b"7"))
         );
     }
 }

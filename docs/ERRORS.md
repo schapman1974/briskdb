@@ -170,10 +170,15 @@ locations. See the [shard-key inference contract](SQL_SHARD_KEYS.md).
 The synchronous bound statement planner preserves those inference error kinds
 and diagnostics. Before inference it also acquires ordinary schema-operation
 admission, so a migrating gate returns `Busy`, a pending migration returns
-`FailedPrecondition`, and a degraded gate returns `DataCorruption`. A shape
-inconsistency between a successful inference and its route entries is
-`Internal`. Planning adds no new error kind, retains no failed parameters, and
-does not change protocol mappings. See the [bound statement-planning
+`FailedPrecondition`, and a degraded gate returns `DataCorruption`. Routing
+policy reports an explicit physical-shard conflict, or a sharded
+`UPDATE`/`DELETE` missing both finite inference and explicit fallback, as
+`InvalidArgument`. A shard-key `UPDATE`, an `INSERT` without a proven key for
+every row, or a finite write spanning physical shards is `InvalidQuery`.
+Retained metadata inconsistency is `Internal`. Policy diagnostics contain no
+SQL, identifier spelling, parameter value, or routing-key bytes. Planning adds
+no new error kind, retains no failed parameters, and does not change protocol
+mappings. See the [bound statement-planning and routing-policy
 contract](SQL_PLANNING.md).
 
 The core contains no HTTP, PostgreSQL, or MySQL response types. Conversely,

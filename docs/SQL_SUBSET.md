@@ -45,10 +45,11 @@ A successful `CommonSql` does not mean that the SQL:
 - has been executed.
 
 Those responsibilities remain with the implemented issue #21 normalization,
-issue #22 inference, and issue #23 advisory planning layers, issues #24 through
-#27, and the later wire frontends. Validation never consults parameters, a
-session, the logical catalog, storage, routing state, the filesystem, or
-SQLite. It never formats or searches SQL text to make a structural decision.
+issue #22 inference, and issues #23/#24 bound planning and routing-policy
+layers, issues #25 through #27, and the later wire frontends. Validation never
+consults parameters, a session, the logical catalog, storage, routing state,
+the filesystem, or SQLite. It never formats or searches SQL text to make a
+structural decision.
 
 Empty and comment-only parsed batches validate successfully. Every statement in
 a mixed batch is checked independently and source order is retained, but that
@@ -81,8 +82,11 @@ pinning, and protocol status reporting remain issues #34 and #47.
 
 An absent `WHERE` on `UPDATE` or `DELETE` is structurally valid. Likewise,
 validation does not inspect whether an assignment changes a shard-key column.
-The separate inference layer classifies the supported predicate proof; issue
-#24 owns rejection of conflicting or unroutable writes and assignment policy.
+The separate inference layer classifies the supported predicate proof. The
+implemented [bound planning and routing-policy layer](SQL_PLANNING.md) performs
+the narrow catalog-aware `UPDATE` target check and rejects conflicting or
+unroutable sharded DML. That does not broaden structural validation or replace
+the complete statement classifier owned by issue #27.
 
 ### Names, aliases, and types
 

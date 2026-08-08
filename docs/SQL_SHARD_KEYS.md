@@ -111,8 +111,9 @@ cell in every row.
 - A complete row set with one distinct value is `Exact`; two or more distinct
   values are `Multiple`.
 
-This classification does not decide whether a multi-key insert may run. Issue
-#24 owns rejection of conflicting or unroutable writes.
+This inference classification alone does not decide whether a multi-key insert
+may run. The implemented [bound planning and routing policy](SQL_PLANNING.md)
+accepts it only when every occurrence selects one physical shard.
 
 ## Value compatibility
 
@@ -162,11 +163,12 @@ existing raw SQLite SQL and caller-provided `shard_key` behavior.
 
 The implemented synchronous
 [`Engine::plan_bound_statement`](SQL_PLANNING.md) API invokes inference at
-bind/execute time and turns every inferred value into an owned advisory route.
-It retains an optional explicit route separately and does not make the result
-executable. Issue #24 will enforce the write rules for conflicting, multiple,
-or unconstrained keys. Later work owns syntax translation, prepared-statement
-lifecycle, statement classification, and wire-protocol integration.
+bind/execute time and turns every inferred value into an owned route. It
+retains optional explicit routing separately, compares finite physical targets,
+rejects unroutable sharded DML, and records a valid single-shard assignment.
+The result is still not executable. Later work owns syntax translation,
+prepared-statement lifecycle, authoritative statement classification, and
+wire-protocol integration.
 
 ## Verification obligations
 

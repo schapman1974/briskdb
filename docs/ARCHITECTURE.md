@@ -21,9 +21,9 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, errors, read-only logical catalog, and synchronous bound-value-aware advisory plans; stable key routing; bounded per-shard admission and connection pools; routed execute/query and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, errors, read-only logical catalog, synchronous bound-value-aware plans, and single-shard routing policy; stable key routing; bounded per-shard admission and connection pools; routed execute/query and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
-| `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, source-preserving placeholder normalization, and catalog-aware typed shard-key inference behind BriskDB-owned types; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, session/write policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
+| `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, source-preserving placeholder normalization, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, session/write policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, listener binding, and tracked Axum HTTP/1 connection lifecycle | SQL parsing or storage implementation details |
@@ -125,7 +125,7 @@ contract](SQL_SUBSET.md).
 The current HTTP execute/query and migration paths deliberately remain raw
 SQLite pass-through and call none of the parser, subset validator, placeholder
 normalizer, shard-key inference, or bound statement-planning layers. Issues
-#19 through #23 therefore change no HTTP shape, SQL acceptance, execution
+#19 through #24 therefore change no HTTP shape, SQL acceptance, execution
 routing, or storage behavior.
 
 ### Placeholder-normalization boundary
@@ -174,9 +174,10 @@ This layer is catalog-aware and accepts bound values, but remains read-only and
 statement-local. It does not own the catalog or caller values, encode or hash a
 key, read the bucket map, choose a shard, construct an execution plan, apply
 write policy, mutate session state, or execute SQL. The separate core planner
-owns bind-time canonical encoding and routing; issue #24 owns rejection of
-conflicting or unroutable writes. The normative proof, type, result, error, and
-testing rules are in the [shard-key inference contract](SQL_SHARD_KEYS.md).
+owns bind-time canonical encoding, physical routing, and rejection of
+conflicting or unroutable sharded DML. The normative proof, type, result,
+error, and testing rules are in the [shard-key inference
+contract](SQL_SHARD_KEYS.md).
 
 ### Bound statement-planning boundary
 
@@ -192,9 +193,17 @@ the same physical shard.
 Canonical version-1 inferred bytes are the shortest signed decimal ASCII form
 for `Int64`, exact UTF-8 for `Text`, and exact bytes for `Binary`. Explicit
 routing bytes are retained exactly. Inferred routes and the optional explicit
-route remain separate: this layer does not select a winner, compare them for
-write eligibility, reject any inference category, or decide whether scatter is
-allowed.
+route remain separate in the result. Policy compares them by physical shard,
+never by opaque bytes, and records `assigned_shard()` when one valid target
+exists. Distinct logical keys co-located on one shard remain separate route
+occurrences but form one physical assignment.
+
+The SQL layer exposes only a crate-private inspection of whether the selected
+AST is `INSERT`, `UPDATE`, or `DELETE` and whether an `UPDATE` targets the
+cataloged shard-key column. Core uses that shape to reject unproven inserts,
+multi-shard writes, broad updates/deletes without explicit fallback, and every
+shard-key assignment. Full read/write/schema/session behavior and batch
+classification remain issue #27.
 
 Planning holds the existing schema-operation guard while it reads logical and
 routing state. The owned result records schema generation, map generation, and
@@ -203,12 +212,13 @@ provenance does not reserve future state; an eventual execution integration
 must establish that the physical schema and routing snapshot remain
 authoritative before using a plan.
 
-The planner is advisory and stateless. It does not translate SQL, mutate a
-session, cache a prepared statement, apply write or batch policy, open a shard
-connection, or execute anything. The normative API, encoding, provenance,
-error, boundary, and testing rules are in the [bound statement-planning
-contract](SQL_PLANNING.md). Issues #24 through #27 own write policy,
-translation, prepared-statement/session lifecycle, and statement/batch policy
+The planner is stateless and its assignment is still non-executable. It does
+not translate SQL, mutate a session, cache a prepared statement, apply batch
+policy, open a shard connection, scatter reads, or execute anything. The
+normative API, assignment matrix, encoding, provenance, error, boundary, and
+testing rules are in the [bound statement-planning and routing-policy
+contract](SQL_PLANNING.md). Issues #25 through #27 own translation,
+prepared-statement/session lifecycle, and authoritative statement/batch policy
 respectively.
 
 ## Manifest storage boundary
