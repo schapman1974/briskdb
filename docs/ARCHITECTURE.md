@@ -96,11 +96,13 @@ manifest does not rewrite its journal mode or touch shard files.
 
 This is an internal storage-open concern. It changes no core or adapter
 signature, is unreachable from client SQL, and is atomic only within
-`manifest.sqlite`. Runtime routing still uses the legacy BLAKE3 modulo path;
-catalog lookup is the next isolated roadmap item. The generation-1 bucket ranges
-and versioned derivation are constructed to reproduce that placement for every
-supported initial shard count, including counts that do not divide 4,096. The
-catalog does not yet validate shard-file presence, identity, WAL, or schema
+`manifest.sqlite`. Validation returns an immutable catalog snapshot from the
+same locked transaction; `Storage` shares it across clones. Core routing hashes
+the exact key bytes, derives a versioned virtual bucket, and reads the final
+physical shard from that snapshot without querying SQLite. The generation-1
+bucket ranges reproduce prior modulo placement for every supported initial
+shard count, including counts that do not divide 4,096. The catalog does not yet
+validate shard-file presence, identity, WAL, or schema
 generation, and it is not the future cross-shard application-schema migration
 journal. The exact format, downgrade policy, recovery cases, and tests are
 documented in [manifest storage format](STORAGE_FORMAT.md).

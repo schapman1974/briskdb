@@ -21,7 +21,7 @@ use rusqlite::{
 
 pub use crate::core::Database;
 use crate::{
-    core::{EngineError, EngineErrorKind, EngineResult},
+    core::{EngineError, EngineErrorKind, EngineResult, RoutingCatalog},
     sqlite_error,
 };
 
@@ -30,7 +30,7 @@ pub(crate) const CONNECTION_BUSY_TIMEOUT: std::time::Duration = std::time::Durat
 #[derive(Debug, Clone)]
 pub(crate) struct Storage {
     root: PathBuf,
-    shard_count: u16,
+    catalog: Arc<RoutingCatalog>,
 }
 
 impl Storage {
@@ -48,22 +48,29 @@ impl Storage {
                 .context(format!("failed to open {}", manifest_path.display()))
         })?;
         configure_manifest_connection(&manifest)?;
-        let shard_count = manifest::load_or_create(&mut manifest, requested_shards)?;
+        let catalog = Arc::new(manifest::load_or_create_catalog(
+            &mut manifest,
+            requested_shards,
+        )?);
         configure_journal_mode(&manifest)?;
 
         fs::create_dir_all(&shards_dir).map_err(|error| {
             sqlite_error::storage_io(error, format!("failed to create {}", shards_dir.display()))
         })?;
 
-        let storage = Self { root, shard_count };
-        for shard in 0..shard_count {
+        let storage = Self { root, catalog };
+        for shard in 0..storage.shard_count() {
             storage.open_shard(shard)?;
         }
         Ok(storage)
     }
 
     pub(crate) fn shard_count(&self) -> u16 {
-        self.shard_count
+        self.catalog.shard_count()
+    }
+
+    pub(crate) fn shard_for_key(&self, key: &[u8]) -> u16 {
+        self.catalog.shard_for_key(key)
     }
 
     fn shard_path(&self, shard: u16) -> PathBuf {
@@ -77,7 +84,7 @@ impl Storage {
     }
 
     fn open_unconfigured_shard(&self, shard: u16) -> EngineResult<Connection> {
-        if shard >= self.shard_count {
+        if shard >= self.shard_count() {
             return Err(EngineError::new(
                 EngineErrorKind::Internal,
                 format!("shard {shard} is outside the configured range"),

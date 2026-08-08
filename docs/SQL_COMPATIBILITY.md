@@ -328,9 +328,12 @@ underlying execution semantics.
 ### Current
 
 - The caller supplies an opaque `shard_key` independently from the SQL text.
-- BLAKE3 hashing followed by modulo shard count selects one physical shard.
-- Manifest version 3 already persists the versioned 4,096-bucket catalog, but
-  runtime lookup is deliberately deferred to the next routing milestone.
+- Exact key bytes are hashed with version-1 BLAKE3; the little-endian 64-bit
+  prefix selects one of 4,096 virtual buckets through the versioned
+  compatibility algorithm.
+- The final physical shard is read from the validated, generation-stamped
+  bucket map loaded from manifest version 3. Generation 1 preserves the earlier
+  modulo placement for every supported shard count.
 - Point queries and writes visit only that shard.
 - No scatter/gather query path exists.
 - Unique constraints and transactions are local to one SQLite shard.

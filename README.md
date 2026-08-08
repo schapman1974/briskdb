@@ -33,7 +33,7 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 
 ## Current foundation
 
-- Stable BLAKE3 routing from a caller-provided shard key
+- Versioned BLAKE3-to-virtual-bucket routing from a caller-provided shard key
 - A protocol-neutral async engine with per-request HTTP sessions
 - Bounded, lazy per-shard SQLite connection pools with explicit backpressure
 - Request cancellation and deadlines that interrupt SQLite and await cleanup
@@ -174,13 +174,13 @@ manifests to version 3 through one transaction per numbered step. Version 3
 persists hash, key-encoding, and bucket-algorithm versions, a generation-stamped
 4,096-bucket map, and active physical-shard lifecycle records. Newer or malformed
 manifests fail closed, and downgrade fences reject shipped version-1 and
-version-2 readers. Runtime routing deliberately remains the existing BLAKE3
-modulo calculation until the next roadmap item activates catalog lookup; the
-generation-1 ranges are constructed so that activation can preserve every
-existing placement, including non-power-of-two shard counts. This changes only
-`manifest.sqlite`, not shard files, SQL behavior, or wire contracts. The
-complete format and upgrade contract is in
-[manifest storage format](docs/STORAGE_FORMAT.md).
+version-2 readers. Startup loads the validated catalog into one immutable
+snapshot, and runtime routing hashes the exact key bytes, derives a virtual
+bucket, then reads that bucket's persisted physical-shard assignment. The
+generation-1 ranges preserve every earlier modulo placement, including
+non-power-of-two shard counts. This changes only routing internals, not shard
+files, SQL behavior, or wire contracts. The complete format and upgrade
+contract is in [manifest storage format](docs/STORAGE_FORMAT.md).
 Embedders should call
 `Engine::shutdown`; merely dropping the final `Engine` is not the explicit
 asynchronous cleanup contract.
