@@ -5,15 +5,22 @@
 
 mod engine;
 mod error;
+mod options;
 mod session;
 mod types;
+pub(crate) mod worker;
 
 pub use engine::{Engine, EngineStatus, Statement};
 pub use error::{EngineError, EngineErrorKind, EngineResult};
+pub use options::{
+    DEFAULT_CONNECTIONS_PER_SHARD, DEFAULT_QUEUE_CAPACITY_PER_SHARD, EngineOptions,
+    MAX_CONNECTIONS_PER_SHARD, MAX_QUEUE_CAPACITY_PER_SHARD,
+};
 pub use session::{Session, SessionId, SessionState};
 pub use types::{
     Column, DataType, Decimal, ParseDecimalError, ResultSet, ResultSetShapeError, Row, Value,
 };
+pub(crate) use worker::BlockingPool;
 
 use session::SessionInner;
 

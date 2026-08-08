@@ -4,7 +4,7 @@ use axum::Router;
 use briskdb::{
     api, core,
     protocol::{error, http},
-    storage,
+    server, storage,
 };
 
 #[test]
@@ -13,6 +13,7 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _core_database: Option<core::Database> = None;
     let _engine: Option<core::Engine> = None;
     let _engine_status: Option<core::EngineStatus> = None;
+    let _engine_options: core::EngineOptions = core::EngineOptions::default();
     let _session: Option<core::Session> = None;
     let _ready = core::SessionState::Ready;
     let _closed = core::SessionState::Closed;
@@ -20,6 +21,8 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _legacy_router: fn(Arc<storage::Database>) -> Router = api::router;
     let _http_router: fn(Arc<core::Database>) -> Router = http::router;
     let _engine_router: fn(core::Engine) -> Router = http::router_with_engine;
+    let _default_server_entry_point = server::run;
+    let _configured_server_entry_point = server::run_with_engine_options;
 
     let result = core::ResultSet::new(
         vec![core::Column::new("value", core::DataType::Int64)],
@@ -49,13 +52,85 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     );
 }
 
+#[test]
+fn engine_options_are_public_validated_and_have_stable_defaults() {
+    let defaults = core::EngineOptions::default();
+    assert_eq!(
+        defaults.connections_per_shard(),
+        core::DEFAULT_CONNECTIONS_PER_SHARD
+    );
+    assert_eq!(
+        defaults.queue_capacity_per_shard(),
+        core::DEFAULT_QUEUE_CAPACITY_PER_SHARD
+    );
+
+    let minimum = core::EngineOptions::new(1, 1).unwrap();
+    assert_eq!(minimum.connections_per_shard(), 1);
+    assert_eq!(minimum.queue_capacity_per_shard(), 1);
+
+    let maximum = core::EngineOptions::new(
+        core::MAX_CONNECTIONS_PER_SHARD,
+        core::MAX_QUEUE_CAPACITY_PER_SHARD,
+    )
+    .unwrap();
+    assert_eq!(
+        maximum.connections_per_shard(),
+        core::MAX_CONNECTIONS_PER_SHARD
+    );
+    assert_eq!(
+        maximum.queue_capacity_per_shard(),
+        core::MAX_QUEUE_CAPACITY_PER_SHARD
+    );
+
+    for (connections, queue_capacity) in [
+        (0, 1),
+        (core::MAX_CONNECTIONS_PER_SHARD + 1, 1),
+        (1, 0),
+        (1, core::MAX_QUEUE_CAPACITY_PER_SHARD + 1),
+    ] {
+        assert_eq!(
+            core::EngineOptions::new(connections, queue_capacity)
+                .unwrap_err()
+                .kind(),
+            core::EngineErrorKind::InvalidArgument
+        );
+    }
+}
+
 #[tokio::test]
 async fn protocol_neutral_async_engine_surface_is_available() {
     let temp = tempfile::tempdir().unwrap();
-    let engine = core::Engine::open(temp.path(), 4).await.unwrap();
+    let options = core::EngineOptions::new(2, 7).unwrap();
+    let engine = core::Engine::open_with_options(temp.path(), 4, options)
+        .await
+        .unwrap();
     let session: core::Session = engine.session();
 
     assert_eq!(session.state().await, core::SessionState::Ready);
+    assert_eq!(engine.options(), options);
     let status: core::EngineStatus = engine.status(&session).await.unwrap();
     assert_eq!(status.shard_count(), 4);
+    assert_eq!(status.max_blocking_workers(), 8);
+    assert_eq!(status.connections_per_shard(), 2);
+    assert_eq!(status.queue_capacity_per_shard(), 7);
+}
+
+#[tokio::test]
+async fn default_and_wrapped_database_engine_constructors_remain_available() {
+    let default_temp = tempfile::tempdir().unwrap();
+    let default_engine = core::Engine::open(default_temp.path(), 2).await.unwrap();
+    assert_eq!(default_engine.options(), core::EngineOptions::default());
+
+    let wrapped_temp = tempfile::tempdir().unwrap();
+    let database = Arc::new(core::Database::open(wrapped_temp.path(), 4).unwrap());
+    let options = core::EngineOptions::new(3, 11).unwrap();
+    let wrapped = core::Engine::from_database_with_options(database, options).unwrap();
+    let session = wrapped.session();
+    let status = wrapped.status(&session).await.unwrap();
+
+    assert_eq!(wrapped.options(), options);
+    assert_eq!(status.shard_count(), 4);
+    assert_eq!(status.max_blocking_workers(), 12);
+    assert_eq!(status.connections_per_shard(), 3);
+    assert_eq!(status.queue_capacity_per_shard(), 11);
 }

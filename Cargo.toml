@@ -12,7 +12,7 @@ anyhow = "1.0"
 axum = "0.8.9"
 blake3 = "1.8"
 clap = { version = "4.6.6", features = ["derive", "env"] }
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "hooks"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.53.1", features = ["full"] }

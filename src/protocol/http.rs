@@ -818,6 +818,11 @@ mod tests {
             "crate::storage",
             "blake3",
             "rusqlite",
+            "ConnectionPools",
+            "PooledConnection",
+            "BlockingPool",
+            "EngineOptions",
+            "Semaphore",
         ] {
             assert!(
                 !production_source.contains(forbidden),

@@ -43,6 +43,23 @@ implies retryability in BriskDB; notably, `OutOfMemory` and
 contract. Storage-open and I/O failures can be permanent, so BriskDB does not
 guess that a later attempt will recover.
 
+Bounded-pool admission uses the existing `Busy` kind; it does not add a separate
+overload error. An operation receives `Busy` when its target shard has all
+configured connection slots active and its per-shard admission queue is full.
+The HTTP response is therefore the fixed 503 problem detail above. Admission
+accounting is per shard, so one shard returning `Busy` does not by itself imply
+that another shard is saturated. Routed single-shard requests consume only
+their selected pool; broadcast is the intentional exception and reserves one
+slot in every pool. Clients that retry should use the same bounded exponential
+backoff and jitter as for SQLite-originated `Busy` failures.
+
+If a caller drops a future while its operation is queued, the engine skips the
+operation and there is no error response to serialize. Once blocking SQLite
+execution has started, dropping the future does not cancel the operation; it may
+still commit. Issue #11 defines future in-flight cancellation and deadline
+behavior. Queue depth, pool internals, SQL text, and connection-cleanup details
+remain diagnostic data and must not be added to the fixed public problem detail.
+
 MySQL has separate foreign-key errors for the parent and child directions.
 `ForeignKeyViolation` does not retain that direction, so BriskDB deliberately
 uses the general 1105/`HY000` mapping instead of guessing a more specific MySQL
