@@ -60,24 +60,44 @@ failing shard as well as leave earlier shards fully or partially updated.
 ### Current parameter and result conversion
 
 Use SQLite positional placeholders such as `?1` and `?2`. Values are never
-interpolated into SQL text.
+interpolated into SQL text. The HTTP adapter converts JSON parameters into
+protocol-neutral BriskDB values; the SQL layer binds only those typed values.
 
 | JSON input | SQLite binding |
 | --- | --- |
 | `null` | `NULL` |
 | `true` / `false` | `INTEGER` `1` / `0` |
 | Signed integer representable as `i64` | `INTEGER` |
-| Other accepted JSON number | `REAL` through `f64`; large integers can lose precision |
+| Unsigned integer no greater than `i64::MAX` | `INTEGER` after a checked conversion |
+| Unsigned integer greater than `i64::MAX` | Rejected; it is not rounded to `REAL` |
+| Accepted fractional or exponent-form JSON number | `REAL` through `f64` |
 | Number outside `serde_json`'s accepted range | Request decoding fails before SQLite binding |
 | String | `TEXT` |
 | Array or object | Compact JSON stored as `TEXT` |
 
-SQLite results currently map `NULL`, `INTEGER`, and `REAL` directly to their
-JSON counterparts. `TEXT` is decoded as UTF-8 with invalid byte sequences
-replaced by U+FFFD. A `BLOB` is returned as an array of byte-valued JSON
-integers. Query results are currently JSON objects keyed by column name, so a
-later duplicate column name overwrites an earlier one. The protocol-neutral
-row model will replace these lossy representations before the API is stable.
+SQLite results map to protocol-neutral BriskDB `Null`, `Int64`, `Float64`,
+`Text`, `InvalidText`, and `Binary` values. Valid `TEXT` becomes `Text`; invalid
+UTF-8 remains byte-for-byte intact in `InvalidText`. The wider value model also
+has `UInt64` and a validated, exact string-backed `Decimal` variant for protocol
+inputs. Decimal construction accepts SQL-style signed decimal and exponent
+syntax and preserves its original digits and scale.
+SQLite binding accepts `UInt64` only through a checked conversion to `i64` and
+rejects larger values, `Decimal`, `InvalidText`, and `Float64(NaN)` instead of
+rounding, rewriting, or allowing SQLite to turn `NaN` into `NULL`. Infinite
+`Float64` values remain SQLite `REAL` values. Ordered column metadata and
+positional rows are preserved inside `ResultSet`; SQLite result-column metadata
+is marked `Unknown` because dynamic SQLite values do not guarantee one static
+type.
+
+The experimental HTTP adapter still returns `NULL`, `INTEGER`, `REAL`, and
+`TEXT` as their JSON counterparts and a `BLOB` as an array of byte-valued JSON
+integers. It encodes exact `Decimal` values as JSON strings and renders
+`InvalidText` lossily, replacing invalid UTF-8 byte sequences with U+FFFD.
+Because JSON has no non-finite number syntax, it renders infinite or `NaN`
+`Float64` values as `null`. Its current rows are objects keyed by column name,
+so a later duplicate column name overwrites an earlier one. This remaining
+adapter loss is tracked separately; storage and core no longer collapse rows
+into JSON maps.
 
 ## SQL surface
 
@@ -154,7 +174,7 @@ engine used by PostgreSQL and HTTP.
 | --- | --- | --- |
 | Parameters | `?` in prepared statements | Planned normalization to bound SQLite parameters; no string interpolation |
 | Identifier quoting | Backticks by default | Planned normalization; double-quoted strict SQL remains available |
-| Type system | Static signed/unsigned column types | Planned loss-aware mapping; integers outside signed 64-bit range need an explicit policy |
+| Type system | Static signed/unsigned column types | BriskDB retains `UInt64` without narrowing; current SQLite binding rejects values above `i64::MAX` until an explicit storage mapping exists |
 | Boolean | Commonly `TINYINT(1)` | Stored as SQLite integer `0` or `1`; protocol adapter returns documented metadata |
 | `AUTO_INCREMENT` | Table column attribute | Unsupported until generated-key semantics are designed |
 | `UNSIGNED`, display widths | MySQL column attributes | No current SQLite equivalent; unsupported initially |

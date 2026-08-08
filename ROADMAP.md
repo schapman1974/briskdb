@@ -164,7 +164,7 @@ Status: **in progress**
 
 - [x] Split the crate into `core`, `storage`, `sql`, `protocol/http`, and
   `server` modules without changing externally visible behavior.
-- [ ] Replace `serde_json::Value` in storage with BriskDB `Value`, `DataType`,
+- [x] Replace `serde_json::Value` in storage with BriskDB `Value`, `DataType`,
   `Column`, `Row`, and `ResultSet` types.
 - [ ] Preserve column order and duplicate column names.
 - [ ] Add a structured error taxonomy and mappings for HTTP, PostgreSQL, and

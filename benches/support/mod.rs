@@ -5,8 +5,10 @@ use std::{
 };
 
 use anyhow::{Context, anyhow, bail};
-use briskdb::storage::Database;
-use serde_json::{Value, json};
+use briskdb::{
+    core::{ResultSet, Value},
+    storage::Database,
+};
 
 pub const BENCHMARK_SHARDS: u16 = 4;
 
@@ -33,7 +35,11 @@ impl BenchmarkFixture {
             let affected = database.execute(
                 key,
                 "INSERT INTO benchmark_items (id, writes, payload) VALUES (?1, ?2, ?3)",
-                &[json!(key), json!(0), json!("baseline payload")],
+                &[
+                    Value::from(key.clone()),
+                    Value::from(0_i64),
+                    Value::from("baseline payload"),
+                ],
             )?;
             if affected != 1 {
                 bail!("benchmark seed insert affected {affected} rows")
@@ -55,12 +61,12 @@ impl BenchmarkFixture {
         self.database.shard_for_key(key.as_bytes())
     }
 
-    pub fn point_read(&self) -> anyhow::Result<Vec<Value>> {
+    pub fn point_read(&self) -> anyhow::Result<ResultSet> {
         let key = &self.keys_by_shard[0];
         self.database.query(
             key,
             "SELECT id, writes, payload FROM benchmark_items WHERE id = ?1",
-            &[json!(key)],
+            &[Value::from(key.clone())],
         )
     }
 
@@ -104,13 +110,15 @@ impl BenchmarkFixture {
             .keys_by_shard
             .get(shard)
             .context("benchmark shard index is out of range")?;
-        let rows = self.database.query(
+        let result = self.database.query(
             key,
             "SELECT writes FROM benchmark_items WHERE id = ?1",
-            &[json!(key)],
+            &[Value::from(key.clone())],
         )?;
-        rows.first()
-            .and_then(|row| row.get("writes"))
+        result
+            .rows()
+            .first()
+            .and_then(|row| row.get(0))
             .and_then(Value::as_i64)
             .context("benchmark row did not contain an integer write count")
     }
@@ -120,7 +128,7 @@ fn update_key(database: &Database, key: &str) -> anyhow::Result<usize> {
     database.execute(
         key,
         "UPDATE benchmark_items SET writes = writes + 1 WHERE id = ?1",
-        &[json!(key)],
+        &[Value::from(key)],
     )
 }
 

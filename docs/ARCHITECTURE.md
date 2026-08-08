@@ -1,8 +1,9 @@
 # Architecture
 
 BriskDB is organized so network protocols can share one routing and execution
-core. The first module split preserves the experimental HTTP and Rust APIs
-while making future PostgreSQL and MySQL adapters explicit peers.
+core. The module layout preserves the experimental HTTP contract and existing
+Rust module paths while making future PostgreSQL and MySQL adapters explicit
+peers.
 
 ```text
 binary (main)
@@ -20,10 +21,10 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Stable key routing and protocol-neutral coordination of routed execute/query and schema broadcast | HTTP types, listeners, or Axum handlers |
+| `core` | Protocol-neutral `Value`, `DataType`, `Column`, `Row`, and `ResultSet`; stable key routing; routed execute/query and schema broadcast | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Manifest and shard layout, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
-| `sql` | SQLite statement execution and the current JSON/SQLite value conversion | Routing, filesystem layout, or protocol responses |
-| `protocol::http` | HTTP request extraction and response/error encoding | BLAKE3 routing, shard files, or rusqlite calls |
+| `sql` | SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, filesystem layout, or protocol responses |
+| `protocol::http` | HTTP request extraction plus JSON/BriskDB value and response/error encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `server` | Process configuration, database assembly, listener binding, and Axum lifecycle | SQL parsing or storage implementation details |
 
 Implementation dependencies flow one way: adapters call `core`; `core`
@@ -39,7 +40,7 @@ This change deliberately preserves:
 - the CLI flags, environment variables, defaults, and listener behavior;
 - every HTTP route, request field, response shape, and current error status;
 - BLAKE3 routing, shard filenames, manifest schema, WAL and synchronous modes;
-- SQLite pass-through semantics and JSON value conversion; and
+- SQLite pass-through semantics and the legacy HTTP JSON response shape; and
 - the existing `briskdb::api::router` and `briskdb::storage::Database` Rust
   paths through compatibility re-exports.
 
@@ -48,8 +49,43 @@ routed reads, and SQLite error serialization. Unit tests remain colocated with
 routing, storage, SQL conversion, CLI, and server assembly.
 
 The module names are stable boundaries, not a claim that later roadmap work is
-already complete. In particular, BriskDB-specific value/result types, the
-structured error taxonomy, session state, the async `Engine` interface,
-connection pools, cancellation, and limits are separate issues. Until those
-land, the core intentionally retains the current synchronous SQLite and JSON
-interfaces.
+already complete. The structured error taxonomy, session state, the async
+`Engine` interface, connection pools, cancellation, and limits are separate
+issues. Until those land, the core intentionally retains the current
+synchronous execution interface.
+
+## Typed result boundary
+
+Core and SQL code do not use `serde_json::Value`. The protocol-neutral value
+model distinguishes signed and unsigned 64-bit integers, binary floating point,
+validated exact decimal text, valid UTF-8 text, text containing invalid UTF-8
+bytes, and binary data. Decimal construction validates SQL-style decimal syntax
+while preserving the caller's digits, scale, sign, and exponent text. This
+prevents an adapter from silently narrowing an unsigned
+integer, rounding a decimal, or replacing text bytes before it reaches the
+storage boundary. `ResultSet` keeps an ordered `Vec<Column>` and each `Row`
+keeps positional `Vec<Value>` data. SQLite cannot reliably provide one static
+type for every dynamic result column, so column metadata begins as
+`DataType::Unknown`; each value still reports its concrete type.
+
+Conversions into SQLite are checked against its five storage classes. Unsigned
+integers bind as `INTEGER` only when they fit in `i64`; larger unsigned values,
+exact decimals, invalid UTF-8 text, and `NaN` are rejected rather than coerced
+to another SQLite storage class. SQLite `TEXT` results preserve invalid bytes as
+`Value::InvalidText` inside the core.
+
+The experimental HTTP adapter is the only JSON conversion boundary. It renders
+exact decimals as JSON strings, converts `InvalidText` to a JSON string with
+invalid byte sequences replaced by U+FFFD, and maps non-finite floats to JSON
+`null`; these losses are explicit adapter policy rather than storage behavior.
+It keeps the original object-per-row
+response for compatibility, which means duplicate names are still overwritten
+there even though the core result is positional. The next roadmap item changes
+that duplicate-column behavior deliberately. HTTP parameters that cannot bind
+to SQLite without loss now fail instead of being rounded or rewritten.
+
+The pre-1.0 Rust `Database::execute` and `Database::query` signatures now use
+BriskDB `Value` and `ResultSet` directly instead of `serde_json::Value`. This is
+an intentional source-level migration to establish the protocol-neutral core;
+the legacy module paths remain available, but the old JSON-typed method
+signatures do not.
