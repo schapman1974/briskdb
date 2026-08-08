@@ -22,6 +22,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false }
 tempfile = "3.23"
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "storage"

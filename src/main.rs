@@ -1,9 +1,7 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf};
 
-use anyhow::Context;
-use briskdb::{api, storage::Database};
+use briskdb::server::{self, Config};
 use clap::Parser;
-use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -31,18 +29,42 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let database = Arc::new(Database::open(&args.data_dir, args.shards)?);
-    let listener = tokio::net::TcpListener::bind(args.listen)
-        .await
-        .with_context(|| format!("failed to bind {}", args.listen))?;
+    server::run(Config {
+        listen: args.listen,
+        data_dir: args.data_dir,
+        shards: args.shards,
+    })
+    .await
+}
 
-    info!(
-        listen = %args.listen,
-        data_dir = %args.data_dir.display(),
-        shards = database.shard_count(),
-        "BriskDB is ready"
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    axum::serve(listener, api::router(database)).await?;
-    Ok(())
+    #[test]
+    fn cli_defaults_are_preserved() {
+        let args = Args::try_parse_from(["briskdb"]).unwrap();
+
+        assert_eq!(args.listen, "127.0.0.1:7654".parse().unwrap());
+        assert_eq!(args.data_dir, PathBuf::from("./briskdb-data"));
+        assert_eq!(args.shards, 4);
+    }
+
+    #[test]
+    fn cli_flags_are_preserved() {
+        let args = Args::try_parse_from([
+            "briskdb",
+            "--listen",
+            "127.0.0.1:9000",
+            "--data-dir",
+            "/tmp/briskdb-test-data",
+            "--shards",
+            "8",
+        ])
+        .unwrap();
+
+        assert_eq!(args.listen, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(args.data_dir, PathBuf::from("/tmp/briskdb-test-data"));
+        assert_eq!(args.shards, 8);
+    }
 }
