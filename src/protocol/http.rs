@@ -257,7 +257,7 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{io, time::Duration};
 
     use axum::{
         body::{Body, to_bytes},
@@ -266,7 +266,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::core::{Column, DataType, EngineErrorKind, Row};
+    use crate::core::{Column, DataType, EngineErrorKind, EngineOptions, ResultLimits, Row};
 
     fn engine_router(database: Arc<Database>) -> Router {
         router_with_engine(Engine::from_database(database))
@@ -519,6 +519,78 @@ mod tests {
             })
         );
         assert!(!body.to_string().contains("missing_table"));
+    }
+
+    #[tokio::test]
+    async fn result_limit_failures_return_only_a_safe_problem_without_partial_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(temp.path(), 4).unwrap());
+        let options =
+            EngineOptions::default().with_result_limits(ResultLimits::new(1, 1_024).unwrap());
+        let application =
+            router_with_engine(Engine::from_database_with_options(database, options).unwrap());
+
+        let response = send_json(
+            &application,
+            Method::POST,
+            "/v1/query",
+            Some(json!({
+                "shard_key": "limited-query",
+                "sql": "SELECT 1 AS value UNION ALL SELECT 2"
+            })),
+        )
+        .await;
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body,
+            json!({
+                "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#limit-exceeded",
+                "title": "Limit exceeded",
+                "status": 422,
+                "detail": "The request exceeds an engine limit.",
+                "code": "limit_exceeded"
+            })
+        );
+        assert!(body.get("columns").is_none());
+        assert!(body.get("rows").is_none());
+    }
+
+    #[tokio::test]
+    async fn engine_deadlines_reach_http_as_safe_gateway_timeout_problems() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(temp.path(), 4).unwrap());
+        let options = EngineOptions::default()
+            .with_request_timeout(Some(Duration::from_millis(5)))
+            .unwrap();
+        let application =
+            router_with_engine(Engine::from_database_with_options(database, options).unwrap());
+
+        let (status, body) = request_json(
+            &application,
+            Method::POST,
+            "/v1/query",
+            Some(json!({
+                "shard_key": "deadline-query",
+                "sql": "WITH RECURSIVE numbers(value) AS (VALUES(0) UNION ALL SELECT value + 1 FROM numbers WHERE value < 1000000000) SELECT sum(value) FROM numbers"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            body,
+            json!({
+                "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#deadline-exceeded",
+                "title": "Request deadline exceeded",
+                "status": 504,
+                "detail": "The operation exceeded its request deadline.",
+                "code": "deadline_exceeded"
+            })
+        );
     }
 
     #[tokio::test]

@@ -160,7 +160,7 @@ and non-promises are written down.
 
 ### 1. Protocol-neutral core
 
-Status: **in progress**
+Status: **complete**
 
 - [x] Split the crate into `core`, `storage`, `sql`, `protocol/http`, and
   `server` modules without changing externally visible behavior.
@@ -173,7 +173,7 @@ Status: **in progress**
   by every frontend.
 - [x] Move blocking SQLite work behind a bounded worker/pool abstraction; add
   per-shard connection pools and backpressure.
-- [ ] Add cancellation, request deadlines, result row/byte limits, and graceful
+- [x] Add cancellation, request deadlines, result row/byte limits, and graceful
   shutdown hooks to the core interface.
 
 Exit criterion: the HTTP adapter contains no routing or SQLite logic and all

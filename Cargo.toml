@@ -12,17 +12,19 @@ anyhow = "1.0"
 axum = "0.8.9"
 blake3 = "1.8"
 clap = { version = "4.6.6", features = ["derive", "env"] }
+hyper = { version = "1.11", features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
 rusqlite = { version = "0.39.0", features = ["bundled", "hooks"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.53.1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false }
 tempfile = "3.23"
-tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "storage"

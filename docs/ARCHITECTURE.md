@@ -26,7 +26,7 @@ server ---------> protocol::http
 | `sql` | SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, filesystem layout, or protocol responses |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
-| `server` | Process configuration, database assembly, listener binding, and Axum lifecycle | SQL parsing or storage implementation details |
+| `server` | Process configuration, database assembly, listener binding, and tracked Axum HTTP/1 connection lifecycle | SQL parsing or storage implementation details |
 
 Implementation dependencies flow one way: adapters call the async `Engine` in
 `core`; the engine coordinates routing, `storage`, and `sql`. An adapter supplies
@@ -66,11 +66,11 @@ engine. Unit tests remain colocated with sessions, engine orchestration,
 routing, storage, SQL conversion, CLI, and server assembly.
 
 The module names are stable boundaries, not a claim that later roadmap work is
-already complete. The async engine and initial session lifecycle are now in
-place, including bounded per-shard connection pools. Cancellation, deadlines,
-limits, and graceful shutdown are separate work. The synchronous `Database` API
-remains available as a Rust compatibility surface; existing engine and server
-entry points retain their signatures and default behavior.
+already complete. The async engine, session lifecycle, bounded per-shard pools,
+request controls, and explicit shutdown lifecycle are now in place. The
+synchronous `Database` API remains available as a Rust compatibility surface;
+existing engine and server entry points retain their signatures and delegate to
+the controlled defaults.
 
 ## Session and asynchronous engine boundary
 
@@ -112,6 +112,11 @@ constructors and server assembly use the defaults, so their APIs and behavior
 remain compatible. Server configuration exposes
 `--connections-per-shard` / `BRISKDB_CONNECTIONS_PER_SHARD` and
 `--queue-capacity-per-shard` / `BRISKDB_QUEUE_CAPACITY_PER_SHARD`.
+The same options boundary carries finite result rows/bytes, the optional
+engine-wide request timeout, and the shutdown grace period. The binary exposes
+them as `--max-result-rows`, `--max-result-bytes`,
+`--request-timeout-ms`, and `--shutdown-grace-ms` with corresponding
+`BRISKDB_*` environment variables.
 
 When a shard has no active slot and its admission queue is full, a new operation
 fails immediately with retryable `Busy`, which the HTTP adapter maps to 503.
@@ -158,17 +163,44 @@ This ownership is a leakage-prevention rule, not connection pinning: a competing
 session can replace an idle write-bearing handle, so write-counter functions
 remain uncontracted across calls until transaction/session pinning is added.
 
-Dropping an engine future while it is still queued removes that work before it
-starts. Once work is running on a blocking worker, dropping the future does not
-interrupt SQLite; the operation may still commit after its frontend disconnects.
-Issue #11 owns in-flight cancellation, deadlines, result limits, and graceful
-shutdown. In particular, implicit Rust destruction is not yet an asynchronous
-shutdown operation: dropping the final `Engine` may close idle SQLite handles
-synchronously on the dropping thread. Issue #11 will add an explicit bounded
-drain path. Real multi-call `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction
-state, and single-shard pinning remain deferred to the PostgreSQL and MySQL
-transaction work in issues #34 and #47. `Ready` and `Closed` therefore describe
-session lifecycle, not SQL transaction state.
+Every operation acquires a lifecycle lease before its first await. Dropping a
+queued future removes the operation before SQLite starts. Once work is running,
+the future's drop guard interrupts the exact leased SQLite handle; the blocking
+closure retains lifecycle, worker, pool, and session permits until rollback and
+connection cleanup really finish. The lease-scoped progress callback and
+interrupt handle are removed before check-in, and interrupted connections are
+retired, preventing a late signal from affecting the next request.
+
+`RequestContext` supplies a sticky cancellation token, an optional absolute
+deadline, and optional narrower result limits. The engine default deadline and
+result budget are owned by `EngineOptions`, so protocol adapters contain no
+SQLite control policy. Queries account a stable logical result representation
+while stepping SQLite and before cloning payloads. A row or byte overflow
+returns no partial `ResultSet`; query statements must be read-only so early
+termination cannot hide DML `RETURNING` effects. The exact accounting contract
+is documented in [request controls](REQUEST_CONTROLS.md).
+
+All engine clones share one mutex-protected lifecycle. The mutex makes the
+`Running` admission check and active-operation increment atomic with
+`begin_shutdown()` changing the state to `Draining`. New work then receives
+`ShuttingDown`; admitted leases drain. After the grace period, shutdown cancels
+the admitted set and still waits for blocking cleanup before closing idle
+SQLite handles on a worker and marking `Stopped`. A timed-out cleanup remains
+`Draining` and can be resumed. Ordinary clone destruction does not initiate
+this explicit asynchronous path.
+
+The server owns accepted HTTP/1 connections in a tracked task set. It stops
+engine admission before dropping the listener, starts HTTP and core draining
+together, and aborts then joins any connection that exceeds the HTTP grace
+deadline. Signal receivers are installed before readiness is logged. Dropping
+the server future aborts its tracked connection set and synchronously enters
+`Draining`; a surviving embedder-owned `Engine` clone can resume asynchronous
+cleanup with `shutdown()`.
+
+Real multi-call `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction state, and
+single-shard pinning remain deferred to the PostgreSQL and MySQL transaction
+work in issues #34 and #47. `Ready` and `Closed` therefore describe session
+lifecycle, not SQL transaction state.
 
 This boundary changes Rust orchestration and adds opt-in `EngineOptions` plus
 pool-sizing CLI/environment configuration. It does not change existing option

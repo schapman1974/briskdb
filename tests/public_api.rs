@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::Router;
 use briskdb::{
@@ -14,6 +17,11 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _engine: Option<core::Engine> = None;
     let _engine_status: Option<core::EngineStatus> = None;
     let _engine_options: core::EngineOptions = core::EngineOptions::default();
+    let _result_limits: core::ResultLimits = core::ResultLimits::default();
+    let _request_context: core::RequestContext = core::RequestContext::new();
+    let _cancellation_token: core::CancellationToken = core::CancellationToken::new();
+    let _running = core::EngineState::Running;
+    let _shutdown_report: Option<core::ShutdownReport> = None;
     let _session: Option<core::Session> = None;
     let _ready = core::SessionState::Ready;
     let _closed = core::SessionState::Closed;
@@ -63,6 +71,22 @@ fn engine_options_are_public_validated_and_have_stable_defaults() {
         defaults.queue_capacity_per_shard(),
         core::DEFAULT_QUEUE_CAPACITY_PER_SHARD
     );
+    assert_eq!(
+        defaults.result_limits(),
+        core::ResultLimits::new(
+            core::DEFAULT_MAX_RESULT_ROWS,
+            core::DEFAULT_MAX_RESULT_BYTES,
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        defaults.request_timeout(),
+        Some(Duration::from_millis(core::DEFAULT_REQUEST_TIMEOUT_MS))
+    );
+    assert_eq!(
+        defaults.shutdown_grace(),
+        Duration::from_millis(core::DEFAULT_SHUTDOWN_GRACE_MS)
+    );
 
     let minimum = core::EngineOptions::new(1, 1).unwrap();
     assert_eq!(minimum.connections_per_shard(), 1);
@@ -95,12 +119,30 @@ fn engine_options_are_public_validated_and_have_stable_defaults() {
             core::EngineErrorKind::InvalidArgument
         );
     }
+
+    let limits = core::ResultLimits::new(37, 4_096).unwrap();
+    let configured = minimum
+        .with_result_limits(limits)
+        .with_request_timeout(None)
+        .unwrap()
+        .with_shutdown_grace(Duration::from_millis(250))
+        .unwrap();
+    assert_eq!(configured.result_limits(), limits);
+    assert_eq!(configured.request_timeout(), None);
+    assert_eq!(configured.shutdown_grace(), Duration::from_millis(250));
 }
 
 #[tokio::test]
 async fn protocol_neutral_async_engine_surface_is_available() {
     let temp = tempfile::tempdir().unwrap();
-    let options = core::EngineOptions::new(2, 7).unwrap();
+    let limits = core::ResultLimits::new(50, 8_192).unwrap();
+    let options = core::EngineOptions::new(2, 7)
+        .unwrap()
+        .with_result_limits(limits)
+        .with_request_timeout(Some(Duration::from_secs(5)))
+        .unwrap()
+        .with_shutdown_grace(Duration::from_millis(100))
+        .unwrap();
     let engine = core::Engine::open_with_options(temp.path(), 4, options)
         .await
         .unwrap();
@@ -113,6 +155,30 @@ async fn protocol_neutral_async_engine_surface_is_available() {
     assert_eq!(status.max_blocking_workers(), 8);
     assert_eq!(status.connections_per_shard(), 2);
     assert_eq!(status.queue_capacity_per_shard(), 7);
+    assert_eq!(status.max_result_rows(), 50);
+    assert_eq!(status.max_result_bytes(), 8_192);
+    assert_eq!(status.request_timeout(), Some(Duration::from_secs(5)));
+    assert_eq!(status.shutdown_grace(), Duration::from_millis(100));
+
+    session.set_routing_key("public-controls").await.unwrap();
+    let token = core::CancellationToken::new();
+    let context = core::RequestContext::new()
+        .with_cancellation_token(token.clone())
+        .with_deadline(Instant::now() + Duration::from_secs(1))
+        .with_result_limits(core::ResultLimits::new(1, 512).unwrap());
+    let result = engine
+        .query_with_context(&session, core::Statement::new("SELECT 1", vec![]), context)
+        .await
+        .unwrap();
+    assert_eq!(result.value.rows().len(), 1);
+    token.cancel();
+    assert!(token.is_cancelled());
+
+    assert_eq!(engine.state(), core::EngineState::Running);
+    assert_eq!(engine.begin_shutdown(), core::EngineState::Draining);
+    let report = engine.shutdown().await.unwrap();
+    assert!(!report.forced());
+    assert_eq!(engine.state(), core::EngineState::Stopped);
 }
 
 #[tokio::test]

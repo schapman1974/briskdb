@@ -97,15 +97,27 @@ connection-local counters to the next request when the owned handle remains
 available. It does not pin that handle, so these observer functions remain
 uncontracted across calls in the current SQL surface.
 
-Dropping a request future before its queued operation starts causes that work to
-be skipped. Dropping it after blocking execution begins does not interrupt
-SQLite, and the operation may still commit after the client disconnects.
-Cancellation and deadline behavior remain planned in issue #11. Broadcast
-execution remains non-atomic: its parameterless SQL batch is not wrapped in a
-transaction on each shard, and shards are processed sequentially. A failure can
-therefore leave earlier statements committed on the failing shard as well as
-leave earlier shards fully or partially updated. Pooling does not change the
-manifest schema, shard files, or stored-data format.
+Dropping or explicitly cancelling a request before its queued operation starts
+skips SQLite entirely. After execution begins, BriskDB interrupts the exact
+leased connection and does not return cancellation until blocking rollback and
+connection cleanup finish. A successfully completed statement wins a very
+close cancellation race. Request deadlines use the same cleanup path but retain
+the distinct `DeadlineExceeded` error kind.
+
+Queries are restricted to statements SQLite identifies as read-only and have
+finite row and protocol-neutral logical-byte budgets. BriskDB returns no partial
+result when a budget is exceeded. This deliberately rejects write-capable query
+forms such as DML `RETURNING`; callers must use the execute surface, whose
+result is rows affected rather than returned rows. Exact accounting and
+configuration semantics are in [request controls](REQUEST_CONTROLS.md).
+
+Broadcast execution remains non-atomic: its parameterless SQL batch is not
+wrapped in a transaction on each shard, and shards are processed sequentially.
+A failure can therefore leave earlier statements committed on the failing
+shard as well as leave earlier shards fully or partially updated. Cancellation
+preserves the completed shard prefix and stops before later shards. Pooling and
+request controls do not change the manifest schema, shard files, or stored-data
+format.
 
 ### Current parameter and result conversion
 
@@ -205,11 +217,12 @@ SQLite library and used through the matching HTTP endpoint:
 
 Other SQLite syntax may happen to pass through, but it is not a stable BriskDB
 contract until it appears in this table and has conformance tests. In
-particular, multi-request transactions, multi-shard writes, `RETURNING`,
-multiple statements outside the broadcast endpoint, and attached-database
-operations are uncontracted public API behavior today. The experimental raw
-HTTP path might accept some of them; clients must not rely on acceptance,
-rejection, or unchanged semantics.
+particular, multi-request transactions, multi-shard writes, multiple statements
+outside the broadcast endpoint, and attached-database operations are
+uncontracted public API behavior today. DML `RETURNING` is explicitly rejected
+from the query surface, and the execute surface exposes only a rows-affected
+count, never a returned rowset. The experimental raw HTTP path uses those same
+engine boundaries.
 
 The current `Session` `Ready`/`Closed` lifecycle is not a transaction state
 machine. Real `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction behavior, and

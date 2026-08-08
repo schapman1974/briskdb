@@ -24,6 +24,7 @@ use crate::{
 };
 
 const SCHEMA_VERSION: &str = "1";
+pub(crate) const CONNECTION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub(crate) struct Storage {
@@ -123,6 +124,12 @@ impl Storage {
     }
 
     pub(crate) fn open_shard(&self, shard: u16) -> EngineResult<Connection> {
+        let connection = self.open_unconfigured_shard(shard)?;
+        configure_connection(&connection)?;
+        Ok(connection)
+    }
+
+    fn open_unconfigured_shard(&self, shard: u16) -> EngineResult<Connection> {
         if shard >= self.shard_count {
             return Err(EngineError::new(
                 EngineErrorKind::Internal,
@@ -133,7 +140,6 @@ impl Storage {
         let connection = Connection::open(&path).map_err(|error| {
             sqlite_error::storage(error).context(format!("failed to open shard {}", path.display()))
         })?;
-        configure_connection(&connection)?;
         Ok(connection)
     }
 
@@ -142,6 +148,13 @@ impl Storage {
         shard: u16,
     ) -> EngineResult<(Connection, ConnectionHygiene)> {
         let connection = self.open_shard(shard)?;
+        self.attach_pool_hygiene(connection)
+    }
+
+    fn attach_pool_hygiene(
+        &self,
+        connection: Connection,
+    ) -> EngineResult<(Connection, ConnectionHygiene)> {
         let tainted = Arc::new(AtomicBool::new(false));
         let wrote = Arc::new(AtomicBool::new(false));
         let probing = Arc::new(AtomicBool::new(false));
@@ -265,8 +278,12 @@ fn action_writes_connection(action: AuthAction<'_>) -> bool {
 
 fn configure_connection(connection: &Connection) -> EngineResult<()> {
     connection
-        .busy_timeout(std::time::Duration::from_secs(5))
+        .busy_timeout(CONNECTION_BUSY_TIMEOUT)
         .map_err(sqlite_error::storage)?;
+    configure_connection_pragmas(connection)
+}
+
+fn configure_connection_pragmas(connection: &Connection) -> EngineResult<()> {
     connection
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(sqlite_error::storage)?;
