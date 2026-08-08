@@ -141,6 +141,30 @@ mod tests {
     }
 
     #[test]
+    fn catalog_creation_does_not_activate_bucket_routing_early() {
+        let keys: [&[u8]; 6] = [
+            b"",
+            b"customer-42",
+            b"tenant/alpha",
+            b"non-power-of-two",
+            &[0, 1, 2, 0xff],
+            "snowman-☃".as_bytes(),
+        ];
+        for shard_count in [3_u16, 5, 7, 63] {
+            let temp = tempfile::tempdir().unwrap();
+            let database = Database::open(temp.path(), shard_count).unwrap();
+            for key in keys {
+                let digest = blake3::hash(key);
+                let hash = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap());
+                assert_eq!(
+                    database.shard_for_key(key),
+                    (hash % u64::from(shard_count)) as u16
+                );
+            }
+        }
+    }
+
+    #[test]
     fn routed_execute_and_query_report_the_selected_shard() {
         let temp = tempfile::tempdir().unwrap();
         let database = Database::open(temp.path(), 4).unwrap();

@@ -40,7 +40,8 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Finite per-query row/logical-byte budgets with no partial results
 - Explicit graceful drain, forced cancellation, and blocking handle cleanup
 - Protocol-neutral typed values, ordered columns, positional rows, and results
-- A transactionally versioned `manifest.sqlite` with a fixed shard count
+- A transactionally versioned `manifest.sqlite` with a durable 4,096-bucket
+  shard catalog
 - One WAL-enabled SQLite database per shard
 - Routed execute and query endpoints
 - A broadcast endpoint for initializing schema on every shard
@@ -167,13 +168,19 @@ still commit.
 Queries have finite row and logical-byte budgets, account values before cloning
 payloads, and return no partial result on `LimitExceeded`.
 Broadcast changes and future scatter operations are not atomic across shard
-files. The shard count is immutable after database creation, so resharding will
-require an explicit migration workflow. Opening now upgrades the exact legacy
-manifest format to version 2 atomically; newer or malformed manifests fail
-closed, and an intentional downgrade fence prevents the shipped legacy opener
-from silently reading version 2. This changes only `manifest.sqlite`, not shard
-files, routing, SQL behavior, or wire contracts. The complete format and
-upgrade contract is in [manifest storage format](docs/STORAGE_FORMAT.md).
+files. The initial shard count is immutable, so resharding will require an
+explicit migration workflow. Opening upgrades exact version-1 and version-2
+manifests to version 3 through one transaction per numbered step. Version 3
+persists hash, key-encoding, and bucket-algorithm versions, a generation-stamped
+4,096-bucket map, and active physical-shard lifecycle records. Newer or malformed
+manifests fail closed, and downgrade fences reject shipped version-1 and
+version-2 readers. Runtime routing deliberately remains the existing BLAKE3
+modulo calculation until the next roadmap item activates catalog lookup; the
+generation-1 ranges are constructed so that activation can preserve every
+existing placement, including non-power-of-two shard counts. This changes only
+`manifest.sqlite`, not shard files, SQL behavior, or wire contracts. The
+complete format and upgrade contract is in
+[manifest storage format](docs/STORAGE_FORMAT.md).
 Embedders should call
 `Engine::shutdown`; merely dropping the final `Engine` is not the explicit
 asynchronous cleanup contract.

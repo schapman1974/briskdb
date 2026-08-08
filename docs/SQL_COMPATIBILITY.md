@@ -329,6 +329,8 @@ underlying execution semantics.
 
 - The caller supplies an opaque `shard_key` independently from the SQL text.
 - BLAKE3 hashing followed by modulo shard count selects one physical shard.
+- Manifest version 3 already persists the versioned 4,096-bucket catalog, but
+  runtime lookup is deliberately deferred to the next routing milestone.
 - Point queries and writes visit only that shard.
 - No scatter/gather query path exists.
 - Unique constraints and transactions are local to one SQLite shard.
@@ -360,7 +362,7 @@ reject cross-shard access.
 Manifest-format migrations are separate from application SQL migrations. They
 run internally during storage open, are transactional only within
 `manifest.sqlite`, and cannot be requested through any protocol or SQL
-statement. The version-2 manifest upgrade does not change shard schemas,
+statement. The version-3 manifest upgrade does not change shard schemas,
 supported SQLite syntax, result conversion, routing, or broadcast semantics.
 See the [manifest storage-format contract](STORAGE_FORMAT.md).
 
