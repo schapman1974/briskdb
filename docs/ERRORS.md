@@ -115,13 +115,26 @@ Manifest compatibility uses the same protocol-neutral kinds. A foreign file,
 a manifest newer than the running binary, or a requested shard-count mismatch
 is `FailedPrecondition`; the file is not downgraded. A recognized BriskDB
 manifest whose identity, schema, or invariant rows disagree is
-`DataCorruption`. SQLite lock contention while an opener waits for the manifest
-migration transaction remains retryable `Busy`. These diagnostics originate in
-storage and are never serialized directly by an adapter.
+`DataCorruption`.
 
-The earlier taxonomy change affected reporting only; the later manifest-format
-migration described above is the storage-layer change. Neither alters shard
-files, stored application values, routing, or wire configuration.
+Shard-layout validation follows the same distinction. A foreign shard
+application ID, unexpected canonical four-digit `.sqlite` shard file or
+symbolic link, persistent journal mode other than WAL, or shard generation
+newer than the catalog is
+`FailedPrecondition`; BriskDB neither claims, downgrades, nor repairs it. A
+layout in `Adopting` or `Ready` with a missing shard is `DataCorruption`. In
+`Ready`, missing identity metadata, a wrong layout or physical-shard ID, an
+older mismatched generation, or otherwise invalid recognized BriskDB metadata
+is also `DataCorruption`. SQLite lock contention while an opener waits for a
+manifest or shard transaction remains retryable `Busy`; permission, read-only,
+full, and I/O failures retain their precise storage kinds. Client access to
+BriskDB-owned metadata or mutation of a storage-control PRAGMA is
+`PermissionDenied`. These diagnostics originate in storage and are never
+serialized directly by an adapter.
+
+The earlier taxonomy change affected reporting only. Manifest v5 is a later
+storage-layer change: it adds identity metadata to shard files while preserving
+legacy application tables, rows, routing, SQL results, and wire configuration.
 
 This is a pre-1.0 Rust API migration: public `Database` operations now return
 `EngineResult<T>` instead of `anyhow::Result<T>`. The `?` operator still

@@ -188,7 +188,7 @@ existing tests pass through the shared engine.
   vectors so upgrades cannot silently move keys.
 - [x] Add logical databases and table metadata, including table placement and
   shard-key column/type.
-- [ ] Validate at startup that every shard is present, uses WAL, has the expected
+- [x] Validate at startup that every shard is present, uses WAL, has the expected
   application ID/user version, and matches the cataloged schema generation.
 - [ ] Implement a crash-resumable schema migration journal instead of the
   current best-effort broadcast endpoint.

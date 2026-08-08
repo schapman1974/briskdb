@@ -45,11 +45,18 @@ storage behavior.
 ## Filesystem and deployment boundary
 
 All BriskDB data files must reside on storage local to the server host with
-working file locks and durable synchronization semantics. The current engine
-enables SQLite WAL mode and `synchronous=FULL` for the manifest and every
-shard. Network filesystems such as NFS or SMB, cloud-synchronized folders,
-userspace filesystems with unverified locking, and sharing one data directory
-between hosts are unsupported.
+working file locks and durable synchronization semantics. Fresh shard
+provisioning in `Creating` enables SQLite WAL mode; every `Adopting`, `Ready`,
+and runtime shard open requires the persisted mode to already be WAL and does
+not silently repair another mode. Every connection uses `synchronous=FULL`.
+Network filesystems such as NFS or SMB, cloud-synchronized folders, userspace
+filesystems with unverified locking, and sharing one data directory between
+hosts are unsupported.
+
+WAL, shared-memory, and rollback-journal sidecars may be absent and are not
+layout members by themselves. The directory must nevertheless permit SQLite to
+create and recover its sidecars. Do not infer damage from a missing sidecar;
+BriskDB validates the database's persistent journal mode instead.
 
 Only a single BriskDB server process per data directory is currently tested.
 Do not copy, move, edit, or separately open the manifest, shard, WAL, or shared
@@ -58,10 +65,19 @@ access, filesystem-fault behavior, and crash-recovery guarantees will become
 supported only when their roadmap issues add the corresponding automated
 tests.
 
-Opening a data directory can transactionally upgrade `manifest.sqlite`; see the
-[manifest storage-format contract](STORAGE_FORMAT.md). A future or foreign
-manifest is rejected before BriskDB enables WAL for it or opens shard files.
-The application ID is an accidental wrong-file guard, not a security boundary.
+Opening a data directory can transactionally upgrade `manifest.sqlite` and can
+resume a manifest-recorded cross-file shard provisioning or adoption step; see
+the [manifest storage-format contract](STORAGE_FORMAT.md). Outside the explicit
+`Creating` state, every shard is opened read-write with SQLite create and
+symbolic-link following disabled. A missing, extra canonical, swapped, foreign,
+non-WAL, or wrong-generation shard file is rejected, as is a shard cloned into
+another slot or layout. It is not recreated, reassigned, or silently
+reconfigured. Recovery requires restoring the correct complete layout.
+
+Manifest and shard application IDs plus the random 16-byte layout ID guard
+against accidental wrong-file placement. They are not authentication, checksums,
+or protection from a process that can write the data directory. Process-kill,
+power-loss, and filesystem-fault certification remains later hardening work.
 
 When reporting a platform problem, include the BriskDB revision, `rustc -Vv`,
 operating-system and architecture details, filesystem type, mount options, and

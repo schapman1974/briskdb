@@ -14,13 +14,16 @@ use crate::{
     sqlite_error,
 };
 
+use super::shard::{SHARD_APPLICATION_ID, SHARD_METADATA_VERSION, ShardLayout, ShardLayoutState};
+
 /// `BRDB` encoded as SQLite's 32-bit application identifier.
 pub(super) const MANIFEST_APPLICATION_ID: i64 = 0x4252_4442;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
 const V4_SCHEMA_VERSION: u32 = 4;
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = V4_SCHEMA_VERSION;
+const V5_SCHEMA_VERSION: u32 = 5;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = V5_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
 
 const INITIAL_SCHEMA_GENERATION: u64 = 0;
@@ -52,6 +55,10 @@ const V3_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
 const V4_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
         CHECK (requires_manifest_version >= 4)
+) STRICT";
+const V5_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 5)
 ) STRICT";
 const V3_ROUTING_TABLE_SQL: &str = "CREATE TABLE briskdb_routing (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -137,6 +144,14 @@ const V4_TABLES_TABLE_SQL: &str = "CREATE TABLE briskdb_tables (
         )
     )
 ) STRICT";
+const V5_SHARD_LAYOUT_TABLE_SQL: &str = "CREATE TABLE briskdb_shard_layout (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    layout_id BLOB NOT NULL
+        CHECK (typeof(layout_id) = 'blob' AND length(layout_id) = 16),
+    shard_application_id INTEGER NOT NULL CHECK (shard_application_id = 1112691528),
+    shard_metadata_version INTEGER NOT NULL CHECK (shard_metadata_version = 1),
+    layout_state INTEGER NOT NULL CHECK (layout_state IN (1, 2, 3))
+) STRICT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RoutingConfiguration {
@@ -167,6 +182,19 @@ struct ManifestSnapshot {
     shard_count: u16,
     routing_catalog: Option<RoutingCatalog>,
     logical_catalog: Option<Catalog>,
+    shard_layout: Option<ShardLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LoadedManifest {
+    catalog: CatalogSnapshot,
+    shard_layout: ShardLayout,
+}
+
+impl LoadedManifest {
+    pub(super) fn into_parts(self) -> (CatalogSnapshot, ShardLayout) {
+        (self.catalog, self.shard_layout)
+    }
 }
 
 const MIGRATIONS: &[Migration] = &[
@@ -191,6 +219,13 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v3_to_v4,
         validate: validate_v4,
     },
+    Migration {
+        from: V4_SCHEMA_VERSION,
+        to: V5_SCHEMA_VERSION,
+        name: "validated_physical_shard_layout",
+        apply: migrate_v4_to_v5,
+        validate: validate_v5,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -198,12 +233,14 @@ struct MigrationPlan<'a> {
     current_version: u32,
     migrations: &'a [Migration],
     initialize_current: fn(&Transaction<'_>, u16) -> EngineResult<()>,
+    initialize_interrupted_legacy: fn(&Transaction<'_>, u16) -> EngineResult<()>,
 }
 
 const CURRENT_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: CURRENT_SCHEMA_VERSION,
     migrations: MIGRATIONS,
-    initialize_current: create_v4_schema,
+    initialize_current: create_v5_schema,
+    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v5,
 };
 
 #[derive(Clone, Copy)]
@@ -244,11 +281,26 @@ enum ManifestState {
 /// The state is inspected again after the write lock is acquired, so two
 /// concurrent openers cannot both act on a stale version. Each numbered
 /// migration owns its transaction and stamps the new version last.
-pub(super) fn load_or_create_catalog(
+#[cfg(test)]
+fn load_or_create_manifest(
     connection: &mut Connection,
     requested_shards: u16,
-) -> EngineResult<CatalogSnapshot> {
-    let snapshot = load_or_create_snapshot_with_hook(connection, requested_shards, |_| Ok(()))?;
+) -> EngineResult<LoadedManifest> {
+    load_or_create_manifest_with_fresh_layout(connection, requested_shards, true)
+}
+
+pub(super) fn load_or_create_manifest_with_fresh_layout(
+    connection: &mut Connection,
+    requested_shards: u16,
+    fresh_layout_allowed: bool,
+) -> EngineResult<LoadedManifest> {
+    let snapshot = load_or_create_snapshot_with_plan(
+        connection,
+        requested_shards,
+        CURRENT_PLAN,
+        fresh_layout_allowed,
+        &mut |_| Ok(()),
+    )?;
     let routing = snapshot.routing_catalog.ok_or_else(|| {
         EngineError::new(
             EngineErrorKind::Internal,
@@ -261,7 +313,126 @@ pub(super) fn load_or_create_catalog(
             "current manifest validation did not produce a logical catalog",
         )
     })?;
-    Ok(CatalogSnapshot::from_validated_parts(routing, logical))
+    let shard_layout = snapshot.shard_layout.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "current manifest validation did not produce a physical shard layout",
+        )
+    })?;
+    Ok(LoadedManifest {
+        catalog: CatalogSnapshot::from_validated_parts(routing, logical),
+        shard_layout,
+    })
+}
+
+#[cfg(test)]
+fn load_or_create_catalog(
+    connection: &mut Connection,
+    requested_shards: u16,
+) -> EngineResult<CatalogSnapshot> {
+    load_or_create_manifest(connection, requested_shards).map(|loaded| loaded.catalog)
+}
+
+#[cfg(test)]
+pub(super) fn mark_shard_layout_ready(
+    connection: &mut Connection,
+    requested_shards: u16,
+    expected: &ShardLayout,
+) -> EngineResult<()> {
+    reconcile_shard_layout(connection, requested_shards, expected, |_| Ok(())).map(|_| ())
+}
+
+/// Serialize physical reconciliation and the final `Ready` publication under
+/// one manifest write lock. The callback receives the state re-read after that
+/// lock is acquired, so a lagging opener can never provision from a stale
+/// `Creating` observation after another opener has committed `Ready`.
+pub(super) fn reconcile_shard_layout<F>(
+    connection: &mut Connection,
+    requested_shards: u16,
+    expected: &ShardLayout,
+    reconcile: F,
+) -> EngineResult<ShardLayout>
+where
+    F: FnOnce(&ShardLayout) -> EngineResult<()>,
+{
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let observed = match inspect_with_plan(&transaction, requested_shards, CURRENT_PLAN)? {
+        ManifestState::Versioned { version, snapshot } if version == CURRENT_SCHEMA_VERSION => {
+            snapshot.shard_layout.ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    "current manifest validation omitted its physical shard layout",
+                )
+            })?
+        }
+        _ => {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "physical shard layout changed before it could be marked ready",
+            ));
+        }
+    };
+    ensure_same_shard_layout(&observed, expected)?;
+    reconcile(&observed)?;
+
+    if observed.state() != ShardLayoutState::Ready {
+        transaction
+            .execute(
+                "UPDATE briskdb_shard_layout
+                 SET layout_state = ?1
+                 WHERE singleton = 1 AND layout_id = ?2",
+                rusqlite::params![
+                    ShardLayoutState::Ready.code(),
+                    expected.layout_id().as_slice()
+                ],
+            )
+            .map_err(sqlite_error::storage)?;
+
+        let ready = match inspect_with_plan(&transaction, requested_shards, CURRENT_PLAN)? {
+            ManifestState::Versioned { version, snapshot } if version == CURRENT_SCHEMA_VERSION => {
+                snapshot.shard_layout.ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "ready manifest validation omitted its physical shard layout",
+                    )
+                })?
+            }
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "physical shard layout ready transition did not produce a current manifest",
+                ));
+            }
+        };
+        ensure_same_shard_layout(&ready, expected)?;
+        if ready.state() != ShardLayoutState::Ready {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "physical shard layout did not persist its ready state",
+            ));
+        }
+        transaction.commit().map_err(sqlite_error::storage)?;
+        return Ok(ready);
+    }
+
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(observed)
+}
+
+fn ensure_same_shard_layout(observed: &ShardLayout, expected: &ShardLayout) -> EngineResult<()> {
+    if observed.layout_id() != expected.layout_id()
+        || observed.expected_application_id() != expected.expected_application_id()
+        || observed.metadata_version() != expected.metadata_version()
+        || (observed.state() != expected.state() && observed.state() != ShardLayoutState::Ready)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "physical shard layout identity changed during startup",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -281,25 +452,15 @@ fn load_or_create_with_hook<F>(
 where
     F: FnMut(MigrationPoint) -> EngineResult<()>,
 {
-    load_or_create_snapshot_with_plan(connection, requested_shards, CURRENT_PLAN, &mut hook)
+    load_or_create_snapshot_with_plan(connection, requested_shards, CURRENT_PLAN, true, &mut hook)
         .map(|snapshot| snapshot.shard_count)
-}
-
-fn load_or_create_snapshot_with_hook<F>(
-    connection: &mut Connection,
-    requested_shards: u16,
-    mut hook: F,
-) -> EngineResult<ManifestSnapshot>
-where
-    F: FnMut(MigrationPoint) -> EngineResult<()>,
-{
-    load_or_create_snapshot_with_plan(connection, requested_shards, CURRENT_PLAN, &mut hook)
 }
 
 fn load_or_create_snapshot_with_plan<F>(
     connection: &mut Connection,
     requested_shards: u16,
     plan: MigrationPlan<'_>,
+    fresh_layout_allowed: bool,
     hook: &mut F,
 ) -> EngineResult<ManifestSnapshot>
 where
@@ -316,6 +477,12 @@ where
                 return Ok(snapshot);
             }
             ManifestState::Empty => {
+                if !fresh_layout_allowed {
+                    return Err(EngineError::new(
+                        EngineErrorKind::FailedPrecondition,
+                        "cannot initialize an empty manifest beside an existing shard layout",
+                    ));
+                }
                 return apply_schema_change(
                     transaction,
                     requested_shards,
@@ -328,7 +495,25 @@ where
                     hook,
                 );
             }
-            ManifestState::LegacyUninitialized => (LEGACY_SCHEMA_VERSION, requested_shards),
+            ManifestState::LegacyUninitialized => {
+                if !fresh_layout_allowed {
+                    return Err(EngineError::new(
+                        EngineErrorKind::FailedPrecondition,
+                        "cannot recover interrupted legacy initialization beside an existing shard layout",
+                    ));
+                }
+                return apply_schema_change(
+                    transaction,
+                    requested_shards,
+                    SchemaChange {
+                        from: LEGACY_SCHEMA_VERSION,
+                        to: plan.current_version,
+                        apply: plan.initialize_interrupted_legacy,
+                    },
+                    plan,
+                    hook,
+                );
+            }
             ManifestState::LegacyV1 { shard_count } => (LEGACY_SCHEMA_VERSION, shard_count),
             ManifestState::Versioned { version, snapshot } => (version, snapshot.shard_count),
         };
@@ -453,6 +638,43 @@ fn create_v3_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineRe
 fn create_v4_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
     create_v3_schema(transaction, shard_count)?;
     migrate_v3_to_v4(transaction, shard_count)
+}
+
+fn create_v5_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
+    create_v4_schema(transaction, shard_count)?;
+    add_v5_schema(transaction, ShardLayoutState::Creating)
+}
+
+fn migrate_interrupted_legacy_to_v5(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v5_schema(transaction, shard_count)
+}
+
+#[cfg(test)]
+fn migrate_interrupted_legacy_to_v3(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v3_schema(transaction, shard_count)
+}
+
+#[cfg(test)]
+fn migrate_interrupted_legacy_to_v4(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v4_schema(transaction, shard_count)
 }
 
 fn migrate_v2_to_v3(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
@@ -590,6 +812,41 @@ fn migrate_v3_to_v4(transaction: &Transaction<'_>, _shard_count: u16) -> EngineR
         .execute_batch(V4_TABLES_TABLE_SQL)
         .map_err(sqlite_error::storage)?;
 
+    Ok(())
+}
+
+fn migrate_v4_to_v5(transaction: &Transaction<'_>, _shard_count: u16) -> EngineResult<()> {
+    add_v5_schema(transaction, ShardLayoutState::Adopting)
+}
+
+fn add_v5_schema(transaction: &Transaction<'_>, state: ShardLayoutState) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V5_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V5_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V5_SHARD_LAYOUT_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_shard_layout (
+                singleton,
+                layout_id,
+                shard_application_id,
+                shard_metadata_version,
+                layout_state
+             ) VALUES (1, randomblob(16), ?1, ?2, ?3)",
+            rusqlite::params![SHARD_APPLICATION_ID, SHARD_METADATA_VERSION, state.code(),],
+        )
+        .map_err(sqlite_error::storage)?;
     Ok(())
 }
 
@@ -811,6 +1068,18 @@ fn v4_objects() -> Vec<SchemaObject> {
     ]
 }
 
+fn v5_objects() -> Vec<SchemaObject> {
+    let mut objects = v4_objects();
+    objects.push(SchemaObject {
+        object_type: "table".to_owned(),
+        name: "briskdb_shard_layout".to_owned(),
+    });
+    objects.sort_by(|left, right| {
+        (&left.object_type, &left.name).cmp(&(&right.object_type, &right.name))
+    });
+    objects
+}
+
 fn schema_objects(connection: &Connection) -> EngineResult<Vec<SchemaObject>> {
     let mut statement = connection
         .prepare(
@@ -907,6 +1176,10 @@ fn validate_table(
         "briskdb_tables" => {
             "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
              FROM pragma_table_xinfo('briskdb_tables') LIMIT ?1"
+        }
+        "briskdb_shard_layout" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_shard_layout') LIMIT ?1"
         }
         _ => {
             return Err(EngineError::new(
@@ -1094,6 +1367,7 @@ fn validate_v2(
         shard_count,
         routing_catalog: None,
         logical_catalog: None,
+        shard_layout: None,
     })
 }
 
@@ -1120,6 +1394,7 @@ fn validate_v3(
         shard_count,
         routing_catalog: Some(routing_catalog),
         logical_catalog: None,
+        shard_layout: None,
     })
 }
 
@@ -1218,18 +1493,70 @@ fn validate_v4(
     requested_shards: u16,
     objects: &[SchemaObject],
 ) -> EngineResult<ManifestSnapshot> {
-    if objects != v4_objects() {
+    validate_catalog_manifest(
+        connection,
+        requested_shards,
+        objects,
+        V4_SCHEMA_VERSION,
+        V4_DOWNGRADE_FENCE_SQL,
+        &v4_objects(),
+    )
+}
+
+fn validate_v5(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    let mut snapshot = validate_catalog_manifest(
+        connection,
+        requested_shards,
+        objects,
+        V5_SCHEMA_VERSION,
+        V5_DOWNGRADE_FENCE_SQL,
+        &v5_objects(),
+    )?;
+    validate_table(
+        connection,
+        "briskdb_shard_layout",
+        &[
+            TableColumn::expected(0, "singleton", "INTEGER", false, 1),
+            TableColumn::expected(1, "layout_id", "BLOB", true, 0),
+            TableColumn::expected(2, "shard_application_id", "INTEGER", true, 0),
+            TableColumn::expected(3, "shard_metadata_version", "INTEGER", true, 0),
+            TableColumn::expected(4, "layout_state", "INTEGER", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_shard_layout",
+        V5_SHARD_LAYOUT_TABLE_SQL,
+    )?;
+    snapshot.shard_layout = Some(validate_shard_layout(connection)?);
+    Ok(snapshot)
+}
+
+fn validate_catalog_manifest(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+    expected_version: u32,
+    downgrade_fence_sql: &str,
+    expected_objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    if objects != expected_objects {
         return Err(EngineError::new(
             EngineErrorKind::DataCorruption,
-            "manifest schema version 4 has unexpected database objects",
+            format!("manifest schema version {expected_version} has unexpected database objects"),
         ));
     }
 
     let (shard_count, routing_catalog) = validate_routing_manifest(
         connection,
         requested_shards,
-        V4_SCHEMA_VERSION,
-        V4_DOWNGRADE_FENCE_SQL,
+        expected_version,
+        downgrade_fence_sql,
     )?;
     validate_table(
         connection,
@@ -1292,7 +1619,78 @@ fn validate_v4(
             databases,
             tables,
         )),
+        shard_layout: None,
     })
+}
+
+fn validate_shard_layout(connection: &Connection) -> EngineResult<ShardLayout> {
+    let mut statement = connection
+        .prepare(
+            "SELECT singleton,
+                    layout_id,
+                    shard_application_id,
+                    shard_metadata_version,
+                    layout_state
+             FROM briskdb_shard_layout
+             ORDER BY singleton
+             LIMIT 3",
+        )
+        .map_err(|error| manifest_read_error(error, "failed to read physical shard layout"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|error| manifest_read_error(error, "failed to read physical shard layout"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| manifest_read_error(error, "failed to read physical shard layout"))?;
+    if rows.len() != 1 || rows[0].0 != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "physical shard layout must contain exactly its singleton row",
+        ));
+    }
+
+    let (_, layout_id, application_id, metadata_version, state) = &rows[0];
+    let layout_id: [u8; 16] = layout_id.as_slice().try_into().map_err(|_| {
+        EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "physical shard layout identifier must contain exactly 16 bytes",
+        )
+    })?;
+    if *application_id != SHARD_APPLICATION_ID {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!(
+                "physical shard layout has unsupported application identifier {application_id:#010x}"
+            ),
+        ));
+    }
+    let metadata_version = u32::try_from(*metadata_version).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "physical shard metadata version is outside the supported numeric range",
+            error,
+        )
+    })?;
+    if metadata_version != SHARD_METADATA_VERSION {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("physical shard layout has unsupported metadata version {metadata_version}"),
+        ));
+    }
+    let state = ShardLayoutState::from_code(*state)?;
+    Ok(ShardLayout::from_validated_parts(
+        layout_id,
+        *application_id,
+        metadata_version,
+        state,
+    ))
 }
 
 fn validate_schema_catalog_configuration(
@@ -1879,6 +2277,16 @@ fn manifest_read_error(error: rusqlite::Error, diagnostic: &'static str) -> Engi
 }
 
 #[cfg(test)]
+pub(super) fn create_v4_fixture(connection: &mut Connection, shard_count: u16) {
+    let transaction = connection
+        .transaction()
+        .expect("v4 fixture transaction starts");
+    create_v4_schema(&transaction, shard_count).expect("v4 fixture schema is valid");
+    set_identity(&transaction, V4_SCHEMA_VERSION).expect("v4 fixture identity is valid");
+    transaction.commit().expect("v4 fixture commits");
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
@@ -1935,6 +2343,25 @@ mod tests {
         create_v3_schema(&transaction, shards).unwrap();
         set_identity(&transaction, V3_SCHEMA_VERSION).unwrap();
         transaction.commit().unwrap();
+    }
+
+    fn create_v4_manifest(connection: &mut Connection, shards: u16) {
+        create_v4_fixture(connection, shards);
+    }
+
+    fn shard_layout_row(connection: &Connection) -> (Vec<u8>, i64, i64, i64) {
+        connection
+            .query_row(
+                "SELECT layout_id,
+                        shard_application_id,
+                        shard_metadata_version,
+                        layout_state
+                 FROM briskdb_shard_layout
+                 WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
     }
 
     fn routing_configuration(connection: &Connection) -> (i64, i64, i64, i64, i64, i64) {
@@ -2068,7 +2495,7 @@ mod tests {
             identity(connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(connection).unwrap(), v4_objects());
+        assert_eq!(schema_objects(connection).unwrap(), v5_objects());
         assert_eq!(
             connection
                 .query_row(
@@ -2077,7 +2504,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V4_SCHEMA_VERSION)
+            i64::from(V5_SCHEMA_VERSION)
         );
         assert_eq!(
             routing_configuration(connection),
@@ -2118,6 +2545,11 @@ mod tests {
             [(1, DEFAULT_LOGICAL_DATABASE_NAME.to_owned())]
         );
         assert!(table_metadata_rows(connection).is_empty());
+        let (layout_id, application_id, metadata_version, state) = shard_layout_row(connection);
+        assert_eq!(layout_id.len(), 16);
+        assert_eq!(application_id, SHARD_APPLICATION_ID);
+        assert_eq!(metadata_version, i64::from(SHARD_METADATA_VERSION));
+        assert!(matches!(state, 1..=3));
         validate_foreign_keys(connection).unwrap();
     }
 
@@ -2207,7 +2639,7 @@ mod tests {
             .unwrap(),
             4
         );
-        assert_eq!(resumed_steps, [(2, 3), (3, 4)]);
+        assert_eq!(resumed_steps, [(2, 3), (3, 4), (4, 5)]);
         assert_generation_one_catalog(&connection, 4);
         assert_eq!(quick_check(&connection), "ok");
     }
@@ -2232,6 +2664,160 @@ mod tests {
             .pragma_query_value(None, "data_version", |row| row.get(0))
             .unwrap();
         assert_eq!(before, after, "a current-version reopen must not write");
+    }
+
+    #[test]
+    fn fresh_manifest_persists_one_layout_identity_and_ready_transition() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let (_, creating) = load_or_create_manifest(&mut connection, 4)
+            .unwrap()
+            .into_parts();
+
+        assert_eq!(creating.state(), ShardLayoutState::Creating);
+        assert_eq!(creating.expected_application_id(), SHARD_APPLICATION_ID);
+        assert_eq!(creating.metadata_version(), SHARD_METADATA_VERSION);
+
+        let (_, reopened) = load_or_create_manifest(&mut connection, 4)
+            .unwrap()
+            .into_parts();
+        assert_eq!(reopened, creating);
+
+        mark_shard_layout_ready(&mut connection, 4, &creating).unwrap();
+        let (_, ready) = load_or_create_manifest(&mut connection, 4)
+            .unwrap()
+            .into_parts();
+        assert_eq!(ready.layout_id(), creating.layout_id());
+        assert_eq!(ready.state(), ShardLayoutState::Ready);
+
+        mark_shard_layout_ready(&mut connection, 4, &ready).unwrap();
+        assert_eq!(
+            shard_layout_row(&connection).3,
+            ShardLayoutState::Ready.code()
+        );
+    }
+
+    #[test]
+    fn lagging_reconciler_rereads_ready_instead_of_using_stale_creating_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.sqlite");
+        let mut first = Connection::open(&path).unwrap();
+        let (_, first_creating) = load_or_create_manifest(&mut first, 4).unwrap().into_parts();
+        let mut lagging = Connection::open(&path).unwrap();
+        let (_, stale_creating) = load_or_create_manifest(&mut lagging, 4)
+            .unwrap()
+            .into_parts();
+        assert_eq!(first_creating, stale_creating);
+
+        let ready = reconcile_shard_layout(&mut first, 4, &first_creating, |_| Ok(())).unwrap();
+        assert_eq!(ready.state(), ShardLayoutState::Ready);
+
+        let mut state_under_lock = None;
+        let observed = reconcile_shard_layout(&mut lagging, 4, &stale_creating, |locked| {
+            state_under_lock = Some(locked.state());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(state_under_lock, Some(ShardLayoutState::Ready));
+        assert_eq!(observed, ready);
+    }
+
+    #[test]
+    fn version_four_upgrade_enters_adopting_and_preserves_catalog_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_v4_manifest(&mut connection, 4);
+        insert_valid_table_catalog(&connection);
+
+        let (catalog, layout) = load_or_create_manifest(&mut connection, 4)
+            .unwrap()
+            .into_parts();
+
+        assert_eq!(layout.state(), ShardLayoutState::Adopting);
+        assert_eq!(catalog.logical().logical_databases().len(), 2);
+        assert_eq!(catalog.logical().tables().len(), 5);
+        assert_eq!(
+            identity(&connection),
+            (MANIFEST_APPLICATION_ID, i64::from(V5_SCHEMA_VERSION))
+        );
+        assert_eq!(schema_objects(&connection).unwrap(), v5_objects());
+        assert_eq!(
+            shard_layout_row(&connection).3,
+            ShardLayoutState::Adopting.code()
+        );
+        assert_eq!(quick_check(&connection), "ok");
+    }
+
+    #[test]
+    fn ready_transition_rejects_different_layout_identity_or_state_without_mutation() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let (_, expected) = load_or_create_manifest(&mut connection, 4)
+            .unwrap()
+            .into_parts();
+        let wrong_state = ShardLayout::from_validated_parts(
+            expected.layout_id(),
+            expected.expected_application_id(),
+            expected.metadata_version(),
+            ShardLayoutState::Adopting,
+        );
+        let error = mark_shard_layout_ready(&mut connection, 4, &wrong_state).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+
+        let mut wrong_id = expected.layout_id();
+        wrong_id[0] ^= 0xff;
+        let wrong = ShardLayout::from_validated_parts(
+            wrong_id,
+            expected.expected_application_id(),
+            expected.metadata_version(),
+            expected.state(),
+        );
+
+        let error = mark_shard_layout_ready(&mut connection, 4, &wrong).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        let (_, observed) = load_or_create_manifest(&mut connection, 4)
+            .unwrap()
+            .into_parts();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn fresh_initialization_is_rejected_beside_an_existing_layout() {
+        let mut empty = Connection::open_in_memory().unwrap();
+        let error = load_or_create_manifest_with_fresh_layout(&mut empty, 4, false).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert_eq!(identity(&empty), (0, 0));
+        assert!(schema_objects(&empty).unwrap().is_empty());
+
+        let mut interrupted = Connection::open_in_memory().unwrap();
+        create_empty_legacy_manifest(&interrupted);
+        let error =
+            load_or_create_manifest_with_fresh_layout(&mut interrupted, 4, false).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert_eq!(identity(&interrupted), (0, 0));
+        assert_eq!(schema_objects(&interrupted).unwrap(), legacy_objects());
+    }
+
+    #[test]
+    fn rejects_corrupt_physical_layout_rows() {
+        for mutation in [
+            "DELETE FROM briskdb_shard_layout",
+            "UPDATE briskdb_shard_layout SET layout_id = x'01'",
+            "UPDATE briskdb_shard_layout SET shard_application_id = 7",
+            "UPDATE briskdb_shard_layout SET shard_metadata_version = 2",
+            "UPDATE briskdb_shard_layout SET layout_state = 9",
+            "INSERT INTO briskdb_shard_layout VALUES (2, randomblob(16), 1112691528, 1, 1)",
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            load_or_create(&mut connection, 4).unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            connection.execute_batch(mutation).unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .unwrap();
+
+            let error = load_or_create(&mut connection, 4).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::DataCorruption, "{mutation}");
+        }
     }
 
     #[test]
@@ -2339,12 +2925,20 @@ mod tests {
             let fresh_catalog = load_or_create_catalog(&mut fresh, shard_count).unwrap();
             assert_eq!(fresh_catalog.routing().shard_count(), shard_count);
             assert_generation_one_catalog(&fresh, shard_count);
+            assert_eq!(
+                shard_layout_row(&fresh).3,
+                ShardLayoutState::Creating.code()
+            );
 
             let mut upgraded = Connection::open_in_memory().unwrap();
             create_v2_manifest(&mut upgraded, shard_count);
             let upgraded_catalog = load_or_create_catalog(&mut upgraded, shard_count).unwrap();
             assert_eq!(upgraded_catalog.routing().shard_count(), shard_count);
             assert_generation_one_catalog(&upgraded, shard_count);
+            assert_eq!(
+                shard_layout_row(&upgraded).3,
+                ShardLayoutState::Adopting.code()
+            );
             assert_eq!(fresh_catalog, upgraded_catalog);
             for key in [
                 b"".as_slice(),
@@ -2371,6 +2965,10 @@ mod tests {
                 load_or_create_catalog(&mut version_three, shard_count).unwrap();
             assert_eq!(fresh_catalog, version_three_catalog);
             assert_generation_one_catalog(&version_three, shard_count);
+            assert_eq!(
+                shard_layout_row(&version_three).3,
+                ShardLayoutState::Adopting.code()
+            );
         }
     }
 
@@ -2443,6 +3041,10 @@ mod tests {
             assert_eq!(load_or_create(&mut connection, 4).unwrap(), 4);
             assert_eq!(current_shard_count(&connection), 4);
             assert_generation_one_catalog(&connection, 4);
+            assert_eq!(
+                shard_layout_row(&connection).3,
+                ShardLayoutState::Adopting.code()
+            );
             assert_eq!(quick_check(&connection), "ok");
         }
     }
@@ -2455,6 +3057,10 @@ mod tests {
         assert_eq!(load_or_create(&mut connection, 8).unwrap(), 8);
         assert_eq!(current_shard_count(&connection), 8);
         assert_generation_one_catalog(&connection, 8);
+        assert_eq!(
+            shard_layout_row(&connection).3,
+            ShardLayoutState::Creating.code()
+        );
     }
 
     #[test]
@@ -2709,6 +3315,114 @@ mod tests {
             assert_eq!(load_or_create(&mut connection, 3).unwrap(), 3);
             assert_generation_one_catalog(&connection, 3);
         }
+    }
+
+    #[test]
+    fn physical_layout_migration_failures_roll_back_to_exact_v4_and_retry() {
+        for failing_phase in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_v4_manifest(&mut connection, 4);
+            insert_valid_table_catalog(&connection);
+            let databases_before = logical_databases(&connection);
+            let tables_before = table_metadata_rows(&connection);
+
+            let error = load_or_create_with_hook(&mut connection, 4, |point| {
+                if point.from == V4_SCHEMA_VERSION && point.phase == failing_phase {
+                    Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "injected physical layout migration failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+            assert_eq!(
+                identity(&connection),
+                (MANIFEST_APPLICATION_ID, i64::from(V4_SCHEMA_VERSION))
+            );
+            assert_eq!(schema_objects(&connection).unwrap(), v4_objects());
+            assert_eq!(logical_databases(&connection), databases_before);
+            assert_eq!(table_metadata_rows(&connection), tables_before);
+            assert_eq!(quick_check(&connection), "ok");
+
+            let (_, layout) = load_or_create_manifest(&mut connection, 4)
+                .unwrap()
+                .into_parts();
+            assert_eq!(layout.state(), ShardLayoutState::Adopting);
+        }
+    }
+
+    #[test]
+    fn physical_layout_migration_panics_roll_back_to_exact_v4_and_retry() {
+        for failing_phase in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_v4_manifest(&mut connection, 3);
+
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                let _ = load_or_create_with_hook(&mut connection, 3, |point| {
+                    if point.from == V4_SCHEMA_VERSION && point.phase == failing_phase {
+                        panic!("injected physical layout migration panic");
+                    }
+                    Ok(())
+                });
+            }));
+            assert!(panic.is_err());
+            assert_eq!(
+                identity(&connection),
+                (MANIFEST_APPLICATION_ID, i64::from(V4_SCHEMA_VERSION))
+            );
+            assert_eq!(schema_objects(&connection).unwrap(), v4_objects());
+            assert_eq!(quick_check(&connection), "ok");
+
+            let (_, layout) = load_or_create_manifest(&mut connection, 3)
+                .unwrap()
+                .into_parts();
+            assert_eq!(layout.state(), ShardLayoutState::Adopting);
+        }
+    }
+
+    #[test]
+    fn reconciliation_error_and_panic_leave_provisioning_state_resumable() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let (_, creating) = load_or_create_manifest(&mut connection, 4)
+            .unwrap()
+            .into_parts();
+
+        let error = reconcile_shard_layout(&mut connection, 4, &creating, |locked| {
+            assert_eq!(locked.state(), ShardLayoutState::Creating);
+            Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "injected shard reconciliation failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Internal);
+        assert_eq!(
+            shard_layout_row(&connection).3,
+            ShardLayoutState::Creating.code()
+        );
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = reconcile_shard_layout(&mut connection, 4, &creating, |_| {
+                panic!("injected shard reconciliation panic");
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(
+            shard_layout_row(&connection).3,
+            ShardLayoutState::Creating.code()
+        );
+
+        let ready = reconcile_shard_layout(&mut connection, 4, &creating, |_| Ok(())).unwrap();
+        assert_eq!(ready.state(), ShardLayoutState::Ready);
     }
 
     #[test]
@@ -3002,6 +3716,7 @@ mod tests {
             current_version: V2_SCHEMA_VERSION,
             migrations: OLD_MIGRATIONS,
             initialize_current: create_v2_schema,
+            initialize_interrupted_legacy: migrate_v1_to_v2,
         };
 
         let mut connection = Connection::open_in_memory().unwrap();
@@ -3015,7 +3730,7 @@ mod tests {
     }
 
     #[test]
-    fn version_three_reader_rejects_version_four_without_mutating_it() {
+    fn version_three_reader_rejects_current_manifest_without_mutating_it() {
         const OLD_MIGRATIONS: &[Migration] = &[
             Migration {
                 from: LEGACY_SCHEMA_VERSION,
@@ -3036,6 +3751,7 @@ mod tests {
             current_version: V3_SCHEMA_VERSION,
             migrations: OLD_MIGRATIONS,
             initialize_current: create_v3_schema,
+            initialize_interrupted_legacy: migrate_interrupted_legacy_to_v3,
         };
 
         let mut connection = Connection::open_in_memory().unwrap();
@@ -3048,6 +3764,52 @@ mod tests {
         assert_eq!(schema_objects(&connection).unwrap(), objects);
         assert_eq!(logical_databases(&connection), databases);
         assert_generation_one_catalog(&connection, 4);
+    }
+
+    #[test]
+    fn version_four_reader_rejects_version_five_without_mutating_it() {
+        const OLD_MIGRATIONS: &[Migration] = &[
+            Migration {
+                from: LEGACY_SCHEMA_VERSION,
+                to: V2_SCHEMA_VERSION,
+                name: "typed_manifest_and_downgrade_fence",
+                apply: migrate_v1_to_v2,
+                validate: validate_v2,
+            },
+            Migration {
+                from: V2_SCHEMA_VERSION,
+                to: V3_SCHEMA_VERSION,
+                name: "durable_shard_catalog",
+                apply: migrate_v2_to_v3,
+                validate: validate_v3,
+            },
+            Migration {
+                from: V3_SCHEMA_VERSION,
+                to: V4_SCHEMA_VERSION,
+                name: "logical_database_and_table_catalog",
+                apply: migrate_v3_to_v4,
+                validate: validate_v4,
+            },
+        ];
+        const OLD_PLAN: MigrationPlan<'static> = MigrationPlan {
+            current_version: V4_SCHEMA_VERSION,
+            migrations: OLD_MIGRATIONS,
+            initialize_current: create_v4_schema,
+            initialize_interrupted_legacy: migrate_interrupted_legacy_to_v4,
+        };
+
+        let mut connection = Connection::open_in_memory().unwrap();
+        load_or_create(&mut connection, 4).unwrap();
+        let identity_before = identity(&connection);
+        let objects_before = schema_objects(&connection).unwrap();
+        let layout_before = shard_layout_row(&connection);
+
+        let error = inspect_with_plan(&connection, 4, OLD_PLAN).unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert_eq!(identity(&connection), identity_before);
+        assert_eq!(schema_objects(&connection).unwrap(), objects_before);
+        assert_eq!(shard_layout_row(&connection), layout_before);
     }
 
     #[test]
@@ -3093,7 +3855,7 @@ mod tests {
         for mutation in [
             "DELETE FROM briskdb_metadata",
             "DELETE FROM briskdb_manifest",
-            "INSERT INTO briskdb_metadata VALUES (4)",
+            "INSERT INTO briskdb_metadata VALUES (5)",
             "DELETE FROM briskdb_routing",
             "DELETE FROM briskdb_virtual_buckets WHERE bucket_id = 4095",
             "DELETE FROM briskdb_physical_shards WHERE shard_id = 3",
@@ -3372,6 +4134,16 @@ mod tests {
                 shard_key_column TEXT,
                 shard_key_type INTEGER
              ) STRICT;",
+            "DROP TABLE briskdb_shard_layout;
+             CREATE TABLE briskdb_shard_layout (
+                singleton INTEGER PRIMARY KEY,
+                layout_id BLOB NOT NULL,
+                shard_application_id INTEGER NOT NULL,
+                shard_metadata_version INTEGER NOT NULL,
+                layout_state INTEGER NOT NULL
+             ) STRICT;
+             INSERT INTO briskdb_shard_layout
+             VALUES (1, randomblob(16), 1112691528, 1, 1);",
         ] {
             let mut connection = Connection::open_in_memory().unwrap();
             load_or_create(&mut connection, 4).unwrap();

@@ -90,21 +90,47 @@ records a stable positive ID, owning database, name, and one of sharded,
 global, or catalog placement; only a sharded table also records one `Int64`,
 text, or binary shard-key column.
 
-Each version retains an intentionally incompatible `briskdb_metadata`
-definition and row as a downgrade fence. The v3-to-v4 migration replaces that
-fence, creates the logical tables and initial rows, validates the complete v4
-destination, and stamps version 4 in the same manifest transaction. Failure
-rolls the step back to the exact committed v3 state; a v3 binary rejects a
-committed v4 manifest rather than interpreting it.
+Version 5 adds physical-layout identity and recovery state. The manifest's
+`briskdb_shard_layout` singleton stores one random 16-byte layout ID, the
+expected `BRSH` shard application ID, metadata encoding version 1, and state
+code 1 (`Creating`), 2 (`Adopting`), or 3 (`Ready`). Every current shard has
+the same layout ID in its exact BriskDB-owned metadata row, its cataloged
+physical shard ID, `application_id = BRSH`, and `user_version` equal to the
+cataloged application-schema generation, currently 0. The layout ID catches
+accidental copies, swaps, and cross-layout placement; it is not a secret,
+checksum, or security boundary.
 
-Startup acquires `BEGIN IMMEDIATE` before making any migration decision. Each
-registered numbered step rewrites schema/data, stamps and reads back its target
-identity/version, validates the destination, and commits in its own transaction.
-Concurrent openers therefore serialize and re-evaluate committed state. A
-failed or interrupted step rolls back to the previous complete version and can
-be retried. Persistent WAL configuration and shard creation occur only after a
-compatible current manifest is committed, so rejecting a foreign or future
-manifest does not rewrite its journal mode or touch shard files.
+Each manifest version retains an intentionally incompatible
+`briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4
+migration remains manifest-atomic. The v4-to-v5 step first validates the v4
+source and commits state `Adopting`, fencing older binaries before any shard is
+changed. Fresh initialization commits `Creating` only for an otherwise empty
+layout. Cross-file work then proceeds one shard at a time and a final manifest
+transaction moves to `Ready` only after strict revalidation of the complete
+layout. A failure or panic leaves `Creating` or `Adopting` durable, so the next
+open resumes instead of guessing whether a missing or partly stamped file is
+safe.
+
+Startup acquires `BEGIN IMMEDIATE` before making a manifest migration or layout
+state decision. Numbered manifest-only steps rewrite schema/data, stamp and read
+back their target identity/version, validate the destination, and commit in
+their own transaction. After those steps commit, layout reconciliation acquires
+a new immediate manifest transaction, re-reads and validates the layout state
+under that write lock, and holds the lock through independently durable
+per-shard work and `Ready` publication. Concurrent openers therefore serialize:
+a lagging opener re-reads `Ready` and strictly validates instead of provisioning
+from a stale `Creating` observation. Only a locked, durable `Creating` state
+permits missing canonical shard files to be created and WAL to be enabled.
+
+`Adopting` recognizes only existing legacy shard files with exact zero
+application-ID/user-version headers and an existing WAL mode. It writes current
+identity metadata without changing application tables or rows. `Ready` and all
+runtime connection opens use read-write, no-create, no-follow SQLite flags and
+require the exact path, layout ID, shard ID, application ID, metadata encoding,
+schema generation, and WAL mode. Missing, extra canonical, foreign, non-WAL,
+and wrong-generation files fail closed, as do swapped files and files cloned
+into a wrong slot or layout. WAL and shared-memory sidecars are transient and
+are not required layout members.
 
 This is an internal storage-open concern, is unreachable from client SQL, and
 is atomic only within `manifest.sqlite`. Validation returns routing and logical
@@ -112,23 +138,33 @@ metadata from the same locked transaction as one immutable snapshot that
 `Storage` shares across clones. `Database::catalog()` and `Engine::catalog()`
 expose the logical portion as a read-only `Catalog` with lookup accessors.
 
-The version-4 logical catalog is advisory: there is no catalog mutation API,
-planner integration, or schema enforcement yet. Fresh and upgraded manifests
-contain no table rows, and migration does not inspect, infer, or adopt physical
-tables already present in shard files. Those tables remain reachable through
-the existing explicit-key execute/query and broadcast surfaces. Core routing
-still hashes the exact caller-provided key bytes, derives a versioned virtual
-bucket, and reads the final physical shard from the snapshot without querying
-SQLite. The generation-1 ranges reproduce prior modulo placement for every
-supported initial shard count, including counts that do not divide 4,096.
-Consequently v4 changes no current SQL execution, HTTP behavior, routing result,
-or shard file.
+The logical catalog remains advisory: there is no catalog mutation API,
+planner integration, or schema enforcement yet. Fresh manifests and upgrades
+originating before v4 contain no table rows; a v4-to-v5 upgrade retains every
+validated v4 logical-catalog row. Migration does not inspect, infer, or adopt
+physical tables already present in shard files. Those tables remain reachable
+through the existing explicit-key execute/query and broadcast surfaces. Core
+routing still hashes the exact caller-provided key bytes, derives a versioned
+virtual bucket, and reads the final physical shard from the snapshot without
+querying SQLite. The generation-1 ranges reproduce prior modulo placement for
+every supported initial shard count, including counts that do not divide 4,096.
+Version-5 adoption adds only BriskDB identity metadata to legacy shards and
+preserves their application schema and data. It changes no current SQL planning,
+HTTP shape, routing result, or broadcast ordering.
 
-The catalog does not yet validate shard-file presence, identity, WAL, or the
-cataloged schema generation against shard files, and it is not the future
-cross-shard application-schema migration journal. The exact format, numeric
-codes, downgrade policy, recovery cases, and tests are documented in
-[manifest storage format](STORAGE_FORMAT.md).
+The storage-owned `briskdb_shard_metadata` table is inaccessible through client
+SQL, and creation of new objects in the reserved `briskdb_*` namespace is
+denied by the SQLite authorizer. Client attempts to mutate `application_id`,
+`user_version`, persistent `journal_mode`, `schema_version`, or
+`writable_schema` are also denied. This prevents a pass-through statement from
+invalidating the validated layout. All `ALTER TABLE` statements are currently
+denied because SQLite's authorizer does not expose the destination of a rename;
+allowing the operation would leave a path into the reserved namespace. The
+application-schema generation is still fixed at 0 and there is not
+yet a cross-shard schema migration journal; that later format must explicitly
+authorize any temporary generation mismatch. The exact format, numeric codes,
+downgrade policy, recovery cases, and tests are documented in [manifest storage
+format](STORAGE_FORMAT.md).
 
 ## Session and asynchronous engine boundary
 
@@ -189,15 +225,17 @@ broadcasts from deadlocking each other.
 Pool checkout also establishes a connection-hygiene boundary. SQLite authorizer
 events identify operations that can persist connection-local state, including
 transaction and savepoint control, `PRAGMA`, `ATTACH`/`DETACH`, and temporary
-objects. The operation is allowed under the current one-call SQLite
-pass-through behavior, but that behavior remains uncontracted. Clean read
-handles may cross sessions for ordinary statements. The pool retains the first
-session associated with each physical handle; an ordinary foreign read does not
-relabel that history. Before a routed statement uses such a foreign handle, the
-engine prepares it under a deny-only authorizer probe. The first
-connection-local or write action is rejected before it can run—even for PRAGMAs
-with prepare-time effects—and the real statement is then executed once on a
-fresh handle. This also gives every cross-owner write clean SQLite counter state.
+objects. BriskDB-owned metadata access and storage-control PRAGMA mutations are
+always denied. Other connection-local operations remain allowed under the
+current one-call SQLite pass-through behavior, but that behavior is
+uncontracted. Clean read handles may cross sessions for ordinary statements.
+The pool retains the first session associated with each physical handle; an
+ordinary foreign read does not relabel that history. Before a routed statement
+uses such a foreign handle, the engine prepares it under a deny-only authorizer
+probe. The first connection-local or write action is rejected before it can
+run—even for PRAGMAs with prepare-time effects—and the real statement is then
+executed once on a fresh handle. This also gives every cross-owner write clean
+SQLite counter state.
 The expected probe error is never exposed to the caller. Any other probe error
 also fails closed to a fresh handle. Opening that replacement can surface its own
 storage error; otherwise only the real execution determines the caller-visible
