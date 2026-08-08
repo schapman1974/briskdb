@@ -45,9 +45,12 @@ than claiming to be a drop-in PostgreSQL or MySQL replacement.
 
 ## Current implementation
 
-Only the experimental HTTP network interface is implemented today. There is no
-PostgreSQL or MySQL listener. The public Rust SQL facade can parse an explicitly
-selected SQLite, PostgreSQL, or MySQL dialect, consume that result with
+Only the experimental HTTP network interface can execute network requests
+today. A separately configured PostgreSQL TCP listener now accepts and
+immediately closes streams as a lifecycle scaffold; it implements no
+PostgreSQL wire message. There is no MySQL listener. The public Rust SQL facade
+can parse an explicitly selected SQLite, PostgreSQL, or MySQL dialect, consume
+that result with
 `validate_common_subset(ParsedSql)`, borrow the result with
 `classify_statements(&CommonSql)`, and then opt into
 `normalize_placeholders(CommonSql)`. That step yields source-preserving SQLite
@@ -79,13 +82,14 @@ path; they do not pass through these opt-in SQL layers.
 | HTTP `/v1/execute` | Experimental | One SQLite statement with positional parameters | Required caller-provided `shard_key` |
 | HTTP `/v1/query` | Experimental | One raw SQLite statement prepared transiently by the row-returning path; no session cache | Required caller-provided `shard_key` |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
-| PostgreSQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
+| PostgreSQL wire protocol | TCP lifecycle scaffold; wire protocol planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; placeholder listener accepts then closes without protocol bytes | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
 The parser, subset validator, statement classifier, placeholder normalizer, SQL
 translator, shard-key inference function, engine planner, and prepared
 lifecycle are implemented Rust APIs, not PostgreSQL or MySQL network
-interfaces. They do not change any current HTTP row in this table.
+interfaces. The PostgreSQL socket scaffold does not connect those APIs to the
+network. They do not change any current HTTP row in this table.
 
 Every HTTP operation now calls the same protocol-neutral async engine intended
 for future PostgreSQL and MySQL adapters. Execute and query requests create a
@@ -274,8 +278,9 @@ to choose an error kind.
 
 The same kinds already have defined PostgreSQL SQLSTATE and MySQL error
 number/SQLSTATE mappings, but those are contracts for the planned adapters.
-They do not make either wire-protocol listener available. See the complete
-[error taxonomy and mapping table](ERRORS.md).
+The PostgreSQL TCP placeholder emits no error frame, and no MySQL listener is
+available. See the complete [error taxonomy and mapping table](ERRORS.md) and
+the [PostgreSQL listener lifecycle](POSTGRES_LISTENER.md).
 
 ## SQL surface
 
@@ -592,9 +597,12 @@ boundary are normative in
 
 ## PostgreSQL differences
 
-The PostgreSQL listener will target the frontend/backend wire protocol and a
-deliberately small SQL compatibility surface. PostgreSQL-specific behavior is
-not implemented unless listed as implemented in this document.
+The bound PostgreSQL TCP scaffold will host an adapter targeting the
+frontend/backend wire protocol and a deliberately small SQL compatibility
+surface. It currently accepts and closes without a handshake; PostgreSQL-
+specific behavior is not implemented unless listed as implemented in this
+document. Configuration and lifecycle semantics are normative in the
+[PostgreSQL listener contract](POSTGRES_LISTENER.md).
 
 | Area | PostgreSQL | BriskDB contract |
 | --- | --- | --- |

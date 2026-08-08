@@ -223,7 +223,7 @@ the engine regardless of its eventual wire protocol.
 
 ### 4. PostgreSQL wire-protocol frontend
 
-- [ ] Run a separate configurable listener, initially
+- [x] Run a separate configurable listener, initially
   `--postgres-listen 127.0.0.1:5433`; allow it to be disabled.
 - [ ] Spike the current `pgwire` crate against the core interfaces before
   committing to it; `pgwire` 0.40.5 is the leading candidate as of this roadmap.

@@ -4,7 +4,14 @@ BriskDB classifies failures once, at the protocol-neutral engine boundary. An
 `EngineErrorKind` is stable error identity; protocol adapters translate that
 identity without inspecting an error message. The HTTP adapter uses the mapping
 today. The PostgreSQL and MySQL columns below are contracts for their planned
-adapters, not a claim that either wire-protocol listener is implemented.
+wire adapters. The current PostgreSQL TCP placeholder accepts and closes
+without emitting an error frame, and there is no MySQL listener yet.
+
+Malformed listener configuration is rejected by the binary before server
+startup. Listener bind/accept failures terminate the shared server lifecycle
+with process-level diagnostics after cleanup; they are not `EngineErrorKind`
+values and are not encoded as HTTP or PostgreSQL responses. A placeholder
+PostgreSQL peer receives only a no-byte connection close.
 
 ## Taxonomy and protocol mappings
 

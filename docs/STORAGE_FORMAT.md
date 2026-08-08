@@ -898,6 +898,14 @@ parameterless schema-batch contract: it still digests and retains the caller's
 exact submitted SQL and does not substitute classified, normalized, or
 translated text as migration identity.
 
+Issue #28's optional PostgreSQL socket address and accept/close listener are
+process configuration only. They add no manifest or shard table, header value,
+format version, digest input, routing metadata, schema fingerprint, journal
+record, or recovery step. Listener settings are not persisted. Because engine
+open and its existing recovery precede listener binding, a later bind failure
+does not undo a migration or recovery transaction that already committed; a
+subsequent startup revalidates the same version-7 layout normally.
+
 The checksums are corruption detectors, not authentication. Both use unkeyed
 BLAKE3 and are writable by anyone who can modify the data directory. The
 manifest root covers canonical control-plane values, not raw SQLite pages. The

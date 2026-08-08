@@ -153,6 +153,16 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _engine_router: fn(core::Engine) -> Router = http::router_with_engine;
     let _default_server_entry_point = server::run;
     let _configured_server_entry_point = server::run_with_engine_options;
+    let server_config = server::Config {
+        listen: "127.0.0.1:7654".parse().unwrap(),
+        postgres_listen: Some("127.0.0.1:5433".parse().unwrap()),
+        data_dir: std::path::PathBuf::from("./briskdb-data"),
+        shards: 4,
+    };
+    assert_eq!(
+        server_config.postgres_listen,
+        Some("127.0.0.1:5433".parse().unwrap())
+    );
 
     let result = core::ResultSet::new(
         vec![core::Column::new("value", core::DataType::Int64)],

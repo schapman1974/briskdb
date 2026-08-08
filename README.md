@@ -13,7 +13,11 @@ The [architecture map](docs/ARCHITECTURE.md) defines the crate's module
 boundaries and dependency direction.
 
 The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
-current SQLite pass-through API from planned PostgreSQL and MySQL compatibility.
+current SQLite pass-through API from the PostgreSQL TCP-listener scaffold and
+planned PostgreSQL/MySQL wire compatibility.
+The [PostgreSQL listener contract](docs/POSTGRES_LISTENER.md) defines its
+address configuration, disabled state, startup order, placeholder connection
+behavior, and shared shutdown lifecycle.
 The [SQL parser decision record](docs/SQL_PARSER.md) defines the shared,
 dialect-explicit syntax boundary and its resource and dependency limits.
 The [common SQL subset contract](docs/SQL_SUBSET.md) defines the opt-in,
@@ -37,7 +41,7 @@ statement and portal caches, exact resource limits, metadata refresh, and
 supported physical-target execution boundary shared by future adapters.
 The [error contract](docs/ERRORS.md) defines stable engine error kinds, safe
 HTTP problem details, and the mappings reserved for future PostgreSQL and MySQL
-adapters.
+wire adapters.
 The [request-control contract](docs/REQUEST_CONTROLS.md) defines cancellation,
 deadlines, materialized-result budgets, and graceful shutdown.
 The [manifest storage-format contract](docs/STORAGE_FORMAT.md) defines versioned
@@ -60,6 +64,8 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Request cancellation and deadlines that interrupt SQLite and await cleanup
 - Finite per-query row/logical-byte budgets with no partial results
 - Explicit graceful drain, forced cancellation, and blocking handle cleanup
+- Independently configured HTTP and PostgreSQL TCP listeners; the PostgreSQL
+  listener currently accepts and closes connections pending wire-adapter work
 - Protocol-neutral typed values, ordered columns, positional rows, and results
 - A bounded per-session prepared-statement and immutable bound-portal lifecycle
   with transient shard-0 metadata compilation, bind-time routing snapshots,
@@ -100,8 +106,26 @@ briskdb-data/
 cargo run -- --data-dir ./briskdb-data --shards 4
 ```
 
-The default listener is `127.0.0.1:7654`. Configuration can also be supplied
-with `BRISKDB_LISTEN`, `BRISKDB_DATA_DIR`, and `BRISKDB_SHARDS`.
+The HTTP listener defaults to `127.0.0.1:7654`. The separate PostgreSQL TCP
+listener defaults to `127.0.0.1:5433`. Set either an explicit socket address or
+the exact value `disabled` with `--postgres-listen`; the corresponding
+environment variable is `BRISKDB_POSTGRES_LISTEN`. Command-line input takes
+precedence over the environment, which takes precedence over the default. The
+HTTP address, data directory, and shard count can also be supplied with
+`BRISKDB_LISTEN`, `BRISKDB_DATA_DIR`, and `BRISKDB_SHARDS`.
+
+```bash
+# Keep the existing HTTP service and do not bind the PostgreSQL port.
+cargo run -- --postgres-listen disabled
+
+# The environment has the same value grammar.
+BRISKDB_POSTGRES_LISTEN=disabled cargo run
+```
+
+Issue #28 supplies only the separately managed TCP endpoint. Until the
+PostgreSQL wire adapter lands, every accepted connection is closed immediately
+without reading or writing protocol bytes, and no PostgreSQL driver can execute
+a request through it. See the [listener contract](docs/POSTGRES_LISTENER.md).
 
 Rust embedders can customize pool sizing through the public `EngineOptions`
 type. Existing engine constructors and server startup keep the defaults of four
@@ -118,9 +142,11 @@ data. Configure these with `--max-result-rows` / `BRISKDB_MAX_RESULT_ROWS` and
 shutdown allows 30 seconds before cancelling admitted work and is configured by
 `--shutdown-grace-ms` / `BRISKDB_SHUTDOWN_GRACE_MS`. Ctrl-C and, on Unix,
 SIGTERM stop new admissions, drain or cancel admitted SQLite work, close idle
-handles, and then stop the process. Accepted HTTP connections are tracked;
-connections that outlive the grace window are force-closed and joined before
-the server returns.
+handles, and then stop the process. Core admission closes before both listener
+sockets are dropped. Accepted HTTP connections are tracked; connections
+that outlive the grace window are force-closed and joined before the server
+returns. Placeholder PostgreSQL connections have already been closed at
+accept time and retain no engine work to drain.
 
 Each session defaults to at most 128 prepared statements, 128 bound portals,
 and a 16 MiB ceiling for retained bound values/captured routing bytes and one

@@ -11,12 +11,14 @@ binary (main)
     v
 server ---------> protocol::http
     |                    |
-    +--------+-----------+
-             v
-            core
-           /    \
-          v      v
-      storage    sql
+    |                    v
+    +-----------------> core
+    |                 /    \
+    |                v      v
+    |            storage    sql
+    |
+    +-- PostgreSQL TCP lifecycle
+        (accept/close placeholder; no core request)
 ```
 
 | Module | Responsibility | Must not own |
@@ -26,7 +28,7 @@ server ---------> protocol::http
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
-| `server` | Process configuration, database assembly, listener binding, and tracked Axum HTTP/1 connection lifecycle | SQL parsing or storage implementation details |
+| `server` | Process configuration, database assembly, separate HTTP/PostgreSQL listener binding, tracked Axum HTTP/1 connection lifecycle, and the temporary PostgreSQL accept/close loop | SQL parsing, PostgreSQL wire messages, or storage implementation details |
 
 Implementation dependencies flow one way: adapters call the async `Engine` in
 `core`; the engine coordinates routing, `storage`, and `sql`. An adapter supplies
@@ -79,7 +81,25 @@ already complete. The async engine, session and prepared-object lifecycle,
 bounded per-session caches, bounded per-shard pools, request controls, and
 explicit shutdown lifecycle are now in place. The synchronous `Database` API
 remains available as a Rust compatibility surface; existing engine and server
-entry points retain their signatures and delegate to the controlled defaults.
+function signatures remain in place and delegate to the controlled defaults.
+Issue #28 adds `Config::postgres_listen: Option<SocketAddr>`, so pre-1.0 Rust
+callers constructing `Config` with a struct literal must now choose an enabled
+address or `None`.
+
+## Listener boundary
+
+The HTTP address remains `Config::listen`. The independent
+`Config::postgres_listen` is either a numeric socket address or disabled with
+`None`; the binary maps the exact `disabled` CLI/environment sentinel to that
+option. The process default enables loopback `127.0.0.1:5433`. See the
+[PostgreSQL listener contract](POSTGRES_LISTENER.md) for the full grammar and
+startup order.
+
+Until the subsequent wire-adapter work, the PostgreSQL listener is a server
+lifecycle placeholder: it accepts and immediately drops each stream without
+reading bytes, writing a PostgreSQL frame, opening a session, or calling the
+engine. This keeps binding, concurrent acceptance, startup cleanup, and shared
+shutdown testable without moving protocol behavior into `server`.
 
 ## SQL parser boundary
 
@@ -627,13 +647,16 @@ this explicit asynchronous path. Prepared statement/portal close and terminal
 session close remain available as in-memory cleanup while draining; no
 prepared state is persisted for restart recovery.
 
-The server owns accepted HTTP/1 connections in a tracked task set. It stops
-engine admission before dropping the listener, starts HTTP and core draining
-together, and aborts then joins any connection that exceeds the HTTP grace
-deadline. Signal receivers are installed before readiness is logged. Dropping
-the server future aborts its tracked connection set and synchronously enters
-`Draining`; a surviving embedder-owned `Engine` clone can resume asynchronous
-cleanup with `shutdown()`.
+The server owns accepted HTTP/1 connections in a tracked task set and manages a
+separate optional PostgreSQL socket in the same accept lifecycle. It stops
+engine admission before dropping both listeners, starts HTTP and core draining
+together, and aborts then joins any HTTP connection that exceeds the HTTP grace
+deadline. Placeholder PostgreSQL streams are already closed at accept time and
+therefore own no drain task. Signal receivers are installed only after every
+configured listener binds and before readiness is logged. Dropping the server
+future closes both listeners, aborts its tracked HTTP connection set, and
+synchronously enters `Draining`; a surviving embedder-owned `Engine` clone can
+resume asynchronous cleanup with `shutdown()`.
 
 Real multi-call `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction state, and
 single-shard pinning remain deferred to the PostgreSQL and MySQL transaction
@@ -654,8 +677,9 @@ response type. SQL and storage classify SQLite failures from primary and
 extended result codes plus operation context; they never parse SQLite error
 messages. Protocol-owned tables map each kind to an HTTP status and safe RFC
 9457 problem, a PostgreSQL SQLSTATE, and a MySQL error number/SQLSTATE pair.
-The PostgreSQL and MySQL entries are mapping contracts for future adapters, not
-implemented listeners.
+The PostgreSQL and MySQL entries are mapping contracts for future wire
+adapters. The PostgreSQL TCP placeholder emits no protocol frame and therefore
+does not encode the PostgreSQL mapping yet; no MySQL listener exists yet.
 
 Client responses use fixed, safe text for the error kind. Diagnostic display
 text and source chains stay available internally but are never serialized, so
