@@ -111,9 +111,17 @@ The core contains no HTTP, PostgreSQL, or MySQL response types. Conversely,
 protocol adapters do not inspect SQLite errors. This lets every frontend share
 one error identity while retaining its own response encoding.
 
-Adding the taxonomy changes error reporting only. It does not change the
-manifest schema, shard files, stored values, routing, configuration, or any
-other on-disk format.
+Manifest compatibility uses the same protocol-neutral kinds. A foreign file,
+a manifest newer than the running binary, or a requested shard-count mismatch
+is `FailedPrecondition`; the file is not downgraded. A recognized BriskDB
+manifest whose identity, schema, or invariant rows disagree is
+`DataCorruption`. SQLite lock contention while an opener waits for the manifest
+migration transaction remains retryable `Busy`. These diagnostics originate in
+storage and are never serialized directly by an adapter.
+
+The earlier taxonomy change affected reporting only; the later manifest-format
+migration described above is the storage-layer change. Neither alters shard
+files, stored application values, routing, or wire configuration.
 
 This is a pre-1.0 Rust API migration: public `Database` operations now return
 `EngineResult<T>` instead of `anyhow::Result<T>`. The `?` operator still

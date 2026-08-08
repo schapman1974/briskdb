@@ -1,4 +1,6 @@
-//! SQLite file layout, manifest initialization, and connection configuration.
+//! SQLite file layout, versioned manifest management, and connection configuration.
+
+mod manifest;
 
 pub(crate) mod pool;
 pub(crate) use pool::{ConnectionOwner, ConnectionPools, PooledConnection};
@@ -13,7 +15,7 @@ use std::{
 };
 
 use rusqlite::{
-    Connection, OptionalExtension,
+    Connection,
     hooks::{AuthAction, AuthContext, Authorization},
 };
 
@@ -23,7 +25,6 @@ use crate::{
     sqlite_error,
 };
 
-const SCHEMA_VERSION: &str = "1";
 pub(crate) const CONNECTION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -37,79 +38,25 @@ impl Storage {
         validate_shard_count(requested_shards)?;
 
         let root = root.as_ref().to_path_buf();
-        let shards_dir = root.join("shards");
-        fs::create_dir_all(&shards_dir).map_err(|error| {
-            sqlite_error::storage_io(error, format!("failed to create {}", shards_dir.display()))
+        fs::create_dir_all(&root).map_err(|error| {
+            sqlite_error::storage_io(error, format!("failed to create {}", root.display()))
         })?;
-
+        let shards_dir = root.join("shards");
         let manifest_path = root.join("manifest.sqlite");
         let mut manifest = Connection::open(&manifest_path).map_err(|error| {
             sqlite_error::storage(error)
                 .context(format!("failed to open {}", manifest_path.display()))
         })?;
-        configure_connection(&manifest)?;
-        manifest
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS briskdb_metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );",
-            )
-            .map_err(sqlite_error::storage)?;
+        configure_manifest_connection(&manifest)?;
+        let shard_count = manifest::load_or_create(&mut manifest, requested_shards)?;
+        configure_journal_mode(&manifest)?;
 
-        let existing: Option<String> = manifest
-            .query_row(
-                "SELECT value FROM briskdb_metadata WHERE key = 'shard_count'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sqlite_error::storage)?;
+        fs::create_dir_all(&shards_dir).map_err(|error| {
+            sqlite_error::storage_io(error, format!("failed to create {}", shards_dir.display()))
+        })?;
 
-        if let Some(existing) = existing {
-            let existing: u16 = existing.parse().map_err(|error| {
-                EngineError::from_source(
-                    EngineErrorKind::DataCorruption,
-                    "manifest has an invalid shard count",
-                    error,
-                )
-            })?;
-            if !(2..=64).contains(&existing) {
-                return Err(EngineError::new(
-                    EngineErrorKind::DataCorruption,
-                    format!("manifest shard count {existing} is outside the supported range"),
-                ));
-            }
-            if existing != requested_shards {
-                return Err(EngineError::new(
-                    EngineErrorKind::FailedPrecondition,
-                    format!(
-                        "database was created with {existing} shards, but {requested_shards} were requested"
-                    ),
-                ));
-            }
-        } else {
-            let transaction = manifest.transaction().map_err(sqlite_error::storage)?;
-            transaction
-                .execute(
-                    "INSERT INTO briskdb_metadata (key, value) VALUES ('shard_count', ?1)",
-                    [requested_shards.to_string()],
-                )
-                .map_err(sqlite_error::storage)?;
-            transaction
-                .execute(
-                    "INSERT INTO briskdb_metadata (key, value) VALUES ('schema_version', ?1)",
-                    [SCHEMA_VERSION],
-                )
-                .map_err(sqlite_error::storage)?;
-            transaction.commit().map_err(sqlite_error::storage)?;
-        }
-
-        let storage = Self {
-            root,
-            shard_count: requested_shards,
-        };
-        for shard in 0..requested_shards {
+        let storage = Self { root, shard_count };
+        for shard in 0..shard_count {
             storage.open_shard(shard)?;
         }
         Ok(storage)
@@ -283,10 +230,34 @@ fn configure_connection(connection: &Connection) -> EngineResult<()> {
     configure_connection_pragmas(connection)
 }
 
-fn configure_connection_pragmas(connection: &Connection) -> EngineResult<()> {
+fn configure_manifest_connection(connection: &Connection) -> EngineResult<()> {
     connection
-        .pragma_update(None, "journal_mode", "WAL")
+        .busy_timeout(CONNECTION_BUSY_TIMEOUT)
         .map_err(sqlite_error::storage)?;
+    connection
+        .pragma_update(None, "synchronous", "FULL")
+        .map_err(sqlite_error::storage)?;
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
+fn configure_journal_mode(connection: &Connection) -> EngineResult<()> {
+    let mode = connection
+        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+        .map_err(sqlite_error::storage)?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("SQLite retained journal mode {mode} instead of enabling WAL"),
+        ));
+    }
+    Ok(())
+}
+
+fn configure_connection_pragmas(connection: &Connection) -> EngineResult<()> {
+    configure_journal_mode(connection)?;
     connection
         .pragma_update(None, "synchronous", "FULL")
         .map_err(sqlite_error::storage)?;
@@ -298,7 +269,11 @@ fn configure_connection_pragmas(connection: &Connection) -> EngineResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error as _;
+    use std::{
+        error::Error as _,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use super::*;
 
@@ -316,12 +291,24 @@ mod tests {
         assert_eq!(
             manifest
                 .query_row(
-                    "SELECT value FROM briskdb_metadata WHERE key = 'schema_version'",
+                    "SELECT shard_count FROM briskdb_manifest WHERE singleton = 1",
                     [],
-                    |row| row.get::<_, String>(0),
+                    |row| row.get::<_, u16>(0),
                 )
                 .unwrap(),
-            SCHEMA_VERSION
+            4
+        );
+        assert_eq!(
+            manifest
+                .pragma_query_value(None, "application_id", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            manifest::MANIFEST_APPLICATION_ID
+        );
+        assert_eq!(
+            manifest
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            manifest::CURRENT_SCHEMA_VERSION
         );
     }
 
@@ -356,32 +343,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_manifest_metadata_as_data_corruption() {
+    fn rejects_an_incompatible_current_manifest_definition_as_data_corruption() {
         let temp = tempfile::tempdir().unwrap();
         Storage::open(temp.path(), 4).unwrap();
         let manifest = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
         manifest
-            .execute(
-                "UPDATE briskdb_metadata SET value = 'not-a-number' WHERE key = 'shard_count'",
-                [],
+            .execute_batch(
+                "DROP TABLE briskdb_manifest;
+                 CREATE TABLE briskdb_manifest (
+                    singleton INTEGER PRIMARY KEY,
+                    shard_count TEXT NOT NULL
+                 ) STRICT;
+                 INSERT INTO briskdb_manifest VALUES (1, '4');",
             )
             .unwrap();
 
         let error = Storage::open(temp.path(), 4).unwrap_err();
         assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
-        assert_eq!(error.to_string(), "manifest has an invalid shard count");
-        assert!(error.source().is_some());
+        assert_eq!(
+            error.to_string(),
+            "manifest table briskdb_manifest has an incompatible definition"
+        );
     }
 
     #[test]
     fn rejects_impossible_numeric_manifest_counts_as_data_corruption() {
-        for invalid in ["0", "1", "65", "65535"] {
+        for invalid in [0_i64, 1, 65, 65_535] {
             let temp = tempfile::tempdir().unwrap();
             Storage::open(temp.path(), 4).unwrap();
             let manifest = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
             manifest
+                .pragma_update(None, "ignore_check_constraints", "ON")
+                .unwrap();
+            manifest
                 .execute(
-                    "UPDATE briskdb_metadata SET value = ?1 WHERE key = 'shard_count'",
+                    "UPDATE briskdb_manifest SET shard_count = ?1 WHERE singleton = 1",
                     [invalid],
                 )
                 .unwrap();
@@ -393,6 +389,127 @@ mod tests {
                 format!("manifest shard count {invalid} is outside the supported range")
             );
         }
+    }
+
+    #[test]
+    fn rejects_a_future_manifest_before_enabling_wal_or_creating_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.sqlite");
+        let mut connection = Connection::open(&path).unwrap();
+        manifest::load_or_create(&mut connection, 4).unwrap();
+        connection
+            .pragma_update(None, "user_version", manifest::CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        drop(connection);
+
+        let error = Storage::open(temp.path(), 4).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(!temp.path().join("shards").exists());
+
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            manifest::CURRENT_SCHEMA_VERSION + 1
+        );
+    }
+
+    #[test]
+    fn rejects_a_foreign_manifest_before_enabling_wal_or_creating_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE foreign_data (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        connection
+            .pragma_update(None, "application_id", 0x1234)
+            .unwrap();
+        drop(connection);
+
+        let error = Storage::open(temp.path(), 4).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(!temp.path().join("shards").exists());
+
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "application_id", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0x1234
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name = 'foreign_data'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_storage_openers_complete_one_wal_shard_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(4));
+        let workers = (0..4)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    Storage::open(root, 4)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().unwrap().shard_count(), 4);
+        }
+        for shard in 0..4 {
+            assert!(
+                root.join("shards")
+                    .join(format!("{shard:04}.sqlite"))
+                    .exists()
+            );
+        }
+        let manifest = Connection::open(root.join("manifest.sqlite")).unwrap();
+        assert_eq!(
+            manifest
+                .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        assert_eq!(
+            manifest
+                .query_row("SELECT shard_count FROM briskdb_manifest", [], |row| {
+                    row.get::<_, u16>(0)
+                })
+                .unwrap(),
+            4
+        );
     }
 
     #[test]

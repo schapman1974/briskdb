@@ -58,6 +58,11 @@ access, filesystem-fault behavior, and crash-recovery guarantees will become
 supported only when their roadmap issues add the corresponding automated
 tests.
 
+Opening a data directory can transactionally upgrade `manifest.sqlite`; see the
+[manifest storage-format contract](STORAGE_FORMAT.md). A future or foreign
+manifest is rejected before BriskDB enables WAL for it or opens shard files.
+The application ID is an accidental wrong-file guard, not a security boundary.
+
 When reporting a platform problem, include the BriskDB revision, `rustc -Vv`,
 operating-system and architecture details, filesystem type, mount options, and
 whether the data directory is local or remote.
