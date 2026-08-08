@@ -6,7 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, MAIN_DB, OpenFlags, TransactionBehavior, hooks::AuthAction};
+use rusqlite::{
+    Connection, MAIN_DB, OpenFlags, TransactionBehavior,
+    hooks::{AuthAction, AuthContext, Authorization},
+};
 
 use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
@@ -117,6 +120,67 @@ struct PreflightShard {
     state: PreflightState,
 }
 
+/// Which side of one journaled schema migration a strictly validated shard is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SchemaMigrationShardState {
+    Source,
+    Target,
+}
+
+/// Whether this invocation committed a shard migration or observed an earlier commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SchemaMigrationShardOutcome {
+    Applied,
+    AlreadyApplied,
+}
+
+/// Durable boundaries exposed to storage migration failure-injection tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SchemaMigrationPoint {
+    SqlApplied,
+    GenerationStamped,
+    Committed,
+}
+
+/// Immutable identity and SQL for one shard's step in a journaled migration.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SchemaMigrationShard<'a> {
+    path: &'a Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &'a ShardLayout,
+    sql: &'a str,
+}
+
+impl<'a> SchemaMigrationShard<'a> {
+    pub(super) const fn new(
+        path: &'a Path,
+        shard_id: u16,
+        source_generation: u64,
+        target_generation: u64,
+        layout: &'a ShardLayout,
+        sql: &'a str,
+    ) -> Self {
+        Self {
+            path,
+            shard_id,
+            source_generation,
+            target_generation,
+            layout,
+            sql,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ReservedSchemaObject {
+    object_type: String,
+    name: String,
+    table_name: String,
+    sql: Option<String>,
+}
+
 /// Preflight every expected file before changing any shard, provision only the
 /// eligible states, then perform one strict no-create validation pass.
 pub(super) fn prepare_layout(
@@ -213,6 +277,529 @@ pub(super) fn validate_open_connection(
     require_writable(connection)?;
     validate_exact_shard(connection, path, shard_id, expected_user_version, layout)?;
     configure_connection_pragmas(connection)
+}
+
+/// Strictly validate a dedicated migration connection while accepting only
+/// the journal's exact source or target application-schema generation.
+///
+/// This does not replace the connection's busy handler or progress callback,
+/// allowing the coordinator to install request cancellation before validation
+/// can wait on a real SQLite lock. The connection must be dedicated to the
+/// migration because the apply path temporarily installs its own authorizer.
+pub(super) fn validate_schema_migration_connection(
+    connection: &Connection,
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+) -> EngineResult<SchemaMigrationShardState> {
+    validate_shard_id(shard_id)?;
+    let (source_user_version, target_user_version) =
+        validate_schema_migration_inputs(source_generation, target_generation, layout)?;
+    require_writable(connection)?;
+    let state = classify_schema_migration_shard(
+        connection,
+        path,
+        shard_id,
+        source_user_version,
+        target_user_version,
+        layout,
+    )?;
+    configure_connection_pragmas(connection)?;
+    Ok(state)
+}
+
+/// Validate the exact durable prefix described by a migration journal.
+///
+/// Shards before `next_shard` must be at the target generation, the current
+/// shard may be at source or target to cover a commit-before-acknowledgement
+/// crash, and every later shard must remain at source. `None` means the journal
+/// points one past the final shard and every shard validated at target.
+pub(super) fn validate_schema_migration_prefix(
+    shards_dir: &Path,
+    shard_count: u16,
+    next_shard: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+) -> EngineResult<Option<SchemaMigrationShardState>> {
+    validate_schema_migration_prefix_with(
+        shards_dir,
+        shard_count,
+        next_shard,
+        source_generation,
+        target_generation,
+        layout,
+        |path, shard_id| {
+            let connection = open_required_file(path)?;
+            configure_busy_timeout(&connection)?;
+            validate_schema_migration_connection(
+                &connection,
+                path,
+                shard_id,
+                source_generation,
+                target_generation,
+                layout,
+            )
+        },
+    )
+}
+
+/// Validate a migration prefix while delegating each SQLite connection to a
+/// coordinator-provided, optionally cancellation-aware validator.
+pub(super) fn validate_schema_migration_prefix_with<F>(
+    shards_dir: &Path,
+    shard_count: u16,
+    next_shard: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+    mut validate: F,
+) -> EngineResult<Option<SchemaMigrationShardState>>
+where
+    F: FnMut(&Path, u16) -> EngineResult<SchemaMigrationShardState>,
+{
+    validate_inputs(shard_count, source_generation, layout)?;
+    validate_schema_migration_inputs(source_generation, target_generation, layout)?;
+    if next_shard > shard_count {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("schema migration next shard {next_shard} exceeds shard count {shard_count}"),
+        ));
+    }
+    validate_directory(shards_dir, shard_count, false)?;
+
+    let mut current = None;
+    for shard_id in 0..shard_count {
+        let path = shard_path(shards_dir, shard_id);
+        let state = validate(&path, shard_id)?;
+        let expected = if shard_id < next_shard {
+            SchemaMigrationShardState::Target
+        } else if shard_id > next_shard {
+            SchemaMigrationShardState::Source
+        } else {
+            current = Some(state);
+            continue;
+        };
+        if state != expected {
+            let expected_name = match expected {
+                SchemaMigrationShardState::Source => "source",
+                SchemaMigrationShardState::Target => "target",
+            };
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "schema migration shard {shard_id} is not at its journaled {expected_name} generation"
+                ),
+            ));
+        }
+    }
+    Ok(current)
+}
+
+/// Execute a migration batch in an immediate transaction and always roll it
+/// back. A target-generation shard is strictly validated and skipped.
+pub(super) fn preflight_schema_migration(
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+    sql: &str,
+) -> EngineResult<SchemaMigrationShardState> {
+    let mut connection = open_required_file(path)?;
+    configure_busy_timeout(&connection)?;
+    preflight_schema_migration_on_connection(
+        &mut connection,
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+    )
+}
+
+/// Connection-level preflight for a coordinator-owned, cancellation-aware handle.
+pub(super) fn preflight_schema_migration_on_connection(
+    connection: &mut Connection,
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+    sql: &str,
+) -> EngineResult<SchemaMigrationShardState> {
+    let initial = validate_schema_migration_connection(
+        connection,
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+    )?;
+    if initial == SchemaMigrationShardState::Target {
+        return Ok(initial);
+    }
+
+    let (source_user_version, target_user_version) =
+        validate_schema_migration_inputs(source_generation, target_generation, layout)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let locked = classify_schema_migration_shard(
+        &transaction,
+        path,
+        shard_id,
+        source_user_version,
+        target_user_version,
+        layout,
+    )?;
+    if locked == SchemaMigrationShardState::Target {
+        transaction.rollback().map_err(sqlite_error::storage)?;
+        return validate_schema_migration_connection(
+            connection,
+            path,
+            shard_id,
+            source_generation,
+            target_generation,
+            layout,
+        );
+    }
+
+    let reserved_before = reserved_schema_snapshot(&transaction)?;
+    execute_schema_migration_batch(&transaction, sql)?;
+    ensure_reserved_schema_unchanged(&reserved_before, &transaction)?;
+    ensure_no_foreign_key_violations(&transaction)?;
+    transaction.rollback().map_err(sqlite_error::storage)?;
+
+    let state = validate_schema_migration_connection(
+        connection,
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+    )?;
+    if state != SchemaMigrationShardState::Source {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            format!("schema migration preflight changed shard {shard_id} generation"),
+        ));
+    }
+    Ok(state)
+}
+
+/// Atomically apply one journaled batch and its target generation, or strictly
+/// validate and skip a shard already committed at the target generation.
+pub(super) fn apply_schema_migration(
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+    sql: &str,
+) -> EngineResult<SchemaMigrationShardOutcome> {
+    let mut connection = open_required_file(path)?;
+    configure_busy_timeout(&connection)?;
+    apply_schema_migration_on_connection(
+        &mut connection,
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+    )
+}
+
+/// Connection-level apply for a coordinator-owned, cancellation-aware handle.
+pub(super) fn apply_schema_migration_on_connection(
+    connection: &mut Connection,
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+    sql: &str,
+) -> EngineResult<SchemaMigrationShardOutcome> {
+    let migration = SchemaMigrationShard::new(
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+    );
+    apply_schema_migration_on_connection_inner(connection, migration, |_| Ok(()))
+}
+
+/// Test seam for injecting errors, panics, and process termination at the
+/// shard transaction's persistence boundaries.
+#[cfg(test)]
+pub(super) fn apply_schema_migration_on_connection_with_hook<F>(
+    connection: &mut Connection,
+    migration: SchemaMigrationShard<'_>,
+    hook: F,
+) -> EngineResult<SchemaMigrationShardOutcome>
+where
+    F: FnMut(SchemaMigrationPoint) -> EngineResult<()>,
+{
+    apply_schema_migration_on_connection_inner(connection, migration, hook)
+}
+
+fn apply_schema_migration_on_connection_inner<F>(
+    connection: &mut Connection,
+    migration: SchemaMigrationShard<'_>,
+    mut hook: F,
+) -> EngineResult<SchemaMigrationShardOutcome>
+where
+    F: FnMut(SchemaMigrationPoint) -> EngineResult<()>,
+{
+    let SchemaMigrationShard {
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+    } = migration;
+    let initial = validate_schema_migration_connection(
+        connection,
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+    )?;
+    if initial == SchemaMigrationShardState::Target {
+        return Ok(SchemaMigrationShardOutcome::AlreadyApplied);
+    }
+
+    let (source_user_version, target_user_version) =
+        validate_schema_migration_inputs(source_generation, target_generation, layout)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let locked = classify_schema_migration_shard(
+        &transaction,
+        path,
+        shard_id,
+        source_user_version,
+        target_user_version,
+        layout,
+    )?;
+    if locked == SchemaMigrationShardState::Target {
+        transaction.rollback().map_err(sqlite_error::storage)?;
+        validate_schema_migration_connection(
+            connection,
+            path,
+            shard_id,
+            source_generation,
+            target_generation,
+            layout,
+        )?;
+        return Ok(SchemaMigrationShardOutcome::AlreadyApplied);
+    }
+
+    let reserved_before = reserved_schema_snapshot(&transaction)?;
+    execute_schema_migration_batch(&transaction, sql)?;
+    hook(SchemaMigrationPoint::SqlApplied)?;
+    ensure_reserved_schema_unchanged(&reserved_before, &transaction)?;
+
+    transaction
+        .pragma_update(None, "user_version", target_user_version)
+        .map_err(sqlite_error::storage)?;
+    hook(SchemaMigrationPoint::GenerationStamped)?;
+    if classify_schema_migration_shard(
+        &transaction,
+        path,
+        shard_id,
+        source_user_version,
+        target_user_version,
+        layout,
+    )? != SchemaMigrationShardState::Target
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            format!("schema migration did not stamp shard {shard_id} target generation"),
+        ));
+    }
+
+    transaction.commit().map_err(sqlite_error::storage)?;
+    hook(SchemaMigrationPoint::Committed)?;
+    if validate_schema_migration_connection(
+        connection,
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+    )? != SchemaMigrationShardState::Target
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            format!("committed schema migration did not persist on shard {shard_id}"),
+        ));
+    }
+    Ok(SchemaMigrationShardOutcome::Applied)
+}
+
+fn validate_schema_migration_inputs(
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+) -> EngineResult<(i64, i64)> {
+    let expected_target = source_generation.checked_add(1).ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration source generation cannot be incremented",
+        )
+    })?;
+    if target_generation != expected_target {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration target must immediately follow its source generation",
+        ));
+    }
+    if layout.state() != ShardLayoutState::Ready
+        || layout.expected_application_id() != SHARD_APPLICATION_ID
+        || layout.metadata_version() != SHARD_METADATA_VERSION
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "schema migration requires a ready supported shard layout",
+        ));
+    }
+    Ok((
+        expected_user_version(source_generation)?,
+        expected_user_version(target_generation)?,
+    ))
+}
+
+fn classify_schema_migration_shard(
+    connection: &Connection,
+    path: &Path,
+    shard_id: u16,
+    source_user_version: i64,
+    target_user_version: i64,
+    layout: &ShardLayout,
+) -> EngineResult<SchemaMigrationShardState> {
+    let (application_id, user_version) = read_identity(connection)?;
+    if application_id != layout.expected_application_id() {
+        return if application_id == 0 {
+            Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("schema-migration shard {shard_id} is missing its BriskDB application ID"),
+            ))
+        } else {
+            Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "schema-migration shard {shard_id} has foreign application identifier {application_id:#010x}"
+                ),
+            ))
+        };
+    }
+    let state = if user_version == source_user_version {
+        SchemaMigrationShardState::Source
+    } else if user_version == target_user_version {
+        SchemaMigrationShardState::Target
+    } else if user_version > target_user_version {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "shard {shard_id} schema generation {user_version} is newer than migration target {target_user_version}"
+            ),
+        ));
+    } else {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!(
+                "shard {shard_id} schema generation {user_version} is neither migration source {source_user_version} nor target {target_user_version}"
+            ),
+        ));
+    };
+    require_wal(connection, path)?;
+    validate_metadata(connection, shard_id, layout.layout_id())?;
+    Ok(state)
+}
+
+fn execute_schema_migration_batch(connection: &Connection, sql: &str) -> EngineResult<()> {
+    connection
+        .authorizer(Some(|context: AuthContext<'_>| {
+            if denies_schema_migration_action(context) {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }))
+        .map_err(sqlite_error::storage)?;
+    let executed = connection
+        .execute_batch(sql)
+        .map_err(sqlite_error::statement);
+    let cleared = connection
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .map_err(sqlite_error::storage);
+    cleared?;
+    executed
+}
+
+fn reserved_schema_snapshot(connection: &Connection) -> EngineResult<Vec<ReservedSchemaObject>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, tbl_name, sql
+             FROM sqlite_schema
+             ORDER BY type, name, tbl_name",
+        )
+        .map_err(sqlite_error::storage)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ReservedSchemaObject {
+                object_type: row.get(0)?,
+                name: row.get(1)?,
+                table_name: row.get(2)?,
+                sql: row.get(3)?,
+            })
+        })
+        .map_err(sqlite_error::storage)?;
+    let mut reserved = Vec::new();
+    for row in rows {
+        let row = row.map_err(sqlite_error::storage)?;
+        if is_reserved_name(&row.name) || is_reserved_name(&row.table_name) {
+            reserved.push(row);
+        }
+    }
+    Ok(reserved)
+}
+
+fn ensure_reserved_schema_unchanged(
+    before: &[ReservedSchemaObject],
+    connection: &Connection,
+) -> EngineResult<()> {
+    if reserved_schema_snapshot(connection)? == before {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            EngineErrorKind::PermissionDenied,
+            "schema migration attempted to change the reserved BriskDB namespace",
+        ))
+    }
+}
+
+fn ensure_no_foreign_key_violations(connection: &Connection) -> EngineResult<()> {
+    let mut statement = connection
+        .prepare("PRAGMA main.foreign_key_check")
+        .map_err(sqlite_error::storage)?;
+    let mut rows = statement.query([]).map_err(sqlite_error::storage)?;
+    if rows.next().map_err(sqlite_error::storage)?.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::ForeignKeyViolation,
+            "schema migration preflight found a foreign-key violation",
+        ));
+    }
+    Ok(())
 }
 
 fn preflight_all(
@@ -1040,6 +1627,83 @@ fn shard_read_error(error: rusqlite::Error, diagnostic: &'static str) -> EngineE
     }
 }
 
+/// The migration connection is the only SQL surface allowed to change the
+/// persistent application schema. Keep it inside `main`, prevent the batch
+/// from escaping BriskDB's transaction, and protect every storage-owned name
+/// and control. ALTER destinations are validated by comparing the reserved
+/// schema before and after the batch because SQLite reports only its source.
+fn denies_schema_migration_action(context: AuthContext<'_>) -> bool {
+    if context
+        .database_name
+        .is_some_and(|database| !database.eq_ignore_ascii_case("main"))
+    {
+        return true;
+    }
+
+    match context.action {
+        AuthAction::Unknown { .. }
+        | AuthAction::Transaction { .. }
+        | AuthAction::Savepoint { .. }
+        | AuthAction::Attach { .. }
+        | AuthAction::Detach { .. }
+        | AuthAction::CreateTempIndex { .. }
+        | AuthAction::CreateTempTable { .. }
+        | AuthAction::CreateTempTrigger { .. }
+        | AuthAction::CreateTempView { .. }
+        | AuthAction::DropTempIndex { .. }
+        | AuthAction::DropTempTable { .. }
+        | AuthAction::DropTempTrigger { .. }
+        | AuthAction::DropTempView { .. }
+        | AuthAction::CreateVtable { .. }
+        | AuthAction::DropVtable { .. } => true,
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } => pragma_value.is_some() || matches_persistent_pragma(pragma_name),
+        AuthAction::Insert { table_name } | AuthAction::Delete { table_name } => {
+            is_reserved_name(table_name)
+        }
+        AuthAction::Update {
+            table_name,
+            column_name: _,
+        } => is_reserved_name(table_name),
+        AuthAction::Read {
+            table_name,
+            column_name: _,
+        } => is_metadata_table(table_name),
+        AuthAction::CreateTable { table_name } | AuthAction::DropTable { table_name } => {
+            is_reserved_name(table_name)
+        }
+        AuthAction::CreateIndex {
+            index_name,
+            table_name,
+        }
+        | AuthAction::DropIndex {
+            index_name,
+            table_name,
+        } => is_reserved_name(index_name) || is_reserved_name(table_name),
+        AuthAction::CreateTrigger {
+            trigger_name,
+            table_name,
+        }
+        | AuthAction::DropTrigger {
+            trigger_name,
+            table_name,
+        } => is_reserved_name(trigger_name) || is_reserved_name(table_name),
+        AuthAction::CreateView { view_name } | AuthAction::DropView { view_name } => {
+            is_reserved_name(view_name)
+        }
+        AuthAction::AlterTable {
+            database_name,
+            table_name,
+        } => !database_name.eq_ignore_ascii_case("main") || is_reserved_name(table_name),
+        AuthAction::Reindex { index_name } => is_reserved_name(index_name),
+        AuthAction::Analyze { table_name } => is_reserved_name(table_name),
+        AuthAction::Select | AuthAction::Function { .. } | AuthAction::Recursive => false,
+        _ => false,
+    }
+}
+
 /// Return whether a client statement action would mutate storage-owned shard
 /// identity, durability configuration, or the reserved metadata namespace.
 pub(super) fn denies_client_action(action: AuthAction<'_>) -> bool {
@@ -1048,13 +1712,9 @@ pub(super) fn denies_client_action(action: AuthAction<'_>) -> bool {
             pragma_name,
             pragma_value: Some(_),
         } => matches_persistent_pragma(pragma_name),
-        AuthAction::Insert { table_name }
-        | AuthAction::Delete { table_name }
-        | AuthAction::DropTable { table_name }
-        | AuthAction::DropVtable {
-            table_name,
-            module_name: _,
-        } => is_metadata_table(table_name),
+        AuthAction::Insert { table_name } | AuthAction::Delete { table_name } => {
+            is_metadata_table(table_name)
+        }
         AuthAction::Update {
             table_name,
             column_name: _,
@@ -1063,55 +1723,40 @@ pub(super) fn denies_client_action(action: AuthAction<'_>) -> bool {
             table_name,
             column_name: _,
         } => is_metadata_table(table_name),
-        // SQLite's authorizer reports the source table for ALTER TABLE but
-        // does not expose a RENAME TO destination. Deny the whole operation
-        // so a client cannot move an application table into the reserved
-        // namespace without the authorizer seeing the new name.
-        AuthAction::AlterTable {
-            database_name: _,
-            table_name: _,
-        } => true,
-        AuthAction::CreateTable { table_name }
-        | AuthAction::CreateTempTable { table_name }
-        | AuthAction::CreateVtable {
-            table_name,
-            module_name: _,
-        } => is_reserved_name(table_name),
-        AuthAction::CreateIndex {
-            index_name,
-            table_name,
-        }
-        | AuthAction::CreateTempIndex {
+        // Every persistent application-schema change must go through the
+        // journaled migration connection. Temp objects remain connection-local
+        // and are retired by the pool's hygiene boundary.
+        AuthAction::AlterTable { .. }
+        | AuthAction::CreateTable { .. }
+        | AuthAction::CreateIndex { .. }
+        | AuthAction::CreateTrigger { .. }
+        | AuthAction::CreateView { .. }
+        | AuthAction::CreateVtable { .. }
+        | AuthAction::DropTable { .. }
+        | AuthAction::DropIndex { .. }
+        | AuthAction::DropTrigger { .. }
+        | AuthAction::DropView { .. }
+        | AuthAction::DropVtable { .. } => true,
+        AuthAction::CreateTempTable { table_name } => is_reserved_name(table_name),
+        AuthAction::CreateTempIndex {
             index_name,
             table_name,
         } => is_reserved_name(index_name) || is_metadata_table(table_name),
-        AuthAction::CreateTrigger {
-            trigger_name,
-            table_name,
-        }
-        | AuthAction::CreateTempTrigger {
+        AuthAction::CreateTempTrigger {
             trigger_name,
             table_name,
         } => is_reserved_name(trigger_name) || is_metadata_table(table_name),
-        AuthAction::CreateView { view_name } | AuthAction::CreateTempView { view_name } => {
-            is_reserved_name(view_name)
-        }
-        AuthAction::DropIndex {
-            index_name,
-            table_name,
-        }
-        | AuthAction::DropTempIndex {
+        AuthAction::CreateTempView { view_name } => is_reserved_name(view_name),
+        AuthAction::DropTempIndex {
             index_name,
             table_name,
         } => is_reserved_name(index_name) || is_metadata_table(table_name),
-        AuthAction::DropTrigger {
-            trigger_name,
-            table_name,
-        }
-        | AuthAction::DropTempTrigger {
+        AuthAction::DropTempTrigger {
             trigger_name,
             table_name,
         } => is_reserved_name(trigger_name) || is_metadata_table(table_name),
+        AuthAction::DropTempTable { table_name } => is_reserved_name(table_name),
+        AuthAction::DropTempView { view_name } => is_reserved_name(view_name),
         AuthAction::Reindex { index_name } => is_reserved_name(index_name),
         AuthAction::Analyze { table_name } => is_metadata_table(table_name),
         _ => false,
@@ -1135,15 +1780,18 @@ fn is_metadata_table(name: &str) -> bool {
 }
 
 fn is_reserved_name(name: &str) -> bool {
-    name.as_bytes()
-        .get(.."briskdb_".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"briskdb_"))
+    name.eq_ignore_ascii_case("briskdb")
+        || name
+            .as_bytes()
+            .get(.."briskdb_".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"briskdb_"))
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
+        process::Command,
         sync::Arc,
         thread,
     };
@@ -1153,6 +1801,9 @@ mod tests {
     use super::*;
 
     const LAYOUT_ID: [u8; 16] = *b"brisk-layout-001";
+    const SHARD_CRASH_SQL: &str = "\
+        CREATE TABLE shard_crash_marker (id INTEGER PRIMARY KEY, value TEXT NOT NULL);\
+        INSERT INTO shard_crash_marker (id, value) VALUES (1, 'persisted');";
 
     fn layout(state: ShardLayoutState) -> ShardLayout {
         ShardLayout::from_validated_parts(
@@ -1179,6 +1830,24 @@ mod tests {
     fn has_metadata(path: &Path) -> bool {
         let connection = Connection::open(path).unwrap();
         has_metadata_object(&connection).unwrap()
+    }
+
+    fn create_ready_layout(shard_count: u16) -> (tempfile::TempDir, PathBuf, ShardLayout) {
+        let temp = tempfile::tempdir().unwrap();
+        let shards = temp.path().join("shards");
+        prepare_layout(&shards, shard_count, 0, &layout(ShardLayoutState::Creating)).unwrap();
+        (temp, shards, layout(ShardLayoutState::Ready))
+    }
+
+    fn schema_object_exists(path: &Path, name: &str) -> bool {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = ?1)",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -1582,6 +2251,495 @@ mod tests {
     }
 
     #[test]
+    fn migration_preflight_rolls_back_and_apply_commits_sql_with_generation_once() {
+        let (_temp, shards, ready) = create_ready_layout(2);
+        let path = shard_path(&shards, 0);
+        let sql = "CREATE TABLE migrated_widgets (
+                       id INTEGER PRIMARY KEY,
+                       value TEXT NOT NULL
+                   );
+                   INSERT INTO migrated_widgets (id, value) VALUES (1, 'once');";
+
+        assert_eq!(
+            preflight_schema_migration(&path, 0, 0, 1, &ready, sql).unwrap(),
+            SchemaMigrationShardState::Source
+        );
+        assert_eq!(identity(&path), (SHARD_APPLICATION_ID, 0));
+        assert!(!schema_object_exists(&path, "migrated_widgets"));
+
+        assert_eq!(
+            apply_schema_migration(&path, 0, 0, 1, &ready, sql).unwrap(),
+            SchemaMigrationShardOutcome::Applied
+        );
+        assert_eq!(identity(&path), (SHARD_APPLICATION_ID, 1));
+        assert_eq!(
+            Connection::open(&path)
+                .unwrap()
+                .query_row("SELECT value FROM migrated_widgets", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "once"
+        );
+
+        // The original SQL is intentionally not idempotent. A retry must
+        // recognize the target generation and skip it rather than execute it.
+        assert_eq!(
+            preflight_schema_migration(&path, 0, 0, 1, &ready, sql).unwrap(),
+            SchemaMigrationShardState::Target
+        );
+        assert_eq!(
+            apply_schema_migration(&path, 0, 0, 1, &ready, sql).unwrap(),
+            SchemaMigrationShardOutcome::AlreadyApplied
+        );
+        assert_eq!(
+            Connection::open(&path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM migrated_widgets", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        open_existing(&path, 0, 1, &ready).unwrap();
+    }
+
+    #[test]
+    fn migration_batch_failure_rolls_back_earlier_statements_and_generation() {
+        for preflight_only in [true, false] {
+            let (_temp, shards, ready) = create_ready_layout(2);
+            let path = shard_path(&shards, 0);
+            let sql = "CREATE TABLE must_rollback (id INTEGER);
+                       INSERT INTO missing_table VALUES (1);";
+            let error = if preflight_only {
+                preflight_schema_migration(&path, 0, 0, 1, &ready, sql).unwrap_err()
+            } else {
+                apply_schema_migration(&path, 0, 0, 1, &ready, sql).unwrap_err()
+            };
+            assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+            assert_eq!(identity(&path), (SHARD_APPLICATION_ID, 0));
+            assert!(!schema_object_exists(&path, "must_rollback"));
+            open_existing(&path, 0, 0, &ready).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_allows_main_ddl_dml_and_alter_without_touching_reserved_schema() {
+        let (_temp, shards, ready) = create_ready_layout(2);
+        let path = shard_path(&shards, 0);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE widgets (
+                     id INTEGER PRIMARY KEY,
+                     value TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        let sql = "ALTER TABLE widgets ADD COLUMN note TEXT;
+                   INSERT INTO widgets (id, value, note) VALUES (1, 'first', 'created');
+                   UPDATE widgets SET value = upper(value) WHERE id = 1;
+                   CREATE INDEX widgets_value_idx ON widgets (value);
+                   CREATE VIEW widget_notes AS SELECT id, note FROM widgets;
+                   CREATE TRIGGER widgets_note_default
+                   AFTER INSERT ON widgets WHEN NEW.note IS NULL
+                   BEGIN
+                       UPDATE widgets SET note = 'default' WHERE id = NEW.id;
+                   END;";
+
+        assert_eq!(
+            apply_schema_migration(&path, 0, 0, 1, &ready, sql).unwrap(),
+            SchemaMigrationShardOutcome::Applied
+        );
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT value, note FROM widgets", [], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap(),
+            ("FIRST".to_owned(), "created".to_owned())
+        );
+        validate_metadata(&connection, 0, LAYOUT_ID).unwrap();
+    }
+
+    #[test]
+    fn migration_authorizer_denies_escape_and_reserved_surfaces() {
+        let denied = [
+            "SAVEPOINT escaped",
+            "ATTACH DATABASE ':memory:' AS auxiliary",
+            "CREATE TEMP TABLE temporary_escape (id INTEGER)",
+            "CREATE VIRTUAL TABLE virtual_escape USING fts5(value)",
+            "PRAGMA user_version = 7",
+            "CREATE TABLE briskdb (id INTEGER)",
+            "CREATE TABLE BRISKDB (id INTEGER)",
+            "CREATE TABLE briskdb_private (id INTEGER)",
+            "SELECT * FROM briskdb_shard_metadata",
+        ];
+        for sql in denied {
+            let (_temp, shards, ready) = create_ready_layout(2);
+            let path = shard_path(&shards, 0);
+            let error = preflight_schema_migration(&path, 0, 0, 1, &ready, sql).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::PermissionDenied, "{sql}");
+            assert_eq!(identity(&path), (SHARD_APPLICATION_ID, 0));
+            validate_metadata(&Connection::open(&path).unwrap(), 0, LAYOUT_ID).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_postcheck_catches_an_alter_destination_in_reserved_namespace() {
+        let (_temp, shards, ready) = create_ready_layout(2);
+        let path = shard_path(&shards, 0);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE widgets (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        for destination in ["briskdb", "BRISKDB", "briskdb_hidden"] {
+            let sql = format!("ALTER TABLE widgets RENAME TO {destination}");
+            let error = preflight_schema_migration(&path, 0, 0, 1, &ready, &sql).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::PermissionDenied);
+            assert!(schema_object_exists(&path, "widgets"));
+            assert!(!schema_object_exists(&path, destination));
+            assert_eq!(identity(&path), (SHARD_APPLICATION_ID, 0));
+        }
+    }
+
+    #[test]
+    fn migration_error_hooks_prove_every_transaction_persistence_boundary() {
+        for point in [
+            SchemaMigrationPoint::SqlApplied,
+            SchemaMigrationPoint::GenerationStamped,
+            SchemaMigrationPoint::Committed,
+        ] {
+            let (_temp, shards, ready) = create_ready_layout(2);
+            let path = shard_path(&shards, 0);
+            let mut connection = open_required_file(&path).unwrap();
+            configure_busy_timeout(&connection).unwrap();
+            let error = apply_schema_migration_on_connection_with_hook(
+                &mut connection,
+                SchemaMigrationShard::new(
+                    &path,
+                    0,
+                    0,
+                    1,
+                    &ready,
+                    "CREATE TABLE error_boundary (id INTEGER)",
+                ),
+                |seen| {
+                    if seen == point {
+                        Err(EngineError::new(
+                            EngineErrorKind::Internal,
+                            "injected migration boundary error",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+            drop(connection);
+
+            let committed = point == SchemaMigrationPoint::Committed;
+            assert_eq!(
+                identity(&path),
+                (SHARD_APPLICATION_ID, i64::from(committed))
+            );
+            assert_eq!(schema_object_exists(&path, "error_boundary"), committed);
+            assert_eq!(
+                apply_schema_migration(
+                    &path,
+                    0,
+                    0,
+                    1,
+                    &ready,
+                    "CREATE TABLE error_boundary (id INTEGER)",
+                )
+                .unwrap(),
+                if committed {
+                    SchemaMigrationShardOutcome::AlreadyApplied
+                } else {
+                    SchemaMigrationShardOutcome::Applied
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn migration_panics_prove_every_transaction_persistence_boundary() {
+        for point in [
+            SchemaMigrationPoint::SqlApplied,
+            SchemaMigrationPoint::GenerationStamped,
+            SchemaMigrationPoint::Committed,
+        ] {
+            let (_temp, shards, ready) = create_ready_layout(2);
+            let path = shard_path(&shards, 0);
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                let mut connection = open_required_file(&path).unwrap();
+                configure_busy_timeout(&connection).unwrap();
+                let _ = apply_schema_migration_on_connection_with_hook(
+                    &mut connection,
+                    SchemaMigrationShard::new(
+                        &path,
+                        0,
+                        0,
+                        1,
+                        &ready,
+                        "CREATE TABLE panic_boundary (id INTEGER)",
+                    ),
+                    |seen| {
+                        if seen == point {
+                            panic!("injected migration boundary panic");
+                        }
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(panic.is_err());
+
+            let committed = point == SchemaMigrationPoint::Committed;
+            assert_eq!(
+                identity(&path),
+                (SHARD_APPLICATION_ID, i64::from(committed))
+            );
+            assert_eq!(schema_object_exists(&path, "panic_boundary"), committed);
+            assert_eq!(
+                apply_schema_migration(
+                    &path,
+                    0,
+                    0,
+                    1,
+                    &ready,
+                    "CREATE TABLE panic_boundary (id INTEGER)",
+                )
+                .unwrap(),
+                if committed {
+                    SchemaMigrationShardOutcome::AlreadyApplied
+                } else {
+                    SchemaMigrationShardOutcome::Applied
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn schema_migration_shard_crash_child() {
+        let Ok(path) = std::env::var("BRISKDB_SHARD_CRASH_PATH") else {
+            return;
+        };
+        let crash_point = std::env::var("BRISKDB_SHARD_CRASH_POINT").unwrap();
+        let ready = layout(ShardLayoutState::Ready);
+        let mut connection = open_required_file(Path::new(&path)).unwrap();
+        configure_busy_timeout(&connection).unwrap();
+        let result = apply_schema_migration_on_connection_with_hook(
+            &mut connection,
+            SchemaMigrationShard::new(Path::new(&path), 0, 0, 1, &ready, SHARD_CRASH_SQL),
+            |point| {
+                let point_name = match point {
+                    SchemaMigrationPoint::SqlApplied => "sql-applied",
+                    SchemaMigrationPoint::GenerationStamped => "generation-stamped",
+                    SchemaMigrationPoint::Committed => "committed",
+                };
+                if crash_point == point_name {
+                    std::process::abort();
+                }
+                Ok(())
+            },
+        );
+        panic!("child did not reach requested crash point {crash_point}: {result:?}");
+    }
+
+    #[test]
+    fn real_process_abort_before_shard_commit_rolls_back_sql_and_generation() {
+        for crash_point in ["sql-applied", "generation-stamped"] {
+            let (_temp, shards, ready) = create_ready_layout(2);
+            let path = shard_path(&shards, 0);
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("storage::shard::tests::schema_migration_shard_crash_child")
+                .arg("--nocapture")
+                .env("BRISKDB_SHARD_CRASH_PATH", &path)
+                .env("BRISKDB_SHARD_CRASH_POINT", crash_point)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "child did not abort at {crash_point}");
+
+            assert_eq!(identity(&path), (SHARD_APPLICATION_ID, 0));
+            assert!(!schema_object_exists(&path, "shard_crash_marker"));
+            assert_eq!(
+                apply_schema_migration(&path, 0, 0, 1, &ready, SHARD_CRASH_SQL).unwrap(),
+                SchemaMigrationShardOutcome::Applied
+            );
+            assert_eq!(identity(&path), (SHARD_APPLICATION_ID, 1));
+            assert!(schema_object_exists(&path, "shard_crash_marker"));
+            assert_eq!(
+                Connection::open(&path)
+                    .unwrap()
+                    .query_row(
+                        "SELECT value FROM shard_crash_marker WHERE id = 1",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "persisted"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_prefix_allows_only_the_single_commit_before_acknowledgement_slot() {
+        let (_temp, shards, ready) = create_ready_layout(4);
+        let sql = "CREATE TABLE prefix_marker (id INTEGER)";
+        assert_eq!(
+            validate_schema_migration_prefix(&shards, 4, 0, 0, 1, &ready).unwrap(),
+            Some(SchemaMigrationShardState::Source)
+        );
+
+        apply_schema_migration(&shard_path(&shards, 0), 0, 0, 1, &ready, sql).unwrap();
+        assert_eq!(
+            validate_schema_migration_prefix(&shards, 4, 0, 0, 1, &ready).unwrap(),
+            Some(SchemaMigrationShardState::Target)
+        );
+        assert_eq!(
+            validate_schema_migration_prefix(&shards, 4, 1, 0, 1, &ready).unwrap(),
+            Some(SchemaMigrationShardState::Source)
+        );
+
+        apply_schema_migration(&shard_path(&shards, 2), 2, 0, 1, &ready, sql).unwrap();
+        assert_eq!(
+            validate_schema_migration_prefix(&shards, 4, 1, 0, 1, &ready)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+
+        let (_temp, shards, ready) = create_ready_layout(2);
+        for shard_id in 0..2 {
+            apply_schema_migration(&shard_path(&shards, shard_id), shard_id, 0, 1, &ready, sql)
+                .unwrap();
+        }
+        assert_eq!(
+            validate_schema_migration_prefix(&shards, 2, 2, 0, 1, &ready).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn migration_prefix_regression_is_corruption_and_future_generation_is_newer() {
+        let (_temp, shards, ready) = create_ready_layout(2);
+        let first = shard_path(&shards, 0);
+        apply_schema_migration(
+            &first,
+            0,
+            0,
+            1,
+            &ready,
+            "CREATE TABLE regression_marker (id INTEGER)",
+        )
+        .unwrap();
+        Connection::open(&first)
+            .unwrap()
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
+        assert_eq!(
+            validate_schema_migration_prefix(&shards, 2, 1, 0, 1, &ready)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+
+        Connection::open(&first)
+            .unwrap()
+            .pragma_update(None, "user_version", 2)
+            .unwrap();
+        assert_eq!(
+            validate_schema_migration_prefix(&shards, 2, 0, 0, 1, &ready)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn migration_validation_rejects_nonadjacent_overflow_and_nonready_inputs() {
+        let (_temp, shards, ready) = create_ready_layout(2);
+        let path = shard_path(&shards, 0);
+        for (source, target, layout, expected) in [
+            (0, 2, ready, EngineErrorKind::FailedPrecondition),
+            (u64::MAX, 0, ready, EngineErrorKind::FailedPrecondition),
+            (
+                0,
+                1,
+                layout(ShardLayoutState::Adopting),
+                EngineErrorKind::DataCorruption,
+            ),
+        ] {
+            assert_eq!(
+                validate_schema_migration_connection(
+                    &Connection::open(&path).unwrap(),
+                    &path,
+                    0,
+                    source,
+                    target,
+                    &layout,
+                )
+                .unwrap_err()
+                .kind(),
+                expected
+            );
+        }
+        assert_eq!(
+            validate_schema_migration_connection(
+                &Connection::open(&path).unwrap(),
+                &path,
+                0,
+                i32::MAX as u64,
+                i32::MAX as u64 + 1,
+                &ready,
+            )
+            .unwrap_err()
+            .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn connection_level_migration_keeps_the_callers_progress_handler() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_temp, shards, ready) = create_ready_layout(2);
+        let path = shard_path(&shards, 0);
+        let mut connection = open_required_file(&path).unwrap();
+        configure_busy_timeout(&connection).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let callback_cancelled = Arc::clone(&cancelled);
+        connection
+            .progress_handler(1, Some(move || callback_cancelled.load(Ordering::Relaxed)))
+            .unwrap();
+        assert_eq!(
+            validate_schema_migration_connection(&connection, &path, 0, 0, 1, &ready).unwrap(),
+            SchemaMigrationShardState::Source
+        );
+
+        cancelled.store(true, Ordering::Relaxed);
+        let error = apply_schema_migration_on_connection(
+            &mut connection,
+            &path,
+            0,
+            0,
+            1,
+            &ready,
+            "CREATE TABLE cancellation_marker (id INTEGER)",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        drop(connection);
+        assert_eq!(identity(&path), (SHARD_APPLICATION_ID, 0));
+        assert!(!schema_object_exists(&path, "cancellation_marker"));
+    }
+
+    #[test]
     fn strict_existing_opens_are_deterministic_in_parallel() {
         let temp = tempfile::tempdir().unwrap();
         let shards = temp.path().join("shards");
@@ -1609,7 +2767,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_client_actions_are_exact_and_application_reads_remain_allowed() {
+    fn client_authorizer_denies_every_persistent_ddl_and_allows_application_dml() {
         for pragma in [
             "application_id",
             "USER_VERSION",
@@ -1639,6 +2797,39 @@ mod tests {
         assert!(denies_client_action(AuthAction::CreateTable {
             table_name: "briskdb_future",
         }));
+        assert!(denies_client_action(AuthAction::CreateTable {
+            table_name: "widgets",
+        }));
+        assert!(denies_client_action(AuthAction::CreateIndex {
+            index_name: "widgets_idx",
+            table_name: "widgets",
+        }));
+        assert!(denies_client_action(AuthAction::CreateTrigger {
+            trigger_name: "widgets_trigger",
+            table_name: "widgets",
+        }));
+        assert!(denies_client_action(AuthAction::CreateView {
+            view_name: "widget_view",
+        }));
+        assert!(denies_client_action(AuthAction::CreateVtable {
+            table_name: "widget_search",
+            module_name: "fts5",
+        }));
+        assert!(denies_client_action(AuthAction::DropIndex {
+            index_name: "widgets_idx",
+            table_name: "widgets",
+        }));
+        assert!(denies_client_action(AuthAction::DropTrigger {
+            trigger_name: "widgets_trigger",
+            table_name: "widgets",
+        }));
+        assert!(denies_client_action(AuthAction::DropView {
+            view_name: "widget_view",
+        }));
+        assert!(denies_client_action(AuthAction::DropVtable {
+            table_name: "widget_search",
+            module_name: "fts5",
+        }));
         assert!(denies_client_action(AuthAction::AlterTable {
             database_name: "main",
             table_name: "widgets",
@@ -1651,8 +2842,120 @@ mod tests {
             table_name: "widgets",
             column_name: "value",
         }));
+        assert!(!denies_client_action(AuthAction::Insert {
+            table_name: "widgets",
+        }));
+        assert!(!denies_client_action(AuthAction::Update {
+            table_name: "widgets",
+            column_name: "value",
+        }));
+        assert!(!denies_client_action(AuthAction::Delete {
+            table_name: "widgets",
+        }));
+        assert!(!denies_client_action(AuthAction::CreateTempTable {
+            table_name: "temporary_widgets",
+        }));
         assert!(!denies_client_action(AuthAction::Transaction {
             operation: TransactionOperation::Begin,
         }));
+    }
+
+    #[test]
+    fn migration_authorizer_action_matrix_is_fail_closed() {
+        let context = |action, database_name| AuthContext {
+            action,
+            database_name,
+            accessor: None,
+        };
+        assert!(!denies_schema_migration_action(context(
+            AuthAction::CreateTable {
+                table_name: "widgets",
+            },
+            Some("main"),
+        )));
+        assert!(!denies_schema_migration_action(context(
+            AuthAction::AlterTable {
+                database_name: "main",
+                table_name: "widgets",
+            },
+            Some("main"),
+        )));
+        assert!(!denies_schema_migration_action(context(
+            AuthAction::Insert {
+                table_name: "widgets",
+            },
+            Some("main"),
+        )));
+        for table_name in ["briskdb", "BRISKDB", "briskdb_private"] {
+            assert!(denies_schema_migration_action(context(
+                AuthAction::CreateTable { table_name },
+                Some("main"),
+            )));
+        }
+        assert!(denies_schema_migration_action(context(
+            AuthAction::Read {
+                table_name: SHARD_METADATA_TABLE,
+                column_name: "shard_id",
+            },
+            Some("main"),
+        )));
+        assert!(denies_schema_migration_action(context(
+            AuthAction::Pragma {
+                pragma_name: "user_version",
+                pragma_value: None,
+            },
+            None,
+        )));
+        assert!(denies_schema_migration_action(context(
+            AuthAction::Pragma {
+                pragma_name: "cache_size",
+                pragma_value: Some("20"),
+            },
+            None,
+        )));
+        assert!(denies_schema_migration_action(context(
+            AuthAction::Transaction {
+                operation: TransactionOperation::Begin,
+            },
+            None,
+        )));
+        assert!(denies_schema_migration_action(context(
+            AuthAction::Savepoint {
+                operation: TransactionOperation::Begin,
+                savepoint_name: "escaped",
+            },
+            None,
+        )));
+        assert!(denies_schema_migration_action(context(
+            AuthAction::Attach {
+                filename: "other.sqlite",
+            },
+            None,
+        )));
+        assert!(denies_schema_migration_action(context(
+            AuthAction::CreateTempTable {
+                table_name: "temporary_widgets",
+            },
+            Some("temp"),
+        )));
+        assert!(denies_schema_migration_action(context(
+            AuthAction::CreateVtable {
+                table_name: "widget_search",
+                module_name: "fts5",
+            },
+            Some("main"),
+        )));
+        assert!(denies_schema_migration_action(context(
+            AuthAction::Select,
+            Some("auxiliary"),
+        )));
+        assert!(denies_schema_migration_action(context(
+            AuthAction::Unknown {
+                code: -1,
+                arg1: None,
+                arg2: None,
+            },
+            None,
+        )));
     }
 }

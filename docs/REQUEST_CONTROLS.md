@@ -7,9 +7,10 @@ therefore share the same resource and cleanup semantics.
 ## Per-request context
 
 The existing `Engine::execute`, `query`, `broadcast`, and `status` methods keep
-their signatures and use a default `RequestContext`. Frontends that have their
-own cancellation or deadline source can call the corresponding
-`*_with_context` method:
+their signatures and use a default `RequestContext`. `broadcast` now means a
+journaled application-schema migration. Frontends that have their own
+cancellation or deadline source can call the corresponding `*_with_context`
+method:
 
 ```rust
 use std::time::Duration;
@@ -85,10 +86,40 @@ a blob expands bytes into JSON integers.
 
 The query path accepts only SQLite statements reported as read-only. This
 prevents an early result-budget failure from accompanying a partially consumed
-DML `RETURNING` statement. Execute and broadcast do not materialize a
+DML `RETURNING` statement. Execute and schema migration do not materialize a
 `ResultSet` and are unaffected by query result budgets. A future scatter/gather
 implementation must apply one budget to the combined result, not a fresh budget
 for every shard.
+
+## Schema-migration controls
+
+A schema-migration request first acquires the exclusive schema gate and waits
+for all previously admitted ordinary work to drain. New ordinary operations and
+a second migration coordinator receive retryable `Busy` while that request is
+preflighting or applying. The migration then uses fresh connections with the
+same sticky cancellation token, deadline, cancellable busy handler, SQLite
+progress callback, and exact-handle interrupt behavior as ordinary work.
+
+Before the durable journal is created, cancellation or deadline expiration
+rolls back the current preflight transaction, leaves every shard at the source
+generation, and returns the gate to `Ready`. After journal creation, an
+interrupted shard transaction rolls back but already committed shards remain as
+an ascending prefix; the gate becomes `Pending` and rejects ordinary work with
+non-retryable `FailedPrecondition`. Submitting byte-identical SQL or restarting
+BriskDB validates and resumes that prefix. A shard commit can win a close
+cancellation race; recovery recognizes the one committed-but-not-yet-recorded
+prefix boundary and does not apply its SQL twice.
+
+Request cancellation is checked before each manifest commit begins. Once
+SQLite has attempted `COMMIT`, a cleanup or I/O error can make the outcome
+ambiguous; BriskDB conservatively leaves the gate `Pending` so startup or an
+exact retry can validate the durable journal before ordinary work resumes.
+
+Dropping the migration future follows the same cleanup path. Its lifecycle and
+worker lease remain live until SQLite cleanup finishes, and the gate publishes
+`Ready` or restores `Pending` according to whether a durable journal exists.
+The exact SQL is retained in that journal, so callers must not embed secrets or
+other sensitive literals.
 
 ## Graceful shutdown
 
@@ -118,6 +149,7 @@ supported Unix hosts. It transitions the engine to `Draining` before dropping
 the listener and signaling each tracked HTTP/1 connection. HTTP draining and
 core shutdown start together. A connection still active at the HTTP grace
 deadline is aborted and joined before server shutdown returns; core cleanup may
-continue through its separately documented forced-cleanup grace. Broadcast
-remains sequential and non-atomic across shard files: cancellation preserves
-the committed prefix and prevents later shards from starting.
+continue through its separately documented forced-cleanup grace. A forced
+cancellation cannot erase committed schema-migration progress: the current
+shard transaction rolls back if still running, the retained prefix remains
+resumable, and the next startup finishes it before serving ordinary work.

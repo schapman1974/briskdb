@@ -7,10 +7,11 @@ a claim about production capacity or a timing threshold for shared CI runners.
 ## Workload contract
 
 Every benchmark creates a fresh temporary BriskDB database with exactly four
-shards, broadcasts the same table definition to each shard, and seeds one
-primary-key row per shard. Point updates keep the database size constant,
-preventing ever-growing insert cost from distorting later samples. Concurrent
-workloads deterministically find and verify one key for every physical shard.
+shards, applies the same untimed journaled schema migration to every shard, and
+seeds one primary-key row per shard. Point updates keep the database size
+constant, preventing ever-growing insert cost from distorting later samples.
+Concurrent workloads deterministically find and verify one key for every
+physical shard.
 
 The original `storage/*` group is retained unchanged as the synchronous,
 unpooled control. Timed operations use the public
@@ -54,7 +55,7 @@ The `storage/*` measurements include:
   timeout.
 
 They exclude HTTP parsing, networking, Tokio scheduling, server startup,
-database creation, schema broadcast, key discovery, and seed inserts.
+database creation, schema migration, key discovery, and seed inserts.
 
 The `engine/*` measurements include routing, session serialization, asynchronous
 admission, blocking-worker dispatch, pooled connection checkout and return,

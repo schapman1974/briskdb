@@ -23,8 +23,15 @@ const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
 const V4_SCHEMA_VERSION: u32 = 4;
 const V5_SCHEMA_VERSION: u32 = 5;
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = V5_SCHEMA_VERSION;
+const V6_SCHEMA_VERSION: u32 = 6;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = V6_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
+
+pub(super) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = 65_536;
+pub(super) const MAX_SCHEMA_GENERATION: u64 = i32::MAX as u64;
+const SCHEMA_MIGRATION_DIGEST_VERSION: u32 = 1;
+const SCHEMA_MIGRATION_APPLYING: i64 = 1;
+const SCHEMA_MIGRATION_COMPLETE: i64 = 2;
 
 const INITIAL_SCHEMA_GENERATION: u64 = 0;
 const SHARDED_PLACEMENT: i64 = 1;
@@ -60,6 +67,10 @@ const V5_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
         CHECK (requires_manifest_version >= 5)
 ) STRICT";
+const V6_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 6)
+) STRICT";
 const V3_ROUTING_TABLE_SQL: &str = "CREATE TABLE briskdb_routing (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     hash_version INTEGER NOT NULL CHECK (hash_version = 1),
@@ -94,6 +105,15 @@ const V4_SCHEMA_CATALOG_TABLE_SQL: &str = "CREATE TABLE briskdb_schema_catalog (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     identifier_encoding_version INTEGER NOT NULL CHECK (identifier_encoding_version = 1),
     schema_generation INTEGER NOT NULL CHECK (schema_generation = 0),
+    default_database_id INTEGER NOT NULL CHECK (default_database_id = 1),
+    FOREIGN KEY (default_database_id)
+        REFERENCES briskdb_logical_databases (database_id)
+) STRICT";
+const V6_SCHEMA_CATALOG_TABLE_SQL: &str = "CREATE TABLE briskdb_schema_catalog (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    identifier_encoding_version INTEGER NOT NULL CHECK (identifier_encoding_version = 1),
+    schema_generation INTEGER NOT NULL
+        CHECK (schema_generation BETWEEN 0 AND 2147483647),
     default_database_id INTEGER NOT NULL CHECK (default_database_id = 1),
     FOREIGN KEY (default_database_id)
         REFERENCES briskdb_logical_databases (database_id)
@@ -152,6 +172,25 @@ const V5_SHARD_LAYOUT_TABLE_SQL: &str = "CREATE TABLE briskdb_shard_layout (
     shard_metadata_version INTEGER NOT NULL CHECK (shard_metadata_version = 1),
     layout_state INTEGER NOT NULL CHECK (layout_state IN (1, 2, 3))
 ) STRICT";
+const V6_SCHEMA_MIGRATIONS_TABLE_SQL: &str = "CREATE TABLE briskdb_schema_migrations (
+    target_generation INTEGER PRIMARY KEY
+        CHECK (target_generation BETWEEN 1 AND 2147483647),
+    source_generation INTEGER NOT NULL
+        CHECK (source_generation = target_generation - 1),
+    migration_id BLOB NOT NULL UNIQUE
+        CHECK (typeof(migration_id) = 'blob' AND length(migration_id) = 32),
+    digest_version INTEGER NOT NULL CHECK (digest_version = 1),
+    sql_text TEXT NOT NULL
+        CHECK (
+            typeof(sql_text) = 'text'
+            AND length(CAST(sql_text AS BLOB)) BETWEEN 1 AND 65536
+            AND instr(sql_text, char(0)) = 0
+        ),
+    shard_count INTEGER NOT NULL CHECK (shard_count BETWEEN 2 AND 64),
+    migration_state INTEGER NOT NULL CHECK (migration_state IN (1, 2)),
+    next_shard INTEGER NOT NULL CHECK (next_shard BETWEEN 0 AND shard_count),
+    CHECK (migration_state = 1 OR next_shard = shard_count)
+) STRICT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RoutingConfiguration {
@@ -166,6 +205,79 @@ struct SchemaCatalogConfiguration {
     identifier_encoding_version: u32,
     schema_generation: u64,
     default_database_id: u64,
+}
+
+/// One fully validated application-schema migration journal row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SchemaMigration {
+    source_generation: u64,
+    target_generation: u64,
+    migration_id: [u8; 32],
+    sql_text: String,
+    shard_count: u16,
+    state: SchemaMigrationState,
+    next_shard: u16,
+}
+
+impl SchemaMigration {
+    pub(super) const fn source_generation(&self) -> u64 {
+        self.source_generation
+    }
+
+    pub(super) const fn target_generation(&self) -> u64 {
+        self.target_generation
+    }
+
+    pub(super) const fn migration_id(&self) -> [u8; 32] {
+        self.migration_id
+    }
+
+    pub(super) fn sql_text(&self) -> &str {
+        &self.sql_text
+    }
+
+    pub(super) const fn shard_count(&self) -> u16 {
+        self.shard_count
+    }
+
+    pub(super) const fn is_applying(&self) -> bool {
+        matches!(self.state, SchemaMigrationState::Applying)
+    }
+
+    pub(super) const fn is_complete(&self) -> bool {
+        matches!(self.state, SchemaMigrationState::Complete)
+    }
+
+    pub(super) const fn next_shard(&self) -> u16 {
+        self.next_shard
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaMigrationState {
+    Applying,
+    Complete,
+}
+
+impl SchemaMigrationState {
+    fn from_code(code: i64) -> EngineResult<Self> {
+        match code {
+            SCHEMA_MIGRATION_APPLYING => Ok(Self::Applying),
+            SCHEMA_MIGRATION_COMPLETE => Ok(Self::Complete),
+            _ => Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("manifest has unsupported schema-migration state {code}"),
+            )),
+        }
+    }
+}
+
+/// Result of looking up the migration identified by exact SQL bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SchemaMigrationClassification {
+    Absent,
+    Active(SchemaMigration),
+    Complete(SchemaMigration),
 }
 
 #[derive(Clone, Copy)]
@@ -183,17 +295,31 @@ struct ManifestSnapshot {
     routing_catalog: Option<RoutingCatalog>,
     logical_catalog: Option<Catalog>,
     shard_layout: Option<ShardLayout>,
+    active_migration: Option<SchemaMigration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LoadedManifest {
     catalog: CatalogSnapshot,
     shard_layout: ShardLayout,
+    active_migration: Option<SchemaMigration>,
 }
 
 impl LoadedManifest {
+    #[cfg(test)]
     pub(super) fn into_parts(self) -> (CatalogSnapshot, ShardLayout) {
         (self.catalog, self.shard_layout)
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_migration(&self) -> Option<&SchemaMigration> {
+        self.active_migration.as_ref()
+    }
+
+    pub(super) fn into_parts_with_migration(
+        self,
+    ) -> (CatalogSnapshot, ShardLayout, Option<SchemaMigration>) {
+        (self.catalog, self.shard_layout, self.active_migration)
     }
 }
 
@@ -226,6 +352,13 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v4_to_v5,
         validate: validate_v5,
     },
+    Migration {
+        from: V5_SCHEMA_VERSION,
+        to: V6_SCHEMA_VERSION,
+        name: "application_schema_migration_journal",
+        apply: migrate_v5_to_v6,
+        validate: validate_v6,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -239,8 +372,8 @@ struct MigrationPlan<'a> {
 const CURRENT_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: CURRENT_SCHEMA_VERSION,
     migrations: MIGRATIONS,
-    initialize_current: create_v5_schema,
-    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v5,
+    initialize_current: create_v6_schema,
+    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v6,
 };
 
 #[derive(Clone, Copy)]
@@ -272,7 +405,7 @@ enum ManifestState {
     },
     Versioned {
         version: u32,
-        snapshot: ManifestSnapshot,
+        snapshot: Box<ManifestSnapshot>,
     },
 }
 
@@ -322,6 +455,7 @@ pub(super) fn load_or_create_manifest_with_fresh_layout(
     Ok(LoadedManifest {
         catalog: CatalogSnapshot::from_validated_parts(routing, logical),
         shard_layout,
+        active_migration: snapshot.active_migration,
     })
 }
 
@@ -331,6 +465,511 @@ fn load_or_create_catalog(
     requested_shards: u16,
 ) -> EngineResult<CatalogSnapshot> {
     load_or_create_manifest(connection, requested_shards).map(|loaded| loaded.catalog)
+}
+
+/// Classify the migration identified by the exact UTF-8 SQL bytes.
+#[cfg(test)]
+pub(super) fn classify_schema_migration(
+    connection: &mut Connection,
+    requested_shards: u16,
+    sql: &str,
+) -> EngineResult<SchemaMigrationClassification> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let classification =
+        classify_schema_migration_in_transaction(&transaction, requested_shards, sql)?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(classification)
+}
+
+pub(super) fn classify_schema_migration_in_transaction(
+    transaction: &Connection,
+    requested_shards: u16,
+    sql: &str,
+) -> EngineResult<SchemaMigrationClassification> {
+    let migration_id = schema_migration_id(sql)?;
+    let snapshot = current_manifest_snapshot(transaction, requested_shards)?;
+    if let Some(active) = snapshot.active_migration {
+        if active.migration_id != migration_id {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "a different schema migration is already active",
+            ));
+        }
+        return classify_matching_schema_migration(Some(active), sql);
+    }
+    let migration = find_schema_migration(transaction, snapshot.shard_count, &migration_id)?;
+    classify_matching_schema_migration(migration, sql)
+}
+
+/// Load the single active journal row under a manifest write transaction.
+#[cfg(test)]
+pub(super) fn load_active_schema_migration(
+    connection: &mut Connection,
+    requested_shards: u16,
+) -> EngineResult<Option<SchemaMigration>> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let active = load_active_schema_migration_in_transaction(&transaction, requested_shards)?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(active)
+}
+
+pub(super) fn load_active_schema_migration_in_transaction(
+    transaction: &Connection,
+    requested_shards: u16,
+) -> EngineResult<Option<SchemaMigration>> {
+    Ok(current_manifest_snapshot(transaction, requested_shards)?.active_migration)
+}
+
+pub(super) fn ensure_schema_migration_layout(
+    connection: &Connection,
+    requested_shards: u16,
+    expected: &ShardLayout,
+) -> EngineResult<()> {
+    let observed = current_manifest_snapshot(connection, requested_shards)?
+        .shard_layout
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "current manifest validation omitted its physical shard layout",
+            )
+        })?;
+    if observed != *expected || observed.state() != ShardLayoutState::Ready {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "manifest physical layout does not match the opened storage root",
+        ));
+    }
+    Ok(())
+}
+
+/// Atomically append a new active journal row after the caller has preflighted
+/// every shard at `expected_source_generation`.
+///
+/// Repeating the exact SQL is idempotent and returns its existing active or
+/// completed row. Only one different migration may be active at a time.
+#[cfg(test)]
+pub(super) fn begin_schema_migration(
+    connection: &mut Connection,
+    requested_shards: u16,
+    expected_source_generation: u64,
+    sql: &str,
+) -> EngineResult<SchemaMigration> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let migration = begin_schema_migration_in_transaction(
+        &transaction,
+        requested_shards,
+        expected_source_generation,
+        sql,
+    )?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(migration)
+}
+
+pub(super) fn begin_schema_migration_in_transaction(
+    transaction: &Connection,
+    requested_shards: u16,
+    expected_source_generation: u64,
+    sql: &str,
+) -> EngineResult<SchemaMigration> {
+    let migration_id = schema_migration_id(sql)?;
+    let snapshot = current_manifest_snapshot(transaction, requested_shards)?;
+
+    if let Some(active) = snapshot.active_migration {
+        if active.migration_id != migration_id {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "a different schema migration is already active",
+            ));
+        }
+        if active.sql_text != sql {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "schema migration identifier collides with different SQL bytes",
+            ));
+        }
+        return Ok(active);
+    }
+    if let Some(existing) = find_schema_migration(transaction, snapshot.shard_count, &migration_id)?
+    {
+        if existing.sql_text != sql {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "schema migration identifier collides with different SQL bytes",
+            ));
+        }
+        return Ok(existing);
+    }
+    let layout = snapshot.shard_layout.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "current manifest validation omitted its physical shard layout",
+        )
+    })?;
+    if layout.state() != ShardLayoutState::Ready {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration requires a ready physical shard layout",
+        ));
+    }
+    let catalog_generation = snapshot
+        .logical_catalog
+        .as_ref()
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "current manifest validation omitted its logical catalog",
+            )
+        })?
+        .schema_generation();
+    if catalog_generation != expected_source_generation {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "schema migration preflight used generation {expected_source_generation}, but the catalog is at generation {catalog_generation}"
+            ),
+        ));
+    }
+    let target_generation = catalog_generation.checked_add(1).ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration generation is exhausted",
+        )
+    })?;
+    if target_generation > MAX_SCHEMA_GENERATION {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration generation is exhausted",
+        ));
+    }
+    transaction
+        .execute(
+            "INSERT INTO briskdb_schema_migrations (
+                target_generation,
+                source_generation,
+                migration_id,
+                digest_version,
+                sql_text,
+                shard_count,
+                migration_state,
+                next_shard
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+            rusqlite::params![
+                i64::try_from(target_generation).expect("schema generation fits in SQLite"),
+                i64::try_from(catalog_generation).expect("schema generation fits in SQLite"),
+                migration_id.as_slice(),
+                SCHEMA_MIGRATION_DIGEST_VERSION,
+                sql,
+                snapshot.shard_count,
+                SCHEMA_MIGRATION_APPLYING,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    let validated = current_manifest_snapshot(transaction, requested_shards)?
+        .active_migration
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "new schema migration did not produce an active journal row",
+            )
+        })?;
+    if validated.migration_id != migration_id || validated.sql_text != sql {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "new schema migration did not preserve its identity",
+        ));
+    }
+    Ok(validated)
+}
+
+/// Advance an active migration's durable prefix by at most one shard.
+/// Repeating an already-persisted position is an idempotent no-op.
+#[cfg(test)]
+pub(super) fn advance_schema_migration(
+    connection: &mut Connection,
+    requested_shards: u16,
+    expected: &SchemaMigration,
+    next_shard: u16,
+) -> EngineResult<SchemaMigration> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let migration = advance_schema_migration_in_transaction(
+        &transaction,
+        requested_shards,
+        expected,
+        next_shard,
+    )?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(migration)
+}
+
+pub(super) fn advance_schema_migration_in_transaction(
+    transaction: &Connection,
+    requested_shards: u16,
+    expected: &SchemaMigration,
+    next_shard: u16,
+) -> EngineResult<SchemaMigration> {
+    let snapshot = current_manifest_snapshot(transaction, requested_shards)?;
+    let Some(active) = snapshot.active_migration else {
+        let completed =
+            find_schema_migration(transaction, snapshot.shard_count, &expected.migration_id)?
+                .filter(|migration| migration.is_complete());
+        if let Some(completed) = completed {
+            ensure_same_schema_migration(&completed, expected)?;
+            return Ok(completed);
+        }
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration is no longer active",
+        ));
+    };
+    ensure_same_schema_migration(&active, expected)?;
+    if next_shard > active.shard_count {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "schema migration progress exceeds its shard count",
+        ));
+    }
+    if next_shard <= active.next_shard {
+        return Ok(active);
+    }
+    if next_shard != active.next_shard + 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration progress cannot skip a shard",
+        ));
+    }
+    transaction
+        .execute(
+            "UPDATE briskdb_schema_migrations
+             SET next_shard = ?1
+             WHERE target_generation = ?2
+               AND migration_state = ?3
+               AND next_shard = ?4",
+            rusqlite::params![
+                next_shard,
+                i64::try_from(active.target_generation).expect("schema generation fits in SQLite"),
+                SCHEMA_MIGRATION_APPLYING,
+                active.next_shard,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    let advanced = current_manifest_snapshot(transaction, requested_shards)?
+        .active_migration
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "schema migration progress update lost its active row",
+            )
+        })?;
+    ensure_same_schema_migration(&advanced, expected)?;
+    if advanced.next_shard != next_shard {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "schema migration progress update did not persist",
+        ));
+    }
+    Ok(advanced)
+}
+
+/// Atomically publish a fully applied migration as the new catalog generation.
+#[cfg(test)]
+pub(super) fn finalize_schema_migration(
+    connection: &mut Connection,
+    requested_shards: u16,
+    expected: &SchemaMigration,
+) -> EngineResult<SchemaMigration> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let migration =
+        finalize_schema_migration_in_transaction(&transaction, requested_shards, expected)?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(migration)
+}
+
+pub(super) fn finalize_schema_migration_in_transaction(
+    transaction: &Connection,
+    requested_shards: u16,
+    expected: &SchemaMigration,
+) -> EngineResult<SchemaMigration> {
+    let snapshot = current_manifest_snapshot(transaction, requested_shards)?;
+    let Some(active) = snapshot.active_migration else {
+        let completed =
+            find_schema_migration(transaction, snapshot.shard_count, &expected.migration_id)?
+                .filter(|migration| migration.is_complete())
+                .ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::FailedPrecondition,
+                        "schema migration is no longer active",
+                    )
+                })?;
+        ensure_same_schema_migration(&completed, expected)?;
+        return Ok(completed);
+    };
+    ensure_same_schema_migration(&active, expected)?;
+    if active.next_shard != active.shard_count {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration cannot finish before every shard is durable",
+        ));
+    }
+    transaction
+        .execute(
+            "UPDATE briskdb_schema_catalog
+             SET schema_generation = ?1
+             WHERE singleton = 1 AND schema_generation = ?2",
+            rusqlite::params![
+                i64::try_from(active.target_generation).expect("schema generation fits in SQLite"),
+                i64::try_from(active.source_generation).expect("schema generation fits in SQLite"),
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "UPDATE briskdb_schema_migrations
+             SET migration_state = ?1
+             WHERE target_generation = ?2
+               AND migration_state = ?3
+               AND next_shard = shard_count",
+            rusqlite::params![
+                SCHEMA_MIGRATION_COMPLETE,
+                i64::try_from(active.target_generation).expect("schema generation fits in SQLite"),
+                SCHEMA_MIGRATION_APPLYING,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    let finalized_snapshot = current_manifest_snapshot(transaction, requested_shards)?;
+    if finalized_snapshot.active_migration.is_some()
+        || finalized_snapshot
+            .logical_catalog
+            .as_ref()
+            .map(Catalog::schema_generation)
+            != Some(active.target_generation)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "schema migration finalization did not publish its target generation",
+        ));
+    }
+    let completed = find_schema_migration(
+        transaction,
+        finalized_snapshot.shard_count,
+        &active.migration_id,
+    )?
+    .ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "schema migration finalization lost its journal row",
+        )
+    })?;
+    if !completed.is_complete() {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "schema migration finalization did not complete its journal row",
+        ));
+    }
+    Ok(completed)
+}
+
+fn current_manifest_snapshot(
+    connection: &Connection,
+    requested_shards: u16,
+) -> EngineResult<ManifestSnapshot> {
+    match inspect_with_plan(connection, requested_shards, CURRENT_PLAN)? {
+        ManifestState::Versioned { version, snapshot } if version == CURRENT_SCHEMA_VERSION => {
+            Ok(*snapshot)
+        }
+        _ => Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migrations require a current manifest",
+        )),
+    }
+}
+
+fn find_schema_migration(
+    connection: &Connection,
+    expected_shard_count: u16,
+    migration_id: &[u8; 32],
+) -> EngineResult<Option<SchemaMigration>> {
+    connection
+        .query_row(
+            "SELECT target_generation,
+                    source_generation,
+                    migration_id,
+                    digest_version,
+                    sql_text,
+                    shard_count,
+                    migration_state,
+                    next_shard
+             FROM briskdb_schema_migrations
+             WHERE migration_id = ?1",
+            [migration_id.as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .map(Some)
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            error => Err(error),
+        })
+        .map_err(|error| manifest_read_error(error, "failed to read schema migration journal"))?
+        .map(|stored| schema_migration_from_stored(stored, expected_shard_count))
+        .transpose()
+}
+
+fn classify_matching_schema_migration(
+    migration: Option<SchemaMigration>,
+    sql: &str,
+) -> EngineResult<SchemaMigrationClassification> {
+    let Some(migration) = migration else {
+        return Ok(SchemaMigrationClassification::Absent);
+    };
+    if migration.sql_text != sql {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration identifier collides with different SQL bytes",
+        ));
+    }
+    if migration.is_applying() {
+        Ok(SchemaMigrationClassification::Active(migration))
+    } else {
+        Ok(SchemaMigrationClassification::Complete(migration))
+    }
+}
+
+fn ensure_same_schema_migration(
+    observed: &SchemaMigration,
+    expected: &SchemaMigration,
+) -> EngineResult<()> {
+    if observed.source_generation != expected.source_generation
+        || observed.target_generation != expected.target_generation
+        || observed.migration_id != expected.migration_id
+        || observed.sql_text != expected.sql_text
+        || observed.shard_count != expected.shard_count
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration identity changed while it was being applied",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -474,7 +1113,7 @@ where
         let (from, shard_count) = match inspect_with_plan(&transaction, requested_shards, plan)? {
             ManifestState::Versioned { version, snapshot } if version == plan.current_version => {
                 transaction.commit().map_err(sqlite_error::storage)?;
-                return Ok(snapshot);
+                return Ok(*snapshot);
             }
             ManifestState::Empty => {
                 if !fresh_layout_allowed {
@@ -585,7 +1224,7 @@ where
     match inspect_with_plan(&transaction, shard_count, plan)? {
         ManifestState::Versioned { version, snapshot } if version == change.to => {
             transaction.commit().map_err(sqlite_error::storage)?;
-            Ok(snapshot)
+            Ok(*snapshot)
         }
         _ => Err(EngineError::new(
             EngineErrorKind::Internal,
@@ -645,14 +1284,19 @@ fn create_v5_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineRe
     add_v5_schema(transaction, ShardLayoutState::Creating)
 }
 
-fn migrate_interrupted_legacy_to_v5(
+fn create_v6_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
+    create_v5_schema(transaction, shard_count)?;
+    migrate_v5_to_v6(transaction, shard_count)
+}
+
+fn migrate_interrupted_legacy_to_v6(
     transaction: &Transaction<'_>,
     shard_count: u16,
 ) -> EngineResult<()> {
     transaction
         .execute_batch("DROP TABLE briskdb_metadata;")
         .map_err(sqlite_error::storage)?;
-    create_v5_schema(transaction, shard_count)
+    create_v6_schema(transaction, shard_count)
 }
 
 #[cfg(test)]
@@ -675,6 +1319,17 @@ fn migrate_interrupted_legacy_to_v4(
         .execute_batch("DROP TABLE briskdb_metadata;")
         .map_err(sqlite_error::storage)?;
     create_v4_schema(transaction, shard_count)
+}
+
+#[cfg(test)]
+fn migrate_interrupted_legacy_to_v5(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v5_schema(transaction, shard_count)
 }
 
 fn migrate_v2_to_v3(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
@@ -819,6 +1474,54 @@ fn migrate_v4_to_v5(transaction: &Transaction<'_>, _shard_count: u16) -> EngineR
     add_v5_schema(transaction, ShardLayoutState::Adopting)
 }
 
+fn migrate_v5_to_v6(transaction: &Transaction<'_>, _shard_count: u16) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V6_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V6_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+
+    transaction
+        .execute_batch(
+            "ALTER TABLE briskdb_schema_catalog
+                 RENAME TO briskdb_schema_catalog_v5;",
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V6_SCHEMA_CATALOG_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_schema_catalog (
+                singleton,
+                identifier_encoding_version,
+                schema_generation,
+                default_database_id
+             )
+             SELECT singleton,
+                    identifier_encoding_version,
+                    schema_generation,
+                    default_database_id
+             FROM briskdb_schema_catalog_v5",
+            [],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch("DROP TABLE briskdb_schema_catalog_v5;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V6_SCHEMA_MIGRATIONS_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
 fn add_v5_schema(transaction: &Transaction<'_>, state: ShardLayoutState) -> EngineResult<()> {
     transaction
         .execute_batch("DROP TABLE briskdb_metadata;")
@@ -912,8 +1615,12 @@ fn inspect_with_plan(
                     ),
                 )
             })?;
-        return validator(connection, requested_shards, &objects)
-            .map(|snapshot| ManifestState::Versioned { version, snapshot });
+        return validator(connection, requested_shards, &objects).map(|snapshot| {
+            ManifestState::Versioned {
+                version,
+                snapshot: Box::new(snapshot),
+            }
+        });
     }
 
     if application_id != 0 {
@@ -1080,6 +1787,18 @@ fn v5_objects() -> Vec<SchemaObject> {
     objects
 }
 
+fn v6_objects() -> Vec<SchemaObject> {
+    let mut objects = v5_objects();
+    objects.push(SchemaObject {
+        object_type: "table".to_owned(),
+        name: "briskdb_schema_migrations".to_owned(),
+    });
+    objects.sort_by(|left, right| {
+        (&left.object_type, &left.name).cmp(&(&right.object_type, &right.name))
+    });
+    objects
+}
+
 fn schema_objects(connection: &Connection) -> EngineResult<Vec<SchemaObject>> {
     let mut statement = connection
         .prepare(
@@ -1180,6 +1899,10 @@ fn validate_table(
         "briskdb_shard_layout" => {
             "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
              FROM pragma_table_xinfo('briskdb_shard_layout') LIMIT ?1"
+        }
+        "briskdb_schema_migrations" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_schema_migrations') LIMIT ?1"
         }
         _ => {
             return Err(EngineError::new(
@@ -1368,6 +2091,7 @@ fn validate_v2(
         routing_catalog: None,
         logical_catalog: None,
         shard_layout: None,
+        active_migration: None,
     })
 }
 
@@ -1395,6 +2119,7 @@ fn validate_v3(
         routing_catalog: Some(routing_catalog),
         logical_catalog: None,
         shard_layout: None,
+        active_migration: None,
     })
 }
 
@@ -1497,9 +2222,13 @@ fn validate_v4(
         connection,
         requested_shards,
         objects,
-        V4_SCHEMA_VERSION,
-        V4_DOWNGRADE_FENCE_SQL,
-        &v4_objects(),
+        CatalogManifestDefinition {
+            version: V4_SCHEMA_VERSION,
+            downgrade_fence_sql: V4_DOWNGRADE_FENCE_SQL,
+            expected_objects: &v4_objects(),
+            schema_catalog_sql: V4_SCHEMA_CATALOG_TABLE_SQL,
+            generation_policy: SchemaGenerationPolicy::InitialOnly,
+        },
     )
 }
 
@@ -1512,9 +2241,13 @@ fn validate_v5(
         connection,
         requested_shards,
         objects,
-        V5_SCHEMA_VERSION,
-        V5_DOWNGRADE_FENCE_SQL,
-        &v5_objects(),
+        CatalogManifestDefinition {
+            version: V5_SCHEMA_VERSION,
+            downgrade_fence_sql: V5_DOWNGRADE_FENCE_SQL,
+            expected_objects: &v5_objects(),
+            schema_catalog_sql: V4_SCHEMA_CATALOG_TABLE_SQL,
+            generation_policy: SchemaGenerationPolicy::InitialOnly,
+        },
     )?;
     validate_table(
         connection,
@@ -1537,26 +2270,131 @@ fn validate_v5(
     Ok(snapshot)
 }
 
+fn validate_v6(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    let mut snapshot = validate_catalog_manifest(
+        connection,
+        requested_shards,
+        objects,
+        CatalogManifestDefinition {
+            version: V6_SCHEMA_VERSION,
+            downgrade_fence_sql: V6_DOWNGRADE_FENCE_SQL,
+            expected_objects: &v6_objects(),
+            schema_catalog_sql: V6_SCHEMA_CATALOG_TABLE_SQL,
+            generation_policy: SchemaGenerationPolicy::Journaled,
+        },
+    )?;
+    validate_table(
+        connection,
+        "briskdb_shard_layout",
+        &[
+            TableColumn::expected(0, "singleton", "INTEGER", false, 1),
+            TableColumn::expected(1, "layout_id", "BLOB", true, 0),
+            TableColumn::expected(2, "shard_application_id", "INTEGER", true, 0),
+            TableColumn::expected(3, "shard_metadata_version", "INTEGER", true, 0),
+            TableColumn::expected(4, "layout_state", "INTEGER", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_shard_layout",
+        V5_SHARD_LAYOUT_TABLE_SQL,
+    )?;
+    let layout = validate_shard_layout(connection)?;
+
+    validate_table(
+        connection,
+        "briskdb_schema_migrations",
+        &[
+            TableColumn::expected(0, "target_generation", "INTEGER", false, 1),
+            TableColumn::expected(1, "source_generation", "INTEGER", true, 0),
+            TableColumn::expected(2, "migration_id", "BLOB", true, 0),
+            TableColumn::expected(3, "digest_version", "INTEGER", true, 0),
+            TableColumn::expected(4, "sql_text", "TEXT", true, 0),
+            TableColumn::expected(5, "shard_count", "INTEGER", true, 0),
+            TableColumn::expected(6, "migration_state", "INTEGER", true, 0),
+            TableColumn::expected(7, "next_shard", "INTEGER", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_schema_migrations",
+        V6_SCHEMA_MIGRATIONS_TABLE_SQL,
+    )?;
+
+    let catalog_generation = snapshot
+        .logical_catalog
+        .as_ref()
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "current manifest validation omitted its logical catalog",
+            )
+        })?
+        .schema_generation();
+    let active =
+        validate_schema_migration_history(connection, snapshot.shard_count, catalog_generation)?;
+    let has_history = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM briskdb_schema_migrations)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| {
+            manifest_read_error(error, "failed to inspect schema migration journal")
+        })?;
+    if has_history && layout.state() != ShardLayoutState::Ready {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "schema migration history requires a ready physical shard layout",
+        ));
+    }
+    snapshot.shard_layout = Some(layout);
+    snapshot.active_migration = active;
+    Ok(snapshot)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SchemaGenerationPolicy {
+    InitialOnly,
+    Journaled,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CatalogManifestDefinition<'a> {
+    version: u32,
+    downgrade_fence_sql: &'a str,
+    expected_objects: &'a [SchemaObject],
+    schema_catalog_sql: &'a str,
+    generation_policy: SchemaGenerationPolicy,
+}
+
 fn validate_catalog_manifest(
     connection: &Connection,
     requested_shards: u16,
     objects: &[SchemaObject],
-    expected_version: u32,
-    downgrade_fence_sql: &str,
-    expected_objects: &[SchemaObject],
+    definition: CatalogManifestDefinition<'_>,
 ) -> EngineResult<ManifestSnapshot> {
-    if objects != expected_objects {
+    if objects != definition.expected_objects {
         return Err(EngineError::new(
             EngineErrorKind::DataCorruption,
-            format!("manifest schema version {expected_version} has unexpected database objects"),
+            format!(
+                "manifest schema version {} has unexpected database objects",
+                definition.version
+            ),
         ));
     }
 
     let (shard_count, routing_catalog) = validate_routing_manifest(
         connection,
         requested_shards,
-        expected_version,
-        downgrade_fence_sql,
+        definition.version,
+        definition.downgrade_fence_sql,
     )?;
     validate_table(
         connection,
@@ -1586,7 +2424,7 @@ fn validate_catalog_manifest(
     validate_table_sql(
         connection,
         "briskdb_schema_catalog",
-        V4_SCHEMA_CATALOG_TABLE_SQL,
+        definition.schema_catalog_sql,
     )?;
     validate_table(
         connection,
@@ -1603,7 +2441,8 @@ fn validate_catalog_manifest(
     )?;
     validate_table_sql(connection, "briskdb_tables", V4_TABLES_TABLE_SQL)?;
 
-    let catalog_configuration = validate_schema_catalog_configuration(connection)?;
+    let catalog_configuration =
+        validate_schema_catalog_configuration(connection, definition.generation_policy)?;
     let databases =
         validate_logical_databases(connection, catalog_configuration.default_database_id)?;
     let tables = validate_table_metadata(connection, &databases)?;
@@ -1620,6 +2459,7 @@ fn validate_catalog_manifest(
             tables,
         )),
         shard_layout: None,
+        active_migration: None,
     })
 }
 
@@ -1695,6 +2535,7 @@ fn validate_shard_layout(connection: &Connection) -> EngineResult<ShardLayout> {
 
 fn validate_schema_catalog_configuration(
     connection: &Connection,
+    generation_policy: SchemaGenerationPolicy,
 ) -> EngineResult<SchemaCatalogConfiguration> {
     let mut statement = connection
         .prepare(
@@ -1746,11 +2587,20 @@ fn validate_schema_catalog_configuration(
             error,
         )
     })?;
-    if schema_generation != INITIAL_SCHEMA_GENERATION {
-        return Err(EngineError::new(
-            EngineErrorKind::DataCorruption,
-            format!("manifest has unsupported schema generation {schema_generation}"),
-        ));
+    match generation_policy {
+        SchemaGenerationPolicy::InitialOnly if schema_generation != INITIAL_SCHEMA_GENERATION => {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("manifest has unsupported schema generation {schema_generation}"),
+            ));
+        }
+        SchemaGenerationPolicy::Journaled if schema_generation > MAX_SCHEMA_GENERATION => {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("manifest has unsupported schema generation {schema_generation}"),
+            ));
+        }
+        SchemaGenerationPolicy::InitialOnly | SchemaGenerationPolicy::Journaled => {}
     }
     let default_database_id = u64::try_from(default_database_id).map_err(|error| {
         EngineError::from_source(
@@ -1771,6 +2621,253 @@ fn validate_schema_catalog_configuration(
         schema_generation,
         default_database_id,
     })
+}
+
+type StoredSchemaMigrationRow = (i64, i64, Vec<u8>, i64, String, i64, i64, i64);
+
+fn validate_schema_migration_history(
+    connection: &Connection,
+    expected_shard_count: u16,
+    catalog_generation: u64,
+) -> EngineResult<Option<SchemaMigration>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT target_generation,
+                    source_generation,
+                    migration_id,
+                    digest_version,
+                    sql_text,
+                    shard_count,
+                    migration_state,
+                    next_shard
+             FROM briskdb_schema_migrations
+             ORDER BY target_generation",
+        )
+        .map_err(|error| manifest_read_error(error, "failed to read schema migration journal"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| manifest_read_error(error, "failed to read schema migration journal"))?;
+
+    let mut expected_target = 1_u64;
+    let mut active = None;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| manifest_read_error(error, "failed to read schema migration journal"))?
+    {
+        let stored: StoredSchemaMigrationRow = (
+            row.get(0).map_err(|error| {
+                manifest_read_error(error, "failed to read schema migration journal")
+            })?,
+            row.get(1).map_err(|error| {
+                manifest_read_error(error, "failed to read schema migration journal")
+            })?,
+            row.get(2).map_err(|error| {
+                manifest_read_error(error, "failed to read schema migration journal")
+            })?,
+            row.get(3).map_err(|error| {
+                manifest_read_error(error, "failed to read schema migration journal")
+            })?,
+            row.get(4).map_err(|error| {
+                manifest_read_error(error, "failed to read schema migration journal")
+            })?,
+            row.get(5).map_err(|error| {
+                manifest_read_error(error, "failed to read schema migration journal")
+            })?,
+            row.get(6).map_err(|error| {
+                manifest_read_error(error, "failed to read schema migration journal")
+            })?,
+            row.get(7).map_err(|error| {
+                manifest_read_error(error, "failed to read schema migration journal")
+            })?,
+        );
+        let migration = schema_migration_from_stored(stored, expected_shard_count)?;
+        if migration.target_generation != expected_target {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "schema migration journal is not contiguous at generation {expected_target}"
+                ),
+            ));
+        }
+
+        if migration.target_generation <= catalog_generation {
+            if !migration.is_complete() {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!(
+                        "committed schema generation {} has an incomplete journal row",
+                        migration.target_generation
+                    ),
+                ));
+            }
+        } else if migration.target_generation == catalog_generation.saturating_add(1) {
+            if !migration.is_applying() || active.is_some() {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    "schema migration journal has an invalid active row",
+                ));
+            }
+            active = Some(migration);
+        } else {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "schema migration journal extends beyond the next catalog generation",
+            ));
+        }
+        expected_target = expected_target.checked_add(1).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "schema migration journal generation overflowed",
+            )
+        })?;
+    }
+
+    if expected_target <= catalog_generation {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("schema migration journal is missing committed generation {expected_target}"),
+        ));
+    }
+    Ok(active)
+}
+
+fn schema_migration_from_stored(
+    stored: StoredSchemaMigrationRow,
+    expected_shard_count: u16,
+) -> EngineResult<SchemaMigration> {
+    let (
+        target_generation,
+        source_generation,
+        migration_id,
+        digest_version,
+        sql_text,
+        shard_count,
+        migration_state,
+        next_shard,
+    ) = stored;
+    let target_generation = u64::try_from(target_generation).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "schema migration target generation is outside the supported range",
+            error,
+        )
+    })?;
+    let source_generation = u64::try_from(source_generation).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "schema migration source generation is outside the supported range",
+            error,
+        )
+    })?;
+    if !(1..=MAX_SCHEMA_GENERATION).contains(&target_generation)
+        || source_generation.checked_add(1) != Some(target_generation)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "schema migration generations are not consecutive",
+        ));
+    }
+    let migration_id: [u8; 32] = migration_id.as_slice().try_into().map_err(|_| {
+        EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "schema migration identifier must contain exactly 32 bytes",
+        )
+    })?;
+    if digest_version != i64::from(SCHEMA_MIGRATION_DIGEST_VERSION) {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("schema migration has unsupported digest version {digest_version}"),
+        ));
+    }
+    validate_stored_schema_migration_sql(&sql_text)?;
+    if schema_migration_digest(&sql_text) != migration_id {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "schema migration identifier does not match its exact SQL bytes",
+        ));
+    }
+    let shard_count = u16::try_from(shard_count).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "schema migration shard count is outside the supported range",
+            error,
+        )
+    })?;
+    if shard_count != expected_shard_count {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!(
+                "schema migration targets {shard_count} shards but the manifest has {expected_shard_count}"
+            ),
+        ));
+    }
+    let state = SchemaMigrationState::from_code(migration_state)?;
+    let next_shard = u16::try_from(next_shard).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "schema migration progress is outside the supported range",
+            error,
+        )
+    })?;
+    if next_shard > shard_count
+        || (state == SchemaMigrationState::Complete && next_shard != shard_count)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "schema migration progress is inconsistent with its state",
+        ));
+    }
+
+    Ok(SchemaMigration {
+        source_generation,
+        target_generation,
+        migration_id,
+        sql_text,
+        shard_count,
+        state,
+        next_shard,
+    })
+}
+
+fn validate_stored_schema_migration_sql(sql: &str) -> EngineResult<()> {
+    if sql.is_empty() || sql.len() > MAX_SCHEMA_MIGRATION_SQL_BYTES || sql.as_bytes().contains(&0) {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "schema migration SQL violates its storage limits",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_schema_migration_sql(sql: &str) -> EngineResult<()> {
+    if sql.is_empty() {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "schema migration SQL cannot be empty",
+        ));
+    }
+    if sql.len() > MAX_SCHEMA_MIGRATION_SQL_BYTES {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            format!("schema migration SQL exceeds the {MAX_SCHEMA_MIGRATION_SQL_BYTES}-byte limit"),
+        ));
+    }
+    if sql.as_bytes().contains(&0) {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "schema migration SQL cannot contain a NUL byte",
+        ));
+    }
+    Ok(())
+}
+
+fn schema_migration_digest(sql: &str) -> [u8; 32] {
+    *blake3::hash(sql.as_bytes()).as_bytes()
+}
+
+pub(super) fn schema_migration_id(sql: &str) -> EngineResult<[u8; 32]> {
+    validate_schema_migration_sql(sql)?;
+    Ok(schema_migration_digest(sql))
 }
 
 fn validate_logical_databases(
@@ -2287,6 +3384,28 @@ pub(super) fn create_v4_fixture(connection: &mut Connection, shard_count: u16) {
 }
 
 #[cfg(test)]
+pub(super) fn create_v5_fixture(connection: &mut Connection, shard_count: u16) {
+    let transaction = connection
+        .transaction()
+        .expect("v5 fixture transaction starts");
+    create_v5_schema(&transaction, shard_count).expect("v5 fixture schema is valid");
+    transaction
+        .execute(
+            "UPDATE briskdb_shard_layout SET layout_state = ?1 WHERE singleton = 1",
+            [ShardLayoutState::Ready.code()],
+        )
+        .expect("v5 fixture layout becomes ready");
+    set_identity(&transaction, V5_SCHEMA_VERSION).expect("v5 fixture identity is valid");
+    validate_v5(
+        &transaction,
+        shard_count,
+        &schema_objects(&transaction).unwrap(),
+    )
+    .expect("v5 fixture validates");
+    transaction.commit().expect("v5 fixture commits");
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
@@ -2347,6 +3466,34 @@ mod tests {
 
     fn create_v4_manifest(connection: &mut Connection, shards: u16) {
         create_v4_fixture(connection, shards);
+    }
+
+    fn create_v5_manifest(connection: &mut Connection, shards: u16) {
+        create_v5_fixture(connection, shards);
+    }
+
+    fn create_ready_current_manifest(connection: &mut Connection, shards: u16) {
+        let (_, creating) = load_or_create_manifest(connection, shards)
+            .unwrap()
+            .into_parts();
+        if creating.state() != ShardLayoutState::Ready {
+            mark_shard_layout_ready(connection, shards, &creating).unwrap();
+        }
+    }
+
+    fn complete_manifest_migration(
+        connection: &mut Connection,
+        shards: u16,
+        expected_source: u64,
+        sql: &str,
+    ) -> SchemaMigration {
+        let mut migration =
+            begin_schema_migration(connection, shards, expected_source, sql).unwrap();
+        while migration.next_shard() < migration.shard_count() {
+            let next = migration.next_shard() + 1;
+            migration = advance_schema_migration(connection, shards, &migration, next).unwrap();
+        }
+        finalize_schema_migration(connection, shards, &migration).unwrap()
     }
 
     fn shard_layout_row(connection: &Connection) -> (Vec<u8>, i64, i64, i64) {
@@ -2495,7 +3642,7 @@ mod tests {
             identity(connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(connection).unwrap(), v5_objects());
+        assert_eq!(schema_objects(connection).unwrap(), v6_objects());
         assert_eq!(
             connection
                 .query_row(
@@ -2504,7 +3651,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V5_SCHEMA_VERSION)
+            i64::from(V6_SCHEMA_VERSION)
         );
         assert_eq!(
             routing_configuration(connection),
@@ -2550,6 +3697,16 @@ mod tests {
         assert_eq!(application_id, SHARD_APPLICATION_ID);
         assert_eq!(metadata_version, i64::from(SHARD_METADATA_VERSION));
         assert!(matches!(state, 1..=3));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
         validate_foreign_keys(connection).unwrap();
     }
 
@@ -2639,7 +3796,7 @@ mod tests {
             .unwrap(),
             4
         );
-        assert_eq!(resumed_steps, [(2, 3), (3, 4), (4, 5)]);
+        assert_eq!(resumed_steps, [(2, 3), (3, 4), (4, 5), (5, 6)]);
         assert_generation_one_catalog(&connection, 4);
         assert_eq!(quick_check(&connection), "ok");
     }
@@ -2736,14 +3893,506 @@ mod tests {
         assert_eq!(catalog.logical().tables().len(), 5);
         assert_eq!(
             identity(&connection),
-            (MANIFEST_APPLICATION_ID, i64::from(V5_SCHEMA_VERSION))
+            (MANIFEST_APPLICATION_ID, i64::from(V6_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v5_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v6_objects());
         assert_eq!(
             shard_layout_row(&connection).3,
             ShardLayoutState::Adopting.code()
         );
         assert_eq!(quick_check(&connection), "ok");
+    }
+
+    #[test]
+    fn version_five_upgrade_preserves_ready_layout_catalog_and_empty_history() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_v5_manifest(&mut connection, 4);
+        insert_valid_table_catalog(&connection);
+        let layout_before = shard_layout_row(&connection);
+        let databases_before = logical_databases(&connection);
+        let tables_before = table_metadata_rows(&connection);
+
+        let loaded = load_or_create_manifest(&mut connection, 4).unwrap();
+        assert!(loaded.active_migration().is_none());
+        let (catalog, layout, active) = loaded.into_parts_with_migration();
+
+        assert_eq!(identity(&connection), (MANIFEST_APPLICATION_ID, 6));
+        assert_eq!(schema_objects(&connection).unwrap(), v6_objects());
+        assert_eq!(layout.state(), ShardLayoutState::Ready);
+        assert_eq!(shard_layout_row(&connection), layout_before);
+        assert_eq!(catalog.logical().schema_generation(), 0);
+        assert_eq!(logical_databases(&connection), databases_before);
+        assert_eq!(table_metadata_rows(&connection), tables_before);
+        assert!(active.is_none());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(quick_check(&connection), "ok");
+    }
+
+    #[test]
+    fn version_six_migration_error_and_panic_restore_exact_v5_then_retry() {
+        for failing_phase in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_v5_manifest(&mut connection, 4);
+            let layout_before = shard_layout_row(&connection);
+
+            let error = load_or_create_with_hook(&mut connection, 4, |point| {
+                if point.from == V5_SCHEMA_VERSION && point.phase == failing_phase {
+                    Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "injected schema journal migration failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+            assert_eq!(identity(&connection), (MANIFEST_APPLICATION_ID, 5));
+            assert_eq!(schema_objects(&connection).unwrap(), v5_objects());
+            assert_eq!(shard_layout_row(&connection), layout_before);
+            assert_eq!(quick_check(&connection), "ok");
+
+            load_or_create_manifest(&mut connection, 4).unwrap();
+            assert_eq!(identity(&connection), (MANIFEST_APPLICATION_ID, 6));
+            assert_eq!(schema_objects(&connection).unwrap(), v6_objects());
+        }
+
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_v5_manifest(&mut connection, 4);
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = load_or_create_with_hook(&mut connection, 4, |point| {
+                if point.from == V5_SCHEMA_VERSION
+                    && point.phase == MigrationPhase::AfterVersionStamp
+                {
+                    panic!("injected schema journal migration panic");
+                }
+                Ok(())
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(identity(&connection), (MANIFEST_APPLICATION_ID, 5));
+        assert_eq!(schema_objects(&connection).unwrap(), v5_objects());
+        load_or_create_manifest(&mut connection, 4).unwrap();
+        assert_eq!(identity(&connection), (MANIFEST_APPLICATION_ID, 6));
+    }
+
+    #[test]
+    fn schema_migration_journal_is_exact_idempotent_and_monotonic() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let first_sql = "CREATE TABLE widgets (id INTEGER PRIMARY KEY)";
+
+        assert_eq!(
+            classify_schema_migration(&mut connection, 4, first_sql).unwrap(),
+            SchemaMigrationClassification::Absent
+        );
+        let active = begin_schema_migration(&mut connection, 4, 0, first_sql).unwrap();
+        assert_eq!(active.source_generation(), 0);
+        assert_eq!(active.target_generation(), 1);
+        assert_eq!(
+            active.migration_id(),
+            schema_migration_id(first_sql).unwrap()
+        );
+        assert_eq!(active.sql_text(), first_sql);
+        assert_eq!(active.shard_count(), 4);
+        assert_eq!(active.next_shard(), 0);
+        assert!(active.is_applying());
+        assert_eq!(
+            load_active_schema_migration(&mut connection, 4).unwrap(),
+            Some(active.clone())
+        );
+        assert_eq!(
+            begin_schema_migration(&mut connection, 4, 0, first_sql).unwrap(),
+            active
+        );
+        assert_eq!(
+            classify_schema_migration(&mut connection, 4, first_sql).unwrap(),
+            SchemaMigrationClassification::Active(active.clone())
+        );
+
+        let conflict =
+            begin_schema_migration(&mut connection, 4, 0, "CREATE TABLE different (id INTEGER)")
+                .unwrap_err();
+        assert_eq!(conflict.kind(), EngineErrorKind::FailedPrecondition);
+        let skipped = advance_schema_migration(&mut connection, 4, &active, 2).unwrap_err();
+        assert_eq!(skipped.kind(), EngineErrorKind::FailedPrecondition);
+        let premature = finalize_schema_migration(&mut connection, 4, &active).unwrap_err();
+        assert_eq!(premature.kind(), EngineErrorKind::FailedPrecondition);
+
+        let one = advance_schema_migration(&mut connection, 4, &active, 1).unwrap();
+        assert_eq!(one.next_shard(), 1);
+        assert_eq!(
+            advance_schema_migration(&mut connection, 4, &one, 1).unwrap(),
+            one
+        );
+        let two = advance_schema_migration(&mut connection, 4, &one, 2).unwrap();
+        let three = advance_schema_migration(&mut connection, 4, &two, 3).unwrap();
+        let four = advance_schema_migration(&mut connection, 4, &three, 4).unwrap();
+        let complete = finalize_schema_migration(&mut connection, 4, &four).unwrap();
+        assert!(complete.is_complete());
+        assert_eq!(complete.next_shard(), 4);
+        assert!(
+            load_active_schema_migration(&mut connection, 4)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            classify_schema_migration(&mut connection, 4, first_sql).unwrap(),
+            SchemaMigrationClassification::Complete(complete.clone())
+        );
+        assert_eq!(
+            begin_schema_migration(&mut connection, 4, 0, first_sql).unwrap(),
+            complete
+        );
+        assert_eq!(
+            load_or_create_manifest(&mut connection, 4)
+                .unwrap()
+                .into_parts()
+                .0
+                .logical()
+                .schema_generation(),
+            1
+        );
+
+        let stale = begin_schema_migration(
+            &mut connection,
+            4,
+            0,
+            "CREATE INDEX widget_ids ON widgets(id)",
+        )
+        .unwrap_err();
+        assert_eq!(stale.kind(), EngineErrorKind::FailedPrecondition);
+        let second = complete_manifest_migration(
+            &mut connection,
+            4,
+            1,
+            "CREATE INDEX widget_ids ON widgets(id)",
+        );
+        assert_eq!(second.target_generation(), 2);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            load_or_create_manifest(&mut connection, 4)
+                .unwrap()
+                .into_parts()
+                .0
+                .logical()
+                .schema_generation(),
+            2
+        );
+    }
+
+    #[test]
+    fn exact_sql_bytes_define_the_bounded_migration_identity() {
+        assert_eq!(
+            schema_migration_id("").unwrap_err().kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            schema_migration_id("SELECT 1\0SELECT 2")
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        let at_limit = "x".repeat(MAX_SCHEMA_MIGRATION_SQL_BYTES);
+        assert_eq!(
+            schema_migration_id(&at_limit).unwrap(),
+            schema_migration_digest(&at_limit)
+        );
+        assert_eq!(
+            schema_migration_id(&format!("{at_limit}x"))
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        assert_ne!(
+            schema_migration_id("CREATE TABLE t(id INTEGER)").unwrap(),
+            schema_migration_id("CREATE TABLE t (id INTEGER)").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_different_active_migration_takes_precedence_over_history_and_absence() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let completed_sql = "CREATE TABLE completed_marker (id INTEGER)";
+        complete_manifest_migration(&mut connection, 4, 0, completed_sql);
+        let active_sql = "CREATE TABLE active_marker (id INTEGER)";
+        let active = begin_schema_migration(&mut connection, 4, 1, active_sql).unwrap();
+
+        assert_eq!(
+            classify_schema_migration(&mut connection, 4, active_sql).unwrap(),
+            SchemaMigrationClassification::Active(active)
+        );
+        for conflicting_sql in [
+            completed_sql,
+            "CREATE TABLE previously_absent_marker (id INTEGER)",
+        ] {
+            let error = classify_schema_migration(&mut connection, 4, conflicting_sql).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+            assert_eq!(
+                error.to_string(),
+                "a different schema migration is already active"
+            );
+            let error = begin_schema_migration(&mut connection, 4, 1, conflicting_sql).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+            assert_eq!(
+                error.to_string(),
+                "a different schema migration is already active"
+            );
+        }
+    }
+
+    #[test]
+    fn held_transaction_journal_mutations_roll_back_on_error_and_panic() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let sql = "CREATE TABLE rollback_marker (id INTEGER)";
+
+        {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let active = begin_schema_migration_in_transaction(&transaction, 4, 0, sql).unwrap();
+            assert_eq!(active.next_shard(), 0);
+            drop(transaction);
+        }
+        assert!(matches!(
+            classify_schema_migration(&mut connection, 4, sql).unwrap(),
+            SchemaMigrationClassification::Absent
+        ));
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            begin_schema_migration_in_transaction(&transaction, 4, 0, sql).unwrap();
+            panic!("injected journal creation panic");
+        }));
+        assert!(panic.is_err());
+        assert!(
+            load_active_schema_migration(&mut connection, 4)
+                .unwrap()
+                .is_none()
+        );
+
+        let active = begin_schema_migration(&mut connection, 4, 0, sql).unwrap();
+        {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let advanced =
+                advance_schema_migration_in_transaction(&transaction, 4, &active, 1).unwrap();
+            assert_eq!(advanced.next_shard(), 1);
+            drop(transaction);
+        }
+        assert_eq!(
+            load_active_schema_migration(&mut connection, 4)
+                .unwrap()
+                .unwrap()
+                .next_shard(),
+            0
+        );
+
+        let mut active = active;
+        for next in 1..=4 {
+            active = advance_schema_migration(&mut connection, 4, &active, next).unwrap();
+        }
+        {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let complete =
+                finalize_schema_migration_in_transaction(&transaction, 4, &active).unwrap();
+            assert!(complete.is_complete());
+            drop(transaction);
+        }
+        let still_active = load_active_schema_migration(&mut connection, 4)
+            .unwrap()
+            .unwrap();
+        assert!(still_active.is_applying());
+        assert_eq!(
+            load_or_create_manifest(&mut connection, 4)
+                .unwrap()
+                .into_parts()
+                .0
+                .logical()
+                .schema_generation(),
+            0
+        );
+        finalize_schema_migration(&mut connection, 4, &still_active).unwrap();
+    }
+
+    #[test]
+    fn non_ready_layouts_require_an_empty_schema_migration_history() {
+        let mut creating = Connection::open_in_memory().unwrap();
+        let loaded = load_or_create_manifest(&mut creating, 4).unwrap();
+        assert_eq!(loaded.into_parts().1.state(), ShardLayoutState::Creating);
+        let error = begin_schema_migration(
+            &mut creating,
+            4,
+            0,
+            "CREATE TABLE cannot_start (id INTEGER)",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+
+        creating
+            .execute(
+                "INSERT INTO briskdb_schema_migrations VALUES (
+                    1, 0, ?1, 1, ?2, 4, 1, 0
+                 )",
+                rusqlite::params![
+                    schema_migration_digest("CREATE TABLE injected (id INTEGER)").as_slice(),
+                    "CREATE TABLE injected (id INTEGER)"
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            load_or_create_manifest(&mut creating, 4)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+
+        let mut adopting = Connection::open_in_memory().unwrap();
+        create_v4_manifest(&mut adopting, 4);
+        let loaded = load_or_create_manifest(&mut adopting, 4).unwrap();
+        assert_eq!(loaded.into_parts().1.state(), ShardLayoutState::Adopting);
+        assert!(
+            load_active_schema_migration(&mut adopting, 4)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn schema_migration_history_corruption_fails_closed() {
+        for mutation in [
+            "UPDATE briskdb_schema_migrations SET migration_id = zeroblob(32)",
+            "UPDATE briskdb_schema_migrations SET digest_version = 2",
+            "UPDATE briskdb_schema_migrations SET source_generation = 7",
+            "UPDATE briskdb_schema_migrations SET migration_state = 1",
+            "UPDATE briskdb_schema_migrations SET next_shard = 3",
+            "UPDATE briskdb_schema_migrations SET shard_count = 3",
+            "UPDATE briskdb_schema_migrations SET sql_text = sql_text || char(0)",
+            "UPDATE briskdb_schema_catalog SET schema_generation = 2",
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_ready_current_manifest(&mut connection, 4);
+            complete_manifest_migration(
+                &mut connection,
+                4,
+                0,
+                "CREATE TABLE corruption_target (id INTEGER)",
+            );
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            connection.execute_batch(mutation).unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .unwrap();
+
+            let error = load_or_create_manifest(&mut connection, 4).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::DataCorruption, "{mutation}");
+        }
+
+        let mut invalid_text = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut invalid_text, 4);
+        complete_manifest_migration(
+            &mut invalid_text,
+            4,
+            0,
+            "CREATE TABLE invalid_text_target (id INTEGER)",
+        );
+        invalid_text
+            .execute_batch(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE briskdb_schema_migrations SET sql_text = CAST(x'80' AS TEXT);
+                 PRAGMA ignore_check_constraints = OFF;",
+            )
+            .unwrap();
+        assert_eq!(
+            load_or_create_manifest(&mut invalid_text, 4)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
+
+    #[test]
+    fn concurrent_journal_creators_converge_or_reject_a_conflict() {
+        fn run(sqls: [&'static str; 2]) -> Vec<EngineResult<SchemaMigration>> {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("manifest.sqlite");
+            let mut setup = Connection::open(&path).unwrap();
+            create_ready_current_manifest(&mut setup, 4);
+            drop(setup);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let workers = sqls.map(|sql| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut connection = Connection::open(path).unwrap();
+                    connection.busy_timeout(Duration::from_secs(5)).unwrap();
+                    barrier.wait();
+                    begin_schema_migration(&mut connection, 4, 0, sql)
+                })
+            });
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect()
+        }
+
+        let identical = run([
+            "CREATE TABLE concurrent_same (id INTEGER)",
+            "CREATE TABLE concurrent_same (id INTEGER)",
+        ]);
+        assert!(identical.iter().all(Result::is_ok));
+        assert_eq!(
+            identical[0].as_ref().unwrap().migration_id(),
+            identical[1].as_ref().unwrap().migration_id()
+        );
+
+        let conflicting = run([
+            "CREATE TABLE concurrent_first (id INTEGER)",
+            "CREATE TABLE concurrent_second (id INTEGER)",
+        ]);
+        assert_eq!(
+            conflicting.iter().filter(|result| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            conflicting
+                .iter()
+                .find_map(|result| result.as_ref().err())
+                .unwrap()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
     }
 
     #[test]
@@ -3813,6 +5462,67 @@ mod tests {
     }
 
     #[test]
+    fn version_five_reader_rejects_version_six_without_mutating_it() {
+        const OLD_MIGRATIONS: &[Migration] = &[
+            Migration {
+                from: LEGACY_SCHEMA_VERSION,
+                to: V2_SCHEMA_VERSION,
+                name: "typed_manifest_and_downgrade_fence",
+                apply: migrate_v1_to_v2,
+                validate: validate_v2,
+            },
+            Migration {
+                from: V2_SCHEMA_VERSION,
+                to: V3_SCHEMA_VERSION,
+                name: "durable_shard_catalog",
+                apply: migrate_v2_to_v3,
+                validate: validate_v3,
+            },
+            Migration {
+                from: V3_SCHEMA_VERSION,
+                to: V4_SCHEMA_VERSION,
+                name: "logical_database_and_table_catalog",
+                apply: migrate_v3_to_v4,
+                validate: validate_v4,
+            },
+            Migration {
+                from: V4_SCHEMA_VERSION,
+                to: V5_SCHEMA_VERSION,
+                name: "validated_physical_shard_layout",
+                apply: migrate_v4_to_v5,
+                validate: validate_v5,
+            },
+        ];
+        const OLD_PLAN: MigrationPlan<'static> = MigrationPlan {
+            current_version: V5_SCHEMA_VERSION,
+            migrations: OLD_MIGRATIONS,
+            initialize_current: create_v5_schema,
+            initialize_interrupted_legacy: migrate_interrupted_legacy_to_v5,
+        };
+
+        let mut connection = Connection::open_in_memory().unwrap();
+        load_or_create(&mut connection, 4).unwrap();
+        let identity_before = identity(&connection);
+        let objects_before = schema_objects(&connection).unwrap();
+
+        let error = inspect_with_plan(&connection, 4, OLD_PLAN).unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert_eq!(identity(&connection), identity_before);
+        assert_eq!(schema_objects(&connection).unwrap(), objects_before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT requires_manifest_version FROM briskdb_metadata",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            i64::from(V6_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
     fn rejects_future_and_foreign_manifests_without_mutating_them() {
         let mut future = Connection::open_in_memory().unwrap();
         load_or_create(&mut future, 4).unwrap();
@@ -3855,7 +5565,7 @@ mod tests {
         for mutation in [
             "DELETE FROM briskdb_metadata",
             "DELETE FROM briskdb_manifest",
-            "INSERT INTO briskdb_metadata VALUES (5)",
+            "INSERT INTO briskdb_metadata VALUES (7)",
             "DELETE FROM briskdb_routing",
             "DELETE FROM briskdb_virtual_buckets WHERE bucket_id = 4095",
             "DELETE FROM briskdb_physical_shards WHERE shard_id = 3",
@@ -4144,6 +5854,17 @@ mod tests {
              ) STRICT;
              INSERT INTO briskdb_shard_layout
              VALUES (1, randomblob(16), 1112691528, 1, 1);",
+            "DROP TABLE briskdb_schema_migrations;
+             CREATE TABLE briskdb_schema_migrations (
+                target_generation INTEGER PRIMARY KEY,
+                source_generation INTEGER NOT NULL,
+                migration_id BLOB NOT NULL,
+                digest_version INTEGER NOT NULL,
+                sql_text TEXT NOT NULL,
+                shard_count INTEGER NOT NULL,
+                migration_state INTEGER NOT NULL,
+                next_shard INTEGER NOT NULL
+             ) STRICT;",
         ] {
             let mut connection = Connection::open_in_memory().unwrap();
             load_or_create(&mut connection, 4).unwrap();

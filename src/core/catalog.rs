@@ -1,6 +1,9 @@
 //! Protocol-neutral logical database and table metadata.
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use super::{EngineError, EngineErrorKind, EngineResult, RoutingCatalog};
 
@@ -208,19 +211,65 @@ impl TableMetadata {
     }
 }
 
-/// Immutable logical schema metadata loaded atomically with routing state.
+/// Stable logical schema metadata loaded atomically with routing state.
 ///
-/// The manifest v4 catalog is read-only and advisory. Existing raw SQLite
-/// tables are not inferred or adopted, and current execution behavior remains
-/// unchanged until cataloged DDL and schema journaling are implemented.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Database and table entries remain immutable for the lifetime of this view.
+/// Its application-schema generation advances in place only after the durable
+/// migration coordinator commits a new generation, so existing `&Catalog`
+/// references observe publication without replacing the catalog allocation.
 pub struct Catalog {
     identifier_encoding_version: u32,
-    schema_generation: u64,
+    schema_generation: AtomicU64,
     default_database_id: LogicalDatabaseId,
     databases: Box<[LogicalDatabaseMetadata]>,
     tables: Box<[TableMetadata]>,
 }
+
+impl fmt::Debug for Catalog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Catalog")
+            .field(
+                "identifier_encoding_version",
+                &self.identifier_encoding_version,
+            )
+            .field("schema_generation", &self.schema_generation())
+            .field("default_database_id", &self.default_database_id)
+            .field("databases", &self.databases)
+            .field("tables", &self.tables)
+            .finish()
+    }
+}
+
+impl Clone for Catalog {
+    fn clone(&self) -> Self {
+        Self {
+            identifier_encoding_version: self.identifier_encoding_version,
+            // Catalog clones retain value semantics: a clone is an independent
+            // metadata snapshot at the generation observed here. Shared live
+            // views use the existing Arc<CatalogSnapshot> storage boundary.
+            schema_generation: AtomicU64::new(self.schema_generation()),
+            default_database_id: self.default_database_id,
+            databases: self.databases.clone(),
+            tables: self.tables.clone(),
+        }
+    }
+}
+
+impl PartialEq for Catalog {
+    fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        self.identifier_encoding_version == other.identifier_encoding_version
+            && self.schema_generation() == other.schema_generation()
+            && self.default_database_id == other.default_database_id
+            && self.databases == other.databases
+            && self.tables == other.tables
+    }
+}
+
+impl Eq for Catalog {}
 
 impl Catalog {
     pub(crate) fn from_validated_parts(
@@ -250,7 +299,7 @@ impl Catalog {
         }));
         Self {
             identifier_encoding_version,
-            schema_generation,
+            schema_generation: AtomicU64::new(schema_generation),
             default_database_id: LogicalDatabaseId::from_validated(default_database_id),
             databases,
             tables,
@@ -262,9 +311,46 @@ impl Catalog {
         self.identifier_encoding_version
     }
 
-    /// Return the cataloged application-schema generation.
-    pub const fn schema_generation(&self) -> u64 {
-        self.schema_generation
+    /// Return the latest durably published application-schema generation.
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation.load(Ordering::Acquire)
+    }
+
+    /// Publish one committed application-schema generation in place.
+    ///
+    /// Re-publishing the already visible target is idempotent. Every other
+    /// stale, skipped, or regressing transition is an internal coordination
+    /// error: manifest validation is responsible for establishing the durable
+    /// source and target before this in-memory publication occurs.
+    pub(crate) fn publish_schema_generation(
+        &self,
+        expected_generation: u64,
+        target_generation: u64,
+    ) -> EngineResult<()> {
+        if expected_generation.checked_add(1) != Some(target_generation) {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                format!(
+                    "invalid in-memory schema-generation transition {expected_generation} -> {target_generation}"
+                ),
+            ));
+        }
+
+        match self.schema_generation.compare_exchange(
+            expected_generation,
+            target_generation,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(observed) if observed == target_generation => Ok(()),
+            Err(observed) => Err(EngineError::new(
+                EngineErrorKind::Internal,
+                format!(
+                    "cannot publish schema generation {target_generation}; in-memory catalog is at generation {observed}"
+                ),
+            )),
+        }
     }
 
     /// Return the storage-default logical database.
@@ -370,6 +456,11 @@ fn ensure_catalog_identifier(identifier: &str) -> EngineResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use super::*;
 
     fn sample_catalog() -> Catalog {
@@ -518,5 +609,101 @@ mod tests {
         assert_send_sync_static::<TablePlacement>();
         assert_send_sync_static::<ShardKeyMetadata>();
         assert_send_sync_static::<ShardKeyType>();
+    }
+
+    #[test]
+    fn schema_generation_publication_is_monotonic_idempotent_and_visible_in_place() {
+        let catalog = sample_catalog();
+        let retained_reference = &catalog;
+
+        catalog.publish_schema_generation(7, 8).unwrap();
+        assert_eq!(retained_reference.schema_generation(), 8);
+        catalog.publish_schema_generation(7, 8).unwrap();
+        assert_eq!(catalog.schema_generation(), 8);
+
+        for (source, target) in [(8, 8), (8, 7), (8, 10), (u64::MAX, 0)] {
+            let error = catalog
+                .publish_schema_generation(source, target)
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+            assert_eq!(catalog.schema_generation(), 8);
+        }
+
+        catalog.publish_schema_generation(7, 8).unwrap();
+        assert_eq!(catalog.schema_generation(), 8);
+        assert_eq!(
+            catalog.publish_schema_generation(9, 10).unwrap_err().kind(),
+            EngineErrorKind::Internal
+        );
+    }
+
+    #[test]
+    fn clone_debug_and_equality_keep_snapshot_value_semantics() {
+        let catalog = sample_catalog();
+        assert_eq!(catalog, catalog);
+        let cloned = catalog.clone();
+        assert_eq!(catalog, cloned);
+        assert_eq!(format!("{catalog:?}"), format!("{cloned:?}"));
+
+        catalog.publish_schema_generation(7, 8).unwrap();
+        assert_eq!(catalog.schema_generation(), 8);
+        assert_eq!(cloned.schema_generation(), 7);
+        assert_ne!(catalog, cloned);
+        assert!(format!("{catalog:?}").contains("schema_generation: 8"));
+        assert!(format!("{cloned:?}").contains("schema_generation: 7"));
+    }
+
+    #[test]
+    fn concurrent_publishers_and_readers_never_observe_a_generation_regression() {
+        let catalog = Arc::new(sample_catalog());
+        let publishers = 8;
+        let publish_barrier = Arc::new(Barrier::new(publishers + 1));
+        let mut publish_threads = Vec::new();
+        for _ in 0..publishers {
+            let catalog = Arc::clone(&catalog);
+            let barrier = Arc::clone(&publish_barrier);
+            publish_threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                catalog.publish_schema_generation(7, 8)
+            }));
+        }
+        publish_barrier.wait();
+        for thread in publish_threads {
+            thread.join().unwrap().unwrap();
+        }
+        assert_eq!(catalog.schema_generation(), 8);
+
+        let readers = 8;
+        let read_barrier = Arc::new(Barrier::new(readers + 1));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut read_threads = Vec::new();
+        for _ in 0..readers {
+            let catalog = Arc::clone(&catalog);
+            let barrier = Arc::clone(&read_barrier);
+            let finished = Arc::clone(&finished);
+            read_threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut observed = catalog.schema_generation();
+                while !finished.load(Ordering::Acquire) {
+                    let next = catalog.schema_generation();
+                    assert!(next >= observed);
+                    observed = next;
+                    std::hint::spin_loop();
+                }
+                assert!(catalog.schema_generation() >= observed);
+            }));
+        }
+
+        read_barrier.wait();
+        for generation in 9..=1_024 {
+            catalog
+                .publish_schema_generation(generation - 1, generation)
+                .unwrap();
+        }
+        finished.store(true, Ordering::Release);
+        for thread in read_threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(catalog.schema_generation(), 1_024);
     }
 }

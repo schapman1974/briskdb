@@ -338,6 +338,28 @@ mod tests {
                 "/v1/execute",
                 Some(json!({
                     "shard_key": "widget-1",
+                    "sql": "CREATE TABLE bypassed_migration (id INTEGER)"
+                })),
+            )
+            .await,
+            (
+                StatusCode::FORBIDDEN,
+                json!({
+                    "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#permission-denied",
+                    "title": "Permission denied",
+                    "status": 403,
+                    "detail": "The operation is not permitted.",
+                    "code": "permission_denied"
+                }),
+            )
+        );
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/execute",
+                Some(json!({
+                    "shard_key": "widget-1",
                     "sql": "INSERT INTO widgets (id, name) VALUES (?1, ?2)",
                     "params": ["widget-1", "First widget"]
                 })),

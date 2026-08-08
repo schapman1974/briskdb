@@ -47,7 +47,7 @@ translation layer. HTTP requests send SQLite SQL directly to `rusqlite`.
 | --- | --- | --- | --- |
 | HTTP `/v1/execute` | Experimental | One SQLite statement with positional parameters | Required caller-provided `shard_key` |
 | HTTP `/v1/query` | Experimental | One prepared SQLite statement executed through the row-returning path | Required caller-provided `shard_key` |
-| HTTP `/v1/admin/broadcast` | Experimental | A parameterless SQLite statement batch | Sequentially applied to every shard |
+| HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
 | PostgreSQL wire protocol | Planned | Common subset plus documented PostgreSQL normalization | SQL/bound-parameter inference with explicit session fallback |
 | MySQL wire protocol | Planned | Common subset plus documented MySQL normalization | SQL/bound-parameter inference with explicit session fallback |
 
@@ -65,8 +65,9 @@ accepts 1–16 active connections and 1–1,024 queued operations per shard,
 provided the configured shard count and per-shard active limit do not exceed
 512 total active connections. Connections are opened lazily and reused. A full
 queue returns the retryable `Busy` error (HTTP 503), while single-shard routed
-work waiting on one shard does not consume another shard's capacity. Broadcast
-intentionally reserves one slot in every shard pool before it dispatches.
+work waiting on one shard does not consume another shard's capacity. Schema
+migration drains admitted ordinary work and uses fresh coordinator-owned
+connections instead of reserving every shard pool.
 
 SQLite forms that can leave connection-local state remain allowed by the
 current one-call pass-through, but they are uncontracted. The pool observes
@@ -80,26 +81,28 @@ starts with fresh SQLite counter state. The real statement then runs once on the
 fresh handle. Any other probe error also fails closed to a fresh handle, after
 which replacement acquisition can return a storage error; otherwise the normal
 statement boundary produces the public SQL result or error. Broadcast batches
-instead receive a fresh handle up front when ownership changes, avoiding any
-multi-statement preflight. After the call, a tainted connection is closed instead
-of being reused. A connection left in a transaction is also retired after
-rollback cleanup is attempted. This preserves existing one-call SQLite behavior
-without allowing connection-local state or observer metadata such as
-`PRAGMA data_version` to leak into another ephemeral HTTP session; it does not
-add multi-request transactions or promise compatibility for those statements.
+use dedicated handles and the migration-specific authorizer described below.
+After an ordinary call, a tainted connection is closed instead of being reused.
+A connection left in a transaction is also retired after rollback cleanup is
+attempted. This preserves existing one-call SQLite behavior without allowing
+connection-local state or observer metadata such as `PRAGMA data_version` to
+leak into another ephemeral HTTP session; it does not add multi-request
+transactions or promise compatibility for those statements.
 
 The pass-through boundary excludes BriskDB-owned storage identity. Client SQL
 may not read or mutate `briskdb_shard_metadata`, create objects in the reserved
-`briskdb_*` namespace, or mutate `application_id`, `user_version`, persistent
+`briskdb` or `briskdb_*` namespaces, or mutate `application_id`, `user_version`, persistent
 `journal_mode`, `schema_version`, or `writable_schema`. The SQLite authorizer
-denies those operations through routed and broadcast execution. These controls
-are reserved for startup validation and future schema migrations, so denial is
-stable BriskDB behavior rather than connection-hygiene policy.
+denies those operations through every client execution path. Ordinary routed
+SQL also denies persistent schema DDL. These controls are reserved for startup
+validation and the journaled migration coordinator, so denial is stable
+BriskDB behavior rather than connection-hygiene policy.
 
-`ALTER TABLE` is also denied on every client surface. SQLite reports the source
-table to its authorizer but not a `RENAME TO` destination, so selectively
-allowing it would let a client create a name inside the reserved `briskdb_*`
-namespace. A future schema API can coordinate and validate those changes.
+`ALTER TABLE` is denied through ordinary execute/query SQL but permitted inside
+the journaled migration batch. That coordinator denies transaction/savepoint
+escape, attachments, temporary and virtual objects, and storage-owned state.
+SQLite reports the source table but not a `RENAME TO` destination, so BriskDB
+also compares the reserved schema before and after the migration transaction.
 
 SQLite also retains `last_insert_rowid()`, `changes()`, and `total_changes()` on
 the physical connection after ordinary writes. A write-bearing handle may be
@@ -124,13 +127,34 @@ forms such as DML `RETURNING`; callers must use the execute surface, whose
 result is rows affected rather than returned rows. Exact accounting and
 configuration semantics are in [request controls](REQUEST_CONTROLS.md).
 
-Broadcast execution remains non-atomic: its parameterless SQL batch is not
-wrapped in a transaction on each shard, and shards are processed sequentially.
-A failure can therefore leave earlier statements committed on the failing
-shard as well as leave earlier shards fully or partially updated. Cancellation
-preserves the completed shard prefix and stops before later shards. Pooling and
-request controls do not change the manifest schema, shard files, or stored-data
-format.
+The `broadcast` surface now implements one application-schema migration. Before
+it creates a journal, BriskDB runs the complete batch on every shard in an
+immediate transaction and rolls each preflight transaction back. It then
+records the exact SQL, applies shards in ascending order, and commits one
+shard's complete batch together with its next `user_version` atomically. There
+is no transaction across shard files. A failure or cancellation after journal
+publication retains a valid committed prefix, and the byte-identical request or
+the next startup resumes it before ordinary work may continue.
+
+Migration identity is digest version 1: the full BLAKE3 digest of the exact
+UTF-8 SQL bytes. SQL must contain 1 through 65,536 bytes and no NUL. Whitespace,
+comments, and casing are identity-significant. Completed journal rows and their
+exact SQL remain in the manifest, so callers must not include credentials or
+other sensitive literals. A byte-identical retry of completed SQL is
+idempotent and does not advance the schema generation again.
+The migration does not infer or update advisory `briskdb_tables` rows. Richer
+migration/history APIs remain issue #53, and schema-equivalence checks,
+checksums, and explicit degraded states remain issue #18.
+
+The schema gate admits no new routed work after migration begins and waits for
+previously admitted operations to drain. During active preflight or apply,
+ordinary requests and a second migration coordinator receive retryable `Busy`
+(HTTP 503). If durable journal progress remains after failure or cancellation,
+ordinary requests receive non-retryable `FailedPrecondition` (HTTP 409); the
+same migration call may resume it. Cancellation before journal creation leaves
+no schema change. Cancellation during one shard transaction rolls that
+transaction back, although a commit that wins a close race remains durable and
+is reconciled from the retained journal prefix.
 
 ### Current parameter and result conversion
 
@@ -222,7 +246,7 @@ SQLite library and used through the matching HTTP endpoint:
 
 | Operation | Current contract | Important boundary |
 | --- | --- | --- |
-| `CREATE TABLE`, `CREATE INDEX` | Execute through the broadcast endpoint | Sequential, non-atomic across shards |
+| Persistent DDL, including `CREATE`, `DROP`, and `ALTER` | Execute only through the migration/broadcast endpoint | Per-shard atomic and crash-resumable; not atomic across shards |
 | `INSERT`, `UPDATE`, `DELETE` | Execute on the shard selected by `shard_key` | BriskDB does not yet prove that SQL values match the supplied key |
 | `SELECT` | Query the shard selected by `shard_key` | No scatter/gather path |
 | SQLite expressions and functions | Passed through without translation | Semantics are SQLite semantics |
@@ -231,11 +255,12 @@ SQLite library and used through the matching HTTP endpoint:
 Other SQLite syntax may happen to pass through, but it is not a stable BriskDB
 contract until it appears in this table and has conformance tests. In
 particular, multi-request transactions, multi-shard writes, multiple statements
-outside the broadcast endpoint, and attached-database operations are
-uncontracted public API behavior today. DML `RETURNING` is explicitly rejected
-from the query surface, and the execute surface exposes only a rows-affected
-count, never a returned rowset. The experimental raw HTTP path uses those same
-engine boundaries.
+outside the migration endpoint, and attached-database operations are
+uncontracted public API behavior today. Persistent DDL outside the migration
+endpoint is explicitly denied. DML `RETURNING` is explicitly rejected from the
+query surface, and the execute surface exposes only a rows-affected count,
+never a returned rowset. The experimental raw HTTP path uses those same engine
+boundaries.
 
 The current `Session` `Ready`/`Closed` lifecycle is not a transaction state
 machine. Real `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction behavior, and
@@ -250,7 +275,7 @@ authorize an adapter to bypass the shared asynchronous boundary.
 
 The first driver-capable SQL subset will include:
 
-- `CREATE TABLE` and `CREATE INDEX` through cataloged schema migrations;
+- `CREATE TABLE` and `CREATE INDEX` through journaled schema migrations;
 - `SELECT`, including documented filters, ordering, limits, and aggregates;
 - `INSERT`, `UPDATE`, and `DELETE` when a single shard can be proven;
 - `BEGIN`, `COMMIT`, and `ROLLBACK` for transactions pinned to one shard; and
@@ -345,16 +370,18 @@ underlying execution semantics.
   prefix selects one of 4,096 virtual buckets through the versioned
   compatibility algorithm.
 - The final physical shard is read from the validated, generation-stamped
-  bucket map retained in manifest version 5. Routing generation 1 preserves
+  bucket map retained in manifest version 6. Routing generation 1 preserves
   the earlier modulo placement for every supported shard count.
-- Manifest version 5 retains the immutable logical catalog introduced in v4,
-  with schema generation 0 and default database ID 1 named `default`. Its
-  optional table rows can describe sharded, global, or catalog placement and a
-  sharded table's `Int64`, text, or binary key column.
-- A ready v5 layout binds every shard to one random 16-byte layout ID and its
+- Manifest version 6 retains the read-only logical catalog introduced in v4,
+  with a journaled schema generation from 0 through 2,147,483,647 and default
+  database ID 1 named `default`. Its optional table rows can describe sharded,
+  global, or catalog placement and a sharded table's `Int64`, text, or binary
+  key column.
+- The ready layout retained from v5 binds every shard to one random 16-byte
+  layout ID and its
   physical shard ID. Each connection is opened without create or symlink
-  following and must match the `BRSH` application ID, schema-generation-0 user
-  version, exact metadata, and existing WAL mode.
+  following and must match the `BRSH` application ID, expected schema
+  generation, exact metadata, and existing WAL mode.
 - Logical metadata is currently read-only and advisory. Fresh manifests and
   upgrades originating before v4 contain no table rows; v4-to-v5 retains every
   validated v4 logical-catalog row. Existing physical tables are not inferred
@@ -362,7 +389,9 @@ underlying execution semantics.
 - Point queries and writes visit only that shard.
 - No scatter/gather query path exists.
 - Unique constraints and transactions are local to one SQLite shard.
-- Schema broadcast applies sequentially and can be partially completed.
+- Schema migration preflights every shard, then commits an ascending prefix
+  under a retained journal. Each shard is atomic; the shard set is not one
+  transaction, and startup resumes a partial prefix before serving work.
 
 ### Planned stable contract
 
@@ -393,11 +422,14 @@ run internally during storage open, are transactional only within
 statement. The atomic version-3-to-version-4 manifest upgrade adds only
 read-only advisory logical metadata and its downgrade fence. It does not infer
 or adopt existing physical tables and does not change shard schemas, supported
-SQLite syntax, result conversion, routing, or broadcast semantics. Version 5
-then adds a resumable physical-layout state machine. Its `Adopting` path accepts
-only exact legacy zero-header WAL shards, preserves their tables and rows, and
-adds BriskDB identity metadata. It does not make application-schema changes or
-turn sequential broadcast into an atomic cross-file operation.
+SQLite syntax, result conversion, or routing. Version 5 then adds a resumable
+physical-layout state machine. Its `Adopting` path accepts only exact legacy
+zero-header WAL shards, preserves their tables and rows, and adds BriskDB
+identity metadata. Version 6 adds the application-schema journal. A migration
+batch and generation are atomic within each shard, and final journal state plus
+catalog generation are atomic within the manifest, but no transaction spans
+those files. Ascending-prefix validation and replay provide recovery rather
+than cross-file atomicity.
 See the [manifest storage-format contract](STORAGE_FORMAT.md).
 
 Scatter reads will combine committed results from multiple SQLite files. They

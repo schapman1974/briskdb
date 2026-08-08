@@ -58,7 +58,10 @@ layout members by themselves. The directory must nevertheless permit SQLite to
 create and recover its sidecars. Do not infer damage from a missing sidecar;
 BriskDB validates the database's persistent journal mode instead.
 
-Only a single BriskDB server process per data directory is currently tested.
+Only a single BriskDB server process per data directory is supported. The
+process-wide registry makes independent `Database` and `Engine` handles that
+resolve to the same canonical root share schema admission and catalog
+publication. It does not coordinate separate server processes.
 Do not copy, move, edit, or separately open the manifest, shard, WAL, or shared
 memory files while the server is running. Backup, restore, multi-process
 access, filesystem-fault behavior, and crash-recovery guarantees will become
@@ -66,18 +69,33 @@ supported only when their roadmap issues add the corresponding automated
 tests.
 
 Opening a data directory can transactionally upgrade `manifest.sqlite` and can
-resume a manifest-recorded cross-file shard provisioning or adoption step; see
-the [manifest storage-format contract](STORAGE_FORMAT.md). Outside the explicit
-`Creating` state, every shard is opened read-write with SQLite create and
-symbolic-link following disabled. A missing, extra canonical, swapped, foreign,
-non-WAL, or wrong-generation shard file is rejected, as is a shard cloned into
-another slot or layout. It is not recreated, reassigned, or silently
-reconfigured. Recovery requires restoring the correct complete layout.
+resume a manifest-recorded cross-file shard provisioning, adoption, or
+application-schema migration step; see the
+[manifest storage-format contract](STORAGE_FORMAT.md). After manifest load or
+upgrade, an active schema migration is resumed before ordinary layout
+reconciliation and final strict shard validation. All startup work finishes
+before the server accepts requests. Outside the explicit `Creating` state,
+every shard is opened read-write with SQLite create and symbolic-link following
+disabled. A missing, extra canonical, swapped, foreign, non-WAL, or
+wrong-generation shard file is rejected, as is a shard cloned into another slot
+or layout. It is not recreated, reassigned, or silently reconfigured. Recovery
+requires restoring the correct complete layout.
+
+The manifest final path component is likewise required to be a regular file.
+Startup and runtime migration opens disable symbolic-link following; a runtime
+open will not create a missing manifest and rechecks the opened layout identity
+before journal mutation.
+
+Manifest v6 retains each migration's exact SQL text for idempotency and startup
+recovery. Treat the data directory accordingly and do not include credentials,
+tokens, or other sensitive literals in migration SQL.
 
 Manifest and shard application IDs plus the random 16-byte layout ID guard
 against accidental wrong-file placement. They are not authentication, checksums,
-or protection from a process that can write the data directory. Process-kill,
-power-loss, and filesystem-fault certification remains later hardening work.
+or protection from a process that can write the data directory. Targeted
+subprocess-abort tests cover schema-journal persistence boundaries, but
+arbitrary process-kill timing, power-loss, and filesystem-fault certification
+remain later hardening work.
 
 When reporting a platform problem, include the BriskDB revision, `rustc -Vv`,
 operating-system and architecture details, filesystem type, mount options, and
