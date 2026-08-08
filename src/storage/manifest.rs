@@ -1158,8 +1158,7 @@ fn validate_virtual_buckets(connection: &Connection, shard_count: u16) -> Engine
     }
 
     let mut assignments = vec![0_u16; usize::from(shard_count)];
-    for (expected, (stored_bucket, stored_shard)) in (0..VIRTUAL_BUCKET_COUNT).zip(rows.into_iter())
-    {
+    for (expected, (stored_bucket, stored_shard)) in (0..VIRTUAL_BUCKET_COUNT).zip(rows) {
         if stored_bucket != i64::from(expected) {
             return Err(EngineError::new(
                 EngineErrorKind::DataCorruption,
