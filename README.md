@@ -28,6 +28,10 @@ The [bound statement-planning contract](docs/SQL_PLANNING.md) defines the
 synchronous engine API that turns one statement's actual bound values into
 owned routes, validates inferred and explicit physical targets, rejects
 unroutable sharded writes, and records a single-shard assignment where valid.
+The [prepared-statement contract](docs/SQL_PREPARED_STATEMENTS.md) defines the
+protocol-neutral prepare/bind/describe/execute lifecycle, session-scoped
+statement and portal caches, exact resource limits, metadata refresh, and
+supported physical-target execution boundary shared by future adapters.
 The [error contract](docs/ERRORS.md) defines stable engine error kinds, safe
 HTTP problem details, and the mappings reserved for future PostgreSQL and MySQL
 adapters.
@@ -54,6 +58,9 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Finite per-query row/logical-byte budgets with no partial results
 - Explicit graceful drain, forced cancellation, and blocking handle cleanup
 - Protocol-neutral typed values, ordered columns, positional rows, and results
+- A bounded per-session prepared-statement and immutable bound-portal lifecycle
+  with transient shard-0 metadata compilation, bind-time routing snapshots,
+  fresh execute-time planning, and supported physical-target execution
 - A bounded SQL AST parser plus recursive common-subset validator for explicit
   SQLite, PostgreSQL, and MySQL dialects, followed by opt-in source-preserving
   placeholder normalization, per-statement binding metadata, and catalog-aware
@@ -110,6 +117,21 @@ SIGTERM stop new admissions, drain or cancel admitted SQLite work, close idle
 handles, and then stop the process. Accepted HTTP connections are tracked;
 connections that outlive the grace window are force-closed and joined before
 the server returns.
+
+Each session defaults to at most 128 prepared statements, 128 bound portals,
+and a 16 MiB ceiling for retained bound values/captured routing bytes and one
+bind's conservative planning expansion. Configure
+these with `--max-prepared-statements-per-session` /
+`BRISKDB_MAX_PREPARED_STATEMENTS_PER_SESSION`,
+`--max-portals-per-session` / `BRISKDB_MAX_PORTALS_PER_SESSION`, and
+`--max-retained-bound-value-bytes` /
+`BRISKDB_MAX_RETAINED_BOUND_VALUE_BYTES`. The hard caps are 1,024 statements,
+1,024 portals, and 1 GiB. Full caches reject new entries without evicting open
+handles. Before planner allocation, the captured route is charged once and
+every normalized marker occurrence charges twice its logical accounted value
+bytes against the same byte ceiling; repeated markers are charged per
+occurrence even though the portal retains one bound value. This is an
+accounting model, not a retained wire encoding.
 
 Create a table on every shard:
 
@@ -199,13 +221,35 @@ parameters, explicit_routing_key)` to retain the inference and produce one
 owned canonical route per inferred value plus an independent explicit route.
 That call compares finite inferred and explicit routes by physical shard,
 rejects cross-shard or otherwise unroutable cataloged sharded DML, prevents
-shard-key updates, and exposes the accepted `assigned_shard()`. The plan
-records schema and routing provenance but does not classify complete request
-behavior or execute anything. Translation and planning remain independent
-opt-in branches over the same normalized request. The HTTP execute, query, and
-migration endpoints invoke none of these opt-in layers and retain their
-existing raw SQLite behavior. The exact translation matrix and strict-mode
-boundary are in [`docs/SQL_TRANSLATION.md`](docs/SQL_TRANSLATION.md).
+shard-key updates, and exposes the accepted `assigned_shard()`. The synchronous
+plan API records schema and routing provenance but does not classify complete
+request behavior or execute anything.
+
+Rust callers can instead create a `PrepareRequest` with an explicit logical
+database, dialect, translation mode, and SQL string. `Engine::prepare_statement`
+runs the complete frontend pipeline, requires exactly one top-level statement,
+transiently compiles metadata on shard 0, and caches only BriskDB-owned SQL and
+metadata in the session. `bind_statement` snapshots typed values and the
+session's current route into an immutable portal after transiently validating a
+plan from those concrete values. `describe_prepared` returns owned `Unknown`
+parameter/result types and refreshes column metadata after a schema-generation
+change.
+`execute_portal` always plans again from the retained values and route snapshot
+under the current schema guard. It runs accepted sharded work on its assigned
+shard and safe column-producing `NotApplicable`/`Global` reads on deterministic
+shard 0, returning routed rows or an affected-row count. There is no implicit
+cache eviction, no retained plan, `rusqlite` statement, or connection, and
+closing a statement closes all of its portals. Complete statement behavior and
+batch classification remain issue #27; sharded reads requiring scatter do not
+execute through this lifecycle.
+
+Translation and planning remain independently callable branches over the same
+normalized request. The HTTP execute, query, and migration endpoints invoke
+none of these opt-in/prepared layers and retain their existing raw SQLite
+behavior. The exact translation matrix and strict-mode boundary are in
+[`docs/SQL_TRANSLATION.md`](docs/SQL_TRANSLATION.md), and the complete lifecycle
+is in
+[`docs/SQL_PREPARED_STATEMENTS.md`](docs/SQL_PREPARED_STATEMENTS.md).
 
 `EngineOptions` permits 1–16 active connections and 1–1,024 queued operations
 per shard, with at most 512 active connections across all shards.
@@ -309,9 +353,9 @@ Independent `Database` and `Engine` handles in one process that resolve to the
 same canonical data directory share schema coordination. Separate BriskDB
 server processes must not use the same data directory.
 
-Near-term work includes authentication, richer migration administration and
-status APIs in issue #53, scatter/gather reads, observability, and backup
-tooling.
+Near-term work includes authoritative statement and batch classification,
+authentication, richer migration administration and status APIs in issue #53,
+scatter/gather reads, observability, and backup tooling.
 
 ## License
 

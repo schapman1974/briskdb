@@ -21,7 +21,7 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, errors, read-only logical catalog, synchronous bound-value-aware plans, and single-shard routing policy; stable key routing; bounded per-shard admission and connection pools; routed execute/query and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only logical catalog, synchronous bound-value-aware plans, prepared lifecycle, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, session/write policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
@@ -75,11 +75,11 @@ durably published generation in place; consequently, its public
 That is an intentional pre-1.0 source-level change.
 
 The module names are stable boundaries, not a claim that later roadmap work is
-already complete. The async engine, session lifecycle, bounded per-shard pools,
-request controls, and explicit shutdown lifecycle are now in place. The
-synchronous `Database` API remains available as a Rust compatibility surface;
-existing engine and server entry points retain their signatures and delegate to
-the controlled defaults.
+already complete. The async engine, session and prepared-object lifecycle,
+bounded per-session caches, bounded per-shard pools, request controls, and
+explicit shutdown lifecycle are now in place. The synchronous `Database` API
+remains available as a Rust compatibility surface; existing engine and server
+entry points retain their signatures and delegate to the controlled defaults.
 
 ## SQL parser boundary
 
@@ -124,9 +124,10 @@ contract](SQL_SUBSET.md).
 
 The current HTTP execute/query and migration paths deliberately remain raw
 SQLite pass-through and call none of the parser, subset validator, placeholder
-normalizer, translator, shard-key inference, or bound statement-planning
-layers. Issues #19 through #25 therefore change no HTTP shape, SQL acceptance,
-execution routing, or storage behavior.
+normalizer, translator, shard-key inference, bound statement-planning, or
+prepared-lifecycle layers. Issues #19 through #26 therefore change no HTTP
+shape, SQL acceptance, execution routing, or storage behavior. Rust callers can
+now invoke those layers together through the separate prepared API.
 
 ### Placeholder-normalization boundary
 
@@ -142,7 +143,9 @@ Each statement, including one without placeholders, has an ordered
 `StatementParameters` record with its largest assigned index, occurrence
 count, and occurrence-to-index sequence. This metadata lets later bind-time
 planning distinguish repeated parameters and gaps without owning protocol
-buffers. It does not inspect the bound values themselves.
+buffers. Prepared bind uses that occurrence sequence for its conservative
+planning-expansion preflight; normalization itself does not inspect the bound
+values.
 
 Normalization uses retained AST placeholder spans rather than regular
 expressions or AST formatting. Every non-marker byte remains exact, including
@@ -231,18 +234,61 @@ classification remain issue #27.
 Planning holds the existing schema-operation guard while it reads logical and
 routing state. The owned result records schema generation, map generation, and
 the hash, key-encoding, and bucket-algorithm versions used for the lookup. That
-provenance does not reserve future state; an eventual execution integration
-must establish that the physical schema and routing snapshot remain
-authoritative before using a plan.
+provenance does not reserve future state. Prepared bind uses a transient plan
+for validation; portal execution always creates a new plan from the portal's
+owned bind snapshot under its current schema-operation guard.
 
-The planner is stateless and its assignment is still non-executable. It does
-not invoke translation, mutate a session, cache a prepared statement, apply
-batch policy, open a shard connection, scatter reads, or execute anything. The
-normative API, assignment matrix, encoding, provenance, error, boundary, and
-testing rules are in the [bound statement-planning and routing-policy
+The public planner remains stateless and its assignment alone is not execution
+permission. It does not invoke translation, mutate a session, cache a prepared
+statement, apply batch policy, open a shard connection, scatter reads, or
+execute anything. The normative API, assignment matrix, encoding, provenance,
+error, boundary, and testing rules are in the
+[bound statement-planning and routing-policy
 contract](SQL_PLANNING.md). Translation is the separate implemented issue #25
-branch over the same `NormalizedSql`; issues #26 and #27 own
-prepared-statement/session lifecycle and authoritative statement/batch policy.
+branch over the same `NormalizedSql`; issue #26's prepared lifecycle consumes
+both layers, while issue #27 still owns authoritative statement/batch policy.
+
+### Prepared-statement and portal boundary
+
+`Engine::prepare_statement` accepts an owned `PrepareRequest` with one logical
+database, source dialect, explicit translation mode, and SQL string. It runs
+parse, exact-one top-level validation, subset validation, placeholder
+normalization, and translation, then transiently compiles metadata on shard 0.
+The session cache retains only BriskDB-owned `TranslatedSql` plus owned
+parameter/column metadata. No `rusqlite::Statement`, rows iterator, SQLite
+connection, pool handle, or protocol buffer crosses the operation boundary.
+
+Prepared-statement and portal IDs are opaque, monotonic, never reused, and
+bound to their process-unique owning session. Binding validates concrete typed
+values with a transient plan, snapshots the session routing bytes, and stores
+only that snapshot and the values in an immutable logical portal. Later
+session-route changes do not affect it. Describing after a schema-generation
+change recompiles owned metadata on shard 0. Every execution plans again from
+the portal snapshot under the current schema/routing guard before choosing the
+supported physical target. Safe
+column-producing `NotApplicable` and `Global` reads may use deterministic shard
+0; a sharded read that still needs scatter remains unsupported. Catalog
+placement is never exposed as an application read target.
+
+Per-session limits independently bound statement count, portal count, and the
+logical accounted value bytes plus routing bytes retained by all portals. Full
+caches return `LimitExceeded`; there is no implicit eviction. Closing a
+statement cascades to its portals, closing a portal releases its bytes, and
+closing the session clears all prepared state. Same-session operations are
+serialized by the existing session mutex, including SQLite metadata and
+execution work.
+
+The retained-value ceiling also preflights one bind's transient planning
+expansion by charging its captured route once and each normalized marker
+occurrence twice; repeated markers cannot cause unbounded inference/route
+allocation before the check.
+
+The prepared lifecycle integrates the previously independent SQL and planning
+layers but deliberately does not publish the complete statement classifier,
+execute a multi-statement batch, scatter reads, or implement transactions.
+Those remain issue #27 and the later planner/transaction milestones. The
+complete API, accounting, execution, error, adapter, and persistence contract
+is in [prepared statements and bound portals](SQL_PREPARED_STATEMENTS.md).
 
 ## Manifest storage boundary
 
@@ -414,8 +460,11 @@ The current routing context is an optional caller-supplied shard key. Routed
 execute and query operations require that context, and the engine alone hashes
 it and reports the selected shard in `Routed<T>`. `Statement` owns its SQL text
 and typed parameters so an adapter can hand work across the asynchronous
-boundary without borrowing protocol buffers. `EngineStatus` exposes the shard
-count needed by health reporting without exposing the storage implementation.
+boundary without borrowing protocol buffers. Prepared statements and portals
+are session-scoped logical objects; binding captures the routing context so a
+later session change cannot retarget an existing portal. `EngineStatus` exposes
+the shard count and prepared-state limits needed by health/configuration
+reporting without exposing the storage implementation.
 
 HTTP is stateless at this stage: each execute or query request creates a fresh
 session and initializes its routing context from the request's `shard_key`.
@@ -439,10 +488,15 @@ constructors and server assembly use the defaults, so their APIs and behavior
 remain compatible. Server configuration exposes
 `--connections-per-shard` / `BRISKDB_CONNECTIONS_PER_SHARD` and
 `--queue-capacity-per-shard` / `BRISKDB_QUEUE_CAPACITY_PER_SHARD`.
-The same options boundary carries finite result rows/bytes, the optional
-engine-wide request timeout, and the shutdown grace period. The binary exposes
-them as `--max-result-rows`, `--max-result-bytes`,
-`--request-timeout-ms`, and `--shutdown-grace-ms` with corresponding
+The same options boundary carries finite result rows/bytes, per-session
+prepared-statement count, portal count and a retained-value/per-bind-planning
+byte ceiling, the optional engine-wide request timeout, and the shutdown grace
+period. Prepared defaults are 128 statements, 128 portals, and 16 MiB;
+configurable hard caps are 1,024, 1,024, and 1 GiB. The binary exposes these as
+`--max-result-rows`,
+`--max-result-bytes`, `--max-prepared-statements-per-session`,
+`--max-portals-per-session`, `--max-retained-bound-value-bytes`,
+`--request-timeout-ms`, and `--shutdown-grace-ms`, with corresponding
 `BRISKDB_*` environment variables.
 
 When a shard has no active slot and its admission queue is full, a new operation
@@ -523,11 +577,13 @@ retired, preventing a late signal from affecting the next request.
 `RequestContext` supplies a sticky cancellation token, an optional absolute
 deadline, and optional narrower result limits. The engine default deadline and
 result budget are owned by `EngineOptions`, so protocol adapters contain no
-SQLite control policy. Queries account a stable logical result representation
-while stepping SQLite and before cloning payloads. A row or byte overflow
-returns no partial `ResultSet`; query statements must be read-only so early
-termination cannot hide DML `RETURNING` effects. The exact accounting contract
-is documented in [request controls](REQUEST_CONTROLS.md).
+SQLite control policy. Prepare, bind, describe, and portal execution expose the
+same `*_with_context` boundary as raw operations. Queries and prepared row
+results account a stable logical representation while stepping SQLite and
+before cloning payloads. A row or byte overflow returns no partial
+`ResultSet`; row-producing writes are rejected so early termination cannot hide
+DML effects. The exact accounting contract is documented in
+[request controls](REQUEST_CONTROLS.md).
 
 All engine clones share one mutex-protected lifecycle. The mutex makes the
 `Running` admission check and active-operation increment atomic with
@@ -536,7 +592,9 @@ All engine clones share one mutex-protected lifecycle. The mutex makes the
 the admitted set and still waits for blocking cleanup before closing idle
 SQLite handles on a worker and marking `Stopped`. A timed-out cleanup remains
 `Draining` and can be resumed. Ordinary clone destruction does not initiate
-this explicit asynchronous path.
+this explicit asynchronous path. Prepared statement/portal close and terminal
+session close remain available as in-memory cleanup while draining; no
+prepared state is persisted for restart recovery.
 
 The server owns accepted HTTP/1 connections in a tracked task set. It stops
 engine admission before dropping the listener, starts HTTP and core draining
@@ -551,10 +609,12 @@ single-shard pinning remain deferred to the PostgreSQL and MySQL transaction
 work in issues #34 and #47. `Ready` and `Closed` therefore describe session
 lifecycle, not SQL transaction state.
 
-The pool/request-control boundary changed Rust orchestration and added opt-in
-`EngineOptions` plus pool-sizing CLI/environment configuration. That earlier
-change did not alter option defaults, HTTP routes or JSON shapes, shard routing,
-storage formats, WAL or synchronous settings, or stored data.
+The pool/request-control and prepared-cache boundaries changed Rust
+orchestration and added opt-in `EngineOptions` plus CLI/environment
+configuration. They did not alter HTTP routes or JSON shapes, shard routing,
+storage formats, WAL or synchronous settings, or stored schema. Prepared
+execution can have the ordinary application-row effects of its one selected
+SQLite statement.
 
 ## Error boundary
 

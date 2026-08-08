@@ -191,6 +191,38 @@ no new error kind, retains no failed parameters, and does not change protocol
 mappings. See the [bound statement-planning and routing-policy
 contract](SQL_PLANNING.md).
 
+The prepared lifecycle preserves each earlier frontend/planner kind. Prepare
+adds `InvalidArgument` for an unknown logical database and for anything other
+than exactly one top-level statement, `LimitExceeded` for a full session
+statement cache, and `InvalidQuery` when SQLite cannot transiently compile the
+translated SQL on shard 0. Bind preserves parameter-count, value-conversion,
+inference, and planning errors, and adds `LimitExceeded` for a full portal cache
+or retained-value byte budget, or when the captured route and repeated
+normalized occurrences exceed the conservative per-bind planning ceiling
+before allocation. Describe preserves transient SQLite compilation errors. A
+normalized-versus-SQLite parameter-count disagreement or retained accounting
+inconsistency is `Internal`.
+
+Prepared-statement and portal handles are session-scoped. A handle from another
+session/engine, a closed session, or an absent statement/portal is
+`FailedPrecondition`; closing an already absent same-session handle instead
+returns `false`. Portal execution reports `PermissionDenied` for catalog
+placement and `Unsupported` for a sharded read that still needs scatter or
+another unimplemented target. Safe column-producing `NotApplicable` and
+`Global` reads use deterministic shard 0; accepted sharded work uses its
+current assigned shard. Cancellation, deadlines, pool admission, schema-gate
+state, SQLite execution, constraints, and result limits retain their existing
+kinds.
+
+A failed prepare or bind publishes no handle, full caches evict nothing, and an
+execution failure retains its portal. Protocol adapters still serialize only
+the fixed public mapping for the error kind. Redacted `Debug` applies to the
+prepare request, cached state, portal, plan, and description; trusted internal
+value-conversion diagnostics may contain the rejected value, and
+`PreparedExecution` `Debug` intentionally contains user-visible results. See
+the complete [prepared statements and bound portals
+contract](SQL_PREPARED_STATEMENTS.md).
+
 The core contains no HTTP, PostgreSQL, or MySQL response types. Conversely,
 protocol adapters do not inspect SQLite errors. This lets every frontend share
 one error identity while retaining its own response encoding.

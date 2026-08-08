@@ -254,10 +254,13 @@ describes manifest-owned metadata rather than a user shard table.
 
 The loaded `Catalog` is read-only to callers and remains advisory in version 7:
 the opt-in SQL inference API may consult its database, table placement, and key
-metadata, but there is no table-catalog mutation API, execution-plan
-integration, routing enforcement, or enforcement against physical shard
-schemas. The engine publishes a newly committed schema generation into its
-shared catalog snapshot only after every shard has reached that generation.
+metadata, but there is no table-catalog mutation API or automatic proof that a
+catalog row matches a physical application table. The prepared lifecycle now
+uses catalog placement and keys for its bind-time plan and supported execution
+target; the raw explicit-key execute/query API remains independent of that
+opt-in integration. The engine publishes a newly committed schema generation
+into its shared catalog snapshot only after every shard has reached that
+generation.
 Fresh initialization and every v1/v2/v3 upgrade leave `briskdb_tables` empty;
 a v4-to-v5 upgrade retains every validated v4 catalog row. Schema migration
 does not inspect, infer, or mutate `briskdb_tables` from the journaled SQL; the
@@ -877,6 +880,14 @@ does not change the manifest version, shard files, stored schema text, migration
 digest, or migration identity. Schema migration continues to retain and compare
 the caller's exact submitted SQL; canonical compatibility output is never used
 as storage identity.
+
+Issue #26's prepared statements, descriptions, bound portals, captured routing
+bytes, and transient plans are also process-memory state. Portals retain no
+plan. These objects add no manifest or shard table, header value, routing
+version, schema fingerprint, journal record, or recovery step.
+Prepare/describe do not write application data. A supported portal command has
+only its ordinary one-shard SQLite row effects; persistent schema changes
+remain exclusive to the exact-text journaled migration path.
 
 The checksums are corruption detectors, not authentication. Both use unkeyed
 BLAKE3 and are writable by anyone who can modify the data directory. The

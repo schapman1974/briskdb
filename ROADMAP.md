@@ -213,7 +213,7 @@ interrupted schema migration can be diagnosed and resumed.
 - [x] Reject conflicting keys and unroutable writes before execution.
 - [x] Translate a deliberately small set of type names and syntax differences;
   preserve a strict mode that exposes SQLite SQL directly.
-- [ ] Implement protocol-neutral prepare/bind/describe/execute lifecycle and a
+- [x] Implement protocol-neutral prepare/bind/describe/execute lifecycle and a
   bounded per-session prepared-statement cache.
 - [ ] Classify statements by read/write/schema/session behavior and block unsafe
   multi-statement combinations.

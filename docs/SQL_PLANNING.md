@@ -20,8 +20,9 @@ Engine::plan_bound_statement(
 slice for that statement, exactly as required by
 [`infer_shard_keys`](SQL_SHARD_KEYS.md). A statement whose shard key is a
 placeholder cannot be routed when SQL is parsed or prepared because its value
-does not exist yet. A frontend calls this API for a concrete bind/execute
-operation.
+does not exist yet. A frontend may call this API directly for a concrete bind,
+while the prepared lifecycle invokes the same admitted planner when validating
+a new portal and again for every execution.
 
 The call performs protocol-neutral analysis only. It infers typed shard-key
 values, converts them to canonical routing bytes, looks up physical shards,
@@ -54,6 +55,14 @@ parameter buffers after the call returns.
 normal successful result for a statement that is not sharded and for a read
 that still needs later scatter or empty-result planning. Every accepted write
 to a cataloged sharded table has `Some(shard)`.
+
+The [prepared execution lifecycle](SQL_PREPARED_STATEMENTS.md) consumes this
+result only after values are bound. Bind validates then discards one plan;
+execution creates another under its current schema guard. Execution uses an
+assigned shard for cataloged sharded work and may select deterministic shard 0
+for a safe column-producing `NotApplicable` or `Global` read. It still rejects
+catalog placement and sharded reads that need scatter. That target-selection
+integration does not change this planner's meaning of `assigned_shard()`.
 
 `Debug` output reports identifiers, versions, shard IDs, and counts where
 useful. It does not render SQL, AST contents, inferred key values, explicit key
@@ -123,8 +132,10 @@ ASCII case-folded catalog comparison; quoted identifiers compare exactly.
 Row movement between shards is not implemented.
 
 `NotApplicable` and `NotSharded` statements do not become successful sharded
-writes. Global, catalog, and schema placement have separate future execution
-paths and retain `assigned_shard() == None` here.
+writes. Global and Catalog placement, plus schema/session statements, retain
+`assigned_shard() == None` at this planning layer. Downstream execution policy
+decides whether a specific unassigned statement can run; the prepared lifecycle
+currently reads Global data on shard 0 and rejects Catalog placement.
 
 ## Canonical routing-key bytes
 
@@ -177,14 +188,16 @@ call returns.
 The successful plan records the application-schema generation,
 routing-map generation, hash version, key-encoding version, and
 bucket-algorithm version used by the call. These fields are provenance, not a
-lease on future state. A future execution path must establish that the
-physical schema and routing snapshot are still authoritative and reject or
-replan stale provenance before using `assigned_shard()`.
+lease on future state. Portal execution establishes that the physical schema
+and routing snapshot remain authoritative by producing a new plan from the
+portal's owned values and route snapshot under every execution's fresh
+schema-operation guard. Bind uses its plan only for transient validation.
 
 The logical table catalog remains read-only and advisory. Planning does not
 assert that its table metadata describes an existing physical SQLite table or
-column. Physical catalog authority and execution validation remain future
-integration work.
+column. Prepared setup transiently compiles translated SQL against shard 0, but
+it does not reconcile advisory table rows with the physical schema or mutate
+the catalog.
 
 ## Errors and recovery
 
@@ -219,17 +232,22 @@ and poisons no engine state; a later independent call can succeed.
 
 ## Deliberate boundaries
 
-Issues #23 and #24 add no configuration, CLI option, environment variable,
-network message, HTTP shape, manifest migration, shard-file change, or SQLite
-execution path. In particular:
+The direct issues #23 and #24 planner API itself adds no configuration, network
+message, HTTP shape, manifest migration, shard-file change, or SQLite execution
+path. In particular:
 
 - `Engine::plan_bound_statement` is synchronous and stateless; it neither
   accepts nor mutates a `Session`;
-- `assigned_shard()` is not consumed by the current raw HTTP or engine execute
-  and query paths;
+- `assigned_shard()` is not consumed by the current raw HTTP execute/query
+  paths, but it is consumed by issue #26 portal execution;
 - no read scatter, merge, contradiction short circuit, or write executes here;
 - no transaction pinning or cross-call routing context is applied;
-- no per-session or global prepared-statement cache is created;
+- this synchronous method creates no per-session or global cache; issue #26
+  retains only typed values and a routing snapshot in each portal, not this
+  plan;
+- the prepared bind path applies its occurrence-based planning-expansion byte
+  ceiling before calling this method; a direct stateless planner call has no
+  session cache or `PreparedStatementLimits` to consult;
 - planning does not invoke the separate PostgreSQL/MySQL-to-SQLite translation
   layer;
 - no complete read/write/schema/session or batch classifier is published; and
@@ -237,9 +255,10 @@ execution path. In particular:
   validation, normalization, inference, or planning.
 
 The implemented issue #25 translation API can independently consume the same
-normalized statement, but it neither changes nor executes a bound plan. Issue
-#26 owns the protocol-neutral prepare/bind/describe/execute lifecycle, session
-integration, provenance revalidation, and bounded per-session cache. Issue #27
+normalized statement, but it neither changes nor executes a bound plan. The
+implemented issue #26 protocol-neutral prepare/bind/describe/execute lifecycle
+integrates translation and planning, validates transiently at bind, and plans
+again from the bounded session portal's snapshot at every execution. Issue #27
 owns the authoritative statement-behavior and empty, single-, and
 multi-statement request policy. Later query-planner work owns scatter/gather
 execution.

@@ -181,11 +181,14 @@ decision, SQLite execution call, manifest migration, shard-file change, or
 storage-format version. The current HTTP execute/query/migration paths continue
 to send caller-provided SQLite SQL directly to their existing engine paths.
 
-Issue #26 owns protocol-neutral prepare/bind/describe/execute state and adoption
-of `sqlite_sql()`. Issue #27 owns authoritative statement behavior and empty,
-single-, or multi-statement request policy. Schema execution must still use the
-journaled migration path, and later execution must revalidate planning
-provenance before consuming an assigned shard.
+The implemented protocol-neutral [prepared lifecycle](SQL_PREPARED_STATEMENTS.md)
+owns prepare/bind/describe/execute state and adopts `sqlite_sql()` only after
+requiring exactly one top-level statement. It transiently compiles metadata,
+caches BriskDB-owned SQL rather than a SQLite handle, and creates a fresh
+current plan from each portal's bind snapshot at execution. Issue #27 still
+owns authoritative statement behavior and general empty, single-, or
+multi-statement request policy. Schema execution must still use the journaled
+migration path.
 
 ## Verification obligations
 

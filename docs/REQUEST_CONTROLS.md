@@ -6,8 +6,9 @@ therefore share the same resource and cleanup semantics.
 
 ## Per-request context
 
-The existing `Engine::execute`, `query`, `broadcast`, and `status` methods keep
-their signatures and use a default `RequestContext`. `broadcast` now means a
+The existing `Engine::execute`, `query`, `broadcast`, and `status` methods, plus
+`prepare_statement`, `bind_statement`, `describe_prepared`, and
+`execute_portal`, use a default `RequestContext`. `broadcast` now means a
 journaled application-schema migration. Frontends that have their own
 cancellation or deadline source can call the corresponding `*_with_context`
 method:
@@ -45,6 +46,14 @@ therefore end SQLite lock waits or expensive preparation before the main SQL
 call starts. Opening the database file itself is an operating-system call and
 cannot be synchronously interrupted, but controls are checked before any
 SQLite configuration or statement work proceeds.
+
+Prepared operations use the same boundary. Prepare and a schema-refreshing
+describe can wait for shard 0 and transient SQLite metadata compilation. Bind
+can wait for the serialized session before it validates and snapshots values.
+Portal execution can wait for its selected shard and runs with the same
+exact-handle interruption and cleanup as raw execution. Cancellation before a
+prepared object is published leaves the session cache unchanged; a cancelled
+or failed execution retains the existing portal.
 
 Completion wins a very close race with cancellation. A statement that is known
 to have completed successfully returns success rather than a misleading
@@ -84,12 +93,38 @@ and SQLite can still allocate its current row internally. The logical limit is
 not an HTTP encoded-body limit; for example, the current JSON representation of
 a blob expands bytes into JSON integers.
 
-The query path accepts only SQLite statements reported as read-only. This
-prevents an early result-budget failure from accompanying a partially consumed
-DML `RETURNING` statement. Execute and schema migration do not materialize a
-`ResultSet` and are unaffected by query result budgets. A future scatter/gather
-implementation must apply one budget to the combined result, not a fresh budget
-for every shard.
+The raw query path accepts only SQLite statements reported as read-only. The
+prepared executor likewise rejects row-producing writes. These rules prevent
+an early result-budget failure from accompanying a partially consumed DML
+`RETURNING` statement. Raw execute, prepared affected-row results, and schema
+migration do not materialize a `ResultSet` and are unaffected by query result
+budgets. A future scatter/gather implementation must apply one budget to the
+combined result, not a fresh budget for every shard.
+
+## Prepared-session limits
+
+Prepared caches have a separate finite per-session budget: 128 statements, 128
+portals, and a 16 MiB retained-value/per-bind-planning ceiling by default, with
+hard caps of 1,024, 1,024, and 1 GiB. Full caches return `LimitExceeded` without
+evicting open handles. `EngineOptions`, server CLI flags, and `BRISKDB_*`
+environment variables can configure each value.
+
+This retained-value budget is independent of materialized-result bytes. Its
+logical accounting charges one type-tag byte and an eight-byte length for each
+parameter, the documented value payload, and exactly the captured route's byte
+length. It does not serialize or retain a wire encoding. Explicit close or
+terminal session close releases the charge. The exact model and configuration
+names are in
+[prepared statements and bound portals](SQL_PREPARED_STATEMENTS.md).
+
+Before planner allocation, one bind also compares a conservative transient sum
+to the same byte ceiling. The sum starts with one exact copy of the captured
+routing-key bytes. Each normalized marker occurrence then charges twice its
+referenced logical accounted value bytes (one type-tag byte, an eight-byte
+length, and its payload), once for a possible typed-inference copy and once for
+a possible canonical-route copy. Repeated markers are charged again. The
+transient sum is not retained or added to existing portal bytes. A failure
+returns `LimitExceeded` before planning and publishes no portal.
 
 ## Schema-migration controls
 
@@ -143,6 +178,12 @@ If forced cleanup also exceeds its grace period, shutdown returns
 shutdown is idempotent, and dropping one shutdown waiter does not strand the
 shared lifecycle. Dropping an ordinary `Engine` clone does not initiate
 shutdown; embedders should call the explicit asynchronous hook.
+
+Prepared statement/portal close and `Session::close` are in-memory cleanup and
+remain available while the engine is draining. Terminal session close waits
+for an admitted same-session operation, then clears every statement, portal,
+captured route/value, and routing context. Nothing in the prepared cache is
+persisted or recovered after process shutdown.
 
 The server constructs its SIGINT/SIGTERM receivers before logging readiness on
 supported Unix hosts. It transitions the engine to `Draining` before dropping

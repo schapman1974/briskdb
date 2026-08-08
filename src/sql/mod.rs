@@ -28,7 +28,7 @@ pub use subset::{CommonSql, MAX_COMMON_SQL_EXPRESSION_DEPTH, validate_common_sub
 pub use translator::{SqlTranslationMode, TranslatedSql, translate_sql};
 
 use rusqlite::{
-    Connection, params_from_iter,
+    Connection, Statement as SqlStatement, params_from_iter,
     types::{Value as SqlValue, ValueRef},
 };
 
@@ -46,15 +46,143 @@ const LENGTH_BYTES: u64 = 8;
 const ROW_FRAME_BYTES: u64 = 8;
 const FIXED_VALUE_PAYLOAD_BYTES: u64 = 8;
 
+/// Owned metadata collected while SQLite transiently prepares a statement.
+///
+/// SQLite's statement and column metadata borrow their connection. Keeping an
+/// owned protocol-neutral copy lets prepared-statement callers release that
+/// borrow before storing the description in a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatementMetadata {
+    parameter_count: usize,
+    columns: Vec<Column>,
+    readonly: bool,
+}
+
+impl StatementMetadata {
+    pub(crate) const fn parameter_count(&self) -> usize {
+        self.parameter_count
+    }
+
+    pub(crate) fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    pub(crate) const fn readonly(&self) -> bool {
+        self.readonly
+    }
+
+    pub(crate) fn produces_columns(&self) -> bool {
+        !self.columns.is_empty()
+    }
+}
+
+/// The result of executing one transiently prepared SQLite statement.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StatementExecution {
+    Rows(ResultSet),
+    AffectedRows(usize),
+}
+
+/// Transiently prepares a statement and copies all metadata needed by the
+/// protocol-neutral prepared-statement lifecycle.
+pub(crate) fn describe_statement(
+    connection: &Connection,
+    statement: &str,
+) -> EngineResult<StatementMetadata> {
+    let statement = connection
+        .prepare(statement)
+        .map_err(sqlite_error::statement)?;
+    Ok(statement_metadata(&statement))
+}
+
+/// Transiently prepares and executes exactly one statement.
+///
+/// Column-producing writes (for example DML with `RETURNING`) are rejected
+/// before SQLite is stepped. Supporting those safely requires a result and
+/// transaction policy that the protocol-neutral engine does not yet expose.
+pub(crate) fn execute_statement_with_limits(
+    connection: &Connection,
+    statement: &str,
+    params: &[Value],
+    limits: ResultLimits,
+) -> EngineResult<StatementExecution> {
+    let params = sqlite_parameters(params)?;
+    let mut statement = connection
+        .prepare(statement)
+        .map_err(sqlite_error::statement)?;
+    let metadata = statement_metadata(&statement);
+
+    if metadata.produces_columns() {
+        if !metadata.readonly() {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidQuery,
+                "row-producing write statements are not supported",
+            ));
+        }
+        return materialize_rows(&mut statement, metadata.columns, params, limits)
+            .map(StatementExecution::Rows);
+    }
+
+    statement
+        .execute(params_from_iter(params))
+        .map(StatementExecution::AffectedRows)
+        .map_err(sqlite_error::statement)
+}
+
+/// Validates that every protocol-neutral parameter has a lossless SQLite
+/// binding without allocating converted text or binary payloads.
+pub(crate) fn validate_parameters(params: &[Value]) -> EngineResult<()> {
+    params.iter().try_for_each(validate_parameter)
+}
+
+fn validate_parameter(value: &Value) -> EngineResult<()> {
+    match value {
+        Value::UInt64(value) => i64::try_from(*value).map(|_| ()).map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::NumericOutOfRange,
+                format!("unsigned integer {value} exceeds SQLite INTEGER range"),
+                error,
+            )
+        }),
+        Value::Float64(value) if value.is_nan() => Err(EngineError::new(
+            EngineErrorKind::Unsupported,
+            "NaN has no lossless SQLite binding because SQLite converts it to NULL",
+        )),
+        Value::Decimal(value) => Err(EngineError::new(
+            EngineErrorKind::Unsupported,
+            format!("decimal value {value} has no lossless SQLite binding"),
+        )),
+        Value::InvalidText(_) => Err(EngineError::new(
+            EngineErrorKind::InvalidTextEncoding,
+            "non-UTF-8 text has no lossless SQLite binding",
+        )),
+        Value::Null
+        | Value::Boolean(_)
+        | Value::Int64(_)
+        | Value::Float64(_)
+        | Value::Text(_)
+        | Value::Binary(_) => Ok(()),
+    }
+}
+
+fn statement_metadata(statement: &SqlStatement<'_>) -> StatementMetadata {
+    StatementMetadata {
+        parameter_count: statement.parameter_count(),
+        columns: statement
+            .column_names()
+            .into_iter()
+            .map(|name| Column::new(name, DataType::Unknown))
+            .collect(),
+        readonly: statement.readonly(),
+    }
+}
+
 pub(crate) fn execute(
     connection: &Connection,
     statement: &str,
     params: &[Value],
 ) -> EngineResult<usize> {
-    let params = params
-        .iter()
-        .map(value_to_sql)
-        .collect::<EngineResult<Vec<_>>>()?;
+    let params = sqlite_parameters(params)?;
     connection
         .execute(statement, params_from_iter(params))
         .map_err(sqlite_error::statement)
@@ -74,10 +202,7 @@ pub(crate) fn query_with_limits(
     params: &[Value],
     limits: ResultLimits,
 ) -> EngineResult<ResultSet> {
-    let params = params
-        .iter()
-        .map(value_to_sql)
-        .collect::<EngineResult<Vec<_>>>()?;
+    let params = sqlite_parameters(params)?;
     let mut statement = connection
         .prepare(statement)
         .map_err(sqlite_error::statement)?;
@@ -88,18 +213,26 @@ pub(crate) fn query_with_limits(
         ));
     }
 
-    let column_names = statement.column_names();
+    let metadata = statement_metadata(&statement);
+    materialize_rows(&mut statement, metadata.columns, params, limits)
+}
+
+fn materialize_rows(
+    statement: &mut SqlStatement<'_>,
+    columns: Vec<Column>,
+    params: Vec<SqlValue>,
+    limits: ResultLimits,
+) -> EngineResult<ResultSet> {
     let mut logical_bytes = account_bytes(0, RESULT_ENVELOPE_BYTES, limits.max_bytes())?;
-    for name in &column_names {
+    for column in &columns {
         logical_bytes = account_bytes(logical_bytes, TYPE_TAG_BYTES, limits.max_bytes())?;
         logical_bytes = account_bytes(logical_bytes, LENGTH_BYTES, limits.max_bytes())?;
-        logical_bytes =
-            account_bytes(logical_bytes, usize_to_u64(name.len())?, limits.max_bytes())?;
+        logical_bytes = account_bytes(
+            logical_bytes,
+            usize_to_u64(column.name.len())?,
+            limits.max_bytes(),
+        )?;
     }
-    let columns = column_names
-        .into_iter()
-        .map(|name| Column::new(name, DataType::Unknown))
-        .collect::<Vec<_>>();
     let mut sqlite_rows = statement
         .query(params_from_iter(params))
         .map_err(sqlite_error::statement)?;
@@ -134,6 +267,10 @@ pub(crate) fn query_with_limits(
             error,
         )
     })
+}
+
+fn sqlite_parameters(params: &[Value]) -> EngineResult<Vec<SqlValue>> {
+    params.iter().map(value_to_sql).collect()
 }
 
 fn account_row(current: u64, maximum: u64) -> EngineResult<u64> {
@@ -245,6 +382,297 @@ mod tests {
     use super::*;
 
     #[test]
+    fn statement_metadata_preserves_exact_parameter_and_column_layouts() {
+        let connection = Connection::open_in_memory().unwrap();
+        let metadata = describe_statement(
+            &connection,
+            "SELECT ?1 AS duplicate,
+                    ?3 AS \"\",
+                    ? AS middle,
+                    :named AS duplicate,
+                    :named AS repeated",
+        )
+        .unwrap();
+
+        // SQLite reports the greatest assigned parameter index. That includes
+        // the unused ?2 gap and does not allocate a second slot for a repeated
+        // named parameter.
+        assert_eq!(metadata.parameter_count(), 5);
+        assert_eq!(
+            metadata.columns(),
+            [
+                Column::new("duplicate", DataType::Unknown),
+                Column::new("", DataType::Unknown),
+                Column::new("middle", DataType::Unknown),
+                Column::new("duplicate", DataType::Unknown),
+                Column::new("repeated", DataType::Unknown),
+            ]
+        );
+        assert!(metadata.readonly());
+        assert!(metadata.produces_columns());
+    }
+
+    #[test]
+    fn statement_metadata_distinguishes_commands_from_row_producers() {
+        let connection = Connection::open_in_memory().unwrap();
+        execute_batch(
+            &connection,
+            "CREATE TABLE metadata_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        let command = describe_statement(
+            &connection,
+            "INSERT INTO metadata_test (id, value) VALUES (?1, ?2)",
+        )
+        .unwrap();
+        assert_eq!(command.parameter_count(), 2);
+        assert!(command.columns().is_empty());
+        assert!(!command.readonly());
+        assert!(!command.produces_columns());
+
+        let returning = describe_statement(
+            &connection,
+            "INSERT INTO metadata_test (id, value) VALUES (?1, ?2) RETURNING id, value",
+        )
+        .unwrap();
+        assert_eq!(returning.parameter_count(), 2);
+        assert_eq!(
+            returning.columns(),
+            [
+                Column::new("id", DataType::Unknown),
+                Column::new("value", DataType::Unknown),
+            ]
+        );
+        assert!(!returning.readonly());
+        assert!(returning.produces_columns());
+    }
+
+    #[test]
+    fn transient_execution_returns_rows_with_ordered_typed_values() {
+        let connection = Connection::open_in_memory().unwrap();
+        let result = execute_statement_with_limits(
+            &connection,
+            "SELECT ?1 AS duplicate,
+                    ?2 AS duplicate,
+                    ?3 AS \"\",
+                    ?4 AS blob_value,
+                    NULL AS optional_value",
+            &[
+                Value::from(7_i64),
+                Value::from(1.5_f64),
+                Value::from("text"),
+                Value::from(vec![0_u8, 255]),
+            ],
+            ResultLimits::default(),
+        )
+        .unwrap();
+
+        let StatementExecution::Rows(result) = result else {
+            panic!("SELECT must produce rows");
+        };
+        assert_eq!(
+            result.columns(),
+            [
+                Column::new("duplicate", DataType::Unknown),
+                Column::new("duplicate", DataType::Unknown),
+                Column::new("", DataType::Unknown),
+                Column::new("blob_value", DataType::Unknown),
+                Column::new("optional_value", DataType::Unknown),
+            ]
+        );
+        assert_eq!(
+            result.rows(),
+            [Row::new(vec![
+                Value::from(7_i64),
+                Value::from(1.5_f64),
+                Value::from("text"),
+                Value::from(vec![0_u8, 255]),
+                Value::Null,
+            ])]
+        );
+    }
+
+    #[test]
+    fn transient_execution_returns_affected_rows_for_commands() {
+        let connection = Connection::open_in_memory().unwrap();
+        execute_batch(
+            &connection,
+            "CREATE TABLE execution_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        assert_eq!(
+            execute_statement_with_limits(
+                &connection,
+                "INSERT INTO execution_test (id, value) VALUES (1, 'one'), (2, 'two')",
+                &[],
+                ResultLimits::default(),
+            )
+            .unwrap(),
+            StatementExecution::AffectedRows(2)
+        );
+        assert_eq!(
+            execute_statement_with_limits(
+                &connection,
+                "UPDATE execution_test SET value = ?1 WHERE id = ?2",
+                &[Value::from("updated"), Value::from(2_i64)],
+                ResultLimits::default(),
+            )
+            .unwrap(),
+            StatementExecution::AffectedRows(1)
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM execution_test WHERE id = 2", [], |row| {
+                    row.get::<_, String>(0)
+                },)
+                .unwrap(),
+            "updated"
+        );
+    }
+
+    #[test]
+    fn transient_execution_classifies_arity_and_value_errors_without_mutation() {
+        let connection = Connection::open_in_memory().unwrap();
+        execute_batch(
+            &connection,
+            "CREATE TABLE binding_test (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);",
+        )
+        .unwrap();
+
+        for params in [Vec::new(), vec![Value::from(1_i64), Value::from(2_i64)]] {
+            let error = execute_statement_with_limits(
+                &connection,
+                "INSERT INTO binding_test (id, value) VALUES (1, ?1)",
+                &params,
+                ResultLimits::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+        }
+
+        let too_large = u64::try_from(i64::MAX).unwrap() + 1;
+        let error = execute_statement_with_limits(
+            &connection,
+            "INSERT INTO binding_test (id, value) VALUES (1, ?1)",
+            &[Value::from(too_large)],
+            ResultLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::NumericOutOfRange);
+
+        let error = execute_statement_with_limits(
+            &connection,
+            "INSERT INTO binding_test (id, value) VALUES (1, ?1)",
+            &[Value::from(f64::NAN)],
+            ResultLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Unsupported);
+
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM binding_test", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn transient_execution_rejects_row_producing_writes_before_mutation() {
+        let connection = Connection::open_in_memory().unwrap();
+        execute_batch(
+            &connection,
+            "CREATE TABLE returning_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO returning_test (id, value) VALUES (1, 'original');",
+        )
+        .unwrap();
+
+        for statement in [
+            "INSERT INTO returning_test (id, value) VALUES (2, 'inserted') RETURNING id",
+            "UPDATE returning_test SET value = 'updated' WHERE id = 1 RETURNING id",
+            "DELETE FROM returning_test WHERE id = 1 RETURNING id",
+        ] {
+            let error =
+                execute_statement_with_limits(&connection, statement, &[], ResultLimits::default())
+                    .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+            assert_eq!(
+                error.to_string(),
+                "row-producing write statements are not supported"
+            );
+        }
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*), MIN(value) FROM returning_test",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            (1, "original".to_owned())
+        );
+    }
+
+    #[test]
+    fn transient_execution_uses_the_existing_exact_result_limits() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Metadata is 26 bytes. Each integer row is 25 bytes.
+        let exact = ResultLimits::new(2, 76).unwrap();
+        let result = execute_statement_with_limits(
+            &connection,
+            "SELECT 1 AS v UNION ALL SELECT 2",
+            &[],
+            exact,
+        )
+        .unwrap();
+        assert!(matches!(result, StatementExecution::Rows(result) if result.len() == 2));
+
+        for (limits, message) in [
+            (
+                ResultLimits::new(1, 76).unwrap(),
+                "query result exceeds the configured row limit",
+            ),
+            (
+                ResultLimits::new(2, 75).unwrap(),
+                "query result exceeds the configured logical byte limit",
+            ),
+        ] {
+            let error = execute_statement_with_limits(
+                &connection,
+                "SELECT 1 AS v UNION ALL SELECT 2",
+                &[],
+                limits,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn transient_prepare_and_execution_classify_invalid_sql() {
+        let connection = Connection::open_in_memory().unwrap();
+
+        for error in [
+            describe_statement(&connection, "SELECT FROM").unwrap_err(),
+            execute_statement_with_limits(
+                &connection,
+                "SELECT * FROM missing_table",
+                &[],
+                ResultLimits::default(),
+            )
+            .unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+        }
+    }
+
+    #[test]
     fn protocol_values_bind_to_the_expected_sqlite_storage_classes() {
         assert_eq!(value_to_sql(&Value::Null).unwrap(), SqlValue::Null);
         assert_eq!(
@@ -279,6 +707,48 @@ mod tests {
             value_to_sql(&Value::from(vec![0_u8, 255])).unwrap(),
             SqlValue::Blob(vec![0, 255])
         );
+    }
+
+    #[test]
+    fn parameter_validation_accepts_every_lossless_sqlite_binding() {
+        validate_parameters(&[
+            Value::Null,
+            Value::from(false),
+            Value::from(true),
+            Value::from(i64::MIN),
+            Value::from(i64::MAX),
+            Value::from(0_u64),
+            Value::from(u64::try_from(i64::MAX).unwrap()),
+            Value::from(f64::NEG_INFINITY),
+            Value::from(-0.0_f64),
+            Value::from(f64::INFINITY),
+            Value::from(String::new()),
+            Value::from("text"),
+            Value::from(Vec::<u8>::new()),
+            Value::from(vec![0_u8, 255]),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn parameter_validation_preserves_precise_rejection_kinds() {
+        let too_large = u64::try_from(i64::MAX).unwrap() + 1;
+        let cases = [
+            (Value::from(too_large), EngineErrorKind::NumericOutOfRange),
+            (
+                Value::decimal("12.3400").unwrap(),
+                EngineErrorKind::Unsupported,
+            ),
+            (
+                Value::InvalidText(vec![0x80]),
+                EngineErrorKind::InvalidTextEncoding,
+            ),
+            (Value::from(f64::NAN), EngineErrorKind::Unsupported),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(validate_parameters(&[value]).unwrap_err().kind(), expected);
+        }
     }
 
     #[test]

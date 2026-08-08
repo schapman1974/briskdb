@@ -73,6 +73,18 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
         queue_capacity_per_shard = engine.options().queue_capacity_per_shard(),
         max_result_rows = engine.options().result_limits().max_rows(),
         max_result_bytes = engine.options().result_limits().max_bytes(),
+        max_prepared_statements_per_session = engine
+            .options()
+            .prepared_statement_limits()
+            .max_statements_per_session(),
+        max_portals_per_session = engine
+            .options()
+            .prepared_statement_limits()
+            .max_portals_per_session(),
+        max_retained_bound_value_bytes = engine
+            .options()
+            .prepared_statement_limits()
+            .max_retained_bound_value_bytes(),
         request_timeout_ms = engine
             .options()
             .request_timeout()

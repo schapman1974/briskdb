@@ -44,6 +44,33 @@ fn insert_catalog_fixture(root: &Path) {
         .unwrap();
 }
 
+fn insert_prepared_catalog_fixture(root: &Path) {
+    let manifest = rusqlite::Connection::open(root.join("manifest.sqlite")).unwrap();
+    manifest
+        .execute_batch(
+            "PRAGMA foreign_keys = ON;
+             BEGIN IMMEDIATE;
+             DROP TABLE briskdb_integrity;
+             DROP TABLE briskdb_metadata;
+             CREATE TABLE briskdb_metadata (
+                 requires_manifest_version INTEGER NOT NULL
+                     CHECK (requires_manifest_version >= 6)
+             ) STRICT;
+             INSERT INTO briskdb_metadata VALUES (6);
+             INSERT INTO briskdb_tables (
+                table_id,
+                database_id,
+                table_name,
+                placement,
+                shard_key_column,
+                shard_key_type
+             ) VALUES (50, 1, 'prepared_events', 1, 'tenant_id', 1);
+             PRAGMA user_version = 6;
+             COMMIT;",
+        )
+        .unwrap();
+}
+
 fn assert_catalog_fixture(catalog: &core::Catalog) {
     assert_eq!(catalog.identifier_encoding_version(), 1);
     assert_eq!(catalog.schema_generation(), 0);
@@ -107,6 +134,7 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _engine_status: Option<core::EngineStatus> = None;
     let _engine_options: core::EngineOptions = core::EngineOptions::default();
     let _result_limits: core::ResultLimits = core::ResultLimits::default();
+    let _prepared_limits: core::PreparedStatementLimits = core::PreparedStatementLimits::default();
     let _request_context: core::RequestContext = core::RequestContext::new();
     let _cancellation_token: core::CancellationToken = core::CancellationToken::new();
     let _running = core::EngineState::Running;
@@ -115,6 +143,11 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _ready = core::SessionState::Ready;
     let _closed = core::SessionState::Closed;
     let _statement = core::Statement::new("SELECT ?1", vec![core::Value::from(42_i64)]);
+    let _prepared_statement_id: Option<core::PreparedStatementId> = None;
+    let _portal_id: Option<core::PortalId> = None;
+    let _describe_target: Option<core::DescribeTarget> = None;
+    let _description: Option<core::PreparedStatementDescription> = None;
+    let _prepared_execution: Option<core::PreparedExecution> = None;
     let _legacy_router: fn(Arc<storage::Database>) -> Router = api::router;
     let _http_router: fn(Arc<core::Database>) -> Router = http::router;
     let _engine_router: fn(core::Engine) -> Router = http::router_with_engine;
@@ -743,6 +776,15 @@ fn engine_options_are_public_validated_and_have_stable_defaults() {
         .unwrap()
     );
     assert_eq!(
+        defaults.prepared_statement_limits(),
+        core::PreparedStatementLimits::new(
+            core::DEFAULT_MAX_PREPARED_STATEMENTS_PER_SESSION,
+            core::DEFAULT_MAX_PORTALS_PER_SESSION,
+            core::DEFAULT_MAX_RETAINED_BOUND_VALUE_BYTES,
+        )
+        .unwrap()
+    );
+    assert_eq!(
         defaults.request_timeout(),
         Some(Duration::from_millis(core::DEFAULT_REQUEST_TIMEOUT_MS))
     );
@@ -783,14 +825,49 @@ fn engine_options_are_public_validated_and_have_stable_defaults() {
         );
     }
 
+    let maximum_prepared = core::PreparedStatementLimits::new(
+        core::MAX_PREPARED_STATEMENTS_PER_SESSION,
+        core::MAX_PORTALS_PER_SESSION,
+        core::MAX_RETAINED_BOUND_VALUE_BYTES,
+    )
+    .unwrap();
+    assert_eq!(
+        maximum_prepared.max_statements_per_session(),
+        core::MAX_PREPARED_STATEMENTS_PER_SESSION
+    );
+    assert_eq!(
+        maximum_prepared.max_portals_per_session(),
+        core::MAX_PORTALS_PER_SESSION
+    );
+    assert_eq!(
+        maximum_prepared.max_retained_bound_value_bytes(),
+        core::MAX_RETAINED_BOUND_VALUE_BYTES
+    );
+    for invalid in [
+        core::PreparedStatementLimits::new(0, 1, 1),
+        core::PreparedStatementLimits::new(core::MAX_PREPARED_STATEMENTS_PER_SESSION + 1, 1, 1),
+        core::PreparedStatementLimits::new(1, 0, 1),
+        core::PreparedStatementLimits::new(1, core::MAX_PORTALS_PER_SESSION + 1, 1),
+        core::PreparedStatementLimits::new(1, 1, 0),
+        core::PreparedStatementLimits::new(1, 1, core::MAX_RETAINED_BOUND_VALUE_BYTES + 1),
+    ] {
+        assert_eq!(
+            invalid.unwrap_err().kind(),
+            core::EngineErrorKind::InvalidArgument
+        );
+    }
+
     let limits = core::ResultLimits::new(37, 4_096).unwrap();
+    let prepared_limits = core::PreparedStatementLimits::new(17, 19, 8_192).unwrap();
     let configured = minimum
         .with_result_limits(limits)
+        .with_prepared_statement_limits(prepared_limits)
         .with_request_timeout(None)
         .unwrap()
         .with_shutdown_grace(Duration::from_millis(250))
         .unwrap();
     assert_eq!(configured.result_limits(), limits);
+    assert_eq!(configured.prepared_statement_limits(), prepared_limits);
     assert_eq!(configured.request_timeout(), None);
     assert_eq!(configured.shutdown_grace(), Duration::from_millis(250));
 }
@@ -799,9 +876,11 @@ fn engine_options_are_public_validated_and_have_stable_defaults() {
 async fn protocol_neutral_async_engine_surface_is_available() {
     let temp = tempfile::tempdir().unwrap();
     let limits = core::ResultLimits::new(50, 8_192).unwrap();
+    let prepared_limits = core::PreparedStatementLimits::new(13, 17, 32_768).unwrap();
     let options = core::EngineOptions::new(2, 7)
         .unwrap()
         .with_result_limits(limits)
+        .with_prepared_statement_limits(prepared_limits)
         .with_request_timeout(Some(Duration::from_secs(5)))
         .unwrap()
         .with_shutdown_grace(Duration::from_millis(100))
@@ -820,6 +899,7 @@ async fn protocol_neutral_async_engine_surface_is_available() {
     assert_eq!(status.queue_capacity_per_shard(), 7);
     assert_eq!(status.max_result_rows(), 50);
     assert_eq!(status.max_result_bytes(), 8_192);
+    assert_eq!(status.prepared_statement_limits(), prepared_limits);
     assert_eq!(status.request_timeout(), Some(Duration::from_secs(5)));
     assert_eq!(status.shutdown_grace(), Duration::from_millis(100));
 
@@ -842,6 +922,137 @@ async fn protocol_neutral_async_engine_surface_is_available() {
     let report = engine.shutdown().await.unwrap();
     assert!(!report.forced());
     assert_eq!(engine.state(), core::EngineState::Stopped);
+}
+
+#[tokio::test]
+async fn prepared_lifecycle_is_public_owned_and_protocol_neutral() {
+    fn assert_owned<T: Send + Sync + 'static>() {}
+    assert_owned::<core::PrepareRequest>();
+    assert_owned::<core::PreparedStatementId>();
+    assert_owned::<core::PortalId>();
+    assert_owned::<core::DescribeTarget>();
+    assert_owned::<core::PreparedStatementDescription>();
+    assert_owned::<core::PreparedExecution>();
+
+    let temp = tempfile::tempdir().unwrap();
+    drop(core::Database::open(temp.path(), 4).unwrap());
+    insert_prepared_catalog_fixture(temp.path());
+    let database = Arc::new(core::Database::open(temp.path(), 4).unwrap());
+    database
+        .broadcast(
+            "CREATE TABLE prepared_events (
+                tenant_id INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL
+             )",
+        )
+        .unwrap();
+    let logical_database = database.catalog().default_database().id();
+    let engine = core::Engine::from_database(database);
+    let session = engine.session();
+
+    let private_request = core::PrepareRequest::new(
+        logical_database,
+        sql::SqlDialect::MySql,
+        sql::SqlTranslationMode::Compatibility,
+        "INSERT INTO prepared_events (tenant_id, payload) VALUES (?, 'private-literal')",
+    );
+    assert_eq!(private_request.database(), logical_database);
+    assert_eq!(private_request.dialect(), sql::SqlDialect::MySql);
+    assert_eq!(
+        private_request.translation_mode(),
+        sql::SqlTranslationMode::Compatibility
+    );
+    assert!(private_request.sql().contains("private-literal"));
+    assert!(!format!("{private_request:?}").contains("private-literal"));
+
+    let insert = engine
+        .prepare_statement(&session, private_request)
+        .await
+        .unwrap();
+    let insert_description = engine
+        .describe_prepared(&session, core::DescribeTarget::Statement(insert))
+        .await
+        .unwrap();
+    assert_eq!(
+        insert_description.parameter_types(),
+        [core::DataType::Unknown]
+    );
+    assert!(insert_description.columns().is_empty());
+    let insert_portal = engine
+        .bind_statement(&session, insert, vec![core::Value::from(42_i64)])
+        .await
+        .unwrap();
+    let inserted = engine
+        .execute_portal(&session, insert_portal)
+        .await
+        .unwrap();
+    assert_eq!(inserted.value, core::PreparedExecution::AffectedRows(1));
+
+    let select = engine
+        .prepare_statement(
+            &session,
+            core::PrepareRequest::new(
+                logical_database,
+                sql::SqlDialect::PostgreSql,
+                sql::SqlTranslationMode::Compatibility,
+                "SELECT tenant_id, payload FROM prepared_events WHERE tenant_id = $1",
+            ),
+        )
+        .await
+        .unwrap();
+    let select_portal = engine
+        .bind_statement(&session, select, vec![core::Value::from(42_i64)])
+        .await
+        .unwrap();
+    let description = engine
+        .describe_prepared(&session, core::DescribeTarget::Portal(select_portal))
+        .await
+        .unwrap();
+    assert_eq!(description.parameter_types(), [core::DataType::Unknown]);
+    assert_eq!(
+        description.columns(),
+        [
+            core::Column::new("tenant_id", core::DataType::Unknown),
+            core::Column::new("payload", core::DataType::Unknown),
+        ]
+    );
+    assert!(description.returns_rows());
+    let selected = engine
+        .execute_portal(&session, select_portal)
+        .await
+        .unwrap();
+    let core::PreparedExecution::Rows(rows) = selected.value else {
+        panic!("the public prepared SELECT should return rows");
+    };
+    assert_eq!(
+        rows.rows()[0].values(),
+        [
+            core::Value::from(42_i64),
+            core::Value::from("private-literal")
+        ]
+    );
+
+    assert!(engine.close_portal(&session, select_portal).await.unwrap());
+    assert!(
+        engine
+            .close_prepared_statement(&session, select)
+            .await
+            .unwrap()
+    );
+    assert!(
+        engine
+            .close_prepared_statement(&session, insert)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        engine
+            .execute_portal(&session, insert_portal)
+            .await
+            .unwrap_err()
+            .kind(),
+        core::EngineErrorKind::FailedPrecondition
+    );
 }
 
 #[tokio::test]

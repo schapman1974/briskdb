@@ -166,10 +166,14 @@ The implemented synchronous
 bind/execute time and turns every inferred value into an owned route. It
 retains optional explicit routing separately, compares finite physical targets,
 rejects unroutable sharded DML, and records a valid single-shard assignment.
-The result is still not executable. The implemented issue #25 translator is a
-separate opt-in operation over the same normalized SQL; it does not change an
-inference result. Later work owns prepared-statement lifecycle, authoritative
-statement classification, and wire-protocol integration.
+The plan by itself is not execution permission. The implemented issue #25
+translator is a separate opt-in operation over the same normalized SQL; it does
+not change an inference result. The implemented
+[prepared lifecycle](SQL_PREPARED_STATEMENTS.md) validates a transient
+bind-time plan, retains the typed values and routing snapshot, and repeats
+planning under the current execution guard to select a supported target. Later
+work owns authoritative statement classification, scatter/gather, and
+wire-protocol integration.
 
 ## Verification obligations
 

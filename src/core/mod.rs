@@ -10,6 +10,7 @@ mod error;
 mod lifecycle;
 mod options;
 mod planner;
+mod prepared;
 mod routing;
 mod session;
 mod types;
@@ -32,12 +33,20 @@ pub use error::{EngineError, EngineErrorKind, EngineResult};
 pub use lifecycle::{EngineState, ShutdownReport};
 pub(crate) use lifecycle::{Lifecycle, OperationLease};
 pub use options::{
-    DEFAULT_CONNECTIONS_PER_SHARD, DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_ROWS,
-    DEFAULT_QUEUE_CAPACITY_PER_SHARD, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_SHUTDOWN_GRACE_MS,
-    EngineOptions, MAX_CONNECTIONS_PER_SHARD, MAX_QUEUE_CAPACITY_PER_SHARD, MAX_REQUEST_TIMEOUT_MS,
-    MAX_RESULT_BYTES, MAX_RESULT_ROWS, MAX_SHUTDOWN_GRACE_MS, ResultLimits,
+    DEFAULT_CONNECTIONS_PER_SHARD, DEFAULT_MAX_PORTALS_PER_SESSION,
+    DEFAULT_MAX_PREPARED_STATEMENTS_PER_SESSION, DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_ROWS,
+    DEFAULT_MAX_RETAINED_BOUND_VALUE_BYTES, DEFAULT_QUEUE_CAPACITY_PER_SHARD,
+    DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_SHUTDOWN_GRACE_MS, EngineOptions,
+    MAX_CONNECTIONS_PER_SHARD, MAX_PORTALS_PER_SESSION, MAX_PREPARED_STATEMENTS_PER_SESSION,
+    MAX_QUEUE_CAPACITY_PER_SHARD, MAX_REQUEST_TIMEOUT_MS, MAX_RESULT_BYTES, MAX_RESULT_ROWS,
+    MAX_RETAINED_BOUND_VALUE_BYTES, MAX_SHUTDOWN_GRACE_MS, PreparedStatementLimits, ResultLimits,
 };
 pub use planner::{BoundStatementPlan, PlannedRoute};
+pub(crate) use prepared::PreparedState;
+pub use prepared::{
+    DescribeTarget, PortalId, PrepareRequest, PreparedExecution, PreparedStatementDescription,
+    PreparedStatementId,
+};
 pub(crate) use routing::{
     BUCKET_ALGORITHM_VERSION, HASH_VERSION, INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION,
     RoutingCatalog, VIRTUAL_BUCKET_COUNT, initial_physical_shard,

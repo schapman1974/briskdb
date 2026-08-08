@@ -18,10 +18,11 @@ public SQLite parameter-index ceiling is `MAX_SQL_PARAMETERS`, currently
 
 This layer changes placeholder tokens only. No parameter values enter the
 normalizer, and values are never rendered or interpolated into SQL text. The
-current HTTP execute, query, and migration endpoints and the asynchronous
-engine do not invoke this opt-in layer; they retain their existing raw SQLite
-behavior. Issue #27 owns whether an empty batch, one statement, or a particular
-multi-statement combination may execute.
+current HTTP execute, query, and migration endpoints do not invoke this opt-in
+layer; they retain their existing raw SQLite behavior. The asynchronous
+prepared lifecycle does invoke it and requires exactly one statement before it
+creates a prepared handle. Issue #27 still owns general empty-batch and
+multi-statement request policy.
 
 The separate [SQL translation layer](SQL_TRANSLATION.md) can consume the
 result and either expose the normalized SQLite text exactly in strict mode or
@@ -53,6 +54,12 @@ Each `StatementParameters` reports:
 explicit PostgreSQL or SQLite index can leave a gap. Numbering restarts for
 each top-level statement. The per-statement records describe binding; they do
 not authorize batch execution.
+
+The prepared bind path also walks `parameter_indices()` in this exact
+occurrence order before planner allocation. It charges every occurrence,
+including repeated references to one parameter, against the conservative
+per-bind planning-expansion limit. This use does not change normalization or
+retain a bound value in `NormalizedSql`.
 
 For example, PostgreSQL `SELECT $2, $1, $2` becomes
 `SELECT ?2, ?1, ?2`. Its parameter count is 2, its occurrence count is 3, and
@@ -169,8 +176,10 @@ metadata plus a catalog database and exact bound-value slice. The implemented
 only after values are bound, compares finite physical targets, rejects
 unroutable cataloged sharded writes, and records a valid single-shard
 assignment. The implemented issue #25 translation layer is separate from this
-normalizer. Issues #26 and #27 own prepared-statement state and request-level
-statement classification respectively.
+normalizer. The implemented
+[prepared-statement lifecycle](SQL_PREPARED_STATEMENTS.md) runs normalization
+during prepare, retains its metadata, and uses it again at bind. Issue #27 owns
+request-level statement classification.
 
 ## Verification obligations
 
