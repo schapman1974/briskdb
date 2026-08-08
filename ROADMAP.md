@@ -204,7 +204,7 @@ interrupted schema migration can be diagnosed and resumed.
   spike; do not route by regular expression.
 - [x] Define the first common SQL subset: `CREATE TABLE`, indexes, `SELECT`,
   `INSERT`, `UPDATE`, `DELETE`, `BEGIN`, `COMMIT`, and `ROLLBACK`.
-- [ ] Normalize placeholders (`$1`, PostgreSQL/MySQL `?`) to SQLite parameters
+- [x] Normalize placeholders (`$1`, PostgreSQL/MySQL `?`) to SQLite parameters
   without interpolating values into SQL text.
 - [ ] Infer shard keys from predicates and inserted values, including bound
   parameters and multi-row inserts.
@@ -370,8 +370,8 @@ The first buildable slices should be small and merge independently:
 4. Define manifest schema v2 and golden routing vectors.
 5. Add the virtual-bucket map while test data can still be discarded.
 6. Add `Session`, transaction state, and one-shard pinning.
-7. Add SQL parsing and structural common-subset validation without syntax
-   translation.
+7. Add SQL parsing, structural common-subset validation, and source-preserving
+   placeholder normalization without general syntax translation.
 8. Infer routing for one-table equality CRUD and reject unroutable writes.
 9. Spike PostgreSQL simple-query connectivity end to end.
 10. Add PostgreSQL extended query flow, then reuse the same conformance suite

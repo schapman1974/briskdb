@@ -23,7 +23,7 @@ server ---------> protocol::http
 | --- | --- | --- |
 | `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, errors, and read-only logical catalog; stable key routing; bounded per-shard admission and connection pools; routed execute/query and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
-| `sql` | Dialect-explicit SQL syntax parsing and recursive common-subset validation behind BriskDB-owned opaque types; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, catalog lookup, filesystem layout, protocol responses, or protocol-specific support policy |
+| `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, and source-preserving placeholder normalization behind BriskDB-owned types; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, catalog lookup, filesystem layout, protocol responses, bound-value ownership, or protocol-specific support policy |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, listener binding, and tracked Axum HTTP/1 connection lifecycle | SQL parsing or storage implementation details |
@@ -92,10 +92,10 @@ deterministic and keeps the dependency replaceable.
 
 Parsing is syntax recognition, not support validation or planning. The parser
 has no session, parameter, catalog, storage, or routing access. The separate
-common-subset validator and later normalization and planner layers consume
-structural syntax through BriskDB-owned interfaces; shard-key inference must not
-inspect raw or formatted SQL with regular expressions. Exact input remains
-authoritative because AST formatting is lossy and is never executed.
+common-subset validator, placeholder normalizer, and later planner layers
+consume structural syntax through BriskDB-owned interfaces; shard-key inference
+must not inspect raw or formatted SQL with regular expressions. Exact input
+remains authoritative because AST formatting is lossy and is never executed.
 
 Inputs are bounded to 65,536 UTF-8 bytes, 256 statements, and recursion depth
 32. The dependency's recursive-protection feature remains enabled. Parse and
@@ -122,9 +122,34 @@ The normative accepted forms and exclusions are in the [common SQL subset
 contract](SQL_SUBSET.md).
 
 The current HTTP execute/query and migration paths deliberately remain raw
-SQLite pass-through and call neither the parser nor the subset validator.
-Issues #19 and #20 therefore change no HTTP shape, SQL acceptance, routing, or
-storage behavior.
+SQLite pass-through and call neither the parser, subset validator, nor
+placeholder normalizer. Issues #19 through #21 therefore change no HTTP shape,
+SQL acceptance, routing, or storage behavior.
+
+### Placeholder-normalization boundary
+
+`normalize_placeholders(CommonSql)` consumes the owned subset marker and
+returns an owned `NormalizedSql`. It retains the exact source and produces a
+separate `sqlite_parameter_sql()` representation in which only accepted
+placeholder spans become canonical SQLite `?N` markers. PostgreSQL `$N`
+retains `N`; MySQL `?` is numbered consecutively; SQLite `?` and `?NNN` use
+SQLite's max-so-far rule. Numbering restarts per top-level statement and is
+bounded by `MAX_SQL_PARAMETERS` (32,766).
+
+Each statement, including one without placeholders, has an ordered
+`StatementParameters` record with its largest assigned index, occurrence
+count, and occurrence-to-index sequence. This metadata lets later bind-time
+planning distinguish repeated parameters and gaps without owning protocol
+buffers. It does not inspect the bound values themselves.
+
+Normalization uses retained AST placeholder spans rather than regular
+expressions or AST formatting. Every non-marker byte remains exact, including
+comments, literals, whitespace, and UTF-8 text. SQLite named parameters are
+deliberately unsupported. The layer has no session, catalog, storage, routing,
+filesystem, or execution access and does not decide whether a statement batch
+may execute; issue #27 owns that policy. The normative API, dialect rules,
+limits, errors, and tests are in the [SQL parameter-normalization
+contract](SQL_PARAMETERS.md).
 
 ## Manifest storage boundary
 

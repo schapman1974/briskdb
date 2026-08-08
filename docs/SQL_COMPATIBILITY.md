@@ -16,12 +16,14 @@ document defines the SQL and behavioral contract separately from connectivity.
 - **Unsupported** means BriskDB rejects the behavior or makes no compatibility
   promise for it.
 
-The syntax parser and recursive common-subset validator are now available behind
-BriskDB-owned opaque types. Validation is explicit and returns `Unsupported`
-for a parsed form outside the subset; parser acceptance alone is not product
-support. The current experimental HTTP interface is still a raw SQLite
-pass-through and can execute uncontracted SQLite syntax because it calls neither
-layer. That behavior is not a compatibility promise.
+The syntax parser, recursive common-subset validator, and placeholder
+normalizer are now available behind BriskDB-owned types. Validation is explicit
+and returns `Unsupported` for a parsed form outside the subset; parser
+acceptance alone is not product support. Normalization is also explicit and
+rewrites only validated placeholder spans. The current experimental HTTP
+interface is still a raw SQLite pass-through and can execute uncontracted
+SQLite syntax because it calls none of these layers. That behavior is not a
+compatibility promise.
 
 ## Compatibility layers
 
@@ -41,13 +43,15 @@ than claiming to be a drop-in PostgreSQL or MySQL replacement.
 ## Current implementation
 
 Only the experimental HTTP network interface is implemented today. There is no
-PostgreSQL or MySQL listener or dialect translation layer yet. The public Rust
-SQL facade can parse an explicitly selected SQLite, PostgreSQL, or MySQL dialect
-and can consume that result with `validate_common_subset(ParsedSql)`, yielding
-an opaque `CommonSql` after recursive structural validation. Neither operation
-plans, routes, translates, authorizes, or executes a statement. HTTP requests
-still send SQLite SQL directly to `rusqlite`; they do not pass through the
-parser or subset validator.
+PostgreSQL or MySQL listener or general dialect translation layer yet. The
+public Rust SQL facade can parse an explicitly selected SQLite, PostgreSQL, or
+MySQL dialect, consume that result with
+`validate_common_subset(ParsedSql)`, and then opt into
+`normalize_placeholders(CommonSql)`. The final step yields canonical SQLite
+`?N` text and per-statement parameter metadata without accepting values. None
+of these operations plans, routes, generally translates, authorizes, or
+executes a statement. HTTP requests still send SQLite SQL directly to
+`rusqlite`; they do not pass through these opt-in SQL layers.
 
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
@@ -57,9 +61,9 @@ parser or subset validator.
 | PostgreSQL wire protocol | Planned | Common subset plus documented PostgreSQL normalization | SQL/bound-parameter inference with explicit session fallback |
 | MySQL wire protocol | Planned | Common subset plus documented MySQL normalization | SQL/bound-parameter inference with explicit session fallback |
 
-The parser and subset validator are implemented Rust APIs, not network
-interfaces. Structural validation is opt-in and does not change any row in this
-table.
+The parser, subset validator, and placeholder normalizer are implemented Rust
+APIs, not network interfaces. Each step is opt-in and does not change any row
+in this table.
 
 Every HTTP operation now calls the same protocol-neutral async engine intended
 for future PostgreSQL and MySQL adapters. Execute and query requests create a
@@ -167,11 +171,14 @@ no schema change. Cancellation during one shard transaction rolls that
 transaction back, although a commit that wins a close race remains durable and
 is reconciled from the retained journal prefix.
 
-### Current parameter and result conversion
+### Current HTTP parameter and result conversion
 
 Use SQLite positional placeholders such as `?1` and `?2`. Values are never
 interpolated into SQL text. The HTTP adapter converts JSON parameters into
 protocol-neutral BriskDB values; the SQL layer binds only those typed values.
+This existing execution-time binding is separate from the opt-in
+`normalize_placeholders(CommonSql)` Rust API: the HTTP adapter neither invokes
+that function nor changes the caller's SQL marker text.
 
 | JSON input | SQLite binding |
 | --- | --- |
@@ -272,15 +279,18 @@ multi-statement combinations are safe.
 consumes the opaque parsed result and returns an owned opaque `CommonSql` only
 when every top-level statement and nested form is in the first subset. Empty
 and mixed batches may validate because request-level batch policy remains issue
-#27. Both marker types retain exact source, dialect, and statement count without
+#27. `normalize_placeholders(CommonSql)` then returns an owned `NormalizedSql`
+with canonical SQLite parameter text and one parameter record per statement.
+All three types retain exact source, dialect, and statement count without
 exposing the upstream AST or rendering SQL in `Debug` output.
 
-The parser and validator have no routing or storage access. Future shard
-inference and statement classification consume structural syntax, never
+The parser, validator, and normalizer have no routing or storage access. Future
+shard inference and statement classification consume structural syntax, never
 regular-expression matches over raw or formatted SQL. See the [SQL parser
-decision record](SQL_PARSER.md) for the dependency and resource contract and
-the [common SQL subset contract](SQL_SUBSET.md) for the normative recursive
-whitelist.
+decision record](SQL_PARSER.md) for the dependency and resource contract, the
+[common SQL subset contract](SQL_SUBSET.md) for the normative recursive
+whitelist, and the [SQL parameter-normalization
+contract](SQL_PARAMETERS.md) for numbering and source-preservation rules.
 
 ### Implemented pass-through surface
 
@@ -345,11 +355,11 @@ does not mean the subset is connected to execution. Column type names are only
 required to be explicit; type compatibility and translation remain issue #25.
 Insert/update duplicate checks fold ASCII letter case regardless of quoting but
 do not define general identifier normalization, which also remains issue #25.
-Placeholders remain unchanged for issue #21. Catalog-aware key extraction,
-single-shard proof, bind-time planning, and rejection of conflicting or
-unroutable writes remain issues #22 through #24. Prepare/bind/describe/execute
-state remains issue #26, and empty or multi-statement execution policy remains
-issue #27.
+Placeholder normalization is the separate implemented issue #21 layer described
+below. Catalog-aware key extraction, single-shard proof, bind-time planning,
+and rejection of conflicting or unroutable writes remain issues #22 through
+#24. Prepare/bind/describe/execute state remains issue #26, and empty or
+multi-statement execution policy remains issue #27.
 
 The validator independently caps recursive expression AST depth at 128. This
 also bounds flat operator chains that parse iteratively; exceeding the limit is
@@ -362,6 +372,28 @@ transactions through protocol-neutral session state. Writes with no provable
 shard, conflicting shard keys, unsafe statement combinations, and cross-shard
 transactions will be rejected before changing data.
 
+### Implemented placeholder normalization
+
+The public Rust function `normalize_placeholders(CommonSql)` is opt-in and
+accepts no bound values. Its `NormalizedSql::sqlite_parameter_sql()` output
+retains every non-marker byte while representing each accepted marker as a
+canonical SQLite `?N`. `statement_parameters()` reports each statement's
+largest parameter index, occurrence count, and occurrence-to-index sequence.
+Numbering restarts per statement; those records do not grant permission to
+execute a batch.
+
+PostgreSQL `$N` retains index `N`, including repeats, gaps, and out-of-order
+occurrences. MySQL bare `?` markers receive consecutive indices from one.
+SQLite positional `?` and `?NNN` follow SQLite's native max-so-far rule, while
+SQLite named markers are deliberately unsupported. No assigned index may
+exceed `MAX_SQL_PARAMETERS` (32,766). The complete API, examples, limits, and
+error contract are in [SQL parameter normalization](SQL_PARAMETERS.md).
+
+This implemented normalization does not bind or count supplied values, infer a
+shard, translate other dialect syntax, create a prepared statement, classify
+statement behavior, authorize a request, or execute SQL. The HTTP and engine
+paths continue to bind their existing caller-supplied SQLite SQL directly.
+
 ## PostgreSQL differences
 
 The PostgreSQL listener will target the frontend/backend wire protocol and a
@@ -370,7 +402,7 @@ not implemented unless listed as implemented in this document.
 
 | Area | PostgreSQL | BriskDB contract |
 | --- | --- | --- |
-| Parameters | `$1`, `$2`, ... | Planned normalization to bound SQLite parameters; routing occurs at bind/execute time |
+| Parameters | `$1`, `$2`, ... | Implemented opt-in Rust normalization to SQLite `?N`; value binding, wire support, and bind-time routing remain planned |
 | Identifier quoting | Double quotes | Passed through where SQLite semantics agree |
 | Type system | Static types identified by OIDs | Planned loss-aware mapping to BriskDB types and SQLite storage classes |
 | Boolean | Dedicated `boolean` type | Stored as SQLite integer `0` or `1`; protocol adapter returns a Boolean value |
@@ -398,7 +430,7 @@ engine used by PostgreSQL and HTTP.
 
 | Area | MySQL | BriskDB contract |
 | --- | --- | --- |
-| Parameters | `?` in prepared statements | Planned normalization to bound SQLite parameters; no string interpolation |
+| Parameters | `?` in prepared statements | Implemented opt-in Rust normalization to consecutive SQLite `?N`; value binding and wire support remain planned |
 | Identifier quoting | Backticks by default | Planned normalization; double-quoted strict SQL remains available |
 | Type system | Static signed/unsigned column types | BriskDB retains `UInt64` without narrowing; current SQLite binding rejects values above `i64::MAX` until an explicit storage mapping exists |
 | Boolean | Commonly `TINYINT(1)` | Stored as SQLite integer `0` or `1`; protocol adapter returns documented metadata |

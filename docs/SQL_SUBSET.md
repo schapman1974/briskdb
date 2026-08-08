@@ -33,7 +33,8 @@ The complete batch succeeds as one validation operation or returns
 A successful `CommonSql` does not mean that the SQL:
 
 - names existing databases, tables, columns, constraints, or types;
-- has normalized or correctly numbered placeholders;
+- has normalized or correctly numbered placeholders until the separate
+  [`normalize_placeholders`](SQL_PARAMETERS.md) step succeeds;
 - can be routed to one shard or has a bound routing value;
 - is safe to execute as an empty, single-, or multi-statement request;
 - has a prepared-statement plan or protocol result description;
@@ -41,10 +42,11 @@ A successful `CommonSql` does not mean that the SQL:
 - is authorized for a particular endpoint or session; or
 - has been executed.
 
-Those responsibilities remain with issues #21 through #27 and the later wire
-frontends. Validation never consults parameters, a session, the logical
-catalog, storage, routing state, the filesystem, or SQLite. It never formats or
-searches SQL text to make a structural decision.
+Those responsibilities remain with the implemented issue #21 normalization
+layer, issues #22 through #27, and the later wire frontends. Validation never
+consults parameters, a session, the logical catalog, storage, routing state,
+the filesystem, or SQLite. It never formats or searches SQL text to make a
+structural decision.
 
 Empty and comment-only parsed batches validate successfully. Every statement in
 a mixed batch is checked independently and source order is retained, but that
@@ -159,8 +161,9 @@ numeric literal or a placeholder. The pinned parser represents PostgreSQL
 `LIMIT ALL` as the same absent-limit AST as omitting the clause, so structural
 validation accepts that AST-equivalent spelling and does not inspect source text
 to distinguish it. Placeholder spelling, numbering, count, and binding are not
-validated or changed here; issue #21 owns normalization without value
-interpolation.
+validated or changed here. The separate [SQL parameter-normalization
+contract](SQL_PARAMETERS.md) defines the implemented opt-in numbering step,
+which consumes `CommonSql` without accepting bound values.
 
 Common-subset expression validation has its own maximum recursive AST depth of
 128. This catches long flat operator chains, which the parser can build
