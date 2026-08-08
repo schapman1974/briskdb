@@ -13,6 +13,8 @@ planner, APIs, and production-hardening milestones.
 The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
 current SQLite pass-through API from planned PostgreSQL and MySQL compatibility.
 Contributions follow the repository's [test-first completion policy](CONTRIBUTING.md).
+The [benchmark baseline](docs/BENCHMARKS.md) defines the reproducible storage
+workloads used to measure the current prototype.
 
 BriskDB supports Rust 1.85 and newer stable releases. CI tests the declared
 minimum supported Rust version (MSRV) and the latest stable toolchain.
@@ -25,6 +27,7 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Routed execute and query endpoints
 - A broadcast endpoint for initializing schema on every shard
 - Full SQLite synchronous durability and a five-second busy timeout
+- Reproducible point-read, point-write, and four-shard write benchmarks
 
 The on-disk layout is deliberately simple:
 
