@@ -89,6 +89,7 @@ impl Database {
         statement: &str,
         params: &[Value],
     ) -> EngineResult<Routed<usize>> {
+        let _schema_operation = self.storage.enter_schema_operation()?;
         let shard = self.shard_for_key(shard_key.as_bytes());
         let connection = self.storage.open_shard(shard)?;
         let value = sql::execute(&connection, statement, params)?;
@@ -101,6 +102,7 @@ impl Database {
         statement: &str,
         params: &[Value],
     ) -> EngineResult<Routed<ResultSet>> {
+        let _schema_operation = self.storage.enter_schema_operation()?;
         let shard = self.shard_for_key(shard_key.as_bytes());
         let connection = self.storage.open_shard(shard)?;
         let value = sql::query(&connection, statement, params)?;
@@ -126,23 +128,18 @@ impl Database {
     }
 
     pub fn broadcast(&self, statement: &str) -> EngineResult<Vec<u16>> {
-        let mut completed = Vec::with_capacity(usize::from(self.shard_count()));
-        for shard in 0..self.shard_count() {
-            let connection = self.storage.open_shard(shard).map_err(|error| {
-                error.context(format!("broadcast failed to open shard {shard}"))
-            })?;
-            sql::execute_batch(&connection, statement)
-                .map_err(|error| error.context(format!("broadcast failed on shard {shard}")))?;
-            completed.push(shard);
-        }
+        let mut migration = self.storage.begin_schema_migration()?;
+        migration.wait_for_quiescence_blocking();
+        let completed = self
+            .storage
+            .apply_schema_migration(statement, &mut migration, None)?;
+        migration.publish_ready()?;
         Ok(completed)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error as _;
-
     use super::*;
 
     #[test]
@@ -335,42 +332,54 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_failure_preserves_kind_and_can_recover_remaining_shards() {
+    fn broadcast_preflight_failure_changes_no_shard_and_can_retry() {
         let temp = tempfile::tempdir().unwrap();
         let database = Database::open(temp.path(), 4).unwrap();
+        database
+            .broadcast("CREATE TABLE recovery_marker (id INTEGER NOT NULL);")
+            .unwrap();
         let shard_one = database.storage.open_shard(1).unwrap();
-        sql::execute_batch(&shard_one, "CREATE TABLE recovery_marker (id INTEGER);").unwrap();
+        shard_one
+            .execute_batch("INSERT INTO recovery_marker VALUES (1), (1)")
+            .unwrap();
 
         let error = database
-            .broadcast("CREATE TABLE recovery_marker (id INTEGER);")
+            .broadcast("CREATE UNIQUE INDEX recovery_marker_id ON recovery_marker (id);")
             .unwrap_err();
-        assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
-        assert_eq!(error.to_string(), "broadcast failed on shard 1");
-        assert!(error.source().is_some());
+        assert_eq!(error.kind(), EngineErrorKind::UniqueViolation);
+        assert_eq!(
+            error.to_string(),
+            "schema migration preflight failed on shard 1"
+        );
 
         let shard_zero = database.storage.open_shard(0).unwrap();
         let shard_two = database.storage.open_shard(2).unwrap();
-        let table_exists = |connection: &rusqlite::Connection| {
+        let index_exists = |connection: &rusqlite::Connection| {
             connection
                 .query_row(
                     "SELECT EXISTS (
                         SELECT 1 FROM sqlite_schema
-                        WHERE type = 'table' AND name = 'recovery_marker'
+                        WHERE type = 'index' AND name = 'recovery_marker_id'
                     )",
                     [],
                     |row| row.get::<_, bool>(0),
                 )
                 .unwrap()
         };
-        assert!(table_exists(&shard_zero));
-        assert!(!table_exists(&shard_two));
+        assert!(!index_exists(&shard_zero));
+        assert!(!index_exists(&shard_two));
+
+        shard_one
+            .execute("DELETE FROM recovery_marker WHERE rowid = 2", [])
+            .unwrap();
 
         assert_eq!(
             database
-                .broadcast("CREATE TABLE IF NOT EXISTS recovery_marker (id INTEGER);")
+                .broadcast("CREATE UNIQUE INDEX recovery_marker_id ON recovery_marker (id);")
                 .unwrap(),
             [0, 1, 2, 3]
         );
-        assert!(table_exists(&shard_two));
+        assert!(index_exists(&shard_zero));
+        assert!(index_exists(&shard_two));
     }
 }

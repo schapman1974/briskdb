@@ -1,24 +1,34 @@
 //! SQLite file layout, versioned manifest management, and connection configuration.
 
 mod manifest;
+mod migration;
+mod schema_gate;
 mod shard;
 
 pub(crate) mod pool;
 pub(crate) use pool::{ConnectionOwner, ConnectionPools, PooledConnection};
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use rusqlite::{
-    Connection,
+    Connection, OpenFlags,
     hooks::{AuthAction, AuthContext, Authorization},
 };
+
+#[cfg(test)]
+pub(crate) use migration::SchemaMigrationCoordinatorPoint;
+#[cfg(test)]
+pub(crate) use schema_gate::{SchemaGateSnapshot, SchemaGateState};
+pub(crate) use schema_gate::{SchemaMigrationGuard, SchemaOperationGuard};
 
 pub use crate::core::Database;
 use crate::{
@@ -28,11 +38,167 @@ use crate::{
 
 pub(crate) const CONNECTION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[derive(Debug)]
+struct RootSchemaCoordination {
+    gate: schema_gate::SchemaGate,
+    catalogs: Mutex<Vec<Weak<CatalogSnapshot>>>,
+}
+
+impl RootSchemaCoordination {
+    fn new() -> Self {
+        Self {
+            gate: schema_gate::SchemaGate::new(),
+            catalogs: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn register_catalog(&self, loaded: CatalogSnapshot) -> EngineResult<Arc<CatalogSnapshot>> {
+        let loaded = Arc::new(loaded);
+        let mut catalogs = self.catalogs.lock().map_err(|error| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                format!("root schema catalog coordination is poisoned: {error}"),
+            )
+        })?;
+        catalogs.retain(|catalog| catalog.strong_count() != 0);
+        catalogs.push(Arc::downgrade(&loaded));
+        Ok(loaded)
+    }
+
+    fn publish_schema_generation(
+        &self,
+        expected_generation: u64,
+        target_generation: u64,
+    ) -> EngineResult<()> {
+        let mut catalogs = self.catalogs.lock().map_err(|error| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                format!("root schema catalog coordination is poisoned: {error}"),
+            )
+        })?;
+        catalogs.retain(|catalog| catalog.strong_count() != 0);
+        let live = catalogs
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+
+        if let Some(observed) = live
+            .iter()
+            .map(|catalog| catalog.logical().schema_generation())
+            .find(|generation| {
+                *generation != expected_generation && *generation != target_generation
+            })
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                format!(
+                    "cannot publish schema generation {target_generation}; a live catalog is at generation {observed}"
+                ),
+            ));
+        }
+
+        for catalog in live {
+            catalog
+                .logical()
+                .publish_schema_generation(expected_generation, target_generation)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_validated_catalog_generation(
+        &self,
+        validated: &CatalogSnapshot,
+    ) -> EngineResult<()> {
+        let target_generation = validated.logical().schema_generation();
+        let mut catalogs = self.catalogs.lock().map_err(|error| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                format!("root schema catalog coordination is poisoned: {error}"),
+            )
+        })?;
+        catalogs.retain(|catalog| catalog.strong_count() != 0);
+        let live = catalogs
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+
+        if live
+            .iter()
+            .all(|catalog| catalog.logical().schema_generation() == target_generation)
+        {
+            return Ok(());
+        }
+        let source_generation = target_generation.checked_sub(1).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "validated manifest generation conflicts with a live catalog",
+            )
+        })?;
+        if live.iter().any(|catalog| {
+            !matches!(
+                catalog.logical().schema_generation(),
+                generation if generation == source_generation || generation == target_generation
+            )
+        }) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "validated manifest generation conflicts with a live catalog",
+            ));
+        }
+
+        for catalog in live {
+            catalog
+                .logical()
+                .publish_schema_generation(source_generation, target_generation)?;
+        }
+        Ok(())
+    }
+}
+
+static ROOT_SCHEMA_COORDINATIONS: OnceLock<Mutex<HashMap<PathBuf, Weak<RootSchemaCoordination>>>> =
+    OnceLock::new();
+
+fn root_schema_coordination(root: &Path) -> EngineResult<Arc<RootSchemaCoordination>> {
+    let registry = ROOT_SCHEMA_COORDINATIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().map_err(|error| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            format!("root schema coordination registry is poisoned: {error}"),
+        )
+    })?;
+    registry.retain(|_, coordination| coordination.strong_count() != 0);
+    if let Some(coordination) = registry.get(root).and_then(Weak::upgrade) {
+        return Ok(coordination);
+    }
+    let coordination = Arc::new(RootSchemaCoordination::new());
+    registry.insert(root.to_path_buf(), Arc::downgrade(&coordination));
+    Ok(coordination)
+}
+
+fn begin_startup_coordination(
+    coordination: &RootSchemaCoordination,
+) -> EngineResult<SchemaMigrationGuard> {
+    let started = Instant::now();
+    loop {
+        match coordination.gate.begin_migration() {
+            Ok(guard) => return Ok(guard),
+            Err(error)
+                if error.kind() == EngineErrorKind::Busy
+                    && started.elapsed() < CONNECTION_BUSY_TIMEOUT =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Storage {
     root: PathBuf,
     catalog: Arc<CatalogSnapshot>,
     shard_layout: shard::ShardLayout,
+    schema_coordination: Arc<RootSchemaCoordination>,
 }
 
 impl Storage {
@@ -43,13 +209,16 @@ impl Storage {
         fs::create_dir_all(&root).map_err(|error| {
             sqlite_error::storage_io(error, format!("failed to create {}", root.display()))
         })?;
+        let root = fs::canonicalize(&root).map_err(|error| {
+            sqlite_error::storage_io(error, format!("failed to resolve {}", root.display()))
+        })?;
+        let schema_coordination = root_schema_coordination(&root)?;
+        let mut startup = begin_startup_coordination(&schema_coordination)?;
+        startup.wait_for_quiescence_blocking();
         let shards_dir = root.join("shards");
         let fresh_layout_allowed = physical_layout_is_empty(&shards_dir)?;
         let manifest_path = root.join("manifest.sqlite");
-        let mut manifest = Connection::open(&manifest_path).map_err(|error| {
-            sqlite_error::storage(error)
-                .context(format!("failed to open {}", manifest_path.display()))
-        })?;
+        let mut manifest = open_manifest_for_startup(&manifest_path)?;
         configure_manifest_connection(&manifest)?;
         let loaded = manifest::load_or_create_manifest_with_fresh_layout(
             &mut manifest,
@@ -57,7 +226,21 @@ impl Storage {
             fresh_layout_allowed,
         )?;
         configure_journal_mode(&manifest)?;
-        let (catalog, shard_layout) = loaded.into_parts();
+        let (catalog, shard_layout, active_migration) = loaded.into_parts_with_migration();
+        let catalog = schema_coordination.register_catalog(catalog)?;
+
+        if let Some(active_migration) = active_migration {
+            startup.mark_pending_on_drop();
+            migration::resume_schema_migration_on_startup(
+                &root,
+                &mut manifest,
+                requested_shards,
+                &catalog,
+                &shard_layout,
+                &schema_coordination,
+                active_migration,
+            )?;
+        }
         let schema_generation = catalog.logical().schema_generation();
 
         let ready_layout = manifest::reconcile_shard_layout(
@@ -76,12 +259,17 @@ impl Storage {
 
         let storage = Self {
             root,
-            catalog: Arc::new(catalog),
+            catalog,
             shard_layout: ready_layout,
+            schema_coordination,
         };
         for shard in 0..storage.shard_count() {
             storage.open_shard(shard)?;
         }
+        storage
+            .schema_coordination
+            .reconcile_validated_catalog_generation(&storage.catalog)?;
+        startup.publish_ready()?;
         Ok(storage)
     }
 
@@ -95,6 +283,51 @@ impl Storage {
 
     pub(crate) fn logical_catalog(&self) -> &Catalog {
         self.catalog.logical()
+    }
+
+    pub(crate) fn current_schema_generation(&self) -> u64 {
+        self.catalog.logical().schema_generation()
+    }
+
+    pub(crate) fn enter_schema_operation(&self) -> EngineResult<SchemaOperationGuard> {
+        self.schema_coordination.gate.try_acquire_operation()
+    }
+
+    pub(crate) fn begin_schema_migration(&self) -> EngineResult<SchemaMigrationGuard> {
+        self.schema_coordination.gate.begin_migration()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_schema_migration_test_block(
+        &self,
+        point: SchemaMigrationCoordinatorPoint,
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> EngineResult<()> {
+        migration::install_schema_migration_test_block(&self.root, point, started, release)
+    }
+
+    fn publish_schema_generation(
+        &self,
+        expected_generation: u64,
+        target_generation: u64,
+    ) -> EngineResult<()> {
+        self.schema_coordination
+            .publish_schema_generation(expected_generation, target_generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn schema_gate_snapshot(&self) -> SchemaGateSnapshot {
+        self.schema_coordination.gate.snapshot()
+    }
+
+    pub(crate) fn apply_schema_migration(
+        &self,
+        sql: &str,
+        guard: &mut SchemaMigrationGuard,
+        control: Option<Arc<crate::core::OperationControl>>,
+    ) -> EngineResult<Vec<u16>> {
+        migration::apply_schema_migration(self, sql, guard, control)
     }
 
     fn shard_path(&self, shard: u16) -> PathBuf {
@@ -337,6 +570,105 @@ fn configure_manifest_connection(connection: &Connection) -> EngineResult<()> {
     Ok(())
 }
 
+fn open_manifest_for_startup(path: &Path) -> EngineResult<Connection> {
+    validate_optional_manifest_file(path)?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+        | OpenFlags::SQLITE_OPEN_EXRESCODE;
+    let open_path = canonical_manifest_open_path(path)?;
+    let connection = Connection::open_with_flags(open_path, flags).map_err(|error| {
+        sqlite_error::storage(error).context(format!("failed to open {}", path.display()))
+    })?;
+    validate_existing_manifest_file(path)?;
+    Ok(connection)
+}
+
+pub(super) fn open_existing_manifest(path: &Path) -> EngineResult<Connection> {
+    validate_existing_manifest_file(path)?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+        | OpenFlags::SQLITE_OPEN_EXRESCODE;
+    let open_path = canonical_manifest_open_path(path)?;
+    let connection = Connection::open_with_flags(open_path, flags).map_err(|error| {
+        sqlite_error::storage(error).context(format!("failed to open {}", path.display()))
+    })?;
+    validate_existing_manifest_file(path)?;
+    Ok(connection)
+}
+
+fn validate_optional_manifest_file(path: &Path) -> EngineResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_file() => Ok(()),
+        Ok(_) => Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("manifest {} is not a real file", path.display()),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(sqlite_error::storage_io(
+            error,
+            format!("failed to inspect {}", path.display()),
+        )),
+    }
+}
+
+fn validate_existing_manifest_file(path: &Path) -> EngineResult<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            EngineError::from_source(
+                EngineErrorKind::DataCorruption,
+                format!("required manifest {} is missing", path.display()),
+                error,
+            )
+        } else {
+            sqlite_error::storage_io(error, format!("failed to inspect {}", path.display()))
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("manifest {} is not a real file", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_manifest_open_path(path: &Path) -> EngineResult<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("manifest path {} has no parent directory", path.display()),
+        )
+    })?;
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
+        sqlite_error::storage_io(
+            error,
+            format!("failed to inspect manifest directory {}", parent.display()),
+        )
+    })?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("manifest path {} is not a real directory", parent.display()),
+        ));
+    }
+    let file_name = path.file_name().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("manifest path {} has no file name", path.display()),
+        )
+    })?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|error| {
+        sqlite_error::storage_io(
+            error,
+            format!("failed to resolve manifest directory {}", parent.display()),
+        )
+    })?;
+    Ok(canonical_parent.join(file_name))
+}
+
 fn configure_journal_mode(connection: &Connection) -> EngineResult<()> {
     let mode = connection
         .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
@@ -503,6 +835,85 @@ mod tests {
                 (layout_id.clone(), shard_id)
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_and_symlink_roots_share_migration_coordination() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = Storage::open(temp.path(), 2).unwrap();
+        let alias_parent = tempfile::tempdir().unwrap();
+        let alias_path = alias_parent.path().join("database-alias");
+        std::os::unix::fs::symlink(temp.path(), &alias_path).unwrap();
+        let alias = Storage::open(&alias_path, 2).unwrap();
+
+        assert!(Arc::ptr_eq(
+            &original.schema_coordination,
+            &alias.schema_coordination
+        ));
+        let mut migration = alias.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        assert_eq!(
+            original.enter_schema_operation().unwrap_err().kind(),
+            EngineErrorKind::Busy
+        );
+        assert_eq!(
+            alias
+                .apply_schema_migration(
+                    "CREATE TABLE canonical_root_marker (id INTEGER)",
+                    &mut migration,
+                    None,
+                )
+                .unwrap(),
+            [0, 1]
+        );
+        migration.publish_ready().unwrap();
+
+        assert_eq!(original.current_schema_generation(), 1);
+        assert_eq!(alias.current_schema_generation(), 1);
+        for shard_id in 0..2 {
+            assert!(
+                original
+                    .open_shard(shard_id)
+                    .unwrap()
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM sqlite_schema WHERE name = 'canonical_root_marker'
+                         )",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_rejects_a_symlinked_manifest_without_mutating_its_target() {
+        let target_root = tempfile::tempdir().unwrap();
+        drop(Storage::open(target_root.path(), 2).unwrap());
+        let target_manifest = target_root.path().join("manifest.sqlite");
+        let before = fs::read(&target_manifest).unwrap();
+
+        let victim_root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&target_manifest, victim_root.path().join("manifest.sqlite"))
+            .unwrap();
+        let error = Storage::open(victim_root.path(), 2).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(!victim_root.path().join("shards").exists());
+        assert_eq!(fs::read(&target_manifest).unwrap(), before);
+        assert_eq!(
+            Connection::open(&target_manifest)
+                .unwrap()
+                .query_row(
+                    "SELECT schema_generation FROM briskdb_schema_catalog WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1094,16 +1505,23 @@ mod tests {
     fn every_connection_surface_denies_storage_owned_sql_and_preserves_identity() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Storage::open(temp.path(), 2).unwrap();
+        let mut migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        storage
+            .apply_schema_migration(
+                "CREATE TABLE application_rows (id INTEGER PRIMARY KEY)",
+                &mut migration,
+                None,
+            )
+            .unwrap();
+        migration.publish_ready().unwrap();
 
         for connection in [
             storage.open_shard(0).unwrap(),
             storage.open_pooled_shard(0).unwrap().0,
         ] {
             connection
-                .execute_batch(
-                    "CREATE TABLE IF NOT EXISTS application_rows (id INTEGER PRIMARY KEY);
-                     INSERT OR IGNORE INTO application_rows VALUES (1);",
-                )
+                .execute_batch("INSERT OR IGNORE INTO application_rows VALUES (1);")
                 .unwrap();
             for statement in [
                 "PRAGMA application_id = 7",
@@ -1114,6 +1532,8 @@ mod tests {
                 "SELECT * FROM briskdb_shard_metadata",
                 "DROP TABLE briskdb_shard_metadata",
                 "CREATE TABLE briskdb_future (id INTEGER)",
+                "CREATE TABLE denied_application_table (id INTEGER)",
+                "DROP TABLE application_rows",
                 "ALTER TABLE application_rows RENAME TO briskdb_future",
             ] {
                 assert!(
@@ -1143,7 +1563,7 @@ mod tests {
         assert_eq!(
             raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            0
+            i64::try_from(storage.current_schema_generation()).unwrap()
         );
         assert_eq!(
             raw.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
@@ -1157,6 +1577,12 @@ mod tests {
     fn protocol_neutral_database_surfaces_report_storage_denials() {
         let temp = tempfile::tempdir().unwrap();
         let database = Database::open(temp.path(), 2).unwrap();
+        assert_eq!(
+            database
+                .broadcast("CREATE TABLE migration_only (id INTEGER PRIMARY KEY)")
+                .unwrap(),
+            [0, 1]
+        );
 
         let pragma = database
             .execute("tenant", "PRAGMA user_version = 7", &[])
@@ -1166,9 +1592,38 @@ mod tests {
             .query("tenant", "SELECT shard_id FROM briskdb_shard_metadata", &[])
             .unwrap_err();
         assert_eq!(metadata.kind(), EngineErrorKind::PermissionDenied);
+        let routed_ddl = database
+            .execute(
+                "tenant",
+                "CREATE TABLE bypassed_migration (id INTEGER)",
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(routed_ddl.kind(), EngineErrorKind::PermissionDenied);
         let broadcast = database
             .broadcast("UPDATE briskdb_shard_metadata SET shard_id = 1")
             .unwrap_err();
         assert_eq!(broadcast.kind(), EngineErrorKind::PermissionDenied);
+        for shard_id in 0..2 {
+            let shard = Connection::open(shard_file(temp.path(), shard_id)).unwrap();
+            assert!(
+                shard
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'migration_only')",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+            assert!(
+                !shard
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'bypassed_migration')",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
     }
 }

@@ -160,6 +160,7 @@ fn byte_limit_exceeded() -> EngineError {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn execute_batch(connection: &Connection, statement: &str) -> EngineResult<()> {
     connection
         .execute_batch(statement)

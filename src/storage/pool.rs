@@ -187,6 +187,7 @@ impl ConnectionPools {
     }
 
     /// Reserve one slot on every shard in deterministic shard order.
+    #[cfg(test)]
     pub(crate) async fn acquire_all_for_owner(
         &self,
         owner: ConnectionOwner,
@@ -226,6 +227,15 @@ impl ConnectionPools {
         let closed = closing.len();
         drop(closing);
         Ok(closed)
+    }
+
+    /// Retire every idle handle before an application-schema migration starts.
+    ///
+    /// The migration coordinator calls this only after schema-operation
+    /// admission is quiescent, so no checked-out handle can race back into the
+    /// pool while the shard generation changes.
+    pub(crate) fn retire_idle_for_schema_migration(&self) -> EngineResult<usize> {
+        self.close_idle()
     }
 
     #[cfg(test)]
@@ -481,8 +491,18 @@ impl ShardPoolInner {
         owner: ConnectionOwner,
         control: Option<Arc<OperationControl>>,
     ) -> EngineResult<ManagedConnection> {
-        let (reusable, foreign_write_connection) = {
+        let current_schema_generation = self.storage.current_schema_generation();
+        let (reusable, foreign_write_connection, stale_connections) = {
             let mut idle = self.lock_idle()?;
+            let mut stale_connections = Vec::new();
+            let mut index = 0;
+            while index < idle.len() {
+                if idle[index].schema_generation == current_schema_generation {
+                    index += 1;
+                } else {
+                    stale_connections.push(idle.swap_remove(index));
+                }
+            }
             let reusable_index = idle
                 .iter()
                 .position(|connection| connection.write_owner == Some(owner))
@@ -495,17 +515,28 @@ impl ShardPoolInner {
                     idle.iter()
                         .position(|connection| connection.write_owner.is_none())
                 });
-            match reusable_index {
+            let (reusable, foreign_write_connection) = match reusable_index {
                 Some(index) => (Some(idle.swap_remove(index)), None),
                 None => (None, idle.pop()),
-            }
+            };
+            (reusable, foreign_write_connection, stale_connections)
         };
 
+        for connection in stale_connections {
+            self.retire(connection);
+        }
         if let Some(connection) = foreign_write_connection {
             self.retire(connection);
         }
 
         if let Some(connection) = reusable {
+            if connection.schema_generation != self.storage.current_schema_generation() {
+                self.retire(connection);
+                return match control {
+                    Some(control) => self.open_connection_controlled(control),
+                    None => self.open_connection(),
+                };
+            }
             connection.hygiene.wrote.store(false, Ordering::Relaxed);
             #[cfg(test)]
             self.reused.fetch_add(1, Ordering::Relaxed);
@@ -519,14 +550,16 @@ impl ShardPoolInner {
     }
 
     fn open_connection(&self) -> EngineResult<ManagedConnection> {
+        let schema_generation = self.storage.current_schema_generation();
         let (connection, hygiene) = self.storage.open_pooled_shard(self.shard)?;
-        Ok(self.managed_connection(connection, hygiene))
+        Ok(self.managed_connection(connection, hygiene, schema_generation))
     }
 
     fn open_connection_controlled(
         &self,
         control: Arc<OperationControl>,
     ) -> EngineResult<ManagedConnection> {
+        let schema_generation = self.storage.current_schema_generation();
         let mut connection = self.storage.open_unconfigured_shard(self.shard)?;
         configure_connection_controlled(
             &mut connection,
@@ -537,7 +570,7 @@ impl ShardPoolInner {
             self.take_setup_hook(),
         )?;
         let (connection, hygiene) = self.storage.attach_pool_hygiene(connection)?;
-        Ok(self.managed_connection(connection, hygiene))
+        Ok(self.managed_connection(connection, hygiene, schema_generation))
     }
 
     #[cfg(test)]
@@ -568,6 +601,7 @@ impl ShardPoolInner {
         &self,
         connection: Connection,
         hygiene: ConnectionHygiene,
+        schema_generation: u64,
     ) -> ManagedConnection {
         #[cfg(test)]
         let id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
@@ -578,6 +612,7 @@ impl ShardPoolInner {
             id,
             connection,
             hygiene,
+            schema_generation,
             write_owner: None,
             origin_owner: None,
         }
@@ -590,6 +625,11 @@ impl ShardPoolInner {
     }
 
     fn check_in(&self, mut connection: ManagedConnection, owner: ConnectionOwner, broken: bool) {
+        if connection.schema_generation != self.storage.current_schema_generation() {
+            self.retire(connection);
+            return;
+        }
+
         let panicking = std::thread::panicking();
         let was_in_transaction = !connection.connection.is_autocommit();
         let mut cleanup_failed = false;
@@ -623,6 +663,7 @@ struct ManagedConnection {
     id: u64,
     connection: Connection,
     hygiene: ConnectionHygiene,
+    schema_generation: u64,
     write_owner: Option<ConnectionOwner>,
     origin_owner: Option<ConnectionOwner>,
 }
@@ -847,16 +888,6 @@ impl PooledConnection {
         preparation_failed || probe.requires_fresh_connection()
     }
 
-    pub(crate) fn ensure_owner_local_controlled(
-        &mut self,
-        control: Arc<OperationControl>,
-    ) -> EngineResult<()> {
-        if self.borrowed_from_other_owner {
-            self.replace_with_fresh_controlled(control)?;
-        }
-        Ok(())
-    }
-
     #[cfg(test)]
     fn replace_with_fresh(&mut self) -> EngineResult<()> {
         let previous = self
@@ -1014,6 +1045,45 @@ mod tests {
         (temp, pools)
     }
 
+    fn pools_with_schema(
+        pool_size: usize,
+        queue_capacity: usize,
+        sql: &str,
+    ) -> (tempfile::TempDir, ConnectionPools) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let mut migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        storage
+            .apply_schema_migration(sql, &mut migration, None)
+            .unwrap();
+        migration.publish_ready().unwrap();
+        let pools = ConnectionPools::new(storage, pool_size, queue_capacity).unwrap();
+        (temp, pools)
+    }
+
+    fn advance_schema_generation(
+        temp: &tempfile::TempDir,
+        pools: &ConnectionPools,
+        source_generation: u64,
+        target_generation: u64,
+    ) {
+        let target_user_version = i64::try_from(target_generation).unwrap();
+        for shard in 0..pools.shards.len() {
+            let path = temp.path().join(format!("shards/{shard:04}.sqlite"));
+            Connection::open(path)
+                .unwrap()
+                .pragma_update(None, "user_version", target_user_version)
+                .unwrap();
+        }
+        pools.shards[0]
+            .inner
+            .storage
+            .logical_catalog()
+            .publish_schema_generation(source_generation, target_generation)
+            .unwrap();
+    }
+
     async fn wait_for_occupancy(pools: &ConnectionPools, shard: u16, active: usize, queued: usize) {
         timeout(Duration::from_secs(2), async {
             loop {
@@ -1117,6 +1187,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_idle_generation_is_retired_before_checkout() {
+        let (temp, pools) = pools(1, 0);
+        let first = pools.acquire(0).await.unwrap().checkout().unwrap();
+        let first_id = first.connection_id();
+        drop(first);
+
+        advance_schema_generation(&temp, &pools, 0, 1);
+
+        let replacement = pools.acquire(0).await.unwrap().checkout().unwrap();
+        assert_ne!(replacement.connection_id(), first_id);
+        drop(replacement);
+
+        let snapshot = pools.snapshot().unwrap().shards[0];
+        assert_eq!(snapshot.opened, 2);
+        assert_eq!(snapshot.checkouts, 2);
+        assert_eq!(snapshot.reused, 0);
+        assert_eq!(snapshot.retired, 1);
+        assert_eq!(snapshot.idle, 1);
+    }
+
+    #[tokio::test]
+    async fn checked_out_connection_from_a_stale_generation_is_retired_on_checkin() {
+        let (temp, pools) = pools(1, 0);
+        let first = pools.acquire(0).await.unwrap().checkout().unwrap();
+        let first_id = first.connection_id();
+
+        advance_schema_generation(&temp, &pools, 0, 1);
+        drop(first);
+
+        let stale = pools.snapshot().unwrap().shards[0];
+        assert_eq!(stale.opened, 1);
+        assert_eq!(stale.retired, 1);
+        assert_eq!(stale.idle, 0);
+
+        let replacement = pools.acquire(0).await.unwrap().checkout().unwrap();
+        assert_ne!(replacement.connection_id(), first_id);
+        drop(replacement);
+
+        let recovered = pools.snapshot().unwrap().shards[0];
+        assert_eq!(recovered.opened, 2);
+        assert_eq!(recovered.retired, 1);
+        assert_eq!(recovered.idle, 1);
+    }
+
+    #[tokio::test]
+    async fn schema_migration_idle_retirement_drains_every_shard() {
+        let (_temp, pools) = pools(1, 0);
+        for shard in 0..2 {
+            drop(pools.acquire(shard).await.unwrap().checkout().unwrap());
+        }
+
+        assert_eq!(pools.retire_idle_for_schema_migration().unwrap(), 2);
+        assert!(
+            pools
+                .snapshot()
+                .unwrap()
+                .shards
+                .iter()
+                .all(|shard| shard.idle == 0)
+        );
+    }
+
+    #[tokio::test]
     async fn lazy_open_preserves_storage_error_classification() {
         let (temp, pools) = pools(1, 0);
         fs::write(
@@ -1135,10 +1268,13 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_implicit_dml_can_reuse_a_connection_within_one_owner() {
-        let (_temp, pools) = pools(1, 0);
+        let (_temp, pools) = pools_with_schema(
+            1,
+            0,
+            "CREATE TABLE widgets (id INTEGER PRIMARY KEY, value INTEGER)",
+        );
         let mut expected_id = None;
         for sql in [
-            "CREATE TABLE widgets (id INTEGER PRIMARY KEY, value INTEGER)",
             "INSERT INTO widgets (id, value) VALUES (1, 10)",
             "UPDATE widgets SET value = 20 WHERE id = 1",
             "DELETE FROM widgets WHERE id = 1",
@@ -1152,14 +1288,15 @@ mod tests {
 
         let snapshot = pools.snapshot().unwrap().shards[0];
         assert_eq!(snapshot.opened, 1);
-        assert_eq!(snapshot.reused, 3);
+        assert_eq!(snapshot.reused, 2);
         assert_eq!(snapshot.retired, 0);
         assert_eq!(snapshot.idle, 1);
     }
 
     #[tokio::test]
     async fn write_local_sqlite_state_never_crosses_connection_owners() {
-        let (_temp, pools) = pools(1, 0);
+        let (_temp, pools) =
+            pools_with_schema(1, 0, "CREATE TABLE widgets (id INTEGER PRIMARY KEY)");
         let first_owner = ConnectionOwner::new(11);
         let second_owner = ConnectionOwner::new(22);
         let third_owner = ConnectionOwner::new(33);
@@ -1171,10 +1308,7 @@ mod tests {
             .checkout()
             .unwrap();
         first
-            .execute_batch(
-                "CREATE TABLE widgets (id INTEGER PRIMARY KEY);
-                 INSERT INTO widgets (id) VALUES (1);",
-            )
+            .execute_batch("INSERT INTO widgets (id) VALUES (1);")
             .unwrap();
         let first_id = first.connection_id();
         assert_eq!(
@@ -1243,12 +1377,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_foreign_write_moves_to_a_fresh_handle_and_keeps_its_own_counters() {
-        let (_temp, pools) = pools(1, 0);
-        let setup = pools.shards[0].inner.storage.open_shard(0).unwrap();
-        setup
-            .execute_batch("CREATE TABLE widgets (id INTEGER PRIMARY KEY)")
-            .unwrap();
-        drop(setup);
+        let (_temp, pools) =
+            pools_with_schema(1, 0, "CREATE TABLE widgets (id INTEGER PRIMARY KEY)");
 
         let first_owner = ConnectionOwner::new(11);
         let writer = ConnectionOwner::new(22);
@@ -1330,7 +1460,11 @@ mod tests {
 
     #[tokio::test]
     async fn connection_local_sql_on_a_foreign_read_handle_moves_to_a_fresh_connection() {
-        let (_temp, pools) = pools(2, 0);
+        let (_temp, pools) = pools_with_schema(
+            2,
+            0,
+            "CREATE TABLE data_version_marker (id INTEGER PRIMARY KEY)",
+        );
         let first_owner = ConnectionOwner::new(11);
         let writer = ConnectionOwner::new(22);
         let observer = ConnectionOwner::new(33);
@@ -1351,7 +1485,7 @@ mod tests {
             .checkout()
             .unwrap();
         writer_connection
-            .execute_batch("CREATE TABLE data_version_marker (id INTEGER PRIMARY KEY)")
+            .execute_batch("INSERT INTO data_version_marker VALUES (1)")
             .unwrap();
         drop(writer_connection);
         drop(first);
@@ -1595,11 +1729,9 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_sql_errors_return_a_clean_connection_to_the_pool() {
-        let (_temp, pools) = pools(1, 0);
+        let (_temp, pools) =
+            pools_with_schema(1, 0, "CREATE TABLE widgets (id INTEGER PRIMARY KEY)");
         let connection = pools.acquire(0).await.unwrap().checkout().unwrap();
-        connection
-            .execute_batch("CREATE TABLE widgets (id INTEGER PRIMARY KEY)")
-            .unwrap();
         connection
             .execute("INSERT INTO widgets (id) VALUES (1)", [])
             .unwrap();
@@ -1624,11 +1756,9 @@ mod tests {
 
     #[tokio::test]
     async fn non_autocommit_state_is_rolled_back_before_a_tainted_connection_retires() {
-        let (_temp, pools) = pools(1, 0);
+        let (_temp, pools) =
+            pools_with_schema(1, 0, "CREATE TABLE widgets (id INTEGER PRIMARY KEY)");
         let connection = pools.acquire(0).await.unwrap().checkout().unwrap();
-        connection
-            .execute_batch("CREATE TABLE widgets (id INTEGER PRIMARY KEY)")
-            .unwrap();
         let original_id = connection.connection_id();
         drop(connection);
 

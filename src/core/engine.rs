@@ -19,7 +19,7 @@ use super::{
 };
 use crate::{
     sql,
-    storage::{ConnectionOwner, ConnectionPools, PooledConnection},
+    storage::{ConnectionOwner, ConnectionPools, PooledConnection, SchemaOperationGuard},
 };
 
 static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
@@ -465,6 +465,10 @@ impl Engine {
         context: RequestContext,
     ) -> EngineResult<Routed<usize>> {
         let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
         let guard = match operation.wait_pending(self.ready_session(session)).await {
             Ok(guard) => guard,
             Err(error) => return operation.finish(Err(error)),
@@ -482,6 +486,7 @@ impl Engine {
                 &mut operation,
                 shard,
                 owner,
+                schema_operation,
                 guard,
                 move |connection, control| {
                     connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sql)?;
@@ -514,6 +519,10 @@ impl Engine {
         context: RequestContext,
     ) -> EngineResult<Routed<ResultSet>> {
         let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
         let guard = match operation.wait_pending(self.ready_session(session)).await {
             Ok(guard) => guard,
             Err(error) => return operation.finish(Err(error)),
@@ -532,6 +541,7 @@ impl Engine {
                 &mut operation,
                 shard,
                 owner,
+                schema_operation,
                 guard,
                 move |connection, control| {
                     connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sql)?;
@@ -545,7 +555,7 @@ impl Engine {
         Ok(Routed { shard, value })
     }
 
-    /// Execute a parameterless SQL batch sequentially on every shard.
+    /// Apply a parameterless SQL migration batch through the durable shard journal.
     pub async fn broadcast(&self, session: &Session, sql: String) -> EngineResult<Vec<u16>> {
         self.broadcast_with_context(session, sql, RequestContext::new())
             .await
@@ -553,8 +563,8 @@ impl Engine {
 
     /// Execute a parameterless SQL batch on every shard with explicit request controls.
     ///
-    /// Shards are processed in order. Cancellation stops before the next shard,
-    /// but statements already committed on earlier shards remain committed.
+    /// Shards are processed in order under a durable journal. Cancellation may
+    /// leave resumable progress, which the same SQL or the next startup resumes.
     pub async fn broadcast_with_context(
         &self,
         session: &Session,
@@ -562,16 +572,27 @@ impl Engine {
         context: RequestContext,
     ) -> EngineResult<Vec<u16>> {
         let mut operation = self.operation(context)?;
-        let guard = match operation.wait_pending(self.ready_session(session)).await {
+        if session.owner != self.inner.id {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "the session belongs to a different engine",
+            )));
+        }
+        let mut migration = match self.inner.database.storage.begin_schema_migration() {
             Ok(guard) => guard,
             Err(error) => return operation.finish(Err(error)),
         };
-        let owner = ConnectionOwner::new(session.id().get());
-        let permits = match operation
-            .wait_pending(self.inner.connections.acquire_all_for_owner(owner))
-            .await
-        {
-            Ok(permits) => permits,
+        let quiesced = operation
+            .wait_pending(async {
+                migration.wait_for_quiescence().await;
+                Ok(())
+            })
+            .await;
+        if let Err(error) = quiesced {
+            return operation.finish(Err(error));
+        }
+        let session_guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
             Err(error) => return operation.finish(Err(error)),
         };
         let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
@@ -582,39 +603,25 @@ impl Engine {
             return operation.finish(Err(error));
         }
         let lease = operation.take_lease();
-        let control = Arc::clone(&operation.control);
-        let worker_control = Arc::clone(&control);
+        let worker_control = Arc::clone(&operation.control);
+        let storage = self.inner.database.storage.clone();
+        let connections = self.inner.connections.clone();
         let join = worker.spawn(move || {
             let _lease = lease;
-            let _session = guard;
-            let result = (|| {
-                let mut completed = Vec::with_capacity(permits.len());
-                for (shard, permit) in permits {
-                    if let Some(reason) = worker_control.reason() {
-                        return Err(reason.error());
-                    }
-                    let mut connection = permit
-                        .checkout_controlled(Arc::clone(&worker_control))
-                        .map_err(|error| {
-                            error.context(format!("broadcast failed to open shard {shard}"))
-                        })?;
-                    connection
-                        .ensure_owner_local_controlled(Arc::clone(&worker_control))
-                        .map_err(|error| {
-                            error.context(format!("broadcast failed to isolate shard {shard}"))
-                        })?;
-                    let result = connection
-                        .run_controlled(Arc::clone(&worker_control), |connection| {
-                            sql::execute_batch(connection, &sql)
-                        });
-                    retire_if_broken(&mut connection, &result);
-                    if let Err(error) = result {
-                        return Err(error.context(format!("broadcast failed on shard {shard}")));
-                    }
-                    completed.push(shard);
-                }
-                Ok(completed)
-            })();
+            let _session = session_guard;
+            let result = connections
+                .retire_idle_for_schema_migration()
+                .and_then(|_| {
+                    storage.apply_schema_migration(
+                        &sql,
+                        &mut migration,
+                        Some(Arc::clone(&worker_control)),
+                    )
+                })
+                .and_then(|completed| {
+                    migration.publish_ready()?;
+                    Ok(completed)
+                });
             worker_control.complete(result)
         });
         let result = operation.wait_started(join).await;
@@ -626,6 +633,7 @@ impl Engine {
         operation: &mut Operation,
         shard: u16,
         owner: ConnectionOwner,
+        schema_operation: SchemaOperationGuard,
         session: OwnedMutexGuard<SessionInner>,
         work: F,
     ) -> EngineResult<T>
@@ -653,6 +661,7 @@ impl Engine {
         let join = worker.spawn(move || {
             let _lease = lease;
             let _session = session;
+            let _schema_operation = schema_operation;
             let result = permit
                 .checkout_controlled(Arc::clone(&worker_control))
                 .and_then(|mut connection| {
@@ -690,17 +699,25 @@ impl Engine {
         release: std::sync::mpsc::Receiver<()>,
     ) -> EngineResult<()> {
         let mut operation = self.operation(RequestContext::new())?;
+        let schema_operation = self.inner.database.storage.enter_schema_operation()?;
         let guard = match operation.wait_pending(self.ready_session(session)).await {
             Ok(guard) => guard,
             Err(error) => return operation.finish(Err(error)),
         };
         let owner = ConnectionOwner::new(session.id().get());
         let result = self
-            .run_on_shard(&mut operation, shard, owner, guard, move |_, _| {
-                let _ = started.send(());
-                release.recv().expect("test releases the blocking worker");
-                Ok(())
-            })
+            .run_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                schema_operation,
+                guard,
+                move |_, _| {
+                    let _ = started.send(());
+                    release.recv().expect("test releases the blocking worker");
+                    Ok(())
+                },
+            )
             .await;
         operation.finish_started(result)
     }
@@ -708,15 +725,21 @@ impl Engine {
     #[cfg(test)]
     async fn panic_worker_for_test(&self, session: &Session, shard: u16) -> EngineResult<()> {
         let mut operation = self.operation(RequestContext::new())?;
+        let schema_operation = self.inner.database.storage.enter_schema_operation()?;
         let guard = match operation.wait_pending(self.ready_session(session)).await {
             Ok(guard) => guard,
             Err(error) => return operation.finish(Err(error)),
         };
         let owner = ConnectionOwner::new(session.id().get());
         let result = self
-            .run_on_shard(&mut operation, shard, owner, guard, move |_, _| {
-                panic!("intentional blocking worker panic")
-            })
+            .run_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                schema_operation,
+                guard,
+                move |_, _| panic!("intentional blocking worker panic"),
+            )
             .await;
         operation.finish_started(result)
     }
@@ -728,6 +751,7 @@ impl Engine {
         shard: u16,
     ) -> EngineResult<()> {
         let mut operation = self.operation(RequestContext::new())?;
+        let schema_operation = self.inner.database.storage.enter_schema_operation()?;
         let guard = match operation.wait_pending(self.ready_session(session)).await {
             Ok(guard) => guard,
             Err(error) => return operation.finish(Err(error)),
@@ -738,6 +762,7 @@ impl Engine {
                 &mut operation,
                 shard,
                 owner,
+                schema_operation,
                 guard,
                 move |connection, control| {
                     connection.run_controlled(control, |_connection| -> EngineResult<()> {
@@ -763,15 +788,21 @@ impl Engine {
         context: RequestContext,
     ) -> EngineResult<u64> {
         let mut operation = self.operation(context)?;
+        let schema_operation = self.inner.database.storage.enter_schema_operation()?;
         let guard = match operation.wait_pending(self.ready_session(session)).await {
             Ok(guard) => guard,
             Err(error) => return operation.finish(Err(error)),
         };
         let owner = ConnectionOwner::new(session.id().get());
         let result = self
-            .run_on_shard(&mut operation, shard, owner, guard, move |connection, _| {
-                Ok(connection.connection_id())
-            })
+            .run_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                schema_operation,
+                guard,
+                move |connection, _| Ok(connection.connection_id()),
+            )
             .await;
         operation.finish_started(result)
     }
@@ -954,6 +985,15 @@ mod tests {
         );
         session.set_routing_key("widget-1").await.unwrap();
 
+        let routed_ddl = engine
+            .execute(
+                &session,
+                Statement::new("CREATE TABLE bypassed_migration (id INTEGER)", vec![]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(routed_ddl.kind(), EngineErrorKind::PermissionDenied);
+
         let write = engine
             .execute(
                 &session,
@@ -999,13 +1039,15 @@ mod tests {
         for shard in &pools.shards {
             assert_eq!(shard.active, 0);
             assert_eq!(shard.queued, 0);
-            assert_eq!(shard.opened, 1);
-            assert_eq!(shard.idle, 1);
             if shard.shard == write.shard {
+                assert_eq!(shard.opened, 1);
+                assert_eq!(shard.idle, 1);
                 assert_eq!(shard.checkouts, 3);
                 assert_eq!(shard.reused, 2);
             } else {
-                assert_eq!(shard.checkouts, 1);
+                assert_eq!(shard.opened, 0);
+                assert_eq!(shard.idle, 0);
+                assert_eq!(shard.checkouts, 0);
                 assert_eq!(shard.reused, 0);
             }
             assert_eq!(shard.retired, 0);
@@ -1116,27 +1158,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_broadcast_failure_can_recover_through_the_engine() {
+    async fn failed_migration_preflight_is_atomic_and_retryable_through_the_engine() {
         let temp = tempfile::tempdir().unwrap();
         let database = Arc::new(Database::open(temp.path(), 4).unwrap());
+        database
+            .broadcast("CREATE TABLE marker (id INTEGER NOT NULL)")
+            .unwrap();
         let shard_one = database.storage.open_shard(1).unwrap();
-        crate::sql::execute_batch(&shard_one, "CREATE TABLE marker (id INTEGER)").unwrap();
+        shard_one
+            .execute_batch("INSERT INTO marker VALUES (1), (1)")
+            .unwrap();
         let engine = Engine::from_database(database);
         let session = engine.session();
 
         let error = engine
-            .broadcast(&session, "CREATE TABLE marker (id INTEGER)".to_owned())
+            .broadcast(
+                &session,
+                "CREATE UNIQUE INDEX marker_id ON marker (id)".to_owned(),
+            )
             .await
             .unwrap_err();
-        assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
-        assert!(error.source().is_some());
+        assert_eq!(error.kind(), EngineErrorKind::UniqueViolation);
         assert_eq!(session.state().await, SessionState::Ready);
+        for shard in 0..4 {
+            let connection = engine.inner.database.storage.open_shard(shard).unwrap();
+            assert!(
+                !connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'marker_id')",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
+
+        shard_one
+            .execute("DELETE FROM marker WHERE rowid = 2", [])
+            .unwrap();
 
         assert_eq!(
             engine
                 .broadcast(
                     &session,
-                    "CREATE TABLE IF NOT EXISTS marker (id INTEGER)".to_owned(),
+                    "CREATE UNIQUE INDEX marker_id ON marker (id)".to_owned(),
                 )
                 .await
                 .unwrap(),
@@ -1145,7 +1210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_broadcasts_use_ordered_pool_acquisition_without_deadlock() {
+    async fn migration_waits_for_in_flight_work_and_rejects_a_second_coordinator() {
         let (_temp, engine) = engine_with_options(2, 1, 1);
         let holder_session = Arc::new(engine.session());
         let (holder_started_tx, holder_started_rx) = oneshot::channel();
@@ -1178,22 +1243,27 @@ mod tests {
                 )
                 .await
         });
-        wait_for_pool_occupancy(&engine, 0, 1, 0).await;
-        wait_for_pool_occupancy(&engine, 1, 1, 1).await;
+        timeout(Duration::from_secs(2), async {
+            while engine.inner.database.storage.schema_gate_snapshot().state
+                != crate::storage::SchemaGateState::Migrating
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first migration should own schema admission");
 
-        let second_session = Arc::new(engine.session());
-        let second_engine = engine.clone();
-        let second_session_for_task = Arc::clone(&second_session);
-        let second = tokio::spawn(async move {
-            second_engine
-                .broadcast(
-                    &second_session_for_task,
-                    "CREATE TABLE IF NOT EXISTS broadcast_marker (id INTEGER)".to_owned(),
-                )
-                .await
-        });
-        wait_for_pool_occupancy(&engine, 0, 1, 1).await;
-        assert_eq!(engine.inner.workers.available_permits(), 1);
+        let second_session = engine.session();
+        let second_error = engine
+            .broadcast(
+                &second_session,
+                "CREATE TABLE IF NOT EXISTS broadcast_marker (id INTEGER)".to_owned(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(second_error.kind(), EngineErrorKind::Busy);
+        assert!(second_error.is_retryable());
+        wait_for_pool_occupancy(&engine, 1, 1, 0).await;
 
         holder_release_tx.send(()).unwrap();
         holder.await.unwrap().unwrap();
@@ -1206,10 +1276,12 @@ mod tests {
             [0, 1]
         );
         assert_eq!(
-            timeout(Duration::from_secs(2), second)
+            engine
+                .broadcast(
+                    &second_session,
+                    "CREATE TABLE IF NOT EXISTS broadcast_marker (id INTEGER)".to_owned(),
+                )
                 .await
-                .expect("second ordered broadcast should complete")
-                .unwrap()
                 .unwrap(),
             [0, 1]
         );
@@ -1221,7 +1293,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborting_a_dispatched_broadcast_stops_before_the_blocked_shard() {
+    async fn independent_engines_share_schema_exclusion_publication_and_pool_retirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = EngineOptions::new(1, 1).unwrap();
+        let first = Engine::from_database_with_options(
+            Arc::new(Database::open(temp.path(), 2).unwrap()),
+            options,
+        )
+        .unwrap();
+        let second = Engine::from_database_with_options(
+            Arc::new(Database::open(temp.path(), 2).unwrap()),
+            options,
+        )
+        .unwrap();
+        let holder_session = Arc::new(first.session());
+        let original_connection = first
+            .connection_id_for_test(&holder_session, 0)
+            .await
+            .unwrap();
+
+        let (holder_started_tx, holder_started_rx) = oneshot::channel();
+        let (holder_release_tx, holder_release_rx) = mpsc::channel();
+        let holder_engine = first.clone();
+        let held_session = Arc::clone(&holder_session);
+        let holder = tokio::spawn(async move {
+            holder_engine
+                .hold_session_for_test(&held_session, 0, holder_started_tx, holder_release_rx)
+                .await
+        });
+        timeout(Duration::from_secs(2), holder_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let migration_session = Arc::new(second.session());
+        let migration_engine = second.clone();
+        let migration_session_for_task = Arc::clone(&migration_session);
+        let migration = tokio::spawn(async move {
+            migration_engine
+                .broadcast(
+                    &migration_session_for_task,
+                    "CREATE TABLE shared_schema (id INTEGER PRIMARY KEY)".to_owned(),
+                )
+                .await
+        });
+        timeout(Duration::from_secs(2), async {
+            while first.inner.database.storage.schema_gate_snapshot().state
+                != crate::storage::SchemaGateState::Migrating
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second engine should exclude work admitted through the first");
+
+        let rejected_session = first.session();
+        rejected_session
+            .set_routing_key(&routing_key_for_shard(&first, 0))
+            .await
+            .unwrap();
+        let error = first
+            .query(&rejected_session, Statement::new("SELECT 1", vec![]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+
+        holder_release_tx.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        assert_eq!(migration.await.unwrap().unwrap(), [0, 1]);
+        assert_eq!(first.catalog().schema_generation(), 1);
+        assert_eq!(second.catalog().schema_generation(), 1);
+
+        let replacement_connection = first
+            .connection_id_for_test(&holder_session, 0)
+            .await
+            .unwrap();
+        assert_ne!(replacement_connection, original_connection);
+        let pool = first.inner.connections.snapshot().unwrap().shards[0];
+        assert_eq!(pool.retired, 1);
+
+        let result = first
+            .query(
+                &rejected_session,
+                Statement::new("SELECT COUNT(*) FROM shared_schema", vec![]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value.rows()[0].get(0), Some(&Value::from(0_i64)));
+    }
+
+    #[tokio::test]
+    async fn aborting_migration_preflight_cleans_up_and_changes_no_shard() {
         let (_temp, engine) = engine_with_options(2, 1, 1);
         let blocker = engine.inner.database.storage.open_shard(1).unwrap();
         blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
@@ -1238,24 +1400,15 @@ mod tests {
                 .await
         });
 
-        let shard_zero = engine.inner.database.storage.open_shard(0).unwrap();
         timeout(Duration::from_secs(2), async {
-            loop {
-                let exists = shard_zero
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'abort_marker')",
-                        [],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .unwrap();
-                if exists {
-                    break;
-                }
+            while engine.inner.database.storage.schema_gate_snapshot().state
+                != crate::storage::SchemaGateState::Migrating
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("broadcast should complete shard zero before blocking on shard one");
+        .expect("migration should own schema admission while preflight is blocked");
 
         broadcast.abort();
         assert!(broadcast.await.unwrap_err().is_cancelled());
@@ -1268,20 +1421,119 @@ mod tests {
             .unwrap();
         assert_eq!(status.shard_count(), 2);
         blocker.execute_batch("COMMIT").unwrap();
-        assert!(
-            !blocker
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'abort_marker')",
-                    [],
-                    |row| row.get::<_, bool>(0),
+        for shard in 0..2 {
+            let connection = engine.inner.database.storage.open_shard(shard).unwrap();
+            assert!(
+                !connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'abort_marker')",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            engine
+                .broadcast(
+                    &session,
+                    "CREATE TABLE abort_marker (id INTEGER)".to_owned(),
                 )
+                .await
                 .unwrap(),
-            "the committed shard-zero prefix is retained, but cancellation must not execute shard one"
+            [0, 1]
         );
         for shard in 0..2 {
             wait_for_pool_occupancy(&engine, shard, 0, 0).await;
         }
         assert_eq!(engine.inner.workers.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_durable_journal_waits_for_cleanup_and_exact_retry_recovers() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let sql = "CREATE TABLE durable_cancel_marker (id INTEGER)";
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        engine
+            .inner
+            .database
+            .storage
+            .install_schema_migration_test_block(
+                crate::storage::SchemaMigrationCoordinatorPoint::JournalCommitted,
+                started_tx,
+                release_rx,
+            )
+            .unwrap();
+
+        let token = CancellationToken::new();
+        let session = Arc::new(engine.session());
+        let broadcast_engine = engine.clone();
+        let broadcast_session = Arc::clone(&session);
+        let context = RequestContext::new().with_cancellation_token(token.clone());
+        let mut broadcast = tokio::spawn(async move {
+            broadcast_engine
+                .broadcast_with_context(&broadcast_session, sql.to_owned(), context)
+                .await
+        });
+        wait_for_blocking_signal(started_rx, "migration journal should become durable").await;
+        assert_eq!(engine.catalog().schema_generation(), 0);
+        assert_eq!(
+            engine.inner.database.storage.schema_gate_snapshot().state,
+            crate::storage::SchemaGateState::Migrating
+        );
+
+        assert!(token.cancel());
+        assert!(
+            timeout(Duration::from_millis(20), &mut broadcast)
+                .await
+                .is_err(),
+            "the public future must await blocking-worker cleanup"
+        );
+        release_tx.send(()).unwrap();
+        let error = timeout(Duration::from_secs(2), broadcast)
+            .await
+            .expect("cancelled migration cleanup should finish")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        assert_eq!(session.state().await, SessionState::Ready);
+        assert_eq!(engine.active_operations_for_test(), 0);
+        assert_eq!(engine.inner.workers.available_permits(), 2);
+        assert_eq!(
+            engine.inner.database.storage.schema_gate_snapshot().state,
+            crate::storage::SchemaGateState::Pending
+        );
+
+        let ordinary = engine.session();
+        ordinary.set_routing_key("pending-work").await.unwrap();
+        assert_eq!(
+            engine
+                .query(&ordinary, Statement::new("SELECT 1", vec![]))
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+
+        let retry = engine.session();
+        assert_eq!(
+            engine.broadcast(&retry, sql.to_owned()).await.unwrap(),
+            [0, 1]
+        );
+        assert_eq!(engine.catalog().schema_generation(), 1);
+        assert_eq!(
+            engine.inner.database.storage.schema_gate_snapshot().state,
+            crate::storage::SchemaGateState::Ready
+        );
+        let recovered = engine
+            .query(
+                &ordinary,
+                Statement::new("SELECT COUNT(*) FROM durable_cancel_marker", vec![]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.value.rows()[0].get(0), Some(&Value::from(0_i64)));
     }
 
     #[tokio::test]
@@ -1331,6 +1583,14 @@ mod tests {
     async fn pragma_data_version_never_exposes_a_foreign_pooled_handles_history() {
         let (_temp, engine) = engine_with_options(2, 2, 1);
         let shard = 0;
+        let schema = engine.session();
+        engine
+            .broadcast(
+                &schema,
+                "CREATE TABLE data_version_marker (id INTEGER PRIMARY KEY)".to_owned(),
+            )
+            .await
+            .unwrap();
         let routing_key = (0_u32..10_000)
             .map(|candidate| format!("data-version-{candidate}"))
             .find(|candidate| engine.inner.database.shard_for_key(candidate.as_bytes()) == shard)
@@ -1361,10 +1621,7 @@ mod tests {
         engine
             .execute(
                 &writer,
-                Statement::new(
-                    "CREATE TABLE data_version_marker (id INTEGER PRIMARY KEY)",
-                    vec![],
-                ),
+                Statement::new("INSERT INTO data_version_marker VALUES (1)", vec![]),
             )
             .await
             .unwrap();
@@ -1455,7 +1712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreign_owner_broadcast_batches_execute_once_without_statement_preflight() {
+    async fn migration_batches_preflight_then_execute_once_per_shard() {
         let (_temp, engine) = engine_with_options(2, 1, 1);
         let first = engine.session();
         assert_eq!(
@@ -1555,8 +1812,8 @@ mod tests {
         );
 
         let snapshot = engine.inner.connections.snapshot().unwrap().shards[usize::from(shard)];
-        assert_eq!(snapshot.opened, 3);
-        assert_eq!(snapshot.retired, 2);
+        assert_eq!(snapshot.opened, 2);
+        assert_eq!(snapshot.retired, 1);
         assert_eq!(snapshot.idle, 1);
     }
 
@@ -1959,7 +2216,7 @@ mod tests {
             2
         );
         wait_for_pool_occupancy(&engine, 0, 0, 0).await;
-        assert_eq!(engine.inner.workers.available_permits(), 2);
+        wait_for_worker_capacity(&engine, 2).await;
     }
 
     #[tokio::test]

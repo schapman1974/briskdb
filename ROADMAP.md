@@ -81,7 +81,7 @@ The core boundary should use protocol-neutral Rust types:
   a backpressured row stream rather than buffering unbounded results.
 - `EngineError`: stable internal error kinds mapped to PostgreSQL SQLSTATE,
   MySQL error number/SQLSTATE, and HTTP status/problem details.
-- `QueryPlan`: single shard, scatter read, schema broadcast, manifest operation,
+- `QueryPlan`: single shard, scatter read, schema migration, manifest operation,
   or rejected unsupported operation.
 
 Protocol handlers may encode and decode messages, but must not open SQLite
@@ -190,8 +190,8 @@ existing tests pass through the shared engine.
   shard-key column/type.
 - [x] Validate at startup that every shard is present, uses WAL, has the expected
   application ID/user version, and matches the cataloged schema generation.
-- [ ] Implement a crash-resumable schema migration journal instead of the
-  current best-effort broadcast endpoint.
+- [x] Implement a crash-resumable schema migration journal instead of the
+  previous unjournaled broadcast behavior.
 - [ ] Add checksums/integrity checks and explicit states for degraded or
   partially migrated databases.
 

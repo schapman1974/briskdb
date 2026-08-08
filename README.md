@@ -45,7 +45,7 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Identity-bound, WAL-enabled SQLite shard files that are never silently
   recreated after initialization
 - Routed execute and query endpoints
-- A broadcast endpoint for initializing schema on every shard
+- A crash-resumable, journaled schema-migration endpoint for every shard
 - Full SQLite synchronous durability and a five-second busy timeout
 - Reproducible point-read, point-write, and four-shard write benchmarks
 
@@ -97,6 +97,13 @@ curl -X POST http://127.0.0.1:7654/v1/admin/broadcast \
   -d '{"sql":"CREATE TABLE widgets (id TEXT PRIMARY KEY, name TEXT NOT NULL)"}'
 ```
 
+The retained migration journal identifies this batch by the BLAKE3 digest of
+its exact UTF-8 bytes. A byte-identical retry is idempotent; even whitespace or
+casing changes identify a new migration. Batches must contain 1 through 65,536
+bytes and no NUL. The endpoint retains its experimental `broadcast` name and
+returns `{"completed_shards":[...]}`, but it is the only client surface allowed
+to change persistent application schema.
+
 Insert a keyed row:
 
 ```bash
@@ -145,8 +152,9 @@ routed work queued for one shard does not consume another shard's capacity.
 Pool admission happens before blocking SQLite work: once a shard's active slots
 and queue are full, the engine returns retryable `Busy` (HTTP 503) instead of
 growing work without bound. Connections are opened lazily and reused. Broadcast
-is the deliberate cross-shard exception: it reserves one slot from every shard
-before dispatch and can therefore occupy capacity in several pools at once.
+is now a journaled schema migration: it excludes new ordinary work, waits for
+previously admitted operations to drain, and uses dedicated migration
+connections rather than reserving every shard pool.
 
 `EngineOptions` permits 1–16 active connections and 1–1,024 queued operations
 per shard, with at most 512 active connections across all shards.
@@ -159,9 +167,10 @@ disposable handle before execution.
 BriskDB-owned shard metadata and storage-control PRAGMA mutations, including
 `application_id`, `user_version`, `journal_mode`, `schema_version`, and
 `writable_schema`, are denied through every client SQL surface rather than
-allowed to invalidate the storage layout. `ALTER TABLE` is currently denied as
-well because SQLite's authorizer does not expose a rename destination, which
-would otherwise let a client enter the reserved `briskdb_*` namespace.
+allowed to invalidate the storage layout. Persistent DDL, including
+`ALTER TABLE`, is denied through ordinary routed SQL and is allowed only inside
+the journaled migration path, where BriskDB protects and revalidates its
+reserved `briskdb` and `briskdb_*` namespaces.
 A handle that performed an ordinary write may return to the same session,
 preserving SQLite write counters, but is replaced before a different session can
 observe `last_insert_rowid()`, `changes()`, or `total_changes()`. Those functions
@@ -174,10 +183,20 @@ success; BriskDB never reports cancellation while a known running write might
 still commit.
 Queries have finite row and logical-byte budgets, account values before cloning
 payloads, and return no partial result on `LimitExceeded`.
-Broadcast changes and future scatter operations are not atomic across shard
-files. The initial shard count is immutable, so resharding will require an
-explicit migration workflow. Opening upgrades exact version-1 through
-version-4 manifests to version 5 through ordered, resumable steps.
+Schema migrations preflight the complete batch on every shard before publishing
+a journal. Each shard then commits the SQL batch and its next `user_version` in
+one SQLite transaction, in ascending shard order. There is no cross-shard
+transaction: interruption can retain a committed prefix, which a byte-identical
+retry or the next startup validates and resumes. While a migration is running,
+new ordinary operations and a second coordinator receive retryable `Busy`.
+After durable partial progress, ordinary work receives non-retryable
+`FailedPrecondition` until the same migration resumes. The exact SQL text is
+retained permanently for recovery and idempotency, so migration batches must
+not contain passwords, tokens, or other sensitive literals.
+
+The initial shard count is immutable, so resharding will require an explicit
+migration workflow. Opening upgrades exact version-1 through version-5
+manifests to version 6 through ordered, resumable steps.
 Version 3 introduced the versioned, generation-stamped 4,096-bucket routing
 map. Version 4 adds schema generation 0 and immutable logical metadata with
 default database ID 1 named `default`; identifier encoding version 1 accepts
@@ -196,14 +215,24 @@ closed, as do shards cloned into the wrong slot or from another layout. They are
 not repaired or recreated. The layout ID is an accidental wrong-file guard, not
 authentication or tamper protection.
 
+Version 6 adds the retained schema-migration journal and permits committed
+application-schema generations from 0 through 2,147,483,647. A fresh migration
+advances exactly one generation. After manifest load or upgrade, startup resumes
+any active schema migration before ordinary physical-layout reconciliation and
+final strict shard validation, then returns an engine. Completed journal rows
+remain as the exact generation history; schema equivalence checks, checksums,
+and explicit degraded states remain issue #18.
+
 The v3-to-v4 step deliberately leaves the table catalog empty: it neither
 infers nor adopts tables already present in physical shard files. The v4-to-v5
 upgrade retains every validated v4 catalog row, while shard adoption preserves
 physical application tables and their data. The public catalog returned by
-`Database::catalog()` and `Engine::catalog()` remains an immutable, read-only
-advisory view. Current execute, query, broadcast, routing, SQLite behavior,
-HTTP shapes, and wire contracts are otherwise unchanged.
-Startup loads routing and logical metadata in one validated immutable snapshot;
+`Database::catalog()` and `Engine::catalog()` remains read-only and advisory.
+Its database and table entries stay immutable, while its schema generation
+advances after migration finalization; migrations neither infer nor mutate
+`briskdb_tables`. Current query results, routing, SQLite value behavior, HTTP
+shapes, and wire contracts are otherwise unchanged.
+Startup loads routing and logical metadata in one validated shared snapshot;
 runtime routing continues to hash the exact key bytes, derive a virtual bucket,
 and read its persisted physical-shard assignment. The generation-1 ranges
 preserve every earlier modulo placement, including non-power-of-two shard
@@ -212,10 +241,13 @@ upgrade contract is in [manifest storage format](docs/STORAGE_FORMAT.md).
 Embedders should call
 `Engine::shutdown`; merely dropping the final `Engine` is not the explicit
 asynchronous cleanup contract.
+Independent `Database` and `Engine` handles in one process that resolve to the
+same canonical data directory share schema coordination. Separate BriskDB
+server processes must not use the same data directory.
 
-Near-term work includes authentication, application-schema migrations,
-scatter/gather reads, observability, backup tooling, and failure-injection
-tests for multi-shard operations.
+Near-term work includes authentication, richer migration administration and
+status APIs in issue #53, schema checksums and degraded-state handling in issue
+#18, scatter/gather reads, observability, and backup tooling.
 
 ## License
 

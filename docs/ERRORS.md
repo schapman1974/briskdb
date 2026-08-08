@@ -53,9 +53,22 @@ configured connection slots active and its per-shard admission queue is full.
 The HTTP response is therefore the fixed 503 problem detail above. Admission
 accounting is per shard, so one shard returning `Busy` does not by itself imply
 that another shard is saturated. Routed single-shard requests consume only
-their selected pool; broadcast is the intentional exception and reserves one
-slot in every pool. Clients that retry should use the same bounded exponential
-backoff and jitter as for SQLite-originated `Busy` failures.
+their selected pool. Schema migration instead uses an in-process gate shared by
+handles for the same canonical root, plus fresh coordinator-owned connections.
+While that gate is `Migrating`, new
+ordinary operations and another migration coordinator receive retryable
+`Busy`. Clients that retry should use the same bounded exponential backoff and
+jitter as for SQLite-originated `Busy` failures.
+
+If a failed, cancelled, or dropped migration has already published a durable
+journal row, the gate becomes `Pending`. Ordinary operations then receive
+non-retryable `FailedPrecondition` (HTTP 409), because retrying arbitrary data
+work cannot repair a mixed-generation prefix. A migration call may resume the
+byte-identical SQL; a different migration is a failed precondition while the
+active row remains. Startup automatically attempts the recorded SQL before it
+returns an engine. `Cancelled` and `DeadlineExceeded` themselves remain
+non-retryable classifications even though an operator may deliberately submit
+the exact migration again.
 
 An explicit cancellation is `Cancelled`; expiration of an absolute request
 deadline is `DeadlineExceeded`, even though PostgreSQL represents both with
@@ -64,7 +77,8 @@ caller drops an operation future, there is no client left to receive either
 error. Requests rejected after graceful shutdown begins use `ShuttingDown`.
 Queue depth, pool internals, SQL text, deadline values, and connection-cleanup
 details remain diagnostic data and must not be added to the fixed public
-problem detail.
+problem detail. This includes migration SQL retained in the manifest, which may
+contain sensitive literals.
 
 MySQL has separate foreign-key errors for the parent and child directions.
 `ForeignKeyViolation` does not retain that direction, so BriskDB deliberately
@@ -117,10 +131,26 @@ is `FailedPrecondition`; the file is not downgraded. A recognized BriskDB
 manifest whose identity, schema, or invariant rows disagree is
 `DataCorruption`.
 
+Manifest v6 applies the same boundary to its retained migration journal. A
+malformed digest, SQL limit violation, noncontiguous generation history,
+inconsistent state/progress, wrong stored shard count, multiple or misplaced
+active rows, or an active row that disagrees with the catalog is
+`DataCorruption`. A recognized shard below the active source generation or in
+an invalid source/target position is also corruption. A shard or manifest newer
+than the coordinator can safely interpret is `FailedPrecondition`. Lock
+contention during preflight, apply, progress, or startup recovery remains
+retryable `Busy`.
+
+For submitted migration input, an empty batch, a batch over 65,536 UTF-8 bytes,
+or a NUL byte is `InvalidArgument`. SQLite syntax or statement-shape failures
+retain the normal SQL classification, and attempts to reach the reserved
+BriskDB schema or storage controls are `PermissionDenied`. The public problem
+detail never includes the retained SQL.
+
 Shard-layout validation follows the same distinction. A foreign shard
 application ID, unexpected canonical four-digit `.sqlite` shard file or
 symbolic link, persistent journal mode other than WAL, or shard generation
-newer than the catalog is
+newer than the catalog and outside an authorized active migration prefix is
 `FailedPrecondition`; BriskDB neither claims, downgrades, nor repairs it. A
 layout in `Adopting` or `Ready` with a missing shard is `DataCorruption`. In
 `Ready`, missing identity metadata, a wrong layout or physical-shard ID, an
@@ -132,9 +162,10 @@ BriskDB-owned metadata or mutation of a storage-control PRAGMA is
 `PermissionDenied`. These diagnostics originate in storage and are never
 serialized directly by an adapter.
 
-The earlier taxonomy change affected reporting only. Manifest v5 is a later
-storage-layer change: it adds identity metadata to shard files while preserving
-legacy application tables, rows, routing, SQL results, and wire configuration.
+The earlier taxonomy change affected reporting only. Manifest v5 later added
+identity metadata to shard files; manifest v6 adds retained, crash-resumable
+application-schema history. Both preserve legacy application tables, rows,
+routing, SQL results, and wire configuration during format upgrade.
 
 This is a pre-1.0 Rust API migration: public `Database` operations now return
 `EngineResult<T>` instead of `anyhow::Result<T>`. The `?` operator still

@@ -128,13 +128,18 @@ where
                         break;
                     }
                 };
+                let accepted = accepted.clone();
                 let service = TowerToHyperService::new(router.clone().map_request(
-                    |request: Request<Incoming>| request.map(Body::new),
+                    move |request: Request<Incoming>| {
+                        if let Some(accepted) = &accepted {
+                            accepted.notify_one();
+                        }
+                        request.map(Body::new)
+                    },
                 ));
                 let graceful_rx = graceful_tx.subscribe();
-                let accepted = accepted.clone();
                 connections.spawn(async move {
-                    serve_http_connection(stream, peer, service, graceful_rx, accepted).await;
+                    serve_http_connection(stream, peer, service, graceful_rx).await;
                 });
             }
         }
@@ -163,7 +168,6 @@ async fn serve_http_connection<S>(
     peer: SocketAddr,
     service: S,
     mut graceful_rx: watch::Receiver<bool>,
-    accepted: Option<Arc<Notify>>,
 ) where
     S: hyper::service::Service<
             Request<Incoming>,
@@ -178,9 +182,6 @@ async fn serve_http_connection<S>(
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades();
     tokio::pin!(connection);
-    if let Some(accepted) = accepted {
-        accepted.notify_one();
-    }
 
     let result = if *graceful_rx.borrow() {
         connection.as_mut().graceful_shutdown();

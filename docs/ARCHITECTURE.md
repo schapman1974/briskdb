@@ -21,8 +21,8 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, errors, and immutable logical catalog; stable key routing; bounded per-shard admission and connection pools; routed execute/query and schema broadcast | JSON/HTTP types, listeners, or Axum handlers |
-| `storage` | Versioned routing/logical manifest, shard layout, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, errors, and read-only logical catalog; stable key routing; bounded per-shard admission and connection pools; routed execute/query and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
+| `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `sql` | SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, filesystem layout, or protocol responses |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
@@ -65,6 +65,15 @@ routed reads, and structured problem-detail serialization through the shared
 engine. Unit tests remain colocated with sessions, engine orchestration,
 routing, storage, SQL conversion, CLI, and server assembly.
 
+Issue #17 intentionally changed the behavior behind the preserved
+`/v1/admin/broadcast`, `Database::broadcast`, and `Engine::broadcast` shapes.
+They now submit one journaled application-schema migration instead of an
+untracked sequential batch. The HTTP success body remains
+`{"completed_shards":[...]}`. A retained `Catalog` reference now observes a
+durably published generation in place; consequently, its public
+`schema_generation` accessor is no longer usable in a Rust `const` context.
+That is an intentional pre-1.0 source-level change.
+
 The module names are stable boundaries, not a claim that later roadmap work is
 already complete. The async engine, session lifecycle, bounded per-shard pools,
 request controls, and explicit shutdown lifecycle are now in place. The
@@ -96,9 +105,19 @@ expected `BRSH` shard application ID, metadata encoding version 1, and state
 code 1 (`Creating`), 2 (`Adopting`), or 3 (`Ready`). Every current shard has
 the same layout ID in its exact BriskDB-owned metadata row, its cataloged
 physical shard ID, `application_id = BRSH`, and `user_version` equal to the
-cataloged application-schema generation, currently 0. The layout ID catches
+cataloged application-schema generation. The layout ID catches
 accidental copies, swaps, and cross-layout placement; it is not a secret,
 checksum, or security boundary.
+
+Version 6 adds the retained `briskdb_schema_migrations` journal and expands the
+catalog generation from fixed zero to the range 0 through 2,147,483,647. Each
+row records consecutive source and target generations, the shard count, an
+ascending durable prefix, state `Applying` or `Complete`, the exact SQL text,
+and its digest. Digest version 1 is the full BLAKE3 digest of the exact UTF-8
+SQL bytes. Input is limited to 1 through 65,536 bytes with no NUL. Completed
+history is contiguous and retained permanently; at most one active row may
+target the generation immediately after the committed catalog. Exact SQL is
+therefore operational metadata that may reveal sensitive literals.
 
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4
@@ -111,16 +130,34 @@ layout. A failure or panic leaves `Creating` or `Adopting` durable, so the next
 open resumes instead of guessing whether a missing or partly stamped file is
 safe.
 
-Startup acquires `BEGIN IMMEDIATE` before making a manifest migration or layout
-state decision. Numbered manifest-only steps rewrite schema/data, stamp and read
-back their target identity/version, validate the destination, and commit in
-their own transaction. After those steps commit, layout reconciliation acquires
-a new immediate manifest transaction, re-reads and validates the layout state
-under that write lock, and holds the lock through independently durable
-per-shard work and `Ready` publication. Concurrent openers therefore serialize:
-a lagging opener re-reads `Ready` and strictly validates instead of provisioning
+The v5-to-v6 step is manifest-only: it preserves layout state, routing, logical
+metadata, and data while rebuilding the schema-generation constraint, creating
+an empty journal, and fencing v5 readers. There is no automatic downgrade; an
+older binary requires a pre-v6 backup.
+
+Startup first canonicalizes the data-directory path and joins the process-wide
+root coordination keyed by that path. It acquires the shared schema gate before
+loading the manifest, so independent `Storage`, `Database`, and `Engine` handles
+in one process serialize startup and migration against ordinary admission and
+share catalog-generation publication.
+
+Manifest loading acquires `BEGIN IMMEDIATE` before making a format migration or
+layout-state decision. Numbered manifest-only steps rewrite schema/data, stamp
+and read back their target identity/version, validate the destination, and
+commit in their own transaction. If the resulting v6 manifest contains an
+`Applying` schema migration, startup validates and resumes it immediately. A
+journal can exist only with a durable `Ready` layout, and recovery publishes its
+target generation before ordinary layout reconciliation or final shard opens.
+
+Layout reconciliation then acquires a new immediate manifest transaction,
+re-reads and validates the layout state under that write lock, and holds the
+lock through independently durable per-shard work and `Ready` publication. A
+lagging opener re-reads `Ready` and strictly validates instead of provisioning
 from a stale `Creating` observation. Only a locked, durable `Creating` state
-permits missing canonical shard files to be created and WAL to be enabled.
+permits missing canonical shard files to be created and WAL to be enabled. The
+final strict shard opens and catalog reconciliation complete before the startup
+guard publishes `Ready`; ordinary work is never served against a persisted
+mixed-generation prefix.
 
 `Adopting` recognizes only existing legacy shard files with exact zero
 application-ID/user-version headers and an existing WAL mode. It writes current
@@ -134,37 +171,42 @@ are not required layout members.
 
 This is an internal storage-open concern, is unreachable from client SQL, and
 is atomic only within `manifest.sqlite`. Validation returns routing and logical
-metadata from the same locked transaction as one immutable snapshot that
-`Storage` shares across clones. `Database::catalog()` and `Engine::catalog()`
-expose the logical portion as a read-only `Catalog` with lookup accessors.
+metadata from the same locked transaction as one shared snapshot. The migration
+coordinator publishes a newly committed generation into that snapshot only
+after every shard verifies. `Database::catalog()` and `Engine::catalog()` expose
+the logical portion as a read-only `Catalog` with lookup accessors.
 
 The logical catalog remains advisory: there is no catalog mutation API,
 planner integration, or schema enforcement yet. Fresh manifests and upgrades
 originating before v4 contain no table rows; a v4-to-v5 upgrade retains every
-validated v4 logical-catalog row. Migration does not inspect, infer, or adopt
-physical tables already present in shard files. Those tables remain reachable
-through the existing explicit-key execute/query and broadcast surfaces. Core
+validated v4 logical-catalog row. Schema migration does not inspect, infer, or
+mutate `briskdb_tables`, nor does it prove physical schema equivalence. Existing
+tables remain reachable through the explicit-key execute/query surfaces. Core
 routing still hashes the exact caller-provided key bytes, derives a versioned
 virtual bucket, and reads the final physical shard from the snapshot without
 querying SQLite. The generation-1 ranges reproduce prior modulo placement for
 every supported initial shard count, including counts that do not divide 4,096.
 Version-5 adoption adds only BriskDB identity metadata to legacy shards and
-preserves their application schema and data. It changes no current SQL planning,
-HTTP shape, routing result, or broadcast ordering.
+preserves their application schema and data. It changes no SQL planning, HTTP
+shape, or routing result.
 
 The storage-owned `briskdb_shard_metadata` table is inaccessible through client
-SQL, and creation of new objects in the reserved `briskdb_*` namespace is
+SQL, and creation of new objects in the reserved `briskdb` or `briskdb_*`
+namespaces is
 denied by the SQLite authorizer. Client attempts to mutate `application_id`,
 `user_version`, persistent `journal_mode`, `schema_version`, or
 `writable_schema` are also denied. This prevents a pass-through statement from
-invalidating the validated layout. All `ALTER TABLE` statements are currently
-denied because SQLite's authorizer does not expose the destination of a rename;
-allowing the operation would leave a path into the reserved namespace. The
-application-schema generation is still fixed at 0 and there is not
-yet a cross-shard schema migration journal; that later format must explicitly
-authorize any temporary generation mismatch. The exact format, numeric codes,
-downgrade policy, recovery cases, and tests are documented in [manifest storage
-format](STORAGE_FORMAT.md).
+invalidating the validated layout. Ordinary routed SQL also denies every
+persistent DDL action. The journaled migration connection is the sole exception:
+it allows main-schema DDL and DML, including `ALTER TABLE`, inside BriskDB's
+transaction while denying transaction escape, attachments, temporary/virtual
+objects, and reserved-state access. Because SQLite does not reveal an
+`ALTER TABLE ... RENAME TO` destination to the authorizer, the coordinator also
+compares the reserved schema before and after the batch. The exact format,
+numeric codes, downgrade policy, recovery cases, and tests are documented in
+[manifest storage format](STORAGE_FORMAT.md).
+Schema checksums and explicit degraded states remain issue #18; richer
+migration administration and status surfaces remain issue #53.
 
 ## Session and asynchronous engine boundary
 
@@ -187,8 +229,8 @@ count needed by health reporting without exposing the storage implementation.
 HTTP is stateless at this stage: each execute or query request creates a fresh
 session and initializes its routing context from the request's `shard_key`.
 Consequently, session settings and transactions cannot span HTTP requests.
-Schema broadcast and status calls also go through the shared engine, but do not
-perform a routing decision in the adapter.
+Schema-migration broadcast and status calls also go through the shared engine,
+but do not perform a routing decision in the adapter.
 
 ### Bounded worker and connection-pool boundary
 
@@ -215,12 +257,31 @@ them as `--max-result-rows`, `--max-result-bytes`,
 When a shard has no active slot and its admission queue is full, a new operation
 fails immediately with retryable `Busy`, which the HTTP adapter maps to 503.
 Capacity for routed work belongs to its selected shard: saturation on shard A
-neither consumes shard B's slots nor delays work already admitted there. Schema
-broadcast is the deliberate cross-shard exception. It reserves one slot from
-every shard in ascending order before dispatch, so it can occupy capacity in
-several pools while waiting; it then checks out each connection only when that
-shard's turn arrives. The deterministic reservation order prevents concurrent
-broadcasts from deadlocking each other.
+neither consumes shard B's slots nor delays work already admitted there.
+
+Schema migration uses a separate, shared admission gate. Transitioning from
+`Ready` to `Migrating` immediately rejects new ordinary operations and a second
+coordinator with retryable `Busy`, then asynchronously waits for already
+admitted work to drain. The engine retires idle pooled handles and performs the
+migration on fresh coordinator-owned connections; it no longer reserves one
+slot in every shard pool. If a durable journal survives an error, panic,
+cancellation, or dropped future, the gate becomes `Pending`. Ordinary work then
+receives non-retryable `FailedPrecondition`, while a new migration call may
+enter `Migrating` to resume the byte-identical SQL. Startup recovery completes
+an active journal while holding the same in-process gate. Independent handles
+for the same canonical root share the gate and live catalog publication.
+Separate server processes for one data directory are unsupported; the gate is
+not a distributed coordination mechanism.
+
+After every-shard preflight succeeds, the coordinator records the exact SQL and
+its BLAKE3 identity, then visits shards in ascending order. One shard's complete
+batch and target `user_version` commit atomically, followed by a separate
+manifest prefix update. There is no cross-shard transaction. Recovery accepts
+the committed prefix plus the single possible shard commit whose acknowledgement
+was interrupted, and never skips ahead. Finalization marks the retained row
+complete and publishes the catalog generation only after every shard validates.
+A byte-identical retry is idempotent; alternate whitespace or casing is a new
+migration identity.
 
 Pool checkout also establishes a connection-hygiene boundary. SQLite authorizer
 events identify operations that can persist connection-local state, including
@@ -239,9 +300,10 @@ SQLite counter state.
 The expected probe error is never exposed to the caller. Any other probe error
 also fails closed to a fresh handle. Opening that replacement can surface its own
 storage error; otherwise only the real execution determines the caller-visible
-SQL result. Broadcast batches are not preflighted because later statements can
-depend on earlier schema changes; instead, a foreign handle is replaced before
-the batch begins.
+SQL result. The schema-migration path is outside this pool-owner probe. Before
+publishing its journal, it executes the complete batch on every shard in a
+rollback-only transaction, so later statements may depend on earlier schema
+changes while a failure still leaves every shard unchanged.
 
 A connection marked tainted by real execution is closed after the call instead
 of returning to the pool. If a call leaves a transaction open, rollback is
@@ -298,10 +360,10 @@ single-shard pinning remain deferred to the PostgreSQL and MySQL transaction
 work in issues #34 and #47. `Ready` and `Closed` therefore describe session
 lifecycle, not SQL transaction state.
 
-This boundary changes Rust orchestration and adds opt-in `EngineOptions` plus
-pool-sizing CLI/environment configuration. It does not change existing option
-defaults, HTTP routes or JSON shapes, shard routing, manifest schema, SQLite
-files, WAL or synchronous settings, or any stored data.
+The pool/request-control boundary changed Rust orchestration and added opt-in
+`EngineOptions` plus pool-sizing CLI/environment configuration. That earlier
+change did not alter option defaults, HTTP routes or JSON shapes, shard routing,
+storage formats, WAL or synchronous settings, or stored data.
 
 ## Error boundary
 
@@ -315,13 +377,14 @@ implemented listeners.
 
 Client responses use fixed, safe text for the error kind. Diagnostic display
 text and source chains stay available internally but are never serialized, so
-SQLite messages, SQL text, and filesystem paths do not leak through an adapter.
+SQLite messages, SQL text—including SQL retained in a migration journal—and
+filesystem paths do not leak through an adapter.
 Only `Busy` advertises that retrying may succeed; a 5xx status alone is not a
 retry signal. The complete taxonomy and mapping table are in the
 [error contract](ERRORS.md).
 
-This boundary changes reporting, not persistence: the manifest schema, shard
-files, stored values, routing, and configuration formats are unchanged.
+The error boundary changes reporting, not persistence; storage-format changes
+are owned and documented separately by the manifest boundary above.
 
 ## Typed result boundary
 
