@@ -141,7 +141,7 @@ therefore required before calling the driver interfaces production-ready.
 ## Milestones
 ### 0. Baseline and compatibility contract
 
-Status: **in progress**
+Status: **complete**
 
 - [x] Create the Rust service and Git repository.
 - [x] Persist a fixed shard count in `manifest.sqlite`.
@@ -153,7 +153,7 @@ Status: **in progress**
 - [x] Add CI for formatting, Clippy, tests, and supported Rust versions.
 - [x] Add a benchmark baseline for point reads, writes, and four-shard
   concurrent writes.
-- [ ] Choose and document the project license and supported-platform policy.
+- [x] Choose and document the project license and supported-platform policy.
 
 Exit criterion: the current prototype is reproducible in CI and its promises
 and non-promises are written down.
