@@ -23,7 +23,7 @@ server ---------> protocol::http
 | --- | --- | --- |
 | `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, errors, and read-only logical catalog; stable key routing; bounded per-shard admission and connection pools; routed execute/query and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
-| `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, and source-preserving placeholder normalization behind BriskDB-owned types; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, catalog lookup, filesystem layout, protocol responses, bound-value ownership, or protocol-specific support policy |
+| `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, source-preserving placeholder normalization, and catalog-aware typed shard-key inference behind BriskDB-owned types; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, session/write policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, listener binding, and tracked Axum HTTP/1 connection lifecycle | SQL parsing or storage implementation details |
@@ -92,10 +92,11 @@ deterministic and keeps the dependency replaceable.
 
 Parsing is syntax recognition, not support validation or planning. The parser
 has no session, parameter, catalog, storage, or routing access. The separate
-common-subset validator, placeholder normalizer, and later planner layers
-consume structural syntax through BriskDB-owned interfaces; shard-key inference
-must not inspect raw or formatted SQL with regular expressions. Exact input
-remains authoritative because AST formatting is lossy and is never executed.
+common-subset validator, placeholder normalizer, shard-key inference layer, and
+later planner layers consume structural syntax through BriskDB-owned
+interfaces; shard-key inference does not inspect raw or formatted SQL with
+regular expressions. Exact input remains authoritative because AST formatting
+is lossy and is never executed.
 
 Inputs are bounded to 65,536 UTF-8 bytes, 256 statements, and recursion depth
 32. The dependency's recursive-protection feature remains enabled. Parse and
@@ -122,9 +123,9 @@ The normative accepted forms and exclusions are in the [common SQL subset
 contract](SQL_SUBSET.md).
 
 The current HTTP execute/query and migration paths deliberately remain raw
-SQLite pass-through and call neither the parser, subset validator, nor
-placeholder normalizer. Issues #19 through #21 therefore change no HTTP shape,
-SQL acceptance, routing, or storage behavior.
+SQLite pass-through and call none of the parser, subset validator, placeholder
+normalizer, or shard-key inference layers. Issues #19 through #22 therefore
+change no HTTP shape, SQL acceptance, routing, or storage behavior.
 
 ### Placeholder-normalization boundary
 
@@ -150,6 +151,31 @@ filesystem, or execution access and does not decide whether a statement batch
 may execute; issue #27 owns that policy. The normative API, dialect rules,
 limits, errors, and tests are in the [SQL parameter-normalization
 contract](SQL_PARAMETERS.md).
+
+### Shard-key inference boundary
+
+`infer_shard_keys(&Catalog, LogicalDatabaseId, &NormalizedSql,
+statement_index, parameters)` borrows an immutable catalog snapshot, one
+normalized batch, and the selected statement's complete protocol-neutral
+`Value` slice. It resolves the accepted base table and cataloged shard-key type,
+then produces an owned `ShardKeyInference` classification and typed values.
+
+For `SELECT`, `UPDATE`, and `DELETE`, the layer proves finite key sets only from
+direct `Int64` or `Binary` shard-column equality and combines those sets through
+Boolean `AND` and `OR`. Non-null `Text` equality remains unconstrained until the
+catalog declares and physical schemas enforce comparison collation. For
+`INSERT`, inference examines the explicit shard-key column in every `VALUES`
+row and retains one value per row, including text values. The result
+distinguishes statements that are not applicable, known non-sharded tables,
+unconstrained predicates, contradictions, one exact key, and multiple keys.
+
+This layer is catalog-aware and accepts bound values, but remains read-only and
+statement-local. It does not own the catalog or caller values, encode or hash a
+key, read the bucket map, choose a shard, construct an execution plan, apply
+write policy, mutate session state, or execute SQL. Issue #23 owns bind/execute
+planning and routing; issue #24 owns rejection of conflicting or unroutable
+writes. The normative proof, type, result, error, and testing rules are in the
+[shard-key inference contract](SQL_SHARD_KEYS.md).
 
 ## Manifest storage boundary
 

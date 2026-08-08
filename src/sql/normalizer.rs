@@ -27,6 +27,7 @@ pub struct NormalizedSql {
     common: CommonSql,
     sqlite_parameter_sql: String,
     statement_parameters: Vec<StatementParameters>,
+    statement_placeholders: Vec<Vec<NormalizedPlaceholder>>,
 }
 
 impl NormalizedSql {
@@ -61,6 +62,18 @@ impl NormalizedSql {
     /// Return one parameter layout for each top-level statement, in order.
     pub fn statement_parameters(&self) -> &[StatementParameters] {
         &self.statement_parameters
+    }
+
+    pub(super) fn common(&self) -> &CommonSql {
+        &self.common
+    }
+
+    pub(super) fn parameter_index(&self, statement_index: usize, span: Span) -> Option<usize> {
+        let placeholders = self.statement_placeholders.get(statement_index)?;
+        placeholders
+            .binary_search_by_key(&span, |placeholder| placeholder.span)
+            .ok()
+            .map(|index| placeholders[index].index)
     }
 }
 
@@ -130,12 +143,14 @@ pub fn normalize_placeholders(common: CommonSql) -> EngineResult<NormalizedSql> 
 
     let mut planned = Vec::new();
     let mut statement_parameters = Vec::with_capacity(common.statement_count());
+    let mut statement_placeholders = Vec::with_capacity(common.statement_count());
 
     for (statement_index, placeholders) in common.statement_placeholders().iter().enumerate() {
         let mut placeholders = placeholders.iter().collect::<Vec<_>>();
         placeholders.sort_unstable_by_key(|placeholder| placeholder.span);
 
         let mut parameter_indices = Vec::with_capacity(placeholders.len());
+        let mut normalized_placeholders = Vec::with_capacity(placeholders.len());
         let mut greatest_index = 0;
 
         for (occurrence_index, placeholder) in placeholders.into_iter().enumerate() {
@@ -148,6 +163,10 @@ pub fn normalize_placeholders(common: CommonSql) -> EngineResult<NormalizedSql> 
             )?;
             greatest_index = greatest_index.max(index);
             parameter_indices.push(index);
+            normalized_placeholders.push(NormalizedPlaceholder {
+                span: placeholder.span,
+                index,
+            });
             planned.push(PlannedPlaceholder {
                 marker: placeholder.marker.clone(),
                 span: placeholder.span,
@@ -159,6 +178,7 @@ pub fn normalize_placeholders(common: CommonSql) -> EngineResult<NormalizedSql> 
             parameter_count: greatest_index,
             parameter_indices,
         });
+        statement_placeholders.push(normalized_placeholders);
     }
 
     let sqlite_parameter_sql = rewrite_placeholders(common.source(), &planned)?;
@@ -166,7 +186,14 @@ pub fn normalize_placeholders(common: CommonSql) -> EngineResult<NormalizedSql> 
         common,
         sqlite_parameter_sql,
         statement_parameters,
+        statement_placeholders,
     })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NormalizedPlaceholder {
+    span: Span,
+    index: usize,
 }
 
 fn parameter_index(

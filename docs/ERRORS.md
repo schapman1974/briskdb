@@ -157,6 +157,16 @@ fixed categories and positions and never contain SQL, literal or marker text,
 bound values, formatted AST output, or source locations. See the [SQL
 parameter-normalization contract](SQL_PARAMETERS.md).
 
+The opt-in shard-key inference layer reports an out-of-range statement index,
+wrong bound-value count, or missing logical database as `InvalidArgument`; an
+unknown table in the selected database as `InvalidQuery`; an incompatible key
+value as `TypeMismatch`; a signed-integer overflow as `NumericOutOfRange`; an
+invalid UTF-8 text key as `InvalidTextEncoding`; and a null inserted shard key
+as `NotNullViolation`. Inference diagnostics may identify the one-based
+statement position and a fixed category, but never contain SQL, identifier
+spelling, literal or bound values, key contents, formatted AST output, or source
+locations. See the [shard-key inference contract](SQL_SHARD_KEYS.md).
+
 The core contains no HTTP, PostgreSQL, or MySQL response types. Conversely,
 protocol adapters do not inspect SQLite errors. This lets every frontend share
 one error identity while retaining its own response encoding.

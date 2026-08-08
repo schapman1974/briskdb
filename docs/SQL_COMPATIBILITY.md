@@ -16,11 +16,11 @@ document defines the SQL and behavioral contract separately from connectivity.
 - **Unsupported** means BriskDB rejects the behavior or makes no compatibility
   promise for it.
 
-The syntax parser, recursive common-subset validator, and placeholder
-normalizer are now available behind BriskDB-owned types. Validation is explicit
-and returns `Unsupported` for a parsed form outside the subset; parser
-acceptance alone is not product support. Normalization is also explicit and
-rewrites only validated placeholder spans. The current experimental HTTP
+The syntax parser, recursive common-subset validator, placeholder normalizer,
+and catalog-aware shard-key inference API are now available behind BriskDB-owned
+types. Validation is explicit and returns `Unsupported` for a parsed form
+outside the subset; parser acceptance alone is not product support.
+Normalization and inference are also explicit. The current experimental HTTP
 interface is still a raw SQLite pass-through and can execute uncontracted
 SQLite syntax because it calls none of these layers. That behavior is not a
 compatibility promise.
@@ -47,23 +47,26 @@ PostgreSQL or MySQL listener or general dialect translation layer yet. The
 public Rust SQL facade can parse an explicitly selected SQLite, PostgreSQL, or
 MySQL dialect, consume that result with
 `validate_common_subset(ParsedSql)`, and then opt into
-`normalize_placeholders(CommonSql)`. The final step yields canonical SQLite
-`?N` text and per-statement parameter metadata without accepting values. None
-of these operations plans, routes, generally translates, authorizes, or
-executes a statement. HTTP requests still send SQLite SQL directly to
-`rusqlite`; they do not pass through these opt-in SQL layers.
+`normalize_placeholders(CommonSql)`. That step yields canonical SQLite `?N`
+text and per-statement parameter metadata. Callers may then pass one
+statement's exact bound-value slice and selected logical database to
+`infer_shard_keys`, which returns a typed key classification. None of these
+operations hashes a key, selects a shard, plans, generally translates,
+authorizes, enforces write policy, or executes a statement. HTTP requests still
+send SQLite SQL directly to `rusqlite`; they do not pass through these opt-in
+SQL layers.
 
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
 | HTTP `/v1/execute` | Experimental | One SQLite statement with positional parameters | Required caller-provided `shard_key` |
 | HTTP `/v1/query` | Experimental | One prepared SQLite statement executed through the row-returning path | Required caller-provided `shard_key` |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
-| PostgreSQL wire protocol | Planned | Common subset plus documented PostgreSQL normalization | SQL/bound-parameter inference with explicit session fallback |
-| MySQL wire protocol | Planned | Common subset plus documented MySQL normalization | SQL/bound-parameter inference with explicit session fallback |
+| PostgreSQL wire protocol | Planned | Common subset plus documented PostgreSQL normalization | Rust inference implemented; wire bind-time planning and session fallback planned |
+| MySQL wire protocol | Planned | Common subset plus documented MySQL normalization | Rust inference implemented; wire bind-time planning and session fallback planned |
 
-The parser, subset validator, and placeholder normalizer are implemented Rust
-APIs, not network interfaces. Each step is opt-in and does not change any row
-in this table.
+The parser, subset validator, placeholder normalizer, and shard-key inference
+function are implemented Rust APIs, not network interfaces. Each step is
+opt-in and does not change any current network row in this table.
 
 Every HTTP operation now calls the same protocol-neutral async engine intended
 for future PostgreSQL and MySQL adapters. Execute and query requests create a
@@ -281,16 +284,21 @@ when every top-level statement and nested form is in the first subset. Empty
 and mixed batches may validate because request-level batch policy remains issue
 #27. `normalize_placeholders(CommonSql)` then returns an owned `NormalizedSql`
 with canonical SQLite parameter text and one parameter record per statement.
-All three types retain exact source, dialect, and statement count without
-exposing the upstream AST or rendering SQL in `Debug` output.
+`infer_shard_keys` can consume that result with catalog context and a complete
+bound-value slice for one statement. The SQL wrapper types retain exact source,
+dialect, and statement count without exposing the upstream AST or rendering
+SQL in `Debug` output.
 
-The parser, validator, and normalizer have no routing or storage access. Future
-shard inference and statement classification consume structural syntax, never
+The parser, validator, and normalizer have no routing or storage access. The
+implemented inference layer borrows only the read-only logical catalog and
+protocol-neutral bound values; it consumes structural syntax, never
 regular-expression matches over raw or formatted SQL. See the [SQL parser
 decision record](SQL_PARSER.md) for the dependency and resource contract, the
 [common SQL subset contract](SQL_SUBSET.md) for the normative recursive
 whitelist, and the [SQL parameter-normalization
-contract](SQL_PARAMETERS.md) for numbering and source-preservation rules.
+contract](SQL_PARAMETERS.md) for numbering and source-preservation rules. The
+[shard-key inference contract](SQL_SHARD_KEYS.md) defines the supported proof
+grammar and typed result.
 
 ### Implemented pass-through surface
 
@@ -356,10 +364,11 @@ required to be explicit; type compatibility and translation remain issue #25.
 Insert/update duplicate checks fold ASCII letter case regardless of quoting but
 do not define general identifier normalization, which also remains issue #25.
 Placeholder normalization is the separate implemented issue #21 layer described
-below. Catalog-aware key extraction, single-shard proof, bind-time planning,
-and rejection of conflicting or unroutable writes remain issues #22 through
-#24. Prepare/bind/describe/execute state remains issue #26, and empty or
-multi-statement execution policy remains issue #27.
+below, and catalog-aware typed key extraction is the implemented issue #22
+layer. Bind-time planning and routing remain issue #23; rejection of conflicting
+or unroutable writes remains issue #24. Prepare/bind/describe/execute state
+remains issue #26, and empty or multi-statement execution policy remains issue
+#27.
 
 The validator independently caps recursive expression AST depth at 128. This
 also bounds flat operator chains that parse iteratively; exceeding the limit is
@@ -394,6 +403,31 @@ shard, translate other dialect syntax, create a prepared statement, classify
 statement behavior, authorize a request, or execute SQL. The HTTP and engine
 paths continue to bind their existing caller-supplied SQLite SQL directly.
 
+### Implemented shard-key inference
+
+The public Rust function `infer_shard_keys` is an opt-in statement-local call
+over a `Catalog`, selected `LogicalDatabaseId`, `NormalizedSql`, zero-based
+statement index, and exact bound `Value` slice. It resolves known table
+placement and a sharded table's key column/type. Its owned result distinguishes
+not-applicable, non-sharded, unconstrained, contradictory, exact, and multiple
+key outcomes and exposes typed integer, text, or binary values.
+
+For `SELECT`, `UPDATE`, and `DELETE`, direct equality against an `Int64` or
+`Binary` shard-key column produces a finite key set; Boolean `AND` intersects
+and `OR` unions those proofs. Non-null `Text` equality remains unconstrained
+because the current catalog does not declare or enforce comparison collation.
+Other predicates do not establish a key. For `INSERT`, every `VALUES` row's
+explicit shard-key cell must be a compatible direct literal or placeholder to
+produce a complete result, and one value per row is retained, including text
+values. The exact identifier, value, result, and error rules are in [shard-key
+inference](SQL_SHARD_KEYS.md).
+
+Inference does not encode, hash, route, plan, authorize, enforce, or execute.
+Issue #23 will use the result at bind/execute time to construct a plan and
+routing decision. Issue #24 will decide which conflicting, multiple, or
+unconstrained write outcomes must be rejected before execution. The raw HTTP
+and engine paths do not invoke inference.
+
 ## PostgreSQL differences
 
 The PostgreSQL listener will target the frontend/backend wire protocol and a
@@ -402,7 +436,7 @@ not implemented unless listed as implemented in this document.
 
 | Area | PostgreSQL | BriskDB contract |
 | --- | --- | --- |
-| Parameters | `$1`, `$2`, ... | Implemented opt-in Rust normalization to SQLite `?N`; value binding, wire support, and bind-time routing remain planned |
+| Parameters | `$1`, `$2`, ... | Implemented opt-in Rust normalization to SQLite `?N` and typed inference from a supplied bound slice; wire binding and bind-time routing remain planned |
 | Identifier quoting | Double quotes | Passed through where SQLite semantics agree |
 | Type system | Static types identified by OIDs | Planned loss-aware mapping to BriskDB types and SQLite storage classes |
 | Boolean | Dedicated `boolean` type | Stored as SQLite integer `0` or `1`; protocol adapter returns a Boolean value |
@@ -430,7 +464,7 @@ engine used by PostgreSQL and HTTP.
 
 | Area | MySQL | BriskDB contract |
 | --- | --- | --- |
-| Parameters | `?` in prepared statements | Implemented opt-in Rust normalization to consecutive SQLite `?N`; value binding and wire support remain planned |
+| Parameters | `?` in prepared statements | Implemented opt-in Rust normalization to consecutive SQLite `?N` and typed inference from a supplied bound slice; wire binding and routing remain planned |
 | Identifier quoting | Backticks by default | Planned normalization; double-quoted strict SQL remains available |
 | Type system | Static signed/unsigned column types | BriskDB retains `UInt64` without narrowing; current SQLite binding rejects values above `i64::MAX` until an explicit storage mapping exists |
 | Boolean | Commonly `TINYINT(1)` | Stored as SQLite integer `0` or `1`; protocol adapter returns documented metadata |
@@ -494,7 +528,11 @@ underlying execution semantics.
 - Logical metadata is currently read-only and advisory. Fresh manifests and
   upgrades originating before v4 contain no table rows; v4-to-v5 retains every
   validated v4 logical-catalog row. Existing physical tables are not inferred
-  or adopted, and catalog contents do not alter SQL planning or execution.
+  or adopted. The opt-in Rust inference API can consult catalog contents, but
+  they do not alter current SQL planning, routing, or execution.
+- Opt-in inference can extract typed cataloged keys from supported equality
+  predicates and every row of a supported `INSERT`; it does not select a shard
+  or change current HTTP behavior.
 - Point queries and writes visit only that shard.
 - No scatter/gather query path exists.
 - Unique constraints and transactions are local to one SQLite shard.
@@ -509,8 +547,9 @@ underlying execution semantics.
 - Every sharded table declares one non-null shard-key column in the catalog.
 - Canonical key encoding, hash version, virtual bucket count, and bucket map are
   persisted in the manifest.
-- The planner extracts equality keys from SQL and bound parameters. An explicit
-  session routing key remains a controlled fallback.
+- At bind/execute time, the planner consumes typed equality keys inferred from
+  SQL and bound parameters. An explicit session routing key remains a
+  controlled fallback.
 - A transaction is pinned to its first shard. Targeting another shard returns a
   stable cross-shard-transaction error.
 - Read-only plans may scatter with bounded concurrency and deterministic merge.

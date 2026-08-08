@@ -62,7 +62,8 @@ In particular, this layer does not:
   the separate `validate_common_subset(ParsedSql)` layer;
 - normalize placeholders; issue #21 implements that as the separate
   `normalize_placeholders(CommonSql)` layer;
-- infer shard keys or inspect bound values (issue #22);
+- infer shard keys or inspect bound values; issue #22 implements that as the
+  separate `infer_shard_keys` layer;
 - plan prepared statements at bind time (issue #23);
 - reject conflicting keys or unroutable writes (issue #24);
 - translate types or syntax, or choose strict SQLite mode (issue #25);
@@ -80,9 +81,9 @@ that still does not grant permission to execute an empty or mixed batch.
 The existing HTTP execute, query, and migration paths remain raw SQLite
 pass-through surfaces with their existing authorizer and endpoint-specific
 rules. They call neither this parser, the opt-in common-subset validator, nor
-the opt-in placeholder normalizer. Connecting those layers before planning,
-translation, and request-level statement policy are implemented would change
-the experimental HTTP SQL surface.
+the opt-in placeholder normalizer or shard-key inference layer. Connecting
+those layers before planning, translation, and request-level statement policy
+are implemented would change the experimental HTTP SQL surface.
 
 ## Resource and error boundaries
 

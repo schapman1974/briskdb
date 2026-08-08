@@ -146,18 +146,22 @@ layer, as does the common-subset validator's expression-depth limit.
 
 A successful `NormalizedSql` does not establish that:
 
-- the caller supplied exactly `parameter_count()` values with compatible
-  types;
-- a bound value identifies one shard;
+- the caller supplied exactly `parameter_count()` values until the separate
+  shard-key inference call validates that count;
+- non-shard-key parameters have types compatible with later translation and
+  execution;
+- an inferred value has been encoded, hashed, or routed to one shard;
 - catalog names and types exist or are compatible;
 - non-placeholder PostgreSQL or MySQL syntax has been translated to SQLite;
 - a statement or batch is permitted by an endpoint or session;
 - a prepared statement has been described, cached, bound, or executed; or
 - execution would preserve all source-dialect semantics.
 
-Issues #22 through #27 own shard-key inference, bind-time planning, conflicting
-or unroutable key rejection, syntax/type translation, prepared-statement state,
-and request-level statement classification respectively.
+The implemented [shard-key inference contract](SQL_SHARD_KEYS.md) consumes this
+metadata plus a catalog database and exact bound-value slice. Issues #23
+through #27 own bind-time planning and routing, conflicting or unroutable write
+rejection, syntax/type translation, prepared-statement state, and request-level
+statement classification respectively.
 
 ## Verification obligations
 
