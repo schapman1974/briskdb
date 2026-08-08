@@ -9,6 +9,8 @@ TinyMongo and makes it available as a small network service.
 See the [development roadmap](ROADMAP.md) for the protocol-neutral engine,
 PostgreSQL and MySQL wire interfaces, durable shard catalog, scatter/gather
 planner, APIs, and production-hardening milestones.
+The [architecture map](docs/ARCHITECTURE.md) defines the crate's module
+boundaries and dependency direction.
 
 The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
 current SQLite pass-through API from planned PostgreSQL and MySQL compatibility.

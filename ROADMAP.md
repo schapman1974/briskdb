@@ -160,9 +160,9 @@ and non-promises are written down.
 
 ### 1. Protocol-neutral core
 
-Status: **next**
+Status: **in progress**
 
-- [ ] Split the crate into `core`, `storage`, `sql`, `protocol/http`, and
+- [x] Split the crate into `core`, `storage`, `sql`, `protocol/http`, and
   `server` modules without changing externally visible behavior.
 - [ ] Replace `serde_json::Value` in storage with BriskDB `Value`, `DataType`,
   `Column`, `Row`, and `ResultSet` types.
