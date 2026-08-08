@@ -13,24 +13,37 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
-    core::{DataType, Database, EngineError, EngineErrorKind, ResultSet, Routed, Value},
+    core::{DataType, Database, Engine, EngineError, ResultSet, Routed, Statement, Value},
     protocol::error::http_error,
 };
 
+/// Build an HTTP router from the legacy synchronous database handle.
+///
+/// New callers should construct one shared [`Engine`] and use
+/// [`router_with_engine`]. This wrapper preserves the pre-engine Rust API while
+/// still sending every request through the shared asynchronous engine.
 pub fn router(database: Arc<Database>) -> Router {
+    router_with_engine(Engine::from_database(database))
+}
+
+/// Build an HTTP router backed by the protocol-neutral asynchronous engine.
+pub fn router_with_engine(engine: Engine) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/execute", post(execute))
         .route("/v1/query", post(query))
         .route("/v1/admin/broadcast", post(broadcast))
-        .with_state(database)
+        .with_state(engine)
 }
 
-async fn health(State(database): State<Arc<Database>>) -> Json<JsonValue> {
-    Json(json!({
+async fn health(State(engine): State<Engine>) -> Result<Json<JsonValue>, ApiError> {
+    let session = engine.session();
+    let status = engine.status(&session).await?;
+
+    Ok(Json(json!({
         "status": "ok",
-        "shards": database.shard_count(),
-    }))
+        "shards": status.shard_count(),
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,21 +79,22 @@ struct QueryColumn {
 }
 
 async fn execute(
-    State(database): State<Arc<Database>>,
+    State(engine): State<Engine>,
     Json(request): Json<RoutedSqlRequest>,
 ) -> Result<Json<ExecuteResponse>, ApiError> {
+    let params = request
+        .params
+        .into_iter()
+        .map(json_to_value)
+        .collect::<Vec<_>>();
+    let session = engine.session();
+    session.set_routing_key(request.shard_key).await?;
     let Routed {
         shard,
         value: rows_affected,
-    } = tokio::task::spawn_blocking(move || {
-        let params = request
-            .params
-            .into_iter()
-            .map(json_to_value)
-            .collect::<Vec<_>>();
-        database.execute_routed(&request.shard_key, &request.sql, &params)
-    })
-    .await??;
+    } = engine
+        .execute(&session, Statement::new(request.sql, params))
+        .await?;
 
     Ok(Json(ExecuteResponse {
         shard,
@@ -89,31 +103,33 @@ async fn execute(
 }
 
 async fn query(
-    State(database): State<Arc<Database>>,
+    State(engine): State<Engine>,
     Json(request): Json<RoutedSqlRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
-    let response = tokio::task::spawn_blocking(move || {
-        let params = request
-            .params
-            .into_iter()
-            .map(json_to_value)
-            .collect::<Vec<_>>();
-        let Routed {
-            shard,
-            value: result,
-        } = database.query_routed(&request.shard_key, &request.sql, &params)?;
-        Ok::<_, EngineError>(result_set_to_query_response(shard, result))
-    })
-    .await??;
+    let params = request
+        .params
+        .into_iter()
+        .map(json_to_value)
+        .collect::<Vec<_>>();
+    let session = engine.session();
+    session.set_routing_key(request.shard_key).await?;
+    let Routed {
+        shard,
+        value: result,
+    } = engine
+        .query(&session, Statement::new(request.sql, params))
+        .await?;
+    let response = result_set_to_query_response(shard, result);
 
     Ok(Json(response))
 }
 
 async fn broadcast(
-    State(database): State<Arc<Database>>,
+    State(engine): State<Engine>,
     Json(request): Json<BroadcastRequest>,
 ) -> Result<Json<JsonValue>, ApiError> {
-    let shards = tokio::task::spawn_blocking(move || database.broadcast(&request.sql)).await??;
+    let session = engine.session();
+    let shards = engine.broadcast(&session, request.sql).await?;
     Ok(Json(json!({"completed_shards": shards})))
 }
 
@@ -200,16 +216,6 @@ impl From<EngineError> for ApiError {
     }
 }
 
-impl From<tokio::task::JoinError> for ApiError {
-    fn from(error: tokio::task::JoinError) -> Self {
-        Self(EngineError::from_source(
-            EngineErrorKind::Internal,
-            "blocking engine task failed",
-            error,
-        ))
-    }
-}
-
 #[derive(Debug, Serialize)]
 struct ProblemDetails {
     #[serde(rename = "type")]
@@ -260,7 +266,11 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::core::{Column, DataType, Row};
+    use crate::core::{Column, DataType, EngineErrorKind, Row};
+
+    fn engine_router(database: Arc<Database>) -> Router {
+        router_with_engine(Engine::from_database(database))
+    }
 
     async fn send_json(
         router: &Router,
@@ -299,11 +309,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_http_endpoints_follow_the_current_contract() {
+    async fn all_http_endpoints_follow_the_current_contract_through_the_engine() {
         let temp = tempfile::tempdir().unwrap();
         let database = Arc::new(Database::open(temp.path(), 4).unwrap());
         let expected_shard = database.shard_for_key(b"widget-1");
-        let application = router(database);
+        let application = engine_router(database);
 
         assert_eq!(
             request_json(&application, Method::GET, "/health", None).await,
@@ -365,9 +375,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_queries_use_safe_problem_details() {
+    async fn legacy_database_router_is_a_behavior_preserving_engine_wrapper() {
         let temp = tempfile::tempdir().unwrap();
         let application = router(Arc::new(Database::open(temp.path(), 4).unwrap()));
+
+        assert_eq!(
+            request_json(&application, Method::GET, "/health", None).await,
+            (StatusCode::OK, json!({"status": "ok", "shards": 4}))
+        );
+        let (status, body) = request_json(
+            &application,
+            Method::POST,
+            "/v1/query",
+            Some(json!({
+                "shard_key": "compatibility-request",
+                "sql": "SELECT 42 AS answer"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["columns"],
+            json!([{"name": "answer", "data_type": "unknown"}])
+        );
+        assert_eq!(body["rows"], json!([[42]]));
+    }
+
+    #[tokio::test]
+    async fn a_failed_http_request_does_not_poison_the_next_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(temp.path(), 4).unwrap());
+        let expected_shard = database.shard_for_key(b"recovery-request");
+        let application = engine_router(database);
+
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/query",
+                Some(json!({
+                    "shard_key": "recovery-request",
+                    "sql": "SELECT * FROM missing_table"
+                })),
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/query",
+                Some(json!({
+                    "shard_key": "recovery-request",
+                    "sql": "SELECT 'recovered' AS state"
+                })),
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({
+                    "shard": expected_shard,
+                    "columns": [{"name": "state", "data_type": "unknown"}],
+                    "rows": [["recovered"]]
+                })
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_http_requests_use_the_shared_engine_without_value_leakage() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(temp.path(), 4).unwrap());
+        let application = engine_router(Arc::clone(&database));
+        let mut requests = tokio::task::JoinSet::new();
+
+        for value in 0_i64..16 {
+            let application = application.clone();
+            let shard_key = format!("concurrent-{value}");
+            let expected_shard = database.shard_for_key(shard_key.as_bytes());
+            requests.spawn(async move {
+                let response = request_json(
+                    &application,
+                    Method::POST,
+                    "/v1/query",
+                    Some(json!({
+                        "shard_key": shard_key,
+                        "sql": "SELECT ?1 AS value",
+                        "params": [value]
+                    })),
+                )
+                .await;
+                (value, expected_shard, response)
+            });
+        }
+
+        let mut completed = 0;
+        while let Some(request) = requests.join_next().await {
+            let (value, expected_shard, (status, body)) = request.unwrap();
+            assert_eq!(status, StatusCode::OK, "request {value}: {body}");
+            assert_eq!(body["shard"], json!(expected_shard));
+            assert_eq!(
+                body["columns"],
+                json!([{"name": "value", "data_type": "unknown"}])
+            );
+            assert_eq!(body["rows"], json!([[value]]));
+            completed += 1;
+        }
+        assert_eq!(completed, 16);
+    }
+
+    #[tokio::test]
+    async fn invalid_queries_use_safe_problem_details() {
+        let temp = tempfile::tempdir().unwrap();
+        let application = engine_router(Arc::new(Database::open(temp.path(), 4).unwrap()));
 
         let response = send_json(
             &application,
@@ -402,7 +524,7 @@ mod tests {
     #[tokio::test]
     async fn unsigned_parameters_outside_sqlite_range_fail_instead_of_rounding() {
         let temp = tempfile::tempdir().unwrap();
-        let application = router(Arc::new(Database::open(temp.path(), 4).unwrap()));
+        let application = engine_router(Arc::new(Database::open(temp.path(), 4).unwrap()));
         let too_large = u64::try_from(i64::MAX).unwrap() + 1;
 
         let (status, body) = request_json(
@@ -434,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn constraint_failures_keep_their_precise_safe_kind() {
         let temp = tempfile::tempdir().unwrap();
-        let application = router(Arc::new(Database::open(temp.path(), 4).unwrap()));
+        let application = engine_router(Arc::new(Database::open(temp.path(), 4).unwrap()));
         assert_eq!(
             request_json(
                 &application,
@@ -511,13 +633,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocking_task_panics_become_redacted_internal_problems() {
-        let join_error = tokio::spawn(async {
-            panic!("password=hunter2 /private/customer.sqlite SELECT secret_value")
-        })
-        .await
-        .unwrap_err();
-        let response = ApiError::from(join_error).into_response();
+    async fn internal_engine_errors_become_redacted_internal_problems() {
+        let secret = "password=hunter2 /private/customer.sqlite SELECT secret_value";
+        let response = ApiError(EngineError::from_source(
+            EngineErrorKind::Internal,
+            secret,
+            io::Error::other(secret),
+        ))
+        .into_response();
 
         assert_eq!(
             response_json(response).await,
@@ -537,7 +660,7 @@ mod tests {
     #[tokio::test]
     async fn non_finite_sqlite_reals_keep_the_legacy_json_null_encoding() {
         let temp = tempfile::tempdir().unwrap();
-        let application = router(Arc::new(Database::open(temp.path(), 4).unwrap()));
+        let application = engine_router(Arc::new(Database::open(temp.path(), 4).unwrap()));
 
         let (status, body) = request_json(
             &application,
@@ -566,7 +689,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let database = Arc::new(Database::open(temp.path(), 4).unwrap());
         let expected_shard = database.shard_for_key(b"typed-row");
-        let application = router(database);
+        let application = engine_router(database);
 
         let (status, body) = request_json(
             &application,
@@ -601,7 +724,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let database = Arc::new(Database::open(temp.path(), 4).unwrap());
         let expected_shard = database.shard_for_key(b"duplicate-row");
-        let application = router(database);
+        let application = engine_router(database);
 
         let (status, body) = request_json(
             &application,
@@ -635,7 +758,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let database = Arc::new(Database::open(temp.path(), 4).unwrap());
         let expected_shard = database.shard_for_key(b"empty-row");
-        let application = router(database);
+        let application = engine_router(database);
 
         let (status, body) = request_json(
             &application,
@@ -665,6 +788,42 @@ mod tests {
     #[test]
     fn legacy_api_module_reexports_the_router() {
         let _legacy_router: fn(Arc<Database>) -> Router = crate::api::router;
+        let _engine_router: fn(Engine) -> Router = crate::api::router_with_engine;
+    }
+
+    #[test]
+    fn production_http_adapter_has_no_blocking_or_shard_routing_escape_hatches() {
+        let test_module_marker = ["#[cfg", "(test)]\nmod tests {"].concat();
+        let (production_source, _) = include_str!("http.rs")
+            .split_once(&test_module_marker)
+            .expect("the HTTP unit-test module has a cfg(test) boundary");
+
+        assert_eq!(
+            production_source.matches("Database").count(),
+            2,
+            "Database may appear only in the compatibility import and router signature"
+        );
+
+        for forbidden in [
+            "spawn_blocking",
+            "block_in_place",
+            "execute_routed(",
+            "query_routed(",
+            "shard_for_key(",
+            "database.execute(",
+            "database.query(",
+            "database.broadcast(",
+            "open_shard(",
+            "crate::sql",
+            "crate::storage",
+            "blake3",
+            "rusqlite",
+        ] {
+            assert!(
+                !production_source.contains(forbidden),
+                "HTTP production code contains forbidden backend escape hatch {forbidden}"
+            );
+        }
     }
 
     #[test]

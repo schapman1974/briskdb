@@ -21,18 +21,20 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral values, results, and `EngineError`; stable key routing; routed execute/query and schema broadcast | JSON/HTTP types, listeners, or Axum handlers |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, values, results, and errors; stable key routing; routed execute/query and schema broadcast | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Manifest and shard layout, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `sql` | SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, routing, filesystem layout, or protocol responses |
 | `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, listener binding, and Axum lifecycle | SQL parsing or storage implementation details |
 
-Implementation dependencies flow one way: adapters call `core`; `core`
-coordinates `storage` and `sql`. The HTTP adapter receives the selected shard
-together with the operation result, so it does not make a second routing
-decision. The only reverse-facing name is `storage::Database`, a compatibility
-re-export of `core::Database`; the storage implementation does not call core.
+Implementation dependencies flow one way: adapters call the async `Engine` in
+`core`; the engine coordinates routing, `storage`, and `sql`. An adapter supplies
+protocol-neutral session routing context and an owned statement, then receives
+the selected shard together with the operation result. It neither computes a
+shard nor opens a SQLite connection. The only reverse-facing name is
+`storage::Database`, a compatibility re-export of `core::Database`; the storage
+implementation does not call core.
 
 ## Compatibility during the split
 
@@ -59,13 +61,58 @@ of `anyhow::Result<T>`; this intentional pre-1.0 source migration gives callers
 stable error identity while retaining automatic `?` conversion into `anyhow`.
 
 Automated HTTP contract tests cover health, schema broadcast, routed writes,
-routed reads, and structured problem-detail serialization. Unit tests remain
-colocated with routing, storage, SQL conversion, CLI, and server assembly.
+routed reads, and structured problem-detail serialization through the shared
+engine. Unit tests remain colocated with sessions, engine orchestration,
+routing, storage, SQL conversion, CLI, and server assembly.
 
 The module names are stable boundaries, not a claim that later roadmap work is
-already complete. Session state, the async `Engine` interface, connection
-pools, cancellation, and limits are separate issues. Until those land, the
-core intentionally retains the current synchronous execution interface.
+already complete. The async engine and initial session lifecycle are now in
+place; connection pools, cancellation, and limits are separate issues. The
+synchronous `Database` API remains available as a Rust compatibility surface
+and is the implementation used behind the asynchronous boundary.
+
+## Session and asynchronous engine boundary
+
+`Session` is protocol-neutral mutable state owned by one frontend connection or
+request. A new session is `Ready`; closing it is a terminal transition to
+`Closed`, and engine operations reject a closed session with
+`FailedPrecondition`. Ordinary statement failures do not close or poison a
+session, so a frontend may correct a request and continue. Sessions are not
+clonable. Frontends may issue concurrent calls against one borrowed session,
+but the engine serializes them; the HTTP adapter instead creates an independent
+session for every request.
+
+The current routing context is an optional caller-supplied shard key. Routed
+execute and query operations require that context, and the engine alone hashes
+it and reports the selected shard in `Routed<T>`. `Statement` owns its SQL text
+and typed parameters so an adapter can hand work across the asynchronous
+boundary without borrowing protocol buffers. `EngineStatus` exposes the shard
+count needed by health reporting without exposing the storage implementation.
+
+HTTP is stateless at this stage: each execute or query request creates a fresh
+session and initializes its routing context from the request's `shard_key`.
+Consequently, session settings and transactions cannot span HTTP requests.
+Schema broadcast and status calls also go through the shared engine, but do not
+perform a routing decision in the adapter.
+
+The local engine currently uses Tokio blocking workers around the existing
+synchronous `Database` operations. Those workers are not BriskDB's planned
+bounded execution pool, and each SQL operation still opens one or more shard
+connections. Bounded per-shard pools and backpressure are issue #10;
+cancellation, deadlines, limits, and graceful shutdown are issue #11. Real
+`BEGIN`/`COMMIT`/`ROLLBACK`,
+failed-transaction state, and single-shard pinning are deliberately deferred to
+the PostgreSQL and MySQL transaction work in issues #34 and #47. `Ready` and
+`Closed` therefore describe session lifecycle, not SQL transaction state.
+
+Dropping an engine future does not cancel SQLite work in this phase. The
+blocking worker retains the session lock until that work ends, so another call
+cannot overlap it on the same session; an operation may still commit after its
+frontend disconnects. Issue #11 owns interruption and cancellation semantics.
+
+This boundary changes Rust orchestration only. It does not change command-line
+or environment configuration, HTTP routes or JSON shapes, shard routing,
+manifest schema, SQLite files, WAL or synchronous settings, or any stored data.
 
 ## Error boundary
 

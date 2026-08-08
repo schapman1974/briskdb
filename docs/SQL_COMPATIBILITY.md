@@ -51,11 +51,23 @@ translation layer. HTTP requests send SQLite SQL directly to `rusqlite`.
 | PostgreSQL wire protocol | Planned | Common subset plus documented PostgreSQL normalization | SQL/bound-parameter inference with explicit session fallback |
 | MySQL wire protocol | Planned | Common subset plus documented MySQL normalization | SQL/bound-parameter inference with explicit session fallback |
 
-The current HTTP calls open a SQLite connection per request. A transaction
-cannot span requests. Broadcast execution is not atomic: its parameterless SQL
-batch is not wrapped in a transaction on each shard, and shards are processed
-sequentially. A failure can therefore leave earlier statements committed on the
-failing shard as well as leave earlier shards fully or partially updated.
+Every HTTP operation now calls the same protocol-neutral async engine intended
+for future PostgreSQL and MySQL adapters. Execute and query requests create a
+fresh `Ready` session, put the request's `shard_key` in its routing context, and
+submit an owned statement. The engine, rather than the HTTP adapter, selects the
+shard and opens the SQLite connection. The session is discarded when that HTTP
+request finishes, so a transaction cannot span requests.
+
+The asynchronous boundary currently delegates each operation to Tokio's
+blocking workers, and each SQL operation still opens one or more SQLite
+connections. It does not yet provide the bounded per-shard pools and
+backpressure planned in issue #10, or the cancellation and deadline behavior
+planned in issue #11. Dropping a request future does not interrupt an in-flight
+SQLite operation; the operation may still commit after the client disconnects.
+Broadcast execution remains non-atomic: its parameterless SQL batch is not
+wrapped in a transaction on each shard, and shards are processed sequentially.
+A failure can therefore leave earlier statements committed on the failing shard
+as well as leave earlier shards fully or partially updated.
 
 ### Current parameter and result conversion
 
@@ -160,6 +172,15 @@ multiple statements outside the broadcast endpoint, and attached-database
 operations are uncontracted public API behavior today. The experimental raw
 HTTP path might accept some of them; clients must not rely on acceptance,
 rejection, or unchanged semantics.
+
+The current `Session` `Ready`/`Closed` lifecycle is not a transaction state
+machine. Real `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction behavior, and
+single-shard pinning remain planned for the PostgreSQL and MySQL transaction
+work in issues #34 and #47.
+
+The synchronous public Rust `Database` methods remain available for source
+compatibility. Network frontends use `Engine`; retaining `Database` does not
+authorize an adapter to bypass the shared asynchronous boundary.
 
 ### Planned common subset
 

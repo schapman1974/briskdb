@@ -1,11 +1,11 @@
 //! Server process assembly and listener lifecycle.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use tracing::info;
 
-use crate::{core::Database, protocol::http};
+use crate::{core::Engine, protocol::http};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -15,7 +15,7 @@ pub struct Config {
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
-    let database = Arc::new(Database::open(&config.data_dir, config.shards)?);
+    let engine = Engine::open(&config.data_dir, config.shards).await?;
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("failed to bind {}", config.listen))?;
@@ -23,11 +23,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     info!(
         listen = %config.listen,
         data_dir = %config.data_dir.display(),
-        shards = database.shard_count(),
+        shards = engine.shard_count(),
         "BriskDB is ready"
     );
 
-    axum::serve(listener, http::router(database)).await?;
+    axum::serve(listener, http::router_with_engine(engine)).await?;
     Ok(())
 }
 

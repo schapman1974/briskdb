@@ -3,13 +3,19 @@
 //! This module owns routing and coordinates storage and SQL execution. It does
 //! not depend on a network protocol.
 
+mod engine;
 mod error;
+mod session;
 mod types;
 
+pub use engine::{Engine, EngineStatus, Statement};
 pub use error::{EngineError, EngineErrorKind, EngineResult};
+pub use session::{Session, SessionId, SessionState};
 pub use types::{
     Column, DataType, Decimal, ParseDecimalError, ResultSet, ResultSetShapeError, Row, Value,
 };
+
+use session::SessionInner;
 
 use std::path::Path;
 

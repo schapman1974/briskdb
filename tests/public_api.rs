@@ -11,8 +11,15 @@ use briskdb::{
 fn legacy_and_explicit_module_paths_are_both_available() {
     let _legacy_database: Option<storage::Database> = None;
     let _core_database: Option<core::Database> = None;
+    let _engine: Option<core::Engine> = None;
+    let _engine_status: Option<core::EngineStatus> = None;
+    let _session: Option<core::Session> = None;
+    let _ready = core::SessionState::Ready;
+    let _closed = core::SessionState::Closed;
+    let _statement = core::Statement::new("SELECT ?1", vec![core::Value::from(42_i64)]);
     let _legacy_router: fn(Arc<storage::Database>) -> Router = api::router;
     let _http_router: fn(Arc<core::Database>) -> Router = http::router;
+    let _engine_router: fn(core::Engine) -> Router = http::router_with_engine;
 
     let result = core::ResultSet::new(
         vec![core::Column::new("value", core::DataType::Int64)],
@@ -40,4 +47,15 @@ fn legacy_and_explicit_module_paths_are_both_available() {
         error::mysql_error(core::EngineErrorKind::UniqueViolation).error_number,
         1062
     );
+}
+
+#[tokio::test]
+async fn protocol_neutral_async_engine_surface_is_available() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = core::Engine::open(temp.path(), 4).await.unwrap();
+    let session: core::Session = engine.session();
+
+    assert_eq!(session.state().await, core::SessionState::Ready);
+    let status: core::EngineStatus = engine.status(&session).await.unwrap();
+    assert_eq!(status.shard_count(), 4);
 }
