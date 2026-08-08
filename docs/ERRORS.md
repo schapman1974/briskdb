@@ -130,6 +130,13 @@ human-readable message to distinguish error kinds. Constraint subtypes use
 extended result codes; an unrecognized constraint remains
 `ConstraintViolation` rather than being guessed from text.
 
+The SQL parser facade classifies tokenization and syntax failures as
+`InvalidQuery`. Exceeding its configured SQL-input, statement-count, or
+recursion limit is `LimitExceeded`. The upstream parser message, source
+location, and submitted SQL remain trusted diagnostics only. Protocol adapters
+serialize the fixed mapping for the BriskDB error kind and never expose those
+diagnostics to a client.
+
 The core contains no HTTP, PostgreSQL, or MySQL response types. Conversely,
 protocol adapters do not inspect SQLite errors. This lets every frontend share
 one error identity while retaining its own response encoding.

@@ -1,7 +1,15 @@
-//! SQLite SQL execution and value conversion.
+//! Protocol-neutral SQL parsing, SQLite execution, and value conversion.
 //!
-//! SQL remains deliberate SQLite pass-through during this phase. Parsing and
-//! dialect normalization are later roadmap work.
+//! The parser facade produces a bounded, dialect-explicit opaque AST for later
+//! planning work. Current execution remains deliberate SQLite pass-through;
+//! parsing does not yet gate, rewrite, classify, route, or execute statements.
+
+mod parser;
+
+pub use parser::{
+    MAX_PARSED_SQL_BYTES, MAX_PARSED_SQL_STATEMENTS, ParsedSql, SQL_PARSE_RECURSION_LIMIT,
+    SqlDialect, parse,
+};
 
 use rusqlite::{
     Connection, params_from_iter,

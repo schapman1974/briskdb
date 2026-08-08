@@ -9,7 +9,7 @@ use axum::Router;
 use briskdb::{
     api, core,
     protocol::{error, http},
-    server, storage,
+    server, sql, storage,
 };
 
 fn insert_catalog_fixture(root: &Path) {
@@ -147,6 +147,48 @@ fn legacy_and_explicit_module_paths_are_both_available() {
         error::mysql_error(core::EngineErrorKind::UniqueViolation).error_number,
         1062
     );
+}
+
+#[test]
+fn protocol_neutral_sql_parser_facade_is_public_bounded_and_opt_in() {
+    fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
+    assert_owned_public::<sql::ParsedSql>();
+    assert_owned_public::<sql::SqlDialect>();
+
+    let cases = [
+        (sql::SqlDialect::Sqlite, "SELECT ?1"),
+        (sql::SqlDialect::PostgreSql, "SELECT $1"),
+        (sql::SqlDialect::MySql, "SELECT ?"),
+    ];
+    for (dialect, source) in cases {
+        let parsed = sql::parse(dialect, source.to_owned()).unwrap();
+        assert_eq!(parsed.dialect(), dialect);
+        assert_eq!(parsed.source(), source);
+        assert_eq!(parsed.statement_count(), 1);
+        assert!(!parsed.is_empty());
+    }
+
+    let empty = sql::parse(sql::SqlDialect::Sqlite, "-- comment only").unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(empty.statement_count(), 0);
+
+    let invalid = sql::parse(sql::SqlDialect::PostgreSql, "SELECT ?").unwrap_err();
+    assert_eq!(invalid.kind(), core::EngineErrorKind::InvalidQuery);
+
+    let too_long = " ".repeat(sql::MAX_PARSED_SQL_BYTES + 1);
+    let limited = sql::parse(sql::SqlDialect::Sqlite, too_long).unwrap_err();
+    assert_eq!(limited.kind(), core::EngineErrorKind::LimitExceeded);
+    assert_eq!(sql::MAX_PARSED_SQL_STATEMENTS, 256);
+    assert_eq!(sql::SQL_PARSE_RECURSION_LIMIT, 32);
+
+    // The facade is infrastructure for the later common-subset planner. The
+    // existing raw SQLite path deliberately does not invoke it yet.
+    let temp = tempfile::tempdir().unwrap();
+    let database = core::Database::open(temp.path(), 2).unwrap();
+    let mut raw_sql = "SELECT 1".to_owned();
+    raw_sql.push_str(&" ".repeat(sql::MAX_PARSED_SQL_BYTES));
+    let result = database.query("parser-opt-in", &raw_sql, &[]).unwrap();
+    assert_eq!(result.rows()[0].get(0), Some(&core::Value::Int64(1)));
 }
 
 #[test]

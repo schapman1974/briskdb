@@ -266,7 +266,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::core::{Column, DataType, EngineErrorKind, EngineOptions, ResultLimits, Row};
+    use crate::{
+        core::{Column, DataType, EngineErrorKind, EngineOptions, ResultLimits, Row},
+        sql::MAX_PARSED_SQL_BYTES,
+    };
 
     fn engine_router(database: Arc<Database>) -> Router {
         router_with_engine(Engine::from_database(database))
@@ -462,6 +465,38 @@ mod tests {
             json!([{"name": "answer", "data_type": "unknown"}])
         );
         assert_eq!(body["rows"], json!([[42]]));
+    }
+
+    #[tokio::test]
+    async fn current_http_sql_remains_raw_sqlite_pass_through_until_planner_integration() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(temp.path(), 2).unwrap());
+        let expected_shard = database.shard_for_key(b"raw-http-parser-boundary");
+        let application = engine_router(database);
+        let mut raw_sql = "SELECT 7 AS value".to_owned();
+        raw_sql.push_str(&" ".repeat(MAX_PARSED_SQL_BYTES));
+        assert!(raw_sql.len() > MAX_PARSED_SQL_BYTES);
+
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/query",
+                Some(json!({
+                    "shard_key": "raw-http-parser-boundary",
+                    "sql": raw_sql
+                })),
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({
+                    "shard": expected_shard,
+                    "columns": [{"name": "value", "data_type": "unknown"}],
+                    "rows": [[7]]
+                })
+            )
+        );
     }
 
     #[tokio::test]
