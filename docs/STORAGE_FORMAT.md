@@ -512,9 +512,12 @@ planner converts inferred `Int64` keys to their shortest signed base-10 ASCII
 form, inferred `Text` keys to exact UTF-8 without Unicode normalization or case
 conversion, and inferred `Binary` keys to exact bytes. The encoding adds no
 type, logical-database, table, or column prefix. These typed rules define input
-to the already persisted version-1 hash; issue #23 adds no manifest or shard
-format change. The complete advisory planning contract is in
-[bound statement planning](SQL_PLANNING.md).
+to the already persisted version-1 hash. Routing policy compares and
+deduplicates only the physical shard IDs produced by that persisted catalog;
+it does not rewrite or persist key bytes. Issues #23 and #24 add no manifest
+version, encoding, bucket-map, shard-file, or migration change. The complete
+planning and policy contract is in [bound statement
+planning](SQL_PLANNING.md).
 
 Bucket algorithm version 1 deliberately preserves legacy placement even when
 `N` does not divide 4,096. Given the version-1 64-bit hash `H`:

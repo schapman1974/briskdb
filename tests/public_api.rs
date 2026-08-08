@@ -346,6 +346,36 @@ fn shard_key_inference_is_public_typed_and_opt_in() {
 #[tokio::test]
 async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
     fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
+    fn same_shard_text_pair(database: &core::Database, prefix: &str) -> ([String; 2], u16) {
+        let first = format!("{prefix}-0");
+        let shard = database.shard_for_key(first.as_bytes());
+        let second = (1_u64..)
+            .map(|candidate| format!("{prefix}-{candidate}"))
+            .find(|candidate| database.shard_for_key(candidate.as_bytes()) == shard)
+            .unwrap();
+        ([first, second], shard)
+    }
+    fn binary_key_for_shard(database: &core::Database, shard: u16, prefix: &str) -> Vec<u8> {
+        (0_u64..)
+            .map(|candidate| {
+                let mut key = format!("\0{prefix}-{candidate}").into_bytes();
+                key.push(0xff);
+                key
+            })
+            .find(|candidate| database.shard_for_key(candidate) == shard)
+            .unwrap()
+    }
+    fn binary_key_for_other_shard(database: &core::Database, shard: u16, prefix: &str) -> Vec<u8> {
+        (0_u64..)
+            .map(|candidate| {
+                let mut key = format!("\0{prefix}-{candidate}").into_bytes();
+                key.push(0xff);
+                key
+            })
+            .find(|candidate| database.shard_for_key(candidate) != shard)
+            .unwrap()
+    }
+
     assert_owned_public::<core::BoundStatementPlan>();
     assert_owned_public::<core::PlannedRoute>();
 
@@ -360,16 +390,18 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
     let parsed = sql::parse(sql::SqlDialect::PostgreSql, source).unwrap();
     let common = sql::validate_common_subset(parsed).unwrap();
     let normalized = sql::normalize_placeholders(common).unwrap();
+    let (first_distinct_keys, first_shard) =
+        same_shard_text_pair(&database, "tenant-alpha-sensitive");
     let first_keys = [
-        "tenant-alpha-sensitive",
-        "tenant-snowman-☃",
-        "tenant-alpha-sensitive",
+        first_distinct_keys[0].as_str(),
+        first_distinct_keys[1].as_str(),
+        first_distinct_keys[0].as_str(),
     ];
     let first_parameters = first_keys
         .iter()
         .map(|key| core::Value::Text((*key).to_owned()))
         .collect::<Vec<_>>();
-    let explicit_key = b"\0explicit-route-sensitive-\xff";
+    let explicit_key = binary_key_for_shard(&database, first_shard, "explicit-route-sensitive");
 
     let plan = engine
         .plan_bound_statement(
@@ -377,7 +409,7 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
             &normalized,
             0,
             &first_parameters,
-            Some(explicit_key),
+            Some(explicit_key.as_slice()),
         )
         .unwrap();
 
@@ -397,6 +429,7 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
     );
     assert_eq!(plan.inference().values().len(), first_keys.len());
     assert_eq!(plan.inferred_routes().len(), first_keys.len());
+    assert_eq!(plan.assigned_shard(), Some(first_shard));
 
     for ((value, route), expected_key) in plan
         .inference()
@@ -411,12 +444,13 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
             route.shard(),
             database.shard_for_key(expected_key.as_bytes())
         );
+        assert_eq!(route.shard(), first_shard);
     }
     assert_eq!(plan.inferred_routes()[0], plan.inferred_routes()[2]);
 
     let explicit_route = plan.explicit_route().unwrap();
     assert_eq!(explicit_route.key_bytes(), explicit_key);
-    assert_eq!(explicit_route.shard(), database.shard_for_key(explicit_key));
+    assert_eq!(explicit_route.shard(), first_shard);
     assert!(
         plan.inferred_routes()
             .iter()
@@ -425,11 +459,7 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
 
     let plan_debug = format!("{plan:?}");
     let route_debug = format!("{explicit_route:?}");
-    for sensitive in [
-        "tenant-alpha-sensitive",
-        "tenant-snowman-☃",
-        "explicit-route-sensitive",
-    ] {
+    for sensitive in ["tenant-alpha-sensitive", "explicit-route-sensitive"] {
         assert!(!plan_debug.contains(sensitive));
         assert!(!route_debug.contains(sensitive));
     }
@@ -438,7 +468,48 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
     assert_eq!(cloned, plan);
     assert_eq!(thread::spawn(move || cloned).join().unwrap(), plan);
 
-    let second_keys = ["tenant-bravo", "tenant-charlie", "tenant-bravo"];
+    let conflicting_key =
+        binary_key_for_other_shard(&database, first_shard, "conflicting-explicit-sensitive");
+    assert_ne!(database.shard_for_key(&conflicting_key), first_shard);
+    let conflict = engine
+        .plan_bound_statement(
+            tenant.id(),
+            &normalized,
+            0,
+            &first_parameters,
+            Some(conflicting_key.as_slice()),
+        )
+        .unwrap_err();
+    assert_eq!(conflict.kind(), core::EngineErrorKind::InvalidArgument);
+    assert_eq!(conflict.code(), "invalid_argument");
+    let conflict_debug = format!("{conflict:?}");
+    for sensitive in [
+        first_distinct_keys[0].as_str(),
+        first_distinct_keys[1].as_str(),
+        "conflicting-explicit-sensitive",
+    ] {
+        assert!(!conflict.diagnostic().contains(sensitive));
+        assert!(!conflict_debug.contains(sensitive));
+    }
+
+    let recovered = engine
+        .plan_bound_statement(
+            tenant.id(),
+            &normalized,
+            0,
+            &first_parameters,
+            Some(explicit_key.as_slice()),
+        )
+        .unwrap();
+    assert_eq!(recovered, plan);
+
+    let (second_distinct_keys, second_shard) =
+        same_shard_text_pair(&database, "tenant-bravo-sensitive");
+    let second_keys = [
+        second_distinct_keys[0].as_str(),
+        second_distinct_keys[1].as_str(),
+        second_distinct_keys[0].as_str(),
+    ];
     let second_parameters = second_keys
         .iter()
         .map(|key| core::Value::Text((*key).to_owned()))
@@ -448,12 +519,14 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
         .unwrap();
     assert_eq!(replanned.inferred_routes().len(), second_keys.len());
     assert!(replanned.explicit_route().is_none());
+    assert_eq!(replanned.assigned_shard(), Some(second_shard));
     for (route, expected_key) in replanned.inferred_routes().iter().zip(second_keys) {
         assert_eq!(route.key_bytes(), expected_key.as_bytes());
         assert_eq!(
             route.shard(),
             database.shard_for_key(expected_key.as_bytes())
         );
+        assert_eq!(route.shard(), second_shard);
     }
     assert_ne!(replanned.inferred_routes()[0], plan.inferred_routes()[0]);
 

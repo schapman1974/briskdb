@@ -210,7 +210,7 @@ interrupted schema migration can be diagnosed and resumed.
   parameters and multi-row inserts.
 - [x] Plan prepared statements at bind/execute time, not parse time, because a
   routing key may be supplied as a bound parameter.
-- [ ] Reject conflicting keys and unroutable writes before execution.
+- [x] Reject conflicting keys and unroutable writes before execution.
 - [ ] Translate a deliberately small set of type names and syntax differences;
   preserve a strict mode that exposes SQLite SQL directly.
 - [ ] Implement protocol-neutral prepare/bind/describe/execute lifecycle and a

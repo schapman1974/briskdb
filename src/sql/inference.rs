@@ -386,7 +386,7 @@ fn object_identifier(name: &ObjectName) -> EngineResult<&Ident> {
     Ok(identifier)
 }
 
-fn column_ident(name: &ObjectName) -> EngineResult<&Ident> {
+pub(super) fn column_ident(name: &ObjectName) -> EngineResult<&Ident> {
     let [ObjectNamePart::Identifier(identifier)] = name.0.as_slice() else {
         return Err(inference_invariant());
     };
@@ -410,7 +410,7 @@ fn reference_identifier(identifier: &Ident) -> String {
     }
 }
 
-fn identifier_matches_catalog(identifier: &Ident, canonical: &str) -> bool {
+pub(super) fn identifier_matches_catalog(identifier: &Ident, canonical: &str) -> bool {
     if identifier.quote_style.is_none() {
         identifier.value.eq_ignore_ascii_case(canonical)
     } else {

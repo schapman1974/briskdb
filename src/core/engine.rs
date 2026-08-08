@@ -291,9 +291,11 @@ impl Engine {
 
     /// Plan one normalized statement from its actual bound parameter values.
     ///
-    /// `statement_index` is zero-based. `explicit_routing_key` is retained as
-    /// an independent fallback route; later policy decides whether inferred
-    /// and explicit routes are compatible and executable.
+    /// `statement_index` is zero-based. Planning infers routes, retains an
+    /// optional explicit fallback, applies single-shard write policy, and
+    /// returns the assigned physical shard when one is valid. Finite inferred
+    /// routes and an explicit route must select the same physical shard.
+    /// Planning remains synchronous and does not prepare or execute SQL.
     pub fn plan_bound_statement(
         &self,
         database: LogicalDatabaseId,

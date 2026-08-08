@@ -65,8 +65,8 @@ In particular, this layer does not:
 - infer shard keys or inspect bound values; issue #22 implements that as the
   separate `infer_shard_keys` layer;
 - itself plan bound statements; issue #23 implements that as the separate
-  synchronous `Engine::plan_bound_statement` layer;
-- reject conflicting keys or unroutable writes (issue #24);
+  synchronous `Engine::plan_bound_statement` layer, and issue #24 extends that
+  call with physical-target comparison and sharded-write policy;
 - translate types or syntax, or choose strict SQLite mode (issue #25);
 - implement prepare/bind/describe/execute state or caches (issue #26); or
 - classify statement behavior or reject unsafe multi-statement combinations
@@ -83,9 +83,9 @@ The existing HTTP execute, query, and migration paths remain raw SQLite
 pass-through surfaces with their existing authorizer and endpoint-specific
 rules. They call neither this parser, the opt-in common-subset validator, nor
 the opt-in placeholder normalizer, shard-key inference, or bound statement
-planner. Connecting those layers before translation, write policy, and
-request-level statement policy are implemented would change the experimental
-HTTP SQL surface.
+planner. Connecting those layers before translation, the prepared execution
+lifecycle, and request-level statement policy are implemented would change the
+experimental HTTP SQL surface.
 
 ## Resource and error boundaries
 

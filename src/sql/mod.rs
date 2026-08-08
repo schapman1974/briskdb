@@ -7,10 +7,13 @@
 //! deliberate SQLite pass-through; these opt-in layers do not gate, route, or
 //! execute statements.
 
+mod dml;
 mod inference;
 mod normalizer;
 mod parser;
 mod subset;
+
+pub(crate) use dml::{RoutedDml, routed_dml_shape};
 
 pub use inference::{ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue, infer_shard_keys};
 pub use normalizer::{

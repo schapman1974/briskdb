@@ -26,8 +26,8 @@ catalog-aware extraction of typed keys from predicates, bound parameters, and
 multi-row inserts without routing or execution.
 The [bound statement-planning contract](docs/SQL_PLANNING.md) defines the
 synchronous engine API that turns one statement's actual bound values into
-owned advisory routes while retaining routing provenance and an independent
-explicit fallback.
+owned routes, validates inferred and explicit physical targets, rejects
+unroutable sharded writes, and records a single-shard assignment where valid.
 The [error contract](docs/ERRORS.md) defines stable engine error kinds, safe
 HTTP problem details, and the mappings reserved for future PostgreSQL and MySQL
 adapters.
@@ -57,8 +57,9 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - A bounded SQL AST parser plus recursive common-subset validator for explicit
   SQLite, PostgreSQL, and MySQL dialects, followed by opt-in source-preserving
   placeholder normalization, per-statement binding metadata, and catalog-aware
-  typed shard-key inference plus synchronous bound-value-aware advisory
-  routing plans, all isolated from the current raw SQLite HTTP execution path
+  typed shard-key inference plus synchronous bound-value-aware routing plans
+  with single-shard write policy, all isolated from the current raw SQLite HTTP
+  execution path
 - A transactionally versioned `manifest.sqlite` with durable 4,096-bucket
   routing plus logical-database and table metadata
 - Identity-bound, WAL-enabled SQLite shard files that are never silently
@@ -191,10 +192,13 @@ may instead use synchronous
 `Engine::plan_bound_statement(database, normalized, statement_index,
 parameters, explicit_routing_key)` to retain the inference and produce one
 owned canonical route per inferred value plus an independent explicit route.
-The plan records schema and routing provenance but does not choose between
-inferred and explicit routes, enforce write or batch policy, translate SQL, or
-execute anything. The HTTP execute, query, and migration endpoints invoke none
-of these opt-in layers and retain their existing raw SQLite behavior.
+That call compares finite inferred and explicit routes by physical shard,
+rejects cross-shard or otherwise unroutable cataloged sharded DML, prevents
+shard-key updates, and exposes the accepted `assigned_shard()`. The plan
+records schema and routing provenance but does not classify complete request
+behavior, translate SQL, or execute anything. The HTTP execute, query, and
+migration endpoints invoke none of these opt-in layers and retain their
+existing raw SQLite behavior.
 
 `EngineOptions` permits 1–16 active connections and 1–1,024 queued operations
 per shard, with at most 512 active connections across all shards.

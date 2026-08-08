@@ -159,10 +159,12 @@ A successful `NormalizedSql` does not establish that:
 
 The implemented [shard-key inference contract](SQL_SHARD_KEYS.md) consumes this
 metadata plus a catalog database and exact bound-value slice. The implemented
-[bound statement planner](SQL_PLANNING.md) uses that result to produce advisory
-routes only after values are bound. Issues #24 through #27 own conflicting or
-unroutable write rejection, syntax/type translation, prepared-statement state,
-and request-level statement classification respectively.
+[bound statement planner and routing policy](SQL_PLANNING.md) uses that result
+only after values are bound, compares finite physical targets, rejects
+unroutable cataloged sharded writes, and records a valid single-shard
+assignment. Issues #25 through #27 own syntax/type translation,
+prepared-statement state, and request-level statement classification
+respectively.
 
 ## Verification obligations
 
