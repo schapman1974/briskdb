@@ -3,17 +3,16 @@
 BriskDB classifies failures once, at the protocol-neutral engine boundary. An
 `EngineErrorKind` is stable error identity; protocol adapters translate that
 identity without inspecting an error message. The HTTP adapter uses the mapping
-today. The selected PostgreSQL adapter seam also converts every engine kind
-through the PostgreSQL column in its compatibility tests, but the current
-PostgreSQL TCP placeholder accepts and closes without emitting an error frame.
-The MySQL column remains a contract for its planned adapter, and there is no
-MySQL listener yet.
+today. PostgreSQL startup and the deliberate pre-query boundary emit fixed
+wire errors through the same safe-message policy, and the adapter converts
+every engine kind through the PostgreSQL column. The MySQL column remains a
+contract for its planned adapter, and there is no MySQL listener yet.
 
 Malformed listener configuration is rejected by the binary before server
 startup. Listener bind/accept failures terminate the shared server lifecycle
 with process-level diagnostics after cleanup; they are not `EngineErrorKind`
-values and are not encoded as HTTP or PostgreSQL responses. A placeholder
-PostgreSQL peer receives only a no-byte connection close.
+values and are not encoded as HTTP or PostgreSQL responses. A PostgreSQL
+startup timeout closes without a frame because no session was established.
 
 ## Taxonomy and protocol mappings
 
@@ -46,6 +45,15 @@ the human-readable text to identify an error.
 | <a id="storage-unavailable"></a>`StorageUnavailable` | `storage_unavailable` | 503 | Storage unavailable | The storage is unavailable. | `58030` | 1105 | `HY000` | No |
 | <a id="data-corruption"></a>`DataCorruption` | `data_corruption` | 500 | Data corruption | Stored data failed an integrity check. | `XX001` | 1105 | `HY000` | No |
 | <a id="internal"></a>`Internal` | `internal` | 500 | Internal error | An internal engine error occurred. | `XX000` | 1105 | `HY000` | No |
+
+PostgreSQL startup also has a finite protocol-specific table: invalid user
+labels use `28000`, unknown logical databases use `3D000`, invalid startup
+values use `22023`, unsupported startup features use `0A000`, and malformed or
+unsupported protocol versions use `08P01`. These are fixed `FATAL` responses
+followed by socket close, without `ReadyForQuery`. Before issue #31, simple
+queries and extended `Parse` use the engine `Unsupported` mapping (`0A000`) and
+never include query text. The complete sequencing is in
+[PostgreSQL startup and listener](POSTGRES_LISTENER.md).
 
 Only `Busy` is retryable. A caller should retry it with bounded exponential
 backoff and jitter. No other HTTP status, SQLSTATE, or MySQL error number
@@ -280,9 +288,10 @@ one error identity while retaining its own response encoding.
 Issue #29's private `pgwire` bridge constructs `ErrorInfo` only from
 `postgres_error(error.kind())`: severity `ERROR`, the fixed SQLSTATE, and the
 fixed public message. Its exhaustive test uses a private diagnostic sentinel
-for every kind and proves that sentinel is absent. This is a library-fit
-contract, not live listener behavior; issue #30 and later transaction work own
-production severity, connection-fatal policy, and failed-transaction state.
+for every kind and proves that sentinel is absent. Issue #30 applies fixed
+`FATAL` startup errors plus terminal close and fixed `ERROR` / `0A000` query
+deferral. Later transaction work owns failed-transaction state and the complete
+execution-error policy.
 
 Manifest compatibility uses the same protocol-neutral kinds. A foreign file,
 a manifest newer than the running binary, or a requested shard-count mismatch

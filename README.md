@@ -13,15 +13,14 @@ The [architecture map](docs/ARCHITECTURE.md) defines the crate's module
 boundaries and dependency direction.
 
 The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
-current SQLite pass-through API from the PostgreSQL TCP-listener scaffold and
-planned PostgreSQL/MySQL wire compatibility.
+current SQLite pass-through API from PostgreSQL startup support and planned
+PostgreSQL/MySQL query compatibility.
 The [PostgreSQL listener contract](docs/POSTGRES_LISTENER.md) defines its
-address configuration, disabled state, startup order, placeholder connection
-behavior, and shared shutdown lifecycle.
+address configuration, startup/session behavior, parameter status, deferred
+query boundary, and shared shutdown lifecycle.
 The [PostgreSQL adapter decision record](docs/POSTGRES_ADAPTER.md) selects the
 exact wire-library version and features, defines the BriskDB-owned connection
-boundary, and records the work that remains before that listener speaks the
-protocol.
+boundary, and records the work that remains for query execution.
 The [SQL parser decision record](docs/SQL_PARSER.md) defines the shared,
 dialect-explicit syntax boundary and its resource and dependency limits.
 The [common SQL subset contract](docs/SQL_SUBSET.md) defines the opt-in,
@@ -44,8 +43,9 @@ protocol-neutral prepare/bind/describe/execute lifecycle, session-scoped
 statement and portal caches, exact resource limits, metadata refresh, and
 supported physical-target execution boundary shared by future adapters.
 The [error contract](docs/ERRORS.md) defines stable engine error kinds, safe
-HTTP problem details, the mapping consumed by the private PostgreSQL adapter
-probe, and the mapping reserved for a future MySQL wire adapter.
+HTTP problem details, the mapping consumed by PostgreSQL startup/query deferral
+and the private adapter probe, and the mapping reserved for a future MySQL wire
+adapter.
 The [request-control contract](docs/REQUEST_CONTROLS.md) defines cancellation,
 deadlines, materialized-result budgets, and graceful shutdown.
 The [admin data-browser contract](docs/ADMIN_BROWSER.md) defines the embedded
@@ -71,9 +71,10 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Request cancellation and deadlines that interrupt SQLite and await cleanup
 - Finite per-query row/logical-byte budgets with no partial results
 - Explicit graceful drain, forced cancellation, and blocking handle cleanup
-- Independently configured HTTP and PostgreSQL TCP listeners; `pgwire` 0.36.3
-  is pinned behind a BriskDB-owned adapter seam while the PostgreSQL listener
-  continues to accept and close connections pending startup/session work
+- Independently configured HTTP and PostgreSQL TCP listeners; the loopback
+  PostgreSQL endpoint supports protocol 3.0 startup, logical database/user
+  selection, BriskDB parameter status, and clean connection termination through
+  a BriskDB-owned `pgwire` 0.36.3 boundary
 - An embedded read-only browser at `/admin` for inspecting user tables and
   bounded row pages on one explicitly selected physical shard
 - Protocol-neutral typed values, ordered columns, positional rows, and results
@@ -124,6 +125,10 @@ precedence over the environment, which takes precedence over the default. The
 HTTP address, data directory, and shard count can also be supplied with
 `BRISKDB_LISTEN`, `BRISKDB_DATA_DIR`, and `BRISKDB_SHARDS`.
 
+An enabled PostgreSQL address must be IPv4 or IPv6 loopback in the current
+phase. A non-loopback value is rejected before the engine opens or either
+listener binds.
+
 ```bash
 # Keep the existing HTTP service and do not bind the PostgreSQL port.
 cargo run -- --postgres-listen disabled
@@ -132,11 +137,11 @@ cargo run -- --postgres-listen disabled
 BRISKDB_POSTGRES_LISTEN=disabled cargo run
 ```
 
-Issue #28 supplies the separately managed TCP endpoint, and issue #29 selects
-the wire library without activating it on that endpoint. Until startup/session
-support lands, every accepted connection is closed immediately without reading
-or writing protocol bytes, and no PostgreSQL driver can execute a request
-through it. See the [listener contract](docs/POSTGRES_LISTENER.md) and
+The PostgreSQL listener currently accepts only loopback addresses. It supports
+protocol 3.0 startup and session selection, then reports fixed `0A000` errors
+for SQL until issue #31 adds simple and extended query execution. It is not yet
+a query-capable PostgreSQL interface. See the
+[listener contract](docs/POSTGRES_LISTENER.md) and
 [adapter decision record](docs/POSTGRES_ADAPTER.md).
 
 The HTTP listener also serves the embedded data explorer at
@@ -165,10 +170,14 @@ shutdown allows 30 seconds before cancelling admitted work and is configured by
 `--shutdown-grace-ms` / `BRISKDB_SHUTDOWN_GRACE_MS`. Ctrl-C and, on Unix,
 SIGTERM stop new admissions, drain or cancel admitted SQLite work, close idle
 handles, and then stop the process. Core admission closes before both listener
-sockets are dropped. Accepted HTTP connections are tracked; connections
-that outlive the grace window are force-closed and joined before the server
-returns. Placeholder PostgreSQL connections have already been closed at
-accept time and retain no engine work to drain.
+sockets are dropped. Accepted HTTP and PostgreSQL connections are tracked;
+connections that outlive the grace window are force-closed. HTTP task joins are
+awaited; PostgreSQL task joins and retained-session closes get one additional
+grace interval. If that second interval expires, remaining PostgreSQL session
+closes are scheduled as best-effort runtime cleanup rather than delaying server
+return. Every completed PostgreSQL startup owns one core session that is closed
+on `Terminate`, EOF, or protocol failure; server shutdown applies the bounded
+cleanup described above.
 
 Each session defaults to at most 128 prepared statements, 128 bound portals,
 and a 16 MiB ceiling for retained bound values/captured routing bytes and one

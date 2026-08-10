@@ -4,9 +4,10 @@ Status: implemented for roadmap issue #27
 
 BriskDB classifies the already validated common SQL AST into a small,
 protocol-neutral behavior taxonomy. The classifier is the shared request gate
-for future PostgreSQL, MySQL, and other adapters; a frontend must not infer
-behavior from SQL text, a wire command, SQLite result columns, or whether
-SQLite reports a statement as read-only.
+for the PostgreSQL adapter's deferred SQL flow, the planned MySQL adapter, and
+other future adapters; a frontend must not infer behavior from SQL text, a wire
+command, SQLite result columns, or whether SQLite reports a statement as
+read-only.
 
 ```rust
 classify_statements(
@@ -206,12 +207,12 @@ pinning remain later transaction work.
 
 ## Adapter and raw-surface boundary
 
-Future PostgreSQL and MySQL adapters must pass their explicitly selected
-dialect through the shared parser, subset validator, and classifier. They may
-map the nested behavior to protocol command tags or status handling, but must
-not implement a second keyword classifier or loosen batch policy on their own.
-The same typed common SQL produces the same classification regardless of its
-wire protocol.
+The PostgreSQL adapter's issue-31 SQL flow and the future MySQL adapter must
+pass their explicitly selected dialect through the shared parser, subset
+validator, and classifier. They may map the nested behavior to protocol command
+tags or status handling, but must not implement a second keyword classifier or
+loosen batch policy on their own. The same typed common SQL produces the same
+classification regardless of its wire protocol.
 
 Issue #27 adds no PostgreSQL or MySQL listener and no new HTTP route, request
 field, response body, or configuration option. The experimental HTTP execute,
@@ -219,8 +220,10 @@ query, and migration endpoints remain raw SQLite surfaces and do not invoke the
 opt-in common frontend. In particular, the journaled migration endpoint keeps
 its own bounded, parameterless SQLite batch contract and can accept a schema
 batch that the general common-SQL classifier deliberately rejects.
-Issue #28 subsequently adds only the PostgreSQL TCP accept/close scaffold; it
-does not connect that socket to classification or any other SQL layer.
+At the issue-28 milestone, the PostgreSQL endpoint was only an accept/close
+scaffold. Issue #30 connected startup, catalog selection, status, and session
+cleanup, but SQL messages still stop before classification or any other shared
+SQL layer until issue #31.
 
 ## Storage-format and configuration boundary
 

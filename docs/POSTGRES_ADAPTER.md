@@ -1,12 +1,14 @@
 # PostgreSQL adapter decision record
 
-Status: accepted for roadmap issue #29
+Status: accepted for roadmap issue #29; amended by issue #30 production startup
+activation
 
 BriskDB needs a PostgreSQL frontend library that can own protocol framing and
 message dispatch without becoming the database engine, routing policy,
 prepared-object store, or public error taxonomy. This record selects that
-library, fixes its dependency boundary, and documents the compatibility probe.
-It does not activate PostgreSQL wire behavior on the configured listener.
+library, fixes its dependency boundary, documents the compatibility probe, and
+records the BriskDB-owned startup constraints applied when issue #30 activated
+the configured loopback listener.
 
 ## Decision
 
@@ -32,7 +34,7 @@ behavior, and MSRV decision followed by the complete verification matrix.
 
 Only `server-api` is enabled. That supplies the Tokio socket entrypoint,
 frontend/backend messages, handler traits, PostgreSQL type descriptors, and
-row encoders needed by the planned server adapter.
+row encoders used by startup and the planned query adapter.
 
 The dependency's defaults are disabled because they additionally select an
 AWS-LC TLS backend and extended chrono, decimal, and JSON adapters. BriskDB does
@@ -64,9 +66,9 @@ The public BriskDB seam consists of two owned types:
   and the current default logical-database identifier. Constructing it has no
   network or session side effect.
 - `protocol::postgres::Connection` owns exactly one non-cloneable core
-  `Session`, exposes its `SessionId`, can read controlled engine status, and can
-  close that session idempotently. Separate connections never share session
-  state.
+  `Session`, exposes its `SessionId` plus selected user/database identity, can
+  read controlled engine status, and can close that session idempotently.
+  Separate connections never share session state.
 
 The connection retains a private implementation of `pgwire`'s `QueryParser`
 trait as the compile-time bridge. Its probe path prepares PostgreSQL-dialect
@@ -102,12 +104,13 @@ server:
    status, returns after client EOF, and explicitly closes its core session;
 7. a rejected startup returns promptly, closes its core session, and leaves a
    later adapter connection usable; and
-8. the existing server tests continue to prove that the configured production
-   PostgreSQL listener writes zero bytes and immediately closes each stream.
+8. production server tests independently prove exact startup frames, concurrent
+   HTTP/PostgreSQL service, tracked termination, and shutdown cleanup.
 
-The loopback command and its response tag exist only inside the unit test. They
-are not supported SQL, public protocol behavior, or a claim that a PostgreSQL
-driver can use BriskDB today.
+The issue-29 loopback command and its response tag remain only a private unit
+probe. They are not supported SQL or public protocol behavior. Production
+startup has separate raw-wire contract tests and deliberately returns `0A000`
+for queries until issue #31.
 
 ## Library fit and retained ownership
 
@@ -124,8 +127,9 @@ Those conveniences do not transfer product ownership to the library. In
 particular:
 
 - `pgwire`'s default startup handler advertises dependency-owned version and
-  parameter values. Issue #30 must replace it with BriskDB values before the
-  production listener calls `process_socket`.
+  parameter values. Production startup therefore uses BriskDB-owned handlers,
+  validates protocol 3.0 and a finite parameter set, and emits only the status
+  documented in `POSTGRES_LISTENER.md`.
 - Its default in-memory statement/portal store is unbounded, replacement does
   not return the old object for cleanup, and statement removal does not cascade
   into BriskDB handles. Issue #31 must keep the engine's existing finite
@@ -135,15 +139,31 @@ particular:
   not call `Engine::bind_statement`. The production adapter must decode into
   BriskDB `Value` objects and bind at Bind time so the route snapshot is
   immutable before Execute.
-- The socket loop has no BriskDB session-close callback. The production wrapper
-  must close its `Connection` on every ordinary, error, EOF, cancellation, and
-  shutdown return path.
+- The selected socket loop does not treat `Terminate` as terminal and has no
+  BriskDB session-close callback. Production uses a narrow BriskDB-owned loop
+  around the library's public decoder/dispatcher and closes its `Connection`
+  on `Terminate`, error, and EOF. Shutdown signals the loop; forced task cleanup
+  hands retained connections to the server's bounded cleanup supervisor.
+- The selected decoder assumes complete, correctly bounded frames. A
+  BriskDB-owned raw-frame gate therefore runs before dependency decoding and
+  releases exactly one validated frame at a time. BriskDB also owns plaintext
+  negotiation: `SSLRequest` and `GSSENCRequest` must each be exactly eight bytes
+  before the dependency identifies them, so a malformed negotiation cannot
+  consume a following startup. Startup frames have a maximum declared length
+  of 10,000 bytes. After startup, only `Query`, `Parse`, `Sync`, and `Terminate`
+  are admitted, with a maximum declared length of 65,541 bytes; strings must be
+  valid UTF-8 and each frame must satisfy its exact structural boundary. Other
+  frontend message types are rejected until their owning roadmap issues.
+  Malformed or oversized input receives BriskDB's fixed `08P01` response when a
+  response can be sent, the socket closes, and an already-selected core session
+  is still closed. Raw-frame regression tests cover malformed input both before
+  and after successful startup.
 - The selected version understands protocol 3.0 and 3.2 and defaults its own
-  client state to 3.2. Issue #32 must apply BriskDB's deliberate baseline and
-  minor-version negotiation policy.
-- Dependency message-size ceilings are not BriskDB retention limits. SQL,
-  names, raw parameters, prepared objects, rows, and connection tasks still
-  require BriskDB-owned finite limits.
+  client state to 3.2. BriskDB now overrides that state with an exact 3.0
+  baseline; issue #32 owns explicit newer-minor negotiation.
+- The raw-frame caps are transport-retention boundaries, not budgets for SQL,
+  names, raw parameters, prepared objects, or rows. Those values and connection
+  tasks still require their BriskDB-owned finite limits.
 - Portal suspension in the dependency cannot cause a BriskDB portal to execute
   twice. The core currently returns a complete bounded materialized result;
   issue #31 must retain and resume the already produced response or provide a
@@ -155,17 +175,19 @@ tests remain authoritative.
 
 ## Current listener behavior
 
-The configured PostgreSQL TCP listener still performs issue #28's exact
-accept-and-close behavior. It does not construct an `Adapter` or `Connection`,
-call `process_socket`, read a startup packet, emit a response, open a core
-session, or run SQL. Selecting a library must not accidentally ship its default
-startup behavior before BriskDB's production session policy is implemented.
+Issue #30 activates production protocol 3.0 startup on configured loopback
+addresses. The listener validates a finite startup parameter set, resolves an
+exact logical database through the core catalog, creates one session only after
+validation, emits BriskDB-owned status, and tracks that session through
+termination and server shutdown. It does not use the dependency's default
+startup values or protocol-version state.
 
-Issue #30 owns production wiring plus startup, logical database/user selection,
-BriskDB parameter status, termination, and server-version identification.
-Issue #31 owns simple and extended query flow. Later roadmap issues retain
-their existing protocol-version, type, transaction, cancellation, TLS/SCRAM,
-client-matrix, and row-streaming scopes.
+Issue #31 owns simple and extended query flow. Until then, every simple query
+and extended `Parse` receives a fixed `0A000` error with protocol recovery and
+no retained statement. Later roadmap issues retain their existing
+minor-version negotiation, type, transaction, cancellation, TLS/SCRAM,
+client-matrix, and row-streaming scopes. The exact live contract is in the
+[PostgreSQL listener document](POSTGRES_LISTENER.md).
 
 ## Errors, configuration, and storage
 
@@ -173,8 +195,9 @@ The compile bridge converts an `EngineError` only by calling
 `protocol::error::postgres_error(error.kind())`. It creates severity `ERROR`,
 the table's five-character SQLSTATE, and the fixed safe message. Trusted SQL,
 SQLite text, paths, and source chains in `diagnostic()` are never serialized.
-Production severity, failed-transaction state, and connection-fatal policy
-remain part of the later wire/session work.
+Startup applies fixed fatal severity and closes after its error; pre-query
+errors use fixed ordinary severity. Failed-transaction state remains part of
+the later transaction work.
 
 This decision adds no CLI or environment setting and does not change listener
 defaults, HTTP routes, JSON, SQL support, routing, engine limits, manifest or
@@ -190,7 +213,8 @@ A `pgwire` update must remain exact and must verify, at minimum:
 - enabled features and absence of unintended providers/type adapters;
 - handler factory, startup, query, error, cancellation, portal, and socket-loop
   API changes;
-- message limits and connection-state behavior;
+- raw-frame gate/decoder boundaries, exact message limits, and connection-state
+  behavior;
 - independent per-connection BriskDB sessions and cleanup on every return path;
 - fixed SQLSTATE/safe-message conversion for every engine error kind;
 - the production listener's expected behavior for the roadmap issue being

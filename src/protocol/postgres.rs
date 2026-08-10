@@ -1,17 +1,47 @@
 //! BriskDB-owned boundary for the selected PostgreSQL wire library.
 //!
-//! This module deliberately does not serve the configured PostgreSQL listener
-//! yet. It owns the selected library integration and one protocol-neutral core
-//! session per future wire connection so `server`, `core`, and public BriskDB
-//! contracts do not depend on `pgwire` types.
+//! The configured loopback listener delegates startup framing and dispatch to
+//! this module. Each successfully started wire connection owns one
+//! protocol-neutral core session; `server`, `core`, and BriskDB's public API do
+//! not accept or return `pgwire` types.
 
-use std::{fmt, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fmt, io,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use futures::{Sink, SinkExt, StreamExt};
 use pgwire::{
-    api::{ClientInfo, Type, stmt::QueryParser},
+    api::{
+        ClientInfo, ClientPortalStore, DefaultClient, ErrorHandler, PgWireConnectionState,
+        PgWireServerHandlers, Type,
+        auth::StartupHandler,
+        portal::Portal,
+        query::{ExtendedQueryHandler, SimpleQueryHandler},
+        results::{DescribePortalResponse, DescribeStatementResponse, Response},
+        stmt::{NoopQueryParser, QueryParser, StoredStatement},
+        store::PortalStore,
+    },
     error::{ErrorInfo, PgWireError, PgWireResult},
+    messages::{
+        PgWireBackendMessage, PgWireFrontendMessage, ProtocolVersion, SslNegotiationMetaMessage,
+        extendedquery::Parse,
+        response::{GssEncResponse, ReadyForQuery, SslResponse, TransactionStatus},
+        simplequery::Query,
+        startup::{Authentication, ParameterStatus},
+    },
+    tokio::server::{PgWireMessageServerCodec, process_error, process_message},
 };
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+};
+use tokio_util::codec::Framed;
 
 use crate::{
     core::{
@@ -19,44 +49,411 @@ use crate::{
         PrepareRequest, PreparedStatementDescription, PreparedStatementId, Session, SessionId,
     },
     protocol::error::postgres_error,
-    sql::{SqlDialect, SqlTranslationMode},
+    sql::{MAX_PARSED_SQL_BYTES, SqlDialect, SqlTranslationMode},
 };
+
+const POSTGRES_PROTOCOL_MAJOR: u16 = 3;
+const POSTGRES_PROTOCOL_MINOR: u16 = 0;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_STARTUP_NAME_BYTES: usize = 63;
+const MAX_STARTUP_PACKET_LENGTH: usize = 10_000;
+const MAX_FRONTEND_MESSAGE_LENGTH: usize = MAX_PARSED_SQL_BYTES + 5;
+const CANCEL_REQUEST_CODE: i32 = 80_877_102;
+const SSL_REQUEST_CODE: i32 = 80_877_103;
+const GSSENC_REQUEST_CODE: i32 = 80_877_104;
+const SERVER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-briskdb");
+const PARAMETER_STATUS: [(&str, &str); 5] = [
+    ("server_version", SERVER_VERSION),
+    ("server_encoding", "UTF8"),
+    ("client_encoding", "UTF8"),
+    ("standard_conforming_strings", "on"),
+    ("integer_datetimes", "on"),
+];
+
+#[derive(Clone, Copy)]
+enum FrontendFramePhase {
+    Startup,
+    Typed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupFrameKind {
+    Negotiation,
+    Startup,
+}
+
+/// Bounded raw-frame gate in front of the pinned dependency decoder.
+///
+/// It releases exactly one complete validated frame at a time. That keeps a
+/// declared oversized body out of the dependency buffer and prevents one
+/// frame's decoder from consuming bytes belonging to the next frame.
+struct GuardedPgStream<S> {
+    inner: S,
+    phase: FrontendFramePhase,
+    pending: Vec<u8>,
+    ready: Option<Vec<u8>>,
+    ready_offset: usize,
+}
+
+impl<S> GuardedPgStream<S> {
+    fn new(inner: S, pending: Vec<u8>) -> Self {
+        Self {
+            inner,
+            phase: FrontendFramePhase::Startup,
+            pending,
+            ready: None,
+            ready_offset: 0,
+        }
+    }
+
+    fn expected_frame_length(&self) -> io::Result<Option<usize>> {
+        let (length_offset, header_length, minimum, maximum, type_length) = match self.phase {
+            FrontendFramePhase::Startup => (0, 4, 8, MAX_STARTUP_PACKET_LENGTH, 0),
+            FrontendFramePhase::Typed => (1, 5, 4, MAX_FRONTEND_MESSAGE_LENGTH, 1),
+        };
+        if self.pending.len() < header_length {
+            return Ok(None);
+        }
+        let declared = i32::from_be_bytes(
+            self.pending[length_offset..length_offset + 4]
+                .try_into()
+                .expect("the guarded frame header length was checked"),
+        );
+        if declared < minimum {
+            return Err(invalid_frontend_frame());
+        }
+        if matches!(self.phase, FrontendFramePhase::Startup) && self.pending.len() >= 8 {
+            let code = i32::from_be_bytes(
+                self.pending[4..8]
+                    .try_into()
+                    .expect("the guarded startup preamble length was checked"),
+            );
+            if code == CANCEL_REQUEST_CODE
+                || (matches!(code, SSL_REQUEST_CODE | GSSENC_REQUEST_CODE) && declared != 8)
+            {
+                return Err(invalid_frontend_frame());
+            }
+        }
+        let declared = usize::try_from(declared).map_err(|_| invalid_frontend_frame())?;
+        if declared > maximum {
+            return Err(invalid_frontend_frame());
+        }
+        Ok(Some(declared + type_length))
+    }
+
+    fn prepare_frame(&mut self) -> io::Result<bool> {
+        if self.ready.is_some() {
+            return Ok(true);
+        }
+        let Some(frame_length) = self.expected_frame_length()? else {
+            return Ok(false);
+        };
+        if self.pending.len() < frame_length {
+            return Ok(false);
+        }
+
+        let remainder = self.pending.split_off(frame_length);
+        let frame = std::mem::replace(&mut self.pending, remainder);
+        match self.phase {
+            FrontendFramePhase::Startup => {
+                if validate_startup_frame(&frame)? == StartupFrameKind::Startup {
+                    self.phase = FrontendFramePhase::Typed;
+                }
+            }
+            FrontendFramePhase::Typed => validate_typed_frame(&frame)?,
+        }
+        self.ready = Some(frame);
+        Ok(true)
+    }
+}
+
+impl<S> AsyncRead for GuardedPgStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if output.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            if let Some(ready) = &this.ready {
+                let available = &ready[this.ready_offset..];
+                let count = available.len().min(output.remaining());
+                output.put_slice(&available[..count]);
+                this.ready_offset += count;
+                if this.ready_offset == ready.len() {
+                    this.ready = None;
+                    this.ready_offset = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            match this.prepare_frame() {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+
+            let needed = match this.expected_frame_length() {
+                Ok(Some(frame_length)) => frame_length.saturating_sub(this.pending.len()),
+                Ok(None) => match this.phase {
+                    FrontendFramePhase::Startup => 4 - this.pending.len(),
+                    FrontendFramePhase::Typed => 5 - this.pending.len(),
+                },
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            let mut scratch = [0_u8; 4_096];
+            let read_length = needed.min(scratch.len());
+            let mut read = ReadBuf::new(&mut scratch[..read_length]);
+            match Pin::new(&mut this.inner).poll_read(context, &mut read) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) if read.filled().is_empty() => {
+                    return if this.pending.is_empty() {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Ready(Err(invalid_frontend_frame()))
+                    };
+                }
+                Poll::Ready(Ok(())) => this.pending.extend_from_slice(read.filled()),
+            }
+        }
+    }
+}
+
+impl<S> AsyncWrite for GuardedPgStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
+
+fn validate_startup_frame(frame: &[u8]) -> io::Result<StartupFrameKind> {
+    if frame.len() < 8
+        || frame.len() > MAX_STARTUP_PACKET_LENGTH
+        || !declared_frame_length_matches(frame, 0, 0)
+    {
+        return Err(invalid_frontend_frame());
+    }
+    let code = i32::from_be_bytes(
+        frame[4..8]
+            .try_into()
+            .expect("the guarded startup frame length was checked"),
+    );
+    if matches!(code, SSL_REQUEST_CODE | GSSENC_REQUEST_CODE) {
+        return if frame.len() == 8 {
+            Ok(StartupFrameKind::Negotiation)
+        } else {
+            Err(invalid_frontend_frame())
+        };
+    }
+    if code == CANCEL_REQUEST_CODE {
+        // Backend cancellation identifiers are introduced by roadmap issue
+        // #35. Until then, a CancelRequest is a well-framed but unsupported
+        // startup packet and must not reach the dependency's no-op handler.
+        return Err(invalid_frontend_frame());
+    }
+    if frame.len() < 9 {
+        return Err(invalid_frontend_frame());
+    }
+
+    let mut cursor = 8;
+    let mut keys = BTreeSet::new();
+    loop {
+        let (key, next) = consume_utf8_cstring(frame, cursor).ok_or_else(invalid_frontend_frame)?;
+        cursor = next;
+        if key.is_empty() {
+            return if cursor == frame.len() {
+                Ok(StartupFrameKind::Startup)
+            } else {
+                Err(invalid_frontend_frame())
+            };
+        }
+        if !keys.insert(key) {
+            return Err(invalid_frontend_frame());
+        }
+        let (_, next) = consume_utf8_cstring(frame, cursor).ok_or_else(invalid_frontend_frame)?;
+        cursor = next;
+    }
+}
+
+fn validate_typed_frame(frame: &[u8]) -> io::Result<()> {
+    if frame.len() < 5
+        || frame.len() > MAX_FRONTEND_MESSAGE_LENGTH + 1
+        || !declared_frame_length_matches(frame, 1, 1)
+    {
+        return Err(invalid_frontend_frame());
+    }
+    let body = frame.get(5..).ok_or_else(invalid_frontend_frame)?;
+    match frame.first().copied() {
+        Some(b'Q') => {
+            if body.last() == Some(&0)
+                && !body[..body.len() - 1].contains(&0)
+                && std::str::from_utf8(&body[..body.len() - 1]).is_ok()
+            {
+                Ok(())
+            } else {
+                Err(invalid_frontend_frame())
+            }
+        }
+        Some(b'P') => {
+            let (_, mut cursor) =
+                consume_utf8_cstring(body, 0).ok_or_else(invalid_frontend_frame)?;
+            let (_, next) =
+                consume_utf8_cstring(body, cursor).ok_or_else(invalid_frontend_frame)?;
+            cursor = next;
+            let count_end = cursor.checked_add(2).ok_or_else(invalid_frontend_frame)?;
+            let count_bytes = body
+                .get(cursor..count_end)
+                .ok_or_else(invalid_frontend_frame)?;
+            let count = usize::from(u16::from_be_bytes(
+                count_bytes
+                    .try_into()
+                    .expect("the guarded Parse count length was checked"),
+            ));
+            let oid_bytes = count.checked_mul(4).ok_or_else(invalid_frontend_frame)?;
+            let expected_end = count_end
+                .checked_add(oid_bytes)
+                .ok_or_else(invalid_frontend_frame)?;
+            if expected_end == body.len() {
+                Ok(())
+            } else {
+                Err(invalid_frontend_frame())
+            }
+        }
+        Some(b'S') | Some(b'X') if body.is_empty() => Ok(()),
+        _ => Err(invalid_frontend_frame()),
+    }
+}
+
+fn declared_frame_length_matches(frame: &[u8], offset: usize, type_length: usize) -> bool {
+    let Some(length_bytes) = frame.get(offset..offset + 4) else {
+        return false;
+    };
+    let declared = i32::from_be_bytes(
+        length_bytes
+            .try_into()
+            .expect("the declared-length slice is exactly four bytes"),
+    );
+    let Ok(declared) = usize::try_from(declared) else {
+        return false;
+    };
+    declared.checked_add(type_length) == Some(frame.len())
+}
+
+fn consume_utf8_cstring(buffer: &[u8], start: usize) -> Option<(&str, usize)> {
+    let tail = buffer.get(start..)?;
+    let offset = tail.iter().position(|byte| *byte == 0)?;
+    let value = std::str::from_utf8(&tail[..offset]).ok()?;
+    let end = start.checked_add(offset)?.checked_add(1)?;
+    Some((value, end))
+}
+
+fn invalid_frontend_frame() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid bounded PostgreSQL frontend frame",
+    )
+}
 
 /// A PostgreSQL protocol adapter backed only by BriskDB's public engine API.
 ///
-/// Constructing an adapter does not bind a socket, accept a connection, create
-/// a session, or alter the current listener behavior. A distinct core session
-/// is allocated only by [`Adapter::open_connection`].
+/// Constructing an adapter does not bind a socket, accept a connection, or
+/// create a session. A distinct core session is allocated only after an
+/// explicit connection open or a fully validated wire startup.
 #[derive(Clone)]
 pub struct Adapter {
     engine: Engine,
     default_database: LogicalDatabaseId,
+    default_database_name: Box<str>,
 }
 
 impl Adapter {
     /// Construct the BriskDB-owned PostgreSQL adapter boundary.
     pub fn new(engine: Engine) -> Self {
-        let default_database = engine.catalog().default_database().id();
+        let default_metadata = engine.catalog().default_database();
+        let default_database = default_metadata.id();
+        let default_database_name = default_metadata.name().into();
         Self {
             engine,
             default_database,
+            default_database_name,
         }
     }
 
-    /// Allocate independent protocol state for one future wire connection.
+    /// Allocate independent protocol state for a direct adapter probe.
     ///
     /// The returned value owns exactly one non-cloneable BriskDB [`Session`].
     /// No socket is opened and no wire handshake is performed.
     pub fn open_connection(&self) -> Connection {
+        self.connection(None, self.default_database, &self.default_database_name)
+    }
+
+    /// Allocate a connection for one validated PostgreSQL user/database pair.
+    ///
+    /// The user is a bounded session label until the later role-catalog work.
+    /// Database selection is an exact lookup in the protocol-neutral catalog.
+    pub fn open_connection_for(&self, user: &str, database: &str) -> EngineResult<Connection> {
+        if !valid_user_label(user) {
+            return Err(EngineError::new(
+                crate::core::EngineErrorKind::InvalidArgument,
+                "PostgreSQL user labels must be 1 to 63 bytes, start with lowercase ASCII or underscore, and then contain only lowercase ASCII, digits, or underscores",
+            ));
+        }
+        let database = self.engine.catalog().database(database)?.ok_or_else(|| {
+            EngineError::new(
+                crate::core::EngineErrorKind::InvalidArgument,
+                "the selected PostgreSQL logical database does not exist",
+            )
+        })?;
+        Ok(self.connection(Some(user), database.id(), database.name()))
+    }
+
+    fn connection(
+        &self,
+        user: Option<&str>,
+        database: LogicalDatabaseId,
+        database_name: &str,
+    ) -> Connection {
         let state = Arc::new(ConnectionState {
             engine: self.engine.clone(),
             session: self.engine.session(),
-            database: self.default_database,
+            user: user.map(Into::into),
+            database,
+            database_name: database_name.into(),
         });
         let wire_parser = Arc::new(PgWireQueryParser {
             state: Arc::clone(&state),
         });
         Connection { state, wire_parser }
+    }
+
+    pub(crate) fn wire_connection(&self) -> WireConnection {
+        WireConnection {
+            state: Arc::new(WireConnectionState {
+                adapter: self.clone(),
+                connection: OnceLock::new(),
+            }),
+        }
     }
 }
 
@@ -73,10 +470,12 @@ impl fmt::Debug for Adapter {
 struct ConnectionState {
     engine: Engine,
     session: Session,
+    user: Option<Box<str>>,
     database: LogicalDatabaseId,
+    database_name: Box<str>,
 }
 
-/// Protocol-owned state for one future PostgreSQL wire connection.
+/// Protocol-owned state for one PostgreSQL connection.
 ///
 /// This type exposes only BriskDB values. The selected wire crate remains an
 /// implementation detail inside this module.
@@ -94,19 +493,34 @@ impl Connection {
         self.state.session.id()
     }
 
+    /// Return the selected user label, if this connection has an identity.
+    pub fn user(&self) -> Option<&str> {
+        self.state.user.as_deref()
+    }
+
+    /// Return the selected logical-database identity.
+    pub fn database_id(&self) -> LogicalDatabaseId {
+        self.state.database
+    }
+
+    /// Return the selected canonical logical-database name.
+    pub fn database(&self) -> &str {
+        &self.state.database_name
+    }
+
     /// Read engine status through this connection's protocol-neutral session.
     ///
-    /// This small operation is the issue-29 proof that the selected wire
-    /// adapter composes with the controlled async engine boundary. Query and
-    /// prepared execution remain later roadmap work.
+    /// Startup uses this operation to prove that the selected session can enter
+    /// the controlled async engine boundary. Query and prepared execution
+    /// remain later roadmap work.
     pub async fn status(&self) -> EngineResult<EngineStatus> {
         self.state.engine.status(&self.state.session).await
     }
 
     /// Close this connection's core session.
     ///
-    /// Closing is terminal and idempotent. Future production socket wrappers
-    /// must call this on every return path from the wire library.
+    /// Closing is terminal and idempotent. The production socket wrapper calls
+    /// this on ordinary termination, EOF, error, shutdown, and forced cleanup.
     pub async fn close(&self) -> EngineResult<()> {
         self.state.session.close().await
     }
@@ -118,9 +532,535 @@ impl fmt::Debug for Connection {
             .debug_struct("Connection")
             .field("session_id", &self.session_id())
             .field("database", &self.state.database)
+            .field("has_user", &self.state.user.is_some())
             .field("wire_parser", &self.wire_parser)
             .finish_non_exhaustive()
     }
+}
+
+/// One accepted PostgreSQL socket and its optional validated core connection.
+///
+/// The server retains a clone while the socket task runs so it can close the
+/// core session even if the task panics or is forcefully cancelled.
+#[derive(Clone)]
+pub(crate) struct WireConnection {
+    state: Arc<WireConnectionState>,
+}
+
+struct WireConnectionState {
+    adapter: Adapter,
+    connection: OnceLock<Arc<Connection>>,
+}
+
+impl WireConnection {
+    async fn install(&self, user: &str, database: &str) -> PgWireResult<()> {
+        if self.state.connection.get().is_some() {
+            return Err(fatal_wire_error(
+                "08P01",
+                "PostgreSQL startup was already completed",
+            ));
+        }
+
+        let connection = Arc::new(
+            self.state
+                .adapter
+                .open_connection_for(user, database)
+                .map_err(|_| {
+                    fatal_wire_error("3D000", "PostgreSQL database selection is unavailable")
+                })?,
+        );
+        if let Err(connection) = self.state.connection.set(connection) {
+            let _ = connection.close().await;
+            return Err(fatal_wire_error(
+                "08P01",
+                "PostgreSQL startup was already completed",
+            ));
+        }
+        let connection = self
+            .state
+            .connection
+            .get()
+            .expect("the validated PostgreSQL connection was just installed");
+        if let Err(error) = connection.status().await {
+            let _ = connection.close().await;
+            return Err(engine_error_to_pgwire_with_severity(error, "FATAL"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn serve<F>(&self, stream: TcpStream, shutdown: F) -> io::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
+        self.serve_with_startup_timeout(stream, shutdown, STARTUP_TIMEOUT)
+            .await
+    }
+
+    async fn serve_with_startup_timeout<F>(
+        &self,
+        stream: TcpStream,
+        shutdown: F,
+        startup_timeout: Duration,
+    ) -> io::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
+        let handlers = WireHandlers {
+            connection: self.clone(),
+        };
+        tokio::pin!(shutdown);
+        let wire_result = tokio::select! {
+            biased;
+            _ = &mut shutdown => Ok(()),
+            result = run_socket(stream, handlers, startup_timeout) => result,
+        };
+        let close_result = self.close().await.map_err(io::Error::other);
+        wire_result.and(close_result)
+    }
+
+    pub(crate) async fn close(&self) -> EngineResult<()> {
+        if let Some(connection) = self.state.connection.get() {
+            connection.close().await
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    fn connection(&self) -> Option<&Arc<Connection>> {
+        self.state.connection.get()
+    }
+}
+
+struct WireHandlers {
+    connection: WireConnection,
+}
+
+#[async_trait]
+impl StartupHandler for WireHandlers {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let PgWireFrontendMessage::Startup(startup) = message else {
+            return Err(fatal_wire_error(
+                "08P01",
+                "a PostgreSQL startup message is required",
+            ));
+        };
+        if (startup.protocol_number_major, startup.protocol_number_minor)
+            != (POSTGRES_PROTOCOL_MAJOR, POSTGRES_PROTOCOL_MINOR)
+        {
+            return Err(fatal_wire_error(
+                "08P01",
+                "the PostgreSQL protocol version is unsupported",
+            ));
+        }
+
+        for key in startup.parameters.keys() {
+            if !matches!(
+                key.as_str(),
+                "user" | "database" | "client_encoding" | "application_name" | "replication"
+            ) {
+                return Err(fatal_wire_error(
+                    "0A000",
+                    "the PostgreSQL startup parameter is unsupported",
+                ));
+            }
+        }
+
+        let user = startup.parameters.get("user").ok_or_else(|| {
+            fatal_wire_error("28000", "a valid PostgreSQL user label is required")
+        })?;
+        if !valid_user_label(user) {
+            return Err(fatal_wire_error(
+                "28000",
+                "a valid PostgreSQL user label is required",
+            ));
+        }
+        let database = startup
+            .parameters
+            .get("database")
+            .map(String::as_str)
+            .unwrap_or(user);
+
+        if startup
+            .parameters
+            .get("client_encoding")
+            .is_some_and(|encoding| !matches!(encoding.as_str(), "UTF8" | "UTF-8"))
+        {
+            return Err(fatal_wire_error(
+                "22023",
+                "PostgreSQL client encoding must be UTF8",
+            ));
+        }
+        let application_name = startup.parameters.get("application_name");
+        if application_name.is_some_and(|name| !valid_application_name(name)) {
+            return Err(fatal_wire_error(
+                "22023",
+                "the PostgreSQL application name is invalid",
+            ));
+        }
+        if startup
+            .parameters
+            .get("replication")
+            .is_some_and(|value| value != "false")
+        {
+            return Err(fatal_wire_error(
+                "0A000",
+                "PostgreSQL replication startup is unsupported",
+            ));
+        }
+
+        self.connection.install(user, database).await?;
+        client.set_protocol_version(ProtocolVersion::PROTOCOL3_0);
+        let metadata = client.metadata_mut();
+        metadata.insert("user".to_owned(), user.to_owned());
+        metadata.insert("database".to_owned(), database.to_owned());
+        metadata.insert("client_encoding".to_owned(), "UTF8".to_owned());
+        if let Some(application_name) = application_name {
+            metadata.insert("application_name".to_owned(), application_name.to_owned());
+        }
+
+        client
+            .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
+            .await?;
+        for (name, value) in PARAMETER_STATUS {
+            client
+                .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                    name.to_owned(),
+                    value.to_owned(),
+                )))
+                .await?;
+        }
+        if let Some(application_name) = application_name {
+            client
+                .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                    "application_name".to_owned(),
+                    application_name.to_owned(),
+                )))
+                .await?;
+        }
+        client
+            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                TransactionStatus::Idle,
+            )))
+            .await?;
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SimpleQueryHandler for WireHandlers {
+    async fn on_query<C>(&self, _client: &mut C, _query: Query) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Err(unsupported_query_error())
+    }
+
+    async fn do_query<C>(&self, _client: &mut C, _query: &str) -> PgWireResult<Vec<Response>>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Err(unsupported_query_error())
+    }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for WireHandlers {
+    type Statement = String;
+    type QueryParser = NoopQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::new(NoopQueryParser)
+    }
+
+    async fn on_parse<C>(&self, _client: &mut C, _message: Parse) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Err(unsupported_query_error())
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        _target: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Err(unsupported_query_error())
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        _target: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Err(unsupported_query_error())
+    }
+
+    async fn do_query<C>(
+        &self,
+        _client: &mut C,
+        _portal: &Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Err(unsupported_query_error())
+    }
+}
+
+impl ErrorHandler for WireHandlers {
+    fn on_error<C>(&self, client: &C, error: &mut PgWireError)
+    where
+        C: ClientInfo,
+    {
+        if matches!(error, PgWireError::UserError(_)) {
+            return;
+        }
+        *error = if matches!(
+            client.state(),
+            PgWireConnectionState::AwaitingStartup
+                | PgWireConnectionState::AuthenticationInProgress
+        ) {
+            fatal_wire_error("08P01", "the PostgreSQL startup message is invalid")
+        } else {
+            unsupported_query_error()
+        };
+    }
+}
+
+impl PgWireServerHandlers for WireHandlers {
+    fn startup_handler(&self) -> Arc<impl StartupHandler> {
+        Arc::new(Self {
+            connection: self.connection.clone(),
+        })
+    }
+
+    fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
+        Arc::new(Self {
+            connection: self.connection.clone(),
+        })
+    }
+
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        Arc::new(Self {
+            connection: self.connection.clone(),
+        })
+    }
+
+    fn error_handler(&self) -> Arc<impl ErrorHandler> {
+        Arc::new(Self {
+            connection: self.connection.clone(),
+        })
+    }
+}
+
+type GuardedSocket = Framed<GuardedPgStream<TcpStream>, PgWireMessageServerCodec<String>>;
+
+async fn negotiate_plaintext(stream: TcpStream) -> io::Result<Option<GuardedSocket>> {
+    let peer = stream.peer_addr()?;
+    stream.set_nodelay(true)?;
+
+    // Direct TLS is not enabled for the loopback-only listener. Match the
+    // dependency's existing behavior by closing without interpreting a TLS
+    // ClientHello as PostgreSQL framing.
+    let mut first = [0_u8; 1];
+    if stream.peek(&mut first).await? > 0 && first[0] == 0x16 {
+        return Ok(None);
+    }
+
+    let client = DefaultClient::<String>::new(peer, false);
+    let codec = PgWireMessageServerCodec::new(client);
+    let mut socket = Framed::new(GuardedPgStream::new(stream, Vec::new()), codec);
+
+    loop {
+        match socket.next().await {
+            Some(Ok(PgWireFrontendMessage::SslNegotiation(
+                SslNegotiationMetaMessage::PostgresSsl(_),
+            ))) => {
+                socket
+                    .send(PgWireBackendMessage::SslResponse(SslResponse::Refuse))
+                    .await?;
+            }
+            Some(Ok(PgWireFrontendMessage::SslNegotiation(
+                SslNegotiationMetaMessage::PostgresGss(_),
+            ))) => {
+                socket
+                    .send(PgWireBackendMessage::GssEncResponse(GssEncResponse::Refuse))
+                    .await?;
+            }
+            Some(Ok(PgWireFrontendMessage::SslNegotiation(SslNegotiationMetaMessage::None))) => {
+                socket.set_state(PgWireConnectionState::AwaitingStartup);
+                return Ok(Some(socket));
+            }
+            Some(Ok(_)) | Some(Err(_)) => {
+                send_connection_error(
+                    &mut socket,
+                    fatal_wire_error("08P01", "the PostgreSQL protocol message is invalid"),
+                )
+                .await?;
+                return Ok(None);
+            }
+            None => return Ok(None),
+        }
+    }
+}
+
+async fn run_socket(
+    stream: TcpStream,
+    handlers: WireHandlers,
+    startup_timeout: Duration,
+) -> io::Result<()> {
+    let startup_timeout = tokio::time::sleep(startup_timeout);
+    tokio::pin!(startup_timeout);
+    let socket = tokio::select! {
+        _ = &mut startup_timeout => return Ok(()),
+        socket = negotiate_plaintext(stream) => socket?,
+    };
+    let Some(mut socket) = socket else {
+        return Ok(());
+    };
+
+    let startup_handler = Arc::new(WireHandlers {
+        connection: handlers.connection.clone(),
+    });
+    let simple_query_handler = Arc::new(WireHandlers {
+        connection: handlers.connection.clone(),
+    });
+    let extended_query_handler = Arc::new(WireHandlers {
+        connection: handlers.connection.clone(),
+    });
+    let copy_handler = handlers.copy_handler();
+    let cancel_handler = handlers.cancel_handler();
+    let error_handler = handlers.error_handler();
+
+    loop {
+        let startup_phase = matches!(
+            socket.state(),
+            PgWireConnectionState::AwaitingStartup
+                | PgWireConnectionState::AuthenticationInProgress
+        );
+        let message = if startup_phase {
+            tokio::select! {
+                _ = &mut startup_timeout => None,
+                message = socket.next() => message,
+            }
+        } else {
+            socket.next().await
+        };
+
+        match message {
+            Some(Ok(PgWireFrontendMessage::Terminate(_))) => break,
+            Some(Ok(message)) => {
+                let is_extended_query = match socket.state() {
+                    PgWireConnectionState::CopyInProgress(is_extended_query) => is_extended_query,
+                    _ => message.is_extended_query(),
+                };
+                if let Err(mut error) = process_message(
+                    message,
+                    &mut socket,
+                    Arc::clone(&startup_handler),
+                    Arc::clone(&simple_query_handler),
+                    Arc::clone(&extended_query_handler),
+                    Arc::clone(&copy_handler),
+                    Arc::clone(&cancel_handler),
+                )
+                .await
+                {
+                    error_handler.on_error(&socket, &mut error);
+                    if startup_phase {
+                        send_connection_error(&mut socket, error).await?;
+                        break;
+                    }
+                    process_error(&mut socket, error, is_extended_query).await?;
+                }
+            }
+            Some(Err(_)) => {
+                send_connection_error(
+                    &mut socket,
+                    fatal_wire_error("08P01", "the PostgreSQL protocol message is invalid"),
+                )
+                .await?;
+                break;
+            }
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+async fn send_connection_error<C>(client: &mut C, error: PgWireError) -> io::Result<()>
+where
+    C: Sink<PgWireBackendMessage, Error = io::Error> + Unpin,
+{
+    let info: ErrorInfo = error.into();
+    client
+        .send(PgWireBackendMessage::ErrorResponse(info.into()))
+        .await?;
+    client.close().await
+}
+
+fn fatal_wire_error(code: &'static str, message: &'static str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "FATAL".to_owned(),
+        code.to_owned(),
+        message.to_owned(),
+    )))
+}
+
+fn unsupported_query_error() -> PgWireError {
+    engine_error_to_pgwire(EngineError::new(
+        crate::core::EngineErrorKind::Unsupported,
+        "PostgreSQL query flow is not implemented yet",
+    ))
+}
+
+fn valid_user_label(user: &str) -> bool {
+    let bytes = user.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_STARTUP_NAME_BYTES
+        && matches!(bytes[0], b'a'..=b'z' | b'_')
+        && bytes
+            .iter()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
+fn valid_application_name(name: &str) -> bool {
+    name.len() <= MAX_STARTUP_NAME_BYTES
+        && !name.contains('\u{fffd}')
+        && name.chars().all(|character| !character.is_control())
 }
 
 #[derive(Clone)]
@@ -210,9 +1150,13 @@ impl QueryParser for PgWireQueryParser {
 }
 
 fn engine_error_to_pgwire(error: EngineError) -> PgWireError {
+    engine_error_to_pgwire_with_severity(error, "ERROR")
+}
+
+fn engine_error_to_pgwire_with_severity(error: EngineError, severity: &str) -> PgWireError {
     let mapping = postgres_error(error.kind());
     PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_owned(),
+        severity.to_owned(),
         mapping.sqlstate.to_owned(),
         mapping.message.to_owned(),
     )))
@@ -317,15 +1261,25 @@ mod tests {
         DefaultClient::new("127.0.0.1:7654".parse().unwrap(), false)
     }
 
-    fn startup_packet() -> Vec<u8> {
+    fn startup_packet_with(protocol: u32, parameters: &[(&str, &str)]) -> Vec<u8> {
         let mut body = Vec::new();
-        body.extend_from_slice(&196_608_u32.to_be_bytes());
-        body.extend_from_slice(b"user\0briskdb\0database\0default\0\0");
+        body.extend_from_slice(&protocol.to_be_bytes());
+        for (name, value) in parameters {
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+            body.extend_from_slice(value.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
         let length = u32::try_from(body.len() + 4).unwrap();
         let mut packet = Vec::with_capacity(body.len() + 4);
         packet.extend_from_slice(&length.to_be_bytes());
         packet.extend_from_slice(&body);
         packet
+    }
+
+    fn startup_packet() -> Vec<u8> {
+        startup_packet_with(196_608, &[("user", "briskdb"), ("database", "default")])
     }
 
     fn typed_packet(message_type: u8, body: &[u8]) -> Vec<u8> {
@@ -361,6 +1315,860 @@ mod tests {
                 return frames;
             }
             assert!(frames.len() < 64, "bounded startup response frame count");
+        }
+    }
+
+    fn message_fields(body: &[u8]) -> std::collections::BTreeMap<u8, String> {
+        let mut fields = std::collections::BTreeMap::new();
+        let mut index = 0;
+        while index < body.len() && body[index] != 0 {
+            let kind = body[index];
+            index += 1;
+            let end = body[index..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|offset| index + offset)
+                .expect("a backend field is null terminated");
+            fields.insert(
+                kind,
+                std::str::from_utf8(&body[index..end]).unwrap().to_owned(),
+            );
+            index = end + 1;
+        }
+        fields
+    }
+
+    fn parameter_status(body: &[u8]) -> (String, String) {
+        let mut fields = body.split(|byte| *byte == 0);
+        let name = std::str::from_utf8(fields.next().unwrap())
+            .unwrap()
+            .to_owned();
+        let value = std::str::from_utf8(fields.next().unwrap())
+            .unwrap()
+            .to_owned();
+        assert_eq!(fields.next(), Some([].as_slice()));
+        (name, value)
+    }
+
+    async fn assert_eof(stream: &mut TcpStream) {
+        let mut byte = [0_u8; 1];
+        let count = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("the PostgreSQL peer closed promptly")
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    async fn assert_closed_after_invalid_input(stream: &mut TcpStream) {
+        let mut byte = [0_u8; 1];
+        match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("the PostgreSQL peer closed promptly")
+        {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                ) => {}
+            Ok(count) => panic!("the closed PostgreSQL peer returned {count} unexpected bytes"),
+            Err(error) => panic!("the PostgreSQL peer closed with an unexpected error: {error}"),
+        }
+    }
+
+    async fn assert_protocol_fatal(stream: &mut TcpStream) {
+        let frame = read_frame(stream).await;
+        assert_eq!(frame.0, b'E');
+        let fields = message_fields(&frame.1);
+        assert_eq!(fields.get(&b'S').map(String::as_str), Some("FATAL"));
+        assert_eq!(fields.get(&b'C').map(String::as_str), Some("08P01"));
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some("the PostgreSQL protocol message is invalid")
+        );
+    }
+
+    async fn spawn_wire_server(
+        adapter: &Adapter,
+    ) -> (
+        SocketAddr,
+        WireConnection,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connection = adapter.wire_connection();
+        let served = connection.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            served.serve(stream, std::future::pending()).await
+        });
+        (address, connection, server)
+    }
+
+    async fn finish_wire_server(
+        client: &mut TcpStream,
+        server: tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        client.write_all(&typed_packet(b'X', &[])).await.unwrap();
+        assert_eof(client).await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("the PostgreSQL connection task returned")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_startup_selects_identity_emits_owned_status_and_terminates() {
+        let (_temp, engine) = engine(3).await;
+        let adapter = Adapter::new(engine.clone());
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        let mut ssl_request = Vec::new();
+        ssl_request.extend_from_slice(&8_u32.to_be_bytes());
+        ssl_request.extend_from_slice(&80_877_103_u32.to_be_bytes());
+        client.write_all(&ssl_request).await.unwrap();
+        let mut ssl_response = [0_u8; 1];
+        client.read_exact(&mut ssl_response).await.unwrap();
+        assert_eq!(ssl_response, *b"N");
+
+        client
+            .write_all(&startup_packet_with(
+                196_608,
+                &[
+                    ("user", "client_user"),
+                    ("database", "default"),
+                    ("client_encoding", "UTF-8"),
+                    ("application_name", "adapter-test"),
+                    ("replication", "false"),
+                ],
+            ))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(frames.first().unwrap(), &(b'R', vec![0, 0, 0, 0]));
+        assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'I']));
+        assert!(!frames.iter().any(|frame| frame.0 == b'K'));
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            vec![b'R', b'S', b'S', b'S', b'S', b'S', b'S', b'Z']
+        );
+        let statuses = frames
+            .iter()
+            .filter(|frame| frame.0 == b'S')
+            .map(|frame| parameter_status(&frame.1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                ("server_version".to_owned(), SERVER_VERSION.to_owned()),
+                ("server_encoding".to_owned(), "UTF8".to_owned()),
+                ("client_encoding".to_owned(), "UTF8".to_owned()),
+                ("standard_conforming_strings".to_owned(), "on".to_owned(),),
+                ("integer_datetimes".to_owned(), "on".to_owned()),
+                ("application_name".to_owned(), "adapter-test".to_owned()),
+            ]
+        );
+        assert!(!statuses.iter().any(|(_, value)| value.contains("pgwire")));
+
+        let core = Arc::clone(wire.connection().unwrap());
+        assert_eq!(core.user(), Some("client_user"));
+        assert_eq!(core.database(), "default");
+        assert_eq!(core.database_id(), engine.catalog().default_database().id());
+        assert_eq!(core.state().await, SessionState::Ready);
+
+        finish_wire_server(&mut client, server).await;
+        assert_eq!(core.state().await, SessionState::Closed);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn negotiation_requests_require_exact_boundaries_before_startup() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+
+        for code in [SSL_REQUEST_CODE, GSSENC_REQUEST_CODE] {
+            let (address, wire, server) = spawn_wire_server(&adapter).await;
+            let mut client = TcpStream::connect(address).await.unwrap();
+            let mut malformed_negotiation = Vec::new();
+            malformed_negotiation.extend_from_slice(&100_u32.to_be_bytes());
+            malformed_negotiation.extend_from_slice(&(code as u32).to_be_bytes());
+            malformed_negotiation.extend_from_slice(&startup_packet());
+            client.write_all(&malformed_negotiation).await.unwrap();
+
+            assert_protocol_fatal(&mut client).await;
+            assert_closed_after_invalid_input(&mut client).await;
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(wire.connection().is_none());
+        }
+
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut gss_request = Vec::new();
+        gss_request.extend_from_slice(&8_u32.to_be_bytes());
+        gss_request.extend_from_slice(&(GSSENC_REQUEST_CODE as u32).to_be_bytes());
+        client.write_all(&gss_request).await.unwrap();
+        let mut response = [0_u8; 1];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, *b"N");
+
+        client.write_all(&startup_packet()).await.unwrap();
+        assert_eq!(read_until_ready(&mut client).await.last().unwrap().0, b'Z');
+        let core = Arc::clone(wire.connection().unwrap());
+        finish_wire_server(&mut client, server).await;
+        assert_eq!(core.state().await, SessionState::Closed);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_rejections_are_fixed_fatal_and_a_later_connection_recovers() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+        let long_user = "a".repeat(MAX_STARTUP_NAME_BYTES + 1);
+        let long_application_name = "a".repeat(MAX_STARTUP_NAME_BYTES + 1);
+        let malformed_startup = vec![0, 0, 0, 12, 0, 3, 0, 0, b'u', b's', b'e', b'r'];
+        let mut malformed_then_pipelined = malformed_startup.clone();
+        malformed_then_pipelined.extend_from_slice(&typed_packet(b'X', &[]));
+        let duplicate_user = startup_packet_with(
+            196_608,
+            &[
+                ("user", "first_user"),
+                ("user", "second_user"),
+                ("database", "default"),
+            ],
+        );
+        let mut invalid_utf8 = startup_packet();
+        let user_value = invalid_utf8
+            .windows(b"briskdb".len())
+            .position(|window| window == b"briskdb")
+            .unwrap();
+        invalid_utf8[user_value] = 0xff;
+        let cases = vec![
+            (
+                malformed_startup,
+                "08P01",
+                "the PostgreSQL protocol message is invalid",
+            ),
+            (
+                malformed_then_pipelined,
+                "08P01",
+                "the PostgreSQL protocol message is invalid",
+            ),
+            (
+                duplicate_user,
+                "08P01",
+                "the PostgreSQL protocol message is invalid",
+            ),
+            (
+                invalid_utf8,
+                "08P01",
+                "the PostgreSQL protocol message is invalid",
+            ),
+            (
+                startup_packet_with(131_072, &[("user", "client_user"), ("database", "default")]),
+                "08P01",
+                "the PostgreSQL protocol message is invalid",
+            ),
+            (
+                startup_packet_with(196_608, &[("database", "default")]),
+                "28000",
+                "a valid PostgreSQL user label is required",
+            ),
+            (
+                startup_packet_with(196_608, &[("user", "Uppercase"), ("database", "default")]),
+                "28000",
+                "a valid PostgreSQL user label is required",
+            ),
+            (
+                startup_packet_with(196_608, &[("user", &long_user), ("database", "default")]),
+                "28000",
+                "a valid PostgreSQL user label is required",
+            ),
+            (
+                startup_packet_with(196_608, &[("user", "client_user"), ("database", "missing")]),
+                "3D000",
+                "PostgreSQL database selection is unavailable",
+            ),
+            (
+                startup_packet_with(196_608, &[("user", "client_user"), ("database", "")]),
+                "3D000",
+                "PostgreSQL database selection is unavailable",
+            ),
+            (
+                startup_packet_with(196_608, &[("user", "client_user")]),
+                "3D000",
+                "PostgreSQL database selection is unavailable",
+            ),
+            (
+                startup_packet_with(
+                    196_608,
+                    &[
+                        ("user", "client_user"),
+                        ("database", "default"),
+                        ("client_encoding", "LATIN1"),
+                    ],
+                ),
+                "22023",
+                "PostgreSQL client encoding must be UTF8",
+            ),
+            (
+                startup_packet_with(
+                    196_608,
+                    &[
+                        ("user", "client_user"),
+                        ("database", "default"),
+                        ("application_name", "line\nbreak"),
+                    ],
+                ),
+                "22023",
+                "the PostgreSQL application name is invalid",
+            ),
+            (
+                startup_packet_with(
+                    196_608,
+                    &[
+                        ("user", "client_user"),
+                        ("database", "default"),
+                        ("application_name", &long_application_name),
+                    ],
+                ),
+                "22023",
+                "the PostgreSQL application name is invalid",
+            ),
+            (
+                startup_packet_with(
+                    196_608,
+                    &[
+                        ("user", "client_user"),
+                        ("database", "default"),
+                        ("options", "private-startup-value"),
+                    ],
+                ),
+                "0A000",
+                "the PostgreSQL startup parameter is unsupported",
+            ),
+            (
+                startup_packet_with(
+                    196_608,
+                    &[
+                        ("user", "client_user"),
+                        ("database", "default"),
+                        ("replication", "database"),
+                    ],
+                ),
+                "0A000",
+                "PostgreSQL replication startup is unsupported",
+            ),
+            (
+                startup_packet_with(196_610, &[("user", "client_user"), ("database", "default")]),
+                "08P01",
+                "the PostgreSQL protocol version is unsupported",
+            ),
+        ];
+
+        for (packet, expected_code, expected_message) in cases {
+            let (address, wire, server) = spawn_wire_server(&adapter).await;
+            let mut client = TcpStream::connect(address).await.unwrap();
+            client.write_all(&packet).await.unwrap();
+            let frame = read_frame(&mut client).await;
+            assert_eq!(frame.0, b'E');
+            let fields = message_fields(&frame.1);
+            assert_eq!(fields.get(&b'S').map(String::as_str), Some("FATAL"));
+            assert_eq!(fields.get(&b'C').map(String::as_str), Some(expected_code));
+            assert_eq!(
+                fields.get(&b'M').map(String::as_str),
+                Some(expected_message)
+            );
+            assert!(!fields.get(&b'M').unwrap().contains("private-startup-value"));
+            assert_closed_after_invalid_input(&mut client).await;
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(wire.connection().is_none());
+        }
+
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(&startup_packet_with(196_608, &[("user", "default")]))
+            .await
+            .unwrap();
+        assert_eq!(read_until_ready(&mut client).await.last().unwrap().0, b'Z');
+        let core = Arc::clone(wire.connection().unwrap());
+        assert_eq!(core.user(), Some("default"));
+        assert_eq!(core.database(), "default");
+        finish_wire_server(&mut client, server).await;
+        assert_eq!(core.state().await, SessionState::Closed);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_status_failure_is_fatal_and_closes_the_selected_session() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+        engine.begin_shutdown();
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+
+        let frame = read_frame(&mut client).await;
+        assert_eq!(frame.0, b'E');
+        let fields = message_fields(&frame.1);
+        let expected = postgres_error(crate::core::EngineErrorKind::ShuttingDown);
+        assert_eq!(fields.get(&b'S').map(String::as_str), Some("FATAL"));
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some(expected.sqlstate)
+        );
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some(expected.message)
+        );
+        assert_eof(&mut client).await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            wire.connection().unwrap().state().await,
+            SessionState::Closed
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn simple_query_is_fixed_unsupported_and_connection_remains_reusable() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        read_until_ready(&mut client).await;
+        let core = Arc::clone(wire.connection().unwrap());
+
+        for query in [b"SELECT 'private query text'\0".as_slice(), b"\0"] {
+            client.write_all(&typed_packet(b'Q', query)).await.unwrap();
+            let frames = read_until_ready(&mut client).await;
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[0].0, b'E');
+            let fields = message_fields(&frames[0].1);
+            assert_eq!(fields.get(&b'S').map(String::as_str), Some("ERROR"));
+            assert_eq!(fields.get(&b'C').map(String::as_str), Some("0A000"));
+            assert_eq!(
+                fields.get(&b'M').map(String::as_str),
+                Some(postgres_error(crate::core::EngineErrorKind::Unsupported).message)
+            );
+            assert!(!fields.get(&b'M').unwrap().contains("private query text"));
+            assert_eq!(frames[1], (b'Z', vec![b'I']));
+            assert_eq!(core.status().await.unwrap().shard_count(), 2);
+        }
+
+        finish_wire_server(&mut client, server).await;
+        assert_eq!(core.state().await, SessionState::Closed);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn extended_query_rejects_before_storage_and_sync_recovers() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        read_until_ready(&mut client).await;
+        let core = Arc::clone(wire.connection().unwrap());
+
+        let mut parse = Vec::new();
+        parse.push(0);
+        parse.extend_from_slice(b"SELECT 'private extended text'\0");
+        parse.extend_from_slice(&0_u16.to_be_bytes());
+        client.write_all(&typed_packet(b'P', &parse)).await.unwrap();
+        let error = read_frame(&mut client).await;
+        assert_eq!(error.0, b'E');
+        let fields = message_fields(&error.1);
+        assert_eq!(fields.get(&b'C').map(String::as_str), Some("0A000"));
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some(postgres_error(crate::core::EngineErrorKind::Unsupported).message)
+        );
+        assert!(!fields.get(&b'M').unwrap().contains("private extended text"));
+
+        client.write_all(&typed_packet(b'S', &[])).await.unwrap();
+        assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
+        assert_eq!(core.status().await.unwrap().shard_count(), 2);
+
+        finish_wire_server(&mut client, server).await;
+        assert_eq!(core.state().await, SessionState::Closed);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_message_after_startup_is_fatal_and_closes_the_core_session() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        read_until_ready(&mut client).await;
+        let core = Arc::clone(wire.connection().unwrap());
+
+        // Parse requires two C strings and a u16 OID count. This complete
+        // frame deliberately ends before the count.
+        client
+            .write_all(&typed_packet(b'P', &[0, 0]))
+            .await
+            .unwrap();
+        let error = read_frame(&mut client).await;
+        assert_eq!(error.0, b'E');
+        let fields = message_fields(&error.1);
+        assert_eq!(fields.get(&b'S').map(String::as_str), Some("FATAL"));
+        assert_eq!(fields.get(&b'C').map(String::as_str), Some("08P01"));
+        assert_eof(&mut client).await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(core.state().await, SessionState::Closed);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_headers_fail_without_waiting_for_the_declared_body() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut oversized_startup_header = Vec::new();
+        oversized_startup_header.extend_from_slice(
+            &u32::try_from(MAX_STARTUP_PACKET_LENGTH + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        client.write_all(&oversized_startup_header).await.unwrap();
+        assert_protocol_fatal(&mut client).await;
+        assert_eof(&mut client).await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(wire.connection().is_none());
+
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        read_until_ready(&mut client).await;
+        let core = Arc::clone(wire.connection().unwrap());
+        let mut oversized_query_header = vec![b'Q'];
+        oversized_query_header.extend_from_slice(
+            &u32::try_from(MAX_FRONTEND_MESSAGE_LENGTH + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        client.write_all(&oversized_query_header).await.unwrap();
+        assert_protocol_fatal(&mut client).await;
+        assert_eof(&mut client).await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(core.state().await, SessionState::Closed);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn eof_and_server_shutdown_both_close_the_selected_core_session() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        read_until_ready(&mut client).await;
+        let eof_core = Arc::clone(wire.connection().unwrap());
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(eof_core.state().await, SessionState::Closed);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let wire = adapter.wire_connection();
+        let served = wire.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            served
+                .serve(stream, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        read_until_ready(&mut client).await;
+        let shutdown_core = Arc::clone(wire.connection().unwrap());
+        shutdown_tx.send(()).unwrap();
+        assert_eof(&mut client).await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(shutdown_core.state().await, SessionState::Closed);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_startup_closes_at_the_configured_timeout_without_a_session() {
+        assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(60));
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let wire = adapter.wire_connection();
+        let served = wire.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            served
+                .serve_with_startup_timeout(
+                    stream,
+                    std::future::pending(),
+                    Duration::from_millis(20),
+                )
+                .await
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        assert_eof(&mut client).await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(wire.connection().is_none());
+        engine.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn raw_frame_validators_enforce_size_structure_boundaries_and_utf8() {
+        let startup = startup_packet();
+        assert_eq!(
+            validate_startup_frame(&startup).unwrap(),
+            StartupFrameKind::Startup
+        );
+
+        for code in [SSL_REQUEST_CODE, GSSENC_REQUEST_CODE] {
+            let mut negotiation = Vec::new();
+            negotiation.extend_from_slice(&8_u32.to_be_bytes());
+            negotiation.extend_from_slice(&(code as u32).to_be_bytes());
+            assert_eq!(
+                validate_startup_frame(&negotiation).unwrap(),
+                StartupFrameKind::Negotiation
+            );
+
+            negotiation[..4].copy_from_slice(&100_u32.to_be_bytes());
+            assert!(validate_startup_frame(&negotiation).is_err());
+        }
+
+        let maximum_value = "a".repeat(MAX_STARTUP_PACKET_LENGTH - 12);
+        let maximum_startup = startup_packet_with(196_608, &[("x", &maximum_value)]);
+        assert_eq!(maximum_startup.len(), MAX_STARTUP_PACKET_LENGTH);
+        assert_eq!(
+            validate_startup_frame(&maximum_startup).unwrap(),
+            StartupFrameKind::Startup
+        );
+
+        let mut oversized_startup = maximum_startup.clone();
+        oversized_startup.insert(oversized_startup.len() - 1, b'a');
+        let oversized_length = u32::try_from(oversized_startup.len()).unwrap();
+        oversized_startup[..4].copy_from_slice(&oversized_length.to_be_bytes());
+        assert!(validate_startup_frame(&oversized_startup).is_err());
+
+        let mut missing_terminal = startup.clone();
+        missing_terminal.pop();
+        let missing_terminal_length = u32::try_from(missing_terminal.len()).unwrap();
+        missing_terminal[..4].copy_from_slice(&missing_terminal_length.to_be_bytes());
+
+        let mut trailing_after_terminal = startup.clone();
+        trailing_after_terminal.push(b'x');
+        let trailing_length = u32::try_from(trailing_after_terminal.len()).unwrap();
+        trailing_after_terminal[..4].copy_from_slice(&trailing_length.to_be_bytes());
+
+        let duplicate = startup_packet_with(
+            196_608,
+            &[
+                ("user", "first"),
+                ("user", "second"),
+                ("database", "default"),
+            ],
+        );
+        let missing_value = vec![0, 0, 0, 14, 0, 3, 0, 0, b'u', b's', b'e', b'r', 0, 0];
+        let mut invalid_utf8 = startup.clone();
+        let user_value = invalid_utf8
+            .windows(b"briskdb".len())
+            .position(|window| window == b"briskdb")
+            .unwrap();
+        invalid_utf8[user_value] = 0xff;
+        let mut wrong_declared_length = startup.clone();
+        wrong_declared_length[..4].copy_from_slice(&8_u32.to_be_bytes());
+        let mut cancel = Vec::new();
+        cancel.extend_from_slice(&16_u32.to_be_bytes());
+        cancel.extend_from_slice(&(CANCEL_REQUEST_CODE as u32).to_be_bytes());
+        cancel.extend_from_slice(&1_u32.to_be_bytes());
+        cancel.extend_from_slice(&2_u32.to_be_bytes());
+
+        for rejected in [
+            missing_terminal,
+            trailing_after_terminal,
+            duplicate,
+            missing_value,
+            invalid_utf8,
+            wrong_declared_length,
+            cancel,
+        ] {
+            assert!(
+                validate_startup_frame(&rejected).is_err(),
+                "rejected startup frame: {rejected:?}"
+            );
+        }
+
+        let mut maximum_query_body = vec![b'a'; MAX_PARSED_SQL_BYTES];
+        maximum_query_body.push(0);
+        let maximum_query = typed_packet(b'Q', &maximum_query_body);
+        assert_eq!(
+            u32::from_be_bytes(maximum_query[1..5].try_into().unwrap()) as usize,
+            MAX_FRONTEND_MESSAGE_LENGTH
+        );
+        validate_typed_frame(&maximum_query).unwrap();
+        validate_typed_frame(&typed_packet(b'Q', &[0])).unwrap();
+
+        let mut parse = Vec::new();
+        parse.extend_from_slice(b"statement\0SELECT 1\0");
+        parse.extend_from_slice(&1_u16.to_be_bytes());
+        parse.extend_from_slice(&23_u32.to_be_bytes());
+        validate_typed_frame(&typed_packet(b'P', &parse)).unwrap();
+        validate_typed_frame(&typed_packet(b'S', &[])).unwrap();
+        validate_typed_frame(&typed_packet(b'X', &[])).unwrap();
+
+        let mut oversized_query_body = vec![b'a'; MAX_PARSED_SQL_BYTES + 1];
+        oversized_query_body.push(0);
+        let invalid_typed_frames = [
+            typed_packet(b'Q', b"SELECT 1"),
+            typed_packet(b'Q', b"SELECT\0trailing\0"),
+            typed_packet(b'Q', &[0xff, 0]),
+            typed_packet(b'Q', &oversized_query_body),
+            typed_packet(b'P', b"statement\0SELECT 1\0"),
+            typed_packet(b'P', b"statement\0SELECT 1\0\0\x01"),
+            typed_packet(b'P', b"statement\0SELECT 1\0\0\x01\0\0\0"),
+            typed_packet(b'S', &[0]),
+            typed_packet(b'X', &[0]),
+            typed_packet(b'B', &[]),
+        ];
+        for rejected in invalid_typed_frames {
+            assert!(
+                validate_typed_frame(&rejected).is_err(),
+                "rejected typed frame: {rejected:?}"
+            );
+        }
+
+        let mut wrong_typed_length = typed_packet(b'Q', b"SELECT 1\0");
+        wrong_typed_length[1..5].copy_from_slice(&4_u32.to_be_bytes());
+        assert!(validate_typed_frame(&wrong_typed_length).is_err());
+    }
+
+    #[tokio::test]
+    async fn raw_frame_guard_handles_fragmented_buffered_and_partial_input() {
+        let startup = startup_packet();
+        let terminate = typed_packet(b'X', &[]);
+        let mut expected = startup.clone();
+        expected.extend_from_slice(&terminate);
+
+        let (mut writer, reader) = tokio::io::duplex(1);
+        let fragmented = expected.clone();
+        let writing = tokio::spawn(async move {
+            writer.write_all(&fragmented).await.unwrap();
+        });
+        let mut guarded = GuardedPgStream::new(reader, Vec::new());
+        let mut received = vec![0; expected.len()];
+        guarded.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, expected);
+        writing.await.unwrap();
+        assert_eq!(guarded.read(&mut [0]).await.unwrap(), 0);
+
+        let (writer, reader) = tokio::io::duplex(1);
+        drop(writer);
+        let mut guarded = GuardedPgStream::new(reader, expected.clone());
+        let mut received = vec![0; expected.len()];
+        guarded.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, expected);
+        assert_eq!(guarded.read(&mut [0]).await.unwrap(), 0);
+
+        let (mut writer, reader) = tokio::io::duplex(8);
+        writer.write_all(&startup[..8]).await.unwrap();
+        writer.shutdown().await.unwrap();
+        let mut guarded = GuardedPgStream::new(reader, Vec::new());
+        assert_eq!(
+            guarded.read(&mut [0]).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn startup_identity_validators_have_exact_byte_and_character_boundaries() {
+        let max_user = "a".repeat(MAX_STARTUP_NAME_BYTES);
+        for user in ["a", "_", "a0", "_0", max_user.as_str()] {
+            assert!(valid_user_label(user), "accepted user boundary: {user:?}");
+        }
+        let too_long_user = "a".repeat(MAX_STARTUP_NAME_BYTES + 1);
+        for user in [
+            "",
+            "0user",
+            "Uppercase",
+            "non_ascii_é",
+            "a-b",
+            &too_long_user,
+        ] {
+            assert!(!valid_user_label(user), "rejected user boundary: {user:?}");
+        }
+
+        let max_utf8_application = format!("{}a", "é".repeat(31));
+        assert_eq!(max_utf8_application.len(), MAX_STARTUP_NAME_BYTES);
+        for application in ["", "client", max_utf8_application.as_str()] {
+            assert!(
+                valid_application_name(application),
+                "accepted application-name boundary: {application:?}"
+            );
+        }
+        let too_long_utf8_application = "é".repeat(32);
+        assert_eq!(too_long_utf8_application.len(), MAX_STARTUP_NAME_BYTES + 1);
+        for application in [
+            "line\nbreak",
+            "replacement_\u{fffd}",
+            too_long_utf8_application.as_str(),
+        ] {
+            assert!(
+                !valid_application_name(application),
+                "rejected application-name boundary: {application:?}"
+            );
         }
     }
 
@@ -480,7 +2288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_pgwire_entrypoint_can_reach_core_without_enabling_the_listener() {
+    async fn historical_pgwire_entrypoint_probe_remains_isolated_from_production_startup() {
         let (_temp, engine) = engine(3).await;
         let adapter = Adapter::new(engine.clone());
         let connection = Arc::new(adapter.open_connection());

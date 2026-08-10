@@ -898,21 +898,24 @@ parameterless schema-batch contract: it still digests and retains the caller's
 exact submitted SQL and does not substitute classified, normalized, or
 translated text as migration identity.
 
-Issue #28's optional PostgreSQL socket address and accept/close listener are
-process configuration only. They add no manifest or shard table, header value,
-format version, digest input, routing metadata, schema fingerprint, journal
-record, or recovery step. Listener settings are not persisted. Because engine
-open and its existing recovery precede listener binding, a later bind failure
-does not undo a migration or recovery transaction that already committed; a
-subsequent startup revalidates the same version-7 layout normally.
+Issue #28's optional PostgreSQL socket address and accept/close listener were
+process-configuration changes only. They added no manifest or shard table,
+header value, format version, digest input, routing metadata, schema
+fingerprint, journal record, or recovery step. Listener settings are not
+persisted. Because engine open and its existing recovery precede listener
+binding, a later bind failure does not undo a migration or recovery transaction
+that already committed; a subsequent startup revalidates the same version-7
+layout normally.
 
-Issue #29's pinned `pgwire` dependency, `protocol::postgres::Adapter`, and
-per-connection core `Session` seam are also process-only code and memory state.
-They add no manifest or shard table, header value, format version, digest input,
-routing metadata, schema fingerprint, journal record, file, or recovery step.
-The production PostgreSQL listener does not construct that state yet. A probe
-prepare is transient prepared metadata and is explicitly closed in tests; it
-does not write application rows or schema.
+Issue #29's pinned `pgwire` dependency and issue #30's production startup,
+`protocol::postgres::Adapter`, selected identity, and per-connection core
+`Session` are also process-only code and memory state. They add no manifest or
+shard table, header value, format version, digest input, routing metadata,
+schema fingerprint, journal record, file, or recovery step. Startup performs a
+read-only engine-status operation; current wire queries are rejected before
+preparation, routing, or SQLite execution. The historical private probe's
+prepared metadata is transient and explicitly closed in tests. None of these
+paths writes application rows or schema.
 
 The checksums are corruption detectors, not authentication. Both use unkeyed
 BLAKE3 and are writable by anyone who can modify the data directory. The
