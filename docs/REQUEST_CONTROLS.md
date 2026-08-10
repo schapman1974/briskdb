@@ -7,12 +7,12 @@ PostgreSQL TCP placeholder never creates an engine request.
 
 ## Per-request context
 
-The existing `Engine::execute`, `query`, `broadcast`, and `status` methods, plus
-`prepare_statement`, `bind_statement`, `describe_prepared`, and
-`execute_portal`, use a default `RequestContext`. `broadcast` now means a
-journaled application-schema migration. Frontends that have their own
-cancellation or deadline source can call the corresponding `*_with_context`
-method:
+The existing `Engine::execute`, `query`, `broadcast`, and `status` methods, the
+crate-private explicit-shard inspection operation, plus `prepare_statement`,
+`bind_statement`, `describe_prepared`, and `execute_portal`, use a default
+`RequestContext`. `broadcast` now means a journaled application-schema
+migration. Frontends that have their own cancellation or deadline source can
+call the corresponding `*_with_context` method:
 
 ```rust
 use std::time::Duration;
@@ -94,13 +94,23 @@ and SQLite can still allocate its current row internally. The logical limit is
 not an HTTP encoded-body limit; for example, the current JSON representation of
 a blob expands bytes into JSON integers.
 
-The raw query path accepts only SQLite statements reported as read-only. The
-prepared executor likewise rejects row-producing writes. These rules prevent
-an early result-budget failure from accompanying a partially consumed DML
-`RETURNING` statement. Raw execute, prepared affected-row results, and schema
-migration do not materialize a `ResultSet` and are unaffected by query result
-budgets. A future scatter/gather implementation must apply one budget to the
-combined result, not a fresh budget for every shard.
+The raw query and explicit-shard inspection paths accept only SQLite statements
+reported as read-only. The prepared executor likewise rejects row-producing
+writes. These rules prevent an early result-budget failure from accompanying a
+partially consumed DML `RETURNING` statement. Raw execute, prepared affected-row
+results, and schema migration do not materialize a `ResultSet` and are
+unaffected by query result budgets. A future scatter/gather implementation must
+apply one budget to the combined result, not a fresh budget for every shard.
+
+The `/admin` browser independently caps a requested page at 200 returned rows
+and validates offsets no greater than 1,000,000. It may inspect one additional
+row to decide whether another page exists; that row is not serialized. The
+inspection still uses the engine's effective logical-byte and row budgets, so a
+lower configured engine limit or a byte-heavy page can return `LimitExceeded`
+with no partial page. Every offset page is a separate request and consumes
+capacity only from its selected physical shard. It is not a global budget,
+cross-shard read, or multi-page snapshot. The continuation flag is false if the
+next calculated offset would exceed the browser's 1,000,000 cap.
 
 ## Prepared-session limits
 
@@ -126,6 +136,27 @@ length, and its payload), once for a possible typed-inference copy and once for
 a possible canonical-route copy. Repeated markers are charged again. The
 transient sum is not retained or added to existing portal bytes. A failure
 returns `LimitExceeded` before planning and publishes no portal.
+
+## Browser-session limits
+
+Admin-browser authentication state is protocol-adapter memory, not an engine
+`Session` or prepared cache. A successful temporary `admin` / `admin` login
+creates one opaque cookie token with an absolute eight-hour lifetime. The HTTP
+adapter retains at most 128 live browser sessions. Logout removes the presented
+session, expiration makes it unusable, and process restart removes all of them.
+A successful login at capacity evicts the earliest-expiring session, using its
+token only as a deterministic tie-break; it never grows the store past 128. No
+browser-session data is charged to a shard pool, written to the data directory,
+or recovered at startup.
+
+Each authenticated discovery or row-page call separately creates a core
+`Session`. Discovery uses one engine operation. A row page uses one operation to
+verify the exact visible table identity, followed by a separately bounded page
+read that repeats the visibility predicate before returning data. Cancelling,
+failing, or completing either operation does not extend the cookie lifetime or
+invalidate an otherwise valid browser session. Conversely, logging out prevents
+later admin requests but does not retroactively cancel an inspection already
+admitted to the engine.
 
 ## Schema-migration controls
 

@@ -44,6 +44,9 @@ HTTP problem details, and the mappings reserved for future PostgreSQL and MySQL
 wire adapters.
 The [request-control contract](docs/REQUEST_CONTROLS.md) defines cancellation,
 deadlines, materialized-result budgets, and graceful shutdown.
+The [admin data-browser contract](docs/ADMIN_BROWSER.md) defines the embedded
+read-only per-shard explorer, its temporary login, finite pages, and live-view
+boundaries.
 The [manifest storage-format contract](docs/STORAGE_FORMAT.md) defines versioned
 startup migrations, downgrade behavior, and recovery boundaries.
 Contributions follow the repository's [test-first completion policy](CONTRIBUTING.md).
@@ -66,6 +69,8 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Explicit graceful drain, forced cancellation, and blocking handle cleanup
 - Independently configured HTTP and PostgreSQL TCP listeners; the PostgreSQL
   listener currently accepts and closes connections pending wire-adapter work
+- An embedded read-only browser at `/admin` for inspecting user tables and
+  bounded row pages on one explicitly selected physical shard
 - Protocol-neutral typed values, ordered columns, positional rows, and results
 - A bounded per-session prepared-statement and immutable bound-portal lifecycle
   with transient shard-0 metadata compilation, bind-time routing snapshots,
@@ -126,6 +131,16 @@ Issue #28 supplies only the separately managed TCP endpoint. Until the
 PostgreSQL wire adapter lands, every accepted connection is closed immediately
 without reading or writing protocol bytes, and no PostgreSQL driver can execute
 a request through it. See the [listener contract](docs/POSTGRES_LISTENER.md).
+
+The HTTP listener also serves the embedded data explorer at
+<http://127.0.0.1:7654/admin>. Its temporary credentials are `admin` / `admin`.
+The explorer is read-only: select one physical shard and an ordinary user table,
+then move through live offset-based pages of at most 200 rows. Browser sessions
+are held only in process memory, expire after eight hours, and disappear on
+restart. The fixed credentials are a development convenience; keep this
+experimental HTTP service on a trusted network. Existing `/health` and `/v1/*`
+behavior is unchanged. See the [admin browser contract](docs/ADMIN_BROWSER.md)
+for the route, table-filtering, pagination, and session boundaries.
 
 Rust embedders can customize pool sizing through the public `EngineOptions`
 type. Existing engine constructors and server startup keep the defaults of four
@@ -296,6 +311,8 @@ are retired rather than reused by another session. Clean read handles can be
 shared for ordinary SQL, but a deny-only authorizer probe moves connection-local
 SQL such as `PRAGMA data_version`, plus any cross-owner write, to a fresh
 disposable handle before execution.
+The read-only `table_list` metadata PRAGMA is an explicit tested exception: it
+does not change connection state and remains reusable for admin discovery.
 BriskDB-owned shard metadata and storage-control PRAGMA mutations, including
 `application_id`, `user_version`, `journal_mode`, `schema_version`, and
 `writable_schema`, are denied through every client SQL surface rather than
@@ -390,9 +407,10 @@ Independent `Database` and `Engine` handles in one process that resolve to the
 same canonical data directory share schema coordination. Separate BriskDB
 server processes must not use the same data directory.
 
-Near-term work includes authentication, richer migration administration and
-status APIs in issue #53, scatter/gather reads, observability, and backup
-tooling.
+The `/admin` browser's fixed development login is separate from the planned
+authentication and role model. Near-term work includes that model, richer
+migration administration and status APIs in issue #53, scatter/gather reads,
+observability, and backup tooling.
 
 ## License
 

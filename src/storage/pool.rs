@@ -1850,6 +1850,18 @@ mod tests {
         ];
 
         assert!(actions.into_iter().all(action_taints_connection));
+        assert!(!action_taints_connection(AuthAction::Pragma {
+            pragma_name: "table_list",
+            pragma_value: None,
+        }));
+        assert!(!action_taints_connection(AuthAction::Pragma {
+            pragma_name: "TABLE_LIST",
+            pragma_value: None,
+        }));
+        assert!(action_taints_connection(AuthAction::Pragma {
+            pragma_name: "table_list",
+            pragma_value: Some("unexpected"),
+        }));
         assert!(!action_taints_connection(AuthAction::Select));
         assert!(!action_taints_connection(AuthAction::Insert {
             table_name: "widgets"
@@ -1885,6 +1897,32 @@ mod tests {
                 .tainted
                 .load(Ordering::Relaxed)
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_table_list_metadata_keeps_a_pooled_connection_reusable() {
+        let (_temp, pools) = pools(1, 0);
+        let connection = pools.acquire(0).await.unwrap().checkout().unwrap();
+        let id = connection.connection_id();
+        let tables = connection
+            .query_row("SELECT COUNT(*) FROM pragma_table_list", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert!(tables >= 1);
+        assert!(
+            !connection
+                .managed
+                .as_ref()
+                .unwrap()
+                .hygiene
+                .tainted
+                .load(Ordering::Relaxed)
+        );
+        drop(connection);
+
+        let reused = pools.acquire(0).await.unwrap().checkout().unwrap();
+        assert_eq!(reused.connection_id(), id);
     }
 
     #[tokio::test]

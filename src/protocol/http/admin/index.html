@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>BriskDB Data Browser</title>
+  <link rel="stylesheet" href="/admin/assets/styles.css">
+  <script src="/admin/assets/app.js" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+
+  <main id="login-view" class="login-shell">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="brand-mark" aria-hidden="true">B</div>
+      <p class="eyebrow">BriskDB</p>
+      <h1 id="login-title">Open the data browser</h1>
+      <p class="muted">Inspect tables and rows on one physical shard at a time.</p>
+      <form id="login-form">
+        <label for="username">Username</label>
+        <input id="username" name="username" autocomplete="username" required>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button class="button primary" type="submit">Log in</button>
+      </form>
+      <p id="login-error" class="form-error" role="alert"></p>
+    </section>
+  </main>
+
+  <div id="browser-view" class="app-shell hidden">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <div class="brand-mark small" aria-hidden="true">B</div>
+        <div>
+          <strong>BriskDB</strong>
+          <span>Data Browser</span>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span class="connection-state"><i></i> Connected</span>
+        <button id="logout-button" class="button ghost" type="button">Log out</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar" aria-label="Database navigation">
+        <div class="sidebar-section">
+          <label for="shard-select" class="section-label">Physical shard</label>
+          <select id="shard-select"></select>
+          <p class="sidebar-note">Each table list and row page comes from this shard only.</p>
+        </div>
+        <div class="sidebar-section tables-section">
+          <div class="section-heading">
+            <span class="section-label">Application tables</span>
+            <span id="table-count" class="count-badge">0</span>
+          </div>
+          <nav id="table-list" class="table-list" aria-label="Application tables"></nav>
+        </div>
+      </aside>
+
+      <main class="content">
+        <div class="content-header">
+          <div>
+            <p id="shard-kicker" class="eyebrow">Physical shard 0</p>
+            <h1 id="table-title">Choose a table</h1>
+            <p id="table-subtitle" class="muted">Select an application table to inspect its rows.</p>
+          </div>
+          <div class="page-size-control">
+            <label for="page-size">Rows per page</label>
+            <select id="page-size">
+              <option value="25">25</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+              <option value="200">200</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="status" class="status" aria-live="polite">Loading session…</div>
+
+        <section class="data-card" aria-labelledby="table-title">
+          <div id="empty-state" class="empty-state">
+            <div class="empty-icon" aria-hidden="true">▦</div>
+            <h2>No table selected</h2>
+            <p>Choose a table from the sidebar to browse a bounded, read-only page.</p>
+          </div>
+          <div id="table-wrap" class="table-wrap hidden">
+            <table>
+              <caption id="table-caption">Rows from the selected physical shard</caption>
+              <thead id="data-head"></thead>
+              <tbody id="data-body"></tbody>
+            </table>
+          </div>
+          <div class="pager">
+            <span id="page-summary">No rows loaded</span>
+            <div>
+              <button id="previous-page" class="button ghost" type="button" disabled>Previous</button>
+              <button id="next-page" class="button ghost" type="button" disabled>Next</button>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+</body>
+</html>

@@ -82,6 +82,7 @@ path; they do not pass through these opt-in SQL layers.
 | HTTP `/v1/execute` | Experimental | One SQLite statement with positional parameters | Required caller-provided `shard_key` |
 | HTTP `/v1/query` | Experimental | One raw SQLite statement prepared transiently by the row-returning path; no session cache | Required caller-provided `shard_key` |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
+| HTTP `/admin` browser | Experimental, read-only | No caller SQL; server-generated physical table discovery and bounded `SELECT *` pages | Required validated physical shard number; never a routed or scatter query |
 | PostgreSQL wire protocol | TCP lifecycle scaffold; wire protocol planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; placeholder listener accepts then closes without protocol bytes | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
@@ -91,12 +92,41 @@ lifecycle are implemented Rust APIs, not PostgreSQL or MySQL network
 interfaces. The PostgreSQL socket scaffold does not connect those APIs to the
 network. They do not change any current HTTP row in this table.
 
-Every HTTP operation now calls the same protocol-neutral async engine intended
-for future PostgreSQL and MySQL adapters. Execute and query requests create a
-fresh `Ready` session, put the request's `shard_key` in its routing context, and
-submit an owned statement. The engine, rather than the HTTP adapter, selects the
-shard and acquires a pooled SQLite connection. The session is discarded when
-that HTTP request finishes, so a transaction cannot span requests.
+Every HTTP database operation now calls the same protocol-neutral async engine
+intended for future PostgreSQL and MySQL adapters. Execute and query requests
+create a fresh `Ready` session, put the request's `shard_key` in its routing
+context, and submit an owned statement. The engine, rather than the HTTP
+adapter, selects the shard and acquires a pooled SQLite connection. Admin
+inspection requests also create a fresh `Ready` session, but use a bounded
+read-only engine operation with an already validated physical shard. The
+session is discarded when that HTTP request finishes, so a transaction cannot
+span requests.
+
+### Admin browser inspection
+
+The `/admin` application is an early operational view rather than another SQL
+compatibility mode. The browser never submits SQL. Its overview selects one
+physical shard from the configured range and discovers ordinary `main`-schema
+tables through SQLite's typed `table_list` metadata. ASCII-case-insensitive `sqlite_`,
+the exact name `briskdb`, and `briskdb_` prefixes are excluded, as are non-table
+objects. This is a physical schema view, not a promise that advisory logical
+catalog metadata describes the table or that another shard has an equal table.
+
+Row browsing generates one safely quoted `SELECT *` for a table returned by
+discovery. Page limits are 1 through 200 and offsets are 0 through 1,000,000;
+the interface reads at most one extra row to decide whether another page is
+available. The user interface offers 25, 50, 100, and 200 and starts at 50.
+Shard, table, limit, offset, and checked arithmetic are validated before
+execution. The engine still requires SQLite to classify the statement as
+read-only and applies its schema gate, pool/worker admission, cancellation,
+deadline, and effective result-byte and row budgets.
+
+Each offset page is a new committed read. No order is promised for a general
+SQLite table scan, and concurrent changes may move rows between pages. The
+browser does not merge physical shards, preserve a multi-page snapshot, accept
+arbitrary filters or SQL, or implement the planned scatter/gather query path.
+The full route, login, and live-view contract is in the [admin data
+browser](ADMIN_BROWSER.md).
 
 The asynchronous boundary admits work to an independent bounded pool for each
 shard before dispatching blocking SQLite work. The default pool permits four
@@ -232,8 +262,10 @@ positional rows are preserved inside `ResultSet`; SQLite result-column metadata
 is marked `Unknown` because dynamic SQLite values do not guarantee one static
 type.
 
-The experimental `/v1/query` response exposes the ordered result directly. For
-example:
+The experimental `/v1/query` response exposes the ordered result directly. The
+admin row-page endpoint reuses the same column and cell conversion and wraps it
+with physical-shard and pagination metadata. For example, the existing query
+shape is:
 
 ```json
 {
@@ -264,9 +296,10 @@ JSON number through binary floating point must also account for precision loss
 when reading large `uint64` cells.
 
 This ordered response intentionally replaces the earlier experimental
-object-per-row shape, which collapsed duplicate names. It changes only HTTP
-query serialization; request fields, routing, configuration, the manifest,
-shard files, and stored data are unchanged.
+object-per-row shape, which collapsed duplicate names. Admin pages preserve the
+same indexed relationship instead of converting rows into name-keyed objects.
+The conversion changes only HTTP serialization; request fields, routing,
+configuration, the manifest, shard files, and stored data are unchanged.
 
 ### Current error contract
 

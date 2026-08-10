@@ -943,6 +943,72 @@ impl Engine {
         Ok(Routed { shard, value })
     }
 
+    /// Run one read-only inspection statement on an explicit physical shard.
+    ///
+    /// This crate-private boundary exists for administrative surfaces that
+    /// need to describe one shard honestly rather than manufacturing a routing
+    /// key. It retains the ordinary engine lifecycle, schema gate, session,
+    /// pool, worker, cancellation, and result-budget behavior. The SQL adapter
+    /// verifies that the prepared SQLite statement is read-only before it is
+    /// stepped.
+    pub(crate) async fn inspect_shard(
+        &self,
+        session: &Session,
+        shard: u16,
+        statement: Statement,
+    ) -> EngineResult<ResultSet> {
+        self.inspect_shard_with_context(session, shard, statement, RequestContext::new())
+            .await
+    }
+
+    /// Run an explicit-shard inspection with request-scoped controls.
+    pub(crate) async fn inspect_shard_with_context(
+        &self,
+        session: &Session,
+        shard: u16,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<ResultSet> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if shard >= self.shard_count() {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!(
+                    "physical shard {shard} is outside the configured range 0..{}",
+                    self.shard_count()
+                ),
+            )));
+        }
+        let owner = ConnectionOwner::new(session.id().get());
+        let (sql, params) = statement.into_parts();
+        let limits = operation.result_limits;
+
+        let result = self
+            .run_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                schema_operation,
+                guard,
+                move |connection, _session, control| {
+                    connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sql)?;
+                    connection.run_controlled(control, |connection| {
+                        sql::query_with_limits(connection, &sql, &params, limits)
+                    })
+                },
+            )
+            .await;
+        operation.finish_started(result)
+    }
+
     /// Apply a parameterless SQL migration batch through the durable shard journal.
     pub async fn broadcast(&self, session: &Session, sql: String) -> EngineResult<Vec<u16>> {
         self.broadcast_with_context(session, sql, RequestContext::new())
@@ -3134,6 +3200,182 @@ mod tests {
             }
             assert_eq!(shard.retired, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_shard_inspection_reads_only_the_selected_physical_shard() {
+        let (_temp, engine) = engine_with_options(2, 2, 2);
+        let setup = engine.session();
+        engine
+            .broadcast(
+                &setup,
+                "CREATE TABLE inspection_rows (id INTEGER PRIMARY KEY, label TEXT NOT NULL)"
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+
+        let writer = engine.session();
+        for shard in 0..engine.shard_count() {
+            writer
+                .set_routing_key(routing_key_for_shard(&engine, shard))
+                .await
+                .unwrap();
+            let written = engine
+                .execute(
+                    &writer,
+                    Statement::new(
+                        "INSERT INTO inspection_rows (id, label) VALUES (?1, ?2)",
+                        vec![
+                            Value::from(i64::from(shard)),
+                            Value::from(format!("shard-{shard}")),
+                        ],
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(written.shard, shard);
+        }
+
+        let inspector = engine.session();
+        for shard in 0..engine.shard_count() {
+            let result = engine
+                .inspect_shard(
+                    &inspector,
+                    shard,
+                    Statement::new("SELECT id, label FROM inspection_rows ORDER BY id", vec![]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result,
+                ResultSet::new(
+                    vec![
+                        Column::new("id", DataType::Unknown),
+                        Column::new("label", DataType::Unknown),
+                    ],
+                    vec![Row::new(vec![
+                        Value::from(i64::from(shard)),
+                        Value::from(format!("shard-{shard}")),
+                    ])],
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(inspector.routing_key().await, None);
+        assert_eq!(inspector.state().await, SessionState::Ready);
+
+        let pools = engine.inner.connections.snapshot().unwrap();
+        assert!(
+            pools
+                .shards
+                .iter()
+                .all(|shard| shard.active == 0 && shard.queued == 0 && shard.checkouts >= 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_shard_inspection_rejects_invalid_shards_without_pool_work_and_recovers() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let session = engine.session();
+
+        let (_other_temp, other_engine) = engine_with_options(2, 1, 1);
+        let foreign_session = other_engine.session();
+        let foreign_error = engine
+            .inspect_shard(
+                &foreign_session,
+                u16::MAX,
+                Statement::new("SELECT 1", vec![]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(foreign_error.kind(), EngineErrorKind::FailedPrecondition);
+
+        for invalid in [engine.shard_count(), u16::MAX] {
+            let error = engine
+                .inspect_shard(&session, invalid, Statement::new("SELECT 1", vec![]))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "physical shard {invalid} is outside the configured range 0..{}",
+                    engine.shard_count()
+                )
+            );
+        }
+        assert!(
+            engine
+                .inner
+                .connections
+                .snapshot()
+                .unwrap()
+                .shards
+                .iter()
+                .all(|shard| shard.checkouts == 0)
+        );
+
+        let recovered = engine
+            .inspect_shard(
+                &session,
+                0,
+                Statement::new("SELECT ?1 AS value", vec![Value::from(7_i64)]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.rows()[0].get(0), Some(&Value::from(7_i64)));
+        assert_eq!(session.state().await, SessionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn explicit_shard_inspection_rejects_writes_and_result_overflow_without_poisoning() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let setup = engine.session();
+        engine
+            .broadcast(
+                &setup,
+                "CREATE TABLE inspected_write (id INTEGER PRIMARY KEY)".to_owned(),
+            )
+            .await
+            .unwrap();
+        let session = engine.session();
+
+        let write_error = engine
+            .inspect_shard(
+                &session,
+                0,
+                Statement::new("INSERT INTO inspected_write (id) VALUES (1)", vec![]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(write_error.kind(), EngineErrorKind::InvalidQuery);
+
+        let narrow = RequestContext::new().with_result_limits(ResultLimits::new(1, 1_024).unwrap());
+        let limit_error = engine
+            .inspect_shard_with_context(
+                &session,
+                0,
+                Statement::new("SELECT 1 AS value UNION ALL SELECT 2", vec![]),
+                narrow,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(limit_error.kind(), EngineErrorKind::LimitExceeded);
+
+        let recovered = engine
+            .inspect_shard(
+                &session,
+                0,
+                Statement::new("SELECT COUNT(*) AS count FROM inspected_write", vec![]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.rows()[0].get(0), Some(&Value::from(0_i64)));
+        assert_eq!(session.state().await, SessionState::Ready);
+        let shard = engine.inner.connections.snapshot().unwrap().shards[0];
+        assert_eq!(shard.active, 0);
+        assert_eq!(shard.queued, 0);
     }
 
     #[tokio::test]

@@ -868,25 +868,34 @@ pub(crate) fn validate_shard_count(requested_shards: u16) -> EngineResult<()> {
 }
 
 fn action_taints_connection(action: AuthAction<'_>) -> bool {
-    matches!(
-        action,
-        AuthAction::Unknown { .. }
-            | AuthAction::CreateTempIndex { .. }
-            | AuthAction::CreateTempTable { .. }
-            | AuthAction::CreateTempTrigger { .. }
-            | AuthAction::CreateTempView { .. }
-            | AuthAction::DropTempIndex { .. }
-            | AuthAction::DropTempTable { .. }
-            | AuthAction::DropTempTrigger { .. }
-            | AuthAction::DropTempView { .. }
-            | AuthAction::Pragma { .. }
-            | AuthAction::Transaction { .. }
-            | AuthAction::Attach { .. }
-            | AuthAction::Detach { .. }
-            | AuthAction::CreateVtable { .. }
-            | AuthAction::DropVtable { .. }
-            | AuthAction::Savepoint { .. }
-    )
+    match action {
+        // SQLite reports table-valued PRAGMAs through the authorizer as a
+        // PRAGMA action. `table_list` is a read-only schema inventory with no
+        // connection-local state, so it is safe for the admin inspector to use
+        // without forcing a pooled handle to retire after every page.
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } => pragma_value.is_some() || !pragma_name.eq_ignore_ascii_case("table_list"),
+        _ => matches!(
+            action,
+            AuthAction::Unknown { .. }
+                | AuthAction::CreateTempIndex { .. }
+                | AuthAction::CreateTempTable { .. }
+                | AuthAction::CreateTempTrigger { .. }
+                | AuthAction::CreateTempView { .. }
+                | AuthAction::DropTempIndex { .. }
+                | AuthAction::DropTempTable { .. }
+                | AuthAction::DropTempTrigger { .. }
+                | AuthAction::DropTempView { .. }
+                | AuthAction::Transaction { .. }
+                | AuthAction::Attach { .. }
+                | AuthAction::Detach { .. }
+                | AuthAction::CreateVtable { .. }
+                | AuthAction::DropVtable { .. }
+                | AuthAction::Savepoint { .. }
+        ),
+    }
 }
 
 fn action_writes_connection(action: AuthAction<'_>) -> bool {
