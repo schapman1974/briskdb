@@ -1,0 +1,115 @@
+# Admin data browser
+
+Status: implemented for roadmap issue #106
+
+BriskDB serves a small read-only data explorer from the existing HTTP listener.
+Open `/admin` (or `/admin/`) to use the embedded application. Its HTML, CSS,
+and JavaScript are compiled into the server binary; loading the page does not
+contact a package CDN, font service, analytics service, or other third party.
+
+## Temporary login
+
+The first implementation has one exact built-in credential pair:
+
+- username: `admin`
+- password: `admin`
+
+This is a temporary development convenience, not the user/role, password
+rotation, or transport-encryption work described by roadmap issues #56 and #64.
+Anyone who can reach the HTTP listener knows these credentials. Keep the current
+HTTP service on a trusted network and do not treat this login as a production
+identity boundary. The existing `/health` and `/v1/*` endpoints retain their
+previous behavior and are not made authenticated by issue #106.
+
+A successful login creates an opaque session from 32 operating-system-random
+bytes and sends its lowercase 64-character hexadecimal token only in the
+`briskdb_admin_session` cookie. The cookie is `HttpOnly`, `SameSite=Strict`, has
+`Path=/admin`, and has an absolute eight-hour lifetime (`Max-Age=28800`). It is
+not persisted in the manifest, shards, or any other file. Restarting BriskDB
+invalidates every browser session.
+
+At most 128 sessions are retained in process memory. A successful login at that
+capacity evicts the earliest-expiring session, with the token as a deterministic
+tie-break. Logout invalidates only the presented session and always clears its
+cookie; other authenticated browsers remain independent. Logout is idempotent
+even when the cookie is absent or already unusable. Protected session,
+discovery, and row calls with a missing, malformed, unknown, expired, or
+logged-out cookie receive HTTP 401 with fixed JSON and a cookie-clearing header.
+Session-cookie state is separate from a core `Session`: every inspection
+request still creates a short-lived engine session, and login does not create a
+multi-request SQL transaction.
+
+## Routes
+
+| Surface | Contract |
+| --- | --- |
+| `GET /admin`, `GET /admin/` | Embedded application shell |
+| `GET /admin/assets/styles.css` | Embedded stylesheet |
+| `GET /admin/assets/app.js` | Embedded application code |
+| `POST /admin/api/login` | Accept JSON `{"username":"admin","password":"admin"}`; return `{"authenticated":true}` and set the session cookie |
+| `GET /admin/api/session` | Return `{"authenticated":true,"username":"admin"}` for a live cookie; otherwise return HTTP 401 |
+| `POST /admin/api/logout` | Revoke a presented live token if any, always clear the cookie, and return `{"authenticated":false}` |
+| `GET /admin/api/overview?shard=N` | Return `shard_count`, `selected_shard`, and the selected shard's binary-ordered `tables`; omitted `shard` selects zero |
+| `GET /admin/api/rows?shard=N&table=T&limit=L&offset=O` | Return one page as `shard`, `table`, `limit`, `offset`, `has_more`, ordered `columns`, and positional `rows`; limit defaults to 50 and offset to zero |
+
+The shell and its two assets are public so the application can render its login
+state. Session, overview, and row calls require the server-side session check;
+logout remains an idempotent cookie-clearing operation. Hiding controls in
+JavaScript is not the access check.
+
+## Physical-shard view
+
+The explorer intentionally selects a physical shard number. This differs from
+normal `/v1/query` routing, which hashes a caller-provided logical `shard_key`.
+The overview accepts only `0 <= shard < shard_count`. It discovers ordinary
+tables in SQLite's `main` schema and excludes SQLite-owned names beginning with
+`sqlite_` plus the exact BriskDB-owned name `briskdb` and names beginning with
+`briskdb_`, using ASCII-case-insensitive prefix checks. Views and internal tables
+are not presented. Names have a stable binary ordering in the response.
+
+Discovery describes the tables physically present on the selected shard. It is
+not the advisory logical `briskdb_tables` catalog, and it makes no claim that a
+table exists on another shard. Guessing an excluded or absent name does not make
+it browseable.
+
+The browser offers page sizes 25, 50, 100, and 200 rows and initially selects
+50. The JSON endpoint accepts only limits from 1 through 200 and offsets from 0
+through 1,000,000. BriskDB validates the shard, table identity, limit, offset,
+and checked pagination arithmetic before running the row read. The continuation
+indicator is derived by reading at most one row beyond the requested page; that
+extra row is not included in the returned page. It remains false when the next
+offset would exceed 1,000,000, even if more physical rows exist.
+
+Each page is a separate read of the selected shard. Offset pagination is
+therefore a live view, not a retained snapshot: inserts or deletes between page
+requests can move or repeat rows, and SQLite's table scan supplies no general
+ordering guarantee. The explorer does not merge shards, compute a global row
+count, or implement the later scatter/gather roadmap.
+
+## Engine and JSON boundaries
+
+The HTTP adapter does not open shard files or call `rusqlite`. Discovery and row
+reads use BriskDB's bounded explicit-shard inspection operation. That operation
+uses the ordinary engine lifecycle, schema gate, per-shard pool and worker
+admission, cancellation, deadline, and effective result limits. SQLite must
+classify its generated statement as read-only before it is stepped.
+
+Results retain the existing HTTP representation: ordered column metadata and
+positional row arrays. Duplicate or empty column names remain representable.
+Nulls, integers, finite floats, and valid text use direct JSON values; blobs are
+arrays of byte-valued integers; decimals use strings; invalid UTF-8 text is
+rendered lossily; and non-finite floats become JSON `null`.
+
+Engine failures use the same fixed, redacted HTTP problem details as other HTTP
+operations. Login or session rejection returns HTTP 401 without echoing the
+submitted password or session token. A failed discovery or page read does not
+invalidate a valid browser session, and a later valid request can continue.
+
+## Deliberate non-goals
+
+Issue #106 does not add editing, arbitrary SQL, schema migration, backup,
+maintenance, query cancellation, a separate admin listener, stable pagination
+across concurrent writes, scatter/gather browsing, durable users or roles,
+credential configuration, or TLS. Those remain separate roadmap work. The
+browser adds no manifest table, file, version, checksum input, migration, or
+recovery step.

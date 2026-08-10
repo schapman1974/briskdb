@@ -128,6 +128,33 @@ the public response stable while preserving the original cause for operators.
 Malformed JSON can still be rejected by the HTTP framework before a request
 reaches the engine; that decoding rejection is outside this taxonomy.
 
+### Admin-browser responses
+
+The embedded `/admin` application's login and cookie checks happen in the HTTP
+adapter before an engine operation exists. Wrong credentials and a missing,
+malformed, unknown, expired, or logged-out `briskdb_admin_session` therefore use
+HTTP 401 rather than inventing an `EngineErrorKind`. A protected call with an
+unusable session returns a fixed JSON response and a cookie-clearing header.
+Logout itself is idempotent: it returns success and clears the cookie even when
+no live token is present. These responses never echo the submitted password or
+cookie token. The public application shell and embedded assets remain loadable
+so the browser can render its login state.
+
+After session validation, overview and row-page failures use the established
+HTTP problem representation whenever they have an engine kind. An out-of-range
+physical shard, absent or excluded table identity, page limit outside 1 through
+200, offset above 1,000,000, or pagination arithmetic overflow is an invalid
+argument. A page that exceeds the effective engine row or logical-byte budget
+is `LimitExceeded` and contains no partial rows. Pool admission, request
+deadline, shutdown, schema-gate, storage, and integrity failures retain their
+normal mappings.
+
+SQLite messages, table contents, filesystem paths, submitted credentials, and
+session tokens remain internal in every case. A failed admin request does not
+invalidate a valid browser session; a subsequent valid request can recover.
+The complete browser route and live-pagination contract is in the [admin data
+browser](ADMIN_BROWSER.md).
+
 ## Classification boundary
 
 The SQL and storage layers classify SQLite failures from primary and extended

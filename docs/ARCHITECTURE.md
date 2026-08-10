@@ -10,6 +10,9 @@ binary (main)
     |
     v
 server ---------> protocol::http
+    |               |    |
+    |               |    v
+    |               +-> embedded admin browser
     |                    |
     |                    v
     +-----------------> core
@@ -23,10 +26,10 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only logical catalog, synchronous bound-value-aware plans, prepared lifecycle, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only logical catalog, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
-| `protocol::http` | HTTP request extraction plus JSON/BriskDB value and RFC 9457 problem-detail encoding | BLAKE3 routing, shard files, or rusqlite calls |
+| `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, discovery, and page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, separate HTTP/PostgreSQL listener binding, tracked Axum HTTP/1 connection lifecycle, and the temporary PostgreSQL accept/close loop | SQL parsing, PostgreSQL wire messages, or storage implementation details |
 
@@ -63,9 +66,10 @@ of `anyhow::Result<T>`; this intentional pre-1.0 source migration gives callers
 stable error identity while retaining automatic `?` conversion into `anyhow`.
 
 Automated HTTP contract tests cover health, schema broadcast, routed writes,
-routed reads, and structured problem-detail serialization through the shared
-engine. Unit tests remain colocated with sessions, engine orchestration,
-routing, storage, SQL conversion, CLI, and server assembly.
+routed reads, structured problem-detail serialization, admin login/session
+lifecycle, embedded assets, physical-shard discovery, and bounded row pages
+through the shared engine. Unit tests remain colocated with sessions, engine
+orchestration, routing, storage, SQL conversion, CLI, and server assembly.
 
 Issue #17 intentionally changed the behavior behind the preserved
 `/v1/admin/broadcast`, `Database::broadcast`, and `Engine::broadcast` shapes.
@@ -100,6 +104,36 @@ lifecycle placeholder: it accepts and immediately drops each stream without
 reading bytes, writing a PostgreSQL frame, opening a session, or calling the
 engine. This keeps binding, concurrent acceptance, startup cleanup, and shared
 shutdown testable without moving protocol behavior into `server`.
+
+## Admin browser boundary
+
+Issue #106 adds an embedded application under `/admin` on the existing HTTP
+listener. The public shell, stylesheet, and JavaScript are static bytes compiled
+into the binary. Same-origin JSON handlers validate the temporary `admin` /
+`admin` login, retain at most 128 opaque sessions in process memory for an
+absolute eight hours, and enforce the cookie on session, discovery, and row-page
+operations. Logout revokes a presented token when possible and always clears
+the cookie, so repeating it is harmless. These browser sessions are adapter
+state, not core SQL sessions, and are neither written to storage nor recovered
+after restart.
+
+The adapter may select a validated physical shard only through the engine's
+crate-private inspection boundary. `Engine::inspect_shard` retains ordinary
+lifecycle admission, schema coordination, session serialization, per-shard pool
+and worker bounds, request controls, read-only SQLite validation, and typed
+`ResultSet` output. It does not require or synthesize a logical routing key.
+This deliberately narrow path exists for administration; it is not a public
+general-purpose direct-shard execution API.
+
+Table discovery reads SQLite's physical `main` schema through that boundary,
+returns only ordinary application tables, and excludes ASCII-case-insensitive
+`sqlite_`, `briskdb`, and `briskdb_` names. The page handler accepts no SQL from
+the browser. It validates the returned table identity, safely quotes that
+identifier, binds finite limit/offset values, and exposes at most 200 rows from
+one shard. It never opens a database file or imports `rusqlite` in the adapter.
+Separate offset pages are live reads, not a transaction, stable ordering, or a
+cross-shard snapshot. The complete route and representation contract is in the
+[admin data browser](ADMIN_BROWSER.md).
 
 ## SQL parser boundary
 
@@ -517,11 +551,14 @@ later session change cannot retarget an existing portal. `EngineStatus` exposes
 the shard count and prepared-state limits needed by health/configuration
 reporting without exposing the storage implementation.
 
-HTTP is stateless at this stage: each execute or query request creates a fresh
-session and initializes its routing context from the request's `shard_key`.
-Consequently, session settings and transactions cannot span HTTP requests.
-Schema-migration broadcast and status calls also go through the shared engine,
-but do not perform a routing decision in the adapter.
+HTTP SQL state remains request-local: each execute or query request creates a
+fresh session and initializes its routing context from the request's
+`shard_key`. Each admin inspection likewise creates a fresh core session but
+selects a validated physical shard through the dedicated read-only boundary.
+Consequently, session settings and transactions cannot span HTTP requests. The
+eight-hour browser cookie authenticates the admin JSON calls; it does not retain
+SQL session state. Schema-migration broadcast and status calls also go through
+the shared engine, but do not perform a routing decision in the adapter.
 
 ### Bounded worker and connection-pool boundary
 
@@ -593,6 +630,10 @@ probe. The first connection-local or write action is rejected before it can
 run—even for PRAGMAs with prepare-time effects—and the real statement is then
 executed once on a fresh handle. This also gives every cross-owner write clean
 SQLite counter state.
+The read-only `table_list` metadata PRAGMA is the narrow exception to PRAGMA
+tainting. It changes no connection-local state, remains reusable under an exact
+pool regression test, and lets the admin explorer distinguish ordinary tables
+from virtual-table shadow objects.
 The expected probe error is never exposed to the caller. Any other probe error
 also fails closed to a fresh handle. Opening that replacement can surface its own
 storage error; otherwise only the real execution determines the caller-visible
@@ -629,12 +670,13 @@ retired, preventing a late signal from affecting the next request.
 deadline, and optional narrower result limits. The engine default deadline and
 result budget are owned by `EngineOptions`, so protocol adapters contain no
 SQLite control policy. Prepare, bind, describe, and portal execution expose the
-same `*_with_context` boundary as raw operations. Queries and prepared row
-results account a stable logical representation while stepping SQLite and
-before cloning payloads. A row or byte overflow returns no partial
-`ResultSet`; row-producing writes are rejected so early termination cannot hide
-DML effects. The exact accounting contract is documented in
-[request controls](REQUEST_CONTROLS.md).
+same `*_with_context` boundary as raw operations; explicit-shard inspection has
+the same controlled form. Queries, inspection pages, and prepared row results
+account a stable logical representation while stepping SQLite and before
+cloning payloads. A row or byte overflow returns no partial `ResultSet`;
+row-producing writes are rejected so early termination cannot hide DML effects.
+The exact accounting contract is documented in [request
+controls](REQUEST_CONTROLS.md).
 
 All engine clones share one mutex-protected lifecycle. The mutex makes the
 `Running` admission check and active-operation increment atomic with
@@ -713,10 +755,12 @@ to another SQLite storage class. SQLite `TEXT` results preserve invalid bytes as
 `Value::InvalidText` inside the core.
 
 The experimental HTTP adapter is the only JSON conversion boundary.
-`/v1/query` returns `shard`, an ordered `columns` array of `name` and
-`data_type` metadata objects, and positional arrays in `rows`. Column and row
-indices correspond exactly. Duplicate and empty names are valid, and metadata
-is returned even when there are zero rows.
+`/v1/query` and the admin row-page response use the same ordered `columns` array
+of `name` and `data_type` metadata objects plus positional arrays in `rows`.
+Column and row indices correspond exactly. Duplicate and empty names are valid,
+and metadata is returned even when there are zero rows. The admin response adds
+physical-shard, table, and finite pagination metadata without altering the cell
+conversion.
 
 The adapter renders exact decimals as JSON strings, converts `InvalidText` to a
 JSON string with invalid byte sequences replaced by U+FFFD, and maps non-finite

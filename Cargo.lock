@@ -187,6 +187,7 @@ dependencies = [
  "blake3",
  "clap",
  "criterion",
+ "getrandom",
  "hyper",
  "hyper-util",
  "psm",

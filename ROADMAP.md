@@ -292,6 +292,10 @@ protocol-specific golden tests only for encoding and state-machine behavior.
 
 ### 6. HTTP data and administration APIs
 
+- [x] Serve an early embedded, read-only data explorer at `/admin` with a
+  temporary fixed login and bounded per-physical-shard row pages (issue #106).
+  This preview does not complete the versioned admin API, listener separation,
+  authentication/role, pagination, or scatter/gather items below.
 - [ ] Replace the experimental endpoints with a versioned `/v1` contract built
   on the shared session/engine types.
 - [ ] Return ordered columns and row arrays so duplicate names and binary values

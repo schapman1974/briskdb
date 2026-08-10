@@ -15,6 +15,7 @@ anyhow = "1.0"
 axum = "0.8.9"
 blake3 = "1.8"
 clap = { version = "4.6.6", features = ["derive", "env"] }
+getrandom = "=0.4.3"
 hyper = { version = "1.11", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
 rusqlite = { version = "0.39.0", features = ["bundled", "hooks"] }

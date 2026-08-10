@@ -39,6 +39,15 @@ PostgreSQL endpoint is currently an accept/close lifecycle scaffold, not a wire
 compatibility claim. Its exact process behavior is documented in
 [PostgreSQL listener lifecycle](POSTGRES_LISTENER.md).
 
+The same runner exercises the embedded `/admin` shell and assets, temporary
+login/session lifecycle, physical-shard table discovery, and bounded row-page
+JSON contract without contacting third-party asset hosts. These are HTTP and
+content contract tests, not a named desktop/mobile browser compatibility
+matrix, visual-regression suite, or accessibility certification. The interface
+uses ordinary HTML, CSS, browser JavaScript, and same-origin requests; an
+unlisted browser remains best-effort until it has repeatable automated coverage.
+See the [admin data-browser contract](ADMIN_BROWSER.md).
+
 ## Development-tested targets
 
 Maintainers also develop and run the full suite on `aarch64-apple-darwin`.
@@ -71,6 +80,9 @@ Only a single BriskDB server process per data directory is supported. The
 process-wide registry makes independent `Database` and `Engine` handles that
 resolve to the same canonical root share schema admission and catalog
 publication. It does not coordinate separate server processes.
+Admin browser sessions likewise belong to one process, but are not part of that
+data-directory registry: their absolute eight-hour state is memory-only and is
+discarded on restart.
 Do not copy, move, edit, or separately open the manifest, shard, WAL, or shared
 memory files while the server is running. Backup, restore, multi-process
 access, filesystem-fault behavior, and crash-recovery guarantees will become

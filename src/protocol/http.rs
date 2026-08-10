@@ -1,5 +1,7 @@
 //! Experimental HTTP adapter.
 
+mod admin;
+
 use std::sync::Arc;
 
 use axum::{
@@ -28,15 +30,27 @@ pub fn router(database: Arc<Database>) -> Router {
 
 /// Build an HTTP router backed by the protocol-neutral asynchronous engine.
 pub fn router_with_engine(engine: Engine) -> Router {
+    let state = HttpState {
+        engine,
+        admin_sessions: admin::SessionStore::new(),
+    };
     Router::new()
         .route("/health", get(health))
         .route("/v1/execute", post(execute))
         .route("/v1/query", post(query))
         .route("/v1/admin/broadcast", post(broadcast))
-        .with_state(engine)
+        .merge(admin::routes(state.clone()))
+        .with_state(state)
 }
 
-async fn health(State(engine): State<Engine>) -> Result<Json<JsonValue>, ApiError> {
+#[derive(Clone)]
+struct HttpState {
+    engine: Engine,
+    admin_sessions: admin::SessionStore,
+}
+
+async fn health(State(state): State<HttpState>) -> Result<Json<JsonValue>, ApiError> {
+    let engine = state.engine;
     let session = engine.session();
     let status = engine.status(&session).await?;
 
@@ -79,9 +93,10 @@ struct QueryColumn {
 }
 
 async fn execute(
-    State(engine): State<Engine>,
+    State(state): State<HttpState>,
     Json(request): Json<RoutedSqlRequest>,
 ) -> Result<Json<ExecuteResponse>, ApiError> {
+    let engine = state.engine;
     let params = request
         .params
         .into_iter()
@@ -103,9 +118,10 @@ async fn execute(
 }
 
 async fn query(
-    State(engine): State<Engine>,
+    State(state): State<HttpState>,
     Json(request): Json<RoutedSqlRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
+    let engine = state.engine;
     let params = request
         .params
         .into_iter()
@@ -125,9 +141,10 @@ async fn query(
 }
 
 async fn broadcast(
-    State(engine): State<Engine>,
+    State(state): State<HttpState>,
     Json(request): Json<BroadcastRequest>,
 ) -> Result<Json<JsonValue>, ApiError> {
+    let engine = state.engine;
     let session = engine.session();
     let shards = engine.broadcast(&session, request.sql).await?;
     Ok(Json(json!({"completed_shards": shards})))
