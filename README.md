@@ -75,8 +75,9 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
   PostgreSQL endpoint supports protocol 3.0 startup, logical database/user
   selection, BriskDB parameter status, and clean connection termination through
   a BriskDB-owned `pgwire` 0.36.3 boundary
-- An embedded read-only browser at `/admin` for inspecting user tables and
-  bounded row pages on one explicitly selected physical shard
+- An embedded read-only browser at `/admin` for inspecting user tables, showing
+  exact physical-row totals across all shards, and reading bounded row pages on
+  one explicitly selected physical shard
 - Protocol-neutral typed values, ordered columns, positional rows, and results
 - A bounded per-session prepared-statement and immutable bound-portal lifecycle
   with transient shard-0 metadata compilation, bind-time routing snapshots,
@@ -147,7 +148,8 @@ a query-capable PostgreSQL interface. See the
 The HTTP listener also serves the embedded data explorer at
 <http://127.0.0.1:7654/admin>. Its temporary credentials are `admin` / `admin`.
 The explorer is read-only: select one physical shard and an ordinary user table,
-then move through live offset-based pages of at most 200 rows. Browser sessions
+see its exact physical-row sum across every shard, then move through live
+offset-based pages of at most 200 rows from the selected shard. Browser sessions
 are held only in process memory, expire after eight hours, and disappear on
 restart. The fixed credentials are a development convenience; keep this
 experimental HTTP service on a trusted network. Existing `/health` and `/v1/*`

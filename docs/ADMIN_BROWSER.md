@@ -55,10 +55,11 @@ multi-request SQL transaction.
 | `GET /admin/api/session` | Return `{"authenticated":true,"username":"admin"}` for a live cookie; otherwise return HTTP 401 |
 | `POST /admin/api/logout` | Revoke a presented live token if any, always clear the cookie, and return `{"authenticated":false}` |
 | `GET /admin/api/overview?shard=N` | Return `shard_count`, `selected_shard`, and the selected shard's binary-ordered `tables`; omitted `shard` selects zero |
+| `GET /admin/api/count?table=T` | Return the exact physical-row sum for `T` as `table`, `scope: "all_physical_shards"`, `shard_count`, and `total_rows` |
 | `GET /admin/api/rows?shard=N&table=T&limit=L&offset=O` | Return one page as `shard`, `table`, `limit`, `offset`, `has_more`, ordered `columns`, and positional `rows`; limit defaults to 50 and offset to zero |
 
 The shell and its three assets are public so the application can render its login
-state. Session, overview, and row calls require the server-side session check;
+state. Session, overview, count, and row calls require the server-side session check;
 logout remains an idempotent cookie-clearing operation. Hiding controls in
 JavaScript is not the access check.
 
@@ -94,13 +95,37 @@ offset would exceed 1,000,000, even if more physical rows exist.
 Each page is a separate read of the selected shard. Offset pagination is
 therefore a live view, not a retained snapshot: inserts or deletes between page
 requests can move or repeat rows, and SQLite's table scan supplies no general
-ordering guarantee. The explorer does not merge shards, compute a global row
-count, or implement the later scatter/gather roadmap.
+ordering guarantee. The explorer does not merge row pages or implement the
+later general scatter/gather roadmap.
+
+## All-shard physical row total
+
+Selecting a table also starts a separate exact count request. BriskDB verifies
+that the same exact ordinary table is browseable on every configured shard,
+runs a generated read-only `COUNT(*)` through the engine on each shard with at
+most eight shard operations in flight, and checked-adds the results as an
+unsigned 64-bit total. One missing table, shard failure, deadline, completed
+schema migration, or arithmetic overflow fails the whole request; no partial
+total is returned. The count is loaded once per table selection rather than on
+every pagination request.
+
+`scope: "all_physical_shards"` is literal. A properly partitioned table's sum
+is its logical row count. A replicated or global table counts every physical
+copy, so identical rows stored on two shards contribute twice. The physical
+browser cannot safely infer deduplication from the advisory catalog, especially
+for imported uncataloged tables. Each shard count is also a separate live read,
+not one atomic cross-shard snapshot, so concurrent writes can affect which
+instant each shard represents.
+
+`total_rows` uses a direct JSON integer through `9007199254740991`; larger
+values use the admin `uint64` tagged representation described below. The page
+summary continues to state the selected physical shard so the global count is
+not mistaken for globally merged displayed rows.
 
 ## Engine and JSON boundaries
 
-The HTTP adapter does not open shard files or call `rusqlite`. Discovery and row
-reads use BriskDB's bounded explicit-shard inspection operation. That operation
+The HTTP adapter does not open shard files or call `rusqlite`. Discovery, count,
+and row reads use BriskDB's bounded explicit-shard inspection operation. That operation
 uses the ordinary engine lifecycle, schema gate, per-shard pool and worker
 admission, cancellation, deadline, and effective result limits. SQLite must
 classify its generated statement as read-only before it is stepped.
@@ -119,14 +144,15 @@ addition does not change the experimental `/v1/query` response.
 
 Engine failures use the same fixed, redacted HTTP problem details as other HTTP
 operations. Login or session rejection returns HTTP 401 without echoing the
-submitted password or session token. A failed discovery or page read does not
-invalidate a valid browser session, and a later valid request can continue.
+submitted password or session token. A failed discovery, count, or page read
+does not invalidate a valid browser session, and a later valid request can
+continue.
 
 ## Deliberate non-goals
 
 Issue #106 does not add editing, arbitrary SQL, schema migration, backup,
 maintenance, query cancellation, a separate admin listener, stable pagination
-across concurrent writes, scatter/gather browsing, durable users or roles,
+across concurrent writes, general scatter/gather browsing, durable users or roles,
 credential configuration, or TLS. Those remain separate roadmap work. The
 browser adds no manifest table, file, version, checksum input, migration, or
 recovery step.

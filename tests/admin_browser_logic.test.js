@@ -49,6 +49,45 @@ test("ordinary cells keep their existing browser presentation", () => {
   assert.equal(logic.cellPresentation([0, 15, 255]).text, "0x000fff");
 });
 
+test("all-shard row counts are formatted without losing integer precision", () => {
+  assert.equal(logic.exactRowCount(1536282), "1536282");
+  let presentation = logic.rowCountPresentation(1536282, 2);
+  assert.equal(presentation.text, "1,536,282 total records across 2 physical shards");
+  assert.match(presentation.title, /Replicated records/);
+
+  const maximum = { $briskdb_type: "uint64", value: "18446744073709551615" };
+  assert.equal(logic.exactRowCount(maximum), "18446744073709551615");
+  presentation = logic.rowCountPresentation(maximum, 64);
+  assert.equal(
+    presentation.text,
+    "18,446,744,073,709,551,615 total records across 64 physical shards",
+  );
+
+  assert.equal(logic.rowCountPresentation(1, 1).text, "1 total record across 1 physical shard");
+  for (const invalid of [-1, Number.MAX_SAFE_INTEGER + 1, { $briskdb_type: "int64", value: "-1" }]) {
+    assert.equal(logic.exactRowCount(invalid), null);
+  }
+  assert.throws(() => logic.rowCountPresentation(-1, 2), /Invalid all-shard/);
+  assert.throws(() => logic.rowCountPresentation(0, 0), /Invalid all-shard/);
+});
+
+test("page summaries retain their selected physical-shard scope", () => {
+  assert.equal(
+    logic.pageSummary({ shard: 1, offset: 50, rows: [[1], [2]] }),
+    "Showing rows 51–52 on physical shard 1",
+  );
+  assert.equal(
+    logic.pageSummary({ shard: 0, offset: 0, rows: [] }),
+    "No rows on physical shard 0",
+  );
+});
+
+test("table response guards reject stale counts after table or shard changes", () => {
+  assert.equal(logic.acceptsTableResponse(4, 4, "orders", "orders"), true);
+  assert.equal(logic.acceptsTableResponse(3, 4, "orders", "orders"), false);
+  assert.equal(logic.acceptsTableResponse(4, 4, "orders", "payments"), false);
+});
+
 test("authentication epochs reject stale responses after login or logout starts", () => {
   const epochs = logic.createAuthEpoch();
   const initialSession = epochs.current();
