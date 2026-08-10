@@ -1,6 +1,9 @@
 (() => {
   "use strict";
 
+  const logic = globalThis.BriskDbAdminLogic;
+  const authEpoch = logic.createAuthEpoch();
+
   const state = {
     shard: 0,
     shardCount: 0,
@@ -39,6 +42,7 @@
   };
 
   async function api(path, options = {}) {
+    const requestAuthEpoch = authEpoch.current();
     const response = await fetch(path, {
       credentials: "same-origin",
       ...options,
@@ -50,7 +54,9 @@
     const contentType = response.headers.get("content-type") || "";
     const body = contentType.includes("json") ? await response.json() : null;
     if (response.status === 401) {
-      showLogin(body && body.message ? body.message : "Log in to continue.");
+      if (logic.acceptAuthenticationFailure(authEpoch, requestAuthEpoch)) {
+        showLogin(body && body.message ? body.message : "Log in to continue.");
+      }
       throw new Error("authentication_required");
     }
     if (!response.ok) {
@@ -78,6 +84,7 @@
     elements.loginView.classList.add("hidden");
     elements.browserView.classList.remove("hidden");
     elements.loginError.textContent = "";
+    elements.browserView.focus();
   }
 
   function clearPage(title, message, summary = "No rows loaded") {
@@ -136,6 +143,7 @@
       button.className = "table-button";
       button.textContent = displayTableName(table);
       button.title = displayTableName(table);
+      button.setAttribute("aria-pressed", "false");
       button.addEventListener("click", () => selectTable(table, button));
       elements.tableList.append(button);
     }
@@ -174,7 +182,9 @@
     state.table = table;
     state.offset = 0;
     for (const item of elements.tableList.querySelectorAll(".table-button")) {
-      item.classList.toggle("active", item === button);
+      const active = item === button;
+      item.classList.toggle("active", active);
+      item.setAttribute("aria-pressed", String(active));
     }
     elements.tableTitle.textContent = displayTableName(table);
     elements.tableSubtitle.textContent = `Read-only rows from physical shard ${state.shard}.`;
@@ -184,17 +194,10 @@
   function renderCell(value) {
     const cell = document.createElement("td");
     const content = document.createElement("span");
-    if (value === null) {
-      content.className = "null-value";
-      content.textContent = "NULL";
-    } else if (Array.isArray(value)) {
-      content.className = "binary-value";
-      content.textContent = value.length === 0 ? "0x" : `0x${value.map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
-    } else if (typeof value === "string") {
-      content.textContent = value;
-    } else {
-      content.textContent = JSON.stringify(value);
-    }
+    const presentation = logic.cellPresentation(value);
+    content.className = presentation.className;
+    content.textContent = presentation.text;
+    content.title = presentation.title;
     cell.append(content);
     return cell;
   }
@@ -268,6 +271,8 @@
 
   elements.loginForm.addEventListener("submit", async (event) => {
     event.preventDefault();
+    authEpoch.advance();
+    const loginAuthEpoch = authEpoch.current();
     elements.loginError.textContent = "";
     const submit = elements.loginForm.querySelector("button[type='submit']");
     submit.disabled = true;
@@ -276,10 +281,11 @@
         method: "POST",
         body: JSON.stringify({ username: elements.username.value, password: elements.password.value }),
       });
+      if (!authEpoch.isCurrent(loginAuthEpoch)) return;
       showBrowser();
       await loadOverview(0);
     } catch (error) {
-      if (error.message !== "authentication_required") {
+      if (authEpoch.isCurrent(loginAuthEpoch) && error.message !== "authentication_required") {
         elements.loginError.textContent = error.message;
       }
     } finally {
@@ -288,12 +294,18 @@
   });
 
   elements.logout.addEventListener("click", async () => {
+    authEpoch.advance();
+    const logoutAuthEpoch = authEpoch.current();
     try {
       await api("/admin/api/logout", { method: "POST" });
     } catch (_) {
       // The local page still returns to login when the server already forgot the session.
+    } finally {
+      if (authEpoch.isCurrent(logoutAuthEpoch)) {
+        authEpoch.advance();
+        showLogin();
+      }
     }
-    showLogin();
   });
 
   elements.shard.addEventListener("change", () => loadOverview(Number(elements.shard.value)));
@@ -313,12 +325,18 @@
     }
   });
 
+  const sessionAuthEpoch = authEpoch.current();
   api("/admin/api/session")
     .then(() => {
+      if (!authEpoch.isCurrent(sessionAuthEpoch)) return undefined;
       showBrowser();
       return loadOverview(0);
     })
     .catch((error) => {
-      if (error.message !== "authentication_required") showLogin(error.message);
+      if (!authEpoch.isCurrent(sessionAuthEpoch)) return;
+      if (error.message !== "authentication_required") {
+        authEpoch.advance();
+        showLogin(error.message);
+      }
     });
 })();

@@ -144,7 +144,8 @@ The embedded `/admin` application's login and cookie checks happen in the HTTP
 adapter before an engine operation exists. Wrong credentials and a missing,
 malformed, unknown, expired, or logged-out `briskdb_admin_session` therefore use
 HTTP 401 rather than inventing an `EngineErrorKind`. A protected call with an
-unusable session returns a fixed JSON response and a cookie-clearing header.
+unusable session returns a fixed JSON response without changing cookies, so an
+older unauthorized response cannot clear a newer login.
 Logout itself is idempotent: it returns success and clears the cookie even when
 no live token is present. These responses never echo the submitted password or
 cookie token. The public application shell and embedded assets remain loadable

@@ -39,8 +39,14 @@ CI update in the same pull request.
 
 Run these before publishing a branch:
 
+Admin-browser script checks require Node.js 18 or newer. The all-target Rust
+suite invokes the same script checks so both CI Rust lanes exercise them.
+
 ```bash
 cargo fmt --all --check
+node --check src/protocol/http/admin/logic.js
+node --check src/protocol/http/admin/app.js
+node --test tests/admin_browser_logic.test.js
 cargo test --locked --all-targets --all-features
 cargo test --locked --doc --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings

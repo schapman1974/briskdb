@@ -269,8 +269,9 @@ is marked `Unknown` because dynamic SQLite values do not guarantee one static
 type.
 
 The experimental `/v1/query` response exposes the ordered result directly. The
-admin row-page endpoint reuses the same column and cell conversion and wraps it
-with physical-shard and pagination metadata. For example, the existing query
+admin row-page endpoint reuses the same ordered columns and positional rows and
+wraps them with physical-shard and pagination metadata. Its large-integer
+display encoding differs as described below. For example, the existing query
 shape is:
 
 ```json
@@ -292,14 +293,21 @@ ordered column metadata with `"rows": []`. The `data_type` label is one of
 or `binary`. SQLite result columns currently report `unknown` because SQLite
 does not guarantee one static result type.
 
-Cell encoding retains the existing HTTP policy: nulls, booleans, signed and
-unsigned integers, finite floats, and valid text use their direct JSON forms;
-binary data is an array of byte-valued JSON integers; and exact decimals are
-JSON strings. `InvalidText` is rendered lossily with invalid UTF-8 byte
-sequences replaced by U+FFFD. Because JSON has no non-finite number syntax,
+The `/v1/query` cell encoding retains the existing HTTP policy: nulls, booleans,
+signed and unsigned integers, finite floats, and valid text use their direct
+JSON forms; binary data is an array of byte-valued JSON integers; and exact
+decimals are JSON strings. `InvalidText` is rendered lossily with invalid UTF-8
+byte sequences replaced by U+FFFD. Because JSON has no non-finite number syntax,
 infinite or `NaN` `Float64` values become `null`. Consumers that decode every
-JSON number through binary floating point must also account for precision loss
-when reading large `uint64` cells.
+`/v1/query` JSON number through binary floating point must also account for
+precision loss when reading large integer cells.
+
+The admin row-page response keeps direct JSON integers within
+`-9007199254740991..=9007199254740991`. It represents larger signed or unsigned
+values as
+`{"$briskdb_type":"int64","value":"exact decimal text"}` or the equivalent
+`uint64` tag, and the embedded browser displays that text verbatim. This
+admin-only tag avoids JavaScript rounding without changing `/v1/query`.
 
 This ordered response intentionally replaces the earlier experimental
 object-per-row shape, which collapsed duplicate names. Admin pages preserve the

@@ -1,6 +1,6 @@
 # Admin data browser
 
-Status: implemented for roadmap issue #106
+Status: implemented for roadmap issue #106 and hardened by issue #110
 
 BriskDB serves a small read-only data explorer from the existing HTTP listener.
 Open `/admin` (or `/admin/`) to use the embedded application. Its HTML, CSS,
@@ -34,7 +34,11 @@ tie-break. Logout invalidates only the presented session and always clears its
 cookie; other authenticated browsers remain independent. Logout is idempotent
 even when the cookie is absent or already unusable. Protected session,
 discovery, and row calls with a missing, malformed, unknown, expired, or
-logged-out cookie receive HTTP 401 with fixed JSON and a cookie-clearing header.
+logged-out cookie receive HTTP 401 with fixed JSON and no `Set-Cookie` header.
+Only explicit logout clears the cookie. This means an older unauthorized
+response cannot clear a session issued by a newer login. The application also
+tracks an authentication generation so an older response cannot replace a
+newer logged-in view.
 Session-cookie state is separate from a core `Session`: every inspection
 request still creates a short-lived engine session, and login does not create a
 multi-request SQL transaction.
@@ -45,6 +49,7 @@ multi-request SQL transaction.
 | --- | --- |
 | `GET /admin`, `GET /admin/` | Embedded application shell |
 | `GET /admin/assets/styles.css` | Embedded stylesheet |
+| `GET /admin/assets/logic.js` | Embedded, independently tested display and authentication-order logic |
 | `GET /admin/assets/app.js` | Embedded application code |
 | `POST /admin/api/login` | Accept JSON `{"username":"admin","password":"admin"}`; return `{"authenticated":true}` and set the session cookie |
 | `GET /admin/api/session` | Return `{"authenticated":true,"username":"admin"}` for a live cookie; otherwise return HTTP 401 |
@@ -52,10 +57,16 @@ multi-request SQL transaction.
 | `GET /admin/api/overview?shard=N` | Return `shard_count`, `selected_shard`, and the selected shard's binary-ordered `tables`; omitted `shard` selects zero |
 | `GET /admin/api/rows?shard=N&table=T&limit=L&offset=O` | Return one page as `shard`, `table`, `limit`, `offset`, `has_more`, ordered `columns`, and positional `rows`; limit defaults to 50 and offset to zero |
 
-The shell and its two assets are public so the application can render its login
+The shell and its three assets are public so the application can render its login
 state. Session, overview, and row calls require the server-side session check;
 logout remains an idempotent cookie-clearing operation. Hiding controls in
 JavaScript is not the access check.
+
+Display conversion and authentication-order transitions live in the small
+`logic.js` asset. Executable Node.js tests cover that pure logic, while a Rust
+integration test syntax-checks both scripts and runs the logic suite as part of
+the existing all-target CI command. Node.js is needed only for development
+tests; serving the embedded browser has no frontend build step.
 
 ## Physical-shard view
 
@@ -94,11 +105,17 @@ uses the ordinary engine lifecycle, schema gate, per-shard pool and worker
 admission, cancellation, deadline, and effective result limits. SQLite must
 classify its generated statement as read-only before it is stepped.
 
-Results retain the existing HTTP representation: ordered column metadata and
-positional row arrays. Duplicate or empty column names remain representable.
-Nulls, integers, finite floats, and valid text use direct JSON values; blobs are
+Results retain ordered column metadata and positional row arrays. Duplicate or
+empty column names remain representable. Nulls, finite floats, valid text, and
+integers in JavaScript's inclusive exact range
+`-9007199254740991..=9007199254740991` use direct JSON values. Larger signed or
+unsigned integers use
+`{"$briskdb_type":"int64","value":"exact decimal text"}` or the equivalent
+`uint64` tag in this admin-only response so the browser never rounds the
+displayed value. Blobs are
 arrays of byte-valued integers; decimals use strings; invalid UTF-8 text is
-rendered lossily; and non-finite floats become JSON `null`.
+rendered lossily; and non-finite floats become JSON `null`. This tagged integer
+addition does not change the experimental `/v1/query` response.
 
 Engine failures use the same fixed, redacted HTTP problem details as other HTTP
 operations. Login or session rejection returns HTTP 401 without echoing the

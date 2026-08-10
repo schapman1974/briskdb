@@ -23,6 +23,7 @@ use crate::core::{EngineError, EngineErrorKind, ResultSet, Statement, Value};
 
 const INDEX_HTML: &str = include_str!("admin/index.html");
 const STYLES_CSS: &str = include_str!("admin/styles.css");
+const LOGIC_JS: &str = include_str!("admin/logic.js");
 const APP_JS: &str = include_str!("admin/app.js");
 
 const ADMIN_USERNAME: &str = "admin";
@@ -33,6 +34,7 @@ const MAX_SESSIONS: usize = 128;
 const DEFAULT_PAGE_LIMIT: u16 = 50;
 const MAX_PAGE_LIMIT: u16 = 200;
 const MAX_PAGE_OFFSET: u64 = 1_000_000;
+const MAX_JAVASCRIPT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const TABLE_DISCOVERY_SQL: &str = "SELECT name FROM pragma_table_list \
      WHERE schema = 'main' AND type = 'table' \
        AND lower(name) NOT GLOB 'sqlite_*' \
@@ -134,6 +136,7 @@ pub(super) fn routes(state: HttpState) -> Router<HttpState> {
         .route("/admin", get(index))
         .route("/admin/", get(index))
         .route("/admin/assets/styles.css", get(styles))
+        .route("/admin/assets/logic.js", get(logic))
         .route("/admin/assets/app.js", get(script))
         .route("/admin/api/login", post(login))
         .route("/admin/api/logout", post(logout))
@@ -170,6 +173,10 @@ async fn index() -> Response {
 
 async fn styles() -> Response {
     static_response("text/css; charset=utf-8", STYLES_CSS)
+}
+
+async fn logic() -> Response {
+    static_response("text/javascript; charset=utf-8", LOGIC_JS)
 }
 
 async fn script() -> Response {
@@ -365,9 +372,23 @@ fn page_response(
     offset: u64,
     result: ResultSet,
 ) -> Response {
-    let super::QueryResponse {
-        columns, mut rows, ..
-    } = super::result_set_to_query_response(shard, result);
+    let (columns, rows) = result.into_parts();
+    let columns = columns
+        .into_iter()
+        .map(|column| super::QueryColumn {
+            name: column.name,
+            data_type: super::data_type_name(column.data_type),
+        })
+        .collect();
+    let mut rows = rows
+        .into_iter()
+        .map(|row| {
+            row.into_values()
+                .into_iter()
+                .map(admin_value_to_json)
+                .collect()
+        })
+        .collect::<Vec<_>>();
     let has_more = rows.len() > usize::from(limit)
         && offset
             .checked_add(u64::from(limit))
@@ -385,6 +406,25 @@ fn page_response(
             rows,
         },
     )
+}
+
+fn admin_value_to_json(value: Value) -> JsonValue {
+    match value {
+        Value::Int64(value) if value.unsigned_abs() > MAX_JAVASCRIPT_SAFE_INTEGER => {
+            tagged_integer("int64", value)
+        }
+        Value::UInt64(value) if value > MAX_JAVASCRIPT_SAFE_INTEGER => {
+            tagged_integer("uint64", value)
+        }
+        value => super::value_to_json(value),
+    }
+}
+
+fn tagged_integer(kind: &'static str, value: impl ToString) -> JsonValue {
+    json!({
+        "$briskdb_type": kind,
+        "value": value.to_string(),
+    })
 }
 
 fn table_names(result: ResultSet) -> Result<Vec<String>, EngineError> {
@@ -522,7 +562,7 @@ fn authentication_required() -> Response {
             "code": "authentication_required",
             "message": "Log in to continue."
         }),
-        Some(clear_session_cookie()),
+        None,
     )
 }
 
@@ -734,6 +774,11 @@ mod tests {
                 "--accent",
             ),
             (
+                "/admin/assets/logic.js",
+                "text/javascript; charset=utf-8",
+                "createAuthEpoch",
+            ),
+            (
                 "/admin/assets/app.js",
                 "text/javascript; charset=utf-8",
                 "textContent",
@@ -773,6 +818,15 @@ mod tests {
         assert!(APP_JS.contains("(empty table name)"));
         assert!(APP_JS.contains("(whitespace-only table name)"));
         assert!(APP_JS.contains("state.table === null"));
+        assert!(APP_JS.contains("logic.acceptAuthenticationFailure"));
+        assert!(APP_JS.contains("logic.cellPresentation"));
+        let logic_position = INDEX_HTML
+            .find("/admin/assets/logic.js")
+            .expect("the shell loads the tested browser logic");
+        let app_position = INDEX_HTML
+            .find("/admin/assets/app.js")
+            .expect("the shell loads the application script");
+        assert!(logic_position < app_position);
     }
 
     #[tokio::test]
@@ -848,12 +902,7 @@ mod tests {
         ] {
             let response = request(&app, Method::GET, uri, None, None).await;
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-            assert!(
-                response.headers()[SET_COOKIE]
-                    .to_str()
-                    .unwrap()
-                    .contains("Max-Age=0")
-            );
+            assert!(response.headers().get(SET_COOKIE).is_none());
         }
 
         let set_cookie = login_cookie(&app).await;
@@ -1065,7 +1114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_sessions_are_independent_and_unknown_tokens_are_cleared() {
+    async fn browser_sessions_are_independent_and_unknown_tokens_are_rejected() {
         let (_temp, app) = application();
         let first = login_cookie(&app).await;
         let second = login_cookie(&app).await;
@@ -1104,13 +1153,32 @@ mod tests {
             let response =
                 request(&app, Method::GET, "/admin/api/session", Some(invalid), None).await;
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-            assert!(
-                response.headers()[SET_COOKIE]
-                    .to_str()
-                    .unwrap()
-                    .contains("Max-Age=0")
-            );
+            assert!(response.headers().get(SET_COOKIE).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn stale_authentication_failure_cannot_clear_a_newer_login_cookie() {
+        let (_temp, app) = application();
+        let stale = request(
+            &app,
+            Method::GET,
+            "/admin/api/session",
+            Some("briskdb_admin_session=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            None,
+        )
+        .await;
+        let current = login_cookie(&app).await;
+        let current = current.to_str().unwrap().split(';').next().unwrap();
+
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        assert!(stale.headers().get(SET_COOKIE).is_none());
+        assert_eq!(
+            request(&app, Method::GET, "/admin/api/session", Some(current), None,)
+                .await
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -1159,6 +1227,74 @@ mod tests {
         .await;
         assert_eq!(body["rows"], json!([[1]]));
         assert_eq!(body["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn admin_page_response_preserves_extreme_integer_text() {
+        let result = ResultSet::new(
+            vec![
+                Column::new("minimum", DataType::Int64),
+                Column::new("maximum", DataType::Int64),
+                Column::new("unsigned", DataType::UInt64),
+            ],
+            vec![Row::new(vec![
+                Value::Int64(i64::MIN),
+                Value::Int64(i64::MAX),
+                Value::UInt64(u64::MAX),
+            ])],
+        )
+        .unwrap();
+        let body = body_json(page_response(0, "numbers".to_owned(), 50, 0, result)).await;
+
+        assert_eq!(
+            body["rows"],
+            json!([[{
+                "$briskdb_type": "int64",
+                "value": "-9223372036854775808"
+            }, {
+                "$briskdb_type": "int64",
+                "value": "9223372036854775807"
+            }, {
+                "$briskdb_type": "uint64",
+                "value": "18446744073709551615"
+            }]])
+        );
+    }
+
+    #[test]
+    fn admin_integer_encoding_is_exact_at_javascript_boundaries() {
+        let safe = MAX_JAVASCRIPT_SAFE_INTEGER as i64;
+        for value in [-safe, safe] {
+            assert_eq!(admin_value_to_json(Value::Int64(value)), json!(value));
+        }
+        assert_eq!(
+            admin_value_to_json(Value::Int64(-safe - 1)),
+            json!({"$briskdb_type":"int64","value":"-9007199254740992"})
+        );
+        assert_eq!(
+            admin_value_to_json(Value::Int64(safe + 1)),
+            json!({"$briskdb_type":"int64","value":"9007199254740992"})
+        );
+        assert_eq!(
+            admin_value_to_json(Value::Int64(i64::MIN)),
+            json!({"$briskdb_type":"int64","value":"-9223372036854775808"})
+        );
+        assert_eq!(
+            admin_value_to_json(Value::Int64(i64::MAX)),
+            json!({"$briskdb_type":"int64","value":"9223372036854775807"})
+        );
+        assert_eq!(
+            admin_value_to_json(Value::UInt64(MAX_JAVASCRIPT_SAFE_INTEGER)),
+            json!(MAX_JAVASCRIPT_SAFE_INTEGER)
+        );
+        assert_eq!(
+            admin_value_to_json(Value::UInt64(MAX_JAVASCRIPT_SAFE_INTEGER + 1)),
+            json!({"$briskdb_type":"uint64","value":"9007199254740992"})
+        );
+        assert_eq!(
+            admin_value_to_json(Value::UInt64(u64::MAX)),
+            json!({"$briskdb_type":"uint64","value":"18446744073709551615"})
+        );
     }
 
     #[tokio::test]
