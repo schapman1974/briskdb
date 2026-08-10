@@ -172,6 +172,8 @@ select { min-height: 2.55rem; padding: 0 2.2rem 0 0.75rem; }
 .content-header { display: flex; align-items: end; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
 .content-header h1 { margin: 0.15rem 0 0.4rem; font-size: clamp(1.5rem, 3vw, 2.1rem); letter-spacing: -0.035em; }
 .content-header p { margin-top: 0; }
+.record-count { margin-bottom: 0; color: var(--accent); font-size: 0.84rem; font-weight: 680; }
+.record-count.error { color: var(--error); }
 .page-size-control { display: grid; width: 8.5rem; gap: 0.35rem; }
 .status { min-height: 1.5rem; margin-bottom: 0.7rem; color: var(--muted); font-size: 0.82rem; }
 .status.error { color: var(--error); }

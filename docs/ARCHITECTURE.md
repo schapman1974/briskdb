@@ -32,7 +32,7 @@ server ---------> protocol::http
 | `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only logical catalog, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
-| `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, discovery, and page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
+| `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, discovery, all-shard physical counts, and page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
 | `protocol::postgres` | BriskDB-owned bounded protocol-3.0 framing, finite parameter validation, selected identity/status, per-connection core-session ownership, query-deferral responses, and private compile/query-parser seam around the exactly pinned `pgwire` library | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, loopback validation, separate HTTP/PostgreSQL listener binding, finite connection-task supervision, and shared graceful/forced draining | SQL parsing, PostgreSQL wire framing, or storage implementation details |
@@ -122,8 +122,9 @@ Issue #106 adds an embedded application under `/admin` on the existing HTTP
 listener. The public shell, stylesheet, and JavaScript are static bytes compiled
 into the binary. Same-origin JSON handlers validate the temporary `admin` /
 `admin` login, retain at most 128 opaque sessions in process memory for an
-absolute eight hours, and enforce the cookie on session, discovery, and row-page
-operations. Logout revokes a presented token when possible and always clears
+absolute eight hours, and enforce the cookie on session, discovery, all-shard
+physical-count, and row-page operations. Logout revokes a presented token when
+possible and always clears
 the cookie, so repeating it is harmless. These browser sessions are adapter
 state, not core SQL sessions, and are neither written to storage nor recovered
 after restart.
@@ -142,8 +143,11 @@ returns only ordinary application tables, and excludes ASCII-case-insensitive
 the browser. It validates the returned table identity, safely quotes that
 identifier, binds finite limit/offset values, and exposes at most 200 rows from
 one shard. It never opens a database file or imports `rusqlite` in the adapter.
-Separate offset pages are live reads, not a transaction, stable ordering, or a
-cross-shard snapshot. The complete route and representation contract is in the
+The specialized count handler verifies the table on every shard, runs bounded
+concurrent read-only counts through the same engine boundary, and returns only
+a checked physical-row sum. Separate pages and shard counts are live reads, not
+a transaction, stable ordering, or a cross-shard snapshot. The complete route
+and representation contract is in the
 [admin data browser](ADMIN_BROWSER.md).
 
 ## SQL parser boundary
@@ -565,7 +569,8 @@ reporting without exposing the storage implementation.
 HTTP SQL state remains request-local: each execute or query request creates a
 fresh session and initializes its routing context from the request's
 `shard_key`. Each admin inspection likewise creates a fresh core session but
-selects a validated physical shard through the dedicated read-only boundary.
+selects a validated physical shard through the dedicated read-only boundary;
+the count handler coordinates multiple such explicitly bounded inspections.
 Consequently, session settings and transactions cannot span HTTP requests. The
 eight-hour browser cookie authenticates the admin JSON calls; it does not retain
 SQL session state. Schema-migration broadcast and status calls also go through

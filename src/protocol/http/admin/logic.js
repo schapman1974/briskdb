@@ -36,6 +36,35 @@
     return { text, className: "", title: text };
   }
 
+  function exactRowCount(value) {
+    if (Number.isSafeInteger(value) && value >= 0) return String(value);
+    if (taggedInteger(value) && !value.value.startsWith("-")) return value.value;
+    return null;
+  }
+
+  function rowCountPresentation(value, shardCount) {
+    const exact = exactRowCount(value);
+    if (exact === null || !Number.isInteger(shardCount) || shardCount < 1) {
+      throw new Error("Invalid all-shard row count response.");
+    }
+    const formatted = exact.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    return {
+      text: `${formatted} total record${exact === "1" ? "" : "s"} across ${shardCount} physical shard${shardCount === 1 ? "" : "s"}`,
+      title: "Exact sum of physical table rows. Replicated records are counted once per shard.",
+    };
+  }
+
+  function acceptsTableResponse(requestId, currentRequestId, requestedTable, currentTable) {
+    return requestId === currentRequestId && requestedTable === currentTable;
+  }
+
+  function pageSummary(page) {
+    if (page.rows.length === 0) return `No rows on physical shard ${page.shard}`;
+    const first = page.offset + 1;
+    const last = page.offset + page.rows.length;
+    return `Showing rows ${first}–${last} on physical shard ${page.shard}`;
+  }
+
   function createAuthEpoch() {
     let current = 0;
     return Object.freeze({
@@ -56,8 +85,12 @@
 
   globalThis.BriskDbAdminLogic = Object.freeze({
     acceptAuthenticationFailure,
+    acceptsTableResponse,
     cellPresentation,
     createAuthEpoch,
+    exactRowCount,
+    pageSummary,
+    rowCountPresentation,
     taggedInteger,
   });
 })();

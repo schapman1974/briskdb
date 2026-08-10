@@ -13,6 +13,7 @@
     hasMore: false,
     overviewRequest: 0,
     rowsRequest: 0,
+    countRequest: 0,
   };
 
   const elements = {
@@ -29,6 +30,7 @@
     tableCount: document.querySelector("#table-count"),
     tableTitle: document.querySelector("#table-title"),
     tableSubtitle: document.querySelector("#table-subtitle"),
+    recordCount: document.querySelector("#record-count"),
     pageSize: document.querySelector("#page-size"),
     status: document.querySelector("#status"),
     empty: document.querySelector("#empty-state"),
@@ -73,6 +75,7 @@
   function showLogin(message = "") {
     state.overviewRequest += 1;
     state.rowsRequest += 1;
+    state.countRequest += 1;
     elements.browserView.classList.add("hidden");
     elements.loginView.classList.remove("hidden");
     elements.loginError.textContent = message;
@@ -99,13 +102,22 @@
     elements.next.disabled = true;
   }
 
+  function setRecordCount(message, isError = false, isBusy = false, title = "") {
+    elements.recordCount.textContent = message;
+    elements.recordCount.classList.toggle("error", isError);
+    elements.recordCount.setAttribute("aria-busy", String(isBusy));
+    elements.recordCount.title = title;
+  }
+
   function resetTable(message = "Select an application table to inspect its rows.") {
     state.rowsRequest += 1;
+    state.countRequest += 1;
     state.table = null;
     state.offset = 0;
     state.hasMore = false;
     elements.tableTitle.textContent = "Choose a table";
     elements.tableSubtitle.textContent = message;
+    setRecordCount("No total loaded");
     clearPage("No table selected", "Choose a table from the sidebar to browse a bounded, read-only page.");
   }
 
@@ -188,7 +200,7 @@
     }
     elements.tableTitle.textContent = displayTableName(table);
     elements.tableSubtitle.textContent = `Read-only rows from physical shard ${state.shard}.`;
-    await loadRows();
+    await Promise.all([loadRows(), loadCount()]);
   }
 
   function renderCell(value) {
@@ -234,9 +246,7 @@
       elements.empty.querySelector("h2").textContent = page.offset === 0 ? "This table is empty" : "No rows on this page";
       elements.empty.querySelector("p").textContent = "Try the previous page or select another table.";
     }
-    const first = page.rows.length === 0 ? 0 : page.offset + 1;
-    const last = page.offset + page.rows.length;
-    elements.summary.textContent = page.rows.length === 0 ? "No rows" : `Showing rows ${first}–${last}`;
+    elements.summary.textContent = logic.pageSummary(page);
     elements.previous.disabled = page.offset === 0;
     elements.next.disabled = !page.has_more;
   }
@@ -265,6 +275,28 @@
       if (error.message !== "authentication_required") {
         clearPage("Rows unavailable", error.message, "No rows loaded");
         setStatus(error.message, true);
+      }
+    }
+  }
+
+  async function loadCount() {
+    if (state.table === null) return;
+    const requestedTable = state.table;
+    const requestId = ++state.countRequest;
+    setRecordCount("Calculating total records across all physical shards…", false, true);
+    const query = new URLSearchParams({ table: requestedTable });
+    try {
+      const count = await api(`/admin/api/count?${query.toString()}`);
+      if (!logic.acceptsTableResponse(requestId, state.countRequest, requestedTable, state.table)) return;
+      if (count.table !== requestedTable || count.scope !== "all_physical_shards") {
+        throw new Error("Invalid all-shard row count response.");
+      }
+      const presentation = logic.rowCountPresentation(count.total_rows, count.shard_count);
+      setRecordCount(presentation.text, false, false, presentation.title);
+    } catch (error) {
+      if (!logic.acceptsTableResponse(requestId, state.countRequest, requestedTable, state.table)) return;
+      if (error.message !== "authentication_required") {
+        setRecordCount("Total across all physical shards unavailable", true, false, error.message);
       }
     }
   }

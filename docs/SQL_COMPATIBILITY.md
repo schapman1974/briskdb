@@ -86,7 +86,7 @@ path; they do not pass through these opt-in SQL layers.
 | HTTP `/v1/execute` | Experimental | One SQLite statement with positional parameters | Required caller-provided `shard_key` |
 | HTTP `/v1/query` | Experimental | One raw SQLite statement prepared transiently by the row-returning path; no session cache | Required caller-provided `shard_key` |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
-| HTTP `/admin` browser | Experimental, read-only | No caller SQL; server-generated physical table discovery and bounded `SELECT *` pages | Required validated physical shard number; never a routed or scatter query |
+| HTTP `/admin` browser | Experimental, read-only | No caller SQL; server-generated physical table discovery, exact all-shard physical `COUNT(*)`, and bounded `SELECT *` pages | Pages require a validated physical shard; the specialized count fans out with bounded concurrency but is not a general scatter-query surface |
 | PostgreSQL wire protocol | Protocol-3.0 startup/session only on loopback; SQL flow deferred | No SQL accepted over the wire; simple `Query` and extended `Parse` return fixed `0A000` responses | Startup selects an exact logical database; no wire SQL request reaches planning or routing |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
@@ -127,10 +127,16 @@ execution. The engine still requires SQLite to classify the statement as
 read-only and applies its schema gate, pool/worker admission, cancellation,
 deadline, and effective result-byte and row budgets.
 
+Table selection separately verifies the exact ordinary table on every shard
+and runs bounded read-only `COUNT(*)` inspections. It returns the checked sum of
+physical rows, so replicated rows count once per shard. The sum is not a
+cross-shard snapshot and does not make arbitrary SQL scatterable.
+
 Each offset page is a new committed read. No order is promised for a general
 SQLite table scan, and concurrent changes may move rows between pages. The
-browser does not merge physical shards, preserve a multi-page snapshot, accept
-arbitrary filters or SQL, or implement the planned scatter/gather query path.
+browser does not merge physical row pages, preserve a multi-page snapshot,
+accept arbitrary filters or SQL, or implement the planned general
+scatter/gather query path.
 The full route, login, and live-view contract is in the [admin data
 browser](ADMIN_BROWSER.md).
 

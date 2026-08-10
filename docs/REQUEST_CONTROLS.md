@@ -153,11 +153,15 @@ or recovered at startup.
 Each authenticated discovery or row-page call separately creates a core
 `Session`. Discovery uses one engine operation. A row page uses one operation to
 verify the exact visible table identity, followed by a separately bounded page
-read that repeats the visibility predicate before returning data. Cancelling,
-failing, or completing either operation does not extend the cookie lifetime or
-invalidate an otherwise valid browser session. Conversely, logging out prevents
-later admin requests but does not retroactively cancel an inspection already
-admitted to the engine.
+read that repeats the visibility predicate before returning data. The separate
+all-shard count uses at most eight concurrent shard tasks. Each task owns a core
+session, verifies the ordinary table, and runs one exact `COUNT(*)`; all tasks
+share one request deadline and only a checked complete sum is returned. A
+completed schema-generation change makes the request retryable instead of
+mixing generations. Cancelling, failing, or completing any operation does not
+extend the cookie lifetime or invalidate an otherwise valid browser session.
+Conversely, logging out prevents later admin requests but does not retroactively
+cancel an inspection already admitted to the engine.
 
 ## Schema-migration controls
 
