@@ -22,6 +22,9 @@ server ---------> protocol::http
     |
     +-- PostgreSQL TCP lifecycle
         (accept/close placeholder; no core request)
+
+protocol::postgres ---------> core
+    (selected pgwire seam; not connected to the listener yet)
 ```
 
 | Module | Responsibility | Must not own |
@@ -30,6 +33,7 @@ server ---------> protocol::http
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, discovery, and page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
+| `protocol::postgres` | BriskDB-owned adapter and per-connection core-session boundary around the exactly pinned `pgwire` library; private compile/query-parser and fixed-error conversion proof | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, separate HTTP/PostgreSQL listener binding, tracked Axum HTTP/1 connection lifecycle, and the temporary PostgreSQL accept/close loop | SQL parsing, PostgreSQL wire messages, or storage implementation details |
 
@@ -99,11 +103,19 @@ option. The process default enables loopback `127.0.0.1:5433`. See the
 [PostgreSQL listener contract](POSTGRES_LISTENER.md) for the full grammar and
 startup order.
 
-Until the subsequent wire-adapter work, the PostgreSQL listener is a server
-lifecycle placeholder: it accepts and immediately drops each stream without
+Issue #29 selects exact `pgwire` 0.36.3 with only `server-api` and adds the
+BriskDB-owned `protocol::postgres::{Adapter, Connection}` seam. Each connection
+created through that seam owns one core `Session`; a private parser bridge and
+loopback compatibility test prove that the selected handler/socket API can call
+the engine without exposing dependency types to core or server contracts. See
+the [adapter decision record](POSTGRES_ADAPTER.md).
+
+The production PostgreSQL listener remains a server-lifecycle placeholder: it
+accepts and immediately drops each stream without constructing that adapter,
 reading bytes, writing a PostgreSQL frame, opening a session, or calling the
-engine. This keeps binding, concurrent acceptance, startup cleanup, and shared
-shutdown testable without moving protocol behavior into `server`.
+engine. Issue #30 owns that wiring and startup behavior. This keeps binding,
+concurrent acceptance, startup cleanup, and shared shutdown testable without
+moving protocol behavior into `server`.
 
 ## Admin browser boundary
 
@@ -719,9 +731,11 @@ response type. SQL and storage classify SQLite failures from primary and
 extended result codes plus operation context; they never parse SQLite error
 messages. Protocol-owned tables map each kind to an HTTP status and safe RFC
 9457 problem, a PostgreSQL SQLSTATE, and a MySQL error number/SQLSTATE pair.
-The PostgreSQL and MySQL entries are mapping contracts for future wire
-adapters. The PostgreSQL TCP placeholder emits no protocol frame and therefore
-does not encode the PostgreSQL mapping yet; no MySQL listener exists yet.
+The selected PostgreSQL adapter probe consumes the PostgreSQL mapping behind a
+private dependency boundary; the MySQL entry remains a contract for its future
+adapter. The PostgreSQL TCP placeholder emits no protocol frame and therefore
+does not expose the PostgreSQL mapping on the network yet; no MySQL listener
+exists yet.
 
 Client responses use fixed, safe text for the error kind. Diagnostic display
 text and source chains stay available internally but are never serialized, so

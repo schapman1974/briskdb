@@ -906,6 +906,14 @@ open and its existing recovery precede listener binding, a later bind failure
 does not undo a migration or recovery transaction that already committed; a
 subsequent startup revalidates the same version-7 layout normally.
 
+Issue #29's pinned `pgwire` dependency, `protocol::postgres::Adapter`, and
+per-connection core `Session` seam are also process-only code and memory state.
+They add no manifest or shard table, header value, format version, digest input,
+routing metadata, schema fingerprint, journal record, file, or recovery step.
+The production PostgreSQL listener does not construct that state yet. A probe
+prepare is transient prepared metadata and is explicitly closed in tests; it
+does not write application rows or schema.
+
 The checksums are corruption detectors, not authentication. Both use unkeyed
 BLAKE3 and are writable by anyone who can modify the data directory. The
 manifest root covers canonical control-plane values, not raw SQLite pages. The

@@ -1,8 +1,10 @@
 # PostgreSQL listener lifecycle
 
 Issue #28 adds the process and TCP-lifecycle boundary for a future PostgreSQL
-wire adapter. It deliberately does not implement a PostgreSQL startup packet,
-authentication, query flow, error response, or any other wire message.
+wire adapter. Issue #29 subsequently selects the adapter library without
+activating it here. The listener deliberately does not implement a PostgreSQL
+startup packet, authentication, query flow, error response, or any other wire
+message.
 
 ## Process configuration
 
@@ -67,8 +69,8 @@ the supported retry.
 
 ## Placeholder connection behavior
 
-While issue #28 is the latest completed PostgreSQL item, the listener accepts
-each TCP connection and immediately drops the stream:
+After issue #29, the listener still accepts each TCP connection and immediately
+drops the stream:
 
 - it reads no client bytes;
 - it writes no server bytes or PostgreSQL error frame;
@@ -79,9 +81,9 @@ each TCP connection and immediately drops the stream:
 
 Continuously accepting and closing prevents the operating-system backlog from
 filling while making the incomplete wire behavior deterministic. Emitting even
-a nominal PostgreSQL frame is deferred to the BriskDB-owned adapter selected by
-the following roadmap work. This TCP scaffold must not be described as a
-usable PostgreSQL interface.
+a nominal PostgreSQL frame is deferred to production activation of the
+selected BriskDB-owned adapter in issue #30. This TCP scaffold must not be
+described as a usable PostgreSQL interface.
 
 HTTP acceptance and placeholder PostgreSQL acceptance share one server
 lifecycle. Neither listener implements routing, parsing, planning, or SQLite
@@ -101,15 +103,18 @@ the server future closes both listener sockets and enters the same resumable
 
 ## Compatibility and storage boundary
 
-This issue adds no dependency on `pgwire` or another PostgreSQL implementation.
-It changes no HTTP route, JSON body, SQL subset, planner rule, typed result,
-engine error mapping, manifest table, shard header, migration journal, stored
-row, or storage-format version. Listener settings are process configuration and
-are not persisted in `manifest.sqlite` or a shard.
+Issue #28 itself adds no wire dependency. Issue #29 pins `pgwire` 0.36.3 behind
+`protocol::postgres`, with default features disabled and only `server-api`
+enabled. That selection changes no HTTP route, JSON body, SQL subset, planner
+rule, typed result, engine error mapping, manifest table, shard header,
+migration journal, stored row, or storage-format version. Listener settings and
+the inactive adapter seam are not persisted in `manifest.sqlite` or a shard.
 
-The PostgreSQL SQLSTATE table remains a tested mapping for the future adapter;
-the placeholder emits none of those mappings. The next roadmap items own the
-adapter dependency and PostgreSQL startup/session messages.
+The PostgreSQL SQLSTATE table is consumed by the adapter compatibility probe;
+the placeholder emits none of those mappings. The next roadmap item owns
+PostgreSQL startup/session messages and production socket integration. Library
+selection details and constraints are normative in the
+[PostgreSQL adapter decision record](POSTGRES_ADAPTER.md).
 
 ## Verification contract
 

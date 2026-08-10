@@ -1,9 +1,10 @@
 # Request controls and shutdown
 
 BriskDB applies cancellation, deadlines, result budgets, and shutdown at the
-protocol-neutral `Engine` boundary. HTTP and future PostgreSQL/MySQL wire
-adapters therefore share the same resource and cleanup semantics. The current
-PostgreSQL TCP placeholder never creates an engine request.
+protocol-neutral `Engine` boundary. HTTP, the selected PostgreSQL adapter seam,
+and a future MySQL adapter therefore share the same resource and cleanup
+semantics. The current PostgreSQL TCP placeholder never creates an engine
+request.
 
 ## Per-request context
 

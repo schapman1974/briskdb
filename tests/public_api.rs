@@ -8,7 +8,7 @@ use std::{
 use axum::Router;
 use briskdb::{
     api, core,
-    protocol::{error, http},
+    protocol::{error, http, postgres},
     server, sql, storage,
 };
 
@@ -232,6 +232,34 @@ fn protocol_neutral_sql_parser_facade_is_public_bounded_and_opt_in() {
     raw_sql.push_str(&" ".repeat(sql::MAX_PARSED_SQL_BYTES));
     let result = database.query("parser-opt-in", &raw_sql, &[]).unwrap();
     assert_eq!(result.rows()[0].get(0), Some(&core::Value::Int64(1)));
+}
+
+#[tokio::test]
+async fn postgres_adapter_boundary_is_public_session_scoped_and_not_a_listener() {
+    fn assert_send_sync<T: Send + Sync + 'static>() {}
+    assert_send_sync::<postgres::Adapter>();
+    assert_send_sync::<postgres::Connection>();
+
+    let temp = tempfile::tempdir().unwrap();
+    let engine = core::Engine::open(temp.path(), 2).await.unwrap();
+    let adapter = postgres::Adapter::new(engine.clone());
+    let first = adapter.open_connection();
+    let second = adapter.open_connection();
+
+    assert_ne!(first.session_id(), second.session_id());
+    assert_eq!(first.status().await.unwrap().shard_count(), 2);
+    assert_eq!(second.status().await.unwrap().shard_count(), 2);
+    assert!(format!("{adapter:?}").contains("shard_count"));
+    assert!(format!("{first:?}").contains("session_id"));
+
+    first.close().await.unwrap();
+    assert_eq!(
+        first.status().await.unwrap_err().kind(),
+        core::EngineErrorKind::FailedPrecondition
+    );
+    assert_eq!(second.status().await.unwrap().shard_count(), 2);
+    second.close().await.unwrap();
+    engine.shutdown().await.unwrap();
 }
 
 #[test]

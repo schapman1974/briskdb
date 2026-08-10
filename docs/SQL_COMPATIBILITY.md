@@ -46,9 +46,10 @@ than claiming to be a drop-in PostgreSQL or MySQL replacement.
 ## Current implementation
 
 Only the experimental HTTP network interface can execute network requests
-today. A separately configured PostgreSQL TCP listener now accepts and
-immediately closes streams as a lifecycle scaffold; it implements no
-PostgreSQL wire message. There is no MySQL listener. The public Rust SQL facade
+today. `pgwire` 0.36.3 is selected and pinned behind a BriskDB-owned adapter
+seam, while the separately configured PostgreSQL TCP listener still accepts
+and immediately closes streams; it implements no PostgreSQL wire message.
+There is no MySQL listener. The public Rust SQL facade
 can parse an explicitly selected SQLite, PostgreSQL, or MySQL dialect, consume
 that result with
 `validate_common_subset(ParsedSql)`, borrow the result with
@@ -83,13 +84,14 @@ path; they do not pass through these opt-in SQL layers.
 | HTTP `/v1/query` | Experimental | One raw SQLite statement prepared transiently by the row-returning path; no session cache | Required caller-provided `shard_key` |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
 | HTTP `/admin` browser | Experimental, read-only | No caller SQL; server-generated physical table discovery and bounded `SELECT *` pages | Required validated physical shard number; never a routed or scatter query |
-| PostgreSQL wire protocol | TCP lifecycle scaffold; wire protocol planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; placeholder listener accepts then closes without protocol bytes | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
+| PostgreSQL wire protocol | `pgwire` 0.36.3 selected behind a BriskDB-owned core-session seam; production TCP listener remains an accept/close scaffold | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; private parser compatibility probe only | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; production wire mapping planned |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
 The parser, subset validator, statement classifier, placeholder normalizer, SQL
-translator, shard-key inference function, engine planner, and prepared
-lifecycle are implemented Rust APIs, not PostgreSQL or MySQL network
-interfaces. The PostgreSQL socket scaffold does not connect those APIs to the
+translator, shard-key inference function, engine planner, prepared lifecycle,
+and PostgreSQL adapter seam are implemented Rust APIs, not PostgreSQL or MySQL
+network interfaces. The private issue-29 probe composes the selected library
+with those APIs, but the PostgreSQL socket scaffold does not connect them to the
 network. They do not change any current HTTP row in this table.
 
 Every HTTP database operation now calls the same protocol-neutral async engine
@@ -310,10 +312,12 @@ SQLite result codes and operation context; error-message text is never parsed
 to choose an error kind.
 
 The same kinds already have defined PostgreSQL SQLSTATE and MySQL error
-number/SQLSTATE mappings, but those are contracts for the planned adapters.
-The PostgreSQL TCP placeholder emits no error frame, and no MySQL listener is
-available. See the complete [error taxonomy and mapping table](ERRORS.md) and
-the [PostgreSQL listener lifecycle](POSTGRES_LISTENER.md).
+number/SQLSTATE mappings. The private selected-adapter probe consumes the
+PostgreSQL mapping; the MySQL mapping remains a contract for its future
+adapter. The PostgreSQL TCP placeholder emits no error frame, and no MySQL
+listener is available. See the complete
+[error taxonomy and mapping table](ERRORS.md) and the
+[PostgreSQL listener lifecycle](POSTGRES_LISTENER.md).
 
 ## SQL surface
 
@@ -630,12 +634,15 @@ boundary are normative in
 
 ## PostgreSQL differences
 
-The bound PostgreSQL TCP scaffold will host an adapter targeting the
-frontend/backend wire protocol and a deliberately small SQL compatibility
-surface. It currently accepts and closes without a handshake; PostgreSQL-
-specific behavior is not implemented unless listed as implemented in this
-document. Configuration and lifecycle semantics are normative in the
-[PostgreSQL listener contract](POSTGRES_LISTENER.md).
+The bound PostgreSQL TCP scaffold will host the selected `pgwire` 0.36.3
+adapter targeting the frontend/backend protocol and a deliberately small SQL
+compatibility surface. The BriskDB-owned adapter/core-session boundary and a
+private parser/socket fit probe exist, but the listener currently accepts and
+closes without a handshake. PostgreSQL-specific behavior is not implemented
+unless listed as implemented in this document. Configuration and lifecycle
+semantics are normative in the [PostgreSQL listener
+contract](POSTGRES_LISTENER.md); dependency and adapter constraints are
+normative in the [adapter decision record](POSTGRES_ADAPTER.md).
 
 | Area | PostgreSQL | BriskDB contract |
 | --- | --- | --- |

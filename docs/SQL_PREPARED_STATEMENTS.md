@@ -395,10 +395,12 @@ handling to that type.
 
 ## Dialect and adapter compatibility
 
-The lifecycle is implemented as a Rust engine API and is not yet connected to
-a wire adapter. The PostgreSQL TCP scaffold accepts and closes without creating
-a session; there is no MySQL listener. All three typed input paths share the
-same planning and result path:
+The lifecycle is implemented as a Rust engine API. The selected PostgreSQL
+adapter seam privately proves that wire preparation can enter that lifecycle,
+but no wire-message path is connected to the production listener yet. The
+PostgreSQL TCP scaffold accepts and closes without creating a session; there is
+no MySQL listener. All three typed input paths share the same planning and
+result path:
 
 | Input | Required mode and parameter form | Prepared execution result |
 | --- | --- | --- |
