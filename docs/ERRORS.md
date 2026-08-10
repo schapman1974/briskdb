@@ -3,9 +3,11 @@
 BriskDB classifies failures once, at the protocol-neutral engine boundary. An
 `EngineErrorKind` is stable error identity; protocol adapters translate that
 identity without inspecting an error message. The HTTP adapter uses the mapping
-today. The PostgreSQL and MySQL columns below are contracts for their planned
-wire adapters. The current PostgreSQL TCP placeholder accepts and closes
-without emitting an error frame, and there is no MySQL listener yet.
+today. The selected PostgreSQL adapter seam also converts every engine kind
+through the PostgreSQL column in its compatibility tests, but the current
+PostgreSQL TCP placeholder accepts and closes without emitting an error frame.
+The MySQL column remains a contract for its planned adapter, and there is no
+MySQL listener yet.
 
 Malformed listener configuration is rejected by the binary before server
 startup. Listener bind/accept failures terminate the shared server lifecycle
@@ -274,6 +276,13 @@ contract](SQL_PREPARED_STATEMENTS.md).
 The core contains no HTTP, PostgreSQL, or MySQL response types. Conversely,
 protocol adapters do not inspect SQLite errors. This lets every frontend share
 one error identity while retaining its own response encoding.
+
+Issue #29's private `pgwire` bridge constructs `ErrorInfo` only from
+`postgres_error(error.kind())`: severity `ERROR`, the fixed SQLSTATE, and the
+fixed public message. Its exhaustive test uses a private diagnostic sentinel
+for every kind and proves that sentinel is absent. This is a library-fit
+contract, not live listener behavior; issue #30 and later transaction work own
+production severity, connection-fatal policy, and failed-transaction state.
 
 Manifest compatibility uses the same protocol-neutral kinds. A foreign file,
 a manifest newer than the running binary, or a requested shard-count mismatch

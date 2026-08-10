@@ -39,6 +39,13 @@ PostgreSQL endpoint is currently an accept/close lifecycle scaffold, not a wire
 compatibility claim. Its exact process behavior is documented in
 [PostgreSQL listener lifecycle](POSTGRES_LISTENER.md).
 
+The selected PostgreSQL library is pinned to `pgwire` 0.36.3 with only its
+`server-api` feature. It is the newest release declaring compatibility with the
+project's Rust 1.85 minimum; 0.37 and newer require Rust 1.89. CI compiles the
+locked adapter/core compatibility probe on Rust 1.85 and stable. This library
+selection does not change the production endpoint's placeholder behavior; see
+the [adapter decision record](POSTGRES_ADAPTER.md).
+
 The same runner exercises the embedded `/admin` shell and assets, temporary
 login/session lifecycle, physical-shard table discovery, and bounded row-page
 JSON contract without contacting third-party asset hosts. These are HTTP and

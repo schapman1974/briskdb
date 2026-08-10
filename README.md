@@ -18,6 +18,10 @@ planned PostgreSQL/MySQL wire compatibility.
 The [PostgreSQL listener contract](docs/POSTGRES_LISTENER.md) defines its
 address configuration, disabled state, startup order, placeholder connection
 behavior, and shared shutdown lifecycle.
+The [PostgreSQL adapter decision record](docs/POSTGRES_ADAPTER.md) selects the
+exact wire-library version and features, defines the BriskDB-owned connection
+boundary, and records the work that remains before that listener speaks the
+protocol.
 The [SQL parser decision record](docs/SQL_PARSER.md) defines the shared,
 dialect-explicit syntax boundary and its resource and dependency limits.
 The [common SQL subset contract](docs/SQL_SUBSET.md) defines the opt-in,
@@ -40,8 +44,8 @@ protocol-neutral prepare/bind/describe/execute lifecycle, session-scoped
 statement and portal caches, exact resource limits, metadata refresh, and
 supported physical-target execution boundary shared by future adapters.
 The [error contract](docs/ERRORS.md) defines stable engine error kinds, safe
-HTTP problem details, and the mappings reserved for future PostgreSQL and MySQL
-wire adapters.
+HTTP problem details, the mapping consumed by the private PostgreSQL adapter
+probe, and the mapping reserved for a future MySQL wire adapter.
 The [request-control contract](docs/REQUEST_CONTROLS.md) defines cancellation,
 deadlines, materialized-result budgets, and graceful shutdown.
 The [admin data-browser contract](docs/ADMIN_BROWSER.md) defines the embedded
@@ -67,8 +71,9 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Request cancellation and deadlines that interrupt SQLite and await cleanup
 - Finite per-query row/logical-byte budgets with no partial results
 - Explicit graceful drain, forced cancellation, and blocking handle cleanup
-- Independently configured HTTP and PostgreSQL TCP listeners; the PostgreSQL
-  listener currently accepts and closes connections pending wire-adapter work
+- Independently configured HTTP and PostgreSQL TCP listeners; `pgwire` 0.36.3
+  is pinned behind a BriskDB-owned adapter seam while the PostgreSQL listener
+  continues to accept and close connections pending startup/session work
 - An embedded read-only browser at `/admin` for inspecting user tables and
   bounded row pages on one explicitly selected physical shard
 - Protocol-neutral typed values, ordered columns, positional rows, and results
@@ -127,10 +132,12 @@ cargo run -- --postgres-listen disabled
 BRISKDB_POSTGRES_LISTEN=disabled cargo run
 ```
 
-Issue #28 supplies only the separately managed TCP endpoint. Until the
-PostgreSQL wire adapter lands, every accepted connection is closed immediately
-without reading or writing protocol bytes, and no PostgreSQL driver can execute
-a request through it. See the [listener contract](docs/POSTGRES_LISTENER.md).
+Issue #28 supplies the separately managed TCP endpoint, and issue #29 selects
+the wire library without activating it on that endpoint. Until startup/session
+support lands, every accepted connection is closed immediately without reading
+or writing protocol bytes, and no PostgreSQL driver can execute a request
+through it. See the [listener contract](docs/POSTGRES_LISTENER.md) and
+[adapter decision record](docs/POSTGRES_ADAPTER.md).
 
 The HTTP listener also serves the embedded data explorer at
 <http://127.0.0.1:7654/admin>. Its temporary credentials are `admin` / `admin`.

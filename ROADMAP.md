@@ -225,10 +225,10 @@ the engine regardless of its eventual wire protocol.
 
 - [x] Run a separate configurable listener, initially
   `--postgres-listen 127.0.0.1:5433`; allow it to be disabled.
-- [ ] Spike the current `pgwire` crate against the core interfaces before
-  committing to it; `pgwire` 0.40.5 is the leading candidate as of this roadmap.
-  Pin the selected pre-1.0 version and keep protocol code behind a BriskDB-owned
-  adapter boundary.
+- [x] Spike `pgwire` against the core interfaces and select exact version
+  `0.36.3`, the newest release compatible with BriskDB's Rust 1.85 baseline.
+  Enable only `server-api`, pin the pre-1.0 version, and keep its types behind
+  the BriskDB-owned `protocol::postgres` adapter boundary.
 - [ ] Support startup, database/user selection, parameter status, clean
   termination, and useful server-version identification.
 - [ ] Support simple query flow and extended Parse/Bind/Describe/Execute/Sync,
@@ -421,7 +421,8 @@ The first buildable slices should be small and merge independently:
   <https://www.postgresql.org/docs/current/protocol-flow.html>
 - MySQL client/server protocol:
   <https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html>
-- PostgreSQL server library candidate: <https://crates.io/crates/pgwire>
+- Selected PostgreSQL server library: exact `pgwire` 0.36.3; see the
+  [adapter decision record](docs/POSTGRES_ADAPTER.md)
 - MySQL server library candidates: <https://crates.io/crates/mysql-mimic> and
   <https://crates.io/crates/opensrv-mysql>
 - SQL parser candidate: <https://crates.io/crates/sqlparser>
