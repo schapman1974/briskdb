@@ -1,10 +1,10 @@
-# PostgreSQL listener lifecycle
+# PostgreSQL startup and listener contract
 
-Issue #28 adds the process and TCP-lifecycle boundary for a future PostgreSQL
-wire adapter. Issue #29 subsequently selects the adapter library without
-activating it here. The listener deliberately does not implement a PostgreSQL
-startup packet, authentication, query flow, error response, or any other wire
-message.
+BriskDB serves PostgreSQL protocol 3.0 startup on a separately configured
+loopback TCP listener. A successful startup selects one logical database,
+creates one protocol-neutral core session, publishes BriskDB-owned parameter
+status, and keeps the socket alive until `Terminate`, EOF, server shutdown, or
+a protocol failure. SQL query execution begins in roadmap issue #31.
 
 ## Process configuration
 
@@ -12,108 +12,174 @@ The binary exposes one value with one grammar:
 
 | Source | Default | Enabled value | Disabled value |
 | --- | --- | --- | --- |
-| CLI | `--postgres-listen 127.0.0.1:5433` | numeric `SocketAddr`, such as `127.0.0.1:6543` or `[::1]:6543` | `--postgres-listen disabled` |
-| Environment | `BRISKDB_POSTGRES_LISTEN=127.0.0.1:5433` | the same numeric `SocketAddr` grammar | `BRISKDB_POSTGRES_LISTEN=disabled` |
+| CLI | `--postgres-listen 127.0.0.1:5433` | numeric loopback `SocketAddr`, such as `127.0.0.1:6543` or `[::1]:6543` | `--postgres-listen disabled` |
+| Environment | `BRISKDB_POSTGRES_LISTEN=127.0.0.1:5433` | the same numeric loopback grammar | `BRISKDB_POSTGRES_LISTEN=disabled` |
 
 An explicit command-line value wins over the environment; the environment wins
 over the default. `disabled` is the exact lowercase sentinel. Empty values,
-hostnames, address strings without a port, and aliases such as `off` or `none`
-are rejected during command-line parsing. Port zero retains the standard
+hostnames, values without a port, and aliases such as `off` or `none` are
+rejected during command-line parsing. Port zero retains the standard
 `SocketAddr` meaning of asking the operating system to select a port.
 
-The existing `--listen` / `BRISKDB_LISTEN` setting remains the always-enabled
-HTTP address and retains its `127.0.0.1:7654` default. The two listeners are
-configured independently; this issue does not rename the HTTP option or add an
-HTTP-disabled mode.
-
-## Rust server configuration
+Only IPv4 or IPv6 loopback addresses may activate the PostgreSQL wire endpoint
+until the TLS and SCRAM work in issue #36. `server::Config` applies that rule
+before opening the data directory or binding either listener. The existing
+HTTP listener remains independently configured and always enabled.
 
 `server::Config::postgres_listen` is `Option<SocketAddr>`:
 
-- `Some(address)` binds and serves the placeholder PostgreSQL listener;
+- `Some(address)` validates, binds, and serves PostgreSQL startup;
 - `None` skips its bind, accept branch, and shutdown work.
 
-The process-only `disabled` spelling is converted to `None` before calling the
-server library, so embedders never parse a command-line sentinel. Adding this
-field to the public pre-1.0 `Config` struct is a source-shape change for callers
-that construct it with a literal; those callers must choose `Some(address)` or
-`None`. The signatures of `server::run` and
-`server::run_with_engine_options` are unchanged.
+The process-only `disabled` spelling is converted to `None` before entering the
+server library. `server::run` and `server::run_with_engine_options` retain their
+existing signatures.
 
 ## Startup and failure order
 
 Startup has one deterministic order:
 
-1. clap parses every CLI/environment value and `Args::into_server_parts`
-   validates resource options;
-2. the engine opens the configured data directory, including existing startup
-   recovery and shard validation;
-3. the HTTP listener binds;
-4. the PostgreSQL listener binds when configured;
-5. process signal receivers are installed; and
-6. readiness is logged and the accept loop starts.
+1. clap parses CLI/environment values and resource options are validated;
+2. a configured PostgreSQL address is required to be loopback;
+3. the engine opens the data directory and completes startup recovery;
+4. the HTTP listener binds;
+5. the PostgreSQL listener binds when configured;
+6. process signal receivers are installed; and
+7. readiness is logged and the shared accept loop starts.
 
-The server never logs readiness after only one of two configured listeners has
-bound. Preserving HTTP-first binding means an HTTP bind conflict is reported
-before a PostgreSQL bind is attempted. If the PostgreSQL bind fails, the
-already-bound HTTP listener is dropped, the engine enters its normal shutdown
-path, cleanup is awaited, and the original PostgreSQL bind error is returned.
-The same cleanup applies if signal setup fails. A disabled PostgreSQL listener
-cannot cause a bind failure, even if the default port is already in use.
+The server never logs readiness after only one configured listener has bound.
+An HTTP bind failure precedes a PostgreSQL bind attempt. If the PostgreSQL bind
+or signal setup fails, the HTTP listener is released and engine shutdown is
+awaited before the original error is returned. Disabled mode cannot cause a
+PostgreSQL bind failure.
 
-Engine open precedes network binding to retain BriskDB's existing startup
-ordering. Consequently, an open may finish an already-recorded storage recovery
-before a later listener bind fails. That durable recovery is not rolled back;
-after the address becomes available, starting the same data directory again is
-the supported retry.
+Engine open still precedes network binding, so a recorded storage recovery can
+finish before a later bind failure. That completed recovery is durable; after
+the address becomes available, reopening the same data directory is the
+supported retry.
 
-## Placeholder connection behavior
+## Startup protocol
 
-After issue #29, the listener still accepts each TCP connection and immediately
-drops the stream:
+The listener accepts PostgreSQL protocol version 3.0 exactly. Newer minor
+version negotiation belongs to issue #32. `SSLRequest` and `GSSENCRequest` must
+each be an exact eight-byte frame and receive `N`, after which the client may
+send a plaintext startup packet on the loopback socket. Malformed negotiation
+lengths cannot consume bytes from a following startup packet. No TLS or GSS
+session is accepted in the current phase. The listener waits at most 60 seconds
+for negotiation and a startup packet; that timeout closes the socket without
+creating a core session.
 
-- it reads no client bytes;
-- it writes no server bytes or PostgreSQL error frame;
-- the peer observes EOF/connection close;
-- no `Engine` session, prepared statement, portal, route, or SQLite operation
-  is created; and
-- accepted placeholder connections are not retained as background tasks.
+For the startup packet and subsequent typed messages, a BriskDB-owned raw-frame
+gate runs before general dependency decoding and releases exactly one complete
+frame at a time. A startup packet's declared length may not exceed 10,000
+bytes. After successful startup, only `Query`, `Parse`, `Sync`, and `Terminate`
+frontend messages are admitted, and their declared length may not exceed 65,541
+bytes (the one-byte message type is outside that declared length). Query and
+Parse strings must be valid UTF-8, all four message types must match their exact
+structural boundaries, and startup key/value pairs must be structurally
+complete valid UTF-8 with no duplicate key. Other frontend message types are
+rejected until their owning roadmap issues. Malformed and oversized frames
+follow the fixed `08P01` protocol-failure path when a response can be sent.
 
-Continuously accepting and closing prevents the operating-system backlog from
-filling while making the incomplete wire behavior deterministic. Emitting even
-a nominal PostgreSQL frame is deferred to production activation of the
-selected BriskDB-owned adapter in issue #30. This TCP scaffold must not be
-described as a usable PostgreSQL interface.
+The accepted startup keys are finite:
 
-HTTP acceptance and placeholder PostgreSQL acceptance share one server
-lifecycle. Neither listener implements routing, parsing, planning, or SQLite
-access; those remain behind the protocol-neutral `Engine` boundary.
+| Key | Contract |
+| --- | --- |
+| `user` | Required session label: 1–63 bytes; first byte lowercase ASCII or `_`; remaining bytes lowercase ASCII, digits, or `_` |
+| `database` | Optional exact logical-database name; omission selects the database whose name equals `user` |
+| `client_encoding` | Optional `UTF8` or `UTF-8`; both become `UTF8` |
+| `application_name` | Optional, at most 63 UTF-8 bytes, with no control or replacement character |
+| `replication` | Optional literal `false`; other values are unsupported |
 
-## Shutdown and recovery
+Every other key is rejected. The `user` value is a bounded connection label,
+not a role lookup or credential check. Authentication and role catalogs are
+separate later work; it is also unrelated to the HTTP browser's temporary
+login. Database selection is an exact lookup through the protocol-neutral
+catalog. Startup creates a core session only after every parameter and the
+database selection have passed validation.
 
-SIGINT and, on supported Unix hosts, SIGTERM first stop new engine admissions.
-Both TCP listeners are then dropped. Existing HTTP connection tasks drain under
-the configured grace period alongside core shutdown. PostgreSQL placeholder
-streams need no drain because they are closed as soon as they are accepted.
+Successful startup emits these frames in order:
 
-An accept failure on either listener ends the shared server: both listeners
-close, HTTP tasks drain, and the engine completes its normal shutdown. Dropping
-the server future closes both listener sockets and enters the same resumable
-`Draining` engine state already documented for HTTP-only operation.
+1. `AuthenticationOk`;
+2. `ParameterStatus(server_version, <BriskDB package version>-briskdb)`;
+3. `ParameterStatus(server_encoding, UTF8)`;
+4. `ParameterStatus(client_encoding, UTF8)`;
+5. `ParameterStatus(standard_conforming_strings, on)`;
+6. `ParameterStatus(integer_datetimes, on)`;
+7. optional validated `ParameterStatus(application_name, ...)`; and
+8. `ReadyForQuery(I)`.
+
+The values and ordering are BriskDB-owned rather than dependency defaults.
+`BackendKeyData` is omitted until cancellation identifiers are implemented in
+issue #35.
+
+## Startup errors
+
+Decoded startup validation/protocol rejections send one fixed `FATAL`
+`ErrorResponse` and then close the socket; they do not append `ReadyForQuery`
+or echo rejected values. A read timeout, server shutdown, or peer disconnect
+can instead close without a response.
+
+| Condition | SQLSTATE |
+| --- | --- |
+| Missing or invalid `user` | `28000` |
+| Empty, invalid, or unknown logical database | `3D000` |
+| Invalid client encoding or application name | `22023` |
+| Unknown startup key or unsupported replication value | `0A000` |
+| Unsupported protocol version or malformed startup message | `08P01` |
+
+A failed startup creates no retained core session, statement, portal, route, or
+SQLite operation. A later connection can start normally.
+
+## Query boundary before issue #31
+
+Startup support does not claim SQL execution. Every simple-query message,
+including an empty query, receives BriskDB's fixed `ERROR` / `0A000` mapping
+followed by `ReadyForQuery(I)`; the same connection remains reusable. An
+extended `Parse` receives the same fixed error before a dependency-owned
+statement is stored, and `Sync` restores `ReadyForQuery(I)`. Query text is
+never included in the response. Issue #31 replaces this deliberate boundary
+with the complete simple and extended query state machine.
+
+## Connection ownership and shutdown
+
+Each accepted socket runs in a tracked task. At most 256 PostgreSQL socket
+tasks are retained; a connection accepted while that limit is full is closed.
+HTTP and PostgreSQL tasks share the process lifecycle but are tracked
+separately. A PostgreSQL socket that completes startup owns exactly one core
+session and tracks it for closure on every terminal path:
+
+- `Terminate` closes promptly without waiting for client EOF;
+- client EOF or a wire failure closes the session;
+- ordinary server shutdown signals both HTTP and PostgreSQL tasks, then drains
+  them concurrently with core shutdown;
+- tasks that exceed the configured shutdown grace are aborted, then get one
+  additional grace interval for their joins and retained-session closes;
+- if that second interval expires, server return does not await the remaining
+  PostgreSQL session closes and schedules them as best-effort runtime cleanup;
+  and
+- dropping the outer server future closes both listener sockets, aborts owned
+  connection tasks, begins the resumable engine drain, and schedules
+  best-effort terminal session cleanup.
+
+Partial startup sockets are tracked and close during shutdown even though they
+have not created a core session. An accept failure on either listener ends the
+shared server and enters the same cleanup path.
 
 ## Compatibility and storage boundary
 
-Issue #28 itself adds no wire dependency. Issue #29 pins `pgwire` 0.36.3 behind
-`protocol::postgres`, with default features disabled and only `server-api`
-enabled. That selection changes no HTTP route, JSON body, SQL subset, planner
-rule, typed result, engine error mapping, manifest table, shard header,
-migration journal, stored row, or storage-format version. Listener settings and
-the inactive adapter seam are not persisted in `manifest.sqlite` or a shard.
+`pgwire` remains pinned exactly at 0.36.3 with default features disabled and
+only `server-api` enabled. Production framing is contained in
+`protocol::postgres`; `core`, `storage`, `sql`, `server`, and the public API do
+not accept or return dependency types. The adapter uses BriskDB's catalog,
+session lifecycle, fixed SQLSTATE table, and safe messages.
 
-The PostgreSQL SQLSTATE table is consumed by the adapter compatibility probe;
-the placeholder emits none of those mappings. The next roadmap item owns
-PostgreSQL startup/session messages and production socket integration. Library
-selection details and constraints are normative in the
+This startup work changes no HTTP route, JSON body, SQL subset, planner rule,
+typed result, manifest table, shard header, migration journal, stored row, or
+storage-format version. Startup identity, parameter metadata, and connection
+tasks exist only in process memory.
+
+Library selection details and upgrade constraints are normative in the
 [PostgreSQL adapter decision record](POSTGRES_ADAPTER.md).
 
 ## Verification contract
@@ -121,11 +187,23 @@ selection details and constraints are normative in the
 Automated coverage includes:
 
 - default, explicit IPv4/IPv6, environment, CLI-over-environment, disabled, and
-  malformed configuration cases;
-- both listeners serving concurrently while the HTTP health path remains live;
-- immediate close for one and many concurrent placeholder clients;
-- disabled mode skipping PostgreSQL binding;
-- PostgreSQL bind-failure cleanup and a clean retry of the data directory;
-- ordinary graceful shutdown and dropped-server-future recovery with both
-  listeners configured; and
+  malformed configuration values;
+- loopback validation before database or listener creation;
+- dual-listener binding, bind-failure cleanup, and clean retry;
+- exact `SSLRequest`/`GSSENCRequest` refusal and boundary handling, startup frame
+  order, selected identity, omitted-database behavior, and useful BriskDB server
+  identification;
+- the 60-second production startup timeout through an accelerated timer test;
+- startup and typed-message size boundaries, exact frame isolation, UTF-8 and
+  structural validation, duplicate startup keys, and unsupported message types;
+- fixed failures for protocol, user, database, encoding, application-name,
+  unknown-key, replication, and truncated-message cases before and after
+  session creation, followed by successful recovery;
+- simple-query recovery and extended-query `Sync` recovery without retaining a
+  dependency statement;
+- immediate `Terminate`, client EOF, partial startup, normal shutdown, forced
+  server-task cancellation, and core-session cleanup;
+- the 256-task admission boundary, deterministic overflow close, and slot reuse
+  after a tracked task completes;
+- many concurrent PostgreSQL sessions while HTTP health remains live; and
 - unchanged public HTTP behavior and unchanged storage version.

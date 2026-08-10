@@ -229,19 +229,20 @@ the engine regardless of its eventual wire protocol.
   `0.36.3`, the newest release compatible with BriskDB's Rust 1.85 baseline.
   Enable only `server-api`, pin the pre-1.0 version, and keep its types behind
   the BriskDB-owned `protocol::postgres` adapter boundary.
-- [ ] Support startup, database/user selection, parameter status, clean
-  termination, and useful server-version identification.
+- [x] Support protocol 3.0 startup, exact logical database/user selection,
+  BriskDB-owned parameter status, clean termination and session cleanup, and
+  useful `<package-version>-briskdb` server identification on loopback.
 - [ ] Support simple query flow and extended Parse/Bind/Describe/Execute/Sync,
   including named and unnamed statements/portals, Flush/Close, protocol error
   resynchronization, and portal suspension.
-- [ ] Baseline protocol 3.0 and negotiate newer minor versions rather than
-  assuming that wire version and server marketing version are identical.
+- [ ] Negotiate explicitly supported newer protocol minor versions from the
+  exact 3.0 baseline rather than conflating protocol and server versions.
 - [ ] Map BriskDB types to PostgreSQL OIDs and support text format first, then
   the binary formats required by tested drivers.
 - [ ] Implement `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction state, and shard
   pinning. Report PostgreSQL's idle/in-transaction/failed (`I`/`T`/`E`) states
   even where SQLite's native behavior differs.
-- [ ] Support cancellation requests and connection cleanup.
+- [ ] Support `CancelRequest`/backend keys and wire cancellation to the core.
 - [ ] Add TLS and SCRAM-SHA-256 before non-loopback use; never ship cleartext
   password authentication on an unencrypted listener.
 - [ ] Add compatibility shims for `SELECT version()`, common `SHOW` commands,

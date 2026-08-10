@@ -395,12 +395,12 @@ handling to that type.
 
 ## Dialect and adapter compatibility
 
-The lifecycle is implemented as a Rust engine API. The selected PostgreSQL
-adapter seam privately proves that wire preparation can enter that lifecycle,
-but no wire-message path is connected to the production listener yet. The
-PostgreSQL TCP scaffold accepts and closes without creating a session; there is
-no MySQL listener. All three typed input paths share the same planning and
-result path:
+The lifecycle is implemented as a Rust engine API. Production PostgreSQL
+startup now validates identity and creates one selected core session, but every
+simple query and extended `Parse` stops at a fixed `0A000` response. That wire
+boundary creates no prepared statement or portal and does not yet enter this
+lifecycle. There is no MySQL listener. All three typed Rust input paths share
+the same planning and result path:
 
 | Input | Required mode and parameter form | Prepared execution result |
 | --- | --- | --- |
@@ -408,11 +408,12 @@ result path:
 | PostgreSQL | `Compatibility`; `$N` identities, including repeats and gaps | Same protocol-neutral routed rows or affected-row count |
 | MySQL | `Compatibility`; each `?` numbered left-to-right | Same protocol-neutral routed rows or affected-row count |
 
-Future adapters own message framing, authentication, statement/portal naming,
-wire parameter decoding, result type encoding, close acknowledgement, and
-protocol resynchronization. They must call this lifecycle rather than retain a
-SQLite handle, implement a second cache, interpolate values into SQL, or choose
-a physical shard themselves.
+Each protocol adapter owns its message framing, authentication,
+statement/portal naming, wire parameter decoding, result type encoding, close
+acknowledgement, and protocol resynchronization. PostgreSQL startup framing and
+session ownership are implemented; issue #31 must map its query messages into
+this lifecycle rather than retain a SQLite handle, implement a second cache,
+interpolate values into SQL, or choose a physical shard itself.
 
 ## Storage-format boundary
 

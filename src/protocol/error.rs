@@ -1,8 +1,8 @@
 //! Safe protocol representations of protocol-neutral engine errors.
 //!
-//! The PostgreSQL TCP placeholder emits no wire messages, and no MySQL listener
-//! exists yet. These records are the tested compatibility contract their wire
-//! adapters will consume.
+//! PostgreSQL startup and deferred-query responses use these fixed mappings.
+//! No MySQL listener exists yet; its mapping remains the tested contract for
+//! that later wire adapter.
 
 use crate::core::EngineErrorKind;
 

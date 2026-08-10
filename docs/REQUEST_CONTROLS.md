@@ -1,10 +1,10 @@
 # Request controls and shutdown
 
 BriskDB applies cancellation, deadlines, result budgets, and shutdown at the
-protocol-neutral `Engine` boundary. HTTP, the selected PostgreSQL adapter seam,
-and a future MySQL adapter therefore share the same resource and cleanup
-semantics. The current PostgreSQL TCP placeholder never creates an engine
-request.
+protocol-neutral `Engine` boundary. HTTP, PostgreSQL sessions, and a future
+MySQL adapter therefore share the same resource and cleanup semantics. Current
+PostgreSQL startup performs one bounded status operation; SQL request flow is
+deferred to issue #31.
 
 ## Per-request context
 
@@ -221,12 +221,16 @@ persisted or recovered after process shutdown.
 The server constructs its SIGINT/SIGTERM receivers after every configured
 listener binds and before logging readiness on supported Unix hosts. It
 transitions the engine to `Draining` before dropping both the HTTP listener and
-the optional PostgreSQL listener and signaling each tracked HTTP/1 connection.
-HTTP draining and core shutdown start together. A connection still active at
-the HTTP grace deadline is aborted and joined before server shutdown returns;
-accepted PostgreSQL placeholder streams were closed immediately and own no
-task to drain. Core cleanup may continue through its separately documented
-forced-cleanup grace. A forced cancellation cannot erase committed
+the optional PostgreSQL listener and signaling every tracked HTTP/PostgreSQL
+connection. Connection draining and core shutdown start together. A connection
+still active at the grace deadline is aborted. HTTP task joins are awaited;
+PostgreSQL task joins and retained-session closes get one additional grace
+interval. If that second interval expires, server return does not await the
+remaining PostgreSQL session closes and schedules them as best-effort runtime
+cleanup. Completed PostgreSQL startups retain one core session; normal and
+completed forced-task cleanup close it, while partial startups own no session.
+Core cleanup may continue through its separately documented forced-cleanup
+grace. A forced cancellation cannot erase committed
 schema-migration progress: the current shard transaction rolls back if still
 running, the retained prefix remains resumable, and the next startup finishes
 it before serving ordinary work.

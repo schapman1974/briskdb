@@ -1,9 +1,10 @@
 # SQL compatibility
 
 BriskDB stores data in SQLite and is designed to expose the same database
-engine through HTTP, PostgreSQL, MySQL, and future protocol adapters. A wire
-protocol does not change SQLite into that protocol's namesake database. This
-document defines the SQL and behavioral contract separately from connectivity.
+engine through HTTP, the active PostgreSQL startup adapter, and planned SQL
+flows for PostgreSQL, MySQL, and other future protocol adapters. A wire protocol
+does not change SQLite into that protocol's namesake database. This document
+defines the SQL and behavioral contract separately from connectivity.
 
 ## Status vocabulary
 
@@ -39,17 +40,19 @@ BriskDB tracks three independent compatibility layers:
 3. **Behavioral compatibility** emulates the metadata, type, error, transaction,
    and session behavior needed by specifically tested clients and tools.
 
-Passing a PostgreSQL or MySQL handshake will establish only wire compatibility.
-BriskDB will publish behavioral compatibility per tested driver or tool rather
-than claiming to be a drop-in PostgreSQL or MySQL replacement.
+Completing only a PostgreSQL or MySQL handshake establishes startup
+compatibility, not the full wire compatibility defined above. BriskDB will
+publish wire and behavioral compatibility per tested driver or tool rather than
+claiming to be a drop-in PostgreSQL or MySQL replacement.
 
 ## Current implementation
 
-Only the experimental HTTP network interface can execute network requests
-today. `pgwire` 0.36.3 is selected and pinned behind a BriskDB-owned adapter
-seam, while the separately configured PostgreSQL TCP listener still accepts
-and immediately closes streams; it implements no PostgreSQL wire message.
-There is no MySQL listener. The public Rust SQL facade
+Only the experimental HTTP network interface can execute SQL network requests
+today. The separately configured loopback PostgreSQL listener implements exact
+protocol-3.0 startup, logical database/user selection, BriskDB parameter
+status, and tracked session termination through a pinned `pgwire` 0.36.3
+boundary. It rejects SQL with fixed `0A000` responses until issue #31. There is
+no MySQL listener. The public Rust SQL facade
 can parse an explicitly selected SQLite, PostgreSQL, or MySQL dialect, consume
 that result with
 `validate_common_subset(ParsedSql)`, borrow the result with
@@ -84,25 +87,26 @@ path; they do not pass through these opt-in SQL layers.
 | HTTP `/v1/query` | Experimental | One raw SQLite statement prepared transiently by the row-returning path; no session cache | Required caller-provided `shard_key` |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
 | HTTP `/admin` browser | Experimental, read-only | No caller SQL; server-generated physical table discovery and bounded `SELECT *` pages | Required validated physical shard number; never a routed or scatter query |
-| PostgreSQL wire protocol | `pgwire` 0.36.3 selected behind a BriskDB-owned core-session seam; production TCP listener remains an accept/close scaffold | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; private parser compatibility probe only | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; production wire mapping planned |
+| PostgreSQL wire protocol | Protocol-3.0 startup/session only on loopback; SQL flow deferred | No SQL accepted over the wire; simple `Query` and extended `Parse` return fixed `0A000` responses | Startup selects an exact logical database; no wire SQL request reaches planning or routing |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
 The parser, subset validator, statement classifier, placeholder normalizer, SQL
-translator, shard-key inference function, engine planner, prepared lifecycle,
-and PostgreSQL adapter seam are implemented Rust APIs, not PostgreSQL or MySQL
-network interfaces. The private issue-29 probe composes the selected library
-with those APIs, but the PostgreSQL socket scaffold does not connect them to the
-network. They do not change any current HTTP row in this table.
+translator, shard-key inference function, engine planner, and prepared
+lifecycle are implemented Rust APIs, not PostgreSQL or MySQL query interfaces.
+PostgreSQL production startup connects only identity, catalog selection,
+status, and session cleanup; the historical private issue-29 parser probe does
+not make that prepared pipeline public wire behavior. These changes do not
+alter any HTTP row in this table.
 
 Every HTTP database operation now calls the same protocol-neutral async engine
-intended for future PostgreSQL and MySQL adapters. Execute and query requests
-create a fresh `Ready` session, put the request's `shard_key` in its routing
-context, and submit an owned statement. The engine, rather than the HTTP
-adapter, selects the shard and acquires a pooled SQLite connection. Admin
-inspection requests also create a fresh `Ready` session, but use a bounded
-read-only engine operation with an already validated physical shard. The
-session is discarded when that HTTP request finishes, so a transaction cannot
-span requests.
+used by PostgreSQL startup status and intended for issue-31 PostgreSQL SQL flow
+and the future MySQL adapter. Execute and query requests create a fresh `Ready`
+session, put the request's `shard_key` in its routing context, and submit an
+owned statement. The engine, rather than the HTTP adapter, selects the shard
+and acquires a pooled SQLite connection. Admin inspection requests also create
+a fresh `Ready` session, but use a bounded read-only engine operation with an
+already validated physical shard. The session is discarded when that HTTP
+request finishes, so a transaction cannot span requests.
 
 ### Admin browser inspection
 
@@ -312,9 +316,10 @@ SQLite result codes and operation context; error-message text is never parsed
 to choose an error kind.
 
 The same kinds already have defined PostgreSQL SQLSTATE and MySQL error
-number/SQLSTATE mappings. The private selected-adapter probe consumes the
-PostgreSQL mapping; the MySQL mapping remains a contract for its future
-adapter. The PostgreSQL TCP placeholder emits no error frame, and no MySQL
+number/SQLSTATE mappings. PostgreSQL startup emits a finite fixed fatal-error
+table, and its current query boundary emits `Unsupported` / `0A000` without
+query text; the private selected-adapter probe also consumes the engine mapping.
+The MySQL mapping remains a contract for its future adapter, and no MySQL
 listener is available. See the complete
 [error taxonomy and mapping table](ERRORS.md) and the
 [PostgreSQL listener lifecycle](POSTGRES_LISTENER.md).
@@ -634,13 +639,13 @@ boundary are normative in
 
 ## PostgreSQL differences
 
-The bound PostgreSQL TCP scaffold will host the selected `pgwire` 0.36.3
-adapter targeting the frontend/backend protocol and a deliberately small SQL
-compatibility surface. The BriskDB-owned adapter/core-session boundary and a
-private parser/socket fit probe exist, but the listener currently accepts and
-closes without a handshake. PostgreSQL-specific behavior is not implemented
-unless listed as implemented in this document. Configuration and lifecycle
-semantics are normative in the [PostgreSQL listener
+The PostgreSQL TCP listener hosts the selected `pgwire` 0.36.3 boundary for
+exact protocol-3.0 startup on loopback. It validates a finite parameter set,
+selects one logical database and user label, advertises BriskDB-owned status,
+and tracks the selected core session through termination. SQL messages remain
+at a fixed error/resynchronization boundary until issue #31. PostgreSQL-specific
+behavior is not implemented unless listed as implemented in this document.
+Configuration and lifecycle semantics are normative in the [PostgreSQL listener
 contract](POSTGRES_LISTENER.md); dependency and adapter constraints are
 normative in the [adapter decision record](POSTGRES_ADAPTER.md).
 
@@ -659,7 +664,7 @@ normative in the [adapter decision record](POSTGRES_ADAPTER.md).
 | `ON CONFLICT` | PostgreSQL upsert syntax | Outside the initial common subset and unsupported |
 | Functions/operators | PostgreSQL catalog | SQLite functions/operators unless an explicit shim is documented |
 | System catalogs | `pg_catalog`, `information_schema` | Only queries required by named, tested clients will be emulated |
-| Error behavior | SQLSTATE and failed transaction state | Stable error-kind-to-SQLSTATE mapping defined; wire encoding and `I`/`T`/`E` transaction states planned |
+| Error behavior | SQLSTATE and failed transaction state | Startup and query-deferral errors are encoded now; the complete execution mapping and `I`/`T`/`E` transaction states remain planned |
 | `COPY`, replication, `LISTEN/NOTIFY` | PostgreSQL subprotocols/features | Deferred and unsupported initially |
 
 PostgreSQL's static result metadata does not always have an exact equivalent in

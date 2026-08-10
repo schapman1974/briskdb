@@ -2,8 +2,8 @@
 
 BriskDB is organized so network protocols can share one routing and execution
 core. The module layout preserves the experimental HTTP contract and existing
-Rust module paths while making future PostgreSQL and MySQL adapters explicit
-peers.
+Rust module paths while making the active PostgreSQL startup adapter and the
+planned MySQL adapter explicit peers.
 
 ```text
 binary (main)
@@ -20,11 +20,11 @@ server ---------> protocol::http
     |                v      v
     |            storage    sql
     |
-    +-- PostgreSQL TCP lifecycle
-        (accept/close placeholder; no core request)
-
-protocol::postgres ---------> core
-    (selected pgwire seam; not connected to the listener yet)
+    +---------> protocol::postgres
+                    |
+                    v
+                  core
+        (startup/session active; SQL deferred)
 ```
 
 | Module | Responsibility | Must not own |
@@ -33,9 +33,9 @@ protocol::postgres ---------> core
 | `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, discovery, and page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
-| `protocol::postgres` | BriskDB-owned adapter and per-connection core-session boundary around the exactly pinned `pgwire` library; private compile/query-parser and fixed-error conversion proof | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
+| `protocol::postgres` | BriskDB-owned bounded protocol-3.0 framing, finite parameter validation, selected identity/status, per-connection core-session ownership, query-deferral responses, and private compile/query-parser seam around the exactly pinned `pgwire` library | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
-| `server` | Process configuration, database assembly, separate HTTP/PostgreSQL listener binding, tracked Axum HTTP/1 connection lifecycle, and the temporary PostgreSQL accept/close loop | SQL parsing, PostgreSQL wire messages, or storage implementation details |
+| `server` | Process configuration, database assembly, loopback validation, separate HTTP/PostgreSQL listener binding, finite connection-task supervision, and shared graceful/forced draining | SQL parsing, PostgreSQL wire framing, or storage implementation details |
 
 Implementation dependencies flow one way: adapters call the async `Engine` in
 `core`; the engine coordinates routing, `storage`, and `sql`. An adapter supplies
@@ -90,7 +90,7 @@ bounded per-session caches, bounded per-shard pools, request controls, and
 explicit shutdown lifecycle are now in place. The synchronous `Database` API
 remains available as a Rust compatibility surface; existing engine and server
 function signatures remain in place and delegate to the controlled defaults.
-Issue #28 adds `Config::postgres_listen: Option<SocketAddr>`, so pre-1.0 Rust
+Issue #28 added `Config::postgres_listen: Option<SocketAddr>`, so pre-1.0 Rust
 callers constructing `Config` with a struct literal must now choose an enabled
 address or `None`.
 
@@ -104,18 +104,17 @@ option. The process default enables loopback `127.0.0.1:5433`. See the
 startup order.
 
 Issue #29 selects exact `pgwire` 0.36.3 with only `server-api` and adds the
-BriskDB-owned `protocol::postgres::{Adapter, Connection}` seam. Each connection
-created through that seam owns one core `Session`; a private parser bridge and
-loopback compatibility test prove that the selected handler/socket API can call
-the engine without exposing dependency types to core or server contracts. See
-the [adapter decision record](POSTGRES_ADAPTER.md).
-
-The production PostgreSQL listener remains a server-lifecycle placeholder: it
-accepts and immediately drops each stream without constructing that adapter,
-reading bytes, writing a PostgreSQL frame, opening a session, or calling the
-engine. Issue #30 owns that wiring and startup behavior. This keeps binding,
-concurrent acceptance, startup cleanup, and shared shutdown testable without
-moving protocol behavior into `server`.
+BriskDB-owned `protocol::postgres::{Adapter, Connection}` seam. Issue #30
+connects the production loopback listener to that adapter for exact protocol
+3.0 startup. Parameter validation, logical database/user selection, fixed
+status/error frames, and terminal session cleanup stay in
+`protocol::postgres`; socket binding, the 256-task cap, and task draining stay
+in `server`. A successful startup creates one core `Session` only after
+validation. `Terminate`, EOF, and protocol failure close it; shutdown hands it
+to the bounded cleanup lifecycle described below. No dependency-owned type
+crosses into core or the public server contract. SQL message execution remains
+issue #31. See the
+[adapter decision record](POSTGRES_ADAPTER.md).
 
 ## Admin browser boundary
 
@@ -701,15 +700,20 @@ this explicit asynchronous path. Prepared statement/portal close and terminal
 session close remain available as in-memory cleanup while draining; no
 prepared state is persisted for restart recovery.
 
-The server owns accepted HTTP/1 connections in a tracked task set and manages a
-separate optional PostgreSQL socket in the same accept lifecycle. It stops
-engine admission before dropping both listeners, starts HTTP and core draining
-together, and aborts then joins any HTTP connection that exceeds the HTTP grace
-deadline. Placeholder PostgreSQL streams are already closed at accept time and
-therefore own no drain task. Signal receivers are installed only after every
-configured listener binds and before readiness is logged. Dropping the server
-future closes both listeners, aborts its tracked HTTP connection set, and
-synchronously enters `Draining`; a surviving embedder-owned `Engine` clone can
+The server owns accepted HTTP/1 and PostgreSQL connections in separate tracked
+task sets under one accept lifecycle. It stops engine admission before dropping
+both listeners, signals both task sets, and starts connection/core draining
+together. Tasks that exceed the common grace deadline are aborted. HTTP task
+joins are awaited, while the PostgreSQL supervisor gets one additional grace
+interval to join aborted tasks and attempt to close each selected core session.
+If that second interval expires, server return does not await the remaining
+PostgreSQL session closes; they are scheduled on the runtime as best-effort
+cleanup.
+Partial startup sockets own a task but no session. Signal receivers are
+installed only after every configured listener binds and before readiness is
+logged. Dropping the server future closes both listeners, aborts both task
+sets, synchronously enters `Draining`, and schedules best-effort terminal
+PostgreSQL session cleanup; a surviving embedder-owned `Engine` clone can
 resume asynchronous cleanup with `shutdown()`.
 
 Real multi-call `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction state, and
@@ -731,11 +735,11 @@ response type. SQL and storage classify SQLite failures from primary and
 extended result codes plus operation context; they never parse SQLite error
 messages. Protocol-owned tables map each kind to an HTTP status and safe RFC
 9457 problem, a PostgreSQL SQLSTATE, and a MySQL error number/SQLSTATE pair.
-The selected PostgreSQL adapter probe consumes the PostgreSQL mapping behind a
-private dependency boundary; the MySQL entry remains a contract for its future
-adapter. The PostgreSQL TCP placeholder emits no protocol frame and therefore
-does not expose the PostgreSQL mapping on the network yet; no MySQL listener
-exists yet.
+Production PostgreSQL startup emits fixed fatal validation/protocol errors and
+the pre-issue-31 query boundary emits the fixed `Unsupported` mapping. The
+private adapter probe also consumes the engine mapping behind the same
+dependency boundary. The MySQL entry remains a contract for its future adapter;
+no MySQL listener exists yet.
 
 Client responses use fixed, safe text for the error kind. Diagnostic display
 text and source chains stay available internally but are never serialized, so

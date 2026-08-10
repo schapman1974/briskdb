@@ -245,12 +245,37 @@ async fn postgres_adapter_boundary_is_public_session_scoped_and_not_a_listener()
     let adapter = postgres::Adapter::new(engine.clone());
     let first = adapter.open_connection();
     let second = adapter.open_connection();
+    let selected = adapter
+        .open_connection_for("public_client", "default")
+        .unwrap();
 
     assert_ne!(first.session_id(), second.session_id());
+    assert_ne!(first.session_id(), selected.session_id());
     assert_eq!(first.status().await.unwrap().shard_count(), 2);
     assert_eq!(second.status().await.unwrap().shard_count(), 2);
+    assert_eq!(selected.user(), Some("public_client"));
+    assert_eq!(selected.database(), "default");
+    assert_eq!(
+        selected.database_id(),
+        engine.catalog().default_database().id()
+    );
     assert!(format!("{adapter:?}").contains("shard_count"));
     assert!(format!("{first:?}").contains("session_id"));
+    assert!(!format!("{selected:?}").contains("public_client"));
+    assert_eq!(
+        adapter
+            .open_connection_for("Invalid", "default")
+            .unwrap_err()
+            .kind(),
+        core::EngineErrorKind::InvalidArgument
+    );
+    assert_eq!(
+        adapter
+            .open_connection_for("public_client", "missing")
+            .unwrap_err()
+            .kind(),
+        core::EngineErrorKind::InvalidArgument
+    );
 
     first.close().await.unwrap();
     assert_eq!(
@@ -259,6 +284,7 @@ async fn postgres_adapter_boundary_is_public_session_scoped_and_not_a_listener()
     );
     assert_eq!(second.status().await.unwrap().shard_count(), 2);
     second.close().await.unwrap();
+    selected.close().await.unwrap();
     engine.shutdown().await.unwrap();
 }
 

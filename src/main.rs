@@ -56,7 +56,7 @@ struct Args {
     #[arg(long, env = "BRISKDB_LISTEN", default_value = "127.0.0.1:7654")]
     listen: SocketAddr,
 
-    /// PostgreSQL TCP listener address, or `disabled` to turn it off.
+    /// Loopback PostgreSQL TCP listener address, or `disabled` to turn it off.
     #[arg(
         long,
         env = "BRISKDB_POSTGRES_LISTEN",
