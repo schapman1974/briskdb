@@ -777,8 +777,10 @@ The experimental HTTP adapter is the only JSON conversion boundary.
 of `name` and `data_type` metadata objects plus positional arrays in `rows`.
 Column and row indices correspond exactly. Duplicate and empty names are valid,
 and metadata is returned even when there are zero rows. The admin response adds
-physical-shard, table, and finite pagination metadata without altering the cell
-conversion.
+physical-shard, table, and finite pagination metadata. It also tags signed or
+unsigned integers outside JavaScript's exact range with their decimal text so
+the browser cannot round them; the experimental `/v1/query` cell encoding is
+unchanged.
 
 The adapter renders exact decimals as JSON strings, converts `InvalidText` to a
 JSON string with invalid byte sequences replaced by U+FFFD, and maps non-finite

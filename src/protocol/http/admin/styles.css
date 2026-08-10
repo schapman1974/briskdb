@@ -124,6 +124,7 @@ select { min-height: 2.55rem; padding: 0 2.2rem 0 0.75rem; }
 .form-error { min-height: 1.3rem; margin: 1rem 0 0; color: var(--error); font-size: 0.88rem; }
 
 .app-shell { position: relative; z-index: 1; min-height: 100vh; }
+.app-shell:focus { outline: none; }
 .topbar {
   position: sticky;
   z-index: 4;
@@ -186,9 +187,9 @@ caption { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: r
 th, td { max-width: 30rem; overflow: hidden; padding: 0.78rem 1rem; border-bottom: 1px solid var(--border); text-align: left; text-overflow: ellipsis; }
 th { position: sticky; z-index: 2; top: 0; color: #aec4bd; background: var(--panel-solid); font-size: 0.72rem; font-weight: 750; letter-spacing: 0.035em; }
 tbody tr:hover { background: rgba(86, 224, 172, 0.035); }
-.column-type { display: block; margin-top: 0.18rem; color: #607b74; font-size: 0.62rem; font-weight: 500; text-transform: uppercase; }
+.column-type { display: block; margin-top: 0.18rem; color: #8aa79f; font-size: 0.62rem; font-weight: 500; text-transform: uppercase; }
 .null-value { color: #7e9891; font-style: italic; }
-.binary-value { color: #9cc8bc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.binary-value, .integer-value { color: #9cc8bc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .pager { display: flex; min-height: 4rem; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.7rem 1rem; color: var(--muted); background: rgba(5, 14, 12, 0.6); font-size: 0.78rem; }
 .pager > div { display: flex; gap: 0.5rem; }
 
