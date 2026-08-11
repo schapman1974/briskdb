@@ -90,11 +90,11 @@ Placement determines the logical table's files:
 - Empty-catalog compatibility visits every file and requires the table and
   column shape to match on all of them.
 
-Before counting or paging, BriskDB verifies the exact ordinary table and column
-metadata on every relevant file. At most eight physical inspections run at
-once. A missing table, incompatible shape, shard failure, deadline, schema
-generation change, or arithmetic overflow fails the request; no partial count
-or page is returned.
+Before counting or paging, BriskDB verifies the exact ordinary table, column,
+and local browse-order metadata on every relevant file. At most eight physical
+inspections run at once. A missing table, incompatible shape or ordering,
+shard failure, deadline, schema-generation change, or arithmetic overflow fails
+the request; no partial count or page is returned.
 
 ## Logical pagination and exact total
 
@@ -109,12 +109,21 @@ representation described below.
 The browser offers page sizes 25, 50, 100, and 200 rows and initially selects
 50. The JSON endpoint accepts only limits from 1 through 200 and offsets from 0
 through 1,000,000. Counts locate the requested shard-major slice; the page then
-reads only those bounded slices, orders each slice by every visible column,
-concatenates shards in ascending physical order, preserves duplicate rows, and
-reads at most one extra logical row to derive `has_more`. The combined page is
-checked against one configured row and logical-byte budget. The extra row is
-not serialized, and `has_more` remains false when the next offset would exceed
-1,000,000.
+reads only those bounded slices and concatenates shards in ascending physical
+order. Within each file, it prefers a proven primary-key order, preserving the
+key index's collation and direction. An exact `INTEGER PRIMARY KEY` uses its
+rowid-backed order without another index. A table without a safe primary-key
+order uses an unshadowed intrinsic `rowid`, `_rowid_`, or `oid`; only the
+rare table with no safe unique physical key falls back to every visible column.
+The response's `ordering` field identifies the selected contract. Duplicate
+rows remain representable, and the browser reads at most one extra logical row
+to derive `has_more`. The combined page is checked against one configured row
+and logical-byte budget. The extra row is not serialized, and `has_more`
+remains false when the next offset would exceed 1,000,000.
+
+Primary-key and rowid ordering avoid the temporary full-table sort previously
+required by wide tables. Offset paging still scans up to the requested local
+offset; a future cursor API can provide constant-work deep-page navigation.
 
 Each count and page is a set of separate committed file reads, not an atomic
 cross-file or retained multi-page snapshot. Concurrent inserts or deletes can
