@@ -46,13 +46,20 @@ const TABLE_DISCOVERY_SQL: &str = "SELECT name FROM pragma_table_list \
        AND lower(name) != 'briskdb' \
        AND lower(name) NOT GLOB 'briskdb_*' \
      ORDER BY name COLLATE BINARY";
-const TABLE_LOOKUP_SQL: &str = "SELECT name FROM pragma_table_list \
+const TABLE_LOOKUP_SQL: &str = "SELECT name, wr FROM pragma_table_list \
      WHERE schema = 'main' AND type = 'table' \
        AND name = ?1 COLLATE BINARY \
        AND lower(name) NOT GLOB 'sqlite_*' \
        AND lower(name) != 'briskdb' \
        AND lower(name) NOT GLOB 'briskdb_*' \
      LIMIT 1";
+const TABLE_COLUMN_INFO_SQL: &str = "SELECT name, type, \"notnull\", pk \
+     FROM pragma_table_xinfo(?1) ORDER BY cid";
+const PRIMARY_KEY_INDEX_SQL: &str = "SELECT x.name, coalesce(x.coll, 'BINARY'), x.\"desc\" \
+     FROM pragma_index_list(?1) AS indexes \
+     JOIN pragma_index_xinfo(indexes.name) AS x \
+     WHERE indexes.origin = 'pk' AND x.key = 1 \
+     ORDER BY x.seqno";
 const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
 const CSP: HeaderValue = HeaderValue::from_static(
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
@@ -361,6 +368,67 @@ struct ShardTableInspection {
     shard: u16,
     rows: u64,
     columns: Vec<Column>,
+    local_order: LocalOrder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableColumnInfo {
+    name: String,
+    declared_type: String,
+    not_null: bool,
+    primary_key_rank: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrimaryKeyTerm {
+    column: String,
+    collation: Option<String>,
+    descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalOrder {
+    PrimaryKey(Vec<PrimaryKeyTerm>),
+    RowId(String),
+    AllColumns,
+}
+
+impl LocalOrder {
+    const fn response_name(&self) -> &'static str {
+        match self {
+            Self::PrimaryKey(_) => "shard_major_then_primary_key",
+            Self::RowId(_) => "shard_major_then_rowid",
+            Self::AllColumns => "shard_major_then_all_columns",
+        }
+    }
+
+    fn sql(&self, columns: &[Column]) -> String {
+        let terms = match self {
+            Self::PrimaryKey(terms) => terms
+                .iter()
+                .map(|term| {
+                    let mut sql = format!("browse.{}", quote_identifier(&term.column));
+                    if let Some(collation) = &term.collation {
+                        sql.push_str(" COLLATE ");
+                        sql.push_str(&quote_identifier(collation));
+                    }
+                    sql.push(' ');
+                    sql.push_str(if term.descending { "DESC" } else { "ASC" });
+                    sql
+                })
+                .collect(),
+            Self::RowId(alias) => vec![format!("browse.{} ASC", quote_identifier(alias))],
+            Self::AllColumns => columns
+                .iter()
+                .map(|column| format!("browse.{} ASC", quote_identifier(&column.name)))
+                .collect(),
+        };
+        if terms.is_empty() {
+            String::new()
+        } else {
+            format!("ORDER BY {}", terms.join(", "))
+        }
+    }
 }
 
 struct LogicalTableInspection {
@@ -381,6 +449,14 @@ impl LogicalTableInspection {
         self.shards
             .first()
             .map_or(&[], |inspection| inspection.columns.as_slice())
+    }
+
+    fn local_order(&self) -> &LocalOrder {
+        &self
+            .shards
+            .first()
+            .expect("logical table inspection always has a physical target")
+            .local_order
     }
 }
 
@@ -449,7 +525,7 @@ async fn inspect_logical_table(
     ensure_schema_generation(schema_generation, engine.catalog().schema_generation())?;
     let mut shards = inspections?;
     shards.sort_unstable_by_key(|inspection| inspection.shard);
-    ensure_matching_columns(&shards)?;
+    ensure_matching_table_shapes(&shards)?;
     let total_rows = sum_row_counts(shards.iter().map(|inspection| inspection.rows))?;
     Ok(LogicalTableInspection {
         scope: targets.scope.name(),
@@ -490,7 +566,9 @@ async fn inspect_table_on_shard(
     context: RequestContext,
 ) -> Result<ShardTableInspection, EngineError> {
     let session = engine.session();
-    ensure_browseable_table_with_context(engine, &session, shard, table, context.clone()).await?;
+    let without_rowid =
+        browseable_table_storage_with_context(engine, &session, shard, table, context.clone())
+            .await?;
     let shape = engine
         .inspect_shard_with_context(
             &session,
@@ -502,6 +580,25 @@ async fn inspect_table_on_shard(
             context.clone(),
         )
         .await?;
+    let column_info = engine
+        .inspect_shard_with_context(
+            &session,
+            shard,
+            Statement::new(TABLE_COLUMN_INFO_SQL, vec![Value::Text(table.to_owned())]),
+            context.clone(),
+        )
+        .await
+        .and_then(table_column_info)?;
+    let primary_key = engine
+        .inspect_shard_with_context(
+            &session,
+            shard,
+            Statement::new(PRIMARY_KEY_INDEX_SQL, vec![Value::Text(table.to_owned())]),
+            context.clone(),
+        )
+        .await
+        .and_then(primary_key_terms)?;
+    let local_order = select_local_order(without_rowid, &column_info, primary_key)?;
     let result = engine
         .inspect_shard_with_context(
             &session,
@@ -520,53 +617,170 @@ async fn inspect_table_on_shard(
         shard,
         rows: row_count(result)?,
         columns: shape.into_parts().0,
+        local_order,
     })
 }
 
-fn ensure_matching_columns(shards: &[ShardTableInspection]) -> Result<(), EngineError> {
-    let Some(expected) = shards.first().map(|shard| shard.columns.as_slice()) else {
+fn ensure_matching_table_shapes(shards: &[ShardTableInspection]) -> Result<(), EngineError> {
+    let Some(expected) = shards.first() else {
         return Err(EngineError::new(
             EngineErrorKind::Internal,
             "admin logical table has no physical targets",
         ));
     };
-    if shards
-        .iter()
-        .all(|shard| shard.columns.as_slice() == expected)
-    {
+    if shards.iter().all(|shard| {
+        shard.columns.as_slice() == expected.columns.as_slice()
+            && shard.local_order == expected.local_order
+    }) {
         Ok(())
     } else {
         Err(EngineError::new(
             EngineErrorKind::DataCorruption,
-            "admin logical table has incompatible physical schemas",
+            "admin logical table has incompatible physical schemas or browse ordering",
         ))
     }
 }
 
-async fn ensure_browseable_table_with_context(
+async fn browseable_table_storage_with_context(
     engine: &crate::core::Engine,
     session: &crate::core::Session,
     shard: u16,
     table: &str,
     context: RequestContext,
-) -> Result<(), EngineError> {
-    let tables = engine
+) -> Result<bool, EngineError> {
+    let result = engine
         .inspect_shard_with_context(
             session,
             shard,
             Statement::new(TABLE_LOOKUP_SQL, vec![Value::Text(table.to_owned())]),
             context,
         )
-        .await
-        .and_then(table_names)?;
-    if tables.as_slice() == [table] {
-        Ok(())
-    } else {
-        Err(EngineError::new(
-            EngineErrorKind::InvalidArgument,
-            format!("admin table is not browseable on physical shard {shard}"),
-        ))
+        .await?;
+    let (_, mut rows) = result.into_parts();
+    if rows.len() == 1 {
+        let values = rows
+            .pop()
+            .expect("the exact row count was checked")
+            .into_values();
+        if let [Value::Text(observed), Value::Int64(without_rowid)] = values.as_slice() {
+            if observed == table && matches!(*without_rowid, 0 | 1) {
+                return Ok(*without_rowid == 1);
+            }
+        }
     }
+    Err(EngineError::new(
+        EngineErrorKind::InvalidArgument,
+        format!("admin table is not browseable on physical shard {shard}"),
+    ))
+}
+
+fn table_column_info(result: ResultSet) -> Result<Vec<TableColumnInfo>, EngineError> {
+    result
+        .into_parts()
+        .1
+        .into_iter()
+        .map(|row| {
+            let values = row.into_values();
+            let [
+                Value::Text(name),
+                Value::Text(declared_type),
+                Value::Int64(not_null),
+                Value::Int64(primary_key_rank),
+            ] = values.as_slice()
+            else {
+                return Err(invalid_table_metadata());
+            };
+            if !matches!(*not_null, 0 | 1) || !(0..=u32::MAX as i64).contains(primary_key_rank) {
+                return Err(invalid_table_metadata());
+            }
+            Ok(TableColumnInfo {
+                name: name.clone(),
+                declared_type: declared_type.clone(),
+                not_null: *not_null == 1,
+                primary_key_rank: *primary_key_rank as u32,
+            })
+        })
+        .collect()
+}
+
+fn primary_key_terms(result: ResultSet) -> Result<Vec<PrimaryKeyTerm>, EngineError> {
+    result
+        .into_parts()
+        .1
+        .into_iter()
+        .map(|row| {
+            let values = row.into_values();
+            let [
+                Value::Text(column),
+                Value::Text(collation),
+                Value::Int64(descending),
+            ] = values.as_slice()
+            else {
+                return Err(invalid_table_metadata());
+            };
+            if !matches!(*descending, 0 | 1) {
+                return Err(invalid_table_metadata());
+            }
+            Ok(PrimaryKeyTerm {
+                column: column.clone(),
+                collation: Some(collation.clone()),
+                descending: *descending == 1,
+            })
+        })
+        .collect()
+}
+
+fn select_local_order(
+    without_rowid: bool,
+    columns: &[TableColumnInfo],
+    primary_key: Vec<PrimaryKeyTerm>,
+) -> Result<LocalOrder, EngineError> {
+    let mut declared_primary_key = columns
+        .iter()
+        .filter(|column| column.primary_key_rank > 0)
+        .collect::<Vec<_>>();
+    declared_primary_key.sort_unstable_by_key(|column| column.primary_key_rank);
+
+    if without_rowid {
+        return if primary_key.is_empty() {
+            Err(invalid_table_metadata())
+        } else {
+            Ok(LocalOrder::PrimaryKey(primary_key))
+        };
+    }
+
+    if primary_key.is_empty() {
+        if let [column] = declared_primary_key.as_slice() {
+            if column.declared_type.trim().eq_ignore_ascii_case("INTEGER") {
+                return Ok(LocalOrder::PrimaryKey(vec![PrimaryKeyTerm {
+                    column: column.name.clone(),
+                    collation: None,
+                    descending: false,
+                }]));
+            }
+        }
+    }
+
+    if !primary_key.is_empty() && declared_primary_key.iter().all(|column| column.not_null) {
+        return Ok(LocalOrder::PrimaryKey(primary_key));
+    }
+
+    let rowid_alias = ["rowid", "_rowid_", "oid"].into_iter().find(|candidate| {
+        columns
+            .iter()
+            .all(|column| !column.name.eq_ignore_ascii_case(candidate))
+    });
+    Ok(match rowid_alias {
+        Some(alias) => LocalOrder::RowId(alias.to_owned()),
+        None => LocalOrder::AllColumns,
+    })
+}
+
+fn invalid_table_metadata() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::DataCorruption,
+        "admin table returned invalid physical ordering metadata",
+    )
 }
 
 fn row_count(result: ResultSet) -> Result<u64, EngineError> {
@@ -636,6 +850,7 @@ async fn rows(State(state): State<HttpState>, Query(query): Query<RowsQuery>) ->
 struct LogicalTablePage {
     scope: &'static str,
     visited_shards: Vec<u16>,
+    ordering: &'static str,
     columns: Vec<Column>,
     rows: Vec<Row>,
 }
@@ -648,14 +863,13 @@ async fn logical_table_page(
 ) -> Result<LogicalTablePage, EngineError> {
     let inspection = inspect_logical_table(engine, table).await?;
     let page_slices = page_slices(&inspection.shards, offset, u64::from(limit) + 1);
-    let quoted_table = quote_identifier(table);
-    let order_by = deterministic_order_by(inspection.columns());
+    let page_sql = page_query_sql(table, inspection.local_order(), inspection.columns());
+    let ordering = inspection.local_order().response_name();
     let page_results = stream::iter(page_slices)
         .map(|slice| {
             let engine = engine.clone();
             let table = table.to_owned();
-            let quoted_table = quoted_table.clone();
-            let order_by = order_by.clone();
+            let page_sql = page_sql.clone();
             let context = inspection.context.clone();
             async move {
                 let session = engine.session();
@@ -664,17 +878,7 @@ async fn logical_table_page(
                         &session,
                         slice.shard,
                         Statement::new(
-                            format!(
-                                "SELECT browse.* FROM {quoted_table} AS browse \
-                                 WHERE EXISTS (\
-                                     SELECT 1 FROM pragma_table_list \
-                                     WHERE schema = 'main' AND type = 'table' \
-                                       AND name = ?1 COLLATE BINARY \
-                                       AND lower(name) NOT GLOB 'sqlite_*' \
-                                       AND lower(name) != 'briskdb' \
-                                       AND lower(name) NOT GLOB 'briskdb_*'\
-                                 ) {order_by} LIMIT ?2 OFFSET ?3"
-                            ),
+                            page_sql,
                             vec![
                                 Value::Text(table),
                                 Value::Int64(slice.limit as i64),
@@ -714,6 +918,7 @@ async fn logical_table_page(
     Ok(LogicalTablePage {
         scope: inspection.scope,
         visited_shards: inspection.visited_shards(),
+        ordering,
         columns: inspection.columns().to_vec(),
         rows,
     })
@@ -751,19 +956,20 @@ fn page_slices(shards: &[ShardTableInspection], offset: u64, limit: u64) -> Vec<
     slices
 }
 
-fn deterministic_order_by(columns: &[Column]) -> String {
-    if columns.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "ORDER BY {}",
-            columns
-                .iter()
-                .map(|column| format!("browse.{}", quote_identifier(&column.name)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
+fn page_query_sql(table: &str, local_order: &LocalOrder, columns: &[Column]) -> String {
+    let quoted_table = quote_identifier(table);
+    let order_by = local_order.sql(columns);
+    format!(
+        "SELECT browse.* FROM {quoted_table} AS browse \
+         WHERE EXISTS (\
+             SELECT 1 FROM pragma_table_list \
+             WHERE schema = 'main' AND type = 'table' \
+               AND name = ?1 COLLATE BINARY \
+               AND lower(name) NOT GLOB 'sqlite_*' \
+               AND lower(name) != 'briskdb' \
+               AND lower(name) NOT GLOB 'briskdb_*'\
+         ) {order_by} LIMIT ?2 OFFSET ?3"
+    )
 }
 
 fn page_response(table: String, page: LogicalTablePage, limit: u16, offset: u64) -> Response {
@@ -796,7 +1002,7 @@ fn page_response(table: String, page: LogicalTablePage, limit: u16, offset: u64)
             table,
             scope: page.scope,
             visited_shards: page.visited_shards,
-            ordering: "shard_major_then_all_columns",
+            ordering: page.ordering,
             limit,
             offset,
             has_more,
@@ -1485,7 +1691,7 @@ mod tests {
         assert_eq!(first_page["table"], "widgets");
         assert_eq!(first_page["scope"], "empty_catalog_all_physical_shards");
         assert_eq!(first_page["visited_shards"], json!([0, 1]));
-        assert_eq!(first_page["ordering"], "shard_major_then_all_columns");
+        assert_eq!(first_page["ordering"], "shard_major_then_primary_key");
         assert_eq!(first_page["limit"], 2);
         assert_eq!(first_page["offset"], 0);
         assert_eq!(first_page["has_more"], true);
@@ -1524,7 +1730,7 @@ mod tests {
                     "table": "widgets",
                     "scope": "empty_catalog_all_physical_shards",
                     "visited_shards": [0, 1],
-                    "ordering": "shard_major_then_all_columns",
+                    "ordering": "shard_major_then_primary_key",
                     "limit": 2,
                     "offset": 2,
                     "has_more": true,
@@ -1711,6 +1917,7 @@ mod tests {
         .await;
         assert_eq!(sharded["scope"], "logical_sharded_table");
         assert_eq!(sharded["visited_shards"], json!([0, 1]));
+        assert_eq!(sharded["ordering"], "shard_major_then_primary_key");
         assert_eq!(sharded["rows"].as_array().unwrap().len(), 2);
         assert_eq!(sharded["rows"][0][1], "same payload");
         assert_eq!(sharded["rows"][1][1], "same payload");
@@ -1751,6 +1958,7 @@ mod tests {
         .await;
         assert_eq!(global["scope"], "logical_global_table");
         assert_eq!(global["visited_shards"], json!([0]));
+        assert_eq!(global["ordering"], "shard_major_then_primary_key");
         assert_eq!(global["rows"], json!([["US", "canonical"]]));
         assert_eq!(
             response_json(
@@ -1842,6 +2050,11 @@ mod tests {
         let failed = body_json(failed).await;
         assert_eq!(failed["code"], "invalid_argument");
         assert!(failed.get("rows").is_none());
+
+        rusqlite::Connection::open(temp.path().join("shards/0001.sqlite"))
+            .unwrap()
+            .execute_batch("CREATE TABLE counted (id INTEGER PRIMARY KEY)")
+            .unwrap();
 
         assert_eq!(
             response_json(
@@ -1977,6 +2190,7 @@ mod tests {
             LogicalTablePage {
                 scope: "logical_sharded_table",
                 visited_shards: vec![0, 1],
+                ordering: "shard_major_then_primary_key",
                 columns,
                 rows,
             },
@@ -2009,6 +2223,7 @@ mod tests {
             LogicalTablePage {
                 scope: "logical_sharded_table",
                 visited_shards: vec![0, 1],
+                ordering: "shard_major_then_primary_key",
                 columns,
                 rows,
             },
@@ -2128,6 +2343,7 @@ mod tests {
                 shard: shard as u16,
                 rows,
                 columns: columns.clone(),
+                local_order: LocalOrder::AllColumns,
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2151,12 +2367,167 @@ mod tests {
             ]
         );
         assert_eq!(
-            deterministic_order_by(&[
+            LocalOrder::AllColumns.sql(&[
                 Column::new("a", DataType::Unknown),
                 Column::new("odd\"name", DataType::Unknown),
             ]),
-            "ORDER BY browse.\"a\", browse.\"odd\"\"name\""
+            "ORDER BY browse.\"a\" ASC, browse.\"odd\"\"name\" ASC"
         );
+    }
+
+    #[test]
+    fn local_order_uses_unique_physical_keys_and_safe_fallbacks() {
+        let column =
+            |name: &str, declared_type: &str, not_null, primary_key_rank| TableColumnInfo {
+                name: name.to_owned(),
+                declared_type: declared_type.to_owned(),
+                not_null,
+                primary_key_rank,
+            };
+        let visible = [
+            Column::new("payload", DataType::Unknown),
+            Column::new("id", DataType::Unknown),
+        ];
+
+        let integer_primary_key = select_local_order(
+            false,
+            &[
+                column("payload", "TEXT", false, 0),
+                column("id", "INTEGER", false, 1),
+            ],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            integer_primary_key,
+            LocalOrder::PrimaryKey(vec![PrimaryKeyTerm {
+                column: "id".to_owned(),
+                collation: None,
+                descending: false,
+            }])
+        );
+        assert_eq!(
+            integer_primary_key.sql(&visible),
+            "ORDER BY browse.\"id\" ASC"
+        );
+
+        let rowid = select_local_order(
+            false,
+            &[
+                column("rowid", "TEXT", false, 0),
+                column("payload", "TEXT", false, 0),
+            ],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(rowid, LocalOrder::RowId("_rowid_".to_owned()));
+        assert_eq!(rowid.sql(&visible), "ORDER BY browse.\"_rowid_\" ASC");
+
+        let all_columns = select_local_order(
+            false,
+            &[
+                column("rowid", "TEXT", false, 0),
+                column("_ROWID_", "TEXT", false, 0),
+                column("Oid", "TEXT", false, 0),
+            ],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(all_columns, LocalOrder::AllColumns);
+
+        let composite = LocalOrder::PrimaryKey(vec![
+            PrimaryKeyTerm {
+                column: "tenant".to_owned(),
+                collation: Some("NOCASE".to_owned()),
+                descending: true,
+            },
+            PrimaryKeyTerm {
+                column: "seq".to_owned(),
+                collation: Some("BINARY".to_owned()),
+                descending: false,
+            },
+        ]);
+        assert_eq!(
+            composite.sql(&visible),
+            "ORDER BY browse.\"tenant\" COLLATE \"NOCASE\" DESC, browse.\"seq\" COLLATE \"BINARY\" ASC"
+        );
+        assert_eq!(
+            select_local_order(true, &[], vec![]).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+
+        let columns = vec![Column::new("id", DataType::Unknown)];
+        let mismatched = vec![
+            ShardTableInspection {
+                shard: 0,
+                rows: 0,
+                columns: columns.clone(),
+                local_order: integer_primary_key,
+            },
+            ShardTableInspection {
+                shard: 1,
+                rows: 0,
+                columns,
+                local_order: LocalOrder::AllColumns,
+            },
+        ];
+        assert_eq!(
+            ensure_matching_table_shapes(&mismatched)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
+
+    #[test]
+    fn primary_key_page_query_avoids_temp_sort_and_orders_by_key() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE keyed (payload TEXT, id INTEGER PRIMARY KEY, note TEXT); \
+                 INSERT INTO keyed (payload, id, note) VALUES \
+                    ('a', 2, 'second'), ('z', 1, 'first');",
+            )
+            .unwrap();
+        let columns = vec![
+            Column::new("payload", DataType::Unknown),
+            Column::new("id", DataType::Unknown),
+            Column::new("note", DataType::Unknown),
+        ];
+        let local_order = LocalOrder::PrimaryKey(vec![PrimaryKeyTerm {
+            column: "id".to_owned(),
+            collation: None,
+            descending: false,
+        }]);
+        let page_sql = page_query_sql("keyed", &local_order, &columns);
+        assert!(page_sql.contains("ORDER BY browse.\"id\" ASC"));
+        assert!(!page_sql.contains("ORDER BY browse.\"payload\""));
+
+        let explain_sql = format!("EXPLAIN QUERY PLAN {page_sql}");
+        let mut explain = connection.prepare(&explain_sql).unwrap();
+        let details = explain
+            .query_map(rusqlite::params!["keyed", 51_i64, 0_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "{details:?}"
+        );
+
+        let mut page = connection.prepare(&page_sql).unwrap();
+        let ids = page
+            .query_map(rusqlite::params!["keyed", 51_i64, 0_i64], |row| {
+                row.get::<_, i64>(1)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[tokio::test]

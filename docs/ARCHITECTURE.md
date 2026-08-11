@@ -126,8 +126,8 @@ Issue #106 adds an embedded application under `/admin` on the existing HTTP
 listener. The public shell, stylesheet, and JavaScript are static bytes compiled
 into the binary. Same-origin JSON handlers validate the temporary `admin` /
 `admin` login, retain at most 128 opaque sessions in process memory for an
-absolute eight hours, and enforce the cookie on session, discovery, all-shard
-physical-count, and row-page operations. Logout revokes a presented token when
+absolute eight hours, and enforce the cookie on session, discovery, logical
+count, and row-page operations. Logout revokes a presented token when
 possible and always clears
 the cookie, so repeating it is harmless. These browser sessions are adapter
 state, not core SQL sessions, and are neither written to storage nor recovered
@@ -145,13 +145,16 @@ Table discovery reads SQLite's physical `main` schema through that boundary,
 returns only ordinary application tables, and excludes ASCII-case-insensitive
 `sqlite_`, `briskdb`, and `briskdb_` names. The page handler accepts no SQL from
 the browser. It validates the returned table identity, safely quotes that
-identifier, binds finite limit/offset values, and exposes at most 200 rows from
-one shard. It never opens a database file or imports `rusqlite` in the adapter.
-The specialized count handler verifies the table on every shard, runs bounded
-concurrent read-only counts through the same engine boundary, and returns only
-a checked physical-row sum. Separate pages and shard counts are live reads, not
-a transaction, stable ordering, or a cross-shard snapshot. The complete route
-and representation contract is in the
+identifier, binds finite limit/offset values, and exposes at most 200 logical
+rows from metadata-selected files. Physical inspection derives a unique local
+primary-key or rowid ordering and requires it to match across those files, so
+wide tables do not require an every-column temporary sort. It never opens a
+database file or imports `rusqlite` in the adapter. The specialized count
+handler verifies the table on every relevant shard, runs bounded concurrent
+read-only counts through the same engine boundary, and returns only a checked
+logical-row sum. Separate pages and shard counts are live reads, not a
+transaction or a cross-shard snapshot. The complete route and representation
+contract is in the
 [admin data browser](ADMIN_BROWSER.md).
 
 ## SQL parser boundary

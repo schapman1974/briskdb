@@ -84,7 +84,8 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
   a BriskDB-owned `pgwire` 0.36.3 boundary
 - An embedded read-only browser at `/admin` for inspecting user tables, showing
   exact logical-row totals, and reading bounded logical pages across each
-  table's metadata-selected files without a shard selector
+  table's metadata-selected files without a shard selector; pages reuse each
+  physical table's primary-key or rowid order instead of sorting every column
 - Protocol-neutral typed values, ordered columns, positional rows, and results
 - A bounded per-session prepared-statement and immutable bound-portal lifecycle
   with transient shard-0 metadata compilation, bind-time routing snapshots,
