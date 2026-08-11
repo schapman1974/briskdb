@@ -1,5 +1,4 @@
 use std::{
-    path::Path,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -12,81 +11,75 @@ use briskdb::{
     server, sql, storage,
 };
 
-fn insert_catalog_fixture(root: &Path) {
-    let manifest = rusqlite::Connection::open(root.join("manifest.sqlite")).unwrap();
-    manifest
-        .execute_batch(
-            "PRAGMA foreign_keys = ON;
-             BEGIN IMMEDIATE;
-             DROP TABLE briskdb_integrity;
-             DROP TABLE briskdb_metadata;
-             CREATE TABLE briskdb_metadata (
-                 requires_manifest_version INTEGER NOT NULL
-                     CHECK (requires_manifest_version >= 6)
-             ) STRICT;
-             INSERT INTO briskdb_metadata VALUES (6);
-             INSERT INTO briskdb_logical_databases (database_id, database_name)
-             VALUES (9, 'tenant');
-             INSERT INTO briskdb_tables (
-                table_id,
-                database_id,
-                table_name,
-                placement,
-                shard_key_column,
-                shard_key_type
-             ) VALUES
-                (20, 1, 'countries', 2, NULL, NULL),
-                (30, 9, 'accounts', 1, 'tenant_id', 2),
-                (40, 9, 'internal_catalog', 3, NULL, NULL);
-             PRAGMA user_version = 6;
-             COMMIT;",
+fn register_catalog_fixture(database: &mut core::Database) {
+    database
+        .broadcast(
+            "CREATE TABLE accounts (
+                id INTEGER NOT NULL,
+                tenant_id TEXT NOT NULL,
+                payload TEXT,
+                PRIMARY KEY (tenant_id, id)
+             );
+             CREATE TABLE countries (
+                code TEXT PRIMARY KEY,
+                name TEXT NOT NULL
+             );",
         )
+        .unwrap();
+    let logical_database = database.catalog().default_database().id();
+    database
+        .register_tables(vec![
+            core::TableDeclaration::global(logical_database, "countries").unwrap(),
+            core::TableDeclaration::catalog(logical_database, "internal_catalog").unwrap(),
+            core::TableDeclaration::sharded(
+                logical_database,
+                "accounts",
+                core::ShardKeyMetadata::new("tenant_id", core::ShardKeyType::Text).unwrap(),
+            )
+            .unwrap(),
+        ])
         .unwrap();
 }
 
-fn insert_prepared_catalog_fixture(root: &Path) {
-    let manifest = rusqlite::Connection::open(root.join("manifest.sqlite")).unwrap();
-    manifest
-        .execute_batch(
-            "PRAGMA foreign_keys = ON;
-             BEGIN IMMEDIATE;
-             DROP TABLE briskdb_integrity;
-             DROP TABLE briskdb_metadata;
-             CREATE TABLE briskdb_metadata (
-                 requires_manifest_version INTEGER NOT NULL
-                     CHECK (requires_manifest_version >= 6)
-             ) STRICT;
-             INSERT INTO briskdb_metadata VALUES (6);
-             INSERT INTO briskdb_tables (
-                table_id,
-                database_id,
-                table_name,
-                placement,
-                shard_key_column,
-                shard_key_type
-             ) VALUES (50, 1, 'prepared_events', 1, 'tenant_id', 1);
-             PRAGMA user_version = 6;
-             COMMIT;",
+fn register_prepared_catalog_fixture(database: &mut core::Database) {
+    database
+        .broadcast(
+            "CREATE TABLE prepared_events (
+                tenant_id INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL
+             )",
         )
+        .unwrap();
+    let logical_database = database.catalog().default_database().id();
+    database
+        .register_tables(vec![
+            core::TableDeclaration::sharded(
+                logical_database,
+                "prepared_events",
+                core::ShardKeyMetadata::new("tenant_id", core::ShardKeyType::Int64).unwrap(),
+            )
+            .unwrap(),
+        ])
         .unwrap();
 }
 
 fn assert_catalog_fixture(catalog: &core::Catalog) {
     assert_eq!(catalog.identifier_encoding_version(), 1);
-    assert_eq!(catalog.schema_generation(), 0);
+    assert_eq!(catalog.schema_generation(), 1);
     assert_eq!(catalog.default_database().id().get(), 1);
     assert_eq!(catalog.default_database().name(), "default");
-    assert_eq!(catalog.logical_databases().len(), 2);
+    assert_eq!(catalog.logical_databases().len(), 1);
     assert_eq!(catalog.tables().len(), 3);
 
-    let tenant = catalog.database("tenant").unwrap().unwrap();
-    assert_eq!(tenant.id().get(), 9);
-    assert_eq!(tenant.id().to_string(), "9");
-    assert_eq!(catalog.database_by_id(tenant.id()), Some(tenant));
+    let logical_database = catalog.default_database();
+    assert_eq!(
+        catalog.database_by_id(logical_database.id()),
+        Some(logical_database)
+    );
 
     let countries = catalog.table("default", "countries").unwrap().unwrap();
-    assert_eq!(countries.id().get(), 20);
-    assert_eq!(countries.id().to_string(), "20");
+    assert_eq!(countries.id().get(), 2);
+    assert_eq!(countries.id().to_string(), "2");
     assert_eq!(countries.database_id().get(), 1);
     assert!(matches!(
         countries.placement(),
@@ -97,9 +90,9 @@ fn assert_catalog_fixture(catalog: &core::Catalog) {
         Some(countries)
     );
 
-    let accounts = catalog.table("tenant", "accounts").unwrap().unwrap();
-    assert_eq!(accounts.id().get(), 30);
-    assert_eq!(accounts.database_id(), tenant.id());
+    let accounts = catalog.table("default", "accounts").unwrap().unwrap();
+    assert_eq!(accounts.id().get(), 1);
+    assert_eq!(accounts.database_id(), logical_database.id());
     match accounts.placement() {
         core::TablePlacement::Sharded(shard_key) => {
             assert_eq!(shard_key.column(), "tenant_id");
@@ -110,7 +103,7 @@ fn assert_catalog_fixture(catalog: &core::Catalog) {
 
     assert!(matches!(
         catalog
-            .table("tenant", "internal_catalog")
+            .table("default", "internal_catalog")
             .unwrap()
             .unwrap()
             .placement(),
@@ -122,7 +115,7 @@ fn assert_catalog_fixture(catalog: &core::Catalog) {
             .iter()
             .map(|table| (table.database_id().get(), table.name()))
             .collect::<Vec<_>>(),
-        [(1, "countries"), (9, "accounts"), (9, "internal_catalog")]
+        [(1, "accounts"), (1, "countries"), (1, "internal_catalog")]
     );
 }
 
@@ -224,8 +217,8 @@ fn protocol_neutral_sql_parser_facade_is_public_bounded_and_opt_in() {
     assert_eq!(sql::MAX_PARSED_SQL_STATEMENTS, 256);
     assert_eq!(sql::SQL_PARSE_RECURSION_LIMIT, 32);
 
-    // Parsing and subset validation are opt-in infrastructure. The existing
-    // raw SQLite path deliberately does not invoke either layer yet.
+    // An empty authoritative catalog deliberately retains the raw SQLite
+    // compatibility path and therefore does not invoke either layer.
     let temp = tempfile::tempdir().unwrap();
     let database = core::Database::open(temp.path(), 2).unwrap();
     let mut raw_sql = "SELECT 1".to_owned();
@@ -543,11 +536,11 @@ fn sql_translation_is_public_owned_dialect_equivalent_and_opt_in() {
     assert!(!format!("{strict:?}").contains("private"));
 
     let temp = tempfile::tempdir().unwrap();
-    drop(core::Database::open(temp.path(), 4).unwrap());
-    insert_catalog_fixture(temp.path());
-    let database = Arc::new(core::Database::open(temp.path(), 4).unwrap());
+    let mut database = core::Database::open(temp.path(), 4).unwrap();
+    register_catalog_fixture(&mut database);
+    let database = Arc::new(database);
     let engine = core::Engine::from_database(Arc::clone(&database));
-    let tenant = database.catalog().database("tenant").unwrap().unwrap();
+    let logical_database = database.catalog().default_database();
     let parameter = [core::Value::Text("tenant-public-translation".to_owned())];
     let requests = [
         (
@@ -578,7 +571,7 @@ fn sql_translation_is_public_owned_dialect_equivalent_and_opt_in() {
         );
         engine
             .plan_bound_statement(
-                tenant.id(),
+                logical_database.id(),
                 translated.normalized_sql(),
                 0,
                 &parameter,
@@ -589,14 +582,22 @@ fn sql_translation_is_public_owned_dialect_equivalent_and_opt_in() {
     assert_eq!(plans[0], plans[1]);
     assert_eq!(plans[1], plans[2]);
 
-    // Translation remains opt-in. Existing raw SQLite execution continues to
-    // accept its current named-parameter behavior directly.
+    // A populated authoritative catalog sends raw calls through the bounded
+    // SQLite frontend, which accepts positional parameters and rejects named
+    // parameters instead of retaining the empty-catalog pass-through.
+    assert_eq!(
+        database
+            .query(
+                "translation-opt-in",
+                "SELECT :value",
+                &[core::Value::Int64(29)],
+            )
+            .unwrap_err()
+            .kind(),
+        core::EngineErrorKind::Unsupported
+    );
     let raw = database
-        .query(
-            "translation-opt-in",
-            "SELECT :value",
-            &[core::Value::Int64(29)],
-        )
+        .query("translation-opt-in", "SELECT ?1", &[core::Value::Int64(29)])
         .unwrap();
     assert_eq!(raw.rows()[0].get(0), Some(&core::Value::Int64(29)));
 }
@@ -609,10 +610,9 @@ fn shard_key_inference_is_public_typed_and_opt_in() {
     assert_owned_public::<sql::ShardKeyValue>();
 
     let temp = tempfile::tempdir().unwrap();
-    drop(core::Database::open(temp.path(), 4).unwrap());
-    insert_catalog_fixture(temp.path());
-    let database = core::Database::open(temp.path(), 4).unwrap();
-    let tenant = database.catalog().database("tenant").unwrap().unwrap();
+    let mut database = core::Database::open(temp.path(), 4).unwrap();
+    register_catalog_fixture(&mut database);
+    let logical_database = database.catalog().default_database();
 
     let source = "INSERT INTO accounts (payload, tenant_id) VALUES ($1, $2), ($3, 'tenant-b')";
     let parsed = sql::parse(sql::SqlDialect::PostgreSql, source).unwrap();
@@ -620,7 +620,7 @@ fn shard_key_inference_is_public_typed_and_opt_in() {
     let normalized = sql::normalize_placeholders(common).unwrap();
     let inference = sql::infer_shard_keys(
         database.catalog(),
-        tenant.id(),
+        logical_database.id(),
         &normalized,
         0,
         &[
@@ -631,7 +631,7 @@ fn shard_key_inference_is_public_typed_and_opt_in() {
     )
     .unwrap();
 
-    assert_eq!(inference.table_id().unwrap().get(), 30);
+    assert_eq!(inference.table_id().unwrap().get(), 1);
     assert_eq!(inference.key_type(), Some(core::ShardKeyType::Text));
     assert_eq!(inference.kind(), sql::ShardKeyInferenceKind::Multiple);
     assert_eq!(inference.values().len(), 2);
@@ -690,11 +690,11 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
     assert_owned_public::<core::PlannedRoute>();
 
     let temp = tempfile::tempdir().unwrap();
-    drop(core::Database::open(temp.path(), 8).unwrap());
-    insert_catalog_fixture(temp.path());
-    let database = Arc::new(core::Database::open(temp.path(), 8).unwrap());
+    let mut database = core::Database::open(temp.path(), 8).unwrap();
+    register_catalog_fixture(&mut database);
+    let database = Arc::new(database);
     let engine = core::Engine::from_database(Arc::clone(&database));
-    let tenant = database.catalog().database("tenant").unwrap().unwrap();
+    let logical_database = database.catalog().default_database();
 
     let source = "INSERT INTO accounts (tenant_id) VALUES ($1), ($2), ($3)";
     let parsed = sql::parse(sql::SqlDialect::PostgreSql, source).unwrap();
@@ -715,7 +715,7 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
 
     let plan = engine
         .plan_bound_statement(
-            tenant.id(),
+            logical_database.id(),
             &normalized,
             0,
             &first_parameters,
@@ -723,7 +723,7 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
         )
         .unwrap();
 
-    assert_eq!(plan.database(), tenant.id());
+    assert_eq!(plan.database(), logical_database.id());
     assert_eq!(
         plan.schema_generation(),
         database.catalog().schema_generation()
@@ -787,7 +787,7 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
     assert_ne!(database.shard_for_key(&conflicting_key), first_shard);
     let conflict = engine
         .plan_bound_statement(
-            tenant.id(),
+            logical_database.id(),
             &normalized,
             0,
             &first_parameters,
@@ -808,7 +808,7 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
 
     let recovered = engine
         .plan_bound_statement(
-            tenant.id(),
+            logical_database.id(),
             &normalized,
             0,
             &first_parameters,
@@ -829,7 +829,13 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
         .map(|key| core::Value::Text((*key).to_owned()))
         .collect::<Vec<_>>();
     let replanned = engine
-        .plan_bound_statement(tenant.id(), &normalized, 0, &second_parameters, None)
+        .plan_bound_statement(
+            logical_database.id(),
+            &normalized,
+            0,
+            &second_parameters,
+            None,
+        )
         .unwrap();
     assert_eq!(replanned.inferred_routes().len(), second_keys.len());
     assert!(replanned.explicit_route().is_none());
@@ -878,6 +884,7 @@ fn logical_catalog_types_and_access_are_public_and_protocol_neutral() {
     assert_public_metadata::<core::LogicalDatabaseId>();
     assert_public_metadata::<core::LogicalDatabaseMetadata>();
     assert_public_metadata::<core::TableId>();
+    assert_public_metadata::<core::TableDeclaration>();
     assert_public_metadata::<core::TableMetadata>();
     assert_public_metadata::<core::TablePlacement>();
     assert_public_metadata::<core::ShardKeyMetadata>();
@@ -1103,17 +1110,9 @@ async fn prepared_lifecycle_is_public_owned_and_protocol_neutral() {
     assert_owned::<core::PreparedExecution>();
 
     let temp = tempfile::tempdir().unwrap();
-    drop(core::Database::open(temp.path(), 4).unwrap());
-    insert_prepared_catalog_fixture(temp.path());
-    let database = Arc::new(core::Database::open(temp.path(), 4).unwrap());
-    database
-        .broadcast(
-            "CREATE TABLE prepared_events (
-                tenant_id INTEGER PRIMARY KEY,
-                payload TEXT NOT NULL
-             )",
-        )
-        .unwrap();
+    let mut database = core::Database::open(temp.path(), 4).unwrap();
+    register_prepared_catalog_fixture(&mut database);
+    let database = Arc::new(database);
     let logical_database = database.catalog().default_database().id();
     let engine = core::Engine::from_database(database);
     let session = engine.session();
@@ -1258,16 +1257,10 @@ fn catalog_snapshot_is_immutable_and_reopen_observes_only_valid_commits() {
         &[0, 1, 2, 0xff],
         "snowman-☃".as_bytes(),
     ];
-    let database = core::Database::open(temp.path(), 10).unwrap();
+    let mut database = core::Database::open(temp.path(), 10).unwrap();
     let expected_routes = keys.map(|key| database.shard_for_key(key));
-    assert_eq!(database.catalog().logical_databases().len(), 1);
-    assert!(database.catalog().tables().is_empty());
-
-    insert_catalog_fixture(temp.path());
-
-    assert_eq!(database.catalog().logical_databases().len(), 1);
-    assert!(database.catalog().tables().is_empty());
-    assert_eq!(database.catalog().database("tenant").unwrap(), None);
+    register_catalog_fixture(&mut database);
+    assert_catalog_fixture(database.catalog());
     assert_eq!(keys.map(|key| database.shard_for_key(key)), expected_routes);
 
     let reopened = core::Database::open(temp.path(), 10).unwrap();
@@ -1278,7 +1271,7 @@ fn catalog_snapshot_is_immutable_and_reopen_observes_only_valid_commits() {
     manifest
         .execute_batch(
             "PRAGMA ignore_check_constraints = ON;
-             UPDATE briskdb_tables SET placement = 99 WHERE table_id = 30;
+             UPDATE briskdb_tables SET placement = 99 WHERE table_id = 1;
              PRAGMA ignore_check_constraints = OFF;",
         )
         .unwrap();
@@ -1289,18 +1282,16 @@ fn catalog_snapshot_is_immutable_and_reopen_observes_only_valid_commits() {
     let error = core::Database::open(temp.path(), 10).unwrap_err();
     assert_eq!(error.kind(), core::EngineErrorKind::DataCorruption);
 
-    assert_eq!(database.catalog().logical_databases().len(), 1);
-    assert!(database.catalog().tables().is_empty());
+    assert_catalog_fixture(database.catalog());
     assert_eq!(keys.map(|key| database.shard_for_key(key)), expected_routes);
 }
 
 #[test]
 fn database_and_engine_catalog_reads_are_deterministic_in_parallel() {
     let temp = tempfile::tempdir().unwrap();
-    drop(core::Database::open(temp.path(), 6).unwrap());
-    insert_catalog_fixture(temp.path());
-
-    let database = Arc::new(core::Database::open(temp.path(), 6).unwrap());
+    let mut database = core::Database::open(temp.path(), 6).unwrap();
+    register_catalog_fixture(&mut database);
+    let database = Arc::new(database);
     let engine = core::Engine::from_database(Arc::clone(&database));
     assert!(std::ptr::eq(database.catalog(), engine.catalog()));
     assert_catalog_fixture(database.catalog());
@@ -1319,12 +1310,12 @@ fn database_and_engine_catalog_reads_are_deterministic_in_parallel() {
                     assert_eq!(
                         database
                             .catalog()
-                            .table("tenant", "accounts")
+                            .table("default", "accounts")
                             .unwrap()
                             .unwrap()
                             .id()
                             .get(),
-                        30
+                        1
                     );
                     assert_eq!(database.shard_for_key(b"parallel-catalog"), expected_shard);
                 }

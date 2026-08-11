@@ -248,6 +248,14 @@ no new error kind, retains no failed parameters, and does not change protocol
 mappings. See the [bound statement-planning and routing-policy
 contract](SQL_PLANNING.md).
 
+Populated-catalog raw execute/query preserves those frontend and planner kinds.
+It adds `InvalidArgument` when the request is not exactly one top-level
+statement, `InvalidQuery` when logical read/write behavior does not match the
+chosen endpoint, `PermissionDenied` for Catalog placement, and `Unsupported`
+for schema/session behavior, Global writes, or a sharded read/write without one
+finite executable owner. An undeclared table remains `InvalidQuery`. Empty
+catalogs retain the legacy SQLite error boundary instead of this catalog gate.
+
 The prepared lifecycle preserves each earlier frontend/planner kind. Prepare
 adds `InvalidArgument` for an unknown logical database and for anything other
 than exactly one top-level statement, `LimitExceeded` for a full session
@@ -329,6 +337,33 @@ retain the normal SQL classification, and attempts to reach the reserved
 BriskDB schema or storage controls are `PermissionDenied`. The public problem
 detail never includes the retained SQL.
 
+With a populated authoritative catalog, row-moving DML,
+`CREATE TABLE ... AS SELECT`, `DROP TABLE`, `CREATE TRIGGER`, or a final schema
+containing an application foreign key, trigger, virtual table, invalid
+primary/unique key, or changed placement/key invariant is
+`FailedPrecondition` before journal publication.
+
+Manifest v8 table registration reports malformed, empty, duplicate, or
+unknown-database declarations as `InvalidArgument` and an oversized catalog as
+`LimitExceeded`. A nonempty physical table, an incomplete or differing physical
+table set, a catalog-table shadow, an invalid sharded key or Text collation, a
+sharded primary/unique key without its `BINARY` shard-key term, any application
+foreign key, trigger, or virtual table, another live owner, or an attempted
+replacement of an already populated catalog is `FailedPrecondition`. The same
+complete declaration set is idempotent. Schema SQL that would violate a
+populated authoritative catalog is also `FailedPrecondition` before a journal
+or shard mutation is published.
+
+Registration changes schema admission to `Pending` immediately before the
+manifest commit attempt. A commit cleanup/I/O error retains its precise storage
+kind; a later in-process publication failure is `Internal`. Either can be
+durability-ambiguous, so ordinary operations on the registering handle return
+`FailedPrecondition`. If the complete catalog committed, another open while the
+stale handle remains live also returns `FailedPrecondition` rather than exposing
+two catalog snapshots. Close the stale handle and reopen the data root to
+reconcile old versus new durable state; do not retry registration through that
+pending handle.
+
 Shard-layout validation follows the same distinction. A foreign shard
 application ID, unexpected canonical four-digit `.sqlite` shard file or
 symbolic link, persistent journal mode other than WAL, or shard generation
@@ -347,7 +382,9 @@ serialized directly by an adapter.
 The earlier taxonomy change affected reporting only. Manifest v5 later added
 identity metadata to shard files, manifest v6 added retained crash-resumable
 application-schema history, and manifest v7 added semantic and schema
-fingerprints plus explicit integrity state. Their format upgrades preserve
+fingerprints plus explicit integrity state. Manifest v8 clears unproved v7
+advisory table rows and adds authoritative initialization registration. These
+format upgrades preserve
 legacy application tables, rows, routing, SQL results, and wire configuration.
 
 This is a pre-1.0 Rust API migration: public `Database` operations now return

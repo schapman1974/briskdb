@@ -487,7 +487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_http_sql_remains_raw_sqlite_pass_through_until_planner_integration() {
+    async fn empty_catalog_http_sql_retains_raw_sqlite_compatibility() {
         let temp = tempfile::tempdir().unwrap();
         let database = Arc::new(Database::open(temp.path(), 2).unwrap());
         let expected_shard = database.shard_for_key(b"raw-http-parser-boundary");

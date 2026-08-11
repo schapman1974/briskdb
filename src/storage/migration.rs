@@ -354,6 +354,7 @@ where
                 control: control.as_ref(),
             },
             &source_digest,
+            &storage.catalog,
         )
         .map_err(|error| sanitized_shard_error(error, "preflight", shard_id))?;
         if state != shard::SchemaMigrationShardState::Source {
@@ -991,6 +992,7 @@ struct ShardMigrationRequest<'a> {
 fn preflight_one_shard(
     request: ShardMigrationRequest<'_>,
     expected_source_digest: &[u8; 32],
+    catalog: &CatalogSnapshot,
 ) -> EngineResult<(shard::SchemaMigrationShardState, [u8; 32])> {
     let ShardMigrationRequest {
         path,
@@ -1016,7 +1018,7 @@ fn preflight_one_shard(
                 layout,
             )?;
             shard::verify_schema_digest(&connection, source_generation, expected_source_digest)?;
-            shard::preflight_schema_migration_on_connection_with_digest(
+            shard::preflight_schema_migration_on_connection_with_digest_and_catalog(
                 &mut connection,
                 path,
                 shard_id,
@@ -1024,6 +1026,7 @@ fn preflight_one_shard(
                 target_generation,
                 layout,
                 sql,
+                catalog.logical(),
             )
         }
         Some(control) => {
@@ -1038,7 +1041,7 @@ fn preflight_one_shard(
                     layout,
                 )?;
                 shard::verify_schema_digest(connection, source_generation, expected_source_digest)?;
-                shard::preflight_schema_migration_on_connection_with_digest(
+                shard::preflight_schema_migration_on_connection_with_digest_and_catalog(
                     connection,
                     path,
                     shard_id,
@@ -1046,6 +1049,7 @@ fn preflight_one_shard(
                     target_generation,
                     layout,
                     sql,
+                    catalog.logical(),
                 )
             })
         }
@@ -1255,7 +1259,10 @@ mod tests {
     use rusqlite::OptionalExtension;
 
     use super::*;
-    use crate::storage::SchemaGateState;
+    use crate::{
+        core::{LogicalDatabaseId, ShardKeyMetadata, ShardKeyType, TableDeclaration},
+        storage::SchemaGateState,
+    };
 
     const MIGRATION_SQL: &str =
         "CREATE TABLE migration_marker (id INTEGER PRIMARY KEY, value TEXT NOT NULL)";
@@ -1813,6 +1820,136 @@ mod tests {
             0,
             "preflight corruption must not publish a migration journal"
         );
+    }
+
+    #[test]
+    fn authoritative_catalog_rejects_breaking_migrations_before_journal_or_shard_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(temp.path(), 2).unwrap();
+        run_sql_with_hook(
+            &storage,
+            "CREATE TABLE accounts (
+                 id INTEGER PRIMARY KEY,
+                 display_name TEXT NOT NULL
+             ) STRICT;
+             CREATE TABLE countries (
+                 code TEXT PRIMARY KEY,
+                 display_name TEXT NOT NULL
+             ) STRICT",
+            |_| Ok(()),
+        )
+        .unwrap();
+        let database = LogicalDatabaseId::new(1).unwrap();
+        storage
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    database,
+                    "accounts",
+                    ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+                TableDeclaration::catalog(database, "audit_catalog").unwrap(),
+                TableDeclaration::global(database, "countries").unwrap(),
+            ])
+            .unwrap();
+
+        let manifest_before = Connection::open(temp.path().join("manifest.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT c.schema_generation,
+                        (SELECT COUNT(*) FROM briskdb_schema_migrations)
+                 FROM briskdb_schema_catalog AS c
+                 WHERE c.singleton = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        let generations_before = shard_generations(temp.path());
+
+        for sql in [
+            "DROP TABLE accounts",
+            "DROP TABLE accounts;
+             CREATE TABLE accounts (
+                 id TEXT PRIMARY KEY,
+                 display_name TEXT NOT NULL
+             ) STRICT",
+            "CREATE TABLE undeclared (id INTEGER PRIMARY KEY) STRICT",
+            "CREATE TABLE audit_catalog (id INTEGER PRIMARY KEY) STRICT",
+            "CREATE VIEW audit_catalog AS SELECT id FROM accounts",
+        ] {
+            let error = run_sql_with_hook(&storage, sql, |_| Ok(())).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition, "{sql}");
+            assert_eq!(storage.schema_gate_snapshot().state, SchemaGateState::Ready);
+            assert_eq!(active_journal_snapshot(temp.path()), None, "{sql}");
+            assert_eq!(shard_generations(temp.path()), generations_before, "{sql}");
+            assert_eq!(
+                Connection::open(temp.path().join("manifest.sqlite"))
+                    .unwrap()
+                    .query_row(
+                        "SELECT c.schema_generation,
+                                (SELECT COUNT(*) FROM briskdb_schema_migrations)
+                         FROM briskdb_schema_catalog AS c
+                         WHERE c.singleton = 1",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .unwrap(),
+                manifest_before,
+                "{sql}"
+            );
+            for shard_id in 0..2 {
+                let connection = storage.open_shard(shard_id).unwrap();
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM pragma_table_list
+                             WHERE schema = 'main' AND type = 'table'
+                               AND name IN ('accounts', 'countries')",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    2,
+                    "{sql}"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM pragma_table_list
+                             WHERE schema = 'main'
+                               AND name IN ('undeclared', 'audit_catalog')",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    0,
+                    "{sql}"
+                );
+            }
+        }
+
+        run_sql_with_hook(
+            &storage,
+            "CREATE INDEX accounts_display_name_idx ON accounts (display_name)",
+            |_| Ok(()),
+        )
+        .unwrap();
+        for shard_id in 0..2 {
+            assert!(
+                storage
+                    .open_shard(shard_id)
+                    .unwrap()
+                    .query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM sqlite_schema
+                             WHERE type = 'index' AND name = 'accounts_display_name_idx'
+                         )",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
     }
 
     #[test]

@@ -440,7 +440,6 @@ fn canonical_key_bytes(value: &ShardKeyValue) -> Arc<[u8]> {
 #[cfg(test)]
 mod tests {
     use std::{
-        path::Path,
         sync::{Arc, Barrier},
         thread,
     };
@@ -450,7 +449,7 @@ mod tests {
         core::{
             BUCKET_ALGORITHM_VERSION, Database, Engine, HASH_VERSION, INITIAL_MAP_GENERATION,
             KEY_ENCODING_VERSION, LogicalDatabaseMetadata, RoutingCatalog, ShardKeyMetadata,
-            ShardKeyType, TableMetadata, TablePlacement, VIRTUAL_BUCKET_COUNT,
+            ShardKeyType, TableDeclaration, TableMetadata, TablePlacement, VIRTUAL_BUCKET_COUNT,
             initial_physical_shard,
         },
         sql::{SqlDialect, normalize_placeholders, parse, validate_common_subset},
@@ -519,30 +518,25 @@ mod tests {
         )
     }
 
-    fn insert_engine_catalog_fixture(root: &Path) {
-        let manifest = rusqlite::Connection::open(root.join("manifest.sqlite")).unwrap();
-        manifest
-            .execute_batch(
-                "PRAGMA foreign_keys = ON;
-                 BEGIN IMMEDIATE;
-                 DROP TABLE briskdb_integrity;
-                 DROP TABLE briskdb_metadata;
-                 CREATE TABLE briskdb_metadata (
-                     requires_manifest_version INTEGER NOT NULL
-                         CHECK (requires_manifest_version >= 6)
-                 ) STRICT;
-                 INSERT INTO briskdb_metadata VALUES (6);
-                 INSERT INTO briskdb_tables (
-                    table_id,
-                    database_id,
-                    table_name,
-                    placement,
-                    shard_key_column,
-                    shard_key_type
-                 ) VALUES (4, 1, 'events', 1, 'tenant_id', 1);
-                 PRAGMA user_version = 6;
-                 COMMIT;",
+    fn register_engine_catalog_fixture(database: &mut Database) {
+        database
+            .broadcast(
+                "CREATE TABLE events (
+                    tenant_id INTEGER PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 );",
             )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "events",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+            ])
             .unwrap();
     }
 
@@ -1514,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn text_predicates_remain_conservative_while_text_inserts_are_routed() {
+    fn authoritative_binary_text_predicates_and_inserts_are_routed() {
         let catalog = sample_catalog();
         let predicate = plan(
             &catalog,
@@ -1525,18 +1519,12 @@ mod tests {
             ),
             0,
             &[Value::Text("tenant-a".to_owned())],
-            Some(b"caller-route"),
+            Some(b"tenant-a"),
         )
         .unwrap();
-        assert_eq!(
-            predicate.inference().kind(),
-            ShardKeyInferenceKind::Unconstrained
-        );
-        assert!(predicate.inferred_routes().is_empty());
-        assert_eq!(
-            predicate.explicit_route().unwrap().key_bytes(),
-            b"caller-route"
-        );
+        assert_eq!(predicate.inference().kind(), ShardKeyInferenceKind::Exact);
+        assert_eq!(predicate.inferred_routes()[0].key_bytes(), b"tenant-a");
+        assert_eq!(predicate.explicit_route().unwrap().key_bytes(), b"tenant-a");
 
         let insert = plan(
             &catalog,
@@ -1935,9 +1923,9 @@ mod tests {
     #[test]
     fn schema_gate_precedes_write_policy_and_a_later_valid_plan_recovers() {
         let temp = tempfile::tempdir().unwrap();
-        drop(Database::open(temp.path(), 2).unwrap());
-        insert_engine_catalog_fixture(temp.path());
-        let database = Arc::new(Database::open(temp.path(), 2).unwrap());
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        register_engine_catalog_fixture(&mut database);
+        let database = Arc::new(database);
         let engine = Engine::from_database(Arc::clone(&database));
         let logical_database = engine.catalog().default_database().id();
         let broad_write = normalize(SqlDialect::Sqlite, "DELETE FROM events");

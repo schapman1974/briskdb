@@ -1,7 +1,7 @@
 use std::{borrow::Cow, fmt};
 
 use sqlparser::{
-    ast::Statement as AstStatement,
+    ast::{ObjectType, Statement as AstStatement},
     dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
     parser::{Parser, ParserError},
 };
@@ -139,6 +139,33 @@ pub fn parse<'a>(dialect: SqlDialect, source: impl Into<Cow<'a, str>>) -> Engine
         source: source.into_owned(),
         statements,
     })
+}
+
+/// Reject data-moving SQL from the application-schema migration path once an
+/// authoritative placement catalog exists. Those migrations may alter schema
+/// while preserving registered tables and shard keys, but row movement needs
+/// a separate placement-aware coordinator.
+pub(crate) fn validate_authoritative_schema_migration(source: &str) -> EngineResult<()> {
+    let parsed = parse(SqlDialect::Sqlite, source)?;
+    let unsafe_statement = parsed.statements.iter().any(|statement| match statement {
+        AstStatement::Insert(_)
+        | AstStatement::Update(_)
+        | AstStatement::Delete(_)
+        | AstStatement::Merge(_)
+        | AstStatement::Truncate(_)
+        | AstStatement::CreateTrigger(_) => true,
+        AstStatement::CreateTable(table) => table.query.is_some(),
+        AstStatement::Drop { object_type, .. } => *object_type == ObjectType::Table,
+        _ => false,
+    });
+    if unsafe_statement {
+        Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "authoritative-catalog schema migrations cannot move rows, drop tables, or create triggers",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_with(dialect: &dyn Dialect, source: &str) -> Result<Vec<AstStatement>, ParserError> {
@@ -309,6 +336,34 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{dialect} rejected {source}: {error}"));
                 assert_eq!(parsed.statement_count(), 1, "{dialect}: {source}");
             }
+        }
+    }
+
+    #[test]
+    fn authoritative_schema_migrations_reject_every_row_moving_shape() {
+        for source in [
+            "INSERT INTO widgets (id) VALUES (1)",
+            "UPDATE widgets SET id = 2 WHERE id = 1",
+            "DELETE FROM widgets WHERE id = 1",
+            "DROP TABLE widgets",
+            "CREATE TABLE copied AS SELECT * FROM widgets",
+            "CREATE TRIGGER move_row AFTER INSERT ON widgets BEGIN DELETE FROM widgets WHERE id = NEW.id; END",
+        ] {
+            assert_eq!(
+                validate_authoritative_schema_migration(source)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition,
+                "{source}"
+            );
+        }
+        for source in [
+            "CREATE INDEX widgets_id ON widgets (id)",
+            "ALTER TABLE widgets ADD COLUMN payload TEXT",
+            "CREATE VIEW widget_ids AS SELECT id FROM widgets",
+        ] {
+            validate_authoritative_schema_migration(source)
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
         }
     }
 

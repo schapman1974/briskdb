@@ -4,9 +4,10 @@
 //! common-subset validator recursively admits only protocol-neutral SQL shapes,
 //! the statement classifier identifies protocol-neutral behavior and enforces
 //! read-only multi-statement batches, and the placeholder normalizer produces a
-//! separate source-preserving SQLite parameter representation for later
-//! planning work. Current HTTP execution remains deliberate SQLite pass-through;
-//! these opt-in layers do not route or execute statements.
+//! separate source-preserving SQLite parameter representation for planning.
+//! HTTP execution uses these layers whenever an authoritative table catalog is
+//! populated; only an empty-catalog compatibility path remains raw SQLite
+//! pass-through. The SQL layer itself does not open storage or execute a plan.
 
 mod classifier;
 mod dml;
@@ -27,6 +28,7 @@ pub use inference::{ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue, inf
 pub use normalizer::{
     MAX_SQL_PARAMETERS, NormalizedSql, StatementParameters, normalize_placeholders,
 };
+pub(crate) use parser::validate_authoritative_schema_migration;
 pub use parser::{
     MAX_PARSED_SQL_BYTES, MAX_PARSED_SQL_STATEMENTS, ParsedSql, SQL_PARSE_RECURSION_LIMIT,
     SqlDialect, parse,

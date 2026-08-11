@@ -491,38 +491,11 @@ fn atom_domain(
     key_type: ShardKeyType,
     context: &InferenceContext<'_>,
 ) -> EngineResult<KeyDomain> {
-    if matches!(key_type, ShardKeyType::Text) {
-        return text_atom_domain(expression, context);
-    }
     Ok(match infer_atom(expression, key_type, context)? {
         InferredAtom::Value(value) => KeyDomain::Finite(vec![value]),
         InferredAtom::Null => KeyDomain::Finite(Vec::new()),
         InferredAtom::Unresolved => KeyDomain::Any,
     })
-}
-
-fn text_atom_domain(expression: &Expr, context: &InferenceContext<'_>) -> EngineResult<KeyDomain> {
-    let Expr::Value(value) = peel_nested(expression) else {
-        return Ok(KeyDomain::Any);
-    };
-    match &value.value {
-        AstValue::Placeholder(_) => match bound_parameter(value.span, context)? {
-            Value::Null => Ok(KeyDomain::Finite(Vec::new())),
-            Value::Text(_) => Ok(KeyDomain::Any),
-            Value::InvalidText(_) => Err(EngineError::new(
-                EngineErrorKind::InvalidTextEncoding,
-                format!(
-                    "statement {} binds non-UTF-8 text to its shard key",
-                    context.statement_index + 1
-                ),
-            )),
-            _ => Err(type_mismatch(context)),
-        },
-        AstValue::Null => Ok(KeyDomain::Finite(Vec::new())),
-        AstValue::SingleQuotedString(_) => Ok(KeyDomain::Any),
-        AstValue::Number(_, false) | AstValue::Boolean(_) => Err(type_mismatch(context)),
-        _ => Err(inference_invariant()),
-    }
 }
 
 fn is_shard_column(expression: &Expr, target: &PredicateTarget<'_>) -> bool {
@@ -1436,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn text_predicates_need_collation_metadata_and_binary_keys_are_exact() {
+    fn authoritative_binary_text_and_binary_predicates_are_exact() {
         let catalog = sample_catalog();
         let text = infer(
             &catalog,
@@ -1446,8 +1419,8 @@ mod tests {
             &[Value::Text("snowman-☃".to_owned())],
         )
         .unwrap();
-        assert_eq!(text.kind(), ShardKeyInferenceKind::Unconstrained);
-        assert!(text.values().is_empty());
+        assert_eq!(text.kind(), ShardKeyInferenceKind::Exact);
+        assert_eq!(text.values()[0].as_str(), Some("snowman-☃"));
 
         let text_literal = infer(
             &catalog,
@@ -1457,8 +1430,8 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(text_literal.kind(), ShardKeyInferenceKind::Unconstrained);
-        assert!(text_literal.values().is_empty());
+        assert_eq!(text_literal.kind(), ShardKeyInferenceKind::Exact);
+        assert_eq!(text_literal.values()[0].as_str(), Some("snowman-☃"));
 
         let folded_candidates = infer(
             &catalog,
@@ -1468,11 +1441,8 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(
-            folded_candidates.kind(),
-            ShardKeyInferenceKind::Unconstrained
-        );
-        assert!(folded_candidates.values().is_empty());
+        assert_eq!(folded_candidates.kind(), ShardKeyInferenceKind::Multiple);
+        assert_eq!(folded_candidates.values().len(), 2);
 
         let bound_null = infer(
             &catalog,

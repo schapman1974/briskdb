@@ -16,11 +16,12 @@ byte-exact source, and the ordered statement count. It does not expose the
 dependency-owned AST. Its `Debug` representation reports only the dialect,
 source byte count, and statement count; it does not render SQL or AST contents.
 
-Validation is deliberately opt-in. The current HTTP execute, query, and schema
-migration paths remain raw SQLite pass-through surfaces and do not call either
-the parser or this validator. Issue #20 therefore changes no HTTP request or
-response shape, SQL accepted by HTTP, routing result, transaction behavior,
-configuration, manifest, shard file, or stored data.
+Validation remains a directly callable API. HTTP execute/query also invokes it
+once the authoritative table catalog is populated; an empty catalog retains the
+legacy raw SQLite path. The schema-migration endpoint keeps a separate exact-text
+batch contract and does not require this common subset, although a populated
+catalog applies its narrower no-row-movement parser gate and physical
+postflight. No HTTP request or response field changes with either mode.
 
 ## Boundary
 
@@ -220,6 +221,7 @@ dialects, every recursive clause boundary, exact source ownership, redacted
 debug and unsupported diagnostics, empty and mixed batches, dialect-native
 placeholders, multi-row insert width, duplicate insert/update targets,
 concurrent validation, ordinary nested expressions, and the exact independent
-validator-depth boundary for flat operator chains. A raw HTTP regression must
-also continue to execute SQLite syntax outside this subset, proving that this
-opt-in marker has not become an implicit HTTP execution gate.
+validator-depth boundary for flat operator chains. HTTP regressions must prove
+both modes: an empty catalog can retain legacy SQLite syntax outside this
+subset, while a populated catalog makes this marker an intentional execution
+gate before placement-aware routing.

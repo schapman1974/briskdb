@@ -24,7 +24,7 @@ hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
 # baseline. Keep the pre-1.0 dependency exact and enable only the plaintext
 # server surface; later roadmap work owns TLS and extended type adapters.
 pgwire = { version = "=0.36.3", default-features = false, features = ["server-api"] }
-rusqlite = { version = "0.39.0", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "column_metadata", "hooks"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 # The exact upstream revision contains the post-0.62.0 `parse_interval`

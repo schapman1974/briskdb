@@ -72,7 +72,8 @@ tests; serving the embedded browser has no frontend build step.
 ## Physical-shard view
 
 The explorer intentionally selects a physical shard number. This differs from
-normal `/v1/query` routing, which hashes a caller-provided logical `shard_key`.
+normal `/v1/query`, which requires a caller routing key and, once the table
+catalog is populated, validates it against inferred authoritative placement.
 The overview accepts only `0 <= shard < shard_count`. It discovers ordinary
 tables in SQLite's `main` schema and excludes SQLite-owned names beginning with
 `sqlite_` plus the exact BriskDB-owned name `briskdb` and names beginning with
@@ -80,9 +81,9 @@ tables in SQLite's `main` schema and excludes SQLite-owned names beginning with
 are not presented. Names have a stable binary ordering in the response.
 
 Discovery describes the tables physically present on the selected shard. It is
-not the advisory logical `briskdb_tables` catalog, and it makes no claim that a
-table exists on another shard. Guessing an excluded or absent name does not make
-it browseable.
+not the authoritative logical `briskdb_tables` view, does not consult placement
+metadata, and makes no claim that another shard contributes the same rows.
+Guessing an excluded or absent name does not make it browseable.
 
 The browser offers page sizes 25, 50, 100, and 200 rows and initially selects
 50. The JSON endpoint accepts only limits from 1 through 200 and offsets from 0
@@ -112,8 +113,10 @@ every pagination request.
 `scope: "all_physical_shards"` is literal. A properly partitioned table's sum
 is its logical row count. A replicated or global table counts every physical
 copy, so identical rows stored on two shards contribute twice. The physical
-browser cannot safely infer deduplication from the advisory catalog, especially
-for imported uncataloged tables. Each shard count is also a separate live read,
+browser deliberately does not infer deduplication or change multiplicity from
+catalog placement. For a registered sharded table, the one-row-one-owner
+invariant makes the physical sum logical; for `Global`, physical copies remain
+separate count contributions. Each shard count is also a separate live read,
 not one atomic cross-shard snapshot, so concurrent writes can affect which
 instant each shard represents.
 

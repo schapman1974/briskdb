@@ -67,6 +67,14 @@ for a classified safe `NotApplicable` or `Global` read. It still rejects
 catalog placement and sharded reads that need scatter. That target-selection
 integration does not change this planner's meaning of `assigned_shard()`.
 
+Populated-catalog raw execute/query uses the same internal planning result after
+SQLite parsing, common-subset validation, placeholder normalization, and strict
+translation. It requires finite `Exact`/`Multiple` inference with one assigned
+owner for `Sharded` tables, uses shard 0 for supported Global or table-free
+reads, and rejects Catalog, undeclared, unconstrained, contradictory, and
+multi-owner targets. An empty catalog alone bypasses this composition and keeps
+the legacy caller-key route.
+
 `Debug` output reports identifiers, versions, shard IDs, and counts where
 useful. It does not render SQL, AST contents, inferred key values, explicit key
 bytes, or parameter values.
@@ -197,11 +205,22 @@ and routing snapshot remain authoritative by producing a new plan from the
 portal's owned values and route snapshot under every execution's fresh
 schema-operation guard. Bind uses its plan only for transient validation.
 
-The logical table catalog remains read-only and advisory. Planning does not
-assert that its table metadata describes an existing physical SQLite table or
-column. Prepared setup transiently compiles translated SQL against shard 0, but
-it does not reconcile advisory table rows with the physical schema or mutate
-the catalog.
+The logical table catalog is read-only to planning callers. In manifest version
+8, any populated table set was installed through initialization-only
+`Database::register_tables` after exact empty-schema validation, and later
+schema migrations must preserve those registered tables and sharded keys. Text
+keys are physically pinned to SQLite `BINARY` collation, so exact UTF-8 equality
+is a finite proof. Each accepted sharded primary/unique key contains that shard
+key, keeping every possible collision on one owner. An empty catalog means
+table placement has not been registered; physical tables are never inferred.
+Planning consumes the published snapshot and does not reopen or revalidate
+every shard on each call.
+
+For a registered `Sharded` table, every ordinary row belongs on exactly the one
+owner produced from its canonical key. Finite point plans can assign that
+owner. An unpinned or multi-owner read still remains unassigned here; executing
+it as a logical shard `UNION ALL` with bounded scatter and deterministic merge
+is follow-up work in issues #57 and #58, not part of catalog registration.
 
 ## Errors and recovery
 
@@ -248,8 +267,9 @@ path. In particular:
 
 - `Engine::plan_bound_statement` is synchronous and stateless; it neither
   accepts nor mutates a `Session`;
-- `assigned_shard()` is not consumed by the current raw HTTP execute/query
-  paths, but it is consumed by issue #26 portal execution;
+- `assigned_shard()` is consumed by prepared execution and by raw HTTP
+  execute/query when the authoritative catalog is populated; an empty catalog
+  retains legacy routing without a plan;
 - no read scatter, merge, contradiction short circuit, or write executes here;
 - no transaction pinning or cross-call routing context is applied;
 - this synchronous method creates no per-session or global cache; issue #26
@@ -260,8 +280,9 @@ path. In particular:
   session cache or `PreparedStatementLimits` to consult;
 - planning does not invoke the separate PostgreSQL/MySQL-to-SQLite translation
   layer;
-- the current HTTP execute, query, and migration paths do not invoke parsing,
-  validation, classification, normalization, inference, or planning.
+- the migration path does not substitute normalized or translated SQL for its
+  exact durable identity; populated-catalog execute/query does compose the
+  SQLite frontend and this policy, while empty-catalog execute/query does not.
 
 The implemented issue #25 translation API can independently consume the same
 normalized statement, but it neither changes nor executes a bound plan. The
@@ -284,5 +305,6 @@ redaction; policy-error retries; deterministic valid and rejected concurrent
 calls; schema-gate precedence and recovery; owned
 public results; selected behavior; empty, all-read, and rejected mutating batch
 policy; provenance; and equivalent SQLite, PostgreSQL, and MySQL typed requests.
-Raw HTTP regressions prove that opt-in planning still does not change existing
-execution behavior.
+HTTP regressions prove both boundaries: an empty catalog preserves legacy raw
+execution, while a populated catalog consumes the plan, enforces declared
+placement, and fails closed for unsafe or undeclared targets.

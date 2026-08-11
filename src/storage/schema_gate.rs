@@ -164,6 +164,32 @@ impl SchemaGate {
             finished: false,
         })
     }
+
+    /// Begin work that is valid only from a fully ready root. Unlike recovery,
+    /// first-time catalog registration must never reinterpret `Pending` as a
+    /// safe source snapshot before the manifest has reconciled that state.
+    pub(crate) fn begin_new_migration(&self) -> EngineResult<SchemaMigrationGuard> {
+        let mut data = self.inner.lock();
+        match data.state {
+            SchemaGateState::Ready => {
+                data.state = SchemaGateState::Migrating;
+                Ok(SchemaMigrationGuard {
+                    inner: Arc::clone(&self.inner),
+                    restore_state: SchemaGateState::Ready,
+                    finished: false,
+                })
+            }
+            SchemaGateState::Migrating => Err(EngineError::new(
+                EngineErrorKind::Busy,
+                "an application-schema migration is already in progress",
+            )),
+            SchemaGateState::Pending => Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "pending schema state must be reconciled before new catalog registration",
+            )),
+            SchemaGateState::Degraded => Err(degraded_error()),
+        }
+    }
 }
 
 impl Default for SchemaGate {
