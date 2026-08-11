@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use super::HttpState;
-use crate::core::{EngineError, EngineErrorKind, RequestContext, ResultSet, Statement, Value};
+use crate::core::{
+    Column, EngineError, EngineErrorKind, RequestContext, ResultLimits, ResultSet, Routed, Row,
+    Statement, TablePlacement, Value, merge_scatter_results,
+};
 
 const INDEX_HTML: &str = include_str!("admin/index.html");
 const STYLES_CSS: &str = include_str!("admin/styles.css");
@@ -35,7 +38,7 @@ const MAX_SESSIONS: usize = 128;
 const DEFAULT_PAGE_LIMIT: u16 = 50;
 const MAX_PAGE_LIMIT: u16 = 200;
 const MAX_PAGE_OFFSET: u64 = 1_000_000;
-const MAX_COUNT_CONCURRENCY: usize = 8;
+const MAX_INSPECTION_CONCURRENCY: usize = 8;
 const MAX_JAVASCRIPT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const TABLE_DISCOVERY_SQL: &str = "SELECT name FROM pragma_table_list \
      WHERE schema = 'main' AND type = 'table' \
@@ -248,33 +251,51 @@ async fn session() -> Response {
     )
 }
 
-#[derive(Deserialize)]
-struct OverviewQuery {
-    #[serde(default)]
-    shard: Option<u16>,
-}
-
 #[derive(Serialize)]
 struct OverviewResponse {
+    scope: &'static str,
     shard_count: u16,
-    selected_shard: u16,
+    visited_shards: Vec<u16>,
     tables: Vec<String>,
 }
 
-async fn overview(State(state): State<HttpState>, Query(query): Query<OverviewQuery>) -> Response {
-    let shard = query.shard.unwrap_or(0);
-    let session = state.engine.session();
-    let result = state
-        .engine
-        .inspect_shard(&session, shard, Statement::new(TABLE_DISCOVERY_SQL, vec![]))
-        .await;
+async fn overview(State(state): State<HttpState>) -> Response {
+    let catalog = state.engine.catalog();
+    if !catalog.tables().is_empty() {
+        let default_database = catalog.default_database().id();
+        let tables = catalog
+            .tables()
+            .iter()
+            .filter(|table| {
+                table.database_id() == default_database
+                    && !matches!(table.placement(), TablePlacement::Catalog)
+            })
+            .map(|table| table.name().to_owned())
+            .collect();
+        return admin_json(
+            StatusCode::OK,
+            &OverviewResponse {
+                scope: "logical_default_database",
+                shard_count: state.engine.shard_count(),
+                visited_shards: vec![],
+                tables,
+            },
+        );
+    }
 
-    match result.and_then(table_names) {
+    let session = state.engine.session();
+    match state
+        .engine
+        .inspect_shard(&session, 0, Statement::new(TABLE_DISCOVERY_SQL, vec![]))
+        .await
+        .and_then(table_names)
+    {
         Ok(tables) => admin_json(
             StatusCode::OK,
             &OverviewResponse {
+                scope: "empty_catalog_shard_zero_fallback",
                 shard_count: state.engine.shard_count(),
-                selected_shard: shard,
+                visited_shards: vec![0],
                 tables,
             },
         ),
@@ -291,7 +312,7 @@ struct CountQuery {
 struct CountResponse {
     table: String,
     scope: &'static str,
-    shard_count: u16,
+    visited_shards: Vec<u16>,
     total_rows: JsonValue,
 }
 
@@ -300,53 +321,144 @@ async fn count(State(state): State<HttpState>, Query(query): Query<CountQuery>) 
         return invalid_argument("admin table name is not browseable");
     }
 
-    let shard_count = state.engine.shard_count();
-    match count_table_rows(&state.engine, &query.table).await {
-        Ok(total_rows) => admin_json(
+    match inspect_logical_table(&state.engine, &query.table).await {
+        Ok(inspection) => admin_json(
             StatusCode::OK,
             &CountResponse {
                 table: query.table,
-                scope: "all_physical_shards",
-                shard_count,
-                total_rows: admin_value_to_json(Value::UInt64(total_rows)),
+                scope: inspection.scope,
+                visited_shards: inspection.visited_shards(),
+                total_rows: admin_value_to_json(Value::UInt64(inspection.total_rows)),
             },
         ),
         Err(error) => admin_engine_error(error),
     }
 }
 
-async fn count_table_rows(engine: &crate::core::Engine, table: &str) -> Result<u64, EngineError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogicalTableScope {
+    Sharded,
+    Global,
+    EmptyCatalog,
+}
+
+impl LogicalTableScope {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Sharded => "logical_sharded_table",
+            Self::Global => "logical_global_table",
+            Self::EmptyCatalog => "empty_catalog_all_physical_shards",
+        }
+    }
+}
+
+struct TableTargets {
+    scope: LogicalTableScope,
+    shards: Vec<u16>,
+}
+
+struct ShardTableInspection {
+    shard: u16,
+    rows: u64,
+    columns: Vec<Column>,
+}
+
+struct LogicalTableInspection {
+    scope: &'static str,
+    schema_generation: u64,
+    context: RequestContext,
+    result_limits: ResultLimits,
+    shards: Vec<ShardTableInspection>,
+    total_rows: u64,
+}
+
+impl LogicalTableInspection {
+    fn visited_shards(&self) -> Vec<u16> {
+        self.shards.iter().map(|shard| shard.shard).collect()
+    }
+
+    fn columns(&self) -> &[Column] {
+        self.shards
+            .first()
+            .map_or(&[], |inspection| inspection.columns.as_slice())
+    }
+}
+
+fn logical_table_targets(
+    engine: &crate::core::Engine,
+    table: &str,
+) -> Result<TableTargets, EngineError> {
+    let catalog = engine.catalog();
+    if catalog.tables().is_empty() {
+        return Ok(TableTargets {
+            scope: LogicalTableScope::EmptyCatalog,
+            shards: (0..engine.shard_count()).collect(),
+        });
+    }
+
+    let default_database = catalog.default_database().id();
+    let Some(metadata) = catalog
+        .tables()
+        .iter()
+        .find(|metadata| metadata.database_id() == default_database && metadata.name() == table)
+    else {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "admin table is not registered in the default logical database",
+        ));
+    };
+    match metadata.placement() {
+        TablePlacement::Sharded(_) => Ok(TableTargets {
+            scope: LogicalTableScope::Sharded,
+            shards: (0..engine.shard_count()).collect(),
+        }),
+        TablePlacement::Global => Ok(TableTargets {
+            scope: LogicalTableScope::Global,
+            shards: vec![0],
+        }),
+        TablePlacement::Catalog => Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "admin catalog tables are not browseable",
+        )),
+    }
+}
+
+async fn inspect_logical_table(
+    engine: &crate::core::Engine,
+    table: &str,
+) -> Result<LogicalTableInspection, EngineError> {
+    let targets = logical_table_targets(engine, table)?;
     let status_session = engine.session();
     let status = engine.status(&status_session).await?;
     let context = match status.request_timeout() {
         Some(timeout) => RequestContext::new().with_timeout(timeout)?,
         None => RequestContext::new(),
     };
+    let result_limits = ResultLimits::new(status.max_result_rows(), status.max_result_bytes())?;
     let schema_generation = engine.catalog().schema_generation();
-    let counts = stream::iter(0..engine.shard_count())
+    let inspections = stream::iter(targets.shards.iter().copied())
         .map(|shard| {
             let engine = engine.clone();
             let table = table.to_owned();
             let context = context.clone();
-            async move { count_table_rows_on_shard(&engine, shard, &table, context).await }
+            async move { inspect_table_on_shard(&engine, shard, &table, context).await }
         })
-        .buffer_unordered(MAX_COUNT_CONCURRENCY)
+        .buffer_unordered(MAX_INSPECTION_CONCURRENCY)
         .try_collect::<Vec<_>>()
         .await;
-    finish_row_counts(
+    ensure_schema_generation(schema_generation, engine.catalog().schema_generation())?;
+    let mut shards = inspections?;
+    shards.sort_unstable_by_key(|inspection| inspection.shard);
+    ensure_matching_columns(&shards)?;
+    let total_rows = sum_row_counts(shards.iter().map(|inspection| inspection.rows))?;
+    Ok(LogicalTableInspection {
+        scope: targets.scope.name(),
         schema_generation,
-        engine.catalog().schema_generation(),
-        counts,
-    )
-}
-
-fn finish_row_counts(
-    expected_generation: u64,
-    observed_generation: u64,
-    counts: Result<Vec<u64>, EngineError>,
-) -> Result<u64, EngineError> {
-    ensure_schema_generation(expected_generation, observed_generation)?;
-    sum_row_counts(counts?)
+        context,
+        result_limits,
+        shards,
+        total_rows,
+    })
 }
 
 fn sum_row_counts(counts: impl IntoIterator<Item = u64>) -> Result<u64, EngineError> {
@@ -354,7 +466,7 @@ fn sum_row_counts(counts: impl IntoIterator<Item = u64>) -> Result<u64, EngineEr
         total.checked_add(count).ok_or_else(|| {
             EngineError::new(
                 EngineErrorKind::NumericOutOfRange,
-                "admin all-shard row count exceeds the supported unsigned range",
+                "admin logical row count exceeds the supported unsigned range",
             )
         })
     })
@@ -366,19 +478,30 @@ fn ensure_schema_generation(expected: u64, observed: u64) -> Result<(), EngineEr
     } else {
         Err(EngineError::new(
             EngineErrorKind::Busy,
-            "admin all-shard row count crossed a completed schema migration",
+            "admin logical table inspection crossed a completed schema migration",
         ))
     }
 }
 
-async fn count_table_rows_on_shard(
+async fn inspect_table_on_shard(
     engine: &crate::core::Engine,
     shard: u16,
     table: &str,
     context: RequestContext,
-) -> Result<u64, EngineError> {
+) -> Result<ShardTableInspection, EngineError> {
     let session = engine.session();
     ensure_browseable_table_with_context(engine, &session, shard, table, context.clone()).await?;
+    let shape = engine
+        .inspect_shard_with_context(
+            &session,
+            shard,
+            Statement::new(
+                format!("SELECT * FROM {} LIMIT 0", quote_identifier(table)),
+                vec![],
+            ),
+            context.clone(),
+        )
+        .await?;
     let result = engine
         .inspect_shard_with_context(
             &session,
@@ -393,16 +516,31 @@ async fn count_table_rows_on_shard(
             context,
         )
         .await?;
-    row_count(result)
+    Ok(ShardTableInspection {
+        shard,
+        rows: row_count(result)?,
+        columns: shape.into_parts().0,
+    })
 }
 
-async fn ensure_browseable_table(
-    engine: &crate::core::Engine,
-    session: &crate::core::Session,
-    shard: u16,
-    table: &str,
-) -> Result<(), EngineError> {
-    ensure_browseable_table_with_context(engine, session, shard, table, RequestContext::new()).await
+fn ensure_matching_columns(shards: &[ShardTableInspection]) -> Result<(), EngineError> {
+    let Some(expected) = shards.first().map(|shard| shard.columns.as_slice()) else {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "admin logical table has no physical targets",
+        ));
+    };
+    if shards
+        .iter()
+        .all(|shard| shard.columns.as_slice() == expected)
+    {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "admin logical table has incompatible physical schemas",
+        ))
+    }
 }
 
 async fn ensure_browseable_table_with_context(
@@ -456,7 +594,6 @@ fn invalid_count_result() -> EngineError {
 
 #[derive(Deserialize)]
 struct RowsQuery {
-    shard: u16,
     table: String,
     #[serde(default)]
     limit: Option<u16>,
@@ -466,8 +603,10 @@ struct RowsQuery {
 
 #[derive(Serialize)]
 struct RowsResponse {
-    shard: u16,
     table: String,
+    scope: &'static str,
+    visited_shards: Vec<u16>,
+    ordering: &'static str,
     limit: u16,
     offset: u64,
     has_more: bool,
@@ -488,63 +627,156 @@ async fn rows(State(state): State<HttpState>, Query(query): Query<RowsQuery>) ->
         return invalid_argument("admin table name is not browseable");
     }
 
-    let session = state.engine.session();
-    if let Err(error) =
-        ensure_browseable_table(&state.engine, &session, query.shard, &query.table).await
-    {
-        return admin_engine_error(error);
-    }
-
-    let quoted_table = quote_identifier(&query.table);
-    let result = state
-        .engine
-        .inspect_shard(
-            &session,
-            query.shard,
-            Statement::new(
-                format!(
-                    "SELECT browse.* FROM {quoted_table} AS browse \
-                     WHERE EXISTS (\
-                         SELECT 1 FROM pragma_table_list \
-                         WHERE schema = 'main' AND type = 'table' \
-                           AND name = ?1 COLLATE BINARY \
-                           AND lower(name) NOT GLOB 'sqlite_*' \
-                           AND lower(name) != 'briskdb' \
-                           AND lower(name) NOT GLOB 'briskdb_*'\
-                     ) \
-                     LIMIT ?2 OFFSET ?3"
-                ),
-                vec![
-                    Value::Text(query.table.clone()),
-                    Value::Int64(i64::from(limit) + 1),
-                    Value::Int64(offset as i64),
-                ],
-            ),
-        )
-        .await;
-
-    match result {
-        Ok(result) => page_response(query.shard, query.table, limit, offset, result),
+    match logical_table_page(&state.engine, &query.table, limit, offset).await {
+        Ok(page) => page_response(query.table, page, limit, offset),
         Err(error) => admin_engine_error(error),
     }
 }
 
-fn page_response(
-    shard: u16,
-    table: String,
+struct LogicalTablePage {
+    scope: &'static str,
+    visited_shards: Vec<u16>,
+    columns: Vec<Column>,
+    rows: Vec<Row>,
+}
+
+async fn logical_table_page(
+    engine: &crate::core::Engine,
+    table: &str,
     limit: u16,
     offset: u64,
-    result: ResultSet,
-) -> Response {
-    let (columns, rows) = result.into_parts();
-    let columns = columns
+) -> Result<LogicalTablePage, EngineError> {
+    let inspection = inspect_logical_table(engine, table).await?;
+    let page_slices = page_slices(&inspection.shards, offset, u64::from(limit) + 1);
+    let quoted_table = quote_identifier(table);
+    let order_by = deterministic_order_by(inspection.columns());
+    let page_results = stream::iter(page_slices)
+        .map(|slice| {
+            let engine = engine.clone();
+            let table = table.to_owned();
+            let quoted_table = quoted_table.clone();
+            let order_by = order_by.clone();
+            let context = inspection.context.clone();
+            async move {
+                let session = engine.session();
+                let result = engine
+                    .inspect_shard_with_context(
+                        &session,
+                        slice.shard,
+                        Statement::new(
+                            format!(
+                                "SELECT browse.* FROM {quoted_table} AS browse \
+                                 WHERE EXISTS (\
+                                     SELECT 1 FROM pragma_table_list \
+                                     WHERE schema = 'main' AND type = 'table' \
+                                       AND name = ?1 COLLATE BINARY \
+                                       AND lower(name) NOT GLOB 'sqlite_*' \
+                                       AND lower(name) != 'briskdb' \
+                                       AND lower(name) NOT GLOB 'briskdb_*'\
+                                 ) {order_by} LIMIT ?2 OFFSET ?3"
+                            ),
+                            vec![
+                                Value::Text(table),
+                                Value::Int64(slice.limit as i64),
+                                Value::Int64(slice.offset as i64),
+                            ],
+                        ),
+                        context,
+                    )
+                    .await?;
+                Ok::<_, EngineError>(Routed {
+                    shard: slice.shard,
+                    value: result,
+                })
+            }
+        })
+        .buffer_unordered(MAX_INSPECTION_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await;
+    ensure_schema_generation(
+        inspection.schema_generation,
+        engine.catalog().schema_generation(),
+    )?;
+    let mut page_results = page_results?;
+    page_results.sort_unstable_by_key(|result| result.shard);
+    let rows = if page_results.is_empty() {
+        Vec::new()
+    } else {
+        let merged = merge_scatter_results(page_results, inspection.result_limits)?;
+        if merged.columns() != inspection.columns() {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "admin logical page observed incompatible physical columns",
+            ));
+        }
+        merged.into_parts().1
+    };
+    Ok(LogicalTablePage {
+        scope: inspection.scope,
+        visited_shards: inspection.visited_shards(),
+        columns: inspection.columns().to_vec(),
+        rows,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PageSlice {
+    shard: u16,
+    offset: u64,
+    limit: u64,
+}
+
+fn page_slices(shards: &[ShardTableInspection], offset: u64, limit: u64) -> Vec<PageSlice> {
+    let mut remaining_offset = offset;
+    let mut remaining_limit = limit;
+    let mut slices = Vec::new();
+    for shard in shards {
+        if remaining_limit == 0 {
+            break;
+        }
+        if remaining_offset >= shard.rows {
+            remaining_offset -= shard.rows;
+            continue;
+        }
+        let available = shard.rows - remaining_offset;
+        let take = available.min(remaining_limit);
+        slices.push(PageSlice {
+            shard: shard.shard,
+            offset: remaining_offset,
+            limit: take,
+        });
+        remaining_limit -= take;
+        remaining_offset = 0;
+    }
+    slices
+}
+
+fn deterministic_order_by(columns: &[Column]) -> String {
+    if columns.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "ORDER BY {}",
+            columns
+                .iter()
+                .map(|column| format!("browse.{}", quote_identifier(&column.name)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn page_response(table: String, page: LogicalTablePage, limit: u16, offset: u64) -> Response {
+    let columns = page
+        .columns
         .into_iter()
         .map(|column| super::QueryColumn {
             name: column.name,
             data_type: super::data_type_name(column.data_type),
         })
         .collect();
-    let mut rows = rows
+    let mut rows = page
+        .rows
         .into_iter()
         .map(|row| {
             row.into_values()
@@ -561,8 +793,10 @@ fn page_response(
     admin_json(
         StatusCode::OK,
         &RowsResponse {
-            shard,
             table,
+            scope: page.scope,
+            visited_shards: page.visited_shards,
+            ordering: "shard_major_then_all_columns",
             limit,
             offset,
             has_more,
@@ -759,7 +993,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::core::{Column, DataType, Database, Row};
+    use crate::core::{
+        Column, DataType, Database, Row, ShardKeyMetadata, ShardKeyType, TableDeclaration,
+    };
 
     fn token(character: char) -> String {
         std::iter::repeat_n(character, 64).collect()
@@ -967,7 +1203,7 @@ mod tests {
         for id in [
             "login-form",
             "browser-view",
-            "shard-select",
+            "scope-kicker",
             "table-list",
             "record-count",
             "status",
@@ -979,6 +1215,9 @@ mod tests {
             assert!(INDEX_HTML.contains(&format!("id=\"{id}\"")));
             assert!(APP_JS.contains(&format!("#{id}")));
         }
+        assert!(!INDEX_HTML.contains("shard-select"));
+        assert!(!APP_JS.contains("shard-select"));
+        assert!(!APP_JS.contains("selected_shard"));
         assert!(!APP_JS.contains("innerHTML"));
         assert!(APP_JS.contains("(empty table name)"));
         assert!(APP_JS.contains("(whitespace-only table name)"));
@@ -1065,12 +1304,11 @@ mod tests {
         let (_temp, app) = application();
         for uri in [
             "/admin/api/session",
-            "/admin/api/overview?shard=0",
+            "/admin/api/overview",
             "/admin/api/count?table=widgets",
             "/admin/api/count",
-            "/admin/api/rows?shard=0&table=widgets",
-            "/admin/api/overview?shard=not-a-number",
-            "/admin/api/rows?shard=not-a-number",
+            "/admin/api/rows?table=widgets",
+            "/admin/api/rows?table=widgets&shard=not-a-number",
         ] {
             let response = request(&app, Method::GET, uri, None, None).await;
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -1081,10 +1319,9 @@ mod tests {
         let cookie = set_cookie.to_str().unwrap().split(';').next().unwrap();
         for uri in [
             "/admin/api/count",
-            "/admin/api/rows?shard=0&table=widgets&limit=0",
-            "/admin/api/rows?shard=0&table=widgets&limit=201",
-            "/admin/api/rows?shard=0&table=widgets&offset=1000001",
-            "/admin/api/rows?shard=2&table=widgets",
+            "/admin/api/rows?table=widgets&limit=0",
+            "/admin/api/rows?table=widgets&limit=201",
+            "/admin/api/rows?table=widgets&offset=1000001",
         ] {
             let response = request(&app, Method::GET, uri, Some(cookie), None).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
@@ -1104,7 +1341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_browser_discovers_and_pages_only_the_selected_shard() {
+    async fn authenticated_browser_discovers_and_pages_the_logical_table_across_files() {
         let temp = tempfile::tempdir().unwrap();
         let database = Arc::new(Database::open(temp.path(), 2).unwrap());
         database
@@ -1117,6 +1354,7 @@ mod tests {
                  ); \
                  CREATE TABLE \"\" (value TEXT); \
                  CREATE TABLE \" \" (value TEXT); \
+                 CREATE TABLE dupes (value TEXT); \
                  CREATE TABLE \"odd\"\"table\" (value TEXT); \
                  CREATE VIEW widget_view AS SELECT id FROM widgets;",
             )
@@ -1138,6 +1376,13 @@ mod tests {
                     )
                     .unwrap();
             }
+            database
+                .execute(
+                    &routing_key,
+                    "INSERT INTO dupes (value) VALUES ('same')",
+                    &[],
+                )
+                .unwrap();
         }
         let app = super::super::router(database);
         let set_cookie = login_cookie(&app).await;
@@ -1158,9 +1403,10 @@ mod tests {
             (
                 StatusCode::OK,
                 json!({
+                    "scope": "empty_catalog_shard_zero_fallback",
                     "shard_count": 2,
-                    "selected_shard": 1,
-                    "tables": ["", " ", "odd\"table", "widgets"]
+                    "visited_shards": [0],
+                    "tables": ["", " ", "dupes", "odd\"table", "widgets"]
                 })
             )
         );
@@ -1181,8 +1427,8 @@ mod tests {
                 StatusCode::OK,
                 json!({
                     "table": "widgets",
-                    "scope": "all_physical_shards",
-                    "shard_count": 2,
+                    "scope": "empty_catalog_all_physical_shards",
+                    "visited_shards": [0, 1],
                     "total_rows": 5
                 })
             )
@@ -1204,18 +1450,31 @@ mod tests {
                 StatusCode::OK,
                 json!({
                     "table": "odd\"table",
-                    "scope": "all_physical_shards",
-                    "shard_count": 2,
+                    "scope": "empty_catalog_all_physical_shards",
+                    "visited_shards": [0, 1],
                     "total_rows": 0
                 })
             )
         );
 
+        let (_, duplicates) = response_json(
+            request(
+                &app,
+                Method::GET,
+                "/admin/api/rows?table=dupes&limit=50&offset=0",
+                Some(cookie),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(duplicates["rows"], json!([["same"], ["same"]]));
+
         let (status, first_page) = response_json(
             request(
                 &app,
                 Method::GET,
-                "/admin/api/rows?shard=1&table=widgets&limit=2&offset=0",
+                "/admin/api/rows?table=widgets&limit=2&offset=0",
                 Some(cookie),
                 None,
             )
@@ -1223,8 +1482,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(first_page["shard"], 1);
         assert_eq!(first_page["table"], "widgets");
+        assert_eq!(first_page["scope"], "empty_catalog_all_physical_shards");
+        assert_eq!(first_page["visited_shards"], json!([0, 1]));
+        assert_eq!(first_page["ordering"], "shard_major_then_all_columns");
         assert_eq!(first_page["limit"], 2);
         assert_eq!(first_page["offset"], 0);
         assert_eq!(first_page["has_more"], true);
@@ -1240,8 +1501,8 @@ mod tests {
         assert_eq!(
             first_page["rows"],
             json!([
-                [1, "shard-1-row-1", [1, 1], null],
-                [2, "shard-1-row-2", [1, 2], null]
+                [1, "shard-0-row-1", [0, 1], null],
+                [2, "shard-0-row-2", [0, 2], null]
             ])
         );
 
@@ -1250,7 +1511,7 @@ mod tests {
                 request(
                     &app,
                     Method::GET,
-                    "/admin/api/rows?shard=1&table=widgets&limit=2&offset=2",
+                    "/admin/api/rows?table=widgets&limit=2&offset=2&shard=0",
                     Some(cookie),
                     None,
                 )
@@ -1260,65 +1521,87 @@ mod tests {
             (
                 StatusCode::OK,
                 json!({
-                    "shard": 1,
                     "table": "widgets",
+                    "scope": "empty_catalog_all_physical_shards",
+                    "visited_shards": [0, 1],
+                    "ordering": "shard_major_then_all_columns",
                     "limit": 2,
                     "offset": 2,
-                    "has_more": false,
+                    "has_more": true,
                     "columns": [
                         {"name":"id","data_type":"unknown"},
                         {"name":"label","data_type":"unknown"},
                         {"name":"payload","data_type":"unknown"},
                         {"name":"note","data_type":"unknown"}
                     ],
-                    "rows": [[3, "shard-1-row-3", [1, 3], null]]
+                    "rows": [
+                        [1, "shard-1-row-1", [1, 1], null],
+                        [2, "shard-1-row-2", [1, 2], null]
+                    ]
                 })
             )
         );
 
-        let odd_table = "/admin/api/rows?shard=0&table=odd%22table&limit=50&offset=0";
+        assert_eq!(
+            response_json(
+                request(
+                    &app,
+                    Method::GET,
+                    "/admin/api/rows?table=widgets&limit=2&offset=4",
+                    Some(cookie),
+                    None,
+                )
+                .await
+            )
+            .await
+            .1["rows"],
+            json!([[3, "shard-1-row-3", [1, 3], null]])
+        );
+
+        let odd_table = "/admin/api/rows?table=odd%22table&limit=50&offset=0";
         let (status, empty) =
             response_json(request(&app, Method::GET, odd_table, Some(cookie), None).await).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(empty["rows"], json!([]));
         assert_eq!(empty["has_more"], false);
 
-        let empty_name = "/admin/api/rows?shard=0&table=&limit=50&offset=0";
+        let empty_name = "/admin/api/rows?table=&limit=50&offset=0";
         let (status, empty) =
             response_json(request(&app, Method::GET, empty_name, Some(cookie), None).await).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(empty["table"], "");
         assert_eq!(empty["rows"], json!([]));
 
-        let whitespace_name = "/admin/api/rows?shard=0&table=%20&limit=50&offset=0";
+        let whitespace_name = "/admin/api/rows?table=%20&limit=50&offset=0";
         let (status, whitespace) =
             response_json(request(&app, Method::GET, whitespace_name, Some(cookie), None).await)
                 .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(whitespace["table"], " ");
 
-        let shard_zero = request(
+        let ignored_shard_zero = request(
             &app,
             Method::GET,
             "/admin/api/rows?shard=0&table=widgets&limit=1&offset=0",
             Some(cookie),
             None,
         );
-        let shard_one = request(
+        let ignored_shard_one = request(
             &app,
             Method::GET,
             "/admin/api/rows?shard=1&table=widgets&limit=1&offset=0",
             Some(cookie),
             None,
         );
-        let (shard_zero, shard_one) = tokio::join!(shard_zero, shard_one);
-        let (_, shard_zero) = response_json(shard_zero).await;
-        let (_, shard_one) = response_json(shard_one).await;
-        assert_eq!(shard_zero["rows"][0][1], "shard-0-row-1");
-        assert_eq!(shard_one["rows"][0][1], "shard-1-row-1");
+        let (ignored_shard_zero, ignored_shard_one) =
+            tokio::join!(ignored_shard_zero, ignored_shard_one);
+        let (_, ignored_shard_zero) = response_json(ignored_shard_zero).await;
+        let (_, ignored_shard_one) = response_json(ignored_shard_one).await;
+        assert_eq!(ignored_shard_zero, ignored_shard_one);
+        assert_eq!(ignored_shard_zero["rows"][0][1], "shard-0-row-1");
 
         for table in ["briskdb_shard_metadata", "widget_view", "guessed_table"] {
-            let uri = format!("/admin/api/rows?shard=0&table={table}");
+            let uri = format!("/admin/api/rows?table={table}");
             let response = request(&app, Method::GET, &uri, Some(cookie), None).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{table}");
             let uri = format!("/admin/api/count?table={table}");
@@ -1328,7 +1611,7 @@ mod tests {
         let recovered = request(
             &app,
             Method::GET,
-            "/admin/api/rows?shard=0&table=widgets&limit=1&offset=0",
+            "/admin/api/rows?table=widgets&limit=1&offset=0",
             Some(cookie),
             None,
         )
@@ -1337,7 +1620,176 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_shard_count_returns_no_partial_total_and_recovers_after_one_shard_failure() {
+    async fn populated_catalog_drives_sharded_and_global_browser_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE events (\
+                    tenant_key TEXT NOT NULL PRIMARY KEY, \
+                    payload TEXT NOT NULL\
+                 ); \
+                 CREATE TABLE countries (\
+                    code TEXT NOT NULL PRIMARY KEY, \
+                    label TEXT NOT NULL\
+                 );",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "events",
+                    ShardKeyMetadata::new("tenant_key", ShardKeyType::Text).unwrap(),
+                )
+                .unwrap(),
+                TableDeclaration::global(logical_database, "countries").unwrap(),
+                TableDeclaration::catalog(logical_database, "manifest_records").unwrap(),
+            ])
+            .unwrap();
+
+        let tenant_keys = [0_u16, 1_u16].map(|shard| routing_key_for_shard(&database, shard));
+        for (shard, tenant_key) in tenant_keys.iter().enumerate() {
+            let inserted = database
+                .execute_routed(
+                    tenant_key,
+                    "INSERT INTO events (tenant_key, payload) VALUES (?1, 'same payload')",
+                    &[Value::Text(tenant_key.clone())],
+                )
+                .unwrap();
+            assert_eq!(inserted.shard, shard as u16);
+        }
+
+        for (shard, label) in [(0_u16, "canonical"), (1_u16, "noncanonical copy")] {
+            rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                .unwrap()
+                .execute(
+                    "INSERT INTO countries (code, label) VALUES ('US', ?1)",
+                    [label],
+                )
+                .unwrap();
+        }
+
+        let app = super::super::router(Arc::new(database));
+        let set_cookie = login_cookie(&app).await;
+        let cookie = set_cookie.to_str().unwrap().split(';').next().unwrap();
+
+        assert_eq!(
+            response_json(
+                request(
+                    &app,
+                    Method::GET,
+                    "/admin/api/overview?shard=1",
+                    Some(cookie),
+                    None,
+                )
+                .await
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({
+                    "scope": "logical_default_database",
+                    "shard_count": 2,
+                    "visited_shards": [],
+                    "tables": ["countries", "events"]
+                })
+            )
+        );
+
+        let (_, sharded) = response_json(
+            request(
+                &app,
+                Method::GET,
+                "/admin/api/rows?table=events&limit=50&offset=0&shard=1",
+                Some(cookie),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(sharded["scope"], "logical_sharded_table");
+        assert_eq!(sharded["visited_shards"], json!([0, 1]));
+        assert_eq!(sharded["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(sharded["rows"][0][1], "same payload");
+        assert_eq!(sharded["rows"][1][1], "same payload");
+
+        assert_eq!(
+            response_json(
+                request(
+                    &app,
+                    Method::GET,
+                    "/admin/api/count?table=events",
+                    Some(cookie),
+                    None,
+                )
+                .await
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({
+                    "table": "events",
+                    "scope": "logical_sharded_table",
+                    "visited_shards": [0, 1],
+                    "total_rows": 2
+                })
+            )
+        );
+
+        let (_, global) = response_json(
+            request(
+                &app,
+                Method::GET,
+                "/admin/api/rows?table=countries&limit=50&offset=0",
+                Some(cookie),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(global["scope"], "logical_global_table");
+        assert_eq!(global["visited_shards"], json!([0]));
+        assert_eq!(global["rows"], json!([["US", "canonical"]]));
+        assert_eq!(
+            response_json(
+                request(
+                    &app,
+                    Method::GET,
+                    "/admin/api/count?table=countries&shard=1",
+                    Some(cookie),
+                    None,
+                )
+                .await
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({
+                    "table": "countries",
+                    "scope": "logical_global_table",
+                    "visited_shards": [0],
+                    "total_rows": 1
+                })
+            )
+        );
+
+        for endpoint in ["rows", "count"] {
+            let response = request(
+                &app,
+                Method::GET,
+                &format!("/admin/api/{endpoint}?table=manifest_records"),
+                Some(cookie),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn logical_count_and_rows_return_no_partial_data_after_one_file_fails() {
         let temp = tempfile::tempdir().unwrap();
         let database = Arc::new(Database::open(temp.path(), 2).unwrap());
         database
@@ -1378,6 +1830,19 @@ mod tests {
         assert_eq!(failed["code"], "invalid_argument");
         assert!(failed.get("total_rows").is_none());
 
+        let failed = request(
+            &app,
+            Method::GET,
+            "/admin/api/rows?table=counted&limit=50&offset=0",
+            Some(cookie),
+            None,
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
+        let failed = body_json(failed).await;
+        assert_eq!(failed["code"], "invalid_argument");
+        assert!(failed.get("rows").is_none());
+
         assert_eq!(
             response_json(
                 request(
@@ -1394,8 +1859,8 @@ mod tests {
                 StatusCode::OK,
                 json!({
                     "table": "control",
-                    "scope": "all_physical_shards",
-                    "shard_count": 2,
+                    "scope": "empty_catalog_all_physical_shards",
+                    "visited_shards": [0, 1],
                     "total_rows": 0
                 })
             )
@@ -1506,12 +1971,17 @@ mod tests {
             ],
         )
         .unwrap();
+        let (columns, rows) = result.into_parts();
         let body = body_json(page_response(
-            0,
             "widgets".to_owned(),
+            LogicalTablePage {
+                scope: "logical_sharded_table",
+                visited_shards: vec![0, 1],
+                columns,
+                rows,
+            },
             1,
             MAX_PAGE_OFFSET,
-            result,
         ))
         .await;
         assert_eq!(body["rows"], json!([[1]]));
@@ -1533,7 +2003,19 @@ mod tests {
             ])],
         )
         .unwrap();
-        let body = body_json(page_response(0, "numbers".to_owned(), 50, 0, result)).await;
+        let (columns, rows) = result.into_parts();
+        let body = body_json(page_response(
+            "numbers".to_owned(),
+            LogicalTablePage {
+                scope: "logical_sharded_table",
+                visited_shards: vec![0, 1],
+                columns,
+                rows,
+            },
+            50,
+            0,
+        ))
+        .await;
 
         assert_eq!(
             body["rows"],
@@ -1587,7 +2069,7 @@ mod tests {
     }
 
     #[test]
-    fn all_shard_count_validates_shapes_overflow_generation_and_exact_json() {
+    fn logical_count_and_page_helpers_validate_shapes_bounds_and_exact_json() {
         let result =
             |rows| ResultSet::new(vec![Column::new("row_count", DataType::Unknown)], rows).unwrap();
         assert_eq!(
@@ -1623,33 +2105,57 @@ mod tests {
         let changed = ensure_schema_generation(7, 8).unwrap_err();
         assert_eq!(changed.kind(), EngineErrorKind::Busy);
         assert!(changed.is_retryable());
-        let shard_error = || {
-            EngineError::new(
-                EngineErrorKind::InvalidArgument,
-                "one shard no longer has the table",
-            )
-        };
-        assert_eq!(
-            finish_row_counts(7, 7, Err(shard_error()))
-                .unwrap_err()
-                .kind(),
-            EngineErrorKind::InvalidArgument
-        );
-        let changed_wins = finish_row_counts(7, 8, Err(shard_error())).unwrap_err();
-        assert_eq!(changed_wins.kind(), EngineErrorKind::Busy);
-        assert!(changed_wins.is_retryable());
 
         let body = serde_json::to_value(CountResponse {
             table: "events".to_owned(),
-            scope: "all_physical_shards",
-            shard_count: 64,
+            scope: "logical_sharded_table",
+            visited_shards: (0..64).collect(),
             total_rows: admin_value_to_json(Value::UInt64(MAX_JAVASCRIPT_SAFE_INTEGER + 1)),
         })
         .unwrap();
-        assert_eq!(body["scope"], "all_physical_shards");
+        assert_eq!(body["scope"], "logical_sharded_table");
+        assert_eq!(body["visited_shards"].as_array().unwrap().len(), 64);
         assert_eq!(
             body["total_rows"],
             json!({"$briskdb_type":"uint64","value":"9007199254740992"})
+        );
+
+        let columns = vec![Column::new("value", DataType::Unknown)];
+        let shards = [2_u64, 3, 0, 4]
+            .into_iter()
+            .enumerate()
+            .map(|(shard, rows)| ShardTableInspection {
+                shard: shard as u16,
+                rows,
+                columns: columns.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            page_slices(&shards, 1, 5),
+            vec![
+                PageSlice {
+                    shard: 0,
+                    offset: 1,
+                    limit: 1,
+                },
+                PageSlice {
+                    shard: 1,
+                    offset: 0,
+                    limit: 3,
+                },
+                PageSlice {
+                    shard: 3,
+                    offset: 0,
+                    limit: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            deterministic_order_by(&[
+                Column::new("a", DataType::Unknown),
+                Column::new("odd\"name", DataType::Unknown),
+            ]),
+            "ORDER BY browse.\"a\", browse.\"odd\"\"name\""
         );
     }
 

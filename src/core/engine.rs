@@ -9,16 +9,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{sync::OwnedMutexGuard, task::JoinHandle};
+use tokio::{
+    sync::OwnedMutexGuard,
+    task::{JoinHandle, JoinSet},
+};
 
 use super::{
     BlockingPool, BoundStatementPlan, CancelOnDrop, CancellationReason, CancellationToken,
     Database, DescribeTarget, EngineError, EngineErrorKind, EngineOptions, EngineResult,
-    EngineState, Lifecycle, LogicalDatabaseId, OperationControl, OperationLease, PortalId,
-    PrepareRequest, PreparedExecution, PreparedStatementDescription, PreparedStatementId,
+    EngineState, Executed, Lifecycle, LogicalDatabaseId, OperationControl, OperationLease,
+    PortalId, PrepareRequest, PreparedExecution, PreparedStatementDescription, PreparedStatementId,
     PreparedStatementLimits, RawDataOperation, RequestContext, ResultLimits, ResultSet, Routed,
-    Session, SessionInner, ShutdownReport, TablePlacement, Value, wait_for_cancellation,
-    wait_pending,
+    Session, SessionInner, ShutdownReport, TablePlacement, Value, merge_scatter_results,
+    wait_for_cancellation, wait_pending,
 };
 use crate::{
     sql,
@@ -26,6 +29,7 @@ use crate::{
 };
 
 static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_SCATTER_CONCURRENCY: usize = 8;
 
 /// An owned SQL statement and its protocol-neutral parameters.
 #[derive(Debug, Clone, PartialEq)]
@@ -353,6 +357,41 @@ impl Engine {
             ),
             |key| self.inner.database.shard_for_key(key),
         )
+    }
+
+    fn logical_raw_query_plan(
+        &self,
+        statement: &str,
+        parameters: &[Value],
+    ) -> EngineResult<(Vec<u16>, String)> {
+        let parsed = sql::parse(sql::SqlDialect::Sqlite, statement)?;
+        if parsed.statement_count() != 1 {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "logical raw SQL must contain exactly one top-level statement",
+            ));
+        }
+        let common = sql::validate_common_subset(parsed)?;
+        let normalized = sql::normalize_placeholders(common)?;
+        let translated = sql::translate_sql(normalized, sql::SqlTranslationMode::StrictSqlite)?;
+        let plan = self.plan_bound_statement_admitted(
+            self.catalog().default_database().id(),
+            translated.normalized_sql(),
+            0,
+            parameters,
+            None,
+        )?;
+        if !matches!(plan.behavior(), sql::StatementBehavior::Read) {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidQuery,
+                "logical query statements must be read-only",
+            ));
+        }
+        let shards = prepared_execution_shards(&plan, self.catalog(), self.shard_count())?;
+        if shards.len() > 1 {
+            sql::validate_scatter_safe(&translated)?;
+        }
+        Ok((shards, translated.sqlite_sql().to_owned()))
     }
 
     /// Return the engine's immutable pool and admission options.
@@ -824,6 +863,124 @@ impl Engine {
         Ok(Routed { shard, value })
     }
 
+    /// Execute one immutable bound portal as a logical read across every
+    /// metadata-selected physical shard.
+    pub async fn execute_portal_logical(
+        &self,
+        session: &Session,
+        portal: PortalId,
+    ) -> EngineResult<Executed<PreparedExecution>> {
+        self.execute_portal_logical_with_context(session, portal, RequestContext::new())
+            .await
+    }
+
+    /// Execute a logical bound portal with explicit request and result-budget
+    /// controls.
+    pub async fn execute_portal_logical_with_context(
+        &self,
+        session: &Session,
+        portal: PortalId,
+        context: RequestContext,
+    ) -> EngineResult<Executed<PreparedExecution>> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let portal_snapshot = match guard.prepared().portal(portal) {
+            Ok(portal) => portal.clone(),
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let template = match guard.prepared().statement(portal_snapshot.statement()) {
+            Ok(template) => template,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let explicit_routing_key = if matches!(
+            template.description().behavior(),
+            sql::StatementBehavior::Read
+        ) {
+            None
+        } else {
+            portal_snapshot.routing_key()
+        };
+        let plan = match self.plan_bound_statement_admitted(
+            template.database(),
+            template.translated().normalized_sql(),
+            0,
+            portal_snapshot.parameters(),
+            explicit_routing_key,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let shards = match prepared_execution_shards(&plan, self.catalog(), self.shard_count()) {
+            Ok(shards) => shards,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if shards.len() > 1 {
+            if let Err(error) = sql::validate_scatter_safe(template.translated()) {
+                return operation.finish(Err(error));
+            }
+        }
+
+        let sqlite_sql = template.translated().sqlite_sql().to_owned();
+        let behavior = plan.behavior();
+        let result_limits = operation.result_limits;
+        let owner = ConnectionOwner::new(session.id().get());
+        if shards.len() > 1 {
+            if !matches!(behavior, sql::StatementBehavior::Read) {
+                return operation.finish(Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "write planning produced more than one execution shard",
+                )));
+            }
+            let parameters = portal_snapshot.parameters().to_vec();
+            let result = self
+                .run_scatter_query(
+                    &mut operation,
+                    owner,
+                    schema_operation,
+                    guard,
+                    shards.clone(),
+                    sqlite_sql,
+                    parameters,
+                )
+                .await
+                .map(PreparedExecution::Rows);
+            let value = operation.finish_started(result)?;
+            return Ok(Executed { shards, value });
+        }
+
+        let shard = shards[0];
+        let result = self
+            .run_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                schema_operation,
+                guard,
+                move |connection, _session, control| {
+                    connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sqlite_sql)?;
+                    connection.run_controlled(control, |connection| {
+                        sql::execute_statement_with_limits(
+                            connection,
+                            &sqlite_sql,
+                            portal_snapshot.parameters(),
+                            result_limits,
+                        )
+                        .and_then(|execution| prepared_execution(behavior, execution))
+                    })
+                },
+            )
+            .await;
+        let value = operation.finish_started(result)?;
+        Ok(Executed { shards, value })
+    }
+
     /// Close a prepared statement and every portal bound from it.
     ///
     /// This in-memory cleanup remains available while the engine is draining.
@@ -962,7 +1119,6 @@ impl Engine {
             ),
         };
         let limits = operation.result_limits;
-
         let value = self
             .run_on_shard(
                 &mut operation,
@@ -980,6 +1136,89 @@ impl Engine {
             .await;
         let value = operation.finish_started(value)?;
         Ok(Routed { shard, value })
+    }
+
+    /// Query one logical table view, visiting every physical shard selected by
+    /// catalog metadata and preserving `UNION ALL` row semantics.
+    pub async fn query_logical(
+        &self,
+        session: &Session,
+        statement: Statement,
+    ) -> EngineResult<Executed<ResultSet>> {
+        self.query_logical_with_context(session, statement, RequestContext::new())
+            .await
+    }
+
+    /// Query one logical table view with explicit cancellation, deadline, and
+    /// result-budget controls.
+    pub async fn query_logical_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Executed<ResultSet>> {
+        // An empty catalog has no placement metadata, so retain the legacy
+        // explicitly routed compatibility behavior.
+        if self.catalog().tables().is_empty() {
+            return self
+                .query_with_context(session, statement, context)
+                .await
+                .map(|routed| Executed {
+                    shards: vec![routed.shard],
+                    value: routed.value,
+                });
+        }
+
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let (sql, params) = statement.into_parts();
+        let (shards, sql) = match self.logical_raw_query_plan(&sql, &params) {
+            Ok(plan) => plan,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let owner = ConnectionOwner::new(session.id().get());
+        if shards.len() > 1 {
+            let result = self
+                .run_scatter_query(
+                    &mut operation,
+                    owner,
+                    schema_operation,
+                    guard,
+                    shards.clone(),
+                    sql,
+                    params,
+                )
+                .await;
+            let value = operation.finish_started(result)?;
+            return Ok(Executed { shards, value });
+        }
+
+        let shard = shards[0];
+        let limits = operation.result_limits;
+        let value = self
+            .run_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                schema_operation,
+                guard,
+                move |connection, _session, control| {
+                    connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sql)?;
+                    connection.run_controlled(control, |connection| {
+                        sql::query_with_limits(connection, &sql, &params, limits)
+                    })
+                },
+            )
+            .await;
+        let value = operation.finish_started(value)?;
+        Ok(Executed { shards, value })
     }
 
     /// Run one read-only inspection statement on an explicit physical shard.
@@ -1119,6 +1358,261 @@ impl Engine {
         });
         let result = operation.wait_started(join).await;
         operation.finish_started(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_scatter_query(
+        &self,
+        operation: &mut Operation,
+        owner: ConnectionOwner,
+        schema_operation: SchemaOperationGuard,
+        session: OwnedMutexGuard<SessionInner>,
+        shards: Vec<u16>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> EngineResult<ResultSet> {
+        if shards.len() < 2 {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "scatter execution requires at least two physical shards",
+            ));
+        }
+        if let Err(error) = operation.check_before_start() {
+            return operation.control.complete(Err(error));
+        }
+
+        let cancellation = CancellationToken::new();
+        let cancel_scatter = cancellation.clone();
+        if let Err(reason) = operation.control.arm(Arc::new(move || {
+            cancel_scatter.cancel();
+        })) {
+            return operation.control.complete(Err(reason.error()));
+        }
+
+        let lease = operation.take_lease();
+        let worker_control = Arc::clone(&operation.control);
+        let engine = self.clone();
+        let deadline = operation.deadline;
+        let result_limits = operation.result_limits;
+        let sql: Arc<str> = Arc::from(sql);
+        let params: Arc<[Value]> = Arc::from(params);
+        let join = tokio::spawn(async move {
+            // These guards cover the complete logical operation. Cancellation
+            // cannot release schema, lifecycle, or session ownership until
+            // every started physical read has drained and cleaned up.
+            let _lease = lease;
+            let _schema_operation = schema_operation;
+            let _session = session;
+            let result = engine
+                .coordinate_scatter_query(
+                    owner,
+                    shards,
+                    sql,
+                    params,
+                    cancellation,
+                    deadline,
+                    result_limits,
+                )
+                .await;
+            worker_control.complete(result)
+        });
+        operation.wait_started(join).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn coordinate_scatter_query(
+        &self,
+        owner: ConnectionOwner,
+        shards: Vec<u16>,
+        sql: Arc<str>,
+        params: Arc<[Value]>,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        result_limits: ResultLimits,
+    ) -> EngineResult<ResultSet> {
+        let budget = sql::ScatterResultBudget::new(result_limits);
+        let mut remaining = shards.iter().copied();
+        let mut running = JoinSet::new();
+        for shard in remaining.by_ref().take(MAX_SCATTER_CONCURRENCY) {
+            self.spawn_scatter_shard(
+                &mut running,
+                shard,
+                owner,
+                Arc::clone(&sql),
+                Arc::clone(&params),
+                cancellation.clone(),
+                deadline,
+                budget.clone(),
+            );
+        }
+
+        let mut results = Vec::with_capacity(shards.len());
+        let mut first_error = None;
+        while let Some(joined) = running.join_next().await {
+            match joined {
+                Ok((shard, Ok(result))) if first_error.is_none() => {
+                    results.push(Routed {
+                        shard,
+                        value: result,
+                    });
+                }
+                Ok((_, Ok(_))) => {}
+                Ok((_, Err(error))) if first_error.is_none() => {
+                    first_error = Some(error);
+                    cancellation.cancel();
+                }
+                Ok((_, Err(_))) => {}
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(EngineError::from_source(
+                        EngineErrorKind::Internal,
+                        "scatter query task failed",
+                        error,
+                    ));
+                    cancellation.cancel();
+                }
+                Err(_) => {}
+            }
+
+            if first_error.is_none() {
+                if let Some(shard) = remaining.next() {
+                    self.spawn_scatter_shard(
+                        &mut running,
+                        shard,
+                        owner,
+                        Arc::clone(&sql),
+                        Arc::clone(&params),
+                        cancellation.clone(),
+                        deadline,
+                        budget.clone(),
+                    );
+                }
+            }
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        merge_scatter_results(results, result_limits)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_scatter_shard(
+        &self,
+        running: &mut JoinSet<(u16, EngineResult<ResultSet>)>,
+        shard: u16,
+        owner: ConnectionOwner,
+        sql: Arc<str>,
+        params: Arc<[Value]>,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        budget: sql::ScatterResultBudget,
+    ) {
+        let engine = self.clone();
+        running.spawn(async move {
+            let result = engine
+                .run_scatter_shard(shard, owner, sql, params, cancellation, deadline, budget)
+                .await;
+            (shard, result)
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_scatter_shard(
+        &self,
+        shard: u16,
+        owner: ConnectionOwner,
+        sql: Arc<str>,
+        params: Arc<[Value]>,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        budget: sql::ScatterResultBudget,
+    ) -> EngineResult<ResultSet> {
+        let control = OperationControl::new(deadline);
+        let mut cancel_on_drop = CancelOnDrop::new(Arc::clone(&control));
+        let shutdown_cancel = self.inner.shutdown_cancel.clone();
+
+        let permit = match wait_pending(
+            self.inner.connections.acquire_for_owner(shard, owner),
+            &cancellation,
+            &shutdown_cancel,
+            deadline,
+            &control,
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                let result = control.complete(Err(error));
+                cancel_on_drop.disarm();
+                return result;
+            }
+        };
+        let worker = match wait_pending(
+            self.inner.workers.acquire(),
+            &cancellation,
+            &shutdown_cancel,
+            deadline,
+            &control,
+        )
+        .await
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                let result = control.complete(Err(error));
+                cancel_on_drop.disarm();
+                return result;
+            }
+        };
+
+        if let Some(reason) = pending_cancellation_reason(&cancellation, &shutdown_cancel, deadline)
+        {
+            control.request_cancel(reason);
+            let result = control.complete(Err(reason.error()));
+            cancel_on_drop.disarm();
+            return result;
+        }
+
+        let worker_control = Arc::clone(&control);
+        let storage = self.inner.database.storage.clone();
+        let mut join = worker.spawn(move || {
+            let result = permit
+                .checkout_controlled(Arc::clone(&worker_control))
+                .and_then(|mut connection| {
+                    let result = connection
+                        .isolate_foreign_sql_controlled(Arc::clone(&worker_control), &sql)
+                        .and_then(|()| {
+                            connection.run_controlled(Arc::clone(&worker_control), |connection| {
+                                sql::query_with_scatter_budget(
+                                    connection,
+                                    &sql,
+                                    params.as_ref(),
+                                    &budget,
+                                )
+                            })
+                        });
+                    retire_if_broken(&mut connection, &result);
+                    result
+                });
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                storage.record_schema_degraded();
+            }
+            worker_control.complete(result)
+        });
+
+        let result = tokio::select! {
+            biased;
+            result = &mut join => flatten_join(result),
+            reason = wait_for_cancellation(&cancellation, &shutdown_cancel, deadline) => {
+                control.request_cancel(reason);
+                flatten_join(join.await)
+            }
+        };
+        let result = control.complete(result);
+        cancel_on_drop.disarm();
+        result
     }
 
     async fn run_on_shard<T, F>(
@@ -1483,6 +1977,88 @@ fn prepared_execution_shard(
     }
 }
 
+fn prepared_execution_shards(
+    plan: &BoundStatementPlan,
+    catalog: &super::Catalog,
+    shard_count: u16,
+) -> EngineResult<Vec<u16>> {
+    if matches!(
+        plan.behavior(),
+        sql::StatementBehavior::Schema(_) | sql::StatementBehavior::Session(_)
+    ) {
+        return Err(unsupported_prepared_behavior());
+    }
+
+    let placement = if plan.inference().kind() == sql::ShardKeyInferenceKind::NotSharded {
+        let table = plan
+            .inference()
+            .table_id()
+            .and_then(|table| catalog.table_by_id(table))
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    "non-sharded prepared planning lost its catalog table",
+                )
+            })?;
+        match table.placement() {
+            TablePlacement::Catalog => {
+                return Err(catalog_target_denied());
+            }
+            TablePlacement::Global => Some(TablePlacement::Global),
+            TablePlacement::Sharded(_) => {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "non-sharded prepared planning resolved a sharded table",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    match plan.behavior() {
+        sql::StatementBehavior::Read => {
+            let mut shards = match plan.inference().kind() {
+                sql::ShardKeyInferenceKind::NotApplicable => vec![0],
+                sql::ShardKeyInferenceKind::NotSharded
+                    if matches!(placement, Some(TablePlacement::Global)) =>
+                {
+                    vec![0]
+                }
+                sql::ShardKeyInferenceKind::Unconstrained => (0..shard_count).collect(),
+                sql::ShardKeyInferenceKind::Contradiction => vec![0],
+                sql::ShardKeyInferenceKind::Exact | sql::ShardKeyInferenceKind::Multiple => plan
+                    .inferred_routes()
+                    .iter()
+                    .map(super::PlannedRoute::shard)
+                    .collect(),
+                sql::ShardKeyInferenceKind::NotSharded => {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "non-sharded prepared planning lost Global placement",
+                    ));
+                }
+            };
+            shards.sort_unstable();
+            shards.dedup();
+            if shards.is_empty() || shards.iter().any(|&shard| shard >= shard_count) {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "prepared read planning produced invalid physical targets",
+                ));
+            }
+            Ok(shards)
+        }
+        sql::StatementBehavior::Write(_) => plan
+            .assigned_shard()
+            .map(|shard| vec![shard])
+            .ok_or_else(unassigned_prepared_statement),
+        sql::StatementBehavior::Schema(_) | sql::StatementBehavior::Session(_) => {
+            Err(unsupported_prepared_behavior())
+        }
+    }
+}
+
 fn prepared_execution(
     behavior: sql::StatementBehavior,
     execution: sql::StatementExecution,
@@ -1523,6 +2099,20 @@ fn flatten_join<T>(result: Result<EngineResult<T>, tokio::task::JoinError>) -> E
             error,
         )
     })?
+}
+
+fn pending_cancellation_reason(
+    request: &CancellationToken,
+    shutdown: &CancellationToken,
+    deadline: Option<Instant>,
+) -> Option<CancellationReason> {
+    if request.is_cancelled() || shutdown.is_cancelled() {
+        Some(CancellationReason::Cancelled)
+    } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Some(CancellationReason::DeadlineExceeded)
+    } else {
+        None
+    }
 }
 
 fn required_routing_key(session: &SessionInner) -> EngineResult<&str> {
@@ -1581,6 +2171,35 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let database = Arc::new(Database::open(temp.path(), shards).unwrap());
         let engine = Engine::from_database_with_options(database, options).unwrap();
+        (temp, engine)
+    }
+
+    fn engine_with_sharded_events(
+        shards: u16,
+        options: EngineOptions,
+    ) -> (tempfile::TempDir, Engine) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), shards).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE events (
+                    tenant_id INTEGER PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "events",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let engine = Engine::from_database_with_options(Arc::new(database), options).unwrap();
         (temp, engine)
     }
 
@@ -2872,7 +3491,10 @@ mod tests {
             .map(|value| value.to_string())
             .find(|key| engine.inner.database.shard_for_key(key.as_bytes()) != expected_shard)
             .unwrap();
-        session.set_routing_key(different_route).await.unwrap();
+        session
+            .set_routing_key(different_route.clone())
+            .await
+            .unwrap();
 
         let deleted = engine.execute_portal(&session, portal).await.unwrap();
         assert_eq!(deleted.shard, expected_shard);
@@ -2889,6 +3511,24 @@ mod tests {
             .await
             .unwrap();
         assert!(remaining.value.is_empty());
+
+        engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                    vec![Value::from(7_i64), Value::from("delete-me")],
+                ),
+            )
+            .await
+            .unwrap();
+        session.set_routing_key(different_route).await.unwrap();
+        let deleted = engine
+            .execute_portal_logical(&session, portal)
+            .await
+            .unwrap();
+        assert_eq!(deleted.shards, vec![expected_shard]);
+        assert_eq!(deleted.value, PreparedExecution::AffectedRows(1));
     }
 
     #[tokio::test]
@@ -5760,5 +6400,352 @@ mod tests {
         assert_eq!(engine.state(), EngineState::Stopped);
         let snapshot = engine.inner.connections.snapshot().unwrap();
         assert!(snapshot.shards.iter().all(|shard| shard.idle == 0));
+    }
+
+    #[tokio::test]
+    async fn logical_scatter_starts_no_more_than_eight_physical_reads_at_once() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_sharded_events(9, options);
+        let mut started = Vec::new();
+        let mut release = Vec::new();
+        for shard in 0..9 {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            engine
+                .inner
+                .connections
+                .block_next_connection_setup(shard, started_tx, release_rx)
+                .unwrap();
+            started.push(Some(started_rx));
+            release.push(release_tx);
+        }
+
+        let query_engine = engine.clone();
+        let query = tokio::spawn(async move {
+            let session = query_engine.session();
+            query_engine
+                .query_logical(
+                    &session,
+                    Statement::new("SELECT tenant_id FROM events", vec![]),
+                )
+                .await
+        });
+
+        for (shard, receiver) in started.iter_mut().enumerate().take(8) {
+            wait_for_blocking_signal(
+                receiver.take().unwrap(),
+                "one of the first eight scatter reads should start",
+            )
+            .await;
+            assert_eq!(
+                engine.inner.connections.snapshot().unwrap().shards[shard].active,
+                1
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(
+            started[8].as_ref().unwrap().try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        release[0].send(()).unwrap();
+        wait_for_blocking_signal(
+            started[8].take().unwrap(),
+            "the ninth scatter read should start after one bounded slot is released",
+        )
+        .await;
+        for sender in release.iter().skip(1) {
+            sender.send(()).unwrap();
+        }
+
+        let result = timeout(Duration::from_secs(2), query)
+            .await
+            .expect("the bounded scatter query should complete")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.shards, (0_u16..9).collect::<Vec<_>>());
+        assert!(result.value.is_empty());
+        wait_for_worker_capacity(&engine, 9).await;
+        assert!(
+            engine
+                .inner
+                .connections
+                .snapshot()
+                .unwrap()
+                .shards
+                .iter()
+                .all(|shard| shard.active == 0 && shard.queued == 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_scatter_deadline_cancels_and_drains_every_started_shard() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_sharded_events(4, options);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (_release_tx, release_rx) = mpsc::channel();
+        engine
+            .inner
+            .connections
+            .block_next_connection_setup(0, started_tx, release_rx)
+            .unwrap();
+
+        let context = RequestContext::new()
+            .with_timeout(Duration::from_secs(1))
+            .unwrap();
+        let session = Arc::new(engine.session());
+        let query_engine = engine.clone();
+        let query_session = Arc::clone(&session);
+        let query = tokio::spawn(async move {
+            query_engine
+                .query_logical_with_context(
+                    &query_session,
+                    Statement::new("SELECT tenant_id FROM events", vec![]),
+                    context,
+                )
+                .await
+        });
+        wait_for_blocking_signal(started_rx, "one scatter shard should enter SQLite setup").await;
+
+        let error = timeout(Duration::from_secs(2), query)
+            .await
+            .expect("the shared deadline should interrupt the blocked shard")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+        assert_eq!(engine.active_operations_for_test(), 0);
+        wait_for_worker_capacity(&engine, 4).await;
+        assert!(
+            engine
+                .inner
+                .connections
+                .snapshot()
+                .unwrap()
+                .shards
+                .iter()
+                .all(|shard| shard.active == 0 && shard.queued == 0)
+        );
+
+        let recovered = engine
+            .query_logical(
+                &session,
+                Statement::new("SELECT tenant_id FROM events", vec![]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.shards, vec![0, 1, 2, 3]);
+        assert!(recovered.value.is_empty());
+    }
+
+    #[tokio::test]
+    async fn writer_on_another_sqlite_file_progresses_while_scatter_is_in_flight() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_sharded_events(4, options);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        engine
+            .inner
+            .connections
+            .block_next_connection_setup(0, started_tx, release_rx)
+            .unwrap();
+
+        let query_engine = engine.clone();
+        let scatter = tokio::spawn(async move {
+            let session = query_engine.session();
+            query_engine
+                .query_logical(
+                    &session,
+                    Statement::new("SELECT tenant_id, payload FROM events", vec![]),
+                )
+                .await
+        });
+        wait_for_blocking_signal(started_rx, "scatter should remain active on shard zero").await;
+
+        let key = integer_key_for_shard(&engine, 1, None);
+        let writer = engine.session();
+        writer.set_routing_key(key.to_string()).await.unwrap();
+        let inserted = timeout(
+            Duration::from_secs(2),
+            engine.execute(
+                &writer,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                    vec![Value::Int64(key), Value::from("written independently")],
+                ),
+            ),
+        )
+        .await
+        .expect("a writer on shard one must not wait for shard zero")
+        .unwrap();
+        assert_eq!(inserted.shard, 1);
+        assert_eq!(inserted.value, 1);
+
+        release_tx.send(()).unwrap();
+        timeout(Duration::from_secs(2), scatter)
+            .await
+            .expect("scatter should finish after the held shard is released")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborting_logical_scatter_retains_guards_until_detached_cleanup_finishes() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_sharded_events(4, options);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (_release_tx, release_rx) = mpsc::channel();
+        engine
+            .inner
+            .connections
+            .block_next_connection_setup(0, started_tx, release_rx)
+            .unwrap();
+
+        let session = Arc::new(engine.session());
+        let query_engine = engine.clone();
+        let query_session = Arc::clone(&session);
+        let query = tokio::spawn(async move {
+            query_engine
+                .query_logical(
+                    &query_session,
+                    Statement::new("SELECT tenant_id FROM events", vec![]),
+                )
+                .await
+        });
+        wait_for_blocking_signal(started_rx, "one scatter child should enter SQLite setup").await;
+        assert_eq!(engine.active_operations_for_test(), 1);
+
+        query.abort();
+        assert!(query.await.unwrap_err().is_cancelled());
+        timeout(Duration::from_secs(2), async {
+            while engine.active_operations_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached scatter coordinator should finish child cleanup");
+        wait_for_worker_capacity(&engine, 4).await;
+        assert!(
+            engine
+                .inner
+                .connections
+                .snapshot()
+                .unwrap()
+                .shards
+                .iter()
+                .all(|shard| shard.active == 0 && shard.queued == 0)
+        );
+
+        let recovered = engine
+            .query_logical(
+                &session,
+                Statement::new("SELECT tenant_id FROM events", vec![]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.shards, vec![0, 1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn one_scatter_failure_cancels_and_drains_a_blocked_sibling_without_partial_rows() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_sharded_events(4, options);
+        let session = Arc::new(engine.session());
+        let first = integer_key_for_shard(&engine, 0, None);
+        let second = integer_key_for_shard(&engine, 0, Some(first));
+        session.set_routing_key(first.to_string()).await.unwrap();
+        engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, 'one'), (?2, 'two')",
+                    vec![Value::Int64(first), Value::Int64(second)],
+                ),
+            )
+            .await
+            .unwrap();
+
+        let (failure_started_tx, failure_started_rx) = mpsc::channel();
+        let (failure_release_tx, failure_release_rx) = mpsc::channel();
+        engine
+            .inner
+            .connections
+            .block_next_control_teardown(0, failure_started_tx, failure_release_rx)
+            .unwrap();
+        let (sibling_started_tx, sibling_started_rx) = mpsc::channel();
+        let (_sibling_release_tx, sibling_release_rx) = mpsc::channel();
+        engine
+            .inner
+            .connections
+            .block_next_connection_setup(3, sibling_started_tx, sibling_release_rx)
+            .unwrap();
+
+        let context = RequestContext::new()
+            .with_result_limits(ResultLimits::new(1, ResultLimits::default().max_bytes()).unwrap());
+        let query_engine = engine.clone();
+        let query_session = Arc::clone(&session);
+        let query = tokio::spawn(async move {
+            query_engine
+                .query_logical_with_context(
+                    &query_session,
+                    Statement::new("SELECT tenant_id FROM events", vec![]),
+                    context,
+                )
+                .await
+        });
+        wait_for_blocking_signal(
+            sibling_started_rx,
+            "a sibling shard should be blocked before the first error is published",
+        )
+        .await;
+        wait_for_blocking_signal(
+            failure_started_rx,
+            "the row-limit failure should reach controlled SQLite cleanup",
+        )
+        .await;
+        failure_release_tx.send(()).unwrap();
+
+        let error = timeout(Duration::from_secs(2), query)
+            .await
+            .expect("the first shard failure should cancel and drain its sibling")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        assert!(error.diagnostic().contains("row limit"));
+        assert_eq!(engine.active_operations_for_test(), 0);
+        wait_for_worker_capacity(&engine, 4).await;
+        assert!(
+            engine
+                .inner
+                .connections
+                .snapshot()
+                .unwrap()
+                .shards
+                .iter()
+                .all(|shard| shard.active == 0 && shard.queued == 0)
+        );
+
+        let recovered = engine
+            .query_logical(
+                &session,
+                Statement::new("SELECT tenant_id FROM events", vec![]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.value.len(), 2);
     }
 }

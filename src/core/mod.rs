@@ -12,6 +12,7 @@ mod options;
 mod planner;
 mod prepared;
 mod routing;
+mod scatter;
 mod session;
 mod types;
 pub(crate) mod worker;
@@ -52,6 +53,7 @@ pub(crate) use routing::{
     BUCKET_ALGORITHM_VERSION, HASH_VERSION, INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION,
     RoutingCatalog, VIRTUAL_BUCKET_COUNT, initial_physical_shard,
 };
+pub(crate) use scatter::merge_scatter_results;
 pub use session::{Session, SessionId, SessionState};
 pub use types::{
     Column, DataType, Decimal, ParseDecimalError, ResultSet, ResultSetShapeError, Row, Value,
@@ -85,6 +87,23 @@ pub struct Database {
 pub struct Routed<T> {
     pub shard: u16,
     pub value: T,
+}
+
+/// Result of one logical engine operation and the physical shards it visited.
+///
+/// Shards are unique and sorted in ascending order. Single-owner reads and
+/// writes contain one entry; logical Sharded reads may contain several.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Executed<T> {
+    pub shards: Vec<u16>,
+    pub value: T,
+}
+
+impl<T> Executed<T> {
+    /// Return the physical shards visited by this logical operation.
+    pub fn shards(&self) -> &[u16] {
+        &self.shards
+    }
 }
 
 impl Database {

@@ -14,6 +14,7 @@ mod dml;
 mod inference;
 mod normalizer;
 mod parser;
+mod scatter;
 mod subset;
 mod translator;
 
@@ -33,6 +34,7 @@ pub use parser::{
     MAX_PARSED_SQL_BYTES, MAX_PARSED_SQL_STATEMENTS, ParsedSql, SQL_PARSE_RECURSION_LIMIT,
     SqlDialect, parse,
 };
+pub(crate) use scatter::validate_scatter_safe;
 pub use subset::{CommonSql, MAX_COMMON_SQL_EXPRESSION_DEPTH, validate_common_subset};
 pub use translator::{SqlTranslationMode, TranslatedSql, translate_sql};
 
@@ -40,6 +42,7 @@ use rusqlite::{
     Connection, Statement as SqlStatement, params_from_iter,
     types::{Value as SqlValue, ValueRef},
 };
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{
     core::{
@@ -54,6 +57,97 @@ const TYPE_TAG_BYTES: u64 = 1;
 const LENGTH_BYTES: u64 = 8;
 const ROW_FRAME_BYTES: u64 = 8;
 const FIXED_VALUE_PAYLOAD_BYTES: u64 = 8;
+
+/// One result budget shared by every physical query in a scatter operation.
+///
+/// Clones refer to the same counters. Column metadata is charged once and must
+/// match exactly on every shard; rows and logical bytes are reserved atomically
+/// before SQLite values are copied into an owned [`ResultSet`].
+#[derive(Debug, Clone)]
+pub(crate) struct ScatterResultBudget {
+    limits: ResultLimits,
+    state: Arc<Mutex<ScatterResultBudgetState>>,
+}
+
+#[derive(Debug, Default)]
+struct ScatterResultBudgetState {
+    columns: Option<Vec<Column>>,
+    rows: u64,
+    logical_bytes: u64,
+}
+
+impl ScatterResultBudget {
+    pub(crate) fn new(limits: ResultLimits) -> Self {
+        Self {
+            limits,
+            state: Arc::new(Mutex::new(ScatterResultBudgetState::default())),
+        }
+    }
+
+    fn register_columns(&self, columns: &[Column]) -> EngineResult<()> {
+        let mut state = self.lock_state();
+        if let Some(expected) = &state.columns {
+            if expected != columns {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "scatter query returned inconsistent column metadata",
+                ));
+            }
+            return Ok(());
+        }
+
+        // Calculate against locals so a limit failure cannot partially commit
+        // metadata accounting to the shared operation.
+        let mut logical_bytes = account_bytes(
+            state.logical_bytes,
+            RESULT_ENVELOPE_BYTES,
+            self.limits.max_bytes(),
+        )?;
+        for column in columns {
+            logical_bytes = account_bytes(logical_bytes, TYPE_TAG_BYTES, self.limits.max_bytes())?;
+            logical_bytes = account_bytes(logical_bytes, LENGTH_BYTES, self.limits.max_bytes())?;
+            logical_bytes = account_bytes(
+                logical_bytes,
+                usize_to_u64(column.name.len())?,
+                self.limits.max_bytes(),
+            )?;
+        }
+
+        state.logical_bytes = logical_bytes;
+        state.columns = Some(columns.to_vec());
+        Ok(())
+    }
+
+    fn reserve_sqlite_row(&self, row: &rusqlite::Row<'_>, column_count: usize) -> EngineResult<()> {
+        let mut additional_bytes = ROW_FRAME_BYTES;
+        for index in 0..column_count {
+            let value = row.get_ref(index).map_err(sqlite_error::statement)?;
+            additional_bytes = additional_bytes
+                .checked_add(logical_value_bytes(value)?)
+                .ok_or_else(byte_limit_exceeded)?;
+        }
+
+        let mut state = self.lock_state();
+        let rows = account_row(state.rows, self.limits.max_rows())?;
+        let logical_bytes = account_bytes(
+            state.logical_bytes,
+            additional_bytes,
+            self.limits.max_bytes(),
+        )?;
+
+        // Commit both counters together only after both limits pass.
+        state.rows = rows;
+        state.logical_bytes = logical_bytes;
+        Ok(())
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, ScatterResultBudgetState> {
+        // A panic while another owner held the mutex must not turn every later
+        // request into a second panic. The accounting methods themselves only
+        // commit complete transitions, so recovering the guarded state is safe.
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
 
 /// Owned metadata collected while SQLite transiently prepares a statement.
 ///
@@ -226,6 +320,33 @@ pub(crate) fn query_with_limits(
     materialize_rows(&mut statement, metadata.columns, params, limits)
 }
 
+/// Execute one physical shard query against a budget shared by the complete
+/// scatter operation.
+///
+/// This deliberately parallels [`query_with_limits`] instead of changing its
+/// accounting contract: ordinary single-shard queries remain independently
+/// bounded, while scatter callers explicitly opt into operation-wide limits.
+pub(crate) fn query_with_scatter_budget(
+    connection: &Connection,
+    statement: &str,
+    params: &[Value],
+    budget: &ScatterResultBudget,
+) -> EngineResult<ResultSet> {
+    let params = sqlite_parameters(params)?;
+    let mut statement = connection
+        .prepare(statement)
+        .map_err(sqlite_error::statement)?;
+    if !statement.readonly() {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidQuery,
+            "query statements must be read-only",
+        ));
+    }
+
+    let metadata = statement_metadata(&statement);
+    materialize_rows_with_scatter_budget(&mut statement, metadata.columns, params, budget)
+}
+
 fn materialize_rows(
     statement: &mut SqlStatement<'_>,
     columns: Vec<Column>,
@@ -269,6 +390,42 @@ fn materialize_rows(
         rows.push(Row::new(values));
         logical_bytes = row_bytes;
     }
+    ResultSet::new(columns, rows).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::Internal,
+            "SQLite returned rows that do not match their column metadata",
+            error,
+        )
+    })
+}
+
+fn materialize_rows_with_scatter_budget(
+    statement: &mut SqlStatement<'_>,
+    columns: Vec<Column>,
+    params: Vec<SqlValue>,
+    budget: &ScatterResultBudget,
+) -> EngineResult<ResultSet> {
+    budget.register_columns(&columns)?;
+
+    let mut sqlite_rows = statement
+        .query(params_from_iter(params))
+        .map_err(sqlite_error::statement)?;
+    let mut rows = Vec::new();
+
+    while let Some(sqlite_row) = sqlite_rows.next().map_err(sqlite_error::statement)? {
+        // Reservation examines every borrowed value and atomically commits the
+        // full row charge before any payload is cloned into owned memory.
+        budget.reserve_sqlite_row(sqlite_row, columns.len())?;
+
+        let mut values = Vec::with_capacity(columns.len());
+        for index in 0..columns.len() {
+            values.push(sql_to_value(
+                sqlite_row.get_ref(index).map_err(sqlite_error::statement)?,
+            ));
+        }
+        rows.push(Row::new(values));
+    }
+
     ResultSet::new(columns, rows).map_err(|error| {
         EngineError::from_source(
             EngineErrorKind::Internal,
@@ -918,6 +1075,136 @@ mod tests {
                 .get(0),
             Some(&Value::from(3_i64))
         );
+    }
+
+    #[test]
+    fn shared_scatter_budget_charges_metadata_once_across_queries() {
+        let first = Connection::open_in_memory().unwrap();
+        let second = Connection::open_in_memory().unwrap();
+        // One shared metadata envelope is 26 bytes and each integer row is 25.
+        let budget = ScatterResultBudget::new(ResultLimits::new(2, 76).unwrap());
+
+        let first_result =
+            query_with_scatter_budget(&first, "SELECT 1 AS v", &[], &budget).unwrap();
+        let second_result =
+            query_with_scatter_budget(&second, "SELECT 2 AS v", &[], &budget).unwrap();
+
+        assert_eq!(first_result.rows(), [Row::new(vec![Value::from(1_i64)])]);
+        assert_eq!(second_result.rows(), [Row::new(vec![Value::from(2_i64)])]);
+        let state = budget.lock_state();
+        assert_eq!(state.rows, 2);
+        assert_eq!(state.logical_bytes, 76);
+    }
+
+    #[test]
+    fn shared_scatter_budget_enforces_combined_row_limit_one_over() {
+        let first = Connection::open_in_memory().unwrap();
+        let second = Connection::open_in_memory().unwrap();
+        let budget = ScatterResultBudget::new(ResultLimits::new(1, 76).unwrap());
+
+        query_with_scatter_budget(&first, "SELECT 1 AS v", &[], &budget).unwrap();
+        let error = query_with_scatter_budget(&second, "SELECT 2 AS v", &[], &budget).unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        assert_eq!(
+            error.to_string(),
+            "query result exceeds the configured row limit"
+        );
+        let state = budget.lock_state();
+        assert_eq!(state.rows, 1);
+        assert_eq!(state.logical_bytes, 51);
+    }
+
+    #[test]
+    fn shared_scatter_budget_enforces_combined_byte_limit_one_over_atomically() {
+        let first = Connection::open_in_memory().unwrap();
+        let second = Connection::open_in_memory().unwrap();
+        let budget = ScatterResultBudget::new(ResultLimits::new(2, 75).unwrap());
+
+        query_with_scatter_budget(&first, "SELECT 1 AS v", &[], &budget).unwrap();
+        let error = query_with_scatter_budget(&second, "SELECT 2 AS v", &[], &budget).unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        assert_eq!(
+            error.to_string(),
+            "query result exceeds the configured logical byte limit"
+        );
+        // The failed row reserves neither of its counters.
+        let state = budget.lock_state();
+        assert_eq!(state.rows, 1);
+        assert_eq!(state.logical_bytes, 51);
+    }
+
+    #[test]
+    fn shared_scatter_budget_rejects_metadata_mismatch_without_consuming_budget() {
+        let first = Connection::open_in_memory().unwrap();
+        let second = Connection::open_in_memory().unwrap();
+        let budget = ScatterResultBudget::new(ResultLimits::new(1, 51).unwrap());
+
+        query_with_scatter_budget(&first, "SELECT 1 AS v WHERE 0", &[], &budget).unwrap();
+        let error =
+            query_with_scatter_budget(&second, "SELECT 1 AS other", &[], &budget).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Internal);
+        assert_eq!(
+            error.to_string(),
+            "scatter query returned inconsistent column metadata"
+        );
+
+        let result = query_with_scatter_budget(&second, "SELECT 1 AS v", &[], &budget).unwrap();
+        assert_eq!(result.rows(), [Row::new(vec![Value::from(1_i64)])]);
+    }
+
+    #[test]
+    fn cloned_scatter_budgets_serialize_concurrent_row_reservations() {
+        use std::sync::Barrier;
+
+        let budget = ScatterResultBudget::new(ResultLimits::new(1, 51).unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for value in [1_i64, 2_i64] {
+            let worker_budget = budget.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let connection = Connection::open_in_memory().unwrap();
+                worker_barrier.wait();
+                query_with_scatter_budget(
+                    &connection,
+                    "SELECT ?1 AS v",
+                    &[Value::from(value)],
+                    &worker_budget,
+                )
+            }));
+        }
+
+        barrier.wait();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .map(EngineError::kind)
+                .collect::<Vec<_>>(),
+            [EngineErrorKind::LimitExceeded]
+        );
+    }
+
+    #[test]
+    fn shared_scatter_budget_recovers_a_poisoned_accounting_lock() {
+        let budget = ScatterResultBudget::new(ResultLimits::new(1, 51).unwrap());
+        let poisoner = budget.clone();
+        let poisoned = std::panic::catch_unwind(move || {
+            let _guard = poisoner.state.lock().unwrap();
+            panic!("poison shared result accounting for this test");
+        });
+        assert!(poisoned.is_err());
+
+        let connection = Connection::open_in_memory().unwrap();
+        let result = query_with_scatter_budget(&connection, "SELECT 1 AS v", &[], &budget).unwrap();
+        assert_eq!(result.rows(), [Row::new(vec![Value::from(1_i64)])]);
     }
 
     #[test]

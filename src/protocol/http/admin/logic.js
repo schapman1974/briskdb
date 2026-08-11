@@ -42,15 +42,24 @@
     return null;
   }
 
-  function rowCountPresentation(value, shardCount) {
+  function validVisitedShards(shards) {
+    return Array.isArray(shards)
+      && shards.length > 0
+      && shards.every((shard, index) => Number.isInteger(shard)
+        && shard >= 0
+        && (index === 0 || shard > shards[index - 1]));
+  }
+
+  function rowCountPresentation(value, visitedShards) {
     const exact = exactRowCount(value);
-    if (exact === null || !Number.isInteger(shardCount) || shardCount < 1) {
-      throw new Error("Invalid all-shard row count response.");
+    if (exact === null || !validVisitedShards(visitedShards)) {
+      throw new Error("Invalid logical row count response.");
     }
     const formatted = exact.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    const files = visitedShards.length;
     return {
-      text: `${formatted} total record${exact === "1" ? "" : "s"} across ${shardCount} physical shard${shardCount === 1 ? "" : "s"}`,
-      title: "Exact sum of physical table rows. Replicated records are counted once per shard.",
+      text: `${formatted} logical record${exact === "1" ? "" : "s"} across ${files} storage file${files === 1 ? "" : "s"}`,
+      title: `Exact total from visited shard${files === 1 ? "" : "s"}: ${visitedShards.join(", ")}. Global tables are read once.`,
     };
   }
 
@@ -59,10 +68,10 @@
   }
 
   function pageSummary(page) {
-    if (page.rows.length === 0) return `No rows on physical shard ${page.shard}`;
+    if (page.rows.length === 0) return "No logical rows";
     const first = page.offset + 1;
     const last = page.offset + page.rows.length;
-    return `Showing rows ${first}–${last} on physical shard ${page.shard}`;
+    return `Showing logical rows ${first}–${last}`;
   }
 
   function createAuthEpoch() {
@@ -92,5 +101,6 @@
     pageSummary,
     rowCountPresentation,
     taggedInteger,
+    validVisitedShards,
   });
 })();

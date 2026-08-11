@@ -49,40 +49,44 @@ test("ordinary cells keep their existing browser presentation", () => {
   assert.equal(logic.cellPresentation([0, 15, 255]).text, "0x000fff");
 });
 
-test("all-shard row counts are formatted without losing integer precision", () => {
+test("logical row counts are formatted without losing integer precision", () => {
   assert.equal(logic.exactRowCount(1536282), "1536282");
-  let presentation = logic.rowCountPresentation(1536282, 2);
-  assert.equal(presentation.text, "1,536,282 total records across 2 physical shards");
-  assert.match(presentation.title, /Replicated records/);
+  let presentation = logic.rowCountPresentation(1536282, [0, 1]);
+  assert.equal(presentation.text, "1,536,282 logical records across 2 storage files");
+  assert.match(presentation.title, /visited shards: 0, 1/i);
+  assert.match(presentation.title, /Global tables are read once/);
 
   const maximum = { $briskdb_type: "uint64", value: "18446744073709551615" };
   assert.equal(logic.exactRowCount(maximum), "18446744073709551615");
-  presentation = logic.rowCountPresentation(maximum, 64);
+  presentation = logic.rowCountPresentation(maximum, Array.from({ length: 64 }, (_, shard) => shard));
   assert.equal(
     presentation.text,
-    "18,446,744,073,709,551,615 total records across 64 physical shards",
+    "18,446,744,073,709,551,615 logical records across 64 storage files",
   );
 
-  assert.equal(logic.rowCountPresentation(1, 1).text, "1 total record across 1 physical shard");
+  assert.equal(logic.rowCountPresentation(1, [0]).text, "1 logical record across 1 storage file");
   for (const invalid of [-1, Number.MAX_SAFE_INTEGER + 1, { $briskdb_type: "int64", value: "-1" }]) {
     assert.equal(logic.exactRowCount(invalid), null);
   }
-  assert.throws(() => logic.rowCountPresentation(-1, 2), /Invalid all-shard/);
-  assert.throws(() => logic.rowCountPresentation(0, 0), /Invalid all-shard/);
+  assert.throws(() => logic.rowCountPresentation(-1, [0, 1]), /Invalid logical/);
+  for (const invalidShards of [[], [1, 0], [0, 0], [0, 1.5], "0,1"]) {
+    assert.equal(logic.validVisitedShards(invalidShards), false);
+    assert.throws(() => logic.rowCountPresentation(0, invalidShards), /Invalid logical/);
+  }
 });
 
-test("page summaries retain their selected physical-shard scope", () => {
+test("page summaries describe one logical row stream", () => {
   assert.equal(
-    logic.pageSummary({ shard: 1, offset: 50, rows: [[1], [2]] }),
-    "Showing rows 51–52 on physical shard 1",
+    logic.pageSummary({ visited_shards: [0, 1], offset: 50, rows: [[1], [2]] }),
+    "Showing logical rows 51–52",
   );
   assert.equal(
-    logic.pageSummary({ shard: 0, offset: 0, rows: [] }),
-    "No rows on physical shard 0",
+    logic.pageSummary({ visited_shards: [0], offset: 0, rows: [] }),
+    "No logical rows",
   );
 });
 
-test("table response guards reject stale counts after table or shard changes", () => {
+test("table response guards reject stale counts after table changes", () => {
   assert.equal(logic.acceptsTableResponse(4, 4, "orders", "orders"), true);
   assert.equal(logic.acceptsTableResponse(3, 4, "orders", "orders"), false);
   assert.equal(logic.acceptsTableResponse(4, 4, "orders", "payments"), false);

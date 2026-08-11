@@ -74,14 +74,17 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
 - Bounded, lazy per-shard SQLite connection pools with explicit backpressure
 - Request cancellation and deadlines that interrupt SQLite and await cleanup
 - Finite per-query row/logical-byte budgets with no partial results
+- Catalog-aware logical reads: exact keys visit one owner, finite key sets visit
+  their distinct owners, and unconstrained Sharded reads gather every shard
+  with bounded concurrency and `UNION ALL` duplicate semantics
 - Explicit graceful drain, forced cancellation, and blocking handle cleanup
 - Independently configured HTTP and PostgreSQL TCP listeners; the loopback
   PostgreSQL endpoint supports protocol 3.0 startup, logical database/user
   selection, BriskDB parameter status, and clean connection termination through
   a BriskDB-owned `pgwire` 0.36.3 boundary
 - An embedded read-only browser at `/admin` for inspecting user tables, showing
-  exact physical-row totals across all shards, and reading bounded row pages on
-  one explicitly selected physical shard
+  exact logical-row totals, and reading bounded logical pages across each
+  table's metadata-selected files without a shard selector
 - Protocol-neutral typed values, ordered columns, positional rows, and results
 - A bounded per-session prepared-statement and immutable bound-portal lifecycle
   with transient shard-0 metadata compilation, bind-time routing snapshots,
@@ -104,7 +107,7 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
   later schema migrations checked against its table and shard-key declarations
 - Identity-bound, WAL-enabled SQLite shard files that are never silently
   recreated after initialization
-- Routed execute and query endpoints
+- Routed writes and catalog-aware logical query execution
 - A crash-resumable, journaled schema-migration endpoint for every shard
 - A checksummed manifest, generation-bound shard-schema fingerprints, and
   fail-closed `Verifying`/`Ready`/`Migrating`/`Degraded` storage states
@@ -175,14 +178,15 @@ a query-capable PostgreSQL interface. See the
 
 The HTTP listener also serves the embedded data explorer at
 <http://127.0.0.1:7654/admin>. Its temporary credentials are `admin` / `admin`.
-The explorer is read-only: select one physical shard and an ordinary user table,
-see its exact physical-row sum across every shard, then move through live
-offset-based pages of at most 200 rows from the selected shard. Browser sessions
-are held only in process memory, expire after eight hours, and disappear on
-restart. The fixed credentials are a development convenience; keep this
-experimental HTTP service on a trusted network. Existing `/health` and `/v1/*`
-behavior is unchanged. See the [admin browser contract](docs/ADMIN_BROWSER.md)
-for the route, table-filtering, pagination, and session boundaries.
+The explorer is read-only: select a logical table, see its exact logical row
+total, then move through live shard-major pages of at most 200 rows. Sharded
+tables visit every owning file; Global tables visit canonical shard 0 once.
+Browser sessions are held only in process memory, expire after eight hours,
+and disappear on restart. The fixed credentials are a development convenience;
+keep this experimental HTTP service on a trusted network. Existing `/health`
+and `/v1/*` behavior is unchanged. See the
+[admin browser contract](docs/ADMIN_BROWSER.md) for the route, table-filtering,
+pagination, and session boundaries.
 
 Rust embedders can customize pool sizing through the public `EngineOptions`
 type. Existing engine constructors and server startup keep the defaults of four
@@ -265,20 +269,21 @@ curl -X POST http://127.0.0.1:7654/v1/execute \
   }'
 ```
 
-Read it from the same shard:
+Read it through the logical table:
 
 ```bash
 curl -X POST http://127.0.0.1:7654/v1/query \
   -H 'content-type: application/json' \
   -d '{
-    "shard_key":"widget-1",
     "sql":"SELECT id, name FROM widgets WHERE id = ?1",
     "params":["widget-1"]
   }'
 ```
 
 The response keeps column metadata and row values in matching index order. The
-selected shard depends on the routing key; an example response is:
+inferred key selects its one metadata-owned shard, so this point query reports
+one `shard`; a query that visits several reports a sorted `shards` array
+instead. An example point response is:
 
 ```json
 {
@@ -351,18 +356,25 @@ columns, decides whether the target is a read, write, schema change, or session
 control. It runs accepted sharded work on its assigned shard and safe
 `NotApplicable`/`Global` reads on deterministic shard 0, returning routed rows
 or an affected-row count. Schema/session execution and sharded reads requiring
-scatter remain unsupported. There is no implicit cache eviction, no retained
-plan, `rusqlite` statement, or connection, and closing a statement closes all
-of its portals.
+scatter remain unsupported on that compatibility method. The corresponding
+logical portal method uses the same fresh plan but gathers a supported
+multi-owner or unconstrained Sharded read from the relevant physical files.
+It concatenates shard results in physical-shard order, retaining duplicate
+rows exactly as `UNION ALL`; a `Global` read still executes once on shard 0.
+There is no implicit cache eviction, no retained plan, `rusqlite` statement, or
+connection, and closing a statement closes all of its portals.
 
 Translation and planning remain independently callable branches over the same
 normalized request. With an empty table catalog, HTTP execute/query retains the
 legacy caller-routed raw SQLite path. Once tables are registered, those same
 endpoints require exactly one SQLite common-subset statement, normalize its
-placeholders, apply strict SQLite translation, infer its authoritative
-placement, and enforce a finite single-shard target. The migration endpoint
-keeps its separate exact-text journal identity and parameterless batch
-contract. The exact translation matrix and strict-mode boundary are in
+placeholders, apply strict SQLite translation, and infer its authoritative
+placement. Writes still require one owner. Reads select their logical targets
+from metadata: an exact key visits one owner, finite keys visit each distinct
+owner, an unconstrained Sharded read visits every shard, and a `Global` or
+table-free read visits shard 0 once. The migration endpoint keeps its separate
+exact-text journal identity and parameterless batch contract. The exact
+translation matrix and strict-mode boundary are in
 [`docs/SQL_TRANSLATION.md`](docs/SQL_TRANSLATION.md), and the complete lifecycle
 is in
 [`docs/SQL_PREPARED_STATEMENTS.md`](docs/SQL_PREPARED_STATEMENTS.md).
@@ -479,12 +491,19 @@ not sharding. `Global` is the explicit replicated placement, while `Catalog`
 is manifest-only. Registration establishes the authority used by later import
 and execution work; it does not repartition existing data.
 
-Logical reads that are not pinned to one key still require the scatter/gather
-follow-ups (#57 and #58). Their contract is one logical result over all owning
-shards—equivalent to a shard `UNION ALL` before global filtering, ordering,
-pagination, or aggregation—not duplicated copies in every file. The current
-admin browser remains a physical-shard diagnostic until its logical catalog
-view lands separately.
+Supported logical reads that are not pinned to one key now gather the relevant
+physical files with at most eight shard tasks. Sharded rows remain stored once,
+on the metadata-selected owner; the logical result concatenates per-shard rows
+in physical-shard order with `UNION ALL` semantics, including duplicates.
+Exact-key reads visit one owner, finite key sets visit only distinct owners, and
+`Global` data is read once from canonical shard 0. One deadline, cancellation
+signal, and combined result budget cover the complete operation; any shard
+failure returns an error rather than a partial result. This baseline is
+row-local: multi-shard `DISTINCT`, aggregate, grouping, ordering, pagination,
+join, subquery, CTE, set-operation, and window semantics remain rejected until
+their dedicated planner work lands. The admin browser uses a separate,
+server-generated logical count and shard-major paging plan; it does not expose
+arbitrary aggregate, ordering, or pagination SQL.
 Startup loads routing and logical metadata in one validated shared snapshot;
 runtime routing continues to hash the exact key bytes, derive a virtual bucket,
 and read its persisted physical-shard assignment. The generation-1 ranges
@@ -500,8 +519,8 @@ server processes must not use the same data directory.
 
 The `/admin` browser's fixed development login is separate from the planned
 authentication and role model. Near-term work includes that model, richer
-migration administration and status APIs in issue #53, scatter/gather reads,
-observability, and backup tooling.
+migration administration and status APIs in issue #53, richer global logical
+query semantics, observability, and backup tooling.
 
 ## License
 

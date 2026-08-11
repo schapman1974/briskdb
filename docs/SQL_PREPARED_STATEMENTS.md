@@ -1,6 +1,7 @@
 # Prepared statements and bound portals
 
-Status: implemented for roadmap issue #26
+Status: implemented for roadmap issue #26, with logical read execution from
+issue #57
 
 BriskDB exposes one protocol-neutral lifecycle for SQL submitted by SQLite,
 PostgreSQL, MySQL, and future adapters. A frontend owns a `Session`, explicitly
@@ -69,15 +70,17 @@ describe_prepared(&Session, DescribeTarget)
     -> EngineResult<PreparedStatementDescription>
 execute_portal(&Session, PortalId)
     -> EngineResult<Routed<PreparedExecution>>
+execute_portal_logical(&Session, PortalId)
+    -> EngineResult<Executed<PreparedExecution>>
 close_prepared_statement(&Session, PreparedStatementId)
     -> EngineResult<bool>
 close_portal(&Session, PortalId)
     -> EngineResult<bool>
 ```
 
-Prepare, bind, describe, and execute also have `*_with_context` variants that
-accept `RequestContext`. Close is in-memory session cleanup and has no request
-context.
+Prepare, bind, describe, routed execute, and logical execute also have
+`*_with_context` variants that accept `RequestContext`. Close is in-memory
+session cleanup and has no request context.
 
 `PrepareRequest` owns four explicit inputs:
 
@@ -281,8 +284,9 @@ contains the current schema generation, routing-map generation, hash version,
 key-encoding version, and bucket-algorithm version. The engine keeps that same
 guard through target selection and SQLite completion, then discards the plan.
 
-Target selection is intentionally narrow and starts from the retained logical
-behavior rather than SQLite result-column metadata:
+Target selection starts from the retained logical behavior rather than SQLite
+result-column metadata. The compatibility `execute_portal` method retains its
+single-target contract:
 
 - accepted cataloged sharded reads and writes use the current plan's one
   `assigned_shard()`;
@@ -293,14 +297,33 @@ behavior rather than SQLite result-column metadata:
 - an unassigned sharded read, a `Global` write, or `Session` behavior is
   `Unsupported`.
 
+`execute_portal_logical` retains the same rules for writes and single-target
+reads, but also converts a supported Sharded read into a metadata-selected
+target set:
+
+- `Exact` visits its one owner;
+- finite `Multiple` visits each distinct owner once;
+- `Unconstrained` visits every configured shard; and
+- `Global` and table-free reads visit canonical shard 0 once.
+
+For more than one target, it runs at most eight shard tasks and concatenates
+their rows in ascending physical-shard order. It does not deduplicate equal
+rows, so the result has shard `UNION ALL` semantics. Every Sharded row remains
+stored exactly once on its key-selected owner; logical execution is a read
+across files, not replication.
+
 Shard 0 is valid for the two replicated-schema read cases because every ready
 shard has the same generation-bound application schema and `Global` declares
 replicated lookup placement. This initial path reads one deterministic replica;
 it does not compare replicas.
 
+The baseline multi-shard validator admits only a single-table, row-local
+`SELECT` that can run unchanged on every target. It rejects `DISTINCT`,
+functions and aggregates, grouping, ordering, limit/offset, joins, subqueries,
+CTEs, set operations, and windows until their global semantics are planned.
+
 These paths remain outside the current lifecycle:
 
-- scatter/gather or otherwise multi-shard reads;
 - contradictory reads that might later become an empty result without SQLite;
 - global writes, schema and session-statement execution paths;
 - persistent DDL outside the journaled schema-migration API;
@@ -319,15 +342,18 @@ session-control singleton can be prepared and described, but portal execution
 returns `Unsupported` before SQLite is stepped and leaves the session usable.
 
 SQLite transiently prepares and executes the retained canonical SQLite SQL on
-the selected target. Classified reads must produce
-`Routed<PreparedExecution::Rows(ResultSet)>`; commands produce
-`Routed<PreparedExecution::AffectedRows(usize)>` only for classified writes. A
+the selected target or targets. Classified reads produce either the
+compatibility `Routed<PreparedExecution::Rows(ResultSet)>` or logical
+`Executed<PreparedExecution::Rows(ResultSet)>`; commands remain routed
+`PreparedExecution::AffectedRows(usize)` results. A
 disagreement between classified behavior and SQLite execution metadata is an
 `Internal` invariant failure. Row results preserve ordered
 metadata, duplicate names, positional values, and the normal exact result row
-and logical-byte limits. Row-producing writes are rejected rather than partly
-materialized. The returned `Routed` value always names the physical shard that
-performed the operation.
+and logical-byte limits. One combined budget covers a logical result. Any shard
+failure or budget overflow cancels outstanding work and returns no partial
+rows. Row-producing writes are rejected rather than partly materialized. A
+returned `Routed` value names its one physical shard; `Executed::shards()` is
+the sorted, unique set visited by a logical operation.
 
 ## Controls, concurrency, close, and shutdown
 
@@ -336,7 +362,9 @@ Prepare, bind, describe, and execute are ordinary engine operations. Their
 deadline; the engine default deadline is still an upper bound. Prepare and a
 schema-refreshing describe apply those controls while waiting for shard 0 and
 while SQLite compiles metadata. Execute also applies per-request result limits,
-SQLite interruption, rollback, pool cleanup, and exact-handle retirement.
+SQLite interruption, rollback, pool cleanup, and exact-handle retirement. A
+logical scatter shares one absolute deadline, cancellation source, and result
+budget across all targets, and drains child cleanup before returning an error.
 
 The engine serializes all concurrent operations borrowing one `Session`. The
 session lock remains owned across pending admission and blocking SQLite work,
@@ -404,9 +432,9 @@ the same planning and result path:
 
 | Input | Required mode and parameter form | Prepared execution result |
 | --- | --- | --- |
-| SQLite | `StrictSqlite` for exact normalized SQLite, or explicit finite `Compatibility`; `?` / `?N` | Protocol-neutral routed rows or affected-row count |
-| PostgreSQL | `Compatibility`; `$N` identities, including repeats and gaps | Same protocol-neutral routed rows or affected-row count |
-| MySQL | `Compatibility`; each `?` numbered left-to-right | Same protocol-neutral routed rows or affected-row count |
+| SQLite | `StrictSqlite` for exact normalized SQLite, or explicit finite `Compatibility`; `?` / `?N` | Protocol-neutral routed or logical rows, or routed affected-row count |
+| PostgreSQL | `Compatibility`; `$N` identities, including repeats and gaps | Same protocol-neutral routed/logical rows or routed affected-row count |
+| MySQL | `Compatibility`; each `?` numbered left-to-right | Same protocol-neutral routed/logical rows or routed affected-row count |
 
 Each protocol adapter owns its message framing, authentication,
 statement/portal naming, wire parameter decoding, result type encoding, close
@@ -421,9 +449,9 @@ Issue #26 adds only process-memory session state and execution orchestration.
 It does not change manifest version 8, a manifest table, routing encoding,
 shard identity, schema fingerprint, migration journal, SQLite header field,
 WAL/synchronous mode, or filename. Prepared statements and portals disappear
-when their owning process/session ends. Preparing or describing changes no
-application data; executing a supported command has only its ordinary
-single-shard SQLite row effects.
+when their owning process/session ends. Preparing, describing, or gathering a
+logical read changes no application data; executing a supported command has
+only its ordinary single-shard SQLite row effects.
 
 Canonical translated SQL is never a schema-migration identity. Persistent
 application schema changes continue to require the journaled migration path,
@@ -437,7 +465,10 @@ single-statement enforcement; unknown databases; transient shard-0 metadata;
 classified behavior and parameter/column descriptions; schema-generation
 behavior preservation; fresh planning
 after schema/routing changes; routing snapshots; affected-row and row results;
-result limits; session ownership; statement, portal, and retained-byte limits without
+exact, finite-owner, unconstrained, and Global logical read targets;
+deterministic `UNION ALL` duplicate preservation; bounded fanout; all-or-error
+cancellation, deadline, and combined-result-limit behavior; session ownership;
+statement, portal, and retained-byte limits without
 eviction; repeated-marker planning expansion before allocation; exact close and
 cascading invalidation; invalid arity/value recovery; behavior-based unassigned
 execution; schema-prepare denial and session-execution rejection without state
