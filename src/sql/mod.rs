@@ -29,10 +29,12 @@ pub use inference::{ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue, inf
 pub use normalizer::{
     MAX_SQL_PARAMETERS, NormalizedSql, StatementParameters, normalize_placeholders,
 };
-pub(crate) use parser::validate_authoritative_schema_migration;
 pub use parser::{
     MAX_PARSED_SQL_BYTES, MAX_PARSED_SQL_STATEMENTS, ParsedSql, SQL_PARSE_RECURSION_LIMIT,
     SqlDialect, parse,
+};
+pub(crate) use parser::{
+    validate_authoritative_schema_migration, validate_stateless_catalog_schema_sql,
 };
 pub(crate) use scatter::validate_scatter_safe;
 pub use subset::{CommonSql, MAX_COMMON_SQL_EXPRESSION_DEPTH, validate_common_subset};

@@ -31,6 +31,12 @@ use crate::{
 static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_SCATTER_CONCURRENCY: usize = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecuteOwnerPolicy {
+    Session,
+    ReuseValidatedCatalogWrite,
+}
+
 /// An owned SQL statement and its protocol-neutral parameters.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statement {
@@ -300,9 +306,24 @@ impl Engine {
         self.inner.database.shard_count()
     }
 
+    /// Return the engine admission bound for concurrently blocking SQLite tasks.
+    ///
+    /// This is not Tokio's runtime thread count; embedding runtimes configure
+    /// their own blocking-thread capacity independently.
+    pub(crate) fn blocking_task_admission_limit(&self) -> usize {
+        self.inner.workers.limit()
+    }
+
     /// Return the immutable logical database and table catalog.
     pub fn catalog(&self) -> &super::Catalog {
         self.inner.database.catalog()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pool_snapshot_for_test(
+        &self,
+    ) -> EngineResult<crate::storage::pool::PoolSnapshot> {
+        self.inner.connections.snapshot()
     }
 
     /// Plan one normalized statement from its actual bound parameter values.
@@ -544,7 +565,7 @@ impl Engine {
             let result_limits = self.inner.options.result_limits();
             Ok(EngineStatus {
                 shard_count: self.shard_count(),
-                max_blocking_workers: self.inner.workers.limit(),
+                max_blocking_workers: self.blocking_task_admission_limit(),
                 connections_per_shard: self.inner.options.connections_per_shard(),
                 queue_capacity_per_shard: self.inner.options.queue_capacity_per_shard(),
                 max_result_rows: result_limits.max_rows(),
@@ -1011,12 +1032,49 @@ impl Engine {
             .await
     }
 
+    /// Execute one ephemeral HTTP write while allowing safe physical-handle
+    /// reuse after authoritative catalog validation.
+    ///
+    /// An empty catalog retains ordinary unique-session ownership. With a
+    /// populated catalog, raw planning proves that the request is one routed
+    /// common-subset write before the shared stateless ownership domain is
+    /// selected.
+    pub(crate) async fn execute_http_request(
+        &self,
+        session: &Session,
+        statement: Statement,
+    ) -> EngineResult<Routed<usize>> {
+        self.execute_with_context_and_owner(
+            session,
+            statement,
+            RequestContext::new(),
+            ExecuteOwnerPolicy::ReuseValidatedCatalogWrite,
+        )
+        .await
+    }
+
     /// Execute a routed statement with explicit request controls.
     pub async fn execute_with_context(
         &self,
         session: &Session,
         statement: Statement,
         context: RequestContext,
+    ) -> EngineResult<Routed<usize>> {
+        self.execute_with_context_and_owner(
+            session,
+            statement,
+            context,
+            ExecuteOwnerPolicy::Session,
+        )
+        .await
+    }
+
+    async fn execute_with_context_and_owner(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+        owner_policy: ExecuteOwnerPolicy,
     ) -> EngineResult<Routed<usize>> {
         let mut operation = self.operation(context)?;
         let schema_operation = match self.inner.database.storage.enter_schema_operation() {
@@ -1027,7 +1085,6 @@ impl Engine {
             Ok(guard) => guard,
             Err(error) => return operation.finish(Err(error)),
         };
-        let owner = ConnectionOwner::new(session.id().get());
         let routing_key = match required_routing_key(&guard) {
             Ok(key) => key.to_owned(),
             Err(error) => return operation.finish(Err(error)),
@@ -1041,6 +1098,14 @@ impl Engine {
         ) {
             Ok(plan) => plan,
             Err(error) => return operation.finish(Err(error)),
+        };
+        let owner = match (owner_policy, plan.is_some()) {
+            (ExecuteOwnerPolicy::ReuseValidatedCatalogWrite, true) => {
+                ConnectionOwner::stateless_catalog_write()
+            }
+            (ExecuteOwnerPolicy::Session | ExecuteOwnerPolicy::ReuseValidatedCatalogWrite, _) => {
+                ConnectionOwner::new(session.id().get())
+            }
         };
         let (shard, sql) = match plan {
             Some(plan) => (plan.shard, plan.sqlite_sql),

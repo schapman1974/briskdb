@@ -756,13 +756,22 @@ also prevent reuse. Thus connection-local state and observer metadata such as
 
 Ordinary writes require a narrower rule because SQLite exposes per-connection
 `last_insert_rowid()`, `changes()`, and `total_changes()` state. The pool records
-the owning BriskDB session after any authorizer-observed insert, update, or
-delete. That physical handle remains reusable by the same session, preserving
-its SQLite semantics, but a checkout for any other session retires and replaces
-it before SQL runs. Handles used only for reads remain reusable across sessions.
-This ownership is a leakage-prevention rule, not connection pinning: a competing
-session can replace an idle write-bearing handle, so write-counter functions
-remain uncontracted across calls until transaction/session pinning is added.
+the owning BriskDB domain after any authorizer-observed insert, update, or
+delete. Ordinary engine sessions have unique domains. A populated-catalog HTTP
+write receives the shared stateless catalog-write domain only after planning
+proves it is one routed common-subset write; that boundary rejects scalar
+counter functions, session SQL, PRAGMAs, attachments, temporary objects, and
+schema SQL. Catalog registration, import, post-migration validation, and
+ordinary startup parse every persistent table and index definition and reject
+those same functions inside `DEFAULT`, `CHECK`, generated-column, and index
+expressions. Clean handles can therefore remain warm across those ephemeral
+write requests without making their logical sessions shared. Empty-catalog HTTP
+SQL retains its unique session owner. A later ordinary owner retires and
+replaces a stateless write handle before SQL runs, and handles used only for
+reads remain reusable across sessions. This ownership is a leakage-prevention
+rule, not connection pinning: a competing ordinary session can replace an idle
+write-bearing handle, so write-counter functions remain uncontracted across
+calls until transaction/session pinning is added.
 
 Every operation acquires a lifecycle lease before its first await. Dropping a
 queued future removes the operation before SQLite starts. Once work is running,

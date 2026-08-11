@@ -143,3 +143,40 @@ Criterion classified all three changes as statistically significant
 improvements (`p < 0.05`). These local results primarily quantify removal of
 per-operation SQLite connection opening and configuration; they remain a
 hardware-specific engineering comparison, not a production capacity promise.
+
+## Issue #121 ephemeral HTTP write comparison
+
+Issue #121 was measured on 2026-08-11 against base commit `f5ab846` and the
+release build of the completed change. The host was the Apple M1 Pro described
+above (10 cores, 16 GiB RAM), running macOS 26.2 with Rust and Cargo 1.94.1.
+
+Each run used an independent APFS clone of the same imported LARGE_Data
+database with ten shards. One persistent HTTP/1.1 client per worker repeatedly
+toggled `work_order_items.is_highlight` on an existing primary-key row. Workers
+were assigned distinct rows and explicit routing keys on distinct shards. The
+server used one SQLite connection per shard, queue capacity 32, two asynchronous
+Tokio worker threads, and a Tokio blocking-thread cap equal to the tested worker
+count. Only 2, 4, 8, and 10 workers were tested. Every result is the median of
+three 10-second trials after 100 untimed warm-up writes per active shard.
+
+| HTTP writers | Base writes/s | Fixed writes/s | Speedup | Base p50 | Fixed p50 | Base CPU | Fixed CPU |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 776 | 13,352 | 17.20x | 2,545 µs | 137 µs | 152% | 108% |
+| 4 | 704 | 12,664 | 17.99x | 5,716 µs | 299 µs | 295% | 147% |
+| 8 | 634 | 11,194 | 17.65x | 12,465 µs | 677 µs | 673% | 145% |
+| 10 | 690 | 11,229 | 16.27x | 14,256 µs | 837 µs | 808% | 143% |
+
+All timed requests returned the expected shard and affected-row count; timed
+errors were zero. Fixed-path p95 latency was 211, 454, 1,135, and 1,477 µs for
+2, 4, 8, and 10 writers respectively. Peak resident memory remained below
+12.9 MiB, process thread count never exceeded the requested blocking cap plus
+the two runtime threads and main thread, and total observed WAL size remained
+below 39.3 MiB.
+
+The process monitor also recorded about 60 KiB of physical writes per completed
+operation on the base path versus 20 KiB after the fix, a 66-67% reduction.
+Together with the CPU and latency change, this supports the code and stack-sample
+finding: repeated opening, schema validation, and closing of SQLite handles was
+the dominant HTTP bottleneck, not a lock-selection race. The fix keeps clean
+planner-validated write handles warm; it does not reroute a row or reuse a
+handle while that handle is checked out.

@@ -103,7 +103,8 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
         postgres_listen = ?config.postgres_listen,
         data_dir = %config.data_dir.display(),
         shards = engine.shard_count(),
-        max_blocking_workers = engine.options().connections_per_shard()
+        engine_blocking_task_admission_limit = engine.blocking_task_admission_limit(),
+        max_active_sqlite_connections = engine.options().connections_per_shard()
             * usize::from(engine.shard_count()),
         connections_per_shard = engine.options().connections_per_shard(),
         queue_capacity_per_shard = engine.options().queue_capacity_per_shard(),

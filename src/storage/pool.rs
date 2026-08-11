@@ -78,13 +78,25 @@ fn cancellable_busy_handler(attempt: i32) -> bool {
     })
 }
 
-/// Identity of the engine session allowed to observe a connection's write-local state.
+/// Identity of the frontend ownership domain allowed to reuse a connection
+/// that contains SQLite write-local state.
+///
+/// Ordinary sessions always receive a unique identity. The stateless catalog
+/// write domain is shared only by planner-validated HTTP writes, whose SQL
+/// surface cannot observe connection-local counters or leave session state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConnectionOwner(u64);
+pub(crate) enum ConnectionOwner {
+    Session(u64),
+    StatelessCatalogWrite,
+}
 
 impl ConnectionOwner {
     pub(crate) const fn new(session_id: u64) -> Self {
-        Self(session_id)
+        Self::Session(session_id)
+    }
+
+    pub(crate) const fn stateless_catalog_write() -> Self {
+        Self::StatelessCatalogWrite
     }
 }
 
@@ -1300,6 +1312,88 @@ mod tests {
         assert_eq!(snapshot.reused, 2);
         assert_eq!(snapshot.retired, 0);
         assert_eq!(snapshot.idle, 1);
+    }
+
+    #[tokio::test]
+    async fn shared_stateless_write_owner_reuses_distinct_handles_at_pool_capacity() {
+        let (_temp, pools) =
+            pools_with_schema(2, 0, "CREATE TABLE widgets (id INTEGER PRIMARY KEY)");
+        let owner = ConnectionOwner::stateless_catalog_write();
+
+        let first = pools
+            .acquire_for_owner(0, owner)
+            .await
+            .unwrap()
+            .checkout()
+            .unwrap();
+        let second = pools
+            .acquire_for_owner(0, owner)
+            .await
+            .unwrap()
+            .checkout()
+            .unwrap();
+        let mut original_ids = [first.connection_id(), second.connection_id()];
+        assert_ne!(original_ids[0], original_ids[1]);
+        assert_eq!(
+            pools.snapshot().unwrap().shards[0],
+            ShardPoolSnapshot {
+                shard: 0,
+                active: 2,
+                queued: 0,
+                idle: 0,
+                opened: 2,
+                checkouts: 2,
+                reused: 0,
+                retired: 0,
+            }
+        );
+
+        first
+            .execute_batch("INSERT INTO widgets (id) VALUES (1)")
+            .unwrap();
+        second
+            .execute_batch("INSERT INTO widgets (id) VALUES (2)")
+            .unwrap();
+        drop(first);
+        drop(second);
+
+        let reused_first = pools
+            .acquire_for_owner(0, owner)
+            .await
+            .unwrap()
+            .checkout()
+            .unwrap();
+        let reused_second = pools
+            .acquire_for_owner(0, owner)
+            .await
+            .unwrap()
+            .checkout()
+            .unwrap();
+        let mut reused_ids = [reused_first.connection_id(), reused_second.connection_id()];
+        assert_ne!(reused_ids[0], reused_ids[1]);
+        original_ids.sort_unstable();
+        reused_ids.sort_unstable();
+        assert_eq!(reused_ids, original_ids);
+
+        assert_eq!(
+            pools.snapshot().unwrap().shards[0],
+            ShardPoolSnapshot {
+                shard: 0,
+                active: 2,
+                queued: 0,
+                idle: 0,
+                opened: 2,
+                checkouts: 4,
+                reused: 2,
+                retired: 0,
+            }
+        );
+        drop(reused_first);
+        drop(reused_second);
+
+        let final_snapshot = pools.snapshot().unwrap().shards[0];
+        assert_eq!(final_snapshot.active, 0);
+        assert_eq!(final_snapshot.idle, 2);
     }
 
     #[tokio::test]

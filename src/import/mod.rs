@@ -710,4 +710,49 @@ mod tests {
         assert_eq!(report.tables[0].physical_rows.iter().sum::<u64>(), 3);
         assert!(destination.join("manifest.sqlite").is_file());
     }
+
+    #[test]
+    fn import_rejects_connection_local_stored_expressions_before_publish() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source.sqlite");
+        let destination = temporary.path().join("imported");
+        let connection = rusqlite::Connection::open(&source).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE records (
+                     id INTEGER PRIMARY KEY,
+                     observed INTEGER DEFAULT (total_changes())
+                 );
+                 INSERT INTO records (id) VALUES (1);",
+            )
+            .unwrap();
+        connection.close().unwrap();
+        let plan = SqliteImportPlan::new(vec![SqliteTableImportPlan::sharded_by_primary_key(
+            "records",
+        )]);
+
+        let error = import_sqlite_database(
+            &source,
+            &destination,
+            &plan,
+            SqliteImportOptions::new(2).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(
+            error
+                .diagnostic()
+                .contains("cannot participate in stateless catalog write reuse"),
+            "{}",
+            error.diagnostic()
+        );
+        assert!(!destination.exists());
+        assert!(std::fs::read_dir(temporary.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".briskdb-import-stage-")
+        }));
+    }
 }

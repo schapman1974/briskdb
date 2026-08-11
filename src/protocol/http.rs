@@ -124,7 +124,7 @@ async fn execute(
         shard,
         value: rows_affected,
     } = engine
-        .execute(&session, Statement::new(request.sql, params))
+        .execute_http_request(&session, Statement::new(request.sql, params))
         .await?;
 
     Ok(Json(ExecuteResponse {
@@ -444,6 +444,221 @@ mod tests {
                 }),
             )
         );
+    }
+
+    #[tokio::test]
+    async fn validated_catalog_http_writes_reuse_one_handle_and_keep_counters_isolated() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE widgets (
+                    id TEXT NOT NULL PRIMARY KEY,
+                    value INTEGER NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "widgets",
+                    ShardKeyMetadata::new("id", ShardKeyType::Text).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let database = Arc::new(database);
+        let routing_key = "reused-http-write";
+        let expected_shard = database.shard_for_key(routing_key.as_bytes());
+        let options = EngineOptions::new(1, 64).unwrap();
+        let engine = Engine::from_database_with_options(Arc::clone(&database), options).unwrap();
+        let application = router_with_engine(engine.clone());
+
+        let rejected = request_json(
+            &application,
+            Method::POST,
+            "/v1/execute",
+            Some(json!({
+                "shard_key": routing_key,
+                "sql": "INSERT INTO widgets (id, value) VALUES (?1, total_changes())",
+                "params": [routing_key]
+            })),
+        )
+        .await;
+        assert_eq!(rejected.0, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            engine
+                .pool_snapshot_for_test()
+                .unwrap()
+                .shards
+                .iter()
+                .all(|shard| shard.checkouts == 0 && shard.opened == 0),
+            "connection-local functions must be rejected before pool checkout"
+        );
+
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/execute",
+                Some(json!({
+                    "shard_key": routing_key,
+                    "sql": "INSERT INTO widgets (id, value) VALUES (?1, ?2)",
+                    "params": [routing_key, 0]
+                })),
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({"shard": expected_shard, "rows_affected": 1})
+            )
+        );
+        for _ in 0..99 {
+            assert_eq!(
+                request_json(
+                    &application,
+                    Method::POST,
+                    "/v1/execute",
+                    Some(json!({
+                        "shard_key": routing_key,
+                        "sql": "UPDATE widgets SET value = value + 1 WHERE id = ?1",
+                        "params": [routing_key]
+                    })),
+                )
+                .await,
+                (
+                    StatusCode::OK,
+                    json!({"shard": expected_shard, "rows_affected": 1})
+                )
+            );
+        }
+
+        let mut concurrent = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let application = application.clone();
+            concurrent.spawn(async move {
+                request_json(
+                    &application,
+                    Method::POST,
+                    "/v1/execute",
+                    Some(json!({
+                        "shard_key": "reused-http-write",
+                        "sql": "UPDATE widgets SET value = value + 1 WHERE id = ?1",
+                        "params": ["reused-http-write"]
+                    })),
+                )
+                .await
+            });
+        }
+        while let Some(result) = concurrent.join_next().await {
+            assert_eq!(
+                result.unwrap(),
+                (
+                    StatusCode::OK,
+                    json!({"shard": expected_shard, "rows_affected": 1})
+                )
+            );
+        }
+
+        let snapshot = engine.pool_snapshot_for_test().unwrap();
+        let shard = snapshot.shards[usize::from(expected_shard)];
+        assert_eq!(shard.opened, 1);
+        assert_eq!(shard.checkouts, 132);
+        assert_eq!(shard.reused, 131);
+        assert_eq!(shard.retired, 0);
+        assert_eq!(shard.active, 0);
+        assert_eq!(shard.queued, 0);
+        assert_eq!(shard.idle, 1);
+
+        let stored = database
+            .query_routed(
+                routing_key,
+                "SELECT value FROM widgets WHERE id = ?1",
+                &[Value::from(routing_key)],
+            )
+            .unwrap();
+        assert_eq!(stored.value.rows()[0].get(0), Some(&Value::from(131_i64)));
+
+        let observer = engine.session();
+        let counters = engine
+            .inspect_shard(
+                &observer,
+                expected_shard,
+                Statement::new(
+                    "SELECT last_insert_rowid(), changes(), total_changes()",
+                    vec![],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            counters.rows()[0].values(),
+            [Value::from(0_i64), Value::from(0_i64), Value::from(0_i64)]
+        );
+        let isolated = engine.pool_snapshot_for_test().unwrap().shards[usize::from(expected_shard)];
+        assert_eq!(isolated.opened, 2);
+        assert_eq!(isolated.retired, 1);
+    }
+
+    #[tokio::test]
+    async fn empty_catalog_http_writes_keep_unique_owners_and_raw_sqlite_isolation() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(temp.path(), 2).unwrap());
+        database
+            .broadcast("CREATE TABLE raw_items (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let routing_key = "raw-http-write";
+        let expected_shard = database.shard_for_key(routing_key.as_bytes());
+        let options = EngineOptions::new(1, 4).unwrap();
+        let engine = Engine::from_database_with_options(database, options).unwrap();
+        let application = router_with_engine(engine.clone());
+
+        for id in [1, 2] {
+            assert_eq!(
+                request_json(
+                    &application,
+                    Method::POST,
+                    "/v1/execute",
+                    Some(json!({
+                        "shard_key": routing_key,
+                        "sql": "INSERT INTO raw_items (id) VALUES (?1)",
+                        "params": [id]
+                    })),
+                )
+                .await,
+                (
+                    StatusCode::OK,
+                    json!({"shard": expected_shard, "rows_affected": 1})
+                )
+            );
+        }
+        let after_writes =
+            engine.pool_snapshot_for_test().unwrap().shards[usize::from(expected_shard)];
+        assert_eq!(after_writes.opened, 2);
+        assert_eq!(after_writes.checkouts, 2);
+        assert_eq!(after_writes.reused, 0);
+        assert_eq!(after_writes.retired, 1);
+
+        let (status, body) = request_json(
+            &application,
+            Method::POST,
+            "/v1/query",
+            Some(json!({
+                "shard_key": routing_key,
+                "sql": "SELECT last_insert_rowid(), changes(), total_changes(), (SELECT COUNT(*) FROM raw_items)"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rows"], json!([[0, 0, 0, 2]]));
+
+        let after_observer =
+            engine.pool_snapshot_for_test().unwrap().shards[usize::from(expected_shard)];
+        assert_eq!(after_observer.opened, 3);
+        assert_eq!(after_observer.checkouts, 3);
+        assert_eq!(after_observer.retired, 2);
     }
 
     #[tokio::test]

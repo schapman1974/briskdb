@@ -206,11 +206,18 @@ tables, invalid unique keys, and any table-placement or shard-key change.
 
 SQLite also retains `last_insert_rowid()`, `changes()`, and `total_changes()` on
 the physical connection after ordinary writes. A write-bearing handle may be
-reused by its owning BriskDB `Session`, but the pool closes and replaces it
-before checkout by a different session. Read-only handles can cross sessions.
-This preserves same-session write metadata without exposing one HTTP request's
-connection-local counters to the next request when the owned handle remains
-available. It does not pin that handle, so these observer functions remain
+reused by its owning BriskDB `Session`. Planner-validated populated-catalog HTTP
+writes use a shared stateless ownership domain so separate ephemeral requests
+can reuse clean autocommit handles; the admitted SQL cannot contain observer
+functions or session-local forms. Persistent table and index definitions are
+also checked during registration, import, migration, and startup; `DEFAULT`,
+`CHECK`, generated-column, and index expressions cannot call
+`last_insert_rowid()`, `changes()`, or `total_changes()`. Empty-catalog
+pass-through writes keep unique session owners. Before an ordinary different
+owner can inspect a write-bearing handle, the pool closes and replaces it.
+Read-only handles can cross sessions. This preserves same-session write
+metadata without exposing one HTTP request's connection-local counters to the
+next request. It does not pin that handle, so these observer functions remain
 uncontracted across calls in the current SQL surface.
 
 Dropping or explicitly cancelling a request before its queued operation starts

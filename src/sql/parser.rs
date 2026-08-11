@@ -1,7 +1,7 @@
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, fmt, ops::ControlFlow};
 
 use sqlparser::{
-    ast::{ObjectType, Statement as AstStatement},
+    ast::{Expr, ObjectNamePart, ObjectType, Statement as AstStatement, visit_expressions},
     dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
     parser::{Parser, ParserError},
 };
@@ -166,6 +166,50 @@ pub(crate) fn validate_authoritative_schema_migration(source: &str) -> EngineRes
     } else {
         Ok(())
     }
+}
+
+/// Reject stored schema expressions that can observe SQLite write history on
+/// a physical connection reused by stateless catalog writes.
+pub(crate) fn validate_stateless_catalog_schema_sql(source: &str) -> EngineResult<()> {
+    let parsed = parse(SqlDialect::Sqlite, source).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::FailedPrecondition,
+            "persistent SQLite schema SQL could not be validated for stateless write reuse",
+            error,
+        )
+    })?;
+    let found = parsed.statements().iter().any(|statement| {
+        visit_expressions(statement, |expression| {
+            let is_connection_local = match expression {
+                Expr::Function(function) => match function.name.0.as_slice() {
+                    [ObjectNamePart::Identifier(name)] => {
+                        connection_local_counter_function(&name.value)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if is_connection_local {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_break()
+    });
+    if found {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "persistent SQLite schema expressions cannot use connection-local counter functions",
+        ));
+    }
+    Ok(())
+}
+
+fn connection_local_counter_function(function: &str) -> bool {
+    ["last_insert_rowid", "changes", "total_changes"]
+        .iter()
+        .any(|counter| function.eq_ignore_ascii_case(counter))
 }
 
 fn parse_with(dialect: &dyn Dialect, source: &str) -> Result<Vec<AstStatement>, ParserError> {
@@ -363,6 +407,36 @@ mod tests {
             "CREATE VIEW widget_ids AS SELECT id FROM widgets",
         ] {
             validate_authoritative_schema_migration(source)
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+        }
+    }
+
+    #[test]
+    fn stateless_catalog_schema_rejects_only_connection_local_function_calls() {
+        for source in [
+            "CREATE TABLE records(id INTEGER, previous INTEGER DEFAULT (last_insert_rowid()))",
+            "CREATE TABLE records(id INTEGER, CHECK (ChAnGeS() >= 0))",
+            "CREATE TABLE records(id INTEGER, CHECK (\"TOTAL_CHANGES\"() >= 0))",
+            "CREATE TABLE records(id INTEGER, CHECK ([changes]() >= 0))",
+            "CREATE TABLE records(id INTEGER, CHECK (`last_insert_rowid`() >= 0))",
+            "CREATE TABLE records(id INTEGER, observed INTEGER GENERATED ALWAYS AS (changes()) STORED)",
+            "CREATE INDEX records_recent ON records(id) WHERE total_changes() >= 0",
+        ] {
+            assert_eq!(
+                validate_stateless_catalog_schema_sql(source)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition,
+                "{source}"
+            );
+        }
+
+        for source in [
+            "CREATE TABLE changes(changes TEXT DEFAULT 'total_changes()', last_insert_rowid INTEGER, CHECK(changes <> 'changes()'))",
+            "CREATE TABLE records(id INTEGER, normalized TEXT DEFAULT (lower('CHANGES')))",
+            "CREATE INDEX total_changes ON records(id)",
+        ] {
+            validate_stateless_catalog_schema_sql(source)
                 .unwrap_or_else(|error| panic!("{source}: {error}"));
         }
     }
