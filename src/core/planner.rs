@@ -1,6 +1,6 @@
 //! Bound-value-aware, protocol-neutral statement routing plans.
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, fmt, sync::Arc};
 
 use crate::sql::{
     NormalizedSql, RoutedDml, ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue,
@@ -10,6 +10,26 @@ use crate::sql::{
 use super::{
     Catalog, EngineError, EngineErrorKind, EngineResult, LogicalDatabaseId, TablePlacement, Value,
 };
+
+/// Borrowed typed shard key encoded identically by every routing entry point.
+///
+/// Version 1 intentionally has no type tag: signed integers use their minimal
+/// decimal spelling, text uses its exact UTF-8 bytes, and binary keys use their
+/// exact bytes. The persisted key-encoding version freezes this representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalShardKeyRef<'a> {
+    Int64(i64),
+    Text(&'a str),
+    Binary(&'a [u8]),
+}
+
+pub(crate) fn canonical_shard_key_bytes<'a>(value: CanonicalShardKeyRef<'a>) -> Cow<'a, [u8]> {
+    match value {
+        CanonicalShardKeyRef::Int64(value) => Cow::Owned(value.to_string().into_bytes()),
+        CanonicalShardKeyRef::Text(value) => Cow::Borrowed(value.as_bytes()),
+        CanonicalShardKeyRef::Binary(value) => Cow::Borrowed(value),
+    }
+}
 
 /// One owned canonical routing key and its selected physical shard.
 #[derive(Clone, PartialEq, Eq)]
@@ -430,10 +450,18 @@ fn planning_invariant() -> EngineError {
 }
 
 fn canonical_key_bytes(value: &ShardKeyValue) -> Arc<[u8]> {
-    match value {
-        ShardKeyValue::Int64(value) => Arc::from(value.to_string().into_bytes()),
-        ShardKeyValue::Text(value) => Arc::from(value.as_bytes()),
-        ShardKeyValue::Binary(value) => Arc::from(value.as_slice()),
+    let canonical = match value {
+        ShardKeyValue::Int64(value) => {
+            canonical_shard_key_bytes(CanonicalShardKeyRef::Int64(*value))
+        }
+        ShardKeyValue::Text(value) => canonical_shard_key_bytes(CanonicalShardKeyRef::Text(value)),
+        ShardKeyValue::Binary(value) => {
+            canonical_shard_key_bytes(CanonicalShardKeyRef::Binary(value))
+        }
+    };
+    match canonical {
+        Cow::Borrowed(value) => Arc::from(value),
+        Cow::Owned(value) => Arc::from(value),
     }
 }
 

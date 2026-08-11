@@ -227,6 +227,7 @@ dependencies = [
  "pgwire",
  "psm",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "sqlparser",

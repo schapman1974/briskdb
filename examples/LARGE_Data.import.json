@@ -1,0 +1,132 @@
+{
+  "version": 1,
+  "tables": [
+    {
+      "name": "account_codes",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    {
+      "name": "accounting_data",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    { "name": "accounts_payable", "placement": "global" },
+    { "name": "accounts_receivable", "placement": "global" },
+    { "name": "activation_keys", "placement": "global" },
+    {
+      "name": "cb_accounts",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    { "name": "check_layout", "placement": "global" },
+    {
+      "name": "cust_contacts",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" },
+      "foreign_keys": "omit"
+    },
+    {
+      "name": "customer_contacts",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" },
+      "foreign_keys": "omit"
+    },
+    {
+      "name": "customers",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    {
+      "name": "customers_vehicles",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" },
+      "foreign_keys": "omit"
+    },
+    {
+      "name": "drawers",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    { "name": "employees", "placement": "global" },
+    {
+      "name": "integrations",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "text" }
+    },
+    { "name": "inv_matrix", "placement": "global" },
+    {
+      "name": "inv_matrix_tier",
+      "placement": "global",
+      "foreign_keys": "omit"
+    },
+    {
+      "name": "inventory_groups",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    {
+      "name": "inventory_main",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    {
+      "name": "job_codes",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    { "name": "job_kits", "placement": "global" },
+    {
+      "name": "locations",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    { "name": "maintenance", "placement": "global" },
+    {
+      "name": "maintenance_schedules",
+      "placement": "sharded",
+      "shard_key": {
+        "strategy": "column",
+        "column": "service_name",
+        "key_type": "text"
+      }
+    },
+    {
+      "name": "payments",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" },
+      "foreign_keys": "omit"
+    },
+    {
+      "name": "setup",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    {
+      "name": "stores",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    {
+      "name": "vehicles",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    {
+      "name": "work_order_items",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    {
+      "name": "work_order_job_codes",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    },
+    { "name": "work_order_kits", "placement": "global" },
+    {
+      "name": "work_orders",
+      "placement": "sharded",
+      "shard_key": { "strategy": "column", "column": "id", "key_type": "int64" }
+    }
+  ]
+}

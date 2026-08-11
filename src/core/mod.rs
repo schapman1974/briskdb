@@ -42,6 +42,7 @@ pub use options::{
     MAX_RETAINED_BOUND_VALUE_BYTES, MAX_SHUTDOWN_GRACE_MS, PreparedStatementLimits, ResultLimits,
 };
 pub use planner::{BoundStatementPlan, PlannedRoute};
+pub(crate) use planner::{CanonicalShardKeyRef, canonical_shard_key_bytes};
 pub(crate) use prepared::PreparedState;
 pub use prepared::{
     DescribeTarget, PortalId, PrepareRequest, PreparedExecution, PreparedStatementDescription,

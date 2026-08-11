@@ -1,4 +1,5 @@
 pub mod core;
+pub mod import;
 pub mod protocol;
 pub mod server;
 pub mod sql;
