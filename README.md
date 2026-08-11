@@ -52,6 +52,9 @@ deadlines, materialized-result budgets, and graceful shutdown.
 The [admin data-browser contract](docs/ADMIN_BROWSER.md) defines the embedded
 read-only per-shard explorer, its temporary login, finite pages, and live-view
 boundaries.
+The [standard SQLite import contract](docs/SQLITE_IMPORT.md) defines the
+offline, staged conversion of one ordinary SQLite database into an explicitly
+cataloged BriskDB layout with exactly-once Sharded row placement.
 The [manifest storage-format contract](docs/STORAGE_FORMAT.md) defines versioned
 startup migrations, downgrade behavior, and recovery boundaries.
 Contributions follow the repository's [test-first completion policy](CONTRIBUTING.md).
@@ -94,6 +97,9 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
   the legacy pass-through behavior
 - A transactionally versioned `manifest.sqlite` with durable 4,096-bucket
   routing plus logical-database and authoritative table-placement metadata
+- A supported offline SQLite importer with complete per-table placement plans,
+  one physical owner for every Sharded row, explicit-only Global replication,
+  exact-value verification, and atomic no-replace publication
 - Initialization-only registration of a complete, empty physical schema, with
   later schema migrations checked against its table and shard-key declarations
 - Identity-bound, WAL-enabled SQLite shard files that are never silently
@@ -109,6 +115,7 @@ The on-disk layout is deliberately simple:
 
 ```text
 briskdb-data/
+├── briskdb-import-receipt.json  # present for imported layouts
 ├── manifest.sqlite
 └── shards/
     ├── 0000.sqlite
@@ -122,6 +129,22 @@ briskdb-data/
 ```bash
 cargo run -- --data-dir ./briskdb-data --shards 4
 ```
+
+To initialize a new data directory from an existing standard SQLite file, use
+the separate offline importer. The destination must not already exist, and the
+JSON plan must declare every source table as either Sharded with an authoritative
+key or explicitly Global:
+
+```bash
+cargo run --bin briskdb-import -- \
+  --source /path/to/source.db \
+  --data-dir /path/to/new-briskdb-data \
+  --shards 4 \
+  --plan /path/to/import-plan.json
+```
+
+See the [import contract](docs/SQLITE_IMPORT.md) for schema support,
+verification, cancellation, and publication behavior.
 
 The HTTP listener defaults to `127.0.0.1:7654`. The separate PostgreSQL TCP
 listener defaults to `127.0.0.1:5433`. Set either an explicit socket address or

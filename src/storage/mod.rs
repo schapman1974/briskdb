@@ -40,6 +40,7 @@ use crate::{
 };
 
 pub(crate) const CONNECTION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = manifest::MAX_SCHEMA_MIGRATION_SQL_BYTES;
 
 #[derive(Debug)]
 struct RootSchemaCoordination {

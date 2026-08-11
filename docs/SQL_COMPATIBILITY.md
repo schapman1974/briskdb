@@ -432,6 +432,12 @@ the bounded catalog-aware path.
 | SQLite expressions and functions | Legacy syntax may pass through; registered execution accepts only the common subset and strict SQLite translation | Executed semantics remain SQLite semantics |
 | SQLite constraints | SQLite enforces each accepted constraint in one shard | Every sharded `PRIMARY KEY`/`UNIQUE` key includes the `BINARY` shard key, so all possible collisions have one owner; no independent global reservation service exists |
 
+Hidden `rowid`, `_rowid_`, and `oid` values on Sharded tables are physical and
+shard-local. They are not globally unique logical identities and must not be
+used to infer ownership or cross-shard ordering. A visible `INTEGER PRIMARY
+KEY` alias remains an ordinary declared key and follows the catalog's normal
+locality rules.
+
 Other SQLite syntax may happen to pass through only on the empty-catalog legacy
 path and is not a stable BriskDB contract. In
 particular, multi-request transactions, multi-shard writes, multiple statements

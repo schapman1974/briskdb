@@ -256,6 +256,14 @@ sharded copy. `Global` explicitly describes replicated lookup rows. `Catalog`
 describes manifest-owned logical metadata and has no physical application-table
 shadow.
 
+An implicit SQLite `rowid` on a Sharded table is a shard-local physical locator,
+not a globally unique logical identity, routing key, or ordering key. Different
+owners may therefore contain the same hidden `rowid`. Declared primary and
+unique keys remain globally valid because every one contains the authoritative
+shard key and every possible collision meets on one owner. An `INTEGER PRIMARY
+KEY` rowid alias is different: it is a visible declared key and is validated by
+the ordinary shard-key and unique-locality rules.
+
 The loaded `Catalog` remains read-only to observers. Version 8 adds the one-time
 `Database::register_tables` mutation boundary for an empty table catalog. The
 caller supplies the complete declaration set for the storage-default logical
