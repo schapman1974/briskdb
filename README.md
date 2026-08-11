@@ -304,6 +304,14 @@ accepts SQL and should only be exposed on a trusted network. The HTTP adapter
 creates an ephemeral session for each data request, so session state and
 transactions cannot span HTTP requests. Each shard has its own bounded pool, so
 routed work queued for one shard does not consume another shard's capacity.
+After a populated catalog validates `/v1/execute` as one routed common-subset
+write, those ephemeral requests share a stateless physical-handle ownership
+domain. This keeps the logical sessions separate while allowing clean
+autocommit write handles to remain warm. Empty-catalog pass-through SQL and all
+other session surfaces retain unique ownership. Registration, startup, import,
+and migration validation also reject `last_insert_rowid()`, `changes()`, and
+`total_changes()` inside persistent table or index expressions, so a stored
+`DEFAULT`, `CHECK`, generated expression, or index cannot bypass that boundary.
 Pool admission happens before blocking SQLite work: once a shard's active slots
 and queue are full, the engine returns retryable `Busy` (HTTP 503) instead of
 growing work without bound. Connections are opened lazily and reused. Broadcast
@@ -399,9 +407,15 @@ allowed to invalidate the storage layout. Persistent DDL, including
 the journaled migration path, where BriskDB protects and revalidates its
 reserved `briskdb` and `briskdb_*` namespaces.
 A handle that performed an ordinary write may return to the same session,
-preserving SQLite write counters, but is replaced before a different session can
-observe `last_insert_rowid()`, `changes()`, or `total_changes()`. Those functions
-remain uncontracted across calls until sessions gain connection pinning.
+preserving SQLite write counters, but is replaced before a different observable
+session can inspect `last_insert_rowid()`, `changes()`, or `total_changes()`.
+Planner-validated populated-catalog HTTP writes are the narrow exception: they
+may reuse a shared stateless write handle because that SQL boundary rejects
+connection-local functions and session state before checkout, while catalog
+validation rejects the same functions in stored schema expressions. Older
+catalogs are rechecked at startup. A later ordinary session still replaces the
+handle before inspection. Those functions remain uncontracted across calls
+until sessions gain connection pinning.
 Dropping queued work skips it before SQLite starts. Dropping in-flight work
 interrupts its exact leased handle and retains lifecycle, worker, pool, and
 session permits until SQLite cleanup finishes. Explicit cancellation behaves

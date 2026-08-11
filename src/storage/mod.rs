@@ -766,6 +766,7 @@ impl Storage {
                     ),
                 ));
             }
+            shard::validate_stateless_catalog_schema(&connection)?;
             let physical_names = application_table_names(&connection)?;
             let relation_names = application_relation_names(&connection)?;
             if let Some(shadow) = catalog_declarations.iter().find(|name| {
@@ -919,6 +920,7 @@ impl Storage {
         let generation = self.catalog.logical().schema_generation();
         let trusted = integrity.committed_schema_digest();
         let mut consensus = None;
+        let mut verified_connections = Vec::with_capacity(usize::from(self.shard_count()));
         for shard_id in 0..self.shard_count() {
             let path = self.shard_path(shard_id);
             let connection = shard::open_existing(&path, shard_id, generation, &self.shard_layout)?;
@@ -936,13 +938,22 @@ impl Storage {
                 ));
             }
             consensus = Some(observed);
+            verified_connections.push(connection);
         }
-        consensus.ok_or_else(|| {
+        let consensus = consensus.ok_or_else(|| {
             EngineError::new(
                 EngineErrorKind::Internal,
                 "schema verification requires at least one configured shard",
             )
-        })
+        })?;
+
+        // Establish trusted and cross-shard digest agreement everywhere before
+        // enforcing compatibility policy. Otherwise a policy error on an early
+        // shard could mask later corruption and prevent terminal degradation.
+        for connection in &verified_connections {
+            shard::validate_registered_table_schema(connection, self.catalog.logical())?;
+        }
+        Ok(consensus)
     }
 
     fn open_unconfigured_shard(&self, shard: u16) -> EngineResult<Connection> {
@@ -3495,6 +3506,136 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             EngineErrorKind::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn table_registration_rejects_connection_local_functions_in_stored_expressions() {
+        for expression in [
+            "value INTEGER DEFAULT (total_changes())",
+            "value INTEGER CHECK (changes() >= 0)",
+            "value INTEGER CHECK (last_insert_rowid() >= 0)",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut database = Database::open(temp.path(), 2).unwrap();
+            database
+                .broadcast(&format!(
+                    "CREATE TABLE records (
+                         tenant_id TEXT NOT NULL PRIMARY KEY,
+                         {expression}
+                     )"
+                ))
+                .unwrap();
+            let logical_database = database.catalog().default_database().id();
+            let declaration = TableDeclaration::sharded(
+                logical_database,
+                "records",
+                crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+            )
+            .unwrap();
+
+            let error = database.register_tables(vec![declaration]).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+            assert!(
+                error
+                    .diagnostic()
+                    .contains("cannot participate in stateless catalog write reuse"),
+                "{expression}: {}",
+                error.diagnostic()
+            );
+            assert!(database.catalog().tables().is_empty());
+        }
+    }
+
+    #[test]
+    fn startup_rejects_a_preexisting_catalog_with_connection_local_schema_functions() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE records (
+                     tenant_id TEXT NOT NULL PRIMARY KEY,
+                     value INTEGER CHECK(total_changes() >= 0)
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        let declaration = TableDeclaration::sharded(
+            logical_database,
+            "records",
+            crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+        )
+        .unwrap();
+        drop(database);
+
+        let mut manifest_connection =
+            open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        let simulated_older_catalog =
+            manifest::register_table_catalog(&mut manifest_connection, 2, vec![declaration], || {})
+                .unwrap();
+        drop(simulated_older_catalog);
+        drop(manifest_connection);
+
+        let error = Database::open(temp.path(), 2).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(
+            error
+                .diagnostic()
+                .contains("cannot participate in stateless catalog write reuse"),
+            "{}",
+            error.diagnostic()
+        );
+    }
+
+    #[test]
+    fn later_schema_corruption_is_not_masked_by_an_earlier_unsafe_legacy_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE records (
+                     tenant_id TEXT NOT NULL PRIMARY KEY,
+                     value INTEGER CHECK(total_changes() >= 0)
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        let declaration = TableDeclaration::sharded(
+            logical_database,
+            "records",
+            crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+        )
+        .unwrap();
+        drop(database);
+
+        let manifest_path = temp.path().join("manifest.sqlite");
+        let mut manifest_connection = open_existing_manifest(&manifest_path).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        let simulated_older_catalog =
+            manifest::register_table_catalog(&mut manifest_connection, 2, vec![declaration], || {})
+                .unwrap();
+        drop(simulated_older_catalog);
+        drop(manifest_connection);
+
+        Connection::open(temp.path().join("shards/0001.sqlite"))
+            .unwrap()
+            .execute_batch("CREATE TABLE later_shard_tamper(id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let error = Database::open(temp.path(), 2).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            Connection::open(manifest_path)
+                .unwrap()
+                .query_row(
+                    "SELECT database_state FROM briskdb_integrity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            4,
+            "trusted later-shard corruption must persist terminal Degraded state"
         );
     }
 

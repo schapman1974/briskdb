@@ -1866,19 +1866,35 @@ mod tests {
             .unwrap();
         let generations_before = shard_generations(temp.path());
 
-        for sql in [
-            "DROP TABLE accounts",
-            "DROP TABLE accounts;
+        for (sql, expected_kind) in [
+            ("DROP TABLE accounts", EngineErrorKind::FailedPrecondition),
+            (
+                "DROP TABLE accounts;
              CREATE TABLE accounts (
                  id TEXT PRIMARY KEY,
                  display_name TEXT NOT NULL
              ) STRICT",
-            "CREATE TABLE undeclared (id INTEGER PRIMARY KEY) STRICT",
-            "CREATE TABLE audit_catalog (id INTEGER PRIMARY KEY) STRICT",
-            "CREATE VIEW audit_catalog AS SELECT id FROM accounts",
+                EngineErrorKind::FailedPrecondition,
+            ),
+            (
+                "CREATE TABLE undeclared (id INTEGER PRIMARY KEY) STRICT",
+                EngineErrorKind::FailedPrecondition,
+            ),
+            (
+                "CREATE TABLE audit_catalog (id INTEGER PRIMARY KEY) STRICT",
+                EngineErrorKind::FailedPrecondition,
+            ),
+            (
+                "CREATE VIEW audit_catalog AS SELECT id FROM accounts",
+                EngineErrorKind::FailedPrecondition,
+            ),
+            (
+                "ALTER TABLE accounts ADD COLUMN observed INTEGER CHECK(total_changes() >= 0)",
+                EngineErrorKind::PermissionDenied,
+            ),
         ] {
             let error = run_sql_with_hook(&storage, sql, |_| Ok(())).unwrap_err();
-            assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition, "{sql}");
+            assert_eq!(error.kind(), expected_kind, "{sql}");
             assert_eq!(storage.schema_gate_snapshot().state, SchemaGateState::Ready);
             assert_eq!(active_journal_snapshot(temp.path()), None, "{sql}");
             assert_eq!(shard_generations(temp.path()), generations_before, "{sql}");

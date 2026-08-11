@@ -695,7 +695,7 @@ fn preflight_schema_migration_on_connection_with_digest_inner(
 /// such declaration must have a physical table, and Catalog declarations must
 /// remain manifest-only. Sharded keys additionally retain the representation
 /// required by deterministic routing.
-fn validate_registered_table_schema(
+pub(super) fn validate_registered_table_schema(
     connection: &Connection,
     catalog: &Catalog,
 ) -> EngineResult<()> {
@@ -735,6 +735,7 @@ fn validate_registered_table_schema(
             "schema migration violates the authoritative table catalog: virtual tables are not supported",
         ));
     }
+    validate_stateless_catalog_schema(connection)?;
 
     let expected = catalog
         .tables()
@@ -977,6 +978,42 @@ pub(super) fn validate_authoritative_table_constraints(
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+/// Reject persistent expressions that could observe a previous stateless
+/// catalog write through SQLite's connection-local counters.
+pub(super) fn validate_stateless_catalog_schema(connection: &Connection) -> EngineResult<()> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, sql
+             FROM main.sqlite_schema
+             WHERE type IN ('table', 'index') AND sql IS NOT NULL
+               AND name NOT GLOB 'sqlite_*'
+             ORDER BY type, name COLLATE BINARY",
+        )
+        .map_err(sqlite_error::storage)?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(sqlite_error::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error::storage)?;
+
+    for (object_type, name, sql) in objects {
+        crate::sql::validate_stateless_catalog_schema_sql(&sql).map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::FailedPrecondition,
+                format!("{object_type} {name} cannot participate in stateless catalog write reuse"),
+                error,
+            )
+        })?;
     }
     Ok(())
 }
