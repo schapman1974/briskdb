@@ -1,6 +1,7 @@
 # Bound statement planning and routing policy
 
-Status: implemented for roadmap issues #23, #24, and #27 integration
+Status: implemented for roadmap issues #23 and #24, with execution integration
+through issues #27 and #57
 
 BriskDB exposes one synchronous, protocol-neutral engine call that plans a
 normalized statement from the values actually bound for that execution:
@@ -61,19 +62,21 @@ to a cataloged sharded table has `Some(shard)`.
 
 The [prepared execution lifecycle](SQL_PREPARED_STATEMENTS.md) consumes this
 result only after values are bound. Bind validates then discards one plan;
-execution creates another under its current schema guard. Execution uses an
-assigned shard for cataloged sharded work and may select deterministic shard 0
-for a classified safe `NotApplicable` or `Global` read. It still rejects
-catalog placement and sharded reads that need scatter. That target-selection
+execution creates another under its current schema guard. Compatibility
+execution uses an assigned shard for cataloged sharded work and may select
+deterministic shard 0 for a classified safe `NotApplicable` or `Global` read.
+Logical execution additionally converts unassigned Sharded reads into target
+sets: every shard for `Unconstrained`, or each distinct inferred owner for a
+finite multi-owner result. Catalog placement remains denied. This execution
 integration does not change this planner's meaning of `assigned_shard()`.
 
 Populated-catalog raw execute/query uses the same internal planning result after
 SQLite parsing, common-subset validation, placeholder normalization, and strict
-translation. It requires finite `Exact`/`Multiple` inference with one assigned
-owner for `Sharded` tables, uses shard 0 for supported Global or table-free
-reads, and rejects Catalog, undeclared, unconstrained, contradictory, and
-multi-owner targets. An empty catalog alone bypasses this composition and keeps
-the legacy caller-key route.
+translation. Execute still requires one assigned Sharded owner. Query uses one
+owner for `Exact`, each distinct inferred owner for finite `Multiple`, every
+shard for `Unconstrained`, and shard 0 once for supported Global or table-free
+reads. Catalog and undeclared placement remain denied. An empty catalog alone
+bypasses this composition and keeps the legacy caller-key route.
 
 `Debug` output reports identifiers, versions, shard IDs, and counts where
 useful. It does not render SQL, AST contents, inferred key values, explicit key
@@ -114,10 +117,17 @@ Only statements classified as `Read` follow these deferred-assignment rules:
 | `Contradiction` | Leave unassigned for later empty-result/validation policy | Assign the explicit shard |
 | `NotApplicable` or `NotSharded` | Leave unassigned | Leave unassigned; retain explicit context only as advisory metadata |
 
-No scatter execution or no-row short circuit is implemented here. In
-particular, a contradictory predicate is still allowed to reach later SQLite
-prepare and validation work rather than having this advisory layer invent a
-result.
+This synchronous planner does not execute a scatter or invent a no-row result.
+The logical executor consumes its inference after planning and retains SQLite
+validation for contradictory predicates rather than letting this advisory
+layer synthesize a result.
+
+When that target set contains more than one shard, issue #57 accepts only a
+single-table, row-local `SELECT` that can be executed unchanged on each target.
+It rejects `DISTINCT`, functions and aggregates, grouping, ordering,
+limit/offset, joins, subqueries, CTEs, set operations, and windows. Those forms
+need later global-semantic planning rather than a concatenation of independently
+evaluated shard results.
 
 ## Sharded write policy
 
@@ -218,9 +228,13 @@ every shard on each call.
 
 For a registered `Sharded` table, every ordinary row belongs on exactly the one
 owner produced from its canonical key. Finite point plans can assign that
-owner. An unpinned or multi-owner read still remains unassigned here; executing
-it as a logical shard `UNION ALL` with bounded scatter and deterministic merge
-is follow-up work in issues #57 and #58, not part of catalog registration.
+owner. An unpinned or multi-owner read remains unassigned by this synchronous
+API, but issue #57's logical executor consumes the inference as a physical
+target set. It runs supported row-local reads with at most eight shard tasks
+and concatenates results in ascending shard order as `UNION ALL`, retaining
+duplicates. Exact inference visits one owner; finite inference deduplicates
+only repeated physical targets; `Unconstrained` visits all shards; `Global`
+visits shard 0 once. One failed target fails the complete operation.
 
 ## Errors and recovery
 
@@ -270,7 +284,8 @@ path. In particular:
 - `assigned_shard()` is consumed by prepared execution and by raw HTTP
   execute/query when the authoritative catalog is populated; an empty catalog
   retains legacy routing without a plan;
-- no read scatter, merge, contradiction short circuit, or write executes here;
+- no read scatter, merge, contradiction short circuit, or write executes in
+  this synchronous planner method;
 - no transaction pinning or cross-call routing context is applied;
 - this synchronous method creates no per-session or global cache; issue #26
   retains only typed values and a routing snapshot in each portal, not this
@@ -291,7 +306,7 @@ integrates translation and planning, validates transiently at bind, and plans
 again from the bounded session portal's snapshot at every execution. The
 implemented classifier supplies authoritative statement behavior and the
 empty/single/multi-statement gate. Direct inference remains statement-local;
-later query-planner work owns scatter/gather execution.
+the logical engine execution path owns scatter/gather rather than this planner.
 
 ## Verification obligations
 
@@ -307,4 +322,5 @@ public results; selected behavior; empty, all-read, and rejected mutating batch
 policy; provenance; and equivalent SQLite, PostgreSQL, and MySQL typed requests.
 HTTP regressions prove both boundaries: an empty catalog preserves legacy raw
 execution, while a populated catalog consumes the plan, enforces declared
-placement, and fails closed for unsafe or undeclared targets.
+placement, gathers supported logical reads without partial results, and fails
+closed for unsafe or undeclared targets.

@@ -5,8 +5,6 @@
   const authEpoch = logic.createAuthEpoch();
 
   const state = {
-    shard: 0,
-    shardCount: 0,
     table: null,
     limit: 50,
     offset: 0,
@@ -24,8 +22,7 @@
     username: document.querySelector("#username"),
     password: document.querySelector("#password"),
     logout: document.querySelector("#logout-button"),
-    shard: document.querySelector("#shard-select"),
-    shardKicker: document.querySelector("#shard-kicker"),
+    scopeKicker: document.querySelector("#scope-kicker"),
     tableList: document.querySelector("#table-list"),
     tableCount: document.querySelector("#table-count"),
     tableTitle: document.querySelector("#table-title"),
@@ -121,17 +118,6 @@
     clearPage("No table selected", "Choose a table from the sidebar to browse a bounded, read-only page.");
   }
 
-  function renderShardOptions(count, selected) {
-    elements.shard.replaceChildren();
-    for (let shard = 0; shard < count; shard += 1) {
-      const option = document.createElement("option");
-      option.value = String(shard);
-      option.textContent = `Shard ${shard}`;
-      option.selected = shard === selected;
-      elements.shard.append(option);
-    }
-  }
-
   function displayTableName(table) {
     if (table.length === 0) return "(empty table name)";
     if (table.trim().length === 0) return "(whitespace-only table name)";
@@ -144,9 +130,9 @@
     if (tables.length === 0) {
       const note = document.createElement("p");
       note.className = "no-tables";
-      note.textContent = "No application tables on this shard.";
+      note.textContent = "No application tables in the default logical database.";
       elements.tableList.append(note);
-      resetTable("This physical shard has no browseable application tables.");
+      resetTable("The default logical database has no browseable application tables.");
       return;
     }
     for (const table of tables) {
@@ -162,25 +148,21 @@
     resetTable();
   }
 
-  async function loadOverview(shard) {
+  async function loadOverview() {
     const requestId = ++state.overviewRequest;
     state.rowsRequest += 1;
-    state.shard = shard;
     state.table = null;
     state.offset = 0;
     elements.tableList.replaceChildren();
     elements.tableCount.textContent = "…";
-    elements.shardKicker.textContent = `Physical shard ${shard}`;
-    resetTable(`Loading application tables from physical shard ${shard}.`);
-    setStatus(`Loading tables from physical shard ${shard}…`);
+    elements.scopeKicker.textContent = "Logical database · default";
+    resetTable("Loading application tables from the default logical database.");
+    setStatus("Loading logical tables…");
     try {
-      const overview = await api(`/admin/api/overview?shard=${encodeURIComponent(shard)}`);
+      const overview = await api("/admin/api/overview");
       if (requestId !== state.overviewRequest) return;
-      state.shardCount = overview.shard_count;
-      state.shard = overview.selected_shard;
-      renderShardOptions(overview.shard_count, overview.selected_shard);
       renderTables(overview.tables);
-      setStatus(`${overview.tables.length} application table${overview.tables.length === 1 ? "" : "s"} on physical shard ${overview.selected_shard}.`);
+      setStatus(`${overview.tables.length} logical application table${overview.tables.length === 1 ? "" : "s"}.`);
     } catch (error) {
       if (requestId !== state.overviewRequest) return;
       if (error.message !== "authentication_required") {
@@ -199,7 +181,7 @@
       item.setAttribute("aria-pressed", String(active));
     }
     elements.tableTitle.textContent = displayTableName(table);
-    elements.tableSubtitle.textContent = `Read-only rows from physical shard ${state.shard}.`;
+    elements.tableSubtitle.textContent = "Read-only logical rows across the table's metadata-selected files.";
     await Promise.all([loadRows(), loadCount()]);
   }
 
@@ -239,7 +221,7 @@
     }
 
     state.hasMore = page.has_more;
-    elements.tableCaption.textContent = `${displayTableName(page.table)} rows from physical shard ${page.shard}`;
+    elements.tableCaption.textContent = `${displayTableName(page.table)} logical rows`;
     elements.empty.classList.toggle("hidden", page.rows.length !== 0);
     elements.tableWrap.classList.toggle("hidden", page.rows.length === 0);
     if (page.rows.length === 0) {
@@ -255,12 +237,11 @@
     if (state.table === null) return;
     const requestId = ++state.rowsRequest;
     const displayTable = displayTableName(state.table);
-    clearPage("Loading rows…", `Reading ${displayTable} from physical shard ${state.shard}.`, "Loading…");
-    setStatus(`Loading ${displayTable} from physical shard ${state.shard}…`);
+    clearPage("Loading rows…", `Reading logical rows from ${displayTable}.`, "Loading…");
+    setStatus(`Loading logical rows from ${displayTable}…`);
     elements.previous.disabled = true;
     elements.next.disabled = true;
     const query = new URLSearchParams({
-      shard: String(state.shard),
       table: state.table,
       limit: String(state.limit),
       offset: String(state.offset),
@@ -269,7 +250,7 @@
       const page = await api(`/admin/api/rows?${query.toString()}`);
       if (requestId !== state.rowsRequest) return;
       renderPage(page);
-      setStatus(`${page.rows.length} row${page.rows.length === 1 ? "" : "s"} loaded from physical shard ${page.shard}.`);
+      setStatus(`${page.rows.length} logical row${page.rows.length === 1 ? "" : "s"} loaded from ${page.visited_shards.length} file${page.visited_shards.length === 1 ? "" : "s"}.`);
     } catch (error) {
       if (requestId !== state.rowsRequest) return;
       if (error.message !== "authentication_required") {
@@ -283,20 +264,23 @@
     if (state.table === null) return;
     const requestedTable = state.table;
     const requestId = ++state.countRequest;
-    setRecordCount("Calculating total records across all physical shards…", false, true);
+    setRecordCount("Calculating the exact logical record total…", false, true);
     const query = new URLSearchParams({ table: requestedTable });
     try {
       const count = await api(`/admin/api/count?${query.toString()}`);
       if (!logic.acceptsTableResponse(requestId, state.countRequest, requestedTable, state.table)) return;
-      if (count.table !== requestedTable || count.scope !== "all_physical_shards") {
-        throw new Error("Invalid all-shard row count response.");
+      if (
+        count.table !== requestedTable
+        || (!count.scope.startsWith("logical_") && !count.scope.startsWith("empty_catalog_"))
+      ) {
+        throw new Error("Invalid logical row count response.");
       }
-      const presentation = logic.rowCountPresentation(count.total_rows, count.shard_count);
+      const presentation = logic.rowCountPresentation(count.total_rows, count.visited_shards);
       setRecordCount(presentation.text, false, false, presentation.title);
     } catch (error) {
       if (!logic.acceptsTableResponse(requestId, state.countRequest, requestedTable, state.table)) return;
       if (error.message !== "authentication_required") {
-        setRecordCount("Total across all physical shards unavailable", true, false, error.message);
+        setRecordCount("Logical total unavailable", true, false, error.message);
       }
     }
   }
@@ -315,7 +299,7 @@
       });
       if (!authEpoch.isCurrent(loginAuthEpoch)) return;
       showBrowser();
-      await loadOverview(0);
+      await loadOverview();
     } catch (error) {
       if (authEpoch.isCurrent(loginAuthEpoch) && error.message !== "authentication_required") {
         elements.loginError.textContent = error.message;
@@ -340,7 +324,6 @@
     }
   });
 
-  elements.shard.addEventListener("change", () => loadOverview(Number(elements.shard.value)));
   elements.pageSize.addEventListener("change", () => {
     state.limit = Number(elements.pageSize.value);
     state.offset = 0;
@@ -362,7 +345,7 @@
     .then(() => {
       if (!authEpoch.isCurrent(sessionAuthEpoch)) return undefined;
       showBrowser();
-      return loadOverview(0);
+      return loadOverview();
     })
     .catch((error) => {
       if (!authEpoch.isCurrent(sessionAuthEpoch)) return;

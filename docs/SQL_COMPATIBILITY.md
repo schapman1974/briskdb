@@ -83,14 +83,17 @@ HTTP requests still send caller-provided SQLite SQL to the engine. With an empty
 catalog it follows the legacy raw path. With a populated catalog, the engine
 requires exactly one common-subset SQLite statement and runs normalization,
 strict translation, classification, inference, and routing policy before
-SQLite execution.
+SQLite execution. Registered writes remain single-owner. Registered reads use
+catalog metadata to visit an exact owner, the distinct owners of a finite key
+set, every shard for an unconstrained Sharded read, or shard 0 once for a
+`Global` or table-free read.
 
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
 | HTTP `/v1/execute` | Experimental | Empty catalog: legacy SQLite statement. Populated catalog: exactly one SQLite common-subset write with normalized positional parameters and strict SQLite translation | Required caller `shard_key`; a populated catalog also requires authoritative finite single-shard inference and rejects Global/Catalog writes |
-| HTTP `/v1/query` | Experimental | Empty catalog: legacy raw SQLite query. Populated catalog: exactly one SQLite common-subset read; no session cache | Required caller `shard_key`; a populated catalog reads Global data on shard 0, denies Catalog/undeclared tables, and requires one sharded owner |
+| HTTP `/v1/query` | Experimental | Empty catalog: legacy raw SQLite query. Populated catalog: exactly one SQLite common-subset read; no session cache; multi-shard execution is limited to the row-local scatter-safe subset | Empty catalog requires caller `shard_key`; populated catalog derives targets from registered metadata, reads Global data once on shard 0, and denies Catalog/undeclared tables |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch; populated catalogs reject row-moving DML, table drops, and trigger creation | Preflight on every shard, then ascending resumable apply |
-| HTTP `/admin` browser | Experimental, read-only | No caller SQL; server-generated physical table discovery, exact all-shard physical `COUNT(*)`, and bounded `SELECT *` pages | Pages require a validated physical shard; the specialized count fans out with bounded concurrency but is not a general scatter-query surface |
+| HTTP `/admin` browser | Experimental, read-only | No caller SQL; metadata-driven logical table discovery, specialized exact logical `COUNT(*)`, and bounded deterministic `SELECT *` page slices | Sharded tables visit all files; Global tables visit shard 0 once; no browser shard selector or arbitrary SQL |
 | PostgreSQL wire protocol | Protocol-3.0 startup/session only on loopback; SQL flow deferred | No SQL accepted over the wire; simple `Query` and extended `Parse` return fixed `0A000` responses | Startup selects an exact logical database; no wire SQL request reaches planning or routing |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
@@ -106,42 +109,46 @@ execute/query rows as described above; it adds no HTTP field or route.
 Every HTTP database operation now calls the same protocol-neutral async engine
 used by PostgreSQL startup status and intended for issue-31 PostgreSQL SQL flow
 and the future MySQL adapter. Execute and query requests create a fresh `Ready`
-session, put the request's `shard_key` in its routing context, and submit an
-owned statement. The engine, rather than the HTTP adapter, selects the shard
-and acquires a pooled SQLite connection. Admin inspection requests also create
-a fresh `Ready` session, but use a bounded read-only engine operation with an
-already validated physical shard. The session is discarded when that HTTP
-request finishes, so a transaction cannot span requests.
+session and submit an owned statement. Execute and empty-catalog legacy query
+put the request's `shard_key` in its routing context. Populated-catalog query
+instead derives its target set from the statement and authoritative metadata;
+a caller key does not narrow that logical set. The engine, rather than the HTTP
+adapter, selects targets and acquires pooled SQLite connections. Admin
+inspection requests also create fresh `Ready` sessions, but their generated
+logical plan uses placement metadata to choose explicit read-only physical
+inspections. The sessions are discarded when that HTTP request finishes, so a
+transaction cannot span requests.
 
 ### Admin browser inspection
 
 The `/admin` application is an early operational view rather than another SQL
-compatibility mode. The browser never submits SQL. Its overview selects one
-physical shard from the configured range and discovers ordinary `main`-schema
-tables through SQLite's typed `table_list` metadata. ASCII-case-insensitive `sqlite_`,
-the exact name `briskdb`, and `briskdb_` prefixes are excluded, as are non-table
-objects. This is a physical schema view, not the authoritative logical-catalog
-view and not a promise that another shard contributes the same rows.
+compatibility mode. The browser never submits SQL. With a populated catalog,
+its overview lists non-Catalog tables in the default logical database. An empty
+catalog retains a shard-0 physical-discovery fallback through SQLite's typed
+`table_list` metadata. ASCII-case-insensitive `sqlite_`, the exact name
+`briskdb`, and `briskdb_` prefixes are excluded, as are non-table objects.
 
-Row browsing generates one safely quoted `SELECT *` for a table returned by
-discovery. Page limits are 1 through 200 and offsets are 0 through 1,000,000;
-the interface reads at most one extra row to decide whether another page is
-available. The user interface offers 25, 50, 100, and 200 and starts at 50.
-Shard, table, limit, offset, and checked arithmetic are validated before
-execution. The engine still requires SQLite to classify the statement as
-read-only and applies its schema gate, pool/worker admission, cancellation,
-deadline, and effective result-byte and row budgets.
+Table placement selects the physical targets: Sharded uses every file, Global
+uses canonical shard 0 once, and the empty-catalog fallback uses every file.
+The browser verifies table presence and identical column metadata, counts each
+target, calculates only the shard-major slices needed for the requested offset,
+and generates safely quoted, all-column-ordered `SELECT *` reads for those
+slices. Duplicate rows are retained. Page limits are 1 through 200 and offsets
+are 0 through 1,000,000; at most one extra logical row decides whether another
+page is available. The user interface offers 25, 50, 100, and 200 and starts at
+50. Table, limit, offset, target shape, and checked arithmetic are validated.
+The combined page is checked against one configured row/logical-byte budget.
 
 Table selection separately verifies the exact ordinary table on every shard
-and runs bounded read-only `COUNT(*)` inspections. It returns the checked sum of
-physical rows, so replicated rows count once per shard. The sum is not a
-cross-shard snapshot and does not make arbitrary SQL scatterable.
+selected by placement and runs bounded read-only `COUNT(*)` inspections. It
+returns their checked sum, so a Sharded row contributes from its sole owner and
+a Global row contributes from shard 0 once. The sum remains a specialized admin
+operation rather than the general logical query planner's aggregate contract.
 
-Each offset page is a new committed read. No order is promised for a general
-SQLite table scan, and concurrent changes may move rows between pages. The
-browser does not merge physical row pages, preserve a multi-page snapshot,
-accept arbitrary filters or SQL, or implement the planned general
-scatter/gather query path.
+Each offset page is a new set of committed reads, not a retained cross-file
+snapshot. Concurrent changes may move or repeat rows between pages. The browser
+does not accept arbitrary filters or SQL, and its dedicated count/paging plan
+does not add general multi-shard aggregate, ordering, or pagination SQL.
 The full route, login, and live-view contract is in the [admin data
 browser](ADMIN_BROWSER.md).
 
@@ -219,6 +226,15 @@ result when a budget is exceeded. This deliberately rejects write-capable query
 forms such as DML `RETURNING`; callers must use the execute surface, whose
 result is rows affected rather than returned rows. Exact accounting and
 configuration semantics are in [request controls](REQUEST_CONTROLS.md).
+
+A supported logical multi-shard query schedules at most eight shard tasks. All
+targets share one absolute request deadline, cancellation source, and combined
+row/logical-byte budget. Rows are concatenated in ascending shard order and
+duplicates are retained, matching `UNION ALL`. A failure on any target cancels
+the remaining work, waits for cleanup, and returns no partial result. Because
+each physical shard has its own SQLite file and connection pool, this read
+coordination does not collapse the independent per-file write paths into one
+database lock.
 
 The `broadcast` surface now implements one application-schema migration. Before
 it creates a journal, BriskDB runs the complete batch on every shard in an
@@ -310,6 +326,11 @@ shape is:
   "rows": [[1, 2]]
 }
 ```
+
+A successful one-target query contains `"shard": N`. A logical query that
+visits multiple targets replaces that member with `"shards": [N, ...]`; the
+array is unique and sorted in physical-shard order, matching the order used to
+concatenate its per-shard rows.
 
 For every row, `rows[row_index][column_index]` is described by
 `columns[column_index]`. Column names may be duplicated or empty and are never
@@ -428,7 +449,7 @@ the bounded catalog-aware path.
 | --- | --- | --- |
 | Persistent DDL, including `CREATE`, `DROP`, and `ALTER` | Execute only through the migration/broadcast endpoint | Per-shard atomic and crash-resumable; with a populated catalog, row-moving DML, table drops, trigger creation, and any final catalog violation are rejected |
 | `INSERT`, `UPDATE`, `DELETE` | Legacy: caller-selected shard. Registered: exactly one inferred owner, compatible with the caller route | Inserts prove every row key; shard-key updates and multi-owner writes are rejected |
-| `SELECT` | Legacy: caller-selected shard. Registered: one inferred sharded owner, Global shard 0, or table-free shard 0 | No scatter/gather path; unconstrained and multi-owner reads are rejected |
+| `SELECT` | Legacy: caller-selected shard. Registered: exact owner, distinct owners for finite keys, every owner for unconstrained Sharded reads, or shard 0 once for Global/table-free reads | Multi-shard execution accepts only unchanged row-local single-table reads and concatenates with `UNION ALL`; unsupported global semantics are rejected |
 | SQLite expressions and functions | Legacy syntax may pass through; registered execution accepts only the common subset and strict SQLite translation | Executed semantics remain SQLite semantics |
 | SQLite constraints | SQLite enforces each accepted constraint in one shard | Every sharded `PRIMARY KEY`/`UNIQUE` key includes the `BINARY` shard key, so all possible collisions have one owner; no independent global reservation service exists |
 
@@ -482,6 +503,14 @@ foreign keys, generated columns, expression/partial indexes, and all other
 forms are outside this first subset. The exact clause, expression, constraint,
 name, and diagnostic rules are normative in
 [the common SQL subset contract](SQL_SUBSET.md).
+
+Structural acceptance is not permission to scatter a statement. When a
+registered Sharded read selects more than one physical target, the issue-57
+baseline requires one plain table and row-local projection/filter expressions
+whose translated SQL can execute unchanged per shard. It rejects `DISTINCT`,
+all functions and aggregates, grouping, ordering, limit/offset, joins,
+subqueries, CTEs, set operations, and windows. A one-target read may still use
+the broader implemented subset because SQLite evaluates it only once.
 
 This implemented status means structural validation exists and is tested. The
 subset is connected to prepared execution and populated-catalog HTTP
@@ -668,11 +697,13 @@ parameter/result column, exposes the classified behavior, and refreshes column
 metadata after schema migration without changing that behavior. Every execution
 creates a fresh plan under its current schema guard. It runs accepted sharded
 work on its assigned shard and classified safe `NotApplicable`/`Global` reads
-on deterministic shard 0; catalog access and sharded reads requiring scatter
-remain unavailable. Persistent schema prepare is denied before a handle is
-published, and session behavior cannot execute through a portal. Results are
-the same protocol-neutral routed rowset or affected-row count for SQLite,
-PostgreSQL, and MySQL source.
+on deterministic shard 0 through the compatibility execution method. Logical
+portal execution additionally visits the distinct metadata-selected targets of
+a finite Sharded read or every shard for an unconstrained Sharded read. Catalog
+access remains denied. Persistent schema prepare is denied before a handle is
+published, and session behavior cannot execute through a portal. Results use
+the same protocol-neutral values for SQLite, PostgreSQL, and MySQL source;
+logical results also report the sorted, unique physical shards visited.
 
 Per-session statement, portal, retained-bound-value, and per-bind planning
 limits are finite and have no implicit eviction. Planning preflight charges the
@@ -771,9 +802,10 @@ underlying execution semantics.
 
 ### Current
 
-- HTTP continues to require an opaque caller `shard_key`. With an empty catalog
-  it alone selects the shard; with a populated catalog it is retained as an
-  explicit route and must agree by physical shard with finite SQL inference.
+- HTTP execute continues to require an opaque caller `shard_key`. Empty-catalog
+  legacy query also requires it. A populated-catalog logical query derives its
+  targets from registered placement and SQL inference instead of using that
+  caller context to narrow the shard set.
 - Exact key bytes are hashed with version-1 BLAKE3; the little-endian 64-bit
   prefix selects one of 4,096 virtual buckets through the versioned
   compatibility algorithm.
@@ -816,13 +848,19 @@ underlying execution semantics.
   provenance. It compares finite routes by physical shard, rejects unroutable
   cataloged sharded writes, and records an accepted single-shard assignment.
 - The Rust prepared lifecycle snapshots bound values and session routing in an
-  immutable portal, transiently validates at bind, plans on every execution,
-  executes accepted sharded targets, and uses shard 0 for supported
-  replicated-schema reads. Populated-catalog HTTP uses the same routing policy
-  without a prepared cache. Neither path implements scatter reads.
+  immutable portal, transiently validates at bind, and plans on every
+  execution. Its logical read method and populated-catalog HTTP query execute
+  supported Sharded target sets without a second prepared cache; `Global` and
+  table-free reads use shard 0 once.
 - Point queries and writes visit only that key's owning shard.
-- No general scatter/gather query path exists. Logical unpinned reads still
-  require the shard `UNION ALL`/scatter and merge work in issues #57 and #58.
+- Finite multi-owner reads visit each distinct owner; unconstrained Sharded
+  reads visit every shard. At most eight tasks run concurrently, and successful
+  rows merge in ascending shard order with duplicates preserved as `UNION ALL`.
+  Every target shares one request deadline, cancellation source, and result
+  budget; any target failure yields no partial result.
+- The issue-57 baseline does not implement global `DISTINCT`, aggregate,
+  grouping, ordering, pagination, join, subquery, CTE, set-operation, or window
+  semantics. Those forms are rejected when more than one shard is selected.
 - SQLite transactions remain local to one shard. Registration accepts a
   sharded primary/unique key only when it contains the `BINARY` shard-key term,
   ensuring every possible collision is checked by one owning SQLite file.
@@ -842,7 +880,8 @@ underlying execution semantics.
   persisted in the manifest.
 - A transaction is pinned to its first shard. Targeting another shard returns a
   stable cross-shard-transaction error.
-- Read-only plans may scatter with bounded concurrency and deterministic merge.
+- Later planner work may extend bounded logical reads with global filtering,
+  ordering, pagination, aggregation, and other non-row-local semantics.
 - Cross-shard writes remain unsupported unless a future coordinator can prove
   its crash semantics.
 - A future reservation design is required for a unique key that intentionally
@@ -877,9 +916,9 @@ Version 8 retains those integrity rules and includes authoritative table
 registration in the same semantic root.
 See the [manifest storage-format contract](STORAGE_FORMAT.md).
 
-Scatter reads will combine committed results from multiple SQLite files. They
-will not claim an atomic cross-file snapshot until BriskDB has an implementation
-and failure tests that establish such a guarantee.
+Scatter reads combine committed results from multiple SQLite files. They do not
+claim an atomic cross-file snapshot; the files can observe different committed
+instants while the bounded tasks run.
 
 ## Compatibility verification
 

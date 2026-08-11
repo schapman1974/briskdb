@@ -148,6 +148,7 @@ select { min-height: 2.55rem; padding: 0 2.2rem 0 0.75rem; }
 .sidebar { padding: 1.5rem 1rem; border-right: 1px solid var(--border); background: rgba(8, 20, 18, 0.56); }
 .sidebar-section { padding: 0 0.35rem 1.5rem; }
 .sidebar-note { margin: 0.75rem 0 0; color: var(--muted); font-size: 0.75rem; line-height: 1.5; }
+.database-name { display: block; color: var(--text); font-size: 0.95rem; }
 .tables-section { border-top: 1px solid var(--border); padding-top: 1.4rem; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; }
 .count-badge { min-width: 1.5rem; padding: 0.15rem 0.4rem; border-radius: 99px; color: var(--muted); background: var(--panel-raised); text-align: center; font-size: 0.7rem; }

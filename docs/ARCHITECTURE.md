@@ -29,20 +29,21 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, logical Sharded read target selection and scatter/gather, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing and authoritative logical manifest, one-time table registration, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `import` | Offline source-schema preflight, explicit placement-plan validation, exact-value row routing into private staging, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, implicit Global placement, or protocol-specific behavior |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
-| `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, discovery, all-shard physical counts, and page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
+| `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
 | `protocol::postgres` | BriskDB-owned bounded protocol-3.0 framing, finite parameter validation, selected identity/status, per-connection core-session ownership, query-deferral responses, and private compile/query-parser seam around the exactly pinned `pgwire` library | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, loopback validation, separate HTTP/PostgreSQL listener binding, finite connection-task supervision, and shared graceful/forced draining | SQL parsing, PostgreSQL wire framing, or storage implementation details |
 
 Implementation dependencies flow one way: adapters call the async `Engine` in
 `core`; the engine coordinates routing, `storage`, and `sql`. An adapter supplies
-protocol-neutral session routing context and an owned statement, then receives
-the selected shard together with the operation result. It neither computes a
-shard nor opens a SQLite connection. The only reverse-facing name is
+protocol-neutral session context and an owned statement, then receives the
+engine-selected physical target or target set together with the operation
+result. It neither computes a shard nor opens a SQLite connection. The only
+reverse-facing name is
 `storage::Database`, a compatibility re-export of `core::Database`; the storage
 implementation does not call core.
 
@@ -367,13 +368,15 @@ only that snapshot and the values in an immutable logical portal. Later
 session-route changes do not affect it. Describing after a schema-generation
 change recompiles owned metadata on shard 0. Every execution plans again from
 the portal snapshot under the current schema/routing guard before choosing the
-supported physical target. Logical behavior, not SQLite result-column metadata,
+supported physical target or target set. Logical behavior, not SQLite
+result-column metadata,
 distinguishes reads from writes, schema changes, and session control. Safe
-`NotApplicable` and `Global` reads may use deterministic shard 0; a sharded
-read that still needs scatter remains unsupported. Schema/session execution is
-not implemented, and Catalog placement is never exposed as an application
-target. `PreparedStatementDescription::behavior()` gives adapters the same
-retained behavior.
+`NotApplicable` and `Global` reads use deterministic shard 0. The compatibility
+portal executor remains single-target; its logical counterpart gathers
+supported finite multi-owner and unconstrained Sharded reads. Schema/session
+execution is not implemented, and Catalog placement is never exposed as an
+application target. `PreparedStatementDescription::behavior()` gives adapters
+the same retained behavior.
 
 Per-session limits independently bound statement count, portal count, and the
 logical accounted value bytes plus routing bytes retained by all portals. Full
@@ -388,10 +391,11 @@ expansion by charging its captured route once and each normalized marker
 occurrence twice; repeated markers cannot cause unbounded inference/route
 allocation before the check.
 
-The prepared lifecycle integrates the classifier, translation, and planning
-layers but deliberately does not execute a multi-statement batch, scatter
-reads, execute schema/session statements, or implement transactions. Those
-remain later planner/transaction milestones. The complete API, accounting,
+The prepared lifecycle integrates the classifier, translation, planning, and
+logical scatter layers but deliberately does not execute a multi-statement
+batch, global non-row-local query semantics, schema/session statements, or
+transactions. Those remain later planner/transaction milestones. The complete
+API, accounting,
 execution, error, adapter, and persistence contract is in [prepared statements
 and bound portals](SQL_PREPARED_STATEMENTS.md).
 
@@ -558,10 +562,25 @@ Core routing still hashes the exact key bytes, derives a versioned virtual
 bucket, and reads the final physical shard from the snapshot without querying
 SQLite. The generation-1 ranges reproduce prior modulo placement for every
 supported initial shard count, including counts that do not divide 4,096.
-Point reads and writes can therefore target one owner. Unpinned logical reads
-still require the bounded shard `UNION ALL`/scatter and merge work in issues
-#57 and #58; catalog registration does not make that execution path complete.
-The existing admin browser remains an explicit physical-shard diagnostic.
+Point reads and writes can therefore target one owner. The logical read path
+uses this same metadata to select targets: exact inference visits one owner,
+finite inference visits each distinct owner, unconstrained Sharded inference
+visits every shard, and `Global` or table-free reads visit canonical shard 0
+once. Supported multi-shard reads run with at most eight shard tasks and merge
+in ascending physical-shard order as `UNION ALL`, without deduplicating rows.
+Catalog registration establishes ownership; it never copies every Sharded row
+into every file. The admin browser consumes the same placement metadata: it
+targets every file for Sharded tables and canonical shard 0 once for Global
+tables, then exposes one bounded shard-major logical page rather than a shard
+selector.
+
+The initial scatter executor accepts only a row-local single-table `SELECT`
+whose translated SQL can run unchanged on every target. It rejects
+multi-shard `DISTINCT`, aggregate or other function calls, grouping, ordering,
+limit/offset, joins, subqueries, CTEs, set operations, and windows because
+concatenating independently evaluated shard results would not implement their
+global SQL semantics. A statement routed to one shard, including a `Global`
+read on shard 0, is not subject to that multi-shard restriction.
 Version-5 adoption preserves legacy application schema and data and does not
 implicitly register it.
 
@@ -603,19 +622,24 @@ clonable. Frontends may issue concurrent calls against one borrowed session,
 but the engine serializes them; the HTTP adapter instead creates an independent
 session for every request.
 
-The current routing context is an optional caller-supplied shard key. Routed
-execute and query operations require that context, and the engine alone hashes
-it and reports the selected shard in `Routed<T>`. `Statement` owns its SQL text
-and typed parameters so an adapter can hand work across the asynchronous
-boundary without borrowing protocol buffers. Prepared statements and portals
+The current routing context is an optional caller-supplied shard key. Legacy
+routed execute and query operations require that context, and the engine alone
+hashes it and reports the selected shard in `Routed<T>`. Catalog-aware logical
+reads instead derive their physical targets from the statement's inferred keys
+and registered placement metadata and report those targets with the combined
+result. `Statement` owns its SQL text and typed parameters so an adapter can
+hand work across the asynchronous boundary without borrowing protocol buffers.
+Prepared statements and portals
 are session-scoped logical objects; binding captures the routing context so a
 later session change cannot retarget an existing portal. `EngineStatus` exposes
 the shard count and prepared-state limits needed by health/configuration
 reporting without exposing the storage implementation.
 
 HTTP SQL state remains request-local: each execute or query request creates a
-fresh session and initializes its routing context from the request's
-`shard_key`. Each admin inspection likewise creates a fresh core session but
+fresh session. Execute and empty-catalog legacy query initialize routing from
+the request's `shard_key`; a populated-catalog query selects logical targets
+from catalog metadata and does not use a caller key to narrow its shard set.
+Each admin inspection likewise creates a fresh core session but
 selects a validated physical shard through the dedicated read-only boundary;
 the count handler coordinates multiple such explicitly bounded inspections.
 Consequently, session settings and transactions cannot span HTTP requests. The
@@ -654,6 +678,15 @@ When a shard has no active slot and its admission queue is full, a new operation
 fails immediately with retryable `Busy`, which the HTTP adapter maps to 503.
 Capacity for routed work belongs to its selected shard: saturation on shard A
 neither consumes shard B's slots nor delays work already admitted there.
+
+A logical multi-shard read admits one outer operation and schedules no more
+than eight shard tasks at once. Each child uses the independent pool for its
+physical file, so SQLite writes to other shard files retain their own
+connections and transaction locks while the read is gathering. Target order is
+stable even though the child reads may complete in another order. The first
+child failure cancels outstanding children, waits for their SQLite cleanup, and
+returns only the error; BriskDB never exposes the successfully completed prefix
+as a partial logical result.
 
 Schema migration uses a separate, shared admission gate. Transitioning from
 `Ready` to `Migrating` immediately rejects new ordinary operations and a second
@@ -743,7 +776,10 @@ SQLite control policy. Prepare, bind, describe, and portal execution expose the
 same `*_with_context` boundary as raw operations; explicit-shard inspection has
 the same controlled form. Queries, inspection pages, and prepared row results
 account a stable logical representation while stepping SQLite and before
-cloning payloads. A row or byte overflow returns no partial `ResultSet`;
+cloning payloads. A logical scatter shares one budget, absolute deadline, and
+cancellation source across all targets rather than resetting any of them per
+shard. A row or byte overflow or any child failure returns no partial
+`ResultSet`;
 row-producing writes are rejected so early termination cannot hide DML effects.
 The exact accounting contract is documented in [request
 controls](REQUEST_CONTROLS.md).

@@ -18,7 +18,7 @@
       <div class="brand-mark" aria-hidden="true">B</div>
       <p class="eyebrow">BriskDB</p>
       <h1 id="login-title">Open the data browser</h1>
-      <p class="muted">Inspect tables and rows on one physical shard at a time.</p>
+      <p class="muted">Inspect logical tables and rows across the files that store them.</p>
       <form id="login-form">
         <label for="username">Username</label>
         <input id="username" name="username" autocomplete="username" required>
@@ -48,9 +48,9 @@
     <div class="workspace">
       <aside class="sidebar" aria-label="Database navigation">
         <div class="sidebar-section">
-          <label for="shard-select" class="section-label">Physical shard</label>
-          <select id="shard-select"></select>
-          <p class="sidebar-note">Each table list and row page comes from this shard only.</p>
+          <p class="section-label">Logical database</p>
+          <strong class="database-name">default</strong>
+          <p class="sidebar-note">Sharded tables combine each row-owning file. Global tables are read once.</p>
         </div>
         <div class="sidebar-section tables-section">
           <div class="section-heading">
@@ -64,7 +64,7 @@
       <main class="content">
         <div class="content-header">
           <div>
-            <p id="shard-kicker" class="eyebrow">Physical shard 0</p>
+            <p id="scope-kicker" class="eyebrow">Logical database · default</p>
             <h1 id="table-title">Choose a table</h1>
             <p id="table-subtitle" class="muted">Select an application table to inspect its rows.</p>
             <p id="record-count" class="record-count" role="status" aria-live="polite" aria-atomic="true" aria-busy="false">No total loaded</p>
@@ -90,7 +90,7 @@
           </div>
           <div id="table-wrap" class="table-wrap hidden">
             <table>
-              <caption id="table-caption">Rows from the selected physical shard</caption>
+              <caption id="table-caption">Logical table rows</caption>
               <thead id="data-head"></thead>
               <tbody id="data-body"></tbody>
             </table>

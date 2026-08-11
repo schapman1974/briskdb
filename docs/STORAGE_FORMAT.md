@@ -313,15 +313,16 @@ schema, and rows. Registration does not inspect or repartition existing row
 data, which is why it accepts only empty declared physical tables. Raw HTTP
 execute/query remains caller-key-only while this catalog is empty. Once
 populated, it parses and strictly translates one SQLite common-subset statement,
-consults placement, and permits only one safe physical target; undeclared and
-Catalog targets fail closed, Global reads use shard 0, and Global writes require
-a future replication operation.
+consults placement, keeps writes on one proven owner, and selects the relevant
+owner set for supported logical reads; undeclared and Catalog targets fail
+closed, Global reads use shard 0, and Global writes require a future replication
+operation.
 
 The authoritative catalog supplies placement to inference, planning, prepared
-execution, and later import/query layers. It does not itself implement logical
-multi-shard execution. Unpinned sharded reads still require the bounded
-scatter/`UNION ALL` and merge work tracked by issues #57 and #58; the current
-physical admin browser is not that logical query surface.
+execution, import, logical scatter/gather, and the admin browser. Runtime
+coordination now provides bounded `UNION ALL` semantics without changing the
+manifest or shard-file format. Later planner issues extend global ordering,
+aggregation, and pagination semantics for arbitrary client SQL.
 
 ### Application-schema migration journal
 

@@ -10,10 +10,10 @@ deferred to issue #31.
 
 The existing `Engine::execute`, `query`, `broadcast`, and `status` methods, the
 crate-private explicit-shard inspection operation, plus `prepare_statement`,
-`bind_statement`, `describe_prepared`, and `execute_portal`, use a default
-`RequestContext`. `broadcast` now means a journaled application-schema
-migration. Frontends that have their own cancellation or deadline source can
-call the corresponding `*_with_context` method:
+`bind_statement`, `describe_prepared`, `execute_portal`, and their logical read
+counterparts use a default `RequestContext`. `broadcast` now means a journaled
+application-schema migration. Frontends that have their own cancellation or
+deadline source can call the corresponding `*_with_context` method:
 
 ```rust
 use std::time::Duration;
@@ -52,10 +52,10 @@ SQLite configuration or statement work proceeds.
 Prepared operations use the same boundary. Prepare and a schema-refreshing
 describe can wait for shard 0 and transient SQLite metadata compilation. Bind
 can wait for the serialized session before it validates and snapshots values.
-Portal execution can wait for its selected shard and runs with the same
-exact-handle interruption and cleanup as raw execution. Cancellation before a
-prepared object is published leaves the session cache unchanged; a cancelled
-or failed execution retains the existing portal.
+Portal execution can wait for its selected shard or logical target set and runs
+with the same exact-handle interruption and cleanup as raw execution.
+Cancellation before a prepared object is published leaves the session cache
+unchanged; a cancelled or failed execution retains the existing portal.
 
 Completion wins a very close race with cancellation. A statement that is known
 to have completed successfully returns success rather than a misleading
@@ -100,18 +100,29 @@ reported as read-only. The prepared executor likewise rejects row-producing
 writes. These rules prevent an early result-budget failure from accompanying a
 partially consumed DML `RETURNING` statement. Raw execute, prepared affected-row
 results, and schema migration do not materialize a `ResultSet` and are
-unaffected by query result budgets. A future scatter/gather implementation must
-apply one budget to the combined result, not a fresh budget for every shard.
+unaffected by query result budgets. A logical scatter applies one budget to the
+combined result, including one result envelope and one set of column metadata;
+it does not grant every shard a fresh row or byte allowance.
+
+Logical scatter/gather schedules at most eight shard tasks concurrently. All
+children inherit the operation's one absolute deadline and sticky cancellation
+source. Cancellation, deadline expiry, a result-budget overflow, inconsistent
+column metadata, or any shard error cancels outstanding children and waits for
+their cleanup. The caller receives only the error, never rows from the shards
+that happened to finish first. Successful results are concatenated in ascending
+physical-shard order and keep duplicate rows.
 
 The `/admin` browser independently caps a requested page at 200 returned rows
 and validates offsets no greater than 1,000,000. It may inspect one additional
 row to decide whether another page exists; that row is not serialized. The
-inspection still uses the engine's effective logical-byte and row budgets, so a
-lower configured engine limit or a byte-heavy page can return `LimitExceeded`
-with no partial page. Every offset page is a separate request and consumes
-capacity only from its selected physical shard. It is not a global budget,
-cross-shard read, or multi-page snapshot. The continuation flag is false if the
-next calculated offset would exceed the browser's 1,000,000 cap.
+physical inspections and their merged logical page use the engine's configured
+row and logical-byte limits, so a lower limit or byte-heavy page can return
+`LimitExceeded` with no partial page. Placement selects the targets: every file
+for Sharded tables and shard 0 once for Global tables. At most eight inspections
+run concurrently, and only the shard-major slices needed for the page are
+materialized. Every offset page is a separate request, not a retained
+multi-file snapshot. The continuation flag is false if the next calculated
+offset would exceed the browser's 1,000,000 cap.
 
 ## Prepared-session limits
 

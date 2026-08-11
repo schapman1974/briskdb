@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
-    core::{DataType, Database, Engine, EngineError, ResultSet, Routed, Statement, Value},
+    core::{
+        DataType, Database, Engine, EngineError, Executed, ResultSet, Routed, Statement, Value,
+    },
     protocol::error::http_error,
 };
 
@@ -69,6 +71,17 @@ struct RoutedSqlRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct QueryRequest {
+    /// Retained for empty-catalog compatibility. Registered-table reads are
+    /// routed from catalog metadata and SQL predicates instead.
+    #[serde(default)]
+    shard_key: Option<String>,
+    sql: String,
+    #[serde(default)]
+    params: Vec<JsonValue>,
+}
+
+#[derive(Debug, Deserialize)]
 struct BroadcastRequest {
     sql: String,
 }
@@ -81,7 +94,10 @@ struct ExecuteResponse {
 
 #[derive(Debug, Serialize)]
 struct QueryResponse {
-    shard: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shard: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shards: Option<Vec<u16>>,
     columns: Vec<QueryColumn>,
     rows: Vec<Vec<JsonValue>>,
 }
@@ -119,7 +135,7 @@ async fn execute(
 
 async fn query(
     State(state): State<HttpState>,
-    Json(request): Json<RoutedSqlRequest>,
+    Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let engine = state.engine;
     let params = request
@@ -128,14 +144,18 @@ async fn query(
         .map(json_to_value)
         .collect::<Vec<_>>();
     let session = engine.session();
-    session.set_routing_key(request.shard_key).await?;
-    let Routed {
-        shard,
+    if engine.catalog().tables().is_empty() {
+        if let Some(shard_key) = request.shard_key {
+            session.set_routing_key(shard_key).await?;
+        }
+    }
+    let Executed {
+        shards,
         value: result,
     } = engine
-        .query(&session, Statement::new(request.sql, params))
+        .query_logical(&session, Statement::new(request.sql, params))
         .await?;
-    let response = result_set_to_query_response(shard, result);
+    let response = result_set_to_query_response(shards, result);
 
     Ok(Json(response))
 }
@@ -189,7 +209,11 @@ fn value_to_json(value: Value) -> JsonValue {
     }
 }
 
-fn result_set_to_query_response(shard: u16, result: ResultSet) -> QueryResponse {
+fn result_set_to_query_response(shards: Vec<u16>, result: ResultSet) -> QueryResponse {
+    let (shard, shards) = match shards.as_slice() {
+        [shard] => (Some(*shard), None),
+        _ => (None, Some(shards)),
+    };
     let (columns, rows) = result.into_parts();
     let columns = columns
         .into_iter()
@@ -205,6 +229,7 @@ fn result_set_to_query_response(shard: u16, result: ResultSet) -> QueryResponse 
 
     QueryResponse {
         shard,
+        shards,
         columns,
         rows,
     }
@@ -284,7 +309,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        core::{Column, DataType, EngineErrorKind, EngineOptions, ResultLimits, Row},
+        core::{
+            Column, DataType, EngineErrorKind, EngineOptions, ResultLimits, Row, ShardKeyMetadata,
+            ShardKeyType, TableDeclaration,
+        },
         sql::{
             MAX_PARSED_SQL_BYTES, SqlDialect, normalize_placeholders, parse, validate_common_subset,
         },
@@ -415,6 +443,107 @@ mod tests {
                     "rows": [["widget-1", "First widget"]]
                 }),
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_sharded_query_needs_no_shard_key_and_returns_all_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE events (
+                    tenant_key TEXT NOT NULL PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "events",
+                    ShardKeyMetadata::new("tenant_key", ShardKeyType::Text).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+
+        let tenant_keys = [0_u16, 1_u16].map(|expected_shard| {
+            (0_u64..)
+                .map(|candidate| format!("tenant-{expected_shard}-{candidate}"))
+                .find(|candidate| database.shard_for_key(candidate.as_bytes()) == expected_shard)
+                .unwrap()
+        });
+
+        for (shard, tenant_key, payload) in [
+            (0_u16, tenant_keys[0].as_str(), "zero payload"),
+            (1_u16, tenant_keys[1].as_str(), "one payload"),
+        ] {
+            let inserted = database
+                .execute_routed(
+                    tenant_key,
+                    "INSERT INTO events (tenant_key, payload) VALUES (?1, ?2)",
+                    &[Value::from(tenant_key), Value::from(payload)],
+                )
+                .unwrap();
+            assert_eq!(inserted.shard, shard);
+            assert_eq!(inserted.value, 1);
+        }
+
+        let application = engine_router(Arc::new(database));
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/query",
+                Some(json!({
+                    "sql": "SELECT tenant_key, payload FROM events"
+                })),
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({
+                    "shards": [0, 1],
+                    "columns": [
+                        {"name": "tenant_key", "data_type": "unknown"},
+                        {"name": "payload", "data_type": "unknown"}
+                    ],
+                    "rows": [
+                        [tenant_keys[0], "zero payload"],
+                        [tenant_keys[1], "one payload"]
+                    ]
+                })
+            )
+        );
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/query",
+                Some(json!({
+                    "shard_key": tenant_keys[0],
+                    "sql": "SELECT tenant_key, payload FROM events"
+                })),
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({
+                    "shards": [0, 1],
+                    "columns": [
+                        {"name": "tenant_key", "data_type": "unknown"},
+                        {"name": "payload", "data_type": "unknown"}
+                    ],
+                    "rows": [
+                        [tenant_keys[0], "zero payload"],
+                        [tenant_keys[1], "one payload"]
+                    ]
+                })
+            ),
+            "registered logical reads must not be narrowed by a legacy shard key"
         );
     }
 
@@ -1110,6 +1239,20 @@ mod tests {
     }
 
     #[test]
+    fn only_reads_may_omit_an_explicit_shard_key() {
+        assert!(
+            serde_json::from_value::<QueryRequest>(json!({"sql": "SELECT payload FROM events"}))
+                .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<RoutedSqlRequest>(json!({
+                "sql": "INSERT INTO events (tenant_key, payload) VALUES (?1, ?2)"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn typed_values_encode_to_explicit_legacy_json_shapes() {
         assert_eq!(
             value_to_json(Value::from(u64::MAX)),
@@ -1179,7 +1322,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            serde_json::to_value(result_set_to_query_response(3, result)).unwrap(),
+            serde_json::to_value(result_set_to_query_response(vec![3], result)).unwrap(),
             json!({
                 "shard": 3,
                 "columns": [
@@ -1201,14 +1344,35 @@ mod tests {
     fn result_encoding_keeps_valid_zero_column_shapes() {
         let empty = ResultSet::new(Vec::new(), Vec::new()).unwrap();
         assert_eq!(
-            serde_json::to_value(result_set_to_query_response(1, empty)).unwrap(),
+            serde_json::to_value(result_set_to_query_response(vec![1], empty)).unwrap(),
             json!({"shard": 1, "columns": [], "rows": []})
         );
 
         let empty_row = ResultSet::new(Vec::new(), vec![Row::new(Vec::new())]).unwrap();
         assert_eq!(
-            serde_json::to_value(result_set_to_query_response(2, empty_row)).unwrap(),
+            serde_json::to_value(result_set_to_query_response(vec![2], empty_row)).unwrap(),
             json!({"shard": 2, "columns": [], "rows": [[]]})
+        );
+    }
+
+    #[test]
+    fn scatter_result_encoding_reports_every_visited_shard() {
+        let result = ResultSet::new(
+            vec![Column::new("payload", DataType::Text)],
+            vec![
+                Row::new(vec![Value::from("from shard zero")]),
+                Row::new(vec![Value::from("from shard one")]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(result_set_to_query_response(vec![0, 1], result)).unwrap(),
+            json!({
+                "shards": [0, 1],
+                "columns": [{"name": "payload", "data_type": "text"}],
+                "rows": [["from shard zero"], ["from shard one"]]
+            })
         );
     }
 }
