@@ -662,11 +662,10 @@ async fn browseable_table_storage_with_context(
             .pop()
             .expect("the exact row count was checked")
             .into_values();
-        if let [Value::Text(observed), Value::Int64(without_rowid)] = values.as_slice()
-            && observed == table
-            && matches!(*without_rowid, 0 | 1)
-        {
-            return Ok(*without_rowid == 1);
+        if let [Value::Text(observed), Value::Int64(without_rowid)] = values.as_slice() {
+            if observed == table && matches!(*without_rowid, 0 | 1) {
+                return Ok(*without_rowid == 1);
+            }
         }
     }
     Err(EngineError::new(
@@ -750,15 +749,16 @@ fn select_local_order(
         };
     }
 
-    if primary_key.is_empty()
-        && let [column] = declared_primary_key.as_slice()
-        && column.declared_type.trim().eq_ignore_ascii_case("INTEGER")
-    {
-        return Ok(LocalOrder::PrimaryKey(vec![PrimaryKeyTerm {
-            column: column.name.clone(),
-            collation: None,
-            descending: false,
-        }]));
+    if primary_key.is_empty() {
+        if let [column] = declared_primary_key.as_slice() {
+            if column.declared_type.trim().eq_ignore_ascii_case("INTEGER") {
+                return Ok(LocalOrder::PrimaryKey(vec![PrimaryKeyTerm {
+                    column: column.name.clone(),
+                    collation: None,
+                    descending: false,
+                }]));
+            }
+        }
     }
 
     if !primary_key.is_empty() && declared_primary_key.iter().all(|column| column.not_null) {
