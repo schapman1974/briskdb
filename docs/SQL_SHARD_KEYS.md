@@ -76,7 +76,7 @@ assignments do not establish a routing key at this layer.
 
 The finite proof grammar is deliberately small:
 
-- direct equality between an `Int64` or `Binary` shard-key column and a
+- direct equality between an `Int64`, `Text`, or `Binary` shard-key column and a
   compatible literal or placeholder, in either operand order, produces one
   value;
 - transparent parentheses do not change that result;
@@ -92,13 +92,12 @@ such as inequalities, `IN`, `BETWEEN`, `LIKE`, `NOT`, arithmetic, and `CASE`
 remain `Unconstrained` unless another `AND` branch independently proves a
 finite set.
 
-The current catalog declares UTF-8 `Text` key values but does not declare or
-enforce their comparison collation. A non-null `Text` equality predicate is
-therefore `Unconstrained`, even when its literal or bound value has the correct
-type: case- or accent-folding equality could match a different key identity.
-`Text = NULL` remains `Contradiction` because shard-key non-nullness is part of
-the declaration. Text extraction from `INSERT` is unaffected because it
-reports the value being supplied rather than proving comparison semantics.
+Authoritative table registration requires every UTF-8 `Text` shard-key column
+to use SQLite `BINARY` collation and later schema migration must preserve it.
+Inference can therefore treat a compatible non-null Text equality as an exact
+byte-for-byte proof. It performs no case folding, accent folding, or Unicode
+normalization. `Text = NULL` remains `Contradiction` because shard-key
+non-nullness is part of the declaration.
 
 ## INSERT inference
 
@@ -125,7 +124,7 @@ Inference uses the shard-key type declared by the catalog:
 | Catalog key type | Accepted SQL literal | Accepted bound `Value` |
 | --- | --- | --- |
 | `Int64` | An integral decimal magnitude with nested unary `+`/`-`, within the signed 64-bit range | `Int64`, or `UInt64` when it converts losslessly to `i64` |
-| `Text` | A single-quoted string for `INSERT` extraction; predicate equality remains unconstrained without collation metadata | Valid UTF-8 `Text`, with the same predicate limitation |
+| `Text` | A single-quoted UTF-8 string for predicate equality or `INSERT` extraction | Valid UTF-8 `Text`; equality is exact under the registered `BINARY` collation contract |
 | `Binary` | None in the first common literal subset | `Binary` |
 
 Compatible literal and bound values become the same `ShardKeyValue` form.
@@ -160,9 +159,12 @@ snapshot, and a borrowed parameter slice. It does not mutate the catalog,
 manifest, shard files, configuration, session, or caller values. It introduces
 no storage-format or network-contract change.
 
-The current HTTP execute, query, and migration paths do not invoke parsing,
-common-subset validation, normalization, or inference. They retain their
-existing raw SQLite SQL and caller-provided `shard_key` behavior.
+Populated-catalog HTTP execute/query invokes SQLite parsing, common-subset
+validation, normalization, inference, and planning. The caller-provided
+`shard_key` remains an explicit route that must agree by physical shard with
+finite inference. An empty catalog retains the legacy raw route. The migration
+path does not infer row routes; it preserves exact SQL identity and applies its
+separate authoritative-schema restrictions.
 
 The implemented synchronous
 [`Engine::plan_bound_statement`](SQL_PLANNING.md) API invokes inference at
@@ -184,9 +186,9 @@ Tests cover all result categories; literal and bound keys in SQLite,
 PostgreSQL, and MySQL syntax; numbered gaps and repeated parameters; identifier
 quoting, aliases, and qualifiers; Boolean intersection, union, and
 contradiction; `SELECT`, `UPDATE`, and `DELETE`; multi-row inserts and retained
-duplicates; all three catalog key types and the conservative text-collation
-boundary; range, type, text, null, database,
+duplicates; all three catalog key types and authoritative `BINARY` Text
+equality; range, type, text, null, database,
 table, statement-index, and arity errors; empty and multi-statement batches;
 redacted diagnostics and `Debug`; concurrent deterministic inference; and
-successful inference after an independent error. Raw HTTP regressions continue
-to prove that this opt-in API does not change current execution behavior.
+successful inference after an independent error. HTTP regressions prove the
+empty-catalog legacy boundary and populated-catalog inference enforcement.

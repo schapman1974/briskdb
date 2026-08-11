@@ -1,18 +1,18 @@
 //! Physical-shard identity, provisioning, and strict reopen validation.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
 use rusqlite::{
-    Connection, MAIN_DB, OpenFlags, TransactionBehavior,
+    Connection, MAIN_DB, OpenFlags, OptionalExtension, TransactionBehavior,
     hooks::{AuthAction, AuthContext, Authorization},
 };
 
 use crate::{
-    core::{EngineError, EngineErrorKind, EngineResult},
+    core::{Catalog, EngineError, EngineErrorKind, EngineResult, ShardKeyType, TablePlacement},
     sqlite_error,
 };
 
@@ -551,6 +551,7 @@ pub(super) fn preflight_schema_migration_with_digest(
 }
 
 /// Connection-level digesting preflight for a cancellation-aware coordinator.
+#[cfg(test)]
 pub(super) fn preflight_schema_migration_on_connection_with_digest(
     connection: &mut Connection,
     path: &Path,
@@ -560,6 +561,58 @@ pub(super) fn preflight_schema_migration_on_connection_with_digest(
     layout: &ShardLayout,
     sql: &str,
 ) -> EngineResult<(SchemaMigrationShardState, SchemaDigest)> {
+    preflight_schema_migration_on_connection_with_digest_inner(
+        connection,
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+        None,
+    )
+}
+
+/// Connection-level digesting preflight that also preserves the complete
+/// authoritative table catalog. The catalog check runs inside the rollback
+/// transaction after the SQL batch, before its target digest is trusted.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn preflight_schema_migration_on_connection_with_digest_and_catalog(
+    connection: &mut Connection,
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+    sql: &str,
+    catalog: &Catalog,
+) -> EngineResult<(SchemaMigrationShardState, SchemaDigest)> {
+    preflight_schema_migration_on_connection_with_digest_inner(
+        connection,
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+        Some(catalog),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_schema_migration_on_connection_with_digest_inner(
+    connection: &mut Connection,
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+    sql: &str,
+    catalog: Option<&Catalog>,
+) -> EngineResult<(SchemaMigrationShardState, SchemaDigest)> {
+    if catalog.is_some_and(|catalog| !catalog.tables().is_empty()) {
+        crate::sql::validate_authoritative_schema_migration(sql)?;
+    }
     let initial = validate_schema_migration_connection(
         connection,
         path,
@@ -569,6 +622,9 @@ pub(super) fn preflight_schema_migration_on_connection_with_digest(
         layout,
     )?;
     if initial == SchemaMigrationShardState::Target {
+        if let Some(catalog) = catalog {
+            validate_registered_table_schema(connection, catalog)?;
+        }
         let digest = calculate_schema_digest(connection, target_generation)?;
         return Ok((initial, digest));
     }
@@ -596,6 +652,9 @@ pub(super) fn preflight_schema_migration_on_connection_with_digest(
             target_generation,
             layout,
         )?;
+        if let Some(catalog) = catalog {
+            validate_registered_table_schema(connection, catalog)?;
+        }
         let digest = calculate_schema_digest(connection, target_generation)?;
         return Ok((state, digest));
     }
@@ -604,6 +663,9 @@ pub(super) fn preflight_schema_migration_on_connection_with_digest(
     execute_schema_migration_batch(&transaction, sql)?;
     ensure_reserved_schema_unchanged(&reserved_before, &transaction)?;
     ensure_no_foreign_key_violations(&transaction)?;
+    if let Some(catalog) = catalog {
+        validate_registered_table_schema(&transaction, catalog)?;
+    }
     let target_digest = calculate_schema_digest(&transaction, target_generation)?;
     transaction.rollback().map_err(sqlite_error::storage)?;
 
@@ -622,6 +684,399 @@ pub(super) fn preflight_schema_migration_on_connection_with_digest(
         ));
     }
     Ok((state, target_digest))
+}
+
+/// Verify that one physical shard still implements the complete authoritative
+/// logical table catalog after a tentative schema migration.
+///
+/// An empty table catalog predates authoritative registration and deliberately
+/// retains the unrestricted migration behavior. Once any table is registered,
+/// every physical application table must be declared Sharded or Global, every
+/// such declaration must have a physical table, and Catalog declarations must
+/// remain manifest-only. Sharded keys additionally retain the representation
+/// required by deterministic routing.
+fn validate_registered_table_schema(
+    connection: &Connection,
+    catalog: &Catalog,
+) -> EngineResult<()> {
+    if catalog.tables().is_empty() {
+        return Ok(());
+    }
+
+    let has_application_trigger = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM main.sqlite_schema
+                 WHERE type = 'trigger' AND name NOT GLOB 'sqlite_*'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    if has_application_trigger {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration violates the authoritative table catalog: application triggers are not supported",
+        ));
+    }
+    let has_application_virtual_table = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_list
+                 WHERE schema = 'main' AND type = 'virtual'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    if has_application_virtual_table {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration violates the authoritative table catalog: virtual tables are not supported",
+        ));
+    }
+
+    let expected = catalog
+        .tables()
+        .iter()
+        .filter(|table| {
+            matches!(
+                table.placement(),
+                TablePlacement::Sharded(_) | TablePlacement::Global
+            )
+        })
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    let observed = application_table_names(connection)?;
+    if observed != expected {
+        let missing = expected.difference(&observed).next().map(String::as_str);
+        let unexpected = observed.difference(&expected).next().map(String::as_str);
+        let detail = match (missing, unexpected) {
+            (Some(missing), Some(unexpected)) => {
+                format!("missing table {missing} and found undeclared table {unexpected}")
+            }
+            (Some(missing), None) => format!("missing table {missing}"),
+            (None, Some(unexpected)) => format!("found undeclared table {unexpected}"),
+            (None, None) => "physical table set differs".to_owned(),
+        };
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("schema migration violates the authoritative table catalog: {detail}"),
+        ));
+    }
+
+    for table in catalog.tables() {
+        if matches!(table.placement(), TablePlacement::Catalog) {
+            let has_physical_shadow = connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM main.sqlite_schema
+                         WHERE name = ?1 COLLATE NOCASE
+                           AND type IN ('table', 'view')
+                     )",
+                    [table.name()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sqlite_error::storage)?;
+            if has_physical_shadow {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "schema migration violates the authoritative table catalog: catalog table {} has a physical shadow",
+                        table.name()
+                    ),
+                ));
+            }
+            continue;
+        }
+        let TablePlacement::Sharded(shard_key) = table.placement() else {
+            validate_authoritative_table_constraints(connection, table.name(), None)?;
+            continue;
+        };
+        let mut statement = connection
+            .prepare(
+                "SELECT name, type, \"notnull\", pk, hidden
+                 FROM pragma_table_xinfo(?1)
+                 ORDER BY cid",
+            )
+            .map_err(sqlite_error::storage)?;
+        let columns = statement
+            .query_map([table.name()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(sqlite_error::storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error::storage)?;
+        let Some((_, declared_type, not_null, primary_key, hidden)) = columns
+            .iter()
+            .find(|(name, _, _, _, _)| name == shard_key.column())
+        else {
+            return Err(registered_shard_key_error(
+                table.name(),
+                shard_key.column(),
+                "is missing",
+            ));
+        };
+        if *hidden != 0
+            || !registered_shard_key_is_non_null(
+                connection,
+                table.name(),
+                declared_type,
+                *not_null,
+                *primary_key,
+            )?
+        {
+            return Err(registered_shard_key_error(
+                table.name(),
+                shard_key.column(),
+                "must remain a visible physically non-null column",
+            ));
+        }
+        if !shard_key_affinity_is_compatible(shard_key.key_type(), declared_type) {
+            return Err(registered_shard_key_error(
+                table.name(),
+                shard_key.column(),
+                "has an incompatible SQLite declared type",
+            ));
+        }
+        if matches!(shard_key.key_type(), ShardKeyType::Text)
+            && !shard_key_uses_binary_collation(connection, table.name(), shard_key.column())?
+        {
+            return Err(registered_shard_key_error(
+                table.name(),
+                shard_key.column(),
+                "must retain SQLite BINARY collation",
+            ));
+        }
+        validate_authoritative_table_constraints(connection, table.name(), Some(shard_key))?;
+    }
+    Ok(())
+}
+
+/// Enforce constraints that SQLite can only check inside one physical file.
+/// Foreign keys need an explicit co-location policy that is not implemented
+/// yet. Every unique key of a Sharded table must contain its routing key using
+/// BINARY collation so two different owners cannot both accept the same value.
+pub(super) fn validate_authoritative_table_constraints(
+    connection: &Connection,
+    table: &str,
+    shard_key: Option<&crate::core::ShardKeyMetadata>,
+) -> EngineResult<()> {
+    let has_foreign_key = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list(?1))",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    if has_foreign_key {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "table {table} declares a foreign key, but authoritative foreign-key co-location is not supported"
+            ),
+        ));
+    }
+
+    let Some(shard_key) = shard_key else {
+        return Ok(());
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT name, origin
+             FROM pragma_index_list(?1)
+             WHERE \"unique\" <> 0
+             ORDER BY seq",
+        )
+        .map_err(sqlite_error::storage)?;
+    let unique_indexes = statement
+        .query_map([table], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sqlite_error::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error::storage)?;
+    let has_primary_key_index = unique_indexes.iter().any(|(_, origin)| origin == "pk");
+
+    for (index, _) in &unique_indexes {
+        let mut columns = connection
+            .prepare(
+                "SELECT name, coll
+                 FROM pragma_index_xinfo(?1)
+                 WHERE key = 1
+                 ORDER BY seqno",
+            )
+            .map_err(sqlite_error::storage)?;
+        let indexed_columns = columns
+            .query_map([index], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .map_err(sqlite_error::storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error::storage)?;
+        let has_shard_term = indexed_columns
+            .iter()
+            .any(|(column, _)| column.as_deref() == Some(shard_key.column()));
+        if !has_shard_term {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "unique index {index} on sharded table {table} does not include shard key {}",
+                    shard_key.column()
+                ),
+            ));
+        }
+        let has_binary_shard_term = indexed_columns.iter().any(|(column, collation)| {
+            column.as_deref() == Some(shard_key.column())
+                && collation
+                    .as_deref()
+                    .is_some_and(|collation| collation.eq_ignore_ascii_case("BINARY"))
+        });
+        if !has_binary_shard_term {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "unique index {index} on sharded table {table} must use BINARY collation for shard key {}",
+                    shard_key.column()
+                ),
+            ));
+        }
+    }
+
+    if !has_primary_key_index {
+        let rowid_primary_key = connection
+            .query_row(
+                "SELECT name
+                 FROM pragma_table_xinfo(?1)
+                 WHERE pk <> 0
+                 ORDER BY pk
+                 LIMIT 1",
+                [table],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sqlite_error::storage)?;
+        if rowid_primary_key
+            .as_deref()
+            .is_some_and(|column| column != shard_key.column())
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "primary key on sharded table {table} does not include shard key {}",
+                    shard_key.column()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn shard_key_uses_binary_collation(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> EngineResult<bool> {
+    let (_, collation, _, _, _) = connection
+        .column_metadata(Some("main"), table, column)
+        .map_err(sqlite_error::storage)?;
+    Ok(collation.is_some_and(|name| name.to_bytes().eq_ignore_ascii_case(b"BINARY")))
+}
+
+fn registered_shard_key_is_non_null(
+    connection: &Connection,
+    table: &str,
+    declared_type: &str,
+    not_null: i64,
+    primary_key: i64,
+) -> EngineResult<bool> {
+    if not_null != 0 {
+        return Ok(true);
+    }
+    if primary_key == 0 || !declared_type.trim().eq_ignore_ascii_case("INTEGER") {
+        return Ok(false);
+    }
+    let has_primary_key_index = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_index_list(?1) WHERE origin = 'pk'
+             )",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(!has_primary_key_index)
+}
+
+fn application_table_names(connection: &Connection) -> EngineResult<BTreeSet<String>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM pragma_table_list
+             WHERE schema = 'main' AND type IN ('table', 'virtual')
+               AND name NOT GLOB 'sqlite_*'
+               AND name <> 'briskdb_shard_metadata'
+             ORDER BY name COLLATE BINARY",
+        )
+        .map_err(sqlite_error::storage)?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sqlite_error::storage)?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(sqlite_error::storage)
+}
+
+fn registered_shard_key_error(table: &str, column: &str, detail: &str) -> EngineError {
+    EngineError::new(
+        EngineErrorKind::FailedPrecondition,
+        format!(
+            "schema migration violates the authoritative table catalog: shard key {column} on table {table} {detail}"
+        ),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteAffinity {
+    Integer,
+    Text,
+    Blob,
+    Real,
+    Numeric,
+}
+
+fn shard_key_affinity_is_compatible(key_type: ShardKeyType, declared_type: &str) -> bool {
+    let declared_type = declared_type.to_ascii_uppercase();
+    let affinity = if declared_type.contains("INT") {
+        SqliteAffinity::Integer
+    } else if declared_type.contains("CHAR")
+        || declared_type.contains("CLOB")
+        || declared_type.contains("TEXT")
+    {
+        SqliteAffinity::Text
+    } else if declared_type.contains("BLOB") || declared_type.is_empty() {
+        SqliteAffinity::Blob
+    } else if declared_type.contains("REAL")
+        || declared_type.contains("FLOA")
+        || declared_type.contains("DOUB")
+    {
+        SqliteAffinity::Real
+    } else {
+        SqliteAffinity::Numeric
+    };
+    matches!(
+        (key_type, affinity),
+        (ShardKeyType::Int64, SqliteAffinity::Integer)
+            | (ShardKeyType::Text, SqliteAffinity::Text)
+            | (ShardKeyType::Binary, SqliteAffinity::Blob)
+    )
 }
 
 /// Atomically apply one journaled batch and its target generation, or strictly
@@ -2086,6 +2541,9 @@ mod tests {
     use rusqlite::hooks::TransactionOperation;
 
     use super::*;
+    use crate::core::{
+        IDENTIFIER_ENCODING_VERSION, LogicalDatabaseMetadata, ShardKeyMetadata, TableMetadata,
+    };
 
     const LAYOUT_ID: [u8; 16] = *b"brisk-layout-001";
     const SHARD_CRASH_SQL: &str = "\
@@ -2124,6 +2582,72 @@ mod tests {
         let shards = temp.path().join("shards");
         prepare_layout(&shards, shard_count, 0, &layout(ShardLayoutState::Creating)).unwrap();
         (temp, shards, layout(ShardLayoutState::Ready))
+    }
+
+    fn catalog_with_registered_tables() -> Catalog {
+        Catalog::from_validated_parts(
+            IDENTIFIER_ENCODING_VERSION,
+            0,
+            1,
+            vec![LogicalDatabaseMetadata::from_validated(
+                1,
+                "default".to_owned(),
+            )]
+            .into_boxed_slice(),
+            vec![
+                TableMetadata::from_validated(
+                    1,
+                    1,
+                    "accounts".to_owned(),
+                    TablePlacement::Sharded(ShardKeyMetadata::from_validated(
+                        "id".to_owned(),
+                        ShardKeyType::Int64,
+                    )),
+                ),
+                TableMetadata::from_validated(
+                    2,
+                    1,
+                    "audit_catalog".to_owned(),
+                    TablePlacement::Catalog,
+                ),
+                TableMetadata::from_validated(3, 1, "countries".to_owned(), TablePlacement::Global),
+            ]
+            .into_boxed_slice(),
+        )
+    }
+
+    fn empty_catalog() -> Catalog {
+        Catalog::from_validated_parts(
+            IDENTIFIER_ENCODING_VERSION,
+            0,
+            1,
+            vec![LogicalDatabaseMetadata::from_validated(
+                1,
+                "default".to_owned(),
+            )]
+            .into_boxed_slice(),
+            Vec::new().into_boxed_slice(),
+        )
+    }
+
+    fn preflight_with_catalog(
+        path: &Path,
+        ready: &ShardLayout,
+        sql: &str,
+        catalog: &Catalog,
+    ) -> EngineResult<(SchemaMigrationShardState, SchemaDigest)> {
+        let mut connection = open_required_file(path)?;
+        configure_busy_timeout(&connection)?;
+        preflight_schema_migration_on_connection_with_digest_and_catalog(
+            &mut connection,
+            path,
+            0,
+            0,
+            1,
+            ready,
+            sql,
+            catalog,
+        )
     }
 
     fn schema_object_exists(path: &Path, name: &str) -> bool {
@@ -2407,6 +2931,150 @@ mod tests {
         );
         assert_eq!(identity(&second), (SHARD_APPLICATION_ID, 0));
         assert!(!schema_object_exists(&second, "migrated_widgets"));
+    }
+
+    #[test]
+    fn migration_preflight_preserves_authoritative_table_catalog_and_shard_keys() {
+        let (_temp, shards, ready) = create_ready_layout(2);
+        let path = shard_path(&shards, 0);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE accounts (
+                     id INTEGER PRIMARY KEY,
+                     display_name TEXT NOT NULL
+                 ) STRICT;
+                 CREATE TABLE countries (
+                     code TEXT PRIMARY KEY,
+                     display_name TEXT NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        drop(connection);
+        let catalog = catalog_with_registered_tables();
+
+        let (state, _) = preflight_with_catalog(
+            &path,
+            &ready,
+            "CREATE INDEX accounts_display_name_idx ON accounts (display_name)",
+            &catalog,
+        )
+        .unwrap();
+        assert_eq!(state, SchemaMigrationShardState::Source);
+        assert!(!schema_object_exists(&path, "accounts_display_name_idx"));
+
+        for (sql, transient_object) in [
+            (
+                "INSERT INTO accounts (id, display_name) VALUES (1, 'duplicate')",
+                None,
+            ),
+            (
+                "UPDATE accounts SET display_name = upper(display_name)",
+                None,
+            ),
+            ("DELETE FROM accounts", None),
+            ("DROP TABLE accounts", None),
+            (
+                "DROP TABLE accounts;
+                 CREATE TABLE accounts (
+                     account_id INTEGER PRIMARY KEY,
+                     display_name TEXT NOT NULL
+                 ) STRICT",
+                None,
+            ),
+            (
+                "DROP TABLE accounts;
+                 CREATE TABLE accounts (
+                     id TEXT PRIMARY KEY,
+                     display_name TEXT NOT NULL
+                 ) STRICT",
+                None,
+            ),
+            (
+                "DROP TABLE accounts;
+                 CREATE TABLE accounts (
+                     id INTEGER PRIMARY KEY DESC,
+                     display_name TEXT NOT NULL
+                 )",
+                None,
+            ),
+            (
+                "DROP TABLE accounts;
+                 CREATE TABLE accounts (
+                     row_id INTEGER PRIMARY KEY,
+                     id INTEGER,
+                     display_name TEXT NOT NULL
+                 ) STRICT",
+                None,
+            ),
+            (
+                "CREATE TABLE undeclared (id INTEGER PRIMARY KEY) STRICT",
+                Some("undeclared"),
+            ),
+            (
+                "CREATE TABLE copied_accounts AS SELECT * FROM accounts",
+                Some("copied_accounts"),
+            ),
+            (
+                "CREATE UNIQUE INDEX accounts_display_unique ON accounts (display_name)",
+                Some("accounts_display_unique"),
+            ),
+            (
+                "CREATE TRIGGER accounts_move AFTER INSERT ON accounts
+                 BEGIN DELETE FROM accounts WHERE id = NEW.id; END",
+                Some("accounts_move"),
+            ),
+            (
+                "CREATE VIEW Audit_Catalog AS SELECT 1 AS id",
+                Some("Audit_Catalog"),
+            ),
+            (
+                "CREATE VIEW audit_catalog AS SELECT id FROM accounts",
+                Some("audit_catalog"),
+            ),
+        ] {
+            let error = preflight_with_catalog(&path, &ready, sql, &catalog).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition, "{sql}");
+            assert!(schema_object_exists(&path, "accounts"), "{sql}");
+            assert!(schema_object_exists(&path, "countries"), "{sql}");
+            if let Some(transient_object) = transient_object {
+                assert!(!schema_object_exists(&path, transient_object), "{sql}");
+            }
+            assert_eq!(identity(&path), (SHARD_APPLICATION_ID, 0), "{sql}");
+        }
+
+        let empty = empty_catalog();
+        let (state, _) = preflight_with_catalog(
+            &path,
+            &ready,
+            "CREATE TABLE legacy_unregistered (id INTEGER PRIMARY KEY) STRICT",
+            &empty,
+        )
+        .unwrap();
+        assert_eq!(state, SchemaMigrationShardState::Source);
+        assert!(!schema_object_exists(&path, "legacy_unregistered"));
+    }
+
+    #[test]
+    fn authoritative_unique_index_accepts_a_later_binary_shard_key_term() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE records (
+                     tenant_id TEXT NOT NULL COLLATE BINARY,
+                     email TEXT NOT NULL
+                 );
+                 CREATE UNIQUE INDEX records_unique ON records (
+                     tenant_id COLLATE NOCASE,
+                     tenant_id COLLATE BINARY,
+                     email
+                 );",
+            )
+            .unwrap();
+        let shard_key =
+            ShardKeyMetadata::from_validated("tenant_id".to_owned(), ShardKeyType::Text);
+
+        validate_authoritative_table_constraints(&connection, "records", Some(&shard_key)).unwrap();
     }
 
     #[test]

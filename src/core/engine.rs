@@ -16,8 +16,9 @@ use super::{
     Database, DescribeTarget, EngineError, EngineErrorKind, EngineOptions, EngineResult,
     EngineState, Lifecycle, LogicalDatabaseId, OperationControl, OperationLease, PortalId,
     PrepareRequest, PreparedExecution, PreparedStatementDescription, PreparedStatementId,
-    PreparedStatementLimits, RequestContext, ResultLimits, ResultSet, Routed, Session,
-    SessionInner, ShutdownReport, TablePlacement, Value, wait_for_cancellation, wait_pending,
+    PreparedStatementLimits, RawDataOperation, RequestContext, ResultLimits, ResultSet, Routed,
+    Session, SessionInner, ShutdownReport, TablePlacement, Value, wait_for_cancellation,
+    wait_pending,
 };
 use crate::{
     sql,
@@ -554,6 +555,14 @@ impl Engine {
             Ok(prepared) => prepared,
             Err(error) => return operation.finish(Err(error)),
         };
+        if let Err(error) = reject_catalog_prepared_target(
+            self.catalog(),
+            database,
+            translated.normalized_sql(),
+            translated.statement_parameters()[0].parameter_count(),
+        ) {
+            return operation.finish(Err(error));
+        }
         if let Err(error) = guard.prepared().ensure_statement_capacity() {
             return operation.finish(Err(error));
         }
@@ -866,8 +875,23 @@ impl Engine {
             Ok(key) => key.to_owned(),
             Err(error) => return operation.finish(Err(error)),
         };
-        let shard = self.inner.database.shard_for_key(routing_key.as_bytes());
         let (sql, params) = statement.into_parts();
+        let plan = match self.inner.database.raw_data_plan(
+            &routing_key,
+            &sql,
+            &params,
+            RawDataOperation::Execute,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let (shard, sql) = match plan {
+            Some(plan) => (plan.shard, plan.sqlite_sql),
+            None => (
+                self.inner.database.shard_for_key(routing_key.as_bytes()),
+                sql,
+            ),
+        };
 
         let value = self
             .run_on_shard(
@@ -920,8 +944,23 @@ impl Engine {
             Ok(key) => key.to_owned(),
             Err(error) => return operation.finish(Err(error)),
         };
-        let shard = self.inner.database.shard_for_key(routing_key.as_bytes());
         let (sql, params) = statement.into_parts();
+        let plan = match self.inner.database.raw_data_plan(
+            &routing_key,
+            &sql,
+            &params,
+            RawDataOperation::Query,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let (shard, sql) = match plan {
+            Some(plan) => (plan.shard, plan.sqlite_sql),
+            None => (
+                self.inner.database.shard_for_key(routing_key.as_bytes()),
+                sql,
+            ),
+        };
         let limits = operation.result_limits;
 
         let value = self
@@ -1347,6 +1386,41 @@ fn ensure_parameter_metadata(expected: usize, actual: usize) -> EngineResult<()>
     }
 }
 
+fn reject_catalog_prepared_target(
+    catalog: &super::Catalog,
+    database: LogicalDatabaseId,
+    normalized: &sql::NormalizedSql,
+    parameter_count: usize,
+) -> EngineResult<()> {
+    // Resolving a Global or Catalog target does not inspect predicate values.
+    // Supplying NULL placeholders therefore lets prepare enforce the Catalog
+    // boundary before SQLite tries to compile a manifest-only table name. Any
+    // value-dependent inference error belongs to bind-time planning and leaves
+    // the existing prepared-statement behavior unchanged.
+    let placeholders = vec![Value::Null; parameter_count];
+    let Ok(inference) = sql::infer_shard_keys(catalog, database, normalized, 0, &placeholders)
+    else {
+        return Ok(());
+    };
+    let Some(table) = inference
+        .table_id()
+        .and_then(|table| catalog.table_by_id(table))
+    else {
+        return Ok(());
+    };
+    if matches!(table.placement(), TablePlacement::Catalog) {
+        return Err(catalog_target_denied());
+    }
+    Ok(())
+}
+
+fn catalog_target_denied() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::PermissionDenied,
+        "catalog-placed tables cannot execute as client SQL",
+    )
+}
+
 fn prepared_execution_shard(
     plan: &BoundStatementPlan,
     catalog: &super::Catalog,
@@ -1371,10 +1445,7 @@ fn prepared_execution_shard(
             })?;
         match table.placement() {
             TablePlacement::Catalog => {
-                return Err(EngineError::new(
-                    EngineErrorKind::PermissionDenied,
-                    "catalog-placed tables cannot execute as client SQL",
-                ));
+                return Err(catalog_target_denied());
             }
             TablePlacement::Global => true,
             TablePlacement::Sharded(_) => {
@@ -1484,7 +1555,9 @@ mod tests {
     use tokio::{sync::oneshot, time::timeout};
 
     use super::*;
-    use crate::core::{Column, DataType, Row, SessionState};
+    use crate::core::{
+        Column, DataType, Row, SessionState, ShardKeyMetadata, ShardKeyType, TableDeclaration,
+    };
 
     fn engine() -> (tempfile::TempDir, Engine) {
         let temp = tempfile::tempdir().unwrap();
@@ -1515,38 +1588,7 @@ mod tests {
         options: EngineOptions,
     ) -> (tempfile::TempDir, Engine, LogicalDatabaseId) {
         let temp = tempfile::tempdir().unwrap();
-        drop(Database::open(temp.path(), 4).unwrap());
-        let manifest = rusqlite::Connection::open(temp.path().join("manifest.sqlite")).unwrap();
-        manifest
-            .execute_batch(
-                "PRAGMA foreign_keys = ON;
-                 BEGIN IMMEDIATE;
-                 DROP TABLE briskdb_integrity;
-                 DROP TABLE briskdb_metadata;
-                 CREATE TABLE briskdb_metadata (
-                     requires_manifest_version INTEGER NOT NULL
-                         CHECK (requires_manifest_version >= 6)
-                 ) STRICT;
-                 INSERT INTO briskdb_metadata VALUES (6);
-                 INSERT INTO briskdb_tables (
-                    table_id,
-                    database_id,
-                    table_name,
-                    placement,
-                    shard_key_column,
-                    shard_key_type
-                 ) VALUES
-                    (4, 1, 'events', 1, 'tenant_id', 1),
-                    (5, 1, 'global_events', 2, NULL, NULL),
-                    (6, 1, 'catalog_records', 3, NULL, NULL),
-                    (7, 1, 'text_events', 1, 'tenant_key', 2);
-                 PRAGMA user_version = 6;
-                 COMMIT;",
-            )
-            .unwrap();
-        drop(manifest);
-
-        let database = Arc::new(Database::open(temp.path(), 4).unwrap());
+        let mut database = Database::open(temp.path(), 4).unwrap();
         database
             .broadcast(
                 "CREATE TABLE events (
@@ -1554,14 +1596,32 @@ mod tests {
                     payload TEXT NOT NULL
                  );
                  CREATE TABLE global_events (code INTEGER NOT NULL);
-                 CREATE TABLE catalog_records (code INTEGER NOT NULL);
                  CREATE TABLE text_events (
-                    tenant_key TEXT PRIMARY KEY,
+                    tenant_key TEXT PRIMARY KEY NOT NULL,
                     payload TEXT NOT NULL
                  );",
             )
             .unwrap();
         let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "events",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+                TableDeclaration::global(logical_database, "global_events").unwrap(),
+                TableDeclaration::catalog(logical_database, "catalog_records").unwrap(),
+                TableDeclaration::sharded(
+                    logical_database,
+                    "text_events",
+                    ShardKeyMetadata::new("tenant_key", ShardKeyType::Text).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let database = Arc::new(database);
         let engine = Engine::from_database_with_options(database, options).unwrap();
         (temp, engine, logical_database)
     }
@@ -1571,6 +1631,19 @@ mod tests {
             .map(|value| format!("shard-{value}"))
             .find(|key| engine.inner.database.shard_for_key(key.as_bytes()) == expected)
             .expect("the finite shard layout has a routing key")
+    }
+
+    fn integer_key_for_shard(engine: &Engine, expected: u16, excluded: Option<i64>) -> i64 {
+        (1_i64..)
+            .find(|value| {
+                Some(*value) != excluded
+                    && engine
+                        .inner
+                        .database
+                        .shard_for_key(value.to_string().as_bytes())
+                        == expected
+            })
+            .expect("the finite shard layout has an integer routing key")
     }
 
     #[test]
@@ -2436,49 +2509,33 @@ mod tests {
             );
         }
 
-        let catalog_statement = engine
-            .prepare_statement(
-                &session,
-                PrepareRequest::new(
-                    database,
-                    sql::SqlDialect::Sqlite,
-                    sql::SqlTranslationMode::StrictSqlite,
-                    "SELECT code FROM catalog_records",
-                ),
-            )
-            .await
-            .unwrap();
-        let catalog_portal = engine
-            .bind_statement(&session, catalog_statement, vec![])
-            .await
-            .unwrap();
         assert_eq!(
             engine
-                .execute_portal(&session, catalog_portal)
+                .prepare_statement(
+                    &session,
+                    PrepareRequest::new(
+                        database,
+                        sql::SqlDialect::Sqlite,
+                        sql::SqlTranslationMode::StrictSqlite,
+                        "SELECT code FROM catalog_records",
+                    ),
+                )
                 .await
                 .unwrap_err()
                 .kind(),
             EngineErrorKind::PermissionDenied
         );
-        let catalog_update = engine
-            .prepare_statement(
-                &session,
-                PrepareRequest::new(
-                    database,
-                    sql::SqlDialect::Sqlite,
-                    sql::SqlTranslationMode::StrictSqlite,
-                    "UPDATE catalog_records SET code = 1",
-                ),
-            )
-            .await
-            .unwrap();
-        let catalog_update_portal = engine
-            .bind_statement(&session, catalog_update, vec![])
-            .await
-            .unwrap();
         assert_eq!(
             engine
-                .execute_portal(&session, catalog_update_portal)
+                .prepare_statement(
+                    &session,
+                    PrepareRequest::new(
+                        database,
+                        sql::SqlDialect::Sqlite,
+                        sql::SqlTranslationMode::StrictSqlite,
+                        "UPDATE catalog_records SET code = 1",
+                    ),
+                )
                 .await
                 .unwrap_err()
                 .kind(),
@@ -2598,6 +2655,15 @@ mod tests {
     async fn failed_description_refresh_preserves_cached_metadata_and_can_retry() {
         let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
         let session = engine.session();
+        engine
+            .broadcast(
+                &session,
+                "CREATE VIEW refreshable_events AS
+                 SELECT tenant_id, payload FROM events"
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
         let statement = engine
             .prepare_statement(
                 &session,
@@ -2605,7 +2671,7 @@ mod tests {
                     database,
                     sql::SqlDialect::Sqlite,
                     sql::SqlTranslationMode::StrictSqlite,
-                    "SELECT * FROM events",
+                    "SELECT * FROM refreshable_events",
                 ),
             )
             .await
@@ -2618,7 +2684,7 @@ mod tests {
         assert_eq!(before.columns().len(), 2);
 
         engine
-            .broadcast(&session, "DROP TABLE events".to_owned())
+            .broadcast(&session, "DROP VIEW refreshable_events".to_owned())
             .await
             .unwrap();
         let error = engine
@@ -2640,12 +2706,9 @@ mod tests {
         engine
             .broadcast(
                 &session,
-                "CREATE TABLE events (
-                    tenant_id INTEGER PRIMARY KEY,
-                    payload TEXT NOT NULL,
-                    restored TEXT
-                 )"
-                .to_owned(),
+                "CREATE VIEW refreshable_events AS
+                 SELECT tenant_id, payload, NULL AS restored FROM events"
+                    .to_owned(),
             )
             .await
             .unwrap();
@@ -2660,15 +2723,16 @@ mod tests {
 
     #[tokio::test]
     async fn portal_execution_result_limit_failure_is_retryable_with_the_same_handle() {
-        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let (temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
         let session = engine.session();
-        engine
-            .broadcast(
-                &session,
-                "INSERT INTO global_events (code) VALUES (1), (2)".to_owned(),
-            )
-            .await
-            .unwrap();
+        for shard in 0..engine.shard_count() {
+            let connection =
+                rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                    .unwrap();
+            connection
+                .execute_batch("INSERT INTO global_events (code) VALUES (1), (2)")
+                .unwrap();
+        }
         let statement = engine
             .prepare_statement(
                 &session,
@@ -3200,6 +3264,133 @@ mod tests {
             }
             assert_eq!(shard.retired, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn populated_catalog_gates_async_raw_data_plane_routing() {
+        let (_temp, engine, _database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+        let shard_zero_value = integer_key_for_shard(&engine, 0, None);
+        let shard_one_value = integer_key_for_shard(&engine, 1, None);
+        let shard_zero_key = shard_zero_value.to_string();
+        let shard_one_key = shard_one_value.to_string();
+
+        session.set_routing_key(&shard_zero_key).await.unwrap();
+        let write = engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                    vec![Value::from(shard_zero_value), Value::from("owned")],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.shard, 0);
+        assert_eq!(write.value, 1);
+
+        let read = engine
+            .query(
+                &session,
+                Statement::new(
+                    "SELECT payload FROM events WHERE tenant_id = ?1",
+                    vec![Value::from(shard_zero_value)],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.shard, 0);
+        assert_eq!(read.value.rows()[0].get(0), Some(&Value::from("owned")));
+
+        session.set_routing_key(&shard_one_key).await.unwrap();
+        let global = engine
+            .query(
+                &session,
+                Statement::new(
+                    "SELECT code FROM global_events WHERE code = ?1",
+                    vec![Value::from(7_i64)],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(global.shard, 0);
+
+        for (error, expected) in [
+            (
+                engine
+                    .query(
+                        &session,
+                        Statement::new(
+                            "SELECT payload FROM events WHERE tenant_id = ?1",
+                            vec![Value::from(shard_zero_value)],
+                        ),
+                    )
+                    .await
+                    .unwrap_err(),
+                EngineErrorKind::InvalidArgument,
+            ),
+            (
+                engine
+                    .query(
+                        &session,
+                        Statement::new("SELECT payload FROM events", vec![]),
+                    )
+                    .await
+                    .unwrap_err(),
+                EngineErrorKind::Unsupported,
+            ),
+            (
+                engine
+                    .query(
+                        &session,
+                        Statement::new(
+                            "SELECT payload FROM events
+                             WHERE tenant_id = ?1 OR tenant_id = ?2",
+                            vec![Value::from(shard_zero_value), Value::from(shard_one_value)],
+                        ),
+                    )
+                    .await
+                    .unwrap_err(),
+                EngineErrorKind::InvalidArgument,
+            ),
+            (
+                engine
+                    .execute(
+                        &session,
+                        Statement::new(
+                            "INSERT INTO global_events (code) VALUES (?1)",
+                            vec![Value::from(1_i64)],
+                        ),
+                    )
+                    .await
+                    .unwrap_err(),
+                EngineErrorKind::Unsupported,
+            ),
+            (
+                engine
+                    .query(
+                        &session,
+                        Statement::new("SELECT code FROM catalog_records", vec![]),
+                    )
+                    .await
+                    .unwrap_err(),
+                EngineErrorKind::PermissionDenied,
+            ),
+            (
+                engine
+                    .query(
+                        &session,
+                        Statement::new("SELECT * FROM undeclared_events", vec![]),
+                    )
+                    .await
+                    .unwrap_err(),
+                EngineErrorKind::InvalidQuery,
+            ),
+        ] {
+            assert_eq!(error.kind(), expected, "{}", error.diagnostic());
+        }
+        assert_eq!(session.state().await, SessionState::Ready);
+        assert_eq!(engine.active_operations_for_test(), 0);
     }
 
     #[tokio::test]

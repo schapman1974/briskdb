@@ -44,8 +44,9 @@ placeholder normalization may differ from `source()`.
 Strict translation does not bypass parsing, common-subset validation, or
 placeholder normalization. It is also unrelated to SQLite's
 `CREATE TABLE ... STRICT` option, which remains outside the structural common
-subset. Existing raw HTTP SQLite pass-through remains a separate interface and
-is not routed through this API.
+subset. Populated-catalog HTTP execute/query uses this exact strict mode after
+normalization; empty-catalog HTTP alone retains a separate raw SQLite
+pass-through.
 
 ### `Compatibility`
 
@@ -177,11 +178,12 @@ can succeed.
 
 ## Deliberate boundaries
 
-Issue #25 adds no CLI flag, environment variable, listener default, HTTP field,
+Issue #25 added no CLI flag, environment variable, listener default, HTTP field,
 wire message, catalog rule, session state, prepared-statement cache, routing
-decision, SQLite execution call, manifest migration, shard-file change, or
-storage-format version. The current HTTP execute/query/migration paths continue
-to send caller-provided SQLite SQL directly to their existing engine paths.
+decision, manifest migration, shard-file change, or storage-format version. The
+later authoritative-catalog integration composes strict translation into
+populated-catalog HTTP execute/query. Empty-catalog HTTP and the migration
+endpoint retain their legacy/exact-text engine paths.
 
 The implemented protocol-neutral [prepared lifecycle](SQL_PREPARED_STATEMENTS.md)
 owns prepare/bind/describe/execute state and adopts `sqlite_sql()` only after
@@ -200,5 +202,5 @@ transaction, and limit syntax; repeated, gapped, reordered, and per-statement
 placeholder identities; empty and 256-statement batches; NUL and synthetic
 metadata failures; diagnostic and `Debug` redaction; deterministic concurrent
 translation; recovery after independent errors; equivalent SQLite,
-PostgreSQL, and MySQL declarations, plans, and executed SQLite results; and the
-absence of changes to raw SQLite execution.
+PostgreSQL, and MySQL declarations, plans, and executed SQLite results; plus
+empty-catalog legacy execution and populated-catalog strict-mode integration.

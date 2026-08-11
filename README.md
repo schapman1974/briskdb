@@ -13,8 +13,9 @@ The [architecture map](docs/ARCHITECTURE.md) defines the crate's module
 boundaries and dependency direction.
 
 The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
-current SQLite pass-through API from PostgreSQL startup support and planned
-PostgreSQL/MySQL query compatibility.
+unregistered legacy SQLite pass-through from the authoritative-catalog HTTP
+path, PostgreSQL startup support, and planned PostgreSQL/MySQL query
+compatibility.
 The [PostgreSQL listener contract](docs/POSTGRES_LISTENER.md) defines its
 address configuration, startup/session behavior, parameter status, deferred
 query boundary, and shared shutdown lifecycle.
@@ -87,10 +88,14 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
   SQLite, PostgreSQL, and MySQL dialects, followed by opt-in source-preserving
   statement/batch classification, placeholder normalization, per-statement
   binding metadata, and catalog-aware typed shard-key inference plus
-  synchronous bound-value-aware routing plans with single-shard write policy,
-  all isolated from the current raw SQLite HTTP execution path
+  synchronous bound-value-aware routing plans with single-shard write policy;
+  a populated authoritative catalog composes that SQLite frontend and policy
+  into the raw HTTP execute/query path, while an empty catalog alone retains
+  the legacy pass-through behavior
 - A transactionally versioned `manifest.sqlite` with durable 4,096-bucket
-  routing plus logical-database and table metadata
+  routing plus logical-database and authoritative table-placement metadata
+- Initialization-only registration of a complete, empty physical schema, with
+  later schema migrations checked against its table and shard-key declarations
 - Identity-bound, WAL-enabled SQLite shard files that are never silently
   recreated after initialization
 - Routed execute and query endpoints
@@ -211,6 +216,20 @@ bytes and no NUL. The endpoint retains its experimental `broadcast` name and
 returns `{"completed_shards":[...]}`, but it is the only client surface allowed
 to change persistent application schema.
 
+Before loading rows, a Rust embedder may register the complete table layout once
+with `Database::register_tables`. Every ordinary physical table must exist with
+the same name on every shard, be empty, and be declared `Sharded` or `Global`;
+a `Catalog` declaration must have no physical table or view. A sharded
+declaration also names a visible, physically non-null column with compatible
+`Int64`, text, or binary affinity. SQLite's non-null `INTEGER PRIMARY KEY`
+rowid alias is accepted; nullable legacy primary-key forms are not. Text keys
+use SQLite `BINARY` collation, and every primary/unique key on a sharded table
+must include its shard key with `BINARY` collation. Application foreign keys,
+triggers, and virtual tables are temporarily unsupported. An exact repeat is
+idempotent, but a different or partial replacement is rejected. Registration
+is an initialization boundary, not an online catalog-editing API; close and
+reopen the registering handle after an ambiguous manifest-commit error.
+
 Insert a keyed row:
 
 ```bash
@@ -314,9 +333,13 @@ plan, `rusqlite` statement, or connection, and closing a statement closes all
 of its portals.
 
 Translation and planning remain independently callable branches over the same
-normalized request. The HTTP execute, query, and migration endpoints invoke
-none of these opt-in/prepared layers and retain their existing raw SQLite
-behavior. The exact translation matrix and strict-mode boundary are in
+normalized request. With an empty table catalog, HTTP execute/query retains the
+legacy caller-routed raw SQLite path. Once tables are registered, those same
+endpoints require exactly one SQLite common-subset statement, normalize its
+placeholders, apply strict SQLite translation, infer its authoritative
+placement, and enforce a finite single-shard target. The migration endpoint
+keeps its separate exact-text journal identity and parameterless batch
+contract. The exact translation matrix and strict-mode boundary are in
 [`docs/SQL_TRANSLATION.md`](docs/SQL_TRANSLATION.md), and the complete lifecycle
 is in
 [`docs/SQL_PREPARED_STATEMENTS.md`](docs/SQL_PREPARED_STATEMENTS.md).
@@ -324,8 +347,9 @@ is in
 `EngineOptions` permits 1–16 active connections and 1–1,024 queued operations
 per shard, with at most 512 active connections across all shards.
 SQLite statements that can leave connection-local state remain uncontracted
-pass-through behavior. Such connections, and connections left in a transaction,
-are retired rather than reused by another session. Clean read handles can be
+empty-catalog pass-through behavior; the populated-catalog common subset rejects
+those forms. Such connections, and connections left in a transaction, are
+retired rather than reused by another session. Clean read handles can be
 shared for ordinary SQL, but a deny-only authorizer probe moves connection-local
 SQL such as `PRAGMA data_version`, plus any cross-owner write, to a fresh
 disposable handle before execution.
@@ -359,11 +383,14 @@ new ordinary operations and a second coordinator receive retryable `Busy`.
 After durable partial progress, ordinary work receives non-retryable
 `FailedPrecondition` until the same migration resumes. The exact SQL text is
 retained permanently for recovery and idempotency, so migration batches must
-not contain passwords, tokens, or other sensitive literals.
+not contain passwords, tokens, or other sensitive literals. Once the catalog is
+registered, migration rejects row-moving DML, table drops, trigger creation,
+foreign keys, virtual tables, and any change that breaks declared placement,
+Text collation, or one-owner uniqueness.
 
 The initial shard count is immutable, so resharding will require an explicit
-migration workflow. Opening upgrades exact version-1 through version-6
-manifests to version 7 through ordered, resumable steps.
+migration workflow. Opening upgrades exact version-1 through version-7
+manifests to version 8 through ordered, resumable steps.
 Version 3 introduced the versioned, generation-stamped 4,096-bucket routing
 map. Version 4 adds schema generation 0 and immutable logical metadata with
 default database ID 1 named `default`; identifier encoding version 1 accepts
@@ -403,15 +430,38 @@ than rewriting checksum values. These unkeyed
 checksums are corruption detectors, not authentication, and they do not cover
 application row values or provide a continuous whole-data scan.
 
-The v3-to-v4 step deliberately leaves the table catalog empty: it neither
-infers nor adopts tables already present in physical shard files. The v4-to-v5
-upgrade retains every validated v4 catalog row, while shard adoption preserves
-physical application tables and their data. The public catalog returned by
-`Database::catalog()` and `Engine::catalog()` remains read-only and advisory.
-Its database and table entries stay immutable, while its schema generation
-advances after migration finalization; migrations neither infer nor mutate
-`briskdb_tables`. Current query results, routing, SQLite value behavior, HTTP
-shapes, and wire contracts are otherwise unchanged.
+Version 8 makes newly registered table placement authoritative and raises the
+downgrade fence. Because version-7 table rows were only advisory, the v7-to-v8
+upgrade clears them instead of silently treating them as proven declarations;
+it preserves logical databases, routing, schema history, shard files, and rows.
+`Database::register_tables` can then install one complete declaration set only
+after its matching physical tables are empty. Once installed, migrations must
+preserve that exact physical table set and every sharded key's required column
+and affinity. Text shard keys use SQLite `BINARY` collation. Application
+foreign keys, triggers, and virtual tables are temporarily unsupported; every
+`PRIMARY KEY` or `UNIQUE` key on a sharded table must include its shard key with
+`BINARY` collation so uniqueness has one physical owner. The public catalog
+returned by `Database::catalog()` and `Engine::catalog()` remains read-only to
+observers.
+
+Registration marks schema admission `Pending` before its manifest commit. If
+that commit reports an ambiguous cleanup or I/O failure, close the registering
+handle and reopen the data root; a durably committed replacement cannot be
+loaded while the stale pre-registration handle remains live. Do not retry a
+new registration through that pending handle.
+
+For a `Sharded` table, each logical row has exactly one owner selected from its
+canonical shard-key bytes; storing the same ordinary row on several shards is
+not sharding. `Global` is the explicit replicated placement, while `Catalog`
+is manifest-only. Registration establishes the authority used by later import
+and execution work; it does not repartition existing data.
+
+Logical reads that are not pinned to one key still require the scatter/gather
+follow-ups (#57 and #58). Their contract is one logical result over all owning
+shards—equivalent to a shard `UNION ALL` before global filtering, ordering,
+pagination, or aggregation—not duplicated copies in every file. The current
+admin browser remains a physical-shard diagnostic until its logical catalog
+view lands separately.
 Startup loads routing and logical metadata in one validated shared snapshot;
 runtime routing continues to hash the exact key bytes, derive a virtual bucket,
 and read its persisted physical-shard assignment. The generation-1 ranges

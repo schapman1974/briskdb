@@ -418,7 +418,7 @@ interpolate values into SQL, or choose a physical shard itself.
 ## Storage-format boundary
 
 Issue #26 adds only process-memory session state and execution orchestration.
-It does not change manifest version 7, a manifest table, routing encoding,
+It does not change manifest version 8, a manifest table, routing encoding,
 shard identity, schema fingerprint, migration journal, SQLite header field,
 WAL/synchronous mode, or filename. Prepared statements and portals disappear
 when their owning process/session ends. Preparing or describing changes no

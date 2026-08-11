@@ -109,16 +109,13 @@ impl LogicalDatabaseMetadata {
 }
 
 /// Versioned declared type of a non-null shard-key column.
-///
-/// Manifest v4 exposes this as read-only metadata. Routed execution continues
-/// to accept the caller's opaque routing-key bytes and does not yet encode keys
-/// from table values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ShardKeyType {
     /// Signed 64-bit integer.
     Int64,
-    /// UTF-8 text, declared without Unicode normalization or collation.
+    /// UTF-8 text routed as exact bytes and compared with SQLite `BINARY`
+    /// collation, without Unicode normalization.
     Text,
     /// Arbitrary bytes.
     Binary,
@@ -132,6 +129,13 @@ pub struct ShardKeyMetadata {
 }
 
 impl ShardKeyMetadata {
+    /// Construct a validated single-column shard key.
+    pub fn new(column: impl Into<String>, key_type: ShardKeyType) -> EngineResult<Self> {
+        let column = column.into();
+        ensure_catalog_identifier(&column)?;
+        Ok(Self { column, key_type })
+    }
+
     pub(crate) fn from_validated(column: String, key_type: ShardKeyType) -> Self {
         debug_assert!(validate_catalog_identifier(&column));
         Self { column, key_type }
@@ -148,20 +152,82 @@ impl ShardKeyMetadata {
     }
 }
 
-/// Declared physical placement of a logical table.
-///
-/// These declarations remain advisory in the current manifest. Future
-/// catalog-driven DDL and physical-schema validation must make them
-/// authoritative before execution planning relies on them.
+/// Authoritative physical placement of a registered logical table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TablePlacement {
-    /// Intended for the same logical schema on every shard and key-routed rows.
+    /// The schema exists on every shard and each row belongs to one key-selected
+    /// owner. Every local unique key must include the shard key.
     Sharded(ShardKeyMetadata),
     /// Intended for a small lookup table replicated to every shard.
     Global,
     /// Intended for manifest-owned metadata rather than a user shard table.
     Catalog,
+}
+
+/// One validated table declaration to register in an empty logical catalog.
+///
+/// Registration assigns a stable table ID after sorting declarations by
+/// logical database and canonical table name. The declaration itself contains
+/// no physical rows and can be safely prepared before storage is opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDeclaration {
+    database_id: LogicalDatabaseId,
+    name: String,
+    placement: TablePlacement,
+}
+
+impl TableDeclaration {
+    /// Declare a key-routed table whose schema exists on every shard.
+    pub fn sharded(
+        database_id: LogicalDatabaseId,
+        name: impl Into<String>,
+        shard_key: ShardKeyMetadata,
+    ) -> EngineResult<Self> {
+        Self::new(database_id, name.into(), TablePlacement::Sharded(shard_key))
+    }
+
+    /// Declare a table whose explicitly replicated rows exist on every shard.
+    pub fn global(database_id: LogicalDatabaseId, name: impl Into<String>) -> EngineResult<Self> {
+        Self::new(database_id, name.into(), TablePlacement::Global)
+    }
+
+    /// Declare a manifest-owned table that is never an application SQL target.
+    pub fn catalog(database_id: LogicalDatabaseId, name: impl Into<String>) -> EngineResult<Self> {
+        Self::new(database_id, name.into(), TablePlacement::Catalog)
+    }
+
+    fn new(
+        database_id: LogicalDatabaseId,
+        name: String,
+        placement: TablePlacement,
+    ) -> EngineResult<Self> {
+        ensure_catalog_identifier(&name)?;
+        Ok(Self {
+            database_id,
+            name,
+            placement,
+        })
+    }
+
+    /// Return the owning logical database.
+    pub const fn database_id(&self) -> LogicalDatabaseId {
+        self.database_id
+    }
+
+    /// Return the canonical lowercase table name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Return the declared physical placement.
+    pub const fn placement(&self) -> &TablePlacement {
+        &self.placement
+    }
+
+    pub(crate) fn into_parts(self) -> (LogicalDatabaseId, String, TablePlacement) {
+        (self.database_id, self.name, self.placement)
+    }
 }
 
 /// Logical table metadata loaded from the manifest.
@@ -526,6 +592,45 @@ mod tests {
     }
 
     #[test]
+    fn table_declarations_are_validated_owned_and_database_scoped() {
+        let database = LogicalDatabaseId::new(9).unwrap();
+        let shard_key = ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap();
+        let declaration =
+            TableDeclaration::sharded(database, "accounts", shard_key.clone()).unwrap();
+        assert_eq!(declaration.database_id(), database);
+        assert_eq!(declaration.name(), "accounts");
+        assert_eq!(declaration.placement(), &TablePlacement::Sharded(shard_key));
+
+        assert_eq!(
+            TableDeclaration::global(database, "countries")
+                .unwrap()
+                .placement(),
+            &TablePlacement::Global
+        );
+        assert_eq!(
+            TableDeclaration::catalog(database, "audit_catalog")
+                .unwrap()
+                .placement(),
+            &TablePlacement::Catalog
+        );
+
+        for invalid in ["", "Accounts", "two-words", "briskdb_tables"] {
+            assert_eq!(
+                TableDeclaration::global(database, invalid)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::InvalidArgument
+            );
+            assert_eq!(
+                ShardKeyMetadata::new(invalid, ShardKeyType::Int64)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
     fn metadata_accessors_and_lookups_are_stable_and_database_scoped() {
         let catalog = sample_catalog();
         assert_eq!(LogicalDatabaseId::new(9).unwrap().get(), 9);
@@ -608,6 +713,7 @@ mod tests {
         assert_send_sync_static::<LogicalDatabaseMetadata>();
         assert_send_sync_static::<TableMetadata>();
         assert_send_sync_static::<TablePlacement>();
+        assert_send_sync_static::<TableDeclaration>();
         assert_send_sync_static::<ShardKeyMetadata>();
         assert_send_sync_static::<ShardKeyType>();
     }

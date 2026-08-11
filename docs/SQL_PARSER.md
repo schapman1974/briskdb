@@ -9,8 +9,9 @@ defines that boundary. The separate [common SQL subset contract](SQL_SUBSET.md)
 defines the opt-in structural validator, and the [SQL parameter-normalization
 contract](SQL_PARAMETERS.md) defines the opt-in dialect-specific placeholder
 rewrite. The [SQL translation contract](SQL_TRANSLATION.md) defines the
-implemented opt-in strict and finite compatibility modes. None of these layers
-is in the current HTTP execution path.
+implemented opt-in strict and finite compatibility modes. Prepared execution
+and populated-catalog HTTP execute/query compose these layers; empty-catalog
+HTTP retains the legacy raw SQLite path.
 
 ## Decision
 
@@ -87,14 +88,15 @@ particular surface accepts one statement or a combination is decided by the
 statement is a read. The subset validator first checks each ordered statement
 independently and returns `Unsupported` for a parsed form outside its contract.
 
-The existing HTTP execute, query, and migration paths remain raw SQLite
-pass-through surfaces with their existing authorizer and endpoint-specific
-rules. They call neither this parser, the opt-in common-subset validator,
-statement classifier, placeholder normalizer, translator, shard-key inference,
-nor bound statement planner. The separate Rust
-[prepared lifecycle](SQL_PREPARED_STATEMENTS.md) now connects those layers for
-an exact-one-statement handle without changing the experimental HTTP SQL
-surface.
+HTTP execute/query retains raw SQLite pass-through only while the authoritative
+table catalog is empty. With a populated catalog, each request is parsed as
+SQLite, must contain exactly one statement, and continues through the common
+subset, classifier, normalizer, strict translator, inference, and planner. The
+separate Rust [prepared lifecycle](SQL_PREPARED_STATEMENTS.md) composes the same
+frontend for an exact-one-statement handle. The journaled migration endpoint
+keeps its own exact-text batch identity, but a populated catalog adds a parser
+gate that rejects row-moving DML, `CREATE TABLE ... AS SELECT`, `DROP TABLE`,
+and `CREATE TRIGGER` before rollback-only physical preflight.
 
 ## Resource and error boundaries
 
@@ -109,9 +111,10 @@ work:
 
 Empty, whitespace-only, and comment-only input successfully produces an empty
 AST. The general classifier later returns `InvalidArgument` for that empty AST;
-prepared statements apply their own exact-one check, while raw HTTP surfaces
-retain endpoint-specific rules. NUL input, malformed tokens, incomplete syntax,
-and other parse failures are `InvalidQuery`. A syntactically valid statement
+prepared statements and populated-catalog HTTP apply an exact-one check, while
+empty-catalog HTTP and migration retain their endpoint-specific rules. NUL
+input, malformed tokens, incomplete syntax, and other parse failures are
+`InvalidQuery`. A syntactically valid statement
 that is outside BriskDB's common subset is not a parse failure;
 `validate_common_subset` classifies it as `Unsupported`. Public protocol errors
 continue to use the fixed safe text for the error kind and must not serialize
@@ -172,6 +175,10 @@ in a subprocess so a future stack overflow or abort is observed as a failed
 test instead of terminating the test harness. The child must exit normally
 with the configured recursion-limit error.
 
+Authoritative-migration tests cover every row-moving top-level family,
+`CREATE TABLE ... AS SELECT`, table drop, and trigger creation, and prove that a
+schema-only batch remains admissible for later physical preflight.
+
 Structural tests must assert AST meaning for tricky statements rather than
 matching SQL substrings. Source review and dependency review must also confirm
 that BriskDB has no regular-expression parser or routing helper. A transitive
@@ -179,6 +186,8 @@ regular-expression crate elsewhere in `Cargo.lock` is not evidence of SQL
 routing; the architectural proof is that this layer returns structured syntax
 and makes no routing decision.
 
-This decision and the later opt-in subset validator change no HTTP request or
-response shape, routing result, configuration, manifest schema, shard file, or
-stored data.
+This parser decision by itself changes no HTTP request or response shape,
+configuration, manifest schema, shard file, or stored data. The later
+authoritative-catalog integration consumes its SQLite result for HTTP
+execute/query and can change routing or rejection according to committed table
+placement without changing the HTTP JSON shape.

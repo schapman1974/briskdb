@@ -17,8 +17,8 @@ mod types;
 pub(crate) mod worker;
 
 pub use catalog::{
-    Catalog, LogicalDatabaseId, LogicalDatabaseMetadata, ShardKeyMetadata, ShardKeyType, TableId,
-    TableMetadata, TablePlacement,
+    Catalog, LogicalDatabaseId, LogicalDatabaseMetadata, ShardKeyMetadata, ShardKeyType,
+    TableDeclaration, TableId, TableMetadata, TablePlacement,
 };
 pub(crate) use catalog::{
     CatalogSnapshot, DEFAULT_LOGICAL_DATABASE_ID, DEFAULT_LOGICAL_DATABASE_NAME,
@@ -63,6 +63,18 @@ use std::path::Path;
 
 use crate::{sql, storage::Storage};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawDataOperation {
+    Execute,
+    Query,
+}
+
+#[derive(Debug)]
+pub(crate) struct RawDataPlan {
+    pub(crate) shard: u16,
+    pub(crate) sqlite_sql: String,
+}
+
 #[derive(Debug)]
 pub struct Database {
     storage: Storage,
@@ -85,6 +97,20 @@ impl Database {
         self.storage.shard_count()
     }
 
+    /// Atomically register the complete logical table catalog for an empty
+    /// application schema.
+    ///
+    /// This initialization-only operation requires exclusive ownership of the
+    /// database before it is wrapped in an [`Engine`]. Every declared physical
+    /// table must already exist with the same empty schema on all shards.
+    /// Sharded text keys use `BINARY` collation, every unique key must include
+    /// the shard key, and foreign keys, triggers, and virtual tables are not yet
+    /// supported. The catalog can be registered exactly once; later table
+    /// changes belong to a journaled schema-and-catalog migration.
+    pub fn register_tables(&mut self, declarations: Vec<TableDeclaration>) -> EngineResult<()> {
+        self.storage.register_tables(declarations)
+    }
+
     /// Return the immutable logical database and table catalog.
     pub fn catalog(&self) -> &Catalog {
         self.storage.logical_catalog()
@@ -98,6 +124,61 @@ impl Database {
         self.storage.routing_provenance()
     }
 
+    /// Plan a legacy raw statement against the authoritative catalog.
+    ///
+    /// An empty catalog deliberately returns `None` so pre-catalog callers
+    /// retain their existing explicit-route behavior. Once any table has been
+    /// registered, every raw data-plane statement must pass the same bounded
+    /// SQL frontend, inference, and routing policy as prepared statements.
+    pub(crate) fn raw_data_plan(
+        &self,
+        shard_key: &str,
+        statement: &str,
+        params: &[Value],
+        operation: RawDataOperation,
+    ) -> EngineResult<Option<RawDataPlan>> {
+        let catalog = self.catalog();
+        if catalog.tables().is_empty() {
+            return Ok(None);
+        }
+
+        let parsed = sql::parse(sql::SqlDialect::Sqlite, statement)?;
+        if parsed.statement_count() != 1 {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "catalog-routed raw SQL must contain exactly one top-level statement",
+            ));
+        }
+        let common = sql::validate_common_subset(parsed)?;
+        let normalized = sql::normalize_placeholders(common)?;
+        let translated = sql::translate_sql(normalized, sql::SqlTranslationMode::StrictSqlite)?;
+        let (hash_version, key_encoding_version, bucket_algorithm_version, map_generation) =
+            self.routing_provenance();
+        let plan = planner::plan_bound_statement(
+            planner::BoundStatementPlanInput::new(
+                catalog,
+                catalog.default_database().id(),
+                translated.normalized_sql(),
+                0,
+                params,
+                Some(shard_key.as_bytes()),
+            ),
+            planner::RoutingProvenance::new(
+                hash_version,
+                key_encoding_version,
+                bucket_algorithm_version,
+                map_generation,
+            ),
+            |key| self.shard_for_key(key),
+        )?;
+        let shard = raw_data_execution_shard(&plan, catalog, operation)?;
+
+        Ok(Some(RawDataPlan {
+            shard,
+            sqlite_sql: translated.sqlite_sql().to_owned(),
+        }))
+    }
+
     pub fn execute_routed(
         &self,
         shard_key: &str,
@@ -105,7 +186,14 @@ impl Database {
         params: &[Value],
     ) -> EngineResult<Routed<usize>> {
         let _schema_operation = self.storage.enter_schema_operation()?;
-        let shard = self.shard_for_key(shard_key.as_bytes());
+        let plan = self.raw_data_plan(shard_key, statement, params, RawDataOperation::Execute)?;
+        let shard = plan.as_ref().map_or_else(
+            || self.shard_for_key(shard_key.as_bytes()),
+            |plan| plan.shard,
+        );
+        let statement = plan
+            .as_ref()
+            .map_or(statement, |plan| plan.sqlite_sql.as_str());
         let connection = self.storage.open_shard(shard)?;
         let value =
             self.storage
@@ -120,7 +208,14 @@ impl Database {
         params: &[Value],
     ) -> EngineResult<Routed<ResultSet>> {
         let _schema_operation = self.storage.enter_schema_operation()?;
-        let shard = self.shard_for_key(shard_key.as_bytes());
+        let plan = self.raw_data_plan(shard_key, statement, params, RawDataOperation::Query)?;
+        let shard = plan.as_ref().map_or_else(
+            || self.shard_for_key(shard_key.as_bytes()),
+            |plan| plan.shard,
+        );
+        let statement = plan
+            .as_ref()
+            .map_or(statement, |plan| plan.sqlite_sql.as_str());
         let connection = self.storage.open_shard(shard)?;
         let value =
             self.storage
@@ -157,6 +252,95 @@ impl Database {
     }
 }
 
+fn raw_data_execution_shard(
+    plan: &BoundStatementPlan,
+    catalog: &Catalog,
+    operation: RawDataOperation,
+) -> EngineResult<u16> {
+    let behavior_matches_operation = matches!(
+        (operation, plan.behavior()),
+        (RawDataOperation::Execute, sql::StatementBehavior::Write(_))
+            | (RawDataOperation::Query, sql::StatementBehavior::Read)
+    );
+    if !behavior_matches_operation {
+        return match plan.behavior() {
+            sql::StatementBehavior::Schema(_) | sql::StatementBehavior::Session(_) => {
+                Err(EngineError::new(
+                    EngineErrorKind::Unsupported,
+                    "schema and session statements require a dedicated engine operation",
+                ))
+            }
+            sql::StatementBehavior::Read | sql::StatementBehavior::Write(_) => {
+                Err(EngineError::new(
+                    EngineErrorKind::InvalidQuery,
+                    "raw statement behavior does not match the requested operation",
+                ))
+            }
+        };
+    }
+
+    let inference = plan.inference();
+    let Some(table_id) = inference.table_id() else {
+        return if inference.kind() == sql::ShardKeyInferenceKind::NotApplicable
+            && plan.behavior() == sql::StatementBehavior::Read
+        {
+            Ok(0)
+        } else {
+            Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "catalog-routed raw planning lost its target table",
+            ))
+        };
+    };
+    let table = catalog.table_by_id(table_id).ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "catalog-routed raw planning resolved an unknown table identity",
+        )
+    })?;
+
+    match table.placement() {
+        TablePlacement::Catalog => Err(EngineError::new(
+            EngineErrorKind::PermissionDenied,
+            "catalog-placed tables cannot execute as client SQL",
+        )),
+        TablePlacement::Global => match plan.behavior() {
+            sql::StatementBehavior::Read => Ok(0),
+            sql::StatementBehavior::Write(_) => Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "raw writes to global tables require an explicit replication operation",
+            )),
+            sql::StatementBehavior::Schema(_) | sql::StatementBehavior::Session(_) => {
+                Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "catalog-routed raw planning assigned non-data behavior to a global table",
+                ))
+            }
+        },
+        TablePlacement::Sharded(_) => match inference.kind() {
+            sql::ShardKeyInferenceKind::Exact | sql::ShardKeyInferenceKind::Multiple => {
+                plan.assigned_shard().ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::Unsupported,
+                        "raw sharded statement does not have one executable physical shard",
+                    )
+                })
+            }
+            sql::ShardKeyInferenceKind::Unconstrained
+            | sql::ShardKeyInferenceKind::Contradiction => Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "raw sharded statement requires a finite single-shard key constraint",
+            )),
+            sql::ShardKeyInferenceKind::NotApplicable | sql::ShardKeyInferenceKind::NotSharded => {
+                Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "catalog-routed raw inference disagrees with sharded table placement",
+                ))
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -174,6 +358,47 @@ mod tests {
             .map(|value| format!("sync-corruption-{value}"))
             .find(|key| database.shard_for_key(key.as_bytes()) == expected)
             .expect("the finite shard layout has a routing key")
+    }
+
+    fn integer_key_for_shard(database: &Database, expected: u16, excluded: Option<i64>) -> i64 {
+        (1_i64..)
+            .find(|value| {
+                Some(*value) != excluded
+                    && database.shard_for_key(value.to_string().as_bytes()) == expected
+            })
+            .expect("the finite shard layout has an integer routing key")
+    }
+
+    fn database_with_raw_catalog() -> (tempfile::TempDir, Database) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 4).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE events (
+                    tenant_id INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, sequence)
+                 );
+                 CREATE TABLE global_events (code TEXT PRIMARY KEY, label TEXT NOT NULL);
+                 CREATE VIEW undeclared_events AS
+                 SELECT tenant_id, sequence, payload FROM events;",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "events",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+                TableDeclaration::global(logical_database, "global_events").unwrap(),
+                TableDeclaration::catalog(logical_database, "catalog_records").unwrap(),
+            ])
+            .unwrap();
+        (temp, database)
     }
 
     fn corrupt_application_table_root(root: &Path, shard: u16, table: &str) {
@@ -376,6 +601,152 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn populated_catalog_routes_raw_point_operations_without_replicating_rows() {
+        let (_temp, database) = database_with_raw_catalog();
+        let first_key = integer_key_for_shard(&database, 0, None);
+        let second_key = integer_key_for_shard(&database, 0, Some(first_key));
+        let first_route = first_key.to_string();
+        let second_route = second_key.to_string();
+
+        let write = database
+            .execute_routed(
+                &first_route,
+                "INSERT INTO events (tenant_id, sequence, payload)
+                 VALUES (?1, ?2, ?3), (?4, ?5, ?6)",
+                &[
+                    Value::from(first_key),
+                    Value::from(1_i64),
+                    Value::from("first"),
+                    Value::from(second_key),
+                    Value::from(2_i64),
+                    Value::from("second"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(write.shard, 0);
+        assert_eq!(write.value, 2);
+
+        let read = database
+            .query_routed(
+                &second_route,
+                "SELECT payload FROM events WHERE tenant_id = ?1",
+                &[Value::from(second_key)],
+            )
+            .unwrap();
+        assert_eq!(read.shard, 0);
+        assert_eq!(read.value.rows().len(), 1);
+        assert_eq!(read.value.rows()[0].get(0), Some(&Value::from("second")));
+
+        let same_shard_read = database
+            .query_routed(
+                &first_route,
+                "SELECT payload FROM events
+                 WHERE tenant_id = ?1 OR tenant_id = ?2",
+                &[Value::from(first_key), Value::from(second_key)],
+            )
+            .unwrap();
+        assert_eq!(same_shard_read.shard, 0);
+        assert_eq!(same_shard_read.value.rows().len(), 2);
+
+        for shard in 0..database.shard_count() {
+            let connection = database.storage.open_shard(shard).unwrap();
+            let row_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(row_count, if shard == 0 { 2 } else { 0 }, "shard {shard}");
+        }
+    }
+
+    #[test]
+    fn populated_catalog_raw_gate_rejects_unsafe_routes_and_targets() {
+        let (_temp, database) = database_with_raw_catalog();
+        let shard_zero_value = integer_key_for_shard(&database, 0, None);
+        let shard_one_value = integer_key_for_shard(&database, 1, None);
+        let shard_zero_key = shard_zero_value.to_string();
+        let shard_one_key = shard_one_value.to_string();
+
+        let global = database
+            .query_routed(
+                &shard_one_key,
+                "SELECT code FROM global_events WHERE code = ?1",
+                &[Value::from("US")],
+            )
+            .unwrap();
+        assert_eq!(global.shard, 0);
+        assert!(global.value.rows().is_empty());
+
+        for (error, expected) in [
+            (
+                database
+                    .execute(
+                        &shard_zero_key,
+                        "INSERT INTO global_events (code, label) VALUES (?1, ?2)",
+                        &[Value::from("US"), Value::from("United States")],
+                    )
+                    .unwrap_err(),
+                EngineErrorKind::Unsupported,
+            ),
+            (
+                database
+                    .query(&shard_zero_key, "SELECT * FROM catalog_records", &[])
+                    .unwrap_err(),
+                EngineErrorKind::PermissionDenied,
+            ),
+            (
+                database
+                    .query(&shard_zero_key, "SELECT * FROM undeclared_events", &[])
+                    .unwrap_err(),
+                EngineErrorKind::InvalidQuery,
+            ),
+            (
+                database
+                    .query(&shard_zero_key, "SELECT payload FROM events", &[])
+                    .unwrap_err(),
+                EngineErrorKind::Unsupported,
+            ),
+            (
+                database
+                    .execute(
+                        &shard_zero_key,
+                        "UPDATE events SET payload = ?1",
+                        &[Value::from("unsafe")],
+                    )
+                    .unwrap_err(),
+                EngineErrorKind::Unsupported,
+            ),
+            (
+                database
+                    .query(
+                        &shard_one_key,
+                        "SELECT payload FROM events WHERE tenant_id = ?1",
+                        &[Value::from(shard_zero_value)],
+                    )
+                    .unwrap_err(),
+                EngineErrorKind::InvalidArgument,
+            ),
+            (
+                database
+                    .query(
+                        &shard_zero_key,
+                        "SELECT payload FROM events
+                         WHERE tenant_id = ?1 OR tenant_id = ?2",
+                        &[Value::from(shard_zero_value), Value::from(shard_one_value)],
+                    )
+                    .unwrap_err(),
+                EngineErrorKind::InvalidArgument,
+            ),
+            (
+                database
+                    .execute(&shard_zero_key, "CREATE TABLE bypass (id INTEGER)", &[])
+                    .unwrap_err(),
+                EngineErrorKind::Unsupported,
+            ),
+        ] {
+            assert_eq!(error.kind(), expected, "{}", error.diagnostic());
+        }
     }
 
     #[test]

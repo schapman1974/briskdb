@@ -9,11 +9,11 @@ pub(crate) mod pool;
 pub(crate) use pool::{ConnectionOwner, ConnectionPools, PooledConnection};
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Instant,
@@ -32,7 +32,10 @@ pub(crate) use schema_gate::{SchemaMigrationGuard, SchemaOperationGuard};
 
 pub use crate::core::Database;
 use crate::{
-    core::{Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult},
+    core::{
+        Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult, MAX_TABLES,
+        ShardKeyType, TableDeclaration, TablePlacement,
+    },
     sqlite_error,
 };
 
@@ -43,6 +46,31 @@ struct RootSchemaCoordination {
     gate: schema_gate::SchemaGate,
     catalogs: Mutex<Vec<Weak<CatalogSnapshot>>>,
     schema_digests: Mutex<RuntimeSchemaDigests>,
+}
+
+struct CatalogReplacementGuard<'a> {
+    catalogs: MutexGuard<'a, Vec<Weak<CatalogSnapshot>>>,
+}
+
+impl CatalogReplacementGuard<'_> {
+    fn publish(
+        mut self,
+        current: &Arc<CatalogSnapshot>,
+        replacement: CatalogSnapshot,
+    ) -> EngineResult<Arc<CatalogSnapshot>> {
+        if current.routing() != replacement.routing()
+            || current.logical().schema_generation() != replacement.logical().schema_generation()
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "table registration changed routing or schema-generation metadata",
+            ));
+        }
+        let replacement = Arc::new(replacement);
+        self.catalogs.clear();
+        self.catalogs.push(Arc::downgrade(&replacement));
+        Ok(replacement)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -111,7 +139,6 @@ impl RootSchemaCoordination {
     }
 
     fn register_catalog(&self, loaded: CatalogSnapshot) -> EngineResult<Arc<CatalogSnapshot>> {
-        let loaded = Arc::new(loaded);
         let mut catalogs = self.catalogs.lock().map_err(|error| {
             EngineError::new(
                 EngineErrorKind::Internal,
@@ -119,8 +146,49 @@ impl RootSchemaCoordination {
             )
         })?;
         catalogs.retain(|catalog| catalog.strong_count() != 0);
+        if catalogs
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|live| !immutable_catalog_metadata_matches(&live, &loaded))
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "the committed table catalog conflicts with a live database handle; close stale handles before reopening",
+            ));
+        }
+        let loaded = Arc::new(loaded);
         catalogs.push(Arc::downgrade(&loaded));
         Ok(loaded)
+    }
+
+    fn reserve_catalog_replacement<'a>(
+        &'a self,
+        current: &Arc<CatalogSnapshot>,
+    ) -> EngineResult<CatalogReplacementGuard<'a>> {
+        if Arc::strong_count(current) != 1 {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "table registration requires one exclusively owned database handle",
+            ));
+        }
+        let mut catalogs = self.catalogs.lock().map_err(|error| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                format!("root schema catalog coordination is poisoned: {error}"),
+            )
+        })?;
+        catalogs.retain(|catalog| catalog.strong_count() != 0);
+        let current = Arc::downgrade(current);
+        let mut live = catalogs
+            .iter()
+            .filter(|catalog| catalog.strong_count() != 0);
+        if live.next().is_none_or(|catalog| !catalog.ptr_eq(&current)) || live.next().is_some() {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "table registration requires every other database handle to be closed",
+            ));
+        }
+        Ok(CatalogReplacementGuard { catalogs })
     }
 
     fn publish_schema_generation(
@@ -182,6 +250,16 @@ impl RootSchemaCoordination {
 
         if live
             .iter()
+            .any(|catalog| !immutable_catalog_metadata_matches(catalog, validated))
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "the validated table catalog conflicts with a live database handle",
+            ));
+        }
+
+        if live
+            .iter()
             .all(|catalog| catalog.logical().schema_generation() == target_generation)
         {
             return Ok(());
@@ -211,6 +289,19 @@ impl RootSchemaCoordination {
         }
         Ok(())
     }
+}
+
+/// Compare the routing and logical metadata that cannot change while a handle
+/// remains live. Schema generation is deliberately excluded: crash recovery
+/// may publish one validated generation transition into existing snapshots.
+fn immutable_catalog_metadata_matches(left: &CatalogSnapshot, right: &CatalogSnapshot) -> bool {
+    let left_logical = left.logical();
+    let right_logical = right.logical();
+    left.routing() == right.routing()
+        && left_logical.identifier_encoding_version() == right_logical.identifier_encoding_version()
+        && left_logical.default_database().id() == right_logical.default_database().id()
+        && left_logical.logical_databases() == right_logical.logical_databases()
+        && left_logical.tables() == right_logical.tables()
 }
 
 static ROOT_SCHEMA_COORDINATIONS: OnceLock<Mutex<HashMap<PathBuf, Weak<RootSchemaCoordination>>>> =
@@ -529,6 +620,182 @@ impl Storage {
         self.catalog.logical()
     }
 
+    pub(crate) fn register_tables(
+        &mut self,
+        declarations: Vec<TableDeclaration>,
+    ) -> EngineResult<()> {
+        let result = self.register_tables_inner(declarations);
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn register_tables_inner(&mut self, declarations: Vec<TableDeclaration>) -> EngineResult<()> {
+        self.validate_table_declaration_request(&declarations)?;
+        if !self.catalog.logical().tables().is_empty() {
+            let _operation = self.enter_schema_operation()?;
+            return if declarations_match_catalog(self.catalog.logical(), &declarations) {
+                Ok(())
+            } else {
+                Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    "the authoritative table catalog is already registered",
+                ))
+            };
+        }
+        let mut migration = self.schema_coordination.gate.begin_new_migration()?;
+        migration.wait_for_quiescence_blocking();
+        let registration = (|| {
+            self.validate_empty_table_declarations(&declarations)?;
+            let replacement_guard = self
+                .schema_coordination
+                .reserve_catalog_replacement(&self.catalog)?;
+
+            let manifest_path = self.root.join("manifest.sqlite");
+            let mut manifest_connection = open_existing_manifest(&manifest_path)?;
+            configure_manifest_connection(&manifest_connection)?;
+            let replacement = manifest::register_table_catalog(
+                &mut manifest_connection,
+                self.shard_count(),
+                declarations,
+                || migration.mark_pending_on_drop(),
+            )?;
+            let replacement = replacement_guard.publish(&self.catalog, replacement)?;
+            self.catalog = replacement;
+            Ok(())
+        })();
+        if registration
+            .as_ref()
+            .is_err_and(|error: &EngineError| error.kind() == EngineErrorKind::DataCorruption)
+        {
+            // Keep the exclusive migration guard live while degradation is
+            // published so no concurrent operation observes a transient Ready
+            // state between error propagation and fail-closed handling.
+            self.record_schema_degraded();
+        }
+        registration?;
+        migration.publish_ready()
+    }
+
+    fn validate_table_declaration_request(
+        &self,
+        declarations: &[TableDeclaration],
+    ) -> EngineResult<()> {
+        if declarations.is_empty() {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "table registration requires at least one declaration",
+            ));
+        }
+        if declarations.len() > MAX_TABLES {
+            return Err(EngineError::new(
+                EngineErrorKind::LimitExceeded,
+                format!("table registration exceeds its {MAX_TABLES}-table limit"),
+            ));
+        }
+        let default_database_id = self.catalog.logical().default_database().id();
+        let mut names = BTreeSet::new();
+        for declaration in declarations {
+            if declaration.database_id() != default_database_id {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!(
+                        "table {} must use the storage-default logical database",
+                        declaration.name()
+                    ),
+                ));
+            }
+            if !names.insert(declaration.name()) {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!("table {} is declared more than once", declaration.name()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_empty_table_declarations(
+        &self,
+        declarations: &[TableDeclaration],
+    ) -> EngineResult<()> {
+        let mut physical_declarations = BTreeSet::new();
+        let mut catalog_declarations = BTreeSet::new();
+        for declaration in declarations {
+            if matches!(declaration.placement(), TablePlacement::Catalog) {
+                catalog_declarations.insert(declaration.name().to_owned());
+            } else {
+                physical_declarations.insert(declaration.name().to_owned());
+            }
+        }
+
+        for shard_id in 0..self.shard_count() {
+            let connection = self.open_shard(shard_id)?;
+            let has_application_trigger = connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM main.sqlite_schema
+                         WHERE type = 'trigger' AND name NOT GLOB 'sqlite_*'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sqlite_error::storage)?;
+            if has_application_trigger {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "application triggers are not supported with authoritative placement on physical shard {shard_id}"
+                    ),
+                ));
+            }
+            let has_application_virtual_table = connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM pragma_table_list
+                         WHERE schema = 'main' AND type = 'virtual'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sqlite_error::storage)?;
+            if has_application_virtual_table {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "virtual tables are not supported with authoritative placement on physical shard {shard_id}"
+                    ),
+                ));
+            }
+            let physical_names = application_table_names(&connection)?;
+            let relation_names = application_relation_names(&connection)?;
+            if let Some(shadow) = catalog_declarations.iter().find(|name| {
+                relation_names
+                    .iter()
+                    .any(|relation| relation.eq_ignore_ascii_case(name))
+            }) {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "catalog table {shadow} has an application-table shadow on physical shard {shard_id}"
+                    ),
+                ));
+            }
+            if physical_declarations != physical_names {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "the declared physical tables do not exactly match physical shard {shard_id}"
+                    ),
+                ));
+            }
+            for declaration in declarations {
+                if !matches!(declaration.placement(), TablePlacement::Catalog) {
+                    validate_empty_table_declaration(&connection, shard_id, declaration)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn current_schema_generation(&self) -> u64 {
         self.catalog.logical().schema_generation()
     }
@@ -767,6 +1034,236 @@ impl Storage {
             },
         ))
     }
+}
+
+fn declarations_match_catalog(catalog: &Catalog, declarations: &[TableDeclaration]) -> bool {
+    if catalog.tables().len() != declarations.len() {
+        return false;
+    }
+    let mut declarations = declarations.iter().collect::<Vec<_>>();
+    declarations.sort_by_key(|declaration| (declaration.database_id(), declaration.name()));
+    catalog
+        .tables()
+        .iter()
+        .zip(declarations)
+        .all(|(table, declaration)| {
+            table.database_id() == declaration.database_id()
+                && table.name() == declaration.name()
+                && table.placement() == declaration.placement()
+        })
+}
+
+fn application_table_names(connection: &Connection) -> EngineResult<BTreeSet<String>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM pragma_table_list
+             WHERE schema = 'main' AND type IN ('table', 'virtual')
+               AND name NOT GLOB 'sqlite_*'
+               AND name <> 'briskdb_shard_metadata'
+             ORDER BY name COLLATE BINARY",
+        )
+        .map_err(sqlite_error::storage)?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sqlite_error::storage)?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(sqlite_error::storage)
+}
+
+fn application_relation_names(connection: &Connection) -> EngineResult<BTreeSet<String>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM main.sqlite_schema
+             WHERE type IN ('table', 'view')
+             ORDER BY name COLLATE BINARY",
+        )
+        .map_err(sqlite_error::storage)?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sqlite_error::storage)?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(sqlite_error::storage)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteAffinity {
+    Integer,
+    Text,
+    Blob,
+    Real,
+    Numeric,
+}
+
+fn sqlite_affinity(declared_type: &str) -> SqliteAffinity {
+    let declared_type = declared_type.to_ascii_uppercase();
+    if declared_type.contains("INT") {
+        SqliteAffinity::Integer
+    } else if declared_type.contains("CHAR")
+        || declared_type.contains("CLOB")
+        || declared_type.contains("TEXT")
+    {
+        SqliteAffinity::Text
+    } else if declared_type.contains("BLOB") || declared_type.is_empty() {
+        SqliteAffinity::Blob
+    } else if declared_type.contains("REAL")
+        || declared_type.contains("FLOA")
+        || declared_type.contains("DOUB")
+    {
+        SqliteAffinity::Real
+    } else {
+        SqliteAffinity::Numeric
+    }
+}
+
+fn validate_empty_table_declaration(
+    connection: &Connection,
+    shard_id: u16,
+    declaration: &TableDeclaration,
+) -> EngineResult<()> {
+    let quoted_table = quote_identifier(declaration.name());
+    let has_rows = connection
+        .query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {quoted_table} LIMIT 1)"),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    if has_rows != 0 {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "table {} must be empty on physical shard {shard_id} before registration",
+                declaration.name()
+            ),
+        ));
+    }
+
+    let TablePlacement::Sharded(shard_key) = declaration.placement() else {
+        shard::validate_authoritative_table_constraints(connection, declaration.name(), None)?;
+        return Ok(());
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT name, type, \"notnull\", pk, hidden
+             FROM pragma_table_xinfo(?1)
+             ORDER BY cid",
+        )
+        .map_err(sqlite_error::storage)?;
+    let columns = statement
+        .query_map([declaration.name()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(sqlite_error::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error::storage)?;
+    let Some((_, declared_type, not_null, primary_key, hidden)) = columns
+        .iter()
+        .find(|(name, _, _, _, _)| name == shard_key.column())
+    else {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "shard key {} is missing from table {} on physical shard {shard_id}",
+                shard_key.column(),
+                declaration.name()
+            ),
+        ));
+    };
+    if *hidden != 0
+        || !shard_key_is_non_null(
+            connection,
+            declaration.name(),
+            declared_type,
+            *not_null,
+            *primary_key,
+        )?
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "shard key {} on table {} must be a visible physically non-null column",
+                shard_key.column(),
+                declaration.name()
+            ),
+        ));
+    }
+    let affinity = sqlite_affinity(declared_type);
+    let compatible = matches!(
+        (shard_key.key_type(), affinity),
+        (ShardKeyType::Int64, SqliteAffinity::Integer)
+            | (ShardKeyType::Text, SqliteAffinity::Text)
+            | (ShardKeyType::Binary, SqliteAffinity::Blob)
+    );
+    if !compatible {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "shard key {} on table {} has an incompatible SQLite declared type",
+                shard_key.column(),
+                declaration.name()
+            ),
+        ));
+    }
+    if matches!(shard_key.key_type(), ShardKeyType::Text)
+        && !shard::shard_key_uses_binary_collation(
+            connection,
+            declaration.name(),
+            shard_key.column(),
+        )?
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "shard key {} on table {} must use SQLite BINARY collation",
+                shard_key.column(),
+                declaration.name()
+            ),
+        ));
+    }
+    shard::validate_authoritative_table_constraints(
+        connection,
+        declaration.name(),
+        Some(shard_key),
+    )?;
+    Ok(())
+}
+
+fn shard_key_is_non_null(
+    connection: &Connection,
+    table: &str,
+    declared_type: &str,
+    not_null: i64,
+    primary_key: i64,
+) -> EngineResult<bool> {
+    if not_null != 0 {
+        return Ok(true);
+    }
+    if primary_key == 0 || !declared_type.trim().eq_ignore_ascii_case("INTEGER") {
+        return Ok(false);
+    }
+    let has_primary_key_index = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_index_list(?1) WHERE origin = 'pk'
+             )",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    // An exact INTEGER PRIMARY KEY without a separate primary-key index is the
+    // rowid alias. SQLite always materializes a non-null integer for it. Other
+    // rowid-table PRIMARY KEY forms retain SQLite's legacy NULL exception.
+    Ok(!has_primary_key_index)
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn physical_layout_is_empty(shards_dir: &Path) -> EngineResult<bool> {
@@ -1070,6 +1567,7 @@ fn configure_journal_mode(connection: &Connection) -> EngineResult<()> {
 mod tests {
     use std::{
         error::Error as _,
+        process::Command,
         sync::{Arc, Barrier},
         thread,
     };
@@ -2520,5 +3018,493 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    fn registered_table_declarations(database: &Database) -> Vec<TableDeclaration> {
+        let logical_database = database.catalog().default_database().id();
+        vec![
+            TableDeclaration::global(logical_database, "countries").unwrap(),
+            TableDeclaration::sharded(
+                logical_database,
+                "events",
+                crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+            )
+            .unwrap(),
+        ]
+    }
+
+    fn create_registered_table_schema(database: &Database) {
+        database
+            .broadcast(
+                "CREATE TABLE events (
+                    id INTEGER NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    payload BLOB NOT NULL,
+                    PRIMARY KEY (tenant_id, id)
+                 );
+                 CREATE TABLE countries (
+                    code TEXT PRIMARY KEY,
+                    name TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn table_registration_is_authoritative_persistent_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 3).unwrap();
+        create_registered_table_schema(&database);
+        let declarations = registered_table_declarations(&database);
+
+        database.register_tables(declarations.clone()).unwrap();
+        let tables = database.catalog().tables().to_vec();
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].name(), "countries");
+        assert_eq!(tables[0].placement(), &TablePlacement::Global);
+        assert_eq!(tables[1].name(), "events");
+        assert_eq!(tables[1].placement(), declarations[1].placement());
+
+        database
+            .execute(
+                "tenant-one",
+                "INSERT INTO events (id, tenant_id, payload) VALUES (?1, ?2, ?3)",
+                &[
+                    crate::core::Value::from(1_i64),
+                    crate::core::Value::from("tenant-one"),
+                    crate::core::Value::from(vec![1_u8, 2, 3]),
+                ],
+            )
+            .unwrap();
+        database.register_tables(declarations).unwrap();
+        drop(database);
+
+        let reopened = Database::open(temp.path(), 3).unwrap();
+        assert_eq!(reopened.catalog().tables(), tables.as_slice());
+        assert_eq!(
+            reopened
+                .catalog()
+                .table("default", "events")
+                .unwrap()
+                .unwrap()
+                .placement(),
+            &TablePlacement::Sharded(
+                crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn table_registration_rejects_incomplete_or_invalid_physical_metadata_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        create_registered_table_schema(&database);
+        let logical_database = database.catalog().default_database().id();
+
+        let incomplete = vec![
+            TableDeclaration::sharded(
+                logical_database,
+                "events",
+                crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+            )
+            .unwrap(),
+        ];
+        assert_eq!(
+            database.register_tables(incomplete).unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert!(database.catalog().tables().is_empty());
+
+        let wrong_type = vec![
+            TableDeclaration::global(logical_database, "countries").unwrap(),
+            TableDeclaration::sharded(
+                logical_database,
+                "events",
+                crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+            )
+            .unwrap(),
+        ];
+        assert_eq!(
+            database.register_tables(wrong_type).unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert!(database.catalog().tables().is_empty());
+
+        let missing_key = vec![
+            TableDeclaration::global(logical_database, "countries").unwrap(),
+            TableDeclaration::sharded(
+                logical_database,
+                "events",
+                crate::core::ShardKeyMetadata::new("missing_key", ShardKeyType::Text).unwrap(),
+            )
+            .unwrap(),
+        ];
+        assert_eq!(
+            database.register_tables(missing_key).unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert!(database.catalog().tables().is_empty());
+
+        database
+            .broadcast("CREATE VIEW Audit_Catalog AS SELECT 1 AS id")
+            .unwrap();
+        let mut catalog_shadow = registered_table_declarations(&database);
+        catalog_shadow.push(TableDeclaration::catalog(logical_database, "audit_catalog").unwrap());
+        assert_eq!(
+            database.register_tables(catalog_shadow).unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert!(database.catalog().tables().is_empty());
+        database.broadcast("DROP VIEW Audit_Catalog").unwrap();
+
+        database
+            .register_tables(registered_table_declarations(&database))
+            .unwrap();
+        drop(database);
+        assert_eq!(
+            Database::open(temp.path(), 2)
+                .unwrap()
+                .catalog()
+                .tables()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn first_table_registration_requires_exclusive_database_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        create_registered_table_schema(&database);
+        let observer = Database::open(temp.path(), 2).unwrap();
+        let declarations = registered_table_declarations(&database);
+
+        assert_eq!(
+            database
+                .register_tables(declarations.clone())
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert!(database.catalog().tables().is_empty());
+        assert!(observer.catalog().tables().is_empty());
+
+        drop(observer);
+        database.register_tables(declarations).unwrap();
+        assert_eq!(database.catalog().tables().len(), 2);
+    }
+
+    #[test]
+    fn malformed_or_nonempty_registration_changes_no_catalog_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        create_registered_table_schema(&database);
+        let manifest_path = temp.path().join("manifest.sqlite");
+        let manifest_root = || {
+            Connection::open(&manifest_path)
+                .unwrap()
+                .query_row(
+                    "SELECT manifest_digest FROM briskdb_integrity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .unwrap()
+        };
+        let original_root = manifest_root();
+        let declarations = registered_table_declarations(&database);
+        assert_eq!(
+            database
+                .register_tables(vec![declarations[0].clone(), declarations[0].clone()])
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        let unknown_database = crate::core::LogicalDatabaseId::new(99).unwrap();
+        assert_eq!(
+            database
+                .register_tables(vec![
+                    TableDeclaration::global(unknown_database, "countries").unwrap()
+                ])
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        assert_eq!(manifest_root(), original_root);
+
+        database
+            .execute(
+                "tenant-one",
+                "INSERT INTO events (id, tenant_id, payload) VALUES (?1, ?2, ?3)",
+                &[
+                    crate::core::Value::from(1_i64),
+                    crate::core::Value::from("tenant-one"),
+                    crate::core::Value::from(vec![1_u8]),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            database.register_tables(declarations).unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert!(database.catalog().tables().is_empty());
+        assert_eq!(manifest_root(), original_root);
+        assert_eq!(
+            Connection::open(&manifest_path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM briskdb_tables", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        drop(database);
+        assert!(
+            Database::open(temp.path(), 2)
+                .unwrap()
+                .catalog()
+                .tables()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn table_registration_crash_child() {
+        let Ok(root) = std::env::var("BRISKDB_TABLE_REGISTRATION_ABORT_ROOT") else {
+            return;
+        };
+        let mut database = Database::open(root, 2).unwrap();
+        create_registered_table_schema(&database);
+        let declarations = registered_table_declarations(&database);
+        let result = database.register_tables(declarations);
+        panic!("child did not reach requested table-registration boundary: {result:?}");
+    }
+
+    #[test]
+    fn real_process_abort_leaves_exactly_the_old_or_new_table_catalog() {
+        for (boundary, expected_tables) in [("before-commit", 0), ("after-commit", 2)] {
+            let temp = tempfile::tempdir().unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("storage::tests::table_registration_crash_child")
+                .arg("--nocapture")
+                .env("BRISKDB_TABLE_REGISTRATION_ABORT_ROOT", temp.path())
+                .env("BRISKDB_TABLE_REGISTRATION_ABORT_POINT", boundary)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "child did not abort {boundary}");
+
+            let mut reopened = Database::open(temp.path(), 2).unwrap();
+            assert_eq!(reopened.catalog().tables().len(), expected_tables);
+            let declarations = registered_table_declarations(&reopened);
+            reopened.register_tables(declarations).unwrap();
+            assert_eq!(reopened.catalog().tables().len(), 2);
+        }
+    }
+
+    #[test]
+    fn post_commit_registration_ambiguity_stays_pending_until_stale_handle_closes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        create_registered_table_schema(&database);
+        let declarations = registered_table_declarations(&database);
+        let canonical_root = fs::canonicalize(temp.path()).unwrap();
+        let coordination = root_schema_coordination(&canonical_root).unwrap();
+
+        manifest::fail_next_table_registration_post_commit_for_test();
+        let error = database.register_tables(declarations).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Internal);
+        assert!(database.catalog().tables().is_empty());
+        assert_eq!(coordination.gate.snapshot().state, SchemaGateState::Pending);
+
+        let conflict = Database::open(temp.path(), 2).unwrap_err();
+        assert_eq!(conflict.kind(), EngineErrorKind::FailedPrecondition);
+        assert_eq!(coordination.gate.snapshot().state, SchemaGateState::Pending);
+        assert_eq!(
+            database
+                .execute("tenant-one", "SELECT 1", &[])
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+
+        drop(database);
+        let reopened = Database::open(temp.path(), 2).unwrap();
+        assert_eq!(reopened.catalog().tables().len(), 2);
+        assert_eq!(coordination.gate.snapshot().state, SchemaGateState::Ready);
+    }
+
+    #[test]
+    fn registration_manifest_corruption_degrades_every_live_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        create_registered_table_schema(&database);
+        let alias = Database::open(temp.path(), 2).unwrap();
+        let canonical_root = fs::canonicalize(temp.path()).unwrap();
+        let coordination = root_schema_coordination(&canonical_root).unwrap();
+        Connection::open(temp.path().join("manifest.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE briskdb_virtual_buckets
+                 SET physical_shard_id = 1 - physical_shard_id
+                 WHERE bucket_id = 0",
+                [],
+            )
+            .unwrap();
+
+        // Close the observer so exclusivity does not mask the checksummed
+        // manifest read performed by the registration transaction.
+        drop(alias);
+        let error = database
+            .register_tables(registered_table_declarations(&database))
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            coordination.gate.snapshot().state,
+            SchemaGateState::Degraded
+        );
+        assert_eq!(
+            database
+                .execute("tenant-one", "SELECT 1", &[])
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
+
+    #[test]
+    fn table_registration_rejects_sqlite_nullable_primary_key_forms() {
+        for definition in [
+            "key TEXT PRIMARY KEY",
+            "key BIGINT PRIMARY KEY",
+            "key INTEGER PRIMARY KEY DESC",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut database = Database::open(temp.path(), 2).unwrap();
+            database
+                .broadcast(&format!("CREATE TABLE nullable_keys ({definition})"))
+                .unwrap();
+            let logical_database = database.catalog().default_database().id();
+            let key_type = if definition.starts_with("key TEXT") {
+                ShardKeyType::Text
+            } else {
+                ShardKeyType::Int64
+            };
+            let declaration = TableDeclaration::sharded(
+                logical_database,
+                "nullable_keys",
+                crate::core::ShardKeyMetadata::new("key", key_type).unwrap(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                database
+                    .register_tables(vec![declaration])
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition,
+                "{definition}"
+            );
+            assert!(database.catalog().tables().is_empty());
+        }
+    }
+
+    #[test]
+    fn table_registration_rejects_nonlocal_constraints_collations_and_triggers() {
+        for schema in [
+            "CREATE TABLE records (
+                 id INTEGER PRIMARY KEY,
+                 tenant_id TEXT NOT NULL
+             )",
+            "CREATE TABLE records (
+                 tenant_id TEXT COLLATE NOCASE PRIMARY KEY NOT NULL,
+                 payload TEXT
+             )",
+            "CREATE TABLE records (
+                 tenant_id TEXT PRIMARY KEY NOT NULL,
+                 email TEXT NOT NULL UNIQUE
+             )",
+            "CREATE TABLE records (
+                 tenant_id TEXT PRIMARY KEY NOT NULL,
+                 email TEXT,
+                 UNIQUE (tenant_id COLLATE NOCASE, email)
+             )",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut database = Database::open(temp.path(), 2).unwrap();
+            database.broadcast(schema).unwrap();
+            let logical_database = database.catalog().default_database().id();
+            let declaration = TableDeclaration::sharded(
+                logical_database,
+                "records",
+                crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                database
+                    .register_tables(vec![declaration])
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition,
+                "{schema}"
+            );
+            assert!(database.catalog().tables().is_empty());
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE parents (tenant_id TEXT PRIMARY KEY NOT NULL);
+                 CREATE TABLE children (
+                     tenant_id TEXT PRIMARY KEY NOT NULL,
+                     FOREIGN KEY (tenant_id) REFERENCES parents (tenant_id)
+                 );",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        let declarations = ["parents", "children"]
+            .into_iter()
+            .map(|table| {
+                TableDeclaration::sharded(
+                    logical_database,
+                    table,
+                    crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            database.register_tables(declarations).unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        create_registered_table_schema(&database);
+        database
+            .broadcast(
+                "CREATE TRIGGER events_copy AFTER INSERT ON events
+                 BEGIN UPDATE events SET payload = NEW.payload
+                 WHERE tenant_id = NEW.tenant_id AND id = NEW.id; END",
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .register_tables(registered_table_declarations(&database))
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn virtual_tables_are_never_classified_as_ordinary_physical_tables() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE VIRTUAL TABLE search_records USING fts5(body)")
+            .unwrap();
+        let names = application_table_names(&connection).unwrap();
+        assert!(names.contains("search_records"));
+        assert!(!names.contains("search_records_data"));
     }
 }

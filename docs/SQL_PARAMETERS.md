@@ -18,11 +18,12 @@ public SQLite parameter-index ceiling is `MAX_SQL_PARAMETERS`, currently
 
 This layer changes placeholder tokens only. No parameter values enter the
 normalizer, and values are never rendered or interpolated into SQL text. The
-current HTTP execute, query, and migration endpoints do not invoke this opt-in
-layer; they retain their existing raw SQLite behavior. The asynchronous
-prepared lifecycle does invoke it and requires exactly one statement before it
-creates a prepared handle. Before consuming `CommonSql`, callers can borrow it
-with the implemented [statement/batch
+asynchronous prepared lifecycle invokes it and requires exactly one statement
+before it creates a prepared handle. Populated-catalog HTTP execute/query also
+invokes it after requiring exactly one SQLite common-subset statement; an empty
+catalog alone retains legacy raw marker binding. The journaled migration path
+keeps its parameterless exact-text identity and does not normalize its batch.
+Before consuming `CommonSql`, callers can borrow it with the implemented [statement/batch
 classifier](SQL_STATEMENT_CLASSIFICATION.md). That separate layer owns general
 empty and multi-statement request policy.
 
@@ -193,6 +194,7 @@ anonymous SQLite markers, per-statement reset, empty and marker-free input,
 exact preservation of comments/literals/whitespace/UTF-8, zero,
 exact-maximum, and over-maximum index cases, named SQLite rejection, diagnostic
 and `Debug` redaction, cloning, concurrent normalization, and recovery after an
-independent error. A raw HTTP regression must continue to bind SQLite named
-parameters without calling this layer, proving that issue #21 did not change
-current execution behavior.
+independent error. HTTP regressions prove that an empty catalog continues to
+bind legacy SQLite named parameters without this layer, while a populated
+catalog invokes normalization and rejects named SQLite markers outside its
+positional registered-data contract.

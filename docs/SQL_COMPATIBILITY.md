@@ -24,10 +24,11 @@ available behind BriskDB-owned types.
 Validation is explicit and returns `Unsupported` for a parsed form outside the
 subset; parser acceptance alone is not product support. Translation,
 classification, normalization, inference, bound planning, and routing policy
-are also explicit.
-The current experimental HTTP interface is still a raw SQLite pass-through and
-can execute uncontracted SQLite syntax because it calls none of these layers.
-That behavior is not a compatibility promise.
+are also explicit APIs. HTTP execute/query retains raw SQLite pass-through only
+while the authoritative table catalog is empty. Once any table is registered,
+the same endpoints compose those SQLite-mode layers and enforce the committed
+placement catalog. The empty-catalog behavior is a legacy compatibility
+boundary, not a promise for registered databases.
 
 ## Compatibility layers
 
@@ -78,14 +79,17 @@ protocol-neutral prepared lifecycle composes these SQL stages for exactly one
 statement, exposes retained behavior in description metadata, binds typed
 values into a session-scoped portal, refreshes stale description metadata,
 plans freshly at every execution, and executes supported physical targets.
-HTTP requests still send caller-provided SQLite SQL directly to the raw engine
-path; they do not pass through these opt-in SQL layers.
+HTTP requests still send caller-provided SQLite SQL to the engine. With an empty
+catalog it follows the legacy raw path. With a populated catalog, the engine
+requires exactly one common-subset SQLite statement and runs normalization,
+strict translation, classification, inference, and routing policy before
+SQLite execution.
 
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
-| HTTP `/v1/execute` | Experimental | One SQLite statement with positional parameters | Required caller-provided `shard_key` |
-| HTTP `/v1/query` | Experimental | One raw SQLite statement prepared transiently by the row-returning path; no session cache | Required caller-provided `shard_key` |
-| HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch | Preflight on every shard, then ascending resumable apply |
+| HTTP `/v1/execute` | Experimental | Empty catalog: legacy SQLite statement. Populated catalog: exactly one SQLite common-subset write with normalized positional parameters and strict SQLite translation | Required caller `shard_key`; a populated catalog also requires authoritative finite single-shard inference and rejects Global/Catalog writes |
+| HTTP `/v1/query` | Experimental | Empty catalog: legacy raw SQLite query. Populated catalog: exactly one SQLite common-subset read; no session cache | Required caller `shard_key`; a populated catalog reads Global data on shard 0, denies Catalog/undeclared tables, and requires one sharded owner |
+| HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch; populated catalogs reject row-moving DML, table drops, and trigger creation | Preflight on every shard, then ascending resumable apply |
 | HTTP `/admin` browser | Experimental, read-only | No caller SQL; server-generated physical table discovery, exact all-shard physical `COUNT(*)`, and bounded `SELECT *` pages | Pages require a validated physical shard; the specialized count fans out with bounded concurrency but is not a general scatter-query surface |
 | PostgreSQL wire protocol | Protocol-3.0 startup/session only on loopback; SQL flow deferred | No SQL accepted over the wire; simple `Query` and extended `Parse` return fixed `0A000` responses | Startup selects an exact logical database; no wire SQL request reaches planning or routing |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
@@ -95,8 +99,9 @@ translator, shard-key inference function, engine planner, and prepared
 lifecycle are implemented Rust APIs, not PostgreSQL or MySQL query interfaces.
 PostgreSQL production startup connects only identity, catalog selection,
 status, and session cleanup; the historical private issue-29 parser probe does
-not make that prepared pipeline public wire behavior. These changes do not
-alter any HTTP row in this table.
+not make that prepared pipeline public wire behavior. Authoritative table
+registration composes the SQLite frontend and planner into the existing HTTP
+execute/query rows as described above; it adds no HTTP field or route.
 
 Every HTTP database operation now calls the same protocol-neutral async engine
 used by PostgreSQL startup status and intended for issue-31 PostgreSQL SQL flow
@@ -115,8 +120,8 @@ compatibility mode. The browser never submits SQL. Its overview selects one
 physical shard from the configured range and discovers ordinary `main`-schema
 tables through SQLite's typed `table_list` metadata. ASCII-case-insensitive `sqlite_`,
 the exact name `briskdb`, and `briskdb_` prefixes are excluded, as are non-table
-objects. This is a physical schema view, not a promise that advisory logical
-catalog metadata describes the table or that another shard has an equal table.
+objects. This is a physical schema view, not the authoritative logical-catalog
+view and not a promise that another shard contributes the same rows.
 
 Row browsing generates one safely quoted `SELECT *` for a table returned by
 discovery. Page limits are 1 through 200 and offsets are 0 through 1,000,000;
@@ -152,7 +157,8 @@ migration drains admitted ordinary work and uses fresh coordinator-owned
 connections instead of reserving every shard pool.
 
 SQLite forms that can leave connection-local state remain allowed by the
-current one-call pass-through, but they are uncontracted. The pool observes
+empty-catalog one-call pass-through, but they are uncontracted and are outside
+the populated-catalog common subset. The pool observes
 transaction and savepoint control, `PRAGMA`, `ATTACH`/`DETACH`, and temporary
 objects and marks the connection tainted. A clean read handle can be reused by
 another session for ordinary SQL without transferring the handle's recorded
@@ -185,6 +191,11 @@ the journaled migration batch. That coordinator denies transaction/savepoint
 escape, attachments, temporary and virtual objects, and storage-owned state.
 SQLite reports the source table but not a `RENAME TO` destination, so BriskDB
 also compares the reserved schema before and after the migration transaction.
+When the authoritative catalog is populated, migration parsing additionally
+rejects `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE`,
+`CREATE TABLE ... AS SELECT`, `DROP TABLE`, and `CREATE TRIGGER`. Final
+rollback-only validation rejects application foreign keys, triggers, virtual
+tables, invalid unique keys, and any table-placement or shard-key change.
 
 SQLite also retains `last_insert_rowid()`, `changes()`, and `total_changes()` on
 the physical connection after ordinary writes. A write-bearing handle may be
@@ -224,10 +235,18 @@ comments, and casing are identity-significant. Completed journal rows and their
 exact SQL remain in the manifest, so callers must not include credentials or
 other sensitive literals. A byte-identical retry of completed SQL is
 idempotent and does not advance the schema generation again.
-The migration does not infer or update advisory `briskdb_tables` rows. Richer
-migration/history APIs remain issue #53. Manifest v7 independently requires a
-generation-bound persistent-schema fingerprint to agree across every shard; it
-does not claim the advisory catalog describes that schema.
+The migration does not infer or update `briskdb_tables` rows. When the
+authoritative catalog is populated, however, every tentative shard schema must
+still contain exactly the declared `Sharded` and `Global` tables, no physical
+`Catalog` table, and each sharded key with its required column, affinity, and
+`BINARY` Text collation. Every sharded primary/unique key must still include the
+shard key with `BINARY` collation, and application foreign keys, triggers, and
+virtual tables remain prohibited. Row-moving DML, table drops, and trigger
+creation are rejected before this rollback-only check. A violation fails
+preflight before journal publication. Richer
+migration/history APIs remain issue #53. Manifest v8 retains the v7
+generation-bound persistent-schema fingerprint requirement in addition to this
+catalog enforcement.
 
 The schema gate admits no new routed work after migration begins and waits for
 previously admitted operations to drain. During active preflight or apply,
@@ -244,9 +263,10 @@ is reconciled from the retained journal prefix.
 Use SQLite positional placeholders such as `?1` and `?2`. Values are never
 interpolated into SQL text. The HTTP adapter converts JSON parameters into
 protocol-neutral BriskDB values; the SQL layer binds only those typed values.
-This existing execution-time binding is separate from the opt-in
-`normalize_placeholders(CommonSql)` Rust API: the HTTP adapter neither invokes
-that function nor changes the caller's SQL marker text.
+An empty catalog binds the caller's SQLite markers on the legacy path. A
+populated catalog runs `normalize_placeholders(CommonSql)` and executes its
+strict translated `?N` SQL; named SQLite markers accepted by the legacy path
+are therefore not part of the registered-catalog contract.
 
 | JSON input | SQLite binding |
 | --- | --- |
@@ -398,28 +418,29 @@ contract](SQL_PREPARED_STATEMENTS.md) defines the composed exact-one-statement
 lifecycle, session limits, metadata, routing snapshots, current execution
 planning, and supported physical targets.
 
-### Implemented pass-through surface
+### Implemented HTTP SQLite surface
 
-The following operations work when expressed in syntax accepted by the bundled
-SQLite library and used through the matching HTTP endpoint:
+The following operations work through the matching HTTP endpoint. “Legacy”
+below means the authoritative table catalog is empty; registered databases use
+the bounded catalog-aware path.
 
 | Operation | Current contract | Important boundary |
 | --- | --- | --- |
-| Persistent DDL, including `CREATE`, `DROP`, and `ALTER` | Execute only through the migration/broadcast endpoint | Per-shard atomic and crash-resumable; not atomic across shards |
-| `INSERT`, `UPDATE`, `DELETE` | Execute on the shard selected by `shard_key` | BriskDB does not yet prove that SQL values match the supplied key |
-| `SELECT` | Query the shard selected by `shard_key` | No scatter/gather path |
-| SQLite expressions and functions | Passed through without translation | Semantics are SQLite semantics |
-| SQLite constraints | Enforced inside one shard | No global unique-constraint coordinator |
+| Persistent DDL, including `CREATE`, `DROP`, and `ALTER` | Execute only through the migration/broadcast endpoint | Per-shard atomic and crash-resumable; with a populated catalog, row-moving DML, table drops, trigger creation, and any final catalog violation are rejected |
+| `INSERT`, `UPDATE`, `DELETE` | Legacy: caller-selected shard. Registered: exactly one inferred owner, compatible with the caller route | Inserts prove every row key; shard-key updates and multi-owner writes are rejected |
+| `SELECT` | Legacy: caller-selected shard. Registered: one inferred sharded owner, Global shard 0, or table-free shard 0 | No scatter/gather path; unconstrained and multi-owner reads are rejected |
+| SQLite expressions and functions | Legacy syntax may pass through; registered execution accepts only the common subset and strict SQLite translation | Executed semantics remain SQLite semantics |
+| SQLite constraints | SQLite enforces each accepted constraint in one shard | Every sharded `PRIMARY KEY`/`UNIQUE` key includes the `BINARY` shard key, so all possible collisions have one owner; no independent global reservation service exists |
 
-Other SQLite syntax may happen to pass through, but it is not a stable BriskDB
-contract until it appears in this table and has conformance tests. In
+Other SQLite syntax may happen to pass through only on the empty-catalog legacy
+path and is not a stable BriskDB contract. In
 particular, multi-request transactions, multi-shard writes, multiple statements
 outside the migration endpoint, and attached-database operations are
 uncontracted public API behavior today. Persistent DDL outside the migration
 endpoint is explicitly denied. DML `RETURNING` is explicitly rejected from the
 query surface, and the execute surface exposes only a rows-affected count,
-never a returned rowset. The experimental raw HTTP path uses those same engine
-boundaries.
+never a returned rowset. Both empty- and populated-catalog HTTP modes use those
+same engine boundaries.
 
 The current `Session` `Ready`/`Closed` lifecycle is not a transaction state
 machine. Real `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction behavior, and
@@ -456,9 +477,11 @@ forms are outside this first subset. The exact clause, expression, constraint,
 name, and diagnostic rules are normative in
 [the common SQL subset contract](SQL_SUBSET.md).
 
-This implemented status means structural validation exists and is tested. It
-does not mean the subset is connected to execution. Column type names need only
-be explicit at validation; the separate compatibility translator applies its
+This implemented status means structural validation exists and is tested. The
+subset is connected to prepared execution and populated-catalog HTTP
+execute/query, but remains directly callable analysis and is not the
+empty-catalog or migration contract. Column type names need only be explicit at
+validation; the separate compatibility translator applies its
 finite dialect-specific declaration whitelist. Insert/update duplicate checks
 fold ASCII letter case regardless of quoting. Compatibility translation
 canonicalizes accepted backtick-quoted identifiers, but does not define general
@@ -533,8 +556,9 @@ This implemented normalization does not bind or count supplied values, infer a
 shard, translate other dialect syntax, create a prepared statement, classify
 statement behavior, authorize a request, or execute SQL by itself. Translation
 is the separate opt-in layer described next. The prepared lifecycle composes
-both layers, while the raw HTTP paths continue to bind caller-supplied SQLite
-SQL directly.
+both layers. Populated-catalog HTTP execute/query also runs normalization before
+strict SQLite translation; empty-catalog HTTP and the migration identity path
+retain their separate legacy/exact-text behavior.
 
 ### Implemented SQL translation
 
@@ -570,21 +594,22 @@ placement and a sharded table's key column/type. Its owned result distinguishes
 not-applicable, non-sharded, unconstrained, contradictory, exact, and multiple
 key outcomes and exposes typed integer, text, or binary values.
 
-For `SELECT`, `UPDATE`, and `DELETE`, direct equality against an `Int64` or
-`Binary` shard-key column produces a finite key set; Boolean `AND` intersects
-and `OR` unions those proofs. Non-null `Text` equality remains unconstrained
-because the current catalog does not declare or enforce comparison collation.
+For `SELECT`, `UPDATE`, and `DELETE`, direct equality against an `Int64`, `Text`,
+or `Binary` shard-key column produces a finite key set; Boolean `AND` intersects
+and `OR` unions those proofs. Authoritative registration requires Text keys to
+use SQLite `BINARY` collation, so inference compares their exact UTF-8 bytes
+without case folding or Unicode normalization.
 Other predicates do not establish a key. For `INSERT`, every `VALUES` row's
 explicit shard-key cell must be a compatible direct literal or placeholder to
 produce a complete result, and one value per row is retained, including text
 values. The exact identifier, value, result, and error rules are in [shard-key
 inference](SQL_SHARD_KEYS.md).
 
-Inference does not encode, hash, route, plan, authorize, enforce, or execute.
-The implemented planner described below uses the result at bind/execute time to
-construct routes, validate physical-target compatibility, and reject
-unroutable sharded DML. The raw HTTP execution paths do not invoke inference or
-that policy.
+Inference by itself does not encode, hash, route, plan, authorize, enforce, or
+execute. The implemented planner described below uses the result at
+bind/execute time to construct routes, validate physical-target compatibility,
+and reject unroutable sharded DML. Prepared execution and populated-catalog HTTP
+execute/query invoke that policy; the empty-catalog legacy path does not.
 
 ### Implemented bound statement planning
 
@@ -740,28 +765,44 @@ underlying execution semantics.
 
 ### Current
 
-- The caller supplies an opaque `shard_key` independently from the SQL text.
+- HTTP continues to require an opaque caller `shard_key`. With an empty catalog
+  it alone selects the shard; with a populated catalog it is retained as an
+  explicit route and must agree by physical shard with finite SQL inference.
 - Exact key bytes are hashed with version-1 BLAKE3; the little-endian 64-bit
   prefix selects one of 4,096 virtual buckets through the versioned
   compatibility algorithm.
 - The final physical shard is read from the validated, generation-stamped
-  bucket map retained in manifest version 7. Routing generation 1 preserves
+  bucket map retained in manifest version 8. Routing generation 1 preserves
   the earlier modulo placement for every supported shard count.
-- Manifest version 7 retains the read-only logical catalog introduced in v4,
-  with a journaled schema generation from 0 through 2,147,483,647 and default
-  database ID 1 named `default`. Its optional table rows can describe sharded,
-  global, or catalog placement and a sharded table's `Int64`, text, or binary
-  key column.
+- Manifest version 8 retains the read-only catalog view introduced in v4, with
+  a journaled schema generation from 0 through 2,147,483,647 and default
+  database ID 1 named `default`. `Database::register_tables` may populate its
+  table rows exactly once during initialization after proving that every shard
+  has the same complete, empty physical table set. A sharded declaration names
+  one visible, physically non-null `Int64`, text, or binary key column; the
+  `INTEGER PRIMARY KEY` rowid alias qualifies, but nullable legacy primary-key
+  forms do not. Text keys must use SQLite `BINARY` collation. Application
+  foreign keys, triggers, and virtual tables are temporarily unsupported, and
+  every sharded primary/unique key must contain the shard key with `BINARY`
+  collation.
+- Registration changes schema admission to `Pending` before manifest commit.
+  If commit reports an ambiguous cleanup or I/O error, close the stale
+  registering handle and reopen the data root so startup can determine whether
+  the old or complete new catalog committed. A live stale handle deliberately
+  prevents publication of a conflicting durable catalog.
 - The ready layout retained from v5 binds every shard to one random 16-byte
   layout ID and its
   physical shard ID. Each connection is opened without create or symlink
   following and must match the `BRSH` application ID, expected schema
   generation, exact metadata, and existing WAL mode.
-- Logical metadata is currently read-only and advisory. Fresh manifests and
-  upgrades originating before v4 contain no table rows; v4-to-v5 retains every
-  validated v4 logical-catalog row. Existing physical tables are not inferred
-  or adopted. The opt-in Rust inference and planning/policy APIs can consult
-  catalog contents, but they do not alter current HTTP routing or execution.
+- Present version-8 table metadata is authoritative. `Sharded` means each
+  ordinary row has exactly one key-selected physical owner; `Global` is the
+  explicit replicated placement; `Catalog` is manifest-only. The v7-to-v8
+  upgrade clears legacy advisory rows rather than promoting them, and existing
+  physical tables are never inferred or adopted. Registration requires empty
+  tables and does not repartition existing data. The opt-in Rust APIs,
+  prepared execution, and populated-catalog HTTP execute/query all consult the
+  same catalog; only an empty catalog retains caller-key-only routing.
 - Opt-in inference can extract typed cataloged keys from supported equality
   predicates and every row of a supported `INSERT`.
 - Opt-in bound planning converts every inferred occurrence to an owned route,
@@ -771,20 +812,26 @@ underlying execution semantics.
 - The Rust prepared lifecycle snapshots bound values and session routing in an
   immutable portal, transiently validates at bind, plans on every execution,
   executes accepted sharded targets, and uses shard 0 for supported
-  replicated-schema reads. It does not change current HTTP behavior or
-  implement scatter reads.
-- Point queries and writes visit only that shard.
-- No scatter/gather query path exists.
-- Unique constraints and transactions are local to one SQLite shard.
+  replicated-schema reads. Populated-catalog HTTP uses the same routing policy
+  without a prepared cache. Neither path implements scatter reads.
+- Point queries and writes visit only that key's owning shard.
+- No general scatter/gather query path exists. Logical unpinned reads still
+  require the shard `UNION ALL`/scatter and merge work in issues #57 and #58.
+- SQLite transactions remain local to one shard. Registration accepts a
+  sharded primary/unique key only when it contains the `BINARY` shard-key term,
+  ensuring every possible collision is checked by one owning SQLite file.
 - Schema migration preflights every shard, then commits an ascending prefix
   under a retained journal. Each shard is atomic; the shard set is not one
   transaction. The manifest preserves committed-source and target schema
   fingerprints, and startup resumes only an exact checksummed prefix before
-  serving work.
+  serving work. Once tables are registered, preflight also rejects a migration
+  that changes the complete physical table set or a sharded key's required
+  column, affinity, or Text collation; creates row-moving DML, drops a table, or
+  creates a trigger; introduces a foreign key, trigger, or virtual table; or
+  breaks one-owner unique-key locality.
 
 ### Planned stable contract
 
-- Every sharded table declares one non-null shard-key column in the catalog.
 - Canonical key encoding, hash version, virtual bucket count, and bucket map are
   persisted in the manifest.
 - A transaction is pinned to its first shard. Targeting another shard returns a
@@ -792,9 +839,9 @@ underlying execution semantics.
 - Read-only plans may scatter with bounded concurrency and deterministic merge.
 - Cross-shard writes remain unsupported unless a future coordinator can prove
   its crash semantics.
-- Global uniqueness is unsupported unless backed by an explicit reservation
-  design; shard-local uniqueness must include the shard key when applications
-  require system-wide uniqueness by construction.
+- A future reservation design is required for a unique key that intentionally
+  omits the shard key. The current registration contract rejects that shape
+  instead of exposing shard-local duplicates as logical uniqueness.
 
 ## Transactions and concurrency
 
@@ -806,10 +853,11 @@ reject cross-shard access.
 Manifest-format migrations are separate from application SQL migrations. They
 run internally during storage open, are transactional only within
 `manifest.sqlite`, and cannot be requested through any protocol or SQL
-statement. The atomic version-3-to-version-4 manifest upgrade adds only
-read-only advisory logical metadata and its downgrade fence. It does not infer
-or adopt existing physical tables and does not change shard schemas, supported
-SQLite syntax, result conversion, or routing. Version 5 then adds a resumable
+statement. The atomic version-3-to-version-4 manifest upgrade added advisory
+logical metadata and its downgrade fence. Version 8 clears any surviving v7
+advisory table rows, installs a stronger downgrade fence, and allows a later
+initialization-only registration to establish authoritative placement. Neither
+upgrade infers, adopts, or repartitions physical rows. Version 5 added a resumable
 physical-layout state machine. Its `Adopting` path accepts only exact legacy
 zero-header WAL shards, preserves their tables and rows, and adds BriskDB
 identity metadata. Version 6 adds the application-schema journal. A migration
@@ -819,6 +867,8 @@ those files. Ascending-prefix validation and replay provide recovery rather
 than cross-file atomicity. Version 7 adds the semantic manifest root, explicit
 integrity states, and generation-bound shard-schema fingerprints; journal,
 state, checksum, and catalog changes reseal atomically within the manifest.
+Version 8 retains those integrity rules and includes authoritative table
+registration in the same semantic root.
 See the [manifest storage-format contract](STORAGE_FORMAT.md).
 
 Scatter reads will combine committed results from multiple SQLite files. They

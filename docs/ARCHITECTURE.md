@@ -29,8 +29,8 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only logical catalog, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
-| `storage` | Versioned routing/logical manifest, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
+| `storage` | Versioned routing and authoritative logical manifest, one-time table registration, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, discovery, all-shard physical counts, and page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
 | `protocol::postgres` | BriskDB-owned bounded protocol-3.0 framing, finite parameter validation, selected identity/status, per-connection core-session ownership, query-deferral responses, and private compile/query-parser seam around the exactly pinned `pgwire` library | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
@@ -53,7 +53,9 @@ The module split deliberately preserved:
 - every HTTP route and request field, the health, execute, and broadcast response
   shapes, and current error statuses;
 - BLAKE3 routing, shard filenames, manifest schema, WAL and synchronous modes;
-- SQLite pass-through semantics and cell-level HTTP JSON encoding behavior; and
+- legacy SQLite pass-through semantics while the table catalog is empty,
+  authoritative catalog gating after registration, and cell-level HTTP JSON
+  encoding behavior; and
 - the existing `briskdb::api::router` and `briskdb::storage::Database` Rust
   paths through compatibility re-exports.
 
@@ -191,13 +193,14 @@ an independent depth limit of 128 so iteratively parsed flat operator chains rem
 The normative accepted forms and exclusions are in the [common SQL subset
 contract](SQL_SUBSET.md).
 
-The current HTTP execute/query and migration paths deliberately remain raw
-SQLite pass-through and call none of the parser, subset validator, statement
-classifier, placeholder normalizer, translator, shard-key inference, bound
-statement-planning, or prepared-lifecycle layers. Issues #19 through #27
-therefore change no HTTP shape, SQL acceptance, execution routing, or storage
-behavior. Rust callers can now invoke those layers together through the
-separate prepared API.
+HTTP execute/query has two explicit modes. An empty authoritative table catalog
+retains the legacy caller-routed raw SQLite path. Once any table is registered,
+the engine parses exactly one SQLite statement, validates the common subset,
+classifies behavior, normalizes placeholders, applies strict SQLite
+translation, infers catalog placement, and enforces a finite single-shard
+target. The journaled migration endpoint remains a separate parameterless
+exact-text SQLite batch whose SQL bytes define durable identity. Rust callers
+can also invoke the SQL layers directly or through the prepared API.
 
 ### Statement-classification boundary
 
@@ -281,12 +284,13 @@ normalized batch, and the selected statement's complete protocol-neutral
 `Value` slice. It resolves the accepted base table and cataloged shard-key type,
 then produces an owned `ShardKeyInference` classification and typed values.
 
-For `SELECT`, `UPDATE`, and `DELETE`, the layer proves finite key sets only from
-direct `Int64` or `Binary` shard-column equality and combines those sets through
-Boolean `AND` and `OR`. Non-null `Text` equality remains unconstrained until the
-catalog declares and physical schemas enforce comparison collation. For
-`INSERT`, inference examines the explicit shard-key column in every `VALUES`
-row and retains one value per row, including text values. The result
+For `SELECT`, `UPDATE`, and `DELETE`, the layer proves finite key sets from
+direct `Int64`, `Text`, or `Binary` shard-column equality and combines those
+sets through Boolean `AND` and `OR`. Authoritative registration requires a Text
+shard-key column to retain SQLite `BINARY` collation, so exact UTF-8 equality is
+safe to route without Unicode normalization or case folding. For `INSERT`,
+inference examines the explicit shard-key column in every `VALUES` row and
+retains one value per row, including text values. The result
 distinguishes statements that are not applicable, known non-sharded tables,
 unconstrained predicates, contradictions, one exact key, and multiple keys.
 
@@ -440,6 +444,12 @@ exact journal prefix during recovery. The full input encodings and state
 invariants are frozen in the
 [manifest storage format](STORAGE_FORMAT.md).
 
+Version 8 makes newly registered `briskdb_tables` rows authoritative. Its new
+downgrade fence prevents a v7 binary from treating those rows as advisory. The
+v7-to-v8 transaction clears all legacy advisory table rows, reseals the
+manifest, and preserves routing, logical databases, migration history, shard
+schema, and application data.
+
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4
 migration remains manifest-atomic. The v4-to-v5 step first validates the v4
@@ -455,8 +465,10 @@ The v5-to-v6 step is manifest-only: it preserves layout state, routing, logical
 metadata, and data while rebuilding the schema-generation constraint, creating
 an empty journal, and fencing v5 readers. The v6-to-v7 step is also
 manifest-only and begins in `Verifying`; it cannot manufacture a historical
-checksum that v6 never stored. There is no automatic downgrade; an older binary
-requires a backup from before the newer format.
+checksum that v6 never stored. The v7-to-v8 step is likewise manifest-only and
+clears advisory table rows before installing the authoritative-catalog fence.
+There is no automatic downgrade; an older binary requires a backup from before
+the newer format.
 
 Startup first canonicalizes the data-directory path and joins the process-wide
 root coordination keyed by that path. It acquires the shared schema gate before
@@ -470,9 +482,9 @@ Manifest loading then acquires `BEGIN IMMEDIATE` before making a format
 migration or layout-state decision. Numbered manifest-only steps rewrite
 schema/data, stamp and read back their target identity/version, validate the
 destination, and commit in their own transaction. An `Applying` v6 migration is
-finished under v6 rules before v7 establishes checksum authority. An active v7
-migration is resumed only after every shard matches the preserved source or
-target fingerprint for its exact journal-prefix position.
+finished under v6 rules before v7 establishes checksum authority. An active
+checksum-authoritative migration is resumed only after every shard matches the
+preserved source or target fingerprint for its exact journal-prefix position.
 
 Layout reconciliation then acquires a new immediate manifest transaction,
 re-reads and validates the layout state under that write lock, and holds the
@@ -507,33 +519,67 @@ coordinator publishes a newly committed generation into that snapshot only
 after every shard verifies. `Database::catalog()` and `Engine::catalog()` expose
 the logical portion as a read-only `Catalog` with lookup accessors.
 
-The logical catalog remains advisory: there is no catalog mutation API,
-planner integration, or schema enforcement yet. Fresh manifests and upgrades
-originating before v4 contain no table rows; a v4-to-v5 upgrade retains every
-validated v4 logical-catalog row. Schema migration does not inspect, infer, or
-mutate `briskdb_tables`; instead, v7 independently requires the exact
-`sqlite_schema` fingerprint to agree across shards without claiming the
-advisory catalog describes it. Existing tables remain reachable through the
-explicit-key execute/query surfaces. Core
-routing still hashes the exact caller-provided key bytes, derives a versioned
-virtual bucket, and reads the final physical shard from the snapshot without
-querying SQLite. The generation-1 ranges reproduce prior modulo placement for
-every supported initial shard count, including counts that do not divide 4,096.
-Version-5 adoption adds only BriskDB identity metadata to legacy shards and
-preserves their application schema and data. It changes no SQL planning, HTTP
-shape, or routing result.
+`Database::register_tables` is the sole logical-catalog mutation boundary. It
+is an initialization-only operation over an empty catalog and requires one
+exclusive live owner for the canonical root. The complete declaration set must
+exactly match the empty application tables on every shard: each physical table
+is `Sharded` or `Global`, each `Catalog` declaration remains manifest-only, and
+every sharded key is a visible, physically non-null column with compatible
+SQLite affinity. The non-null `INTEGER PRIMARY KEY` rowid alias is accepted,
+but SQLite's nullable legacy primary-key forms are not. Text keys must use
+SQLite `BINARY` collation. Application foreign keys, triggers, and virtual
+tables are temporarily rejected. Every primary or unique key on a sharded
+table must contain the shard-key column with `BINARY` collation, which keeps
+that constraint's complete equality domain on one owner. The coordinator
+validates physical state before opening an immediate manifest transaction,
+assigns deterministic table IDs, reseals the semantic root, revalidates, and
+atomically publishes the replacement snapshot. An exact repeat is idempotent;
+any other replacement is rejected.
+
+The registration guard changes admission to `Pending` before manifest commit.
+If SQLite reports an ambiguous commit cleanup or I/O failure, the registering
+handle deliberately keeps its old catalog and cannot serve ordinary work. The
+operator must close that stale handle and reopen the canonical root so startup
+can determine whether the old or complete new catalog committed; a live stale
+handle prevents a conflicting durable catalog from being published in-process.
+
+Once registered, table placement is authoritative. A `Sharded` row has exactly
+one owner selected by its canonical key; only `Global` data is intentionally
+replicated, and `Catalog` data is not an application-shard table. Registration
+accepts only empty physical tables, so it cannot bless or repartition existing
+duplicates. Every later schema-migration preflight must preserve the exact
+registered table set on all shards and each sharded key's required column and
+affinity and `BINARY` Text collation. It also preserves one-owner unique keys
+and the temporary foreign-key, trigger, and virtual-table restrictions before a
+journal can be published.
+
+Core routing still hashes the exact key bytes, derives a versioned virtual
+bucket, and reads the final physical shard from the snapshot without querying
+SQLite. The generation-1 ranges reproduce prior modulo placement for every
+supported initial shard count, including counts that do not divide 4,096.
+Point reads and writes can therefore target one owner. Unpinned logical reads
+still require the bounded shard `UNION ALL`/scatter and merge work in issues
+#57 and #58; catalog registration does not make that execution path complete.
+The existing admin browser remains an explicit physical-shard diagnostic.
+Version-5 adoption preserves legacy application schema and data and does not
+implicitly register it.
 
 The storage-owned `briskdb_shard_metadata` table is inaccessible through client
 SQL, and creation of new objects in the reserved `briskdb` or `briskdb_*`
 namespaces is
 denied by the SQLite authorizer. Client attempts to mutate `application_id`,
 `user_version`, persistent `journal_mode`, `schema_version`, or
-`writable_schema` are also denied. This prevents a pass-through statement from
+`writable_schema` are also denied. This prevents client SQL from
 invalidating the validated layout. Ordinary routed SQL also denies every
 persistent DDL action. The journaled migration connection is the sole exception:
-it allows main-schema DDL and DML, including `ALTER TABLE`, inside BriskDB's
-transaction while denying transaction escape, attachments, temporary/virtual
-objects, and reserved-state access. Because SQLite does not reveal an
+it allows main-schema DDL, including `ALTER TABLE`, inside BriskDB's transaction
+while denying transaction escape, attachments, temporary/virtual objects, and
+reserved-state access. Before registration, its legacy batch may also contain
+DML. With a populated authoritative catalog, an additional parser gate rejects
+row-moving DML, `CREATE TABLE AS SELECT`, `DROP TABLE`, and `CREATE TRIGGER`;
+postflight validation also rejects any resulting trigger, virtual table,
+foreign key, invalid unique key, or placement/key change. Because SQLite does
+not reveal an
 `ALTER TABLE ... RENAME TO` destination to the authorizer, the coordinator also
 compares the reserved schema before and after the batch. The exact format,
 numeric codes, downgrade policy, recovery cases, and tests are documented in
@@ -622,9 +668,15 @@ for the same canonical root share the gate and live catalog publication.
 Separate server processes for one data directory are unsupported; the gate is
 not a distributed coordination mechanism.
 
-After every-shard preflight succeeds, the coordinator records the exact SQL and
-its BLAKE3 identity, then visits shards in ascending order. One shard's complete
-batch and target `user_version` commit atomically, followed by a separate
+Every-shard preflight executes the complete batch inside a rollback-only
+transaction. When the authoritative table catalog is populated, that tentative
+schema must still contain exactly its declared physical tables, compatible
+sharded keys, `BINARY` Text collation, and one-owner unique constraints, with no
+application foreign key, trigger, or virtual table. The catalog-aware migration
+gate also rejects row-moving DML, table drops, and trigger creation before
+preflight. Only after all preflights succeed does the coordinator record the
+exact SQL and its BLAKE3 identity, then visit shards in ascending order. One
+shard's complete batch and target `user_version` commit atomically, followed by a separate
 manifest prefix update. There is no cross-shard transaction. Recovery accepts
 the committed prefix plus the single possible shard commit whose acknowledgement
 was interrupted, and never skips ahead. Finalization marks the retained row
@@ -637,8 +689,9 @@ events identify operations that can persist connection-local state, including
 transaction and savepoint control, `PRAGMA`, `ATTACH`/`DETACH`, and temporary
 objects. BriskDB-owned metadata access and storage-control PRAGMA mutations are
 always denied. Other connection-local operations remain allowed under the
-current one-call SQLite pass-through behavior, but that behavior is
-uncontracted. Clean read handles may cross sessions for ordinary statements.
+empty-catalog one-call SQLite pass-through behavior, but that behavior is
+uncontracted and is outside the populated-catalog common subset. Clean read
+handles may cross sessions for ordinary statements.
 The pool retains the first session associated with each physical handle; an
 ordinary foreign read does not relabel that history. Before a routed statement
 uses such a foreign handle, the engine prepares it under a deny-only authorizer

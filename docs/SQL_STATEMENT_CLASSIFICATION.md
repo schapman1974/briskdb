@@ -4,10 +4,10 @@ Status: implemented for roadmap issue #27
 
 BriskDB classifies the already validated common SQL AST into a small,
 protocol-neutral behavior taxonomy. The classifier is the shared request gate
-for the PostgreSQL adapter's deferred SQL flow, the planned MySQL adapter, and
-other future adapters; a frontend must not infer behavior from SQL text, a wire
-command, SQLite result columns, or whether SQLite reports a statement as
-read-only.
+for populated-catalog HTTP execute/query, the PostgreSQL adapter's deferred SQL
+flow, the planned MySQL adapter, and other future adapters; a frontend must not
+infer behavior from SQL text, a wire command, SQLite result columns, or whether
+SQLite reports a statement as read-only.
 
 ```rust
 classify_statements(
@@ -214,12 +214,14 @@ tags or status handling, but must not implement a second keyword classifier or
 loosen batch policy on their own. The same typed common SQL produces the same
 classification regardless of its wire protocol.
 
-Issue #27 adds no PostgreSQL or MySQL listener and no new HTTP route, request
-field, response body, or configuration option. The experimental HTTP execute,
-query, and migration endpoints remain raw SQLite surfaces and do not invoke the
-opt-in common frontend. In particular, the journaled migration endpoint keeps
-its own bounded, parameterless SQLite batch contract and can accept a schema
-batch that the general common-SQL classifier deliberately rejects.
+Issue #27 added no PostgreSQL or MySQL listener and no new HTTP route, request
+field, response body, or configuration option. The later authoritative-catalog
+integration now invokes the common frontend and classifier for
+populated-catalog HTTP execute/query; an empty catalog retains the legacy raw
+path. The journaled migration endpoint keeps its own bounded, parameterless
+SQLite batch contract and can accept a schema batch that the general common-SQL
+classifier rejects, subject to the populated-catalog ban on row-moving DML,
+table drops, and trigger creation.
 At the issue-28 milestone, the PostgreSQL endpoint was only an accept/close
 scaffold. Issue #30 connected startup, catalog selection, status, and session
 cleanup, but SQL messages still stop before classification or any other shared
@@ -228,7 +230,7 @@ SQL layer until issue #31.
 ## Storage-format and configuration boundary
 
 Classification is process-memory analysis over an already owned AST. It does
-not change manifest format version 7, manifest tables, logical catalog rows,
+not change manifest format version 8, manifest tables, logical catalog rows,
 routing-key encoding, virtual buckets, shard identity, SQLite headers,
 application-schema fingerprints, migration-journal records, WAL/synchronous
 mode, or filenames. It opens no database connection and performs no recovery
@@ -260,6 +262,7 @@ planning, inference's separate statement-local boundary, and behavior retained
 across equivalent dialect inputs. Prepared tests cover exact-one precedence,
 description behavior, schema refresh, behavior-based physical target policy,
 denied schema prepare and rejected session execution without side effects, and
-later valid work in the same session. Raw HTTP and storage regressions prove
-that classification does not alter the existing migration or pass-through
-contracts.
+later valid work in the same session. HTTP and storage regressions prove that
+populated-catalog execute/query consumes classification, empty-catalog
+execution preserves the legacy path, and migration retains its separate
+exact-text contract.
