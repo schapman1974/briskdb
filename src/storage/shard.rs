@@ -260,6 +260,26 @@ pub(super) fn open_existing(
     Ok(connection)
 }
 
+/// Open and validate a required shard through an OS-level read-only SQLite
+/// handle. This retains the same no-create, no-follow, identity, generation,
+/// metadata, WAL-mode, and schema-integrity preconditions as a writable open.
+#[cfg(feature = "experimental-vtab")]
+pub(super) fn open_existing_read_only(
+    path: &Path,
+    shard_id: u16,
+    schema_generation: u64,
+    layout: &ShardLayout,
+) -> EngineResult<Connection> {
+    validate_existing_file(path)?;
+    let connection = open_existing_read_only_connection(path)?;
+    configure_busy_timeout(&connection)?;
+    validate_shard_id(shard_id)?;
+    let expected_user_version = expected_user_version(schema_generation)?;
+    require_read_only(&connection)?;
+    validate_exact_shard(&connection, path, shard_id, expected_user_version, layout)?;
+    Ok(connection)
+}
+
 /// Open the required path with strict filesystem and SQLite no-create/no-follow
 /// semantics, but leave database validation to the caller. The controlled pool
 /// path uses this split to install cancellation hooks before validation can
@@ -1773,6 +1793,21 @@ fn open_existing_connection(path: &Path) -> EngineResult<Connection> {
     Ok(connection)
 }
 
+#[cfg(feature = "experimental-vtab")]
+fn open_existing_read_only_connection(path: &Path) -> EngineResult<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+        | OpenFlags::SQLITE_OPEN_EXRESCODE;
+    let open_path = canonical_open_path(path)?;
+    let connection = Connection::open_with_flags(open_path, flags).map_err(|error| {
+        sqlite_error::storage(error)
+            .context(format!("failed to open read-only shard {}", path.display()))
+    })?;
+    configure_cell_size_check(&connection)?;
+    Ok(connection)
+}
+
 fn open_creating_connection(path: &Path) -> EngineResult<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
@@ -1869,6 +1904,21 @@ fn require_writable(connection: &Connection) -> EngineResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "experimental-vtab")]
+fn require_read_only(connection: &Connection) -> EngineResult<()> {
+    if connection
+        .is_readonly(MAIN_DB)
+        .map_err(sqlite_error::storage)?
+    {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "read-only shard unexpectedly opened through a writable SQLite handle",
+        ))
+    }
 }
 
 fn configure_connection_pragmas(connection: &Connection) -> EngineResult<()> {

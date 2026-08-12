@@ -672,9 +672,21 @@ SQL translation belongs to issue #130.
 The opt-in `experimental-vtab` feature adds a separate, read-only SQLite
 coordinator that statically registers `brisk_shard`. It proves a no-fork logical
 table boundary while leaving the manifest, physical schemas, protocol behavior,
-and established scatter executor unchanged. Cursor ownership, schema admission,
-cancellation, bounded materialization, static-loading policy, and rejected
-alternatives are specified in the
+and established scatter executor unchanged. It opens validated physical children
+through OS-level SQLite read-only handles, never attaches a shard, and never
+dynamically loads an extension. Trusted metadata supplies each declared
+schema. An exact, storage-class-compatible `Int64`, `Text`, or `Binary`
+shard-key equality can open only its owner and bind the equality on that
+physical child; `native_range_v1` IDs use the immutable owner map while legacy
+integers retain ordinary hash routing. `NULL` is empty and a type mismatch
+falls back to a full scan so SQLite can retain its comparison semantics.
+Unconstrained scans visit shards in ascending order with `UNION ALL` duplicate
+semantics. Remaining filters, aggregation, ordering, limits, and feature-local
+joins execute in the stock SQLite coordinator without pushdown. That delegation
+is internal to the experimental coordinator and does not expand the Engine or
+protocol SQL contract. Cursor ownership, schema admission, cancellation,
+bounded materialization, static-loading policy, and rejected alternatives are
+specified in the
 [experimental sharded virtual-table facade](SHARDED_VIRTUAL_TABLE.md).
 
 ## Session and asynchronous engine boundary
