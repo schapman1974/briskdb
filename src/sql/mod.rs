@@ -437,7 +437,12 @@ fn materialize_rows_with_scatter_budget(
     })
 }
 
-fn sqlite_parameters(params: &[Value]) -> EngineResult<Vec<SqlValue>> {
+/// Convert protocol-neutral values into lossless owned SQLite bindings.
+///
+/// Storage execution boundaries use this shared conversion so direct shard
+/// statements and the experimental coordinator reject unsupported values with
+/// identical error kinds before SQLite can coerce them.
+pub(crate) fn sqlite_parameters(params: &[Value]) -> EngineResult<Vec<SqlValue>> {
     params.iter().map(value_to_sql).collect()
 }
 

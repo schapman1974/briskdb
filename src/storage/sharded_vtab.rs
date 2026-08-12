@@ -32,7 +32,8 @@ use crate::{
     core::generated_id::{GeneratedIdClassification, classify_generated_id},
     core::{
         AllocationOwnerMap, CanonicalShardKeyRef, EngineError, EngineErrorKind, EngineResult,
-        GeneratedIdPolicy, ShardKeyType, TableMetadata, TablePlacement, canonical_shard_key_bytes,
+        GeneratedIdPolicy, OperationControl, ShardKeyType, TableMetadata, TablePlacement,
+        canonical_shard_key_bytes,
     },
     sqlite_error,
 };
@@ -53,6 +54,102 @@ mod write;
 
 #[allow(unused_imports)]
 pub(crate) use write::{CoordinatorWriteResult, WriteCoordinator};
+
+/// Engine-local cache of immutable physical table descriptors for one schema
+/// generation. Each coordinator still owns independent transaction and
+/// cancellation state; only the validated registry blueprint is shared.
+#[derive(Debug, Default)]
+pub(crate) struct RegistrySchemaCache {
+    inner: Mutex<Option<Arc<RegistrySchema>>>,
+    #[cfg(test)]
+    child_busy_gate: Mutex<Option<TestChildScanGate>>,
+    #[cfg(test)]
+    commit_gate: Mutex<Option<TestChildScanGate>>,
+    #[cfg(test)]
+    cancellation_observer: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+}
+
+impl RegistrySchemaCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn requires_bootstrap(&self, schema_generation: u64) -> bool {
+        self.current(schema_generation).is_none()
+    }
+
+    fn current(&self, schema_generation: u64) -> Option<Arc<RegistrySchema>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|schema| schema.schema_generation == schema_generation)
+            .cloned()
+    }
+
+    fn publish(&self, schema: Arc<RegistrySchema>) {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(schema);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_child_busy_gate(&self) -> TestChildScanControl {
+        let (gate, control) = TestChildScanGate::channel();
+        *self
+            .child_busy_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+        control
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_commit_gate(&self) -> TestChildScanControl {
+        let (gate, control) = TestChildScanGate::channel();
+        *self
+            .commit_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+        control
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_cancellation_observer(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        let observer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *self
+            .cancellation_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&observer));
+        observer
+    }
+
+    #[cfg(test)]
+    fn take_write_test_controls(
+        &self,
+    ) -> (
+        Option<TestChildScanGate>,
+        Option<TestChildScanGate>,
+        Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        let child_busy = self
+            .child_busy_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let commit = self
+            .commit_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let cancellation = self
+            .cancellation_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        (child_busy, commit, cancellation)
+    }
+}
 
 /// A separate SQLite coordinator whose logical tables are backed by BriskDB
 /// shard files. The coordinator never attaches those files to its own schema.
@@ -372,7 +469,7 @@ fn register_module(connection: &Connection, registry: Arc<Registry>) -> SqliteRe
 struct Registry {
     storage: Storage,
     schema_generation: u64,
-    tables: BTreeMap<u64, Arc<TableSpec>>,
+    tables: Arc<BTreeMap<u64, Arc<TableSpec>>>,
     mode: CoordinatorMode,
     write_state: Option<Arc<write::WriteState>>,
     limits: CursorLimits,
@@ -385,6 +482,14 @@ struct Registry {
     child_scan_gate: Mutex<Option<TestChildScanGate>>,
     #[cfg(test)]
     child_scan_complete_gate: Mutex<Option<TestChildScanGate>>,
+    #[cfg(test)]
+    write_child_busy_gate: Mutex<Option<TestChildScanGate>>,
+}
+
+#[derive(Debug)]
+struct RegistrySchema {
+    schema_generation: u64,
+    tables: Arc<BTreeMap<u64, Arc<TableSpec>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,6 +519,8 @@ impl Registry {
             storage,
             CursorLimits::default(),
             CoordinatorMode::ReadOnly,
+            None,
+            None,
         )
     }
 
@@ -421,31 +528,198 @@ impl Registry {
         storage: Storage,
         limits: CursorLimits,
     ) -> EngineResult<Arc<Self>> {
-        Self::build_admitted_with_limits_and_mode(storage, limits, CoordinatorMode::ReadOnly)
+        Self::build_admitted_with_limits_and_mode(
+            storage,
+            limits,
+            CoordinatorMode::ReadOnly,
+            None,
+            None,
+        )
     }
 
     fn build_writable(storage: Storage, limits: CursorLimits) -> EngineResult<Arc<Self>> {
-        Self::build_admitted_with_limits_and_mode(storage, limits, CoordinatorMode::Writable)
+        Self::build_admitted_with_limits_and_mode(
+            storage,
+            limits,
+            CoordinatorMode::Writable,
+            None,
+            None,
+        )
+    }
+
+    fn build_writable_admitted(
+        storage: Storage,
+        limits: CursorLimits,
+        operation: SchemaOperationGuard,
+        control: Option<Arc<OperationControl>>,
+    ) -> EngineResult<Arc<Self>> {
+        Self::build_admitted_with_limits_and_mode(
+            storage,
+            limits,
+            CoordinatorMode::Writable,
+            Some(operation),
+            control,
+        )
+    }
+
+    fn build_writable_cached(
+        storage: Storage,
+        limits: CursorLimits,
+        operation: SchemaOperationGuard,
+        control: Arc<OperationControl>,
+        cache: &RegistrySchemaCache,
+    ) -> EngineResult<Arc<Self>> {
+        Self::validate_limits(limits)?;
+        let schema_generation = storage.current_schema_generation();
+        let schema = match cache.current(schema_generation) {
+            Some(schema) => schema,
+            None => {
+                let schema = Arc::new(Self::discover_schema(
+                    &storage,
+                    schema_generation,
+                    Some(control),
+                )?);
+                cache.publish(Arc::clone(&schema));
+                schema
+            }
+        };
+        Self::from_schema(
+            storage,
+            limits,
+            CoordinatorMode::Writable,
+            Some(operation),
+            schema,
+        )
     }
 
     fn build_admitted_with_limits_and_mode(
         storage: Storage,
         limits: CursorLimits,
         mode: CoordinatorMode,
+        admitted_operation: Option<SchemaOperationGuard>,
+        bootstrap_control: Option<Arc<OperationControl>>,
     ) -> EngineResult<Arc<Self>> {
+        Self::validate_limits(limits)?;
+        let schema_generation = storage.current_schema_generation();
+        let schema = Arc::new(Self::discover_schema(
+            &storage,
+            schema_generation,
+            bootstrap_control,
+        )?);
+        Self::from_schema(storage, limits, mode, admitted_operation, schema)
+    }
+
+    fn validate_limits(limits: CursorLimits) -> EngineResult<()> {
         if limits.rows == 0 || limits.bytes == 0 {
             return Err(EngineError::new(
                 EngineErrorKind::InvalidArgument,
                 "brisk_shard result limits must be non-zero",
             ));
         }
-        let schema_generation = storage.current_schema_generation();
-        let shard = storage.open_shard_read_only(0)?;
-        shard
-            .pragma_update(None, "query_only", "ON")
-            .map_err(sqlite_error::storage)?;
+        Ok(())
+    }
 
+    fn discover_schema(
+        storage: &Storage,
+        schema_generation: u64,
+        bootstrap_control: Option<Arc<OperationControl>>,
+    ) -> EngineResult<RegistrySchema> {
         let allocation_owners = storage.allocation_owner_map().cloned().map(Arc::new);
+        let tables = match bootstrap_control {
+            Some(control) => storage.with_shard_read_only_controlled(0, control, |shard| {
+                shard
+                    .pragma_update(None, "query_only", "ON")
+                    .map_err(sqlite_error::storage)?;
+                Self::discover_tables(storage, shard, allocation_owners.as_ref())
+            })?,
+            None => {
+                let shard = storage.open_shard_read_only(0)?;
+                shard
+                    .pragma_update(None, "query_only", "ON")
+                    .map_err(sqlite_error::storage)?;
+                Self::discover_tables(storage, &shard, allocation_owners.as_ref())?
+            }
+        };
+        Ok(RegistrySchema {
+            schema_generation,
+            tables: Arc::new(tables),
+        })
+    }
+
+    fn from_schema(
+        storage: Storage,
+        limits: CursorLimits,
+        mode: CoordinatorMode,
+        admitted_operation: Option<SchemaOperationGuard>,
+        schema: Arc<RegistrySchema>,
+    ) -> EngineResult<Arc<Self>> {
+        if schema.schema_generation != storage.current_schema_generation() {
+            return Err(EngineError::new(
+                EngineErrorKind::Busy,
+                "cached brisk_shard registry belongs to a stale schema generation",
+            ));
+        }
+        let write_state = matches!(mode, CoordinatorMode::Writable).then(|| {
+            Arc::new(
+                admitted_operation
+                    .map_or_else(write::WriteState::new, write::WriteState::new_admitted),
+            )
+        });
+        Ok(Arc::new(Self {
+            storage,
+            schema_generation: schema.schema_generation,
+            tables: Arc::clone(&schema.tables),
+            mode,
+            write_state,
+            limits,
+            cancellation_epoch: Arc::new(AtomicU64::new(0)),
+            active_child_scans: Arc::new(Mutex::new(0)),
+            lifecycle: Arc::new(LifecycleCounters::default()),
+            #[cfg(test)]
+            opened_shards: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            child_scan_gate: Mutex::new(None),
+            #[cfg(test)]
+            child_scan_complete_gate: Mutex::new(None),
+            #[cfg(test)]
+            write_child_busy_gate: Mutex::new(None),
+        }))
+    }
+
+    fn wait_after_child_busy_for_test(&self) -> EngineResult<()> {
+        #[cfg(test)]
+        {
+            let gate = self
+                .write_child_busy_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if gate.is_some_and(|gate| !gate.wait_for_release()) {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "writable child-busy test gate timed out or disconnected",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn install_write_test_controls(&self, cache: &RegistrySchemaCache) {
+        let (child_busy, commit, cancellation) = cache.take_write_test_controls();
+        *self
+            .write_child_busy_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = child_busy;
+        self.write_state()
+            .install_test_controls(commit, cancellation);
+    }
+
+    fn discover_tables(
+        storage: &Storage,
+        shard: &Connection,
+        allocation_owners: Option<&Arc<AllocationOwnerMap>>,
+    ) -> EngineResult<BTreeMap<u64, Arc<TableSpec>>> {
         let mut tables = BTreeMap::new();
         for table in storage.logical_catalog().tables() {
             #[allow(unreachable_patterns)]
@@ -466,33 +740,14 @@ impl Registry {
                 }
             };
             let spec = TableSpec::from_physical_table(
-                &shard,
+                shard,
                 table,
-                allocation_owners.clone(),
+                allocation_owners.cloned(),
                 targets.into_boxed_slice(),
             )?;
             tables.insert(table.id().get(), Arc::new(spec));
         }
-
-        let write_state =
-            matches!(mode, CoordinatorMode::Writable).then(|| Arc::new(write::WriteState::new()));
-        Ok(Arc::new(Self {
-            storage,
-            schema_generation,
-            tables,
-            mode,
-            write_state,
-            limits,
-            cancellation_epoch: Arc::new(AtomicU64::new(0)),
-            active_child_scans: Arc::new(Mutex::new(0)),
-            lifecycle: Arc::new(LifecycleCounters::default()),
-            #[cfg(test)]
-            opened_shards: Mutex::new(Vec::new()),
-            #[cfg(test)]
-            child_scan_gate: Mutex::new(None),
-            #[cfg(test)]
-            child_scan_complete_gate: Mutex::new(None),
-        }))
+        Ok(tables)
     }
 
     fn table(&self, id: u64) -> Option<Arc<TableSpec>> {
@@ -503,6 +758,12 @@ impl Registry {
         self.write_state
             .as_ref()
             .expect("writable coordinator registry has shared write state")
+    }
+
+    fn has_retained_schema_admission(&self) -> bool {
+        self.write_state
+            .as_ref()
+            .is_some_and(|state| state.has_retained_schema_admission())
     }
 
     fn equality_scan(
@@ -908,6 +1169,7 @@ impl Drop for TrackedChildConnection {
     }
 }
 
+#[derive(Debug)]
 struct TableSpec {
     id: u64,
     name: String,
@@ -1836,17 +2098,22 @@ impl BriskShardCursor {
                 )));
             }
         }
-        let operation = self
-            .registry
-            .storage
-            .enter_schema_operation()
-            .map_err(vtab_error)?;
+        let operation = if self.registry.has_retained_schema_admission() {
+            None
+        } else {
+            Some(
+                self.registry
+                    .storage
+                    .enter_schema_operation()
+                    .map_err(vtab_error)?,
+            )
+        };
         if self.registry.storage.current_schema_generation() != self.registry.schema_generation {
             return Err(module_error(
                 "brisk_shard coordinator schema is stale; reopen the coordinator",
             ));
         }
-        self.operation = Some(operation);
+        self.operation = operation;
         self.scan_epoch = self.registry.cancellation_epoch.load(Ordering::Acquire);
         if self.registry.cancelled(self.scan_epoch) {
             return Err(vtab_error(cancelled_error()));
@@ -2138,7 +2405,8 @@ fn limit_error(resource: &str, limit: usize) -> EngineError {
 const TEST_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
-struct TestChildScanGate {
+#[derive(Debug)]
+pub(crate) struct TestChildScanGate {
     started: mpsc::SyncSender<()>,
     release: mpsc::Receiver<()>,
 }
@@ -2166,20 +2434,20 @@ impl TestChildScanGate {
 }
 
 #[cfg(test)]
-struct TestChildScanControl {
+pub(crate) struct TestChildScanControl {
     started: mpsc::Receiver<()>,
     release: TestRelease,
 }
 
 #[cfg(test)]
 impl TestChildScanControl {
-    fn wait_until_started(&self) {
+    pub(crate) fn wait_until_started(&self) {
         self.started
             .recv_timeout(TEST_SYNC_TIMEOUT)
             .expect("child scan did not reach its test gate before the timeout");
     }
 
-    fn release(&mut self) {
+    pub(crate) fn release(&mut self) {
         self.release.signal();
     }
 }
@@ -4416,6 +4684,124 @@ mod tests {
             "written"
         );
         assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn writable_admitted_coordinator_does_not_reenter_schema_admission() {
+        let fixture = Fixture::new();
+        let operation = fixture.storage.enter_schema_operation().unwrap();
+        let migration = fixture.storage.begin_schema_migration().unwrap();
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 1);
+
+        // Opening and executing after the migration starts proves bootstrap,
+        // write-state callbacks, and the UPDATE cursor all reuse the admission
+        // that the Engine acquired before the migration closed the gate.
+        let mut coordinator =
+            WriteCoordinator::open_admitted(fixture.storage.clone(), operation).unwrap();
+        let updated = coordinator
+            .execute_dml(
+                "UPDATE events SET payload = 'admitted'
+                 WHERE tenant_id = ?1 AND event_id = 1",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        assert_eq!(updated.affected_rows(), 1);
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 1);
+
+        drop(coordinator);
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 0);
+        migration.publish_ready().unwrap();
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM events WHERE tenant_id = ?1 AND event_id = 1",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "admitted"
+        );
+    }
+
+    #[test]
+    fn writable_coordinator_binds_protocol_neutral_values_without_coercion() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let parameters = [
+            Value::Int64(fixture.keys[0]),
+            Value::Int64(2),
+            Value::Text("bound text".to_owned()),
+            Value::Float64(3.5),
+            Value::Binary(vec![0, 255]),
+            Value::Null,
+            Value::Text("beta".to_owned()),
+        ];
+
+        let result = coordinator
+            .execute_dml_values(
+                "INSERT INTO events
+                 (tenant_id, event_id, payload, amount, raw, optional, category)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &parameters,
+            )
+            .unwrap();
+
+        assert_eq!(result.affected_rows(), 1);
+        assert_eq!(result.explicit_key(), Some(&Value::Int64(fixture.keys[0])));
+        let connection = fixture.storage.open_shard(0).unwrap();
+        let persisted = connection
+            .query_row(
+                "SELECT payload, amount, raw, optional
+                 FROM events WHERE tenant_id = ?1 AND event_id = 2",
+                [fixture.keys[0]],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            persisted,
+            ("bound text".to_owned(), 3.5, vec![0, 255], None)
+        );
+    }
+
+    #[test]
+    fn writable_protocol_value_rejection_precedes_transaction_and_allows_reuse() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let too_large = u64::try_from(i64::MAX).unwrap() + 1;
+
+        let error = coordinator
+            .execute_dml_values(
+                "INSERT INTO events
+                 (tenant_id, event_id, payload, amount, raw, optional, category)
+                 VALUES (?1, 2, 'rejected', 1.0, x'00', NULL, 'beta')",
+                &[Value::UInt64(too_large)],
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::NumericOutOfRange);
+        assert!(!coordinator.in_transaction());
+        assert_eq!(fixture.physical_row_count(), 2);
+
+        let result = coordinator
+            .execute_dml_values(
+                "INSERT INTO events
+                 (tenant_id, event_id, payload, amount, raw, optional, category)
+                 VALUES (?1, 2, 'accepted', 1.0, x'00', NULL, 'beta')",
+                &[Value::Int64(fixture.keys[0])],
+            )
+            .unwrap();
+        assert_eq!(result.affected_rows(), 1);
+        assert_eq!(fixture.physical_row_count(), 3);
     }
 
     #[test]

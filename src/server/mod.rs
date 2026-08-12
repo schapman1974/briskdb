@@ -98,6 +98,11 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
         }
     };
 
+    #[cfg(feature = "experimental-vtab")]
+    let experimental_vtab_writes = engine.options().experimental_vtab_writes();
+    #[cfg(not(feature = "experimental-vtab"))]
+    let experimental_vtab_writes = false;
+
     info!(
         listen = %config.listen,
         postgres_listen = ?config.postgres_listen,
@@ -127,6 +132,7 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
             .request_timeout()
             .map(|timeout| timeout.as_millis()),
         shutdown_grace_ms = engine.options().shutdown_grace().as_millis(),
+        experimental_vtab_writes,
         "BriskDB is ready"
     );
 

@@ -2,7 +2,8 @@
 
 BriskDB's no-fork direction is a statically registered SQLite virtual-table
 module named `brisk_shard`. The prototype is compiled only with the
-`experimental-vtab` Cargo feature and does not replace the current logical
+`experimental-vtab` Cargo feature. Its writable coordinator has a separate
+runtime gate; its read-only coordinator does not replace the current logical
 scatter/gather executor.
 
 The coordinator is a separate, ephemeral stock-SQLite connection. It contains
@@ -35,10 +36,52 @@ contract is deliberately narrower:
   cancellation, connection loss, and child commit failures are reconciled by a
   wrapper that never exposes the raw writable coordinator connection.
 
-Cancellation and child commit have one explicit durability boundary. If
-cancellation wins before physical `COMMIT`, the child rolls back; once physical
-`COMMIT` begins, it wins and is allowed to finish so BriskDB never reports a
-cancelled result for a write that may already be durable.
+Cancellation and child commit have one explicit linearization boundary. If
+cancellation claims that decision first, the child rolls back. Once finalization
+claims the commit decision, it wins and is allowed to finish, so BriskDB never
+reports a cancelled result for a write that may already be durable.
+
+## Engine and HTTP opt-in
+
+Compiling `experimental-vtab` makes the coordinator available but does not
+change execution by itself. The runtime default remains off. Rust embedders
+enable it with `EngineOptions::with_experimental_vtab_writes(true)`; the server
+maps `--experimental-vtab-writes` and
+`BRISKDB_EXPERIMENTAL_VTAB_WRITES=true` to that same option.
+
+With both gates enabled, `Engine::execute` and HTTP `/v1/execute` dispatch a
+write through the coordinator only after the authoritative catalog, common SQL
+frontend, bound values, caller route, and single-owner write policy
+have accepted one Sharded target. The returned `shard` remains the planner's
+assigned owner. `rows_affected` comes from the reconciled physical child, and a
+successful response is produced only after the autocommit child transaction
+commits under BriskDB's configured SQLite WAL and synchronous policy. The
+endpoint's request and response shapes do not change.
+
+The Engine caches the validated physical table descriptors for the current
+schema generation. One serialized cold bootstrap discovers them through a
+cancellable, shard-0-capacity-accounted read-only handle. Warm coordinator
+opens reuse those immutable descriptors and reserve only the DML target shard,
+preserving independent-shard writer progress. Schema-generation publication
+invalidates the cache and makes the next write rediscover descriptors.
+
+This Engine bridge currently rejects a target table that declares
+`native_range_v1`, including writes that supply an explicit ID. Issue #128 owns
+making Engine planning, returned-shard reporting, and per-shard admission use
+the encoded allocation owner consistently. The storage-internal coordinator's
+native-ID behavior is not exposed through Engine before that work lands.
+
+The integration opens an ephemeral coordinator for one statement. It does not
+retain a coordinator in `Session`, and it does not add `BEGIN`, `COMMIT`,
+`ROLLBACK`, read-your-writes, or any transaction spanning requests. Those need
+the later protocol-neutral transaction state machine and shard-pinning policy.
+Prepared portals are also unchanged in this step.
+
+Reads deliberately stay on the established paths. Engine logical reads and
+HTTP `/v1/query` still select physical targets from catalog metadata and use
+the bounded scatter/gather executor; the admin browser keeps its specialized
+logical count and page readers. The internal read-only virtual-table facade is
+not exposed to those surfaces yet.
 
 For a usable equality constraint on the exact declared shard-key column,
 `xBestIndex` requests one argument but deliberately does not set `omit`.
@@ -158,23 +201,24 @@ This is why several alternatives are excluded:
 
 ## Current non-goals
 
-The internal writable coordinator now provides explicit-key DML on one pinned
-Sharded child. It does not provide missing/generated keys, replicated Global
-writes, multi-shard transactions, `RETURNING`, physical defaults, generated
+The writable coordinator provides explicit-key DML on one pinned Sharded child,
+and the opt-in Engine/HTTP integration exposes only one-statement autocommit
+writes. It does not provide missing/generated keys, replicated Global writes,
+multi-shard or session transactions, `RETURNING`, physical defaults, generated
 columns, physical triggers, client-created virtual-table indexes or triggers,
 `ALTER TABLE`, aggregate/order/limit/join pushdown, parallel shard scans, or a
-public query API. The physical-default restriction is intentional: SQLite's
-`xUpdate` arguments do not distinguish an omitted column from explicit `NULL`.
-Generated keys and omitted-key SQL integration remain owned by issues #128
-through #130, and rollout remains owned by #131.
+public virtual-table query API. The physical-default restriction is
+intentional: SQLite's `xUpdate` arguments do not distinguish an omitted column
+from explicit `NULL`. Generated keys and omitted-key SQL integration remain
+owned by issues #128 through #130, and the broader rollout gate remains owned
+by #131.
 
-This does not change protocol behavior. The current `Engine`, HTTP surface,
-query app, and protocol planner remain authoritative. The writable coordinator
-is kept behind `experimental-vtab` and cannot be reached through a raw
-connection. Additional indexes continue to live on the ordinary physical
-tables and are used by child SQLite statements; SQLite does not permit adding
-indexes or triggers directly to a virtual table. Schema changes remain the
-journaled migration system's responsibility.
+The established protocol planner stays authoritative. The writable coordinator
+is kept behind both `experimental-vtab` and the runtime option and cannot be
+reached through a raw connection. Additional indexes continue to live on the
+ordinary physical tables and are used by child SQLite statements; SQLite does
+not permit adding indexes or triggers directly to a virtual table. Schema
+changes remain the journaled migration system's responsibility.
 
 Only the exact typed shard-key equality described above narrows a scan. Other
 predicates, and a type-mismatched equality whose SQLite affinity semantics

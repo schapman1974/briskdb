@@ -273,14 +273,38 @@ pub(super) fn open_existing_read_only(
     schema_generation: u64,
     layout: &ShardLayout,
 ) -> EngineResult<Connection> {
-    validate_existing_file(path)?;
-    let connection = open_existing_read_only_connection(path)?;
+    let connection = open_required_file_read_only(path)?;
     configure_busy_timeout(&connection)?;
+    validate_open_read_only_connection(&connection, path, shard_id, schema_generation, layout)?;
+    Ok(connection)
+}
+
+/// Open a required shard through an OS-level read-only handle while leaving
+/// validation to the caller. The controlled virtual-table bootstrap path uses
+/// this split so it can install cancellation hooks before validation touches
+/// SQLite schema state that may be locked by another process.
+#[cfg(feature = "experimental-vtab")]
+pub(super) fn open_required_file_read_only(path: &Path) -> EngineResult<Connection> {
+    validate_existing_file(path)?;
+    open_existing_read_only_connection(path)
+}
+
+/// Validate an already-open read-only shard without replacing its busy handler
+/// or progress hook.
+#[cfg(feature = "experimental-vtab")]
+pub(super) fn validate_open_read_only_connection(
+    connection: &Connection,
+    path: &Path,
+    shard_id: u16,
+    schema_generation: u64,
+    layout: &ShardLayout,
+) -> EngineResult<()> {
+    configure_cell_size_check(connection)?;
     validate_shard_id(shard_id)?;
     let expected_user_version = expected_user_version(schema_generation)?;
-    require_read_only(&connection)?;
-    validate_exact_shard(&connection, path, shard_id, expected_user_version, layout)?;
-    Ok(connection)
+    require_read_only(connection)?;
+    validate_exact_shard(connection, path, shard_id, expected_user_version, layout)?;
+    Ok(())
 }
 
 /// Open the required path with strict filesystem and SQLite no-create/no-follow
@@ -2284,7 +2308,6 @@ fn open_existing_read_only_connection(path: &Path) -> EngineResult<Connection> {
         sqlite_error::storage(error)
             .context(format!("failed to open read-only shard {}", path.display()))
     })?;
-    configure_cell_size_check(&connection)?;
     Ok(connection)
 }
 

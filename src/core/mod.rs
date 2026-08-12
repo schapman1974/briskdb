@@ -78,6 +78,8 @@ pub(crate) enum RawDataOperation {
 pub(crate) struct RawDataPlan {
     pub(crate) shard: u16,
     pub(crate) sqlite_sql: String,
+    #[cfg(feature = "experimental-vtab")]
+    pub(crate) native_range_v1: bool,
 }
 
 #[derive(Debug)]
@@ -195,10 +197,23 @@ impl Database {
             |key| self.shard_for_key(key),
         )?;
         let shard = raw_data_execution_shard(&plan, catalog, operation)?;
+        #[cfg(feature = "experimental-vtab")]
+        let native_range_v1 = plan
+            .inference()
+            .table_id()
+            .and_then(|table| catalog.table_by_id(table))
+            .is_some_and(|table| {
+                matches!(
+                    table.generated_id_policy(),
+                    GeneratedIdPolicy::NativeRangeV1 { .. }
+                )
+            });
 
         Ok(Some(RawDataPlan {
             shard,
             sqlite_sql: translated.sqlite_sql().to_owned(),
+            #[cfg(feature = "experimental-vtab")]
+            native_range_v1,
         }))
     }
 

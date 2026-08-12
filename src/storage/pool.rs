@@ -934,6 +934,41 @@ fn configure_connection_controlled(
     shard: u16,
     #[cfg(test)] barrier: Option<ControlledBarrier>,
 ) -> EngineResult<()> {
+    run_connection_validation_controlled(connection, control, |connection, _control| {
+        #[cfg(test)]
+        if let Some(barrier) = barrier {
+            barrier.wait(_control);
+        }
+
+        // Do not call the ordinary configuration wrapper here: its fixed
+        // busy timeout would replace the cancellable handler before these
+        // pragmas can encounter a SQLite lock.
+        storage.validate_unconfigured_shard(connection, shard)
+    })
+}
+
+/// Validate and inspect a dedicated read-only coordinator-bootstrap handle
+/// while request cancellation owns its busy handler, progress hook, and
+/// interrupt handle for the entire registry-discovery operation.
+#[cfg(feature = "experimental-vtab")]
+pub(super) fn with_read_only_connection_controlled<T>(
+    connection: &mut Connection,
+    control: Arc<OperationControl>,
+    storage: &Storage,
+    shard: u16,
+    inspect: impl FnOnce(&Connection) -> EngineResult<T>,
+) -> EngineResult<T> {
+    run_connection_validation_controlled(connection, control, |connection, _control| {
+        storage.validate_unconfigured_shard_read_only(connection, shard)?;
+        inspect(connection)
+    })
+}
+
+fn run_connection_validation_controlled<T>(
+    connection: &mut Connection,
+    control: Arc<OperationControl>,
+    validate: impl FnOnce(&mut Connection, &OperationControl) -> EngineResult<T>,
+) -> EngineResult<T> {
     let _busy_operation = BusyOperationGuard::install(Arc::clone(&control));
     connection
         .busy_handler(Some(cancellable_busy_handler))
@@ -954,15 +989,7 @@ fn configure_connection_controlled(
         return Err(reason.error());
     }
 
-    #[cfg(test)]
-    if let Some(barrier) = barrier {
-        barrier.wait(&control);
-    }
-
-    // Do not call the ordinary configuration wrapper here: its fixed busy
-    // timeout would replace the cancellable handler before these pragmas can
-    // encounter a SQLite lock.
-    let result = storage.validate_unconfigured_shard(connection, shard);
+    let result = validate(connection, &control);
     let progress_cleanup = connection
         .progress_handler(0, None::<fn() -> bool>)
         .map_err(sqlite_error::storage);
@@ -973,14 +1000,14 @@ fn configure_connection_controlled(
     match (result, progress_cleanup, busy_cleanup, reason) {
         (Err(_), _, _, Some(reason)) => Err(reason.error()),
         (Err(error), _, _, None) => Err(error),
-        (Ok(()), _, _, Some(reason)) => Err(reason.error()),
-        (Ok(()), Err(error), _, None) => {
+        (Ok(_), _, _, Some(reason)) => Err(reason.error()),
+        (Ok(_), Err(error), _, None) => {
             Err(error.context("failed to remove the SQLite request progress hook after setup"))
         }
-        (Ok(()), Ok(()), Err(error), None) => {
+        (Ok(_), Ok(()), Err(error), None) => {
             Err(error.context("failed to restore the SQLite busy timeout after setup"))
         }
-        (Ok(()), Ok(()), Ok(()), None) => Ok(()),
+        (Ok(value), Ok(()), Ok(()), None) => Ok(value),
     }
 }
 

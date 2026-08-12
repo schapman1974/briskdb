@@ -11,6 +11,9 @@ PostgreSQL and MySQL wire interfaces, durable shard catalog, scatter/gather
 planner, APIs, and production-hardening milestones.
 The [architecture map](docs/ARCHITECTURE.md) defines the crate's module
 boundaries and dependency direction.
+The [experimental sharded virtual-table contract](docs/SHARDED_VIRTUAL_TABLE.md)
+defines the no-fork coordinator, its opt-in autocommit write path, and the
+features that deliberately remain on the established engine paths.
 
 The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
 unregistered legacy SQLite pass-through from the authoritative-catalog HTTP
@@ -108,7 +111,9 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
   later schema migrations checked against its table and shard-key declarations
 - Identity-bound, WAL-enabled SQLite shard files that are never silently
   recreated after initialization
-- Routed writes and catalog-aware logical query execution
+- Routed writes and catalog-aware logical query execution, with a separately
+  compiled and runtime-enabled virtual-table coordinator for explicit-key
+  autocommit writes to registered Sharded tables
 - A crash-resumable, journaled schema-migration endpoint for every shard
 - A checksummed manifest, generation-bound shard-schema fingerprints, and
   fail-closed `Verifying`/`Ready`/`Migrating`/`Degraded` storage states
@@ -133,6 +138,27 @@ briskdb-data/
 ```bash
 cargo run -- --data-dir ./briskdb-data --shards 4
 ```
+
+The established physical-shard write path remains the default. To try the
+stock-SQLite virtual-table coordinator for registered, explicit-key autocommit
+writes, enable both its Cargo feature and runtime gate:
+
+```bash
+cargo run --features experimental-vtab -- \
+  --experimental-vtab-writes \
+  --data-dir ./briskdb-data \
+  --shards 4
+
+# The runtime gate is also available through the environment.
+BRISKDB_EXPERIMENTAL_VTAB_WRITES=true \
+  cargo run --features experimental-vtab -- --data-dir ./briskdb-data --shards 4
+```
+
+This opt-in changes only validated `Engine::execute` autocommit DML for a
+populated catalog, including the `/v1/execute` adapter. `/v1/query` and the
+admin browser continue to use the established metadata-driven scatter/gather
+readers. `BEGIN`, `COMMIT`, `ROLLBACK`, and transactions spanning HTTP requests
+are not enabled by this flag.
 
 To initialize a new data directory from an existing standard SQLite file, use
 the separate offline importer. The destination must not already exist, and the
@@ -305,12 +331,20 @@ accepts SQL and should only be exposed on a trusted network. The HTTP adapter
 creates an ephemeral session for each data request, so session state and
 transactions cannot span HTTP requests. Each shard has its own bounded pool, so
 routed work queued for one shard does not consume another shard's capacity.
-After a populated catalog validates `/v1/execute` as one routed common-subset
-write, those ephemeral requests share a stateless physical-handle ownership
-domain. This keeps the logical sessions separate while allowing clean
-autocommit write handles to remain warm. Empty-catalog pass-through SQL and all
-other session surfaces retain unique ownership. Registration, startup, import,
-and migration validation also reject `last_insert_rowid()`, `changes()`, and
+By default, after a populated catalog validates `/v1/execute` as one routed
+common-subset write, those ephemeral requests share a stateless physical-handle
+ownership domain. This keeps the logical sessions separate while allowing clean
+autocommit write handles to remain warm. When BriskDB is compiled with
+`experimental-vtab` and `--experimental-vtab-writes` is set, an accepted
+explicit-key write to a registered Sharded table instead executes through one
+ephemeral writable coordinator and commits its one physical child before HTTP
+success is returned. It keeps the same HTTP request, response, planner, shard
+assignment, admission, cancellation, and affected-row contracts. Each request
+is still one autocommit statement; the option does not add session transaction
+state, prepared-portal integration, Global writes, or a virtual-table read
+path. Empty-catalog pass-through SQL and all other session surfaces retain
+their existing behavior. Registration, startup, import, and migration
+validation also reject `last_insert_rowid()`, `changes()`, and
 `total_changes()` inside persistent table or index expressions, so a stored
 `DEFAULT`, `CHECK`, generated expression, or index cannot bypass that boundary.
 Pool admission happens before blocking SQLite work: once a shard's active slots

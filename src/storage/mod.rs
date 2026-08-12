@@ -7,6 +7,8 @@ mod shard;
 #[cfg(feature = "experimental-vtab")]
 #[allow(dead_code)]
 mod sharded_vtab;
+#[cfg(feature = "experimental-vtab")]
+pub(crate) use sharded_vtab::{RegistrySchemaCache, WriteCoordinator};
 
 pub(crate) mod pool;
 pub(crate) use pool::{ConnectionOwner, ConnectionPools, PooledConnection};
@@ -922,6 +924,62 @@ impl Storage {
         self.fail_closed_on_corruption(result)
     }
 
+    /// Open and validate a writable virtual-table child while polling the
+    /// coordinator's cancellation epoch before an interrupt handle exists.
+    #[cfg(feature = "experimental-vtab")]
+    pub(crate) fn open_shard_write_cancellable(
+        &self,
+        shard: u16,
+        cancellation_epoch: Arc<std::sync::atomic::AtomicU64>,
+        expected_epoch: u64,
+    ) -> EngineResult<Connection> {
+        let result = (|| {
+            self.ensure_shard_in_range(shard)?;
+            let connection = self.open_unconfigured_shard(shard)?;
+            connection
+                .busy_timeout(std::time::Duration::from_millis(25))
+                .map_err(sqlite_error::storage)?;
+            let progress_epoch = Arc::clone(&cancellation_epoch);
+            connection
+                .progress_handler(
+                    64,
+                    Some(move || progress_epoch.load(Ordering::Acquire) != expected_epoch),
+                )
+                .map_err(sqlite_error::storage)?;
+
+            let deadline = std::time::Instant::now()
+                .checked_add(CONNECTION_BUSY_TIMEOUT)
+                .unwrap_or_else(std::time::Instant::now);
+            loop {
+                if cancellation_epoch.load(Ordering::Acquire) != expected_epoch {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Cancelled,
+                        "the writable shard child was cancelled while opening",
+                    ));
+                }
+                match self.validate_unconfigured_shard(&connection, shard) {
+                    Ok(()) => break,
+                    Err(error)
+                        if error.kind() == EngineErrorKind::Busy
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if cancellation_epoch.load(Ordering::Acquire) != expected_epoch {
+                return Err(EngineError::new(
+                    EngineErrorKind::Cancelled,
+                    "the writable shard child was cancelled while opening",
+                ));
+            }
+            attach_storage_authorizer(&connection)?;
+            Ok(connection)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
     #[cfg(feature = "experimental-vtab")]
     pub(crate) fn open_shard_read_only(&self, shard: u16) -> EngineResult<Connection> {
         let result = (|| {
@@ -941,6 +999,29 @@ impl Storage {
             )?;
             attach_storage_authorizer(&connection)?;
             Ok(connection)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    /// Validate and inspect one read-only shard while cancellation remains
+    /// installed across the entire virtual-table registry discovery.
+    #[cfg(feature = "experimental-vtab")]
+    pub(crate) fn with_shard_read_only_controlled<T>(
+        &self,
+        shard: u16,
+        control: Arc<crate::core::OperationControl>,
+        inspect: impl FnOnce(&Connection) -> EngineResult<T>,
+    ) -> EngineResult<T> {
+        let result = (|| {
+            self.ensure_shard_in_range(shard)?;
+            let mut connection = shard::open_required_file_read_only(&self.shard_path(shard))?;
+            pool::with_read_only_connection_controlled(
+                &mut connection,
+                control,
+                self,
+                shard,
+                inspect,
+            )
         })();
         self.fail_closed_on_corruption(result)
     }
@@ -1018,6 +1099,32 @@ impl Storage {
                 self.catalog.logical().schema_generation(),
                 &expected_digest,
             )
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    fn validate_unconfigured_shard_read_only(
+        &self,
+        connection: &Connection,
+        shard: u16,
+    ) -> EngineResult<()> {
+        let result = (|| {
+            self.ensure_shard_in_range(shard)?;
+            shard::validate_open_read_only_connection(
+                connection,
+                &self.shard_path(shard),
+                shard,
+                self.catalog.logical().schema_generation(),
+                &self.shard_layout,
+            )?;
+            let expected_digest = self.schema_coordination.committed_schema_digest()?;
+            shard::verify_schema_digest(
+                connection,
+                self.catalog.logical().schema_generation(),
+                &expected_digest,
+            )?;
+            attach_storage_authorizer(connection)
         })();
         self.fail_closed_on_corruption(result)
     }

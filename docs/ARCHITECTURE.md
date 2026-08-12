@@ -673,12 +673,11 @@ validates the policy, codec, and owner slots only; physical
 `sqlite_sequence` validation and seeding belong to issue #128, and omitted-key
 SQL translation belongs to issue #130.
 
-The opt-in `experimental-vtab` feature adds separate read-only and narrowly
-writable SQLite coordinators that statically register `brisk_shard`. They prove
-a no-fork logical table boundary while leaving the manifest, physical schemas,
-protocol behavior, and established scatter executor unchanged. The read-only
-coordinator opens validated physical children through OS-level SQLite read-only
-handles, never attaches a shard, and never
+The `experimental-vtab` feature adds separate read-only and narrowly writable
+SQLite coordinators that statically register `brisk_shard`. They prove a
+no-fork logical table boundary while leaving the manifest and physical schemas
+unchanged. The read-only coordinator opens validated physical children through
+OS-level SQLite read-only handles, never attaches a shard, and never
 dynamically loads an extension. Trusted metadata supplies each declared
 schema. An exact, storage-class-compatible `Int64`, `Text`, or `Binary`
 shard-key equality can open only its owner and bind the equality on that
@@ -687,11 +686,12 @@ integers retain ordinary hash routing. `NULL` is empty and a type mismatch
 falls back to a full scan so SQLite can retain its comparison semantics.
 Unconstrained scans visit shards in ascending order with `UNION ALL` duplicate
 semantics. Remaining filters, aggregation, ordering, limits, and feature-local
-joins execute in the stock SQLite coordinator without pushdown. That delegation
-is internal to the experimental coordinator and does not expand the Engine or
-protocol SQL contract. Cursor ownership, schema admission, cancellation,
-bounded materialization, static-loading policy, and rejected alternatives are
-specified in the
+joins execute in the stock SQLite coordinator without pushdown. That read
+delegation remains internal: Engine logical queries, `/v1/query`, and the admin
+browser continue to use the established metadata-driven scatter/gather
+executor. Cursor ownership, schema admission, cancellation, bounded
+materialization, static-loading policy, and rejected alternatives are specified
+in the
 [experimental sharded virtual-table facade](SHARDED_VIRTUAL_TABLE.md).
 
 The writable coordinator accepts explicit-key INSERT and exactly routed
@@ -702,9 +702,36 @@ physical rowid or complete `WITHOUT ROWID` key without changing shard files.
 The wrapper reconciles stock-SQLite transaction and savepoint callbacks, then
 performs the fallible child commit before acknowledging success. Physical
 constraints and conservatively admitted co-located foreign keys remain
-authoritative. Missing/generated keys, Global writes, multi-shard
-transactions, `RETURNING`, defaults, generated columns, triggers, and public
-protocol integration remain later work.
+authoritative. Missing/generated keys, Global writes, multi-shard transactions,
+`RETURNING`, defaults, generated columns, and triggers remain later work.
+
+Engine integration has two independent opt-ins. The binary must be compiled
+with `experimental-vtab`, and `EngineOptions::with_experimental_vtab_writes(true)`
+must enable the runtime gate; the server exposes that option as
+`--experimental-vtab-writes` and
+`BRISKDB_EXPERIMENTAL_VTAB_WRITES=true`. The gate is false by default even in an
+all-features build. When it is true, only a populated-catalog raw Engine write
+that planning has already proven to be one Sharded owner is dispatched through
+an ephemeral writable coordinator. The engine retains its lifecycle, schema,
+session, per-shard capacity, worker, cancellation, deadline, route-reporting,
+and error boundaries while the coordinator supplies the physical affected-row
+count and acknowledges success only after its child commit. Empty-catalog SQL,
+Global and Catalog placement, prepared portals, and all reads retain their
+established execution paths.
+
+Physical table descriptors discovered from shard 0 are immutable for one schema
+generation and cached per Engine. Cold discovery is serialized, cancellable,
+and charged to shard 0's connection capacity; warm coordinators open no shard-0
+handle and reserve only their target shard, so an occupied shard 0 cannot stall
+writers whose metadata is already warm. A published schema-generation mismatch
+invalidates the cache and forces controlled rediscovery before another write.
+
+This integration is intentionally autocommit-only. Each `Engine::execute` or
+HTTP `/v1/execute` request owns one statement and drops its coordinator after
+that statement reconciles. `Session` still has no transaction state, HTTP still
+creates a fresh Session per request, and `BEGIN`, `COMMIT`, `ROLLBACK`,
+read-your-writes, and transaction shard pinning are deferred to the later
+session-transaction work.
 
 ## Session and asynchronous engine boundary
 
