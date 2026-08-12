@@ -144,6 +144,15 @@ struct Args {
         default_value_t = DEFAULT_SHUTDOWN_GRACE_MS
     )]
     shutdown_grace_ms: u64,
+
+    /// Route registered autocommit writes through the experimental virtual-table facade.
+    #[cfg(feature = "experimental-vtab")]
+    #[arg(
+        long,
+        env = "BRISKDB_EXPERIMENTAL_VTAB_WRITES",
+        default_value_t = false
+    )]
+    experimental_vtab_writes: bool,
 }
 
 impl Args {
@@ -166,6 +175,8 @@ impl Args {
                 .with_prepared_statement_limits(prepared_statement_limits)
                 .with_request_timeout(request_timeout)?
                 .with_shutdown_grace(Duration::from_millis(self.shutdown_grace_ms))?;
+        #[cfg(feature = "experimental-vtab")]
+        let options = options.with_experimental_vtab_writes(self.experimental_vtab_writes);
         let config = Config {
             listen: self.listen,
             postgres_listen: self.postgres_listen.into_option(),
@@ -228,6 +239,8 @@ mod tests {
         );
         assert_eq!(args.request_timeout_ms, DEFAULT_REQUEST_TIMEOUT_MS);
         assert_eq!(args.shutdown_grace_ms, DEFAULT_SHUTDOWN_GRACE_MS);
+        #[cfg(feature = "experimental-vtab")]
+        assert!(!args.experimental_vtab_writes);
     }
 
     #[test]
@@ -339,6 +352,29 @@ mod tests {
             Some(Duration::from_millis(2_500))
         );
         assert_eq!(options.shutdown_grace(), Duration::from_millis(4_000));
+        #[cfg(feature = "experimental-vtab")]
+        assert!(!options.experimental_vtab_writes());
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[test]
+    fn experimental_vtab_write_flag_is_forwarded_to_engine_options() {
+        let args = Args::try_parse_from(["briskdb", "--experimental-vtab-writes"]).unwrap();
+        assert!(args.experimental_vtab_writes);
+
+        let (_, options) = args.into_server_parts().unwrap();
+        assert!(options.experimental_vtab_writes());
+    }
+
+    #[cfg(not(feature = "experimental-vtab"))]
+    #[test]
+    fn experimental_vtab_write_flag_is_absent_without_the_cargo_feature() {
+        assert!(Args::try_parse_from(["briskdb", "--experimental-vtab-writes"]).is_err());
+        assert!(
+            Args::command()
+                .get_arguments()
+                .all(|argument| argument.get_id() != "experimental_vtab_writes")
+        );
     }
 
     #[test]
@@ -474,6 +510,11 @@ mod tests {
             .get_arguments()
             .find(|argument| argument.get_id() == "shutdown_grace_ms")
             .unwrap();
+        #[cfg(feature = "experimental-vtab")]
+        let experimental_vtab_writes = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "experimental_vtab_writes")
+            .unwrap();
 
         assert_eq!(
             postgres_listener.get_env(),
@@ -512,6 +553,37 @@ mod tests {
             shutdown.get_env(),
             Some(OsStr::new("BRISKDB_SHUTDOWN_GRACE_MS"))
         );
+        #[cfg(feature = "experimental-vtab")]
+        assert_eq!(
+            experimental_vtab_writes.get_env(),
+            Some(OsStr::new("BRISKDB_EXPERIMENTAL_VTAB_WRITES"))
+        );
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[test]
+    fn experimental_vtab_writes_parse_from_environment_in_an_isolated_process() {
+        const CHILD_MARKER: &str = "BRISKDB_VTAB_WRITE_ENV_TEST_CHILD";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let args = Args::try_parse_from(["briskdb"]).unwrap();
+            assert!(args.experimental_vtab_writes);
+            let (_, options) = args.into_server_parts().unwrap();
+            assert!(options.experimental_vtab_writes());
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::experimental_vtab_writes_parse_from_environment_in_an_isolated_process",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("BRISKDB_EXPERIMENTAL_VTAB_WRITES", "true")
+            .status()
+            .unwrap();
+
+        assert!(status.success());
     }
 
     #[test]

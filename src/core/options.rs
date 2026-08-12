@@ -213,6 +213,8 @@ pub struct EngineOptions {
     prepared_statement_limits: PreparedStatementLimits,
     request_timeout: Option<Duration>,
     shutdown_grace: Duration,
+    #[cfg(feature = "experimental-vtab")]
+    experimental_vtab_writes: bool,
 }
 
 impl EngineOptions {
@@ -243,6 +245,8 @@ impl EngineOptions {
             prepared_statement_limits: PreparedStatementLimits::default(),
             request_timeout: Some(Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS)),
             shutdown_grace: Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS),
+            #[cfg(feature = "experimental-vtab")]
+            experimental_vtab_writes: false,
         })
     }
 
@@ -313,6 +317,25 @@ impl EngineOptions {
         Ok(self)
     }
 
+    /// Return whether registered autocommit writes use the experimental
+    /// sharded virtual-table facade.
+    #[cfg(feature = "experimental-vtab")]
+    pub const fn experimental_vtab_writes(&self) -> bool {
+        self.experimental_vtab_writes
+    }
+
+    /// Enable or disable the experimental sharded virtual-table write path.
+    ///
+    /// This runtime opt-in is available only when BriskDB is compiled with the
+    /// `experimental-vtab` Cargo feature. The established pooled execution
+    /// path remains the default even in feature-enabled builds.
+    #[cfg(feature = "experimental-vtab")]
+    #[must_use]
+    pub const fn with_experimental_vtab_writes(mut self, enabled: bool) -> Self {
+        self.experimental_vtab_writes = enabled;
+        self
+    }
+
     /// Validate limits that depend on the database's physical shard count.
     ///
     /// The returned value is the maximum number of active SQLite connections
@@ -348,6 +371,8 @@ impl Default for EngineOptions {
             },
             request_timeout: Some(Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS)),
             shutdown_grace: Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS),
+            #[cfg(feature = "experimental-vtab")]
+            experimental_vtab_writes: false,
         }
     }
 }
@@ -409,8 +434,21 @@ mod tests {
         );
         assert_eq!(options.request_timeout(), Some(Duration::from_secs(30)));
         assert_eq!(options.shutdown_grace(), Duration::from_secs(30));
+        #[cfg(feature = "experimental-vtab")]
+        assert!(!options.experimental_vtab_writes());
         assert_eq!(options.worker_limit(2).unwrap(), 8);
         assert_eq!(options.worker_limit(64).unwrap(), 256);
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[test]
+    fn experimental_vtab_writes_are_an_explicit_reversible_opt_in() {
+        let enabled = EngineOptions::default().with_experimental_vtab_writes(true);
+        assert!(enabled.experimental_vtab_writes());
+
+        let disabled = enabled.with_experimental_vtab_writes(false);
+        assert!(!disabled.experimental_vtab_writes());
+        assert_eq!(disabled, EngineOptions::default());
     }
 
     #[test]

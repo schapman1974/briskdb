@@ -472,6 +472,9 @@ mod tests {
         let database = Arc::new(database);
         let routing_key = "reused-http-write";
         let expected_shard = database.shard_for_key(routing_key.as_bytes());
+        // The experimental virtual-table write gate is off by default, even
+        // in an all-features build. This existing pooling assertion therefore
+        // also protects parity for the established physical-shard path.
         let options = EngineOptions::new(1, 64).unwrap();
         let engine = Engine::from_database_with_options(Arc::clone(&database), options).unwrap();
         let application = router_with_engine(engine.clone());
@@ -602,6 +605,205 @@ mod tests {
         assert_eq!(isolated.retired, 1);
     }
 
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn opted_in_vtab_http_autocommit_dml_places_each_row_on_exactly_one_shard() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 4).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE records (
+                    tenant_id TEXT NOT NULL,
+                    record_id INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, record_id)
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "records",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let tenant_keys = (0..4_u16)
+            .map(|expected_shard| {
+                (0_u64..)
+                    .map(|candidate| format!("vtab-http-{expected_shard}-{candidate}"))
+                    .find(|key| database.shard_for_key(key.as_bytes()) == expected_shard)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let database = Arc::new(database);
+        let options = EngineOptions::new(2, 16)
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let engine = Engine::from_database_with_options(Arc::clone(&database), options).unwrap();
+        let application = router_with_engine(engine.clone());
+
+        for (shard, tenant_key) in tenant_keys.iter().enumerate() {
+            assert_eq!(
+                request_json(
+                    &application,
+                    Method::POST,
+                    "/v1/execute",
+                    Some(json!({
+                        "shard_key": tenant_key,
+                        "sql": "INSERT INTO records (tenant_id, record_id, payload) VALUES (?1, ?2, ?3)",
+                        "params": [tenant_key, 1, format!("inserted-{shard}")]
+                    })),
+                )
+                .await,
+                (
+                    StatusCode::OK,
+                    json!({"shard": shard, "rows_affected": 1})
+                )
+            );
+        }
+
+        // Inspect every physical file after INSERT, rather than accepting a
+        // successful logical read as proof of placement. Each owner has its
+        // one row and no other shard has a duplicate.
+        let observer = engine.session();
+        for (shard, tenant_key) in tenant_keys.iter().enumerate() {
+            let physical = engine
+                .inspect_shard(
+                    &observer,
+                    u16::try_from(shard).unwrap(),
+                    Statement::new("SELECT tenant_id, record_id, payload FROM records", vec![]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(physical.rows().len(), 1, "physical shard {shard}");
+            assert_eq!(
+                physical.rows()[0].values(),
+                [
+                    Value::from(tenant_key.clone()),
+                    Value::from(1_i64),
+                    Value::from(format!("inserted-{shard}")),
+                ],
+                "physical shard {shard}"
+            );
+        }
+
+        for (shard, tenant_key) in tenant_keys.iter().enumerate() {
+            assert_eq!(
+                request_json(
+                    &application,
+                    Method::POST,
+                    "/v1/execute",
+                    Some(json!({
+                        "shard_key": tenant_key,
+                        "sql": "UPDATE records SET payload = ?1 WHERE tenant_id = ?2 AND record_id = ?3",
+                        "params": [format!("updated-{shard}"), tenant_key, 1]
+                    })),
+                )
+                .await,
+                (
+                    StatusCode::OK,
+                    json!({"shard": shard, "rows_affected": 1})
+                )
+            );
+        }
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/execute",
+                Some(json!({
+                    "shard_key": tenant_keys[0],
+                    "sql": "UPDATE records SET payload = 'missing' WHERE tenant_id = ?1 AND record_id = ?2",
+                    "params": [tenant_keys[0], 99]
+                })),
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({"shard": 0, "rows_affected": 0})
+            )
+        );
+
+        for expected_rows in [1, 0] {
+            assert_eq!(
+                request_json(
+                    &application,
+                    Method::POST,
+                    "/v1/execute",
+                    Some(json!({
+                        "shard_key": tenant_keys[2],
+                        "sql": "DELETE FROM records WHERE tenant_id = ?1 AND record_id = ?2",
+                        "params": [tenant_keys[2], 1]
+                    })),
+                )
+                .await,
+                (
+                    StatusCode::OK,
+                    json!({"shard": 2, "rows_affected": expected_rows})
+                )
+            );
+        }
+
+        for (shard, tenant_key) in tenant_keys.iter().enumerate() {
+            let physical = engine
+                .inspect_shard(
+                    &observer,
+                    u16::try_from(shard).unwrap(),
+                    Statement::new("SELECT tenant_id, record_id, payload FROM records", vec![]),
+                )
+                .await
+                .unwrap();
+            if shard == 2 {
+                assert!(physical.is_empty(), "deleted owner shard must be empty");
+            } else {
+                assert_eq!(physical.rows().len(), 1, "physical shard {shard}");
+                assert_eq!(
+                    physical.rows()[0].values(),
+                    [
+                        Value::from(tenant_key.clone()),
+                        Value::from(1_i64),
+                        Value::from(format!("updated-{shard}")),
+                    ],
+                    "physical shard {shard}"
+                );
+            }
+        }
+
+        // Opting writes into the coordinator does not replace logical reads:
+        // the existing metadata-driven scatter path still visits all shards.
+        assert_eq!(
+            request_json(
+                &application,
+                Method::POST,
+                "/v1/query",
+                Some(json!({
+                    "sql": "SELECT tenant_id, record_id, payload FROM records"
+                })),
+            )
+            .await,
+            (
+                StatusCode::OK,
+                json!({
+                    "shards": [0, 1, 2, 3],
+                    "columns": [
+                        {"name": "tenant_id", "data_type": "unknown"},
+                        {"name": "record_id", "data_type": "unknown"},
+                        {"name": "payload", "data_type": "unknown"}
+                    ],
+                    "rows": [
+                        [tenant_keys[0], 1, "updated-0"],
+                        [tenant_keys[1], 1, "updated-1"],
+                        [tenant_keys[3], 1, "updated-3"]
+                    ]
+                })
+            )
+        );
+    }
+
     #[tokio::test]
     async fn empty_catalog_http_writes_keep_unique_owners_and_raw_sqlite_isolation() {
         let temp = tempfile::tempdir().unwrap();
@@ -612,6 +814,8 @@ mod tests {
         let routing_key = "raw-http-write";
         let expected_shard = database.shard_for_key(routing_key.as_bytes());
         let options = EngineOptions::new(1, 4).unwrap();
+        #[cfg(feature = "experimental-vtab")]
+        let options = options.with_experimental_vtab_writes(true);
         let engine = Engine::from_database_with_options(database, options).unwrap();
         let application = router_with_engine(engine.clone());
 

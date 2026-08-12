@@ -991,6 +991,8 @@ fn engine_options_are_public_validated_and_have_stable_defaults() {
         defaults.shutdown_grace(),
         Duration::from_millis(core::DEFAULT_SHUTDOWN_GRACE_MS)
     );
+    #[cfg(feature = "experimental-vtab")]
+    assert!(!defaults.experimental_vtab_writes());
 
     let minimum = core::EngineOptions::new(1, 1).unwrap();
     assert_eq!(minimum.connections_per_shard(), 1);
@@ -1069,6 +1071,18 @@ fn engine_options_are_public_validated_and_have_stable_defaults() {
     assert_eq!(configured.prepared_statement_limits(), prepared_limits);
     assert_eq!(configured.request_timeout(), None);
     assert_eq!(configured.shutdown_grace(), Duration::from_millis(250));
+}
+
+#[cfg(feature = "experimental-vtab")]
+#[test]
+fn experimental_vtab_write_option_is_public_and_opt_in() {
+    let constructed = core::EngineOptions::new(2, 7).unwrap();
+    assert!(!constructed.experimental_vtab_writes());
+
+    let enabled = constructed.with_experimental_vtab_writes(true);
+    assert!(enabled.experimental_vtab_writes());
+    assert_eq!(enabled.connections_per_shard(), 2);
+    assert_eq!(enabled.queue_capacity_per_shard(), 7);
 }
 
 #[tokio::test]

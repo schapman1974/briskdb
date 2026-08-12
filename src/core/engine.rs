@@ -28,6 +28,9 @@ use crate::{
     storage::{ConnectionOwner, ConnectionPools, PooledConnection, SchemaOperationGuard},
 };
 
+#[cfg(feature = "experimental-vtab")]
+use crate::storage::{RegistrySchemaCache, WriteCoordinator};
+
 static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_SCATTER_CONCURRENCY: usize = 8;
 
@@ -141,6 +144,10 @@ struct EngineInner {
     lifecycle: Arc<Lifecycle>,
     shutdown_cancel: CancellationToken,
     shutdown_gate: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(feature = "experimental-vtab")]
+    registry_schema_cache: Arc<RegistrySchemaCache>,
+    #[cfg(feature = "experimental-vtab")]
+    registry_bootstrap_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct Operation {
@@ -289,6 +296,10 @@ impl Engine {
                 lifecycle: Lifecycle::new(),
                 shutdown_cancel: CancellationToken::new(),
                 shutdown_gate: Arc::new(tokio::sync::Mutex::new(())),
+                #[cfg(feature = "experimental-vtab")]
+                registry_schema_cache: Arc::new(RegistrySchemaCache::new()),
+                #[cfg(feature = "experimental-vtab")]
+                registry_bootstrap_gate: Arc::new(tokio::sync::Mutex::new(())),
             }),
         })
     }
@@ -1099,6 +1110,17 @@ impl Engine {
             Ok(plan) => plan,
             Err(error) => return operation.finish(Err(error)),
         };
+        let catalog_authoritative = plan.is_some();
+        #[cfg(feature = "experimental-vtab")]
+        if catalog_authoritative
+            && self.inner.options.experimental_vtab_writes()
+            && plan.as_ref().is_some_and(|plan| plan.native_range_v1)
+        {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "experimental virtual-table Engine writes do not yet support native_range_v1 tables",
+            )));
+        }
         let owner = match (owner_policy, plan.is_some()) {
             (ExecuteOwnerPolicy::ReuseValidatedCatalogWrite, true) => {
                 ConnectionOwner::stateless_catalog_write()
@@ -1114,6 +1136,26 @@ impl Engine {
                 sql,
             ),
         };
+
+        #[cfg(feature = "experimental-vtab")]
+        if catalog_authoritative && self.inner.options.experimental_vtab_writes() {
+            let value = self
+                .run_coordinator_write(
+                    &mut operation,
+                    shard,
+                    owner,
+                    schema_operation,
+                    guard,
+                    sql,
+                    params,
+                )
+                .await;
+            let value = operation.finish_started(value)?;
+            return Ok(Routed { shard, value });
+        }
+
+        #[cfg(not(feature = "experimental-vtab"))]
+        let _ = catalog_authoritative;
 
         let value = self
             .run_on_shard(
@@ -1132,6 +1174,132 @@ impl Engine {
             .await;
         let value = operation.finish_started(value)?;
         Ok(Routed { shard, value })
+    }
+
+    /// Execute one catalog-authoritative autocommit write through the
+    /// experimental logical virtual-table facade.
+    ///
+    /// The pool permit is deliberately retained only as a capacity token. The
+    /// coordinator opens and validates its own child SQLite handle, so checking
+    /// out a pooled handle here would double-own the same per-shard capacity.
+    #[cfg(feature = "experimental-vtab")]
+    #[allow(clippy::too_many_arguments)]
+    async fn run_coordinator_write(
+        &self,
+        operation: &mut Operation,
+        shard: u16,
+        owner: ConnectionOwner,
+        schema_operation: SchemaOperationGuard,
+        session: OwnedMutexGuard<SessionInner>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> EngineResult<usize> {
+        // A cold registry cache briefly owns an unpooled read-only shard-0
+        // handle; the physical DML child later owns the target-shard handle.
+        // Serialize that one-time discovery, reserve every real handle through
+        // the ordinary pool limits, and let warm coordinators use only their
+        // target shard. When shard 0 is also the cold target, one permit covers
+        // the sequential handles because discovery closes before DML starts.
+        let schema_generation = self.inner.database.storage.current_schema_generation();
+        let registry_bootstrap_gate = if self
+            .inner
+            .registry_schema_cache
+            .requires_bootstrap(schema_generation)
+        {
+            let gate = Arc::clone(&self.inner.registry_bootstrap_gate);
+            let acquired = match operation
+                .wait_pending(async move { Ok(gate.lock_owned().await) })
+                .await
+            {
+                Ok(acquired) => acquired,
+                Err(error) => return operation.control.complete(Err(error)),
+            };
+            if self
+                .inner
+                .registry_schema_cache
+                .requires_bootstrap(schema_generation)
+            {
+                Some(acquired)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let bootstrap_required = registry_bootstrap_gate.is_some();
+        let shard_zero_capacity = if bootstrap_required {
+            match operation
+                .wait_pending(self.inner.connections.acquire_for_owner(0, owner))
+                .await
+            {
+                Ok(capacity) => Some(capacity),
+                Err(error) => return operation.control.complete(Err(error)),
+            }
+        } else {
+            None
+        };
+        let target_capacity = if shard == 0 && bootstrap_required {
+            None
+        } else {
+            match operation
+                .wait_pending(self.inner.connections.acquire_for_owner(shard, owner))
+                .await
+            {
+                Ok(capacity) => Some(capacity),
+                Err(error) => return operation.control.complete(Err(error)),
+            }
+        };
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => return operation.control.complete(Err(error)),
+        };
+        if let Err(error) = operation.check_before_start() {
+            return operation.control.complete(Err(error));
+        }
+
+        let lease = operation.take_lease();
+        let worker_control = Arc::clone(&operation.control);
+        let storage = self.inner.database.storage.clone();
+        let storage_for_corruption = storage.clone();
+        let registry_schema_cache = Arc::clone(&self.inner.registry_schema_cache);
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _session = session;
+            let mut shard_zero_capacity = shard_zero_capacity;
+            let _target_capacity = target_capacity;
+            let mut registry_bootstrap_gate = registry_bootstrap_gate;
+            let result = (|| {
+                let mut coordinator = WriteCoordinator::open_admitted_controlled(
+                    storage,
+                    schema_operation,
+                    Arc::clone(&worker_control),
+                    registry_schema_cache,
+                )?;
+
+                // A nonzero write no longer owns a shard-0 handle after registry
+                // construction. Keep the same permit for shard-0 target writes.
+                if shard != 0 {
+                    drop(shard_zero_capacity.take());
+                }
+                drop(registry_bootstrap_gate.take());
+                let cancellation = coordinator.cancellation_handle();
+                worker_control
+                    .arm(Arc::new(move || cancellation.cancel_write_nonblocking()))
+                    .map_err(CancellationReason::error)?;
+                coordinator
+                    .execute_dml_values(&sql, &params)
+                    .map(|result| result.affected_rows())
+            })();
+            drop(registry_bootstrap_gate);
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                storage_for_corruption.record_schema_degraded();
+            }
+            worker_control.complete(result)
+        });
+        operation.wait_started(join).await
     }
 
     /// Query a routed statement and return its selected shard and rows.
@@ -2210,6 +2378,8 @@ mod tests {
     use tokio::{sync::oneshot, time::timeout};
 
     use super::*;
+    #[cfg(feature = "experimental-vtab")]
+    use crate::core::GeneratedIdPolicy;
     use crate::core::{
         Column, DataType, Row, SessionState, ShardKeyMetadata, ShardKeyType, TableDeclaration,
     };
@@ -6812,5 +6982,907 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recovered.value.len(), 2);
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_engine_writes_mutate_only_the_metadata_selected_shard() {
+        let options = EngineOptions::default().with_experimental_vtab_writes(true);
+        let (temp, engine) = engine_with_sharded_events(4, options);
+        let session = engine.session();
+
+        let keys = (0..4)
+            .map(|shard| integer_key_for_shard(&engine, shard, None))
+            .collect::<Vec<_>>();
+
+        session.set_routing_key(keys[1].to_string()).await.unwrap();
+        let mismatch = engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                    vec![Value::Int64(keys[0]), Value::from("wrong route")],
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(mismatch.kind(), EngineErrorKind::InvalidArgument);
+
+        for (shard, key) in keys.iter().copied().enumerate() {
+            session.set_routing_key(key.to_string()).await.unwrap();
+            let inserted = engine
+                .execute(
+                    &session,
+                    Statement::new(
+                        "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                        vec![Value::Int64(key), Value::from(format!("event-{shard}"))],
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(inserted.shard, u16::try_from(shard).unwrap());
+            assert_eq!(inserted.value, 1);
+        }
+
+        for (owner, key) in keys.iter().copied().enumerate() {
+            for shard in 0..4 {
+                let connection = rusqlite::Connection::open(
+                    temp.path().join(format!("shards/{shard:04}.sqlite")),
+                )
+                .unwrap();
+                let count = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM events WHERE tenant_id = ?1",
+                        [key],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, i64::from(shard == owner));
+            }
+        }
+
+        let key = keys[2];
+        session.set_routing_key(key.to_string()).await.unwrap();
+        assert_eq!(
+            engine
+                .execute(
+                    &session,
+                    Statement::new(
+                        "UPDATE events SET payload = ?2 WHERE tenant_id = ?1",
+                        vec![Value::Int64(key), Value::from("updated")],
+                    ),
+                )
+                .await
+                .unwrap()
+                .value,
+            1
+        );
+        assert_eq!(
+            engine
+                .execute(
+                    &session,
+                    Statement::new(
+                        "DELETE FROM events WHERE tenant_id = ?1",
+                        vec![Value::Int64(key)],
+                    ),
+                )
+                .await
+                .unwrap()
+                .value,
+            1
+        );
+        assert_eq!(
+            engine
+                .execute(
+                    &session,
+                    Statement::new(
+                        "DELETE FROM events WHERE tenant_id = ?1",
+                        vec![Value::Int64(key)],
+                    ),
+                )
+                .await
+                .unwrap()
+                .value,
+            0
+        );
+
+        let extra_zero = integer_key_for_shard(&engine, 0, Some(keys[0]));
+        let extra_one = integer_key_for_shard(&engine, 1, Some(keys[1]));
+        session
+            .set_routing_key(extra_zero.to_string())
+            .await
+            .unwrap();
+        let multiple_owners = engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, 'zero'), (?2, 'one')",
+                    vec![Value::Int64(extra_zero), Value::Int64(extra_one)],
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(multiple_owners.kind(), EngineErrorKind::InvalidArgument);
+        for shard in 0..4 {
+            let connection =
+                rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                    .unwrap();
+            let count = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE tenant_id IN (?1, ?2)",
+                    [extra_zero, extra_one],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+
+        let pools = engine.pool_snapshot_for_test().unwrap();
+        assert!(pools.shards.iter().all(|shard| {
+            shard.active == 0 && shard.queued == 0 && shard.opened == 0 && shard.checkouts == 0
+        }));
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_nonzero_write_accounts_for_shard_zero_bootstrap_capacity() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let (_temp, engine) = engine_with_sharded_events(4, options);
+        let held = engine
+            .inner
+            .connections
+            .acquire_for_owner(0, ConnectionOwner::new(u64::MAX))
+            .await
+            .unwrap();
+        let available_workers = engine.inner.workers.available_permits();
+        let key = integer_key_for_shard(&engine, 1, None);
+        let session = Arc::new(engine.session());
+        session.set_routing_key(key.to_string()).await.unwrap();
+
+        let write_engine = engine.clone();
+        let write_session = Arc::clone(&session);
+        let write = tokio::spawn(async move {
+            write_engine
+                .execute(
+                    &write_session,
+                    Statement::new(
+                        "INSERT INTO events (tenant_id, payload) VALUES (?1, 'accounted')",
+                        vec![Value::Int64(key)],
+                    ),
+                )
+                .await
+        });
+
+        wait_for_pool_occupancy(&engine, 0, 1, 1).await;
+        assert_eq!(engine.inner.workers.available_permits(), available_workers);
+        let target = engine.pool_snapshot_for_test().unwrap().shards[1];
+        assert_eq!(target.active, 0);
+        assert_eq!(target.queued, 0);
+
+        drop(held);
+        let inserted = timeout(Duration::from_secs(2), write)
+            .await
+            .expect("releasing shard-zero capacity should admit registry bootstrap")
+            .unwrap()
+            .unwrap();
+        assert_eq!(inserted.shard, 1);
+        assert_eq!(inserted.value, 1);
+        for shard in 0..4 {
+            wait_for_pool_occupancy(&engine, shard, 0, 0).await;
+        }
+        wait_for_worker_capacity(&engine, available_workers).await;
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_deadline_interrupts_locked_registry_bootstrap_promptly() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let (_temp, engine) = engine_with_sharded_events(4, options);
+        let blocker = engine.inner.database.storage.open_shard(0).unwrap();
+        blocker
+            .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE")
+            .unwrap();
+        let available_workers = engine.inner.workers.available_permits();
+        let key = integer_key_for_shard(&engine, 1, None);
+        let session = engine.session();
+        session.set_routing_key(key.to_string()).await.unwrap();
+        let context = RequestContext::new()
+            .with_timeout(Duration::from_millis(75))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let error = timeout(
+            Duration::from_secs(1),
+            engine.execute_with_context(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, 'cancelled bootstrap')",
+                    vec![Value::Int64(key)],
+                ),
+                context,
+            ),
+        )
+        .await
+        .expect("the deadline must preempt SQLite's normal five-second bootstrap wait")
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        blocker.execute_batch("COMMIT").unwrap();
+        drop(blocker);
+        for shard in 0..4 {
+            wait_for_pool_occupancy(&engine, shard, 0, 0).await;
+        }
+        wait_for_worker_capacity(&engine, available_workers).await;
+        assert_eq!(engine.active_operations_for_test(), 0);
+
+        assert_eq!(
+            engine
+                .execute(
+                    &session,
+                    Statement::new(
+                        "INSERT INTO events (tenant_id, payload) VALUES (?1, 'recovered')",
+                        vec![Value::Int64(key)],
+                    ),
+                )
+                .await
+                .unwrap()
+                .value,
+            1
+        );
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_explicit_cancellation_interrupts_a_locked_child_write() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let (temp, engine) = engine_with_sharded_events(4, options);
+        let key = integer_key_for_shard(&engine, 1, None);
+        let session = Arc::new(engine.session());
+        session.set_routing_key(key.to_string()).await.unwrap();
+        let blocker = rusqlite::Connection::open(temp.path().join("shards/0001.sqlite")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let token = CancellationToken::new();
+        let context = RequestContext::new().with_cancellation_token(token.clone());
+        let child_busy_gate = engine.inner.registry_schema_cache.install_child_busy_gate();
+        let cancellation_observer = engine
+            .inner
+            .registry_schema_cache
+            .install_cancellation_observer();
+
+        let write_engine = engine.clone();
+        let write_session = Arc::clone(&session);
+        let write = tokio::spawn(async move {
+            write_engine
+                .execute_with_context(
+                    &write_session,
+                    Statement::new(
+                        "INSERT INTO events (tenant_id, payload) VALUES (?1, 'cancelled')",
+                        vec![Value::Int64(key)],
+                    ),
+                    context,
+                )
+                .await
+        });
+        let mut child_busy_gate = timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                child_busy_gate.wait_until_started();
+                child_busy_gate
+            }),
+        )
+        .await
+        .expect("the target child must reach a real SQLite busy result")
+        .unwrap();
+        assert!(token.cancel());
+        timeout(Duration::from_secs(2), async {
+            while !cancellation_observer.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Engine cancellation callback must reach the active coordinator");
+        child_busy_gate.release();
+        let error = timeout(Duration::from_secs(2), write)
+            .await
+            .expect("explicit cancellation should interrupt the child lock wait")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        for shard in 0..4 {
+            wait_for_pool_occupancy(&engine, shard, 0, 0).await;
+        }
+        assert_eq!(engine.active_operations_for_test(), 0);
+        assert_eq!(
+            engine
+                .inner
+                .database
+                .storage
+                .open_shard(1)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_known_commit_wins_a_late_engine_cancellation() {
+        let options = EngineOptions::default()
+            .with_request_timeout(None)
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let (temp, engine) = engine_with_sharded_events(2, options);
+        let key = integer_key_for_shard(&engine, 1, None);
+        let session = Arc::new(engine.session());
+        session.set_routing_key(key.to_string()).await.unwrap();
+        let token = CancellationToken::new();
+        let context = RequestContext::new().with_cancellation_token(token.clone());
+        let commit_gate = engine.inner.registry_schema_cache.install_commit_gate();
+        let cancellation_observer = engine
+            .inner
+            .registry_schema_cache
+            .install_cancellation_observer();
+
+        let write_engine = engine.clone();
+        let write_session = Arc::clone(&session);
+        let write = tokio::spawn(async move {
+            write_engine
+                .execute_with_context(
+                    &write_session,
+                    Statement::new(
+                        "INSERT INTO events (tenant_id, payload) VALUES (?1, 'committed')",
+                        vec![Value::Int64(key)],
+                    ),
+                    context,
+                )
+                .await
+        });
+        let mut commit_gate = timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                commit_gate.wait_until_started();
+                commit_gate
+            }),
+        )
+        .await
+        .expect("the child finalizer must claim the commit decision")
+        .unwrap();
+
+        assert!(token.cancel());
+        timeout(Duration::from_secs(2), async {
+            while !cancellation_observer.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late cancellation must reach the commit linearization point");
+        commit_gate.release();
+
+        let inserted = timeout(Duration::from_secs(2), write)
+            .await
+            .expect("the known commit must finish after cancellation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(inserted.shard, 1);
+        assert_eq!(inserted.value, 1);
+        assert_eq!(
+            rusqlite::Connection::open(temp.path().join("shards/0001.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM events WHERE tenant_id = ?1",
+                    [key],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "committed"
+        );
+        assert_eq!(engine.active_operations_for_test(), 0);
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_registry_cache_rebuilds_after_schema_generation_changes() {
+        let options = EngineOptions::default().with_experimental_vtab_writes(true);
+        let (temp, engine) = engine_with_sharded_events(2, options);
+        let key = integer_key_for_shard(&engine, 1, None);
+        let session = engine.session();
+        session.set_routing_key(key.to_string()).await.unwrap();
+
+        engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, 'warm')",
+                    vec![Value::Int64(key)],
+                ),
+            )
+            .await
+            .unwrap();
+        engine
+            .broadcast(
+                &session,
+                "ALTER TABLE events ADD COLUMN note TEXT".to_owned(),
+            )
+            .await
+            .unwrap();
+
+        let next_key = integer_key_for_shard(&engine, 1, Some(key));
+        session.set_routing_key(next_key.to_string()).await.unwrap();
+        let inserted = engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload, note) VALUES (?1, 'new', 'fresh')",
+                    vec![Value::Int64(next_key)],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inserted.shard, 1);
+        assert_eq!(inserted.value, 1);
+        assert_eq!(
+            rusqlite::Connection::open(temp.path().join("shards/0001.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT note FROM events WHERE tenant_id = ?1",
+                    [next_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "fresh"
+        );
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_engine_rejects_native_range_targets_before_coordinator_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 4).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE native_events (
+                     id INTEGER PRIMARY KEY NOT NULL,
+                     payload TEXT NOT NULL
+                 ) STRICT",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "native_events",
+                    ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap()
+                .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+                .unwrap(),
+            ])
+            .unwrap();
+
+        let (owner_shard, native_id, reserved_floor) = {
+            let owners = database.storage.allocation_owner_map().unwrap();
+            (0..database.shard_count())
+                .find_map(|owner_shard| {
+                    let owner = owners.owner_for_physical_shard(owner_shard).unwrap();
+                    (1..=256_u64).find_map(|local_sequence| {
+                        let native_id =
+                            crate::core::generated_id::NativeRangeV1Id::new(owner, local_sequence)
+                                .unwrap()
+                                .encode();
+                        (database.shard_for_key(native_id.to_string().as_bytes()) != owner_shard)
+                            .then(|| {
+                                (
+                                    owner_shard,
+                                    native_id,
+                                    crate::core::generated_id::native_range_v1_sequence_floor(
+                                        owner,
+                                    ),
+                                )
+                            })
+                    })
+                })
+                .expect("a native owner route must differ from an ordinary hash route")
+        };
+        assert_ne!(
+            database.shard_for_key(native_id.to_string().as_bytes()),
+            owner_shard,
+            "the regression key must expose owner-map versus hash routing"
+        );
+
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let engine = Engine::from_database_with_options(Arc::new(database), options).unwrap();
+        let session = engine.session();
+
+        // A valid explicit native ID would otherwise make the planner reserve
+        // and report its hash-selected shard while the coordinator writes to
+        // its encoded allocation owner. The reserved floor is more severe:
+        // the coordinator classifies it as corruption. Both must stop at the
+        // same client-facing Engine preflight while storage is still healthy.
+        for value in [native_id, reserved_floor] {
+            session.set_routing_key(value.to_string()).await.unwrap();
+            let error = engine
+                .execute(
+                    &session,
+                    Statement::new(
+                        "INSERT INTO native_events (id, payload) VALUES (?1, 'rejected')",
+                        vec![Value::Int64(value)],
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Unsupported);
+            assert!(error.diagnostic().contains("native_range_v1"));
+            assert_eq!(session.state().await, SessionState::Ready);
+            assert_eq!(
+                engine.inner.database.storage.schema_gate_snapshot().state,
+                crate::storage::SchemaGateState::Ready
+            );
+        }
+
+        for shard in 0..engine.shard_count() {
+            assert_eq!(
+                engine
+                    .inner
+                    .database
+                    .storage
+                    .open_shard(shard)
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM native_events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0,
+                "shard {shard}"
+            );
+        }
+        let pools = engine.pool_snapshot_for_test().unwrap();
+        assert!(pools.shards.iter().all(|shard| {
+            shard.active == 0 && shard.queued == 0 && shard.opened == 0 && shard.checkouts == 0
+        }));
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_deadline_interrupts_a_locked_write_and_releases_capacity() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let (temp, engine) = engine_with_sharded_events(4, options);
+        let key = integer_key_for_shard(&engine, 1, None);
+        let session = engine.session();
+        session.set_routing_key(key.to_string()).await.unwrap();
+
+        // Warm registry metadata first so the lock below targets the physical
+        // child-open window rather than cold shard-zero discovery.
+        let warm_key = integer_key_for_shard(&engine, 0, None);
+        session.set_routing_key(warm_key.to_string()).await.unwrap();
+        engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, 'warm')",
+                    vec![Value::Int64(warm_key)],
+                ),
+            )
+            .await
+            .unwrap();
+        session.set_routing_key(key.to_string()).await.unwrap();
+
+        let lock = rusqlite::Connection::open(temp.path().join("shards/0001.sqlite")).unwrap();
+        lock.execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE")
+            .unwrap();
+        let context = RequestContext::new()
+            .with_timeout(Duration::from_millis(75))
+            .unwrap();
+        let error = engine
+            .execute_with_context(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                    vec![Value::Int64(key), Value::from("cancelled")],
+                ),
+                context,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+        lock.execute_batch("COMMIT").unwrap();
+        drop(lock);
+
+        let shard = engine.pool_snapshot_for_test().unwrap().shards[1];
+        assert_eq!(shard.active, 0);
+        assert_eq!(shard.queued, 0);
+        assert_eq!(engine.active_operations_for_test(), 0);
+
+        let inserted = engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                    vec![Value::Int64(key), Value::from("recovered")],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inserted.shard, 1);
+        assert_eq!(inserted.value, 1);
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_engine_preserves_constraint_kinds_and_session_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE parents (
+                     tenant_id INTEGER NOT NULL,
+                     parent_id INTEGER NOT NULL,
+                     label TEXT NOT NULL,
+                     PRIMARY KEY (tenant_id, parent_id)
+                 );
+                 CREATE TABLE items (
+                     tenant_id INTEGER NOT NULL,
+                     item_id INTEGER NOT NULL,
+                     parent_id INTEGER NOT NULL,
+                     code TEXT NOT NULL,
+                     quantity INTEGER NOT NULL CHECK (quantity > 0),
+                     PRIMARY KEY (tenant_id, item_id),
+                     UNIQUE (tenant_id, code),
+                     FOREIGN KEY (tenant_id, parent_id)
+                         REFERENCES parents (tenant_id, parent_id)
+                 );",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "parents",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+                TableDeclaration::sharded(
+                    logical_database,
+                    "items",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let key = (1_i64..)
+            .find(|key| database.shard_for_key(key.to_string().as_bytes()) == 0)
+            .unwrap();
+        let options = EngineOptions::default().with_experimental_vtab_writes(true);
+        let engine = Engine::from_database_with_options(Arc::new(database), options).unwrap();
+        let session = engine.session();
+        session.set_routing_key(key.to_string()).await.unwrap();
+
+        assert_eq!(
+            engine
+                .execute(
+                    &session,
+                    Statement::new(
+                        "INSERT INTO parents (tenant_id, parent_id, label) VALUES (?1, 1, 'parent')",
+                        vec![Value::Int64(key)],
+                    ),
+                )
+                .await
+                .unwrap()
+                .value,
+            1
+        );
+        assert_eq!(
+            engine
+                .execute(
+                    &session,
+                    Statement::new(
+                        "INSERT INTO items
+                         (tenant_id, item_id, parent_id, code, quantity)
+                         VALUES (?1, 1, 1, 'first', 5)",
+                        vec![Value::Int64(key)],
+                    ),
+                )
+                .await
+                .unwrap()
+                .value,
+            1
+        );
+
+        for (sql, expected) in [
+            (
+                "INSERT INTO items
+                 (tenant_id, item_id, parent_id, code, quantity)
+                 VALUES (?1, 1, 1, 'duplicate', 5)",
+                EngineErrorKind::UniqueViolation,
+            ),
+            (
+                "INSERT INTO items
+                 (tenant_id, item_id, parent_id, code, quantity)
+                 VALUES (?1, 2, 1, NULL, 5)",
+                EngineErrorKind::NotNullViolation,
+            ),
+            (
+                "INSERT INTO items
+                 (tenant_id, item_id, parent_id, code, quantity)
+                 VALUES (?1, 2, 1, 'bad-check', 0)",
+                EngineErrorKind::CheckViolation,
+            ),
+            (
+                "INSERT INTO items
+                 (tenant_id, item_id, parent_id, code, quantity)
+                 VALUES (?1, 2, 999, 'bad-parent', 5)",
+                EngineErrorKind::ForeignKeyViolation,
+            ),
+        ] {
+            let error = engine
+                .execute(&session, Statement::new(sql, vec![Value::Int64(key)]))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), expected);
+            assert_eq!(session.state().await, SessionState::Ready);
+        }
+
+        let recovered = engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO items
+                     (tenant_id, item_id, parent_id, code, quantity)
+                     VALUES (?1, 2, 1, 'second', 5)",
+                    vec![Value::Int64(key)],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.value, 1);
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_writer_on_another_shard_progresses_while_one_is_locked() {
+        let options = EngineOptions::new(1, 2)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let (temp, engine) = engine_with_sharded_events(2, options);
+        let key_zero = integer_key_for_shard(&engine, 0, None);
+        let key_one = integer_key_for_shard(&engine, 1, None);
+
+        let lock = rusqlite::Connection::open(temp.path().join("shards/0000.sqlite")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let child_busy_gate = engine.inner.registry_schema_cache.install_child_busy_gate();
+        let blocked_engine = engine.clone();
+        let blocked = tokio::spawn(async move {
+            let session = blocked_engine.session();
+            session.set_routing_key(key_zero.to_string()).await.unwrap();
+            blocked_engine
+                .execute(
+                    &session,
+                    Statement::new(
+                        "INSERT INTO events (tenant_id, payload) VALUES (?1, 'blocked')",
+                        vec![Value::Int64(key_zero)],
+                    ),
+                )
+                .await
+        });
+        let mut child_busy_gate = timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                child_busy_gate.wait_until_started();
+                child_busy_gate
+            }),
+        )
+        .await
+        .expect("the shard-zero writer must reach a real SQLite busy result")
+        .unwrap();
+
+        let independent = engine.session();
+        independent
+            .set_routing_key(key_one.to_string())
+            .await
+            .unwrap();
+        let inserted = timeout(
+            Duration::from_secs(1),
+            engine.execute(
+                &independent,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, 'independent')",
+                    vec![Value::Int64(key_one)],
+                ),
+            ),
+        )
+        .await
+        .expect("a writer on shard one must not wait for shard zero")
+        .unwrap();
+        assert_eq!(inserted.shard, 1);
+        assert_eq!(inserted.value, 1);
+
+        lock.execute_batch("ROLLBACK").unwrap();
+        child_busy_gate.release();
+        let released = timeout(Duration::from_secs(2), blocked)
+            .await
+            .expect("the blocked writer should finish after its shard lock is released")
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.shard, 0);
+        assert_eq!(released.value, 1);
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_shutdown_cancels_and_drains_an_inflight_coordinator() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap()
+            .with_shutdown_grace(Duration::from_millis(100))
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let (temp, engine) = engine_with_sharded_events(2, options);
+        let key = integer_key_for_shard(&engine, 0, None);
+        let lock = rusqlite::Connection::open(temp.path().join("shards/0000.sqlite")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let writer_engine = engine.clone();
+        let writer = tokio::spawn(async move {
+            let session = writer_engine.session();
+            session.set_routing_key(key.to_string()).await.unwrap();
+            writer_engine
+                .execute(
+                    &session,
+                    Statement::new(
+                        "INSERT INTO events (tenant_id, payload) VALUES (?1, 'shutdown')",
+                        vec![Value::Int64(key)],
+                    ),
+                )
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while engine.active_operations_for_test() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the coordinator write should enter Engine lifecycle accounting");
+
+        let report = timeout(Duration::from_secs(2), engine.shutdown())
+            .await
+            .expect("shutdown should cancel and drain the locked coordinator")
+            .unwrap();
+        assert!(report.forced());
+        let error = writer.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        assert_eq!(engine.active_operations_for_test(), 0);
+        assert_eq!(engine.state(), EngineState::Stopped);
+        let shard = engine.pool_snapshot_for_test().unwrap().shards[0];
+        assert_eq!(shard.active, 0);
+        assert_eq!(shard.queued, 0);
+        lock.execute_batch("ROLLBACK").unwrap();
     }
 }

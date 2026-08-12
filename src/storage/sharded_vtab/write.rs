@@ -2,7 +2,7 @@
 
 use std::{
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, TryLockError,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -15,14 +15,14 @@ use rusqlite::{
 
 use super::{
     ALLOCATION_OVERHEAD_BYTES, CoordinatorCancellation, CursorLimits, ROW_ACCOUNTING_BYTES,
-    RawCell, Registry, TableSpec, VALUE_ACCOUNTING_BYTES, allocation_error,
+    RawCell, Registry, RegistrySchemaCache, TableSpec, VALUE_ACCOUNTING_BYTES, allocation_error,
     attach_writable_coordinator_authorizer, bootstrap_coordinator_schema, cancelled_error,
     limit_error, locator, module_v2,
 };
 #[cfg(test)]
 use super::{TestChildScanControl, TestChildScanGate};
 use crate::{
-    core::{EngineError, EngineErrorKind, EngineResult, Value},
+    core::{EngineError, EngineErrorKind, EngineResult, OperationControl, Value},
     sqlite_error,
     storage::{CONNECTION_BUSY_TIMEOUT, SchemaOperationGuard, Storage},
 };
@@ -33,6 +33,21 @@ const CANCELLABLE_BUSY_SLICE: Duration = Duration::from_millis(25);
 pub(crate) struct CoordinatorWriteResult {
     pub(crate) affected_rows: usize,
     pub(crate) explicit_key: Option<Value>,
+}
+
+impl CoordinatorWriteResult {
+    /// Return the direct physical rows changed by this statement.
+    pub(crate) const fn affected_rows(&self) -> usize {
+        self.affected_rows
+    }
+
+    /// Return the caller-supplied key reported for a successful INSERT.
+    ///
+    /// UPDATE and DELETE do not produce a key. Generated keys remain outside
+    /// the current explicit-key coordinator contract.
+    pub(crate) const fn explicit_key(&self) -> Option<&Value> {
+        self.explicit_key.as_ref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,11 +89,99 @@ pub(crate) struct WriteCoordinator {
     statement_arm_gate: Mutex<Option<TestChildScanGate>>,
 }
 
+enum CoordinatorAdmission {
+    Standalone(SchemaOperationGuard),
+    Retained {
+        operation: SchemaOperationGuard,
+        controlled: Option<(Arc<OperationControl>, Arc<RegistrySchemaCache>)>,
+    },
+}
+
 impl WriteCoordinator {
     pub(crate) fn open(storage: Storage) -> EngineResult<Self> {
         let bootstrap_operation = storage.enter_schema_operation()?;
+        Self::open_with_admission(
+            storage,
+            CoordinatorAdmission::Standalone(bootstrap_operation),
+        )
+    }
+
+    /// Open an ephemeral coordinator under schema admission already owned by
+    /// the Engine operation.
+    ///
+    /// The supplied guard is retained through bootstrap, statement execution,
+    /// child cleanup, and coordinator drop. Neither writable callbacks nor
+    /// cursors try to re-enter schema admission while a migration is waiting
+    /// for this already-admitted operation to drain.
+    pub(crate) fn open_admitted(
+        storage: Storage,
+        operation: SchemaOperationGuard,
+    ) -> EngineResult<Self> {
+        Self::open_with_admission(
+            storage,
+            CoordinatorAdmission::Retained {
+                operation,
+                controlled: None,
+            },
+        )
+    }
+
+    /// Open an Engine-admitted coordinator with cancellation installed before
+    /// registry discovery can wait on shard-0 schema state.
+    pub(crate) fn open_admitted_controlled(
+        storage: Storage,
+        operation: SchemaOperationGuard,
+        control: Arc<OperationControl>,
+        registry_cache: Arc<RegistrySchemaCache>,
+    ) -> EngineResult<Self> {
+        Self::open_with_admission(
+            storage,
+            CoordinatorAdmission::Retained {
+                operation,
+                controlled: Some((control, registry_cache)),
+            },
+        )
+    }
+
+    fn open_with_admission(
+        storage: Storage,
+        admission: CoordinatorAdmission,
+    ) -> EngineResult<Self> {
         let connection = Connection::open_in_memory().map_err(sqlite_error::storage)?;
-        let registry = Registry::build_writable(storage, CursorLimits::default())?;
+        let (registry, bootstrap_operation, test_registry_cache) = match admission {
+            CoordinatorAdmission::Standalone(operation) => (
+                Registry::build_writable(storage, CursorLimits::default())?,
+                Some(operation),
+                None,
+            ),
+            CoordinatorAdmission::Retained {
+                operation,
+                controlled: Some((control, registry_cache)),
+            } => (
+                Registry::build_writable_cached(
+                    storage,
+                    CursorLimits::default(),
+                    operation,
+                    control,
+                    &registry_cache,
+                )?,
+                None,
+                Some(registry_cache),
+            ),
+            CoordinatorAdmission::Retained {
+                operation,
+                controlled: None,
+            } => (
+                Registry::build_writable_admitted(
+                    storage,
+                    CursorLimits::default(),
+                    operation,
+                    None,
+                )?,
+                None,
+                None,
+            ),
+        };
         module_v2::register_module(&connection, Arc::clone(&registry))
             .map_err(sqlite_error::storage)?;
         let bootstrap_epoch = registry.cancellation_epoch.load(Ordering::Acquire);
@@ -110,6 +213,13 @@ impl WriteCoordinator {
             ));
         }
         drop(bootstrap_operation);
+
+        #[cfg(test)]
+        if let Some(cache) = test_registry_cache {
+            registry.install_write_test_controls(&cache);
+        }
+        #[cfg(not(test))]
+        let _ = test_registry_cache;
 
         let cancellation = CoordinatorCancellation {
             epoch: Arc::clone(&registry.cancellation_epoch),
@@ -165,6 +275,21 @@ impl WriteCoordinator {
         let result = self.reconcile_statement(execution);
         drop(statement_arm);
         result
+    }
+
+    /// Execute DML using protocol-neutral values from the Engine boundary.
+    ///
+    /// Conversion happens before the coordinator arms a statement, so a value
+    /// without a lossless SQLite representation cannot begin or disturb a
+    /// physical transaction. The generic [`Self::execute_dml`] entry point is
+    /// retained for storage-local callers and focused callback tests.
+    pub(crate) fn execute_dml_values(
+        &mut self,
+        sql: &str,
+        parameters: &[Value],
+    ) -> EngineResult<CoordinatorWriteResult> {
+        let parameters = crate::sql::sqlite_parameters(parameters)?;
+        self.execute_dml(sql, rusqlite::params_from_iter(parameters))
     }
 
     pub(crate) fn begin(&mut self) -> EngineResult<()> {
@@ -504,9 +629,11 @@ fn transaction_identifier(name: &str) -> EngineResult<String> {
 
 pub(super) struct WriteState {
     inner: Mutex<WriteTransactionState>,
+    retained_schema_operation: Option<SchemaOperationGuard>,
     armed_statement_epoch: Mutex<Option<u64>>,
     active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
     commit_linearization: Mutex<()>,
+    nonblocking_cancel_requested: AtomicBool,
     #[cfg(test)]
     fail_next_commit: AtomicBool,
     #[cfg(test)]
@@ -515,15 +642,29 @@ pub(super) struct WriteState {
     fail_next_commit_corruption: AtomicBool,
     #[cfg(test)]
     fail_next_savepoint_operation: Mutex<Option<(SavepointOperation, EngineErrorKind)>>,
+    #[cfg(test)]
+    commit_gate: Mutex<Option<TestChildScanGate>>,
+    #[cfg(test)]
+    cancellation_observer: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl WriteState {
     pub(super) fn new() -> Self {
+        Self::new_with_admission(None)
+    }
+
+    pub(super) fn new_admitted(operation: SchemaOperationGuard) -> Self {
+        Self::new_with_admission(Some(operation))
+    }
+
+    fn new_with_admission(retained_schema_operation: Option<SchemaOperationGuard>) -> Self {
         Self {
             inner: Mutex::new(WriteTransactionState::Idle),
+            retained_schema_operation,
             armed_statement_epoch: Mutex::new(None),
             active_interrupt: Mutex::new(None),
             commit_linearization: Mutex::new(()),
+            nonblocking_cancel_requested: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_commit: AtomicBool::new(false),
             #[cfg(test)]
@@ -532,7 +673,61 @@ impl WriteState {
             fail_next_commit_corruption: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_savepoint_operation: Mutex::new(None),
+            #[cfg(test)]
+            commit_gate: Mutex::new(None),
+            #[cfg(test)]
+            cancellation_observer: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_test_controls(
+        &self,
+        commit_gate: Option<TestChildScanGate>,
+        cancellation_observer: Option<Arc<AtomicBool>>,
+    ) {
+        *self
+            .commit_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = commit_gate;
+        *self
+            .cancellation_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cancellation_observer;
+    }
+
+    fn wait_before_commit_for_test(&self) -> EngineResult<()> {
+        #[cfg(test)]
+        {
+            let gate = self
+                .commit_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if gate.is_some_and(|gate| !gate.wait_for_release()) {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "writable commit test gate timed out or disconnected",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn observe_nonblocking_cancellation_for_test(&self) {
+        if let Some(observer) = self
+            .cancellation_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            observer.store(true, Ordering::Release);
+        }
+    }
+
+    pub(super) const fn has_retained_schema_admission(&self) -> bool {
+        self.retained_schema_operation.is_some()
     }
 
     fn lock(&self) -> MutexGuard<'_, WriteTransactionState> {
@@ -546,6 +741,9 @@ impl WriteState {
             .armed_statement_epoch
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.nonblocking_cancel_requested.load(Ordering::Acquire) {
+            return Err(cancelled_error());
+        }
         if armed.is_some() {
             return Err(EngineError::new(
                 EngineErrorKind::Internal,
@@ -590,6 +788,14 @@ impl WriteState {
         self.commit_linearization
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn try_lock_commit_linearization(&self) -> Option<MutexGuard<'_, ()>> {
+        match self.commit_linearization.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
     }
 
     pub(super) fn interrupt_child(&self) {
@@ -790,6 +996,9 @@ impl WriteState {
                         EngineErrorKind::StorageUnavailable,
                         "injected writable child commit failure",
                     ))
+                } else if let Err(error) = self.wait_before_commit_for_test() {
+                    let _ = transaction.rollback();
+                    Err(error)
                 } else {
                     transaction.commit().map(FinalizedWrite::Committed)
                 }
@@ -982,7 +1191,11 @@ impl WriteState {
         registry: &Registry,
     ) -> EngineResult<&'a mut WriteTransaction> {
         if matches!(state, WriteTransactionState::Idle) {
-            let operation = registry.storage.enter_schema_operation()?;
+            let operation = if self.has_retained_schema_admission() {
+                None
+            } else {
+                Some(registry.storage.enter_schema_operation()?)
+            };
             if registry.storage.current_schema_generation() != registry.schema_generation {
                 return Err(EngineError::new(
                     EngineErrorKind::Busy,
@@ -1067,6 +1280,41 @@ impl WriteState {
     }
 }
 
+impl CoordinatorCancellation {
+    /// Request cancellation without waiting behind durable child finalization.
+    ///
+    /// The commit-linearization mutex remains the ordering point. Acquiring it
+    /// means cancellation won before finalization, so advancing the epoch and
+    /// interrupting SQLite force the child transaction to roll back. If the
+    /// mutex is already held, finalization won; waiting for its potentially
+    /// slow `COMMIT` would block an async runtime thread and interrupting it
+    /// could make the durable outcome ambiguous.
+    pub(crate) fn cancel_write_nonblocking(&self) {
+        let Some(write_state) = &self.write_state else {
+            debug_assert!(
+                false,
+                "write cancellation requires writable coordinator state"
+            );
+            return;
+        };
+        #[cfg(test)]
+        write_state.observe_nonblocking_cancellation_for_test();
+        let Some(_commit) = write_state.try_lock_commit_linearization() else {
+            return;
+        };
+
+        // Publish the one-shot request before advancing the reusable epoch.
+        // Otherwise a statement starting in this narrow window could capture
+        // the new epoch and mistake a pre-start cancellation for fresh state.
+        write_state
+            .nonblocking_cancel_requested
+            .store(true, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        write_state.interrupt_child();
+        self.interrupt.interrupt();
+    }
+}
+
 struct StatementEpochArm {
     state: Arc<WriteState>,
     epoch: u64,
@@ -1103,7 +1351,7 @@ enum WriteTransactionState {
 }
 
 struct WriteTransaction {
-    _operation: SchemaOperationGuard,
+    _operation: Option<SchemaOperationGuard>,
     epoch: u64,
     child: Option<WriteChild>,
     savepoints: Vec<SavepointMark>,
@@ -1119,7 +1367,7 @@ struct SavepointMark {
 }
 
 impl WriteTransaction {
-    fn new(operation: SchemaOperationGuard, epoch: u64) -> Self {
+    fn new(operation: Option<SchemaOperationGuard>, epoch: u64) -> Self {
         Self {
             _operation: operation,
             epoch,
@@ -1200,7 +1448,11 @@ impl WriteTransaction {
             ));
         }
         if self.child.is_none() {
-            let connection = registry.storage.open_shard(shard)?;
+            let connection = registry.storage.open_shard_write_cancellable(
+                shard,
+                Arc::clone(&registry.cancellation_epoch),
+                self.epoch,
+            )?;
             connection
                 .busy_timeout(CANCELLABLE_BUSY_SLICE)
                 .map_err(sqlite_error::storage)?;
@@ -1230,6 +1482,7 @@ impl WriteTransaction {
                         let error = sqlite_error::statement(error);
                         if error.kind() == EngineErrorKind::Busy && Instant::now() < begin_deadline
                         {
+                            registry.wait_after_child_busy_for_test()?;
                             continue;
                         }
                         break Err(error);
@@ -1750,7 +2003,30 @@ pub(super) fn map_callback(result: EngineResult<()>) -> SqliteResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{atomic::AtomicU64, mpsc},
+        thread,
+    };
+
     use super::*;
+
+    fn write_cancellation_fixture() -> (
+        Connection,
+        CoordinatorCancellation,
+        Arc<WriteState>,
+        Arc<AtomicU64>,
+    ) {
+        let connection = Connection::open_in_memory().unwrap();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let write_state = Arc::new(WriteState::new());
+        let cancellation = CoordinatorCancellation {
+            epoch: Arc::clone(&epoch),
+            active_child_scans: Arc::new(Mutex::new(0)),
+            interrupt: Arc::new(connection.get_interrupt_handle()),
+            write_state: Some(Arc::clone(&write_state)),
+        };
+        (connection, cancellation, write_state, epoch)
+    }
 
     #[test]
     fn transaction_identifier_is_bounded_and_injection_safe() {
@@ -1773,8 +2049,58 @@ mod tests {
             affected_rows: 1,
             explicit_key: Some(Value::Int64(7)),
         };
-        assert_eq!(result.affected_rows, 1);
-        assert_eq!(result.explicit_key, Some(Value::Int64(7)));
+        assert_eq!(result.affected_rows(), 1);
+        assert_eq!(result.explicit_key(), Some(&Value::Int64(7)));
         assert_eq!(super::super::MODULE_NAME, "brisk_shard");
+    }
+
+    #[test]
+    fn nonblocking_write_cancellation_wins_before_child_finalization() {
+        let (connection, cancellation, write_state, epoch) = write_cancellation_fixture();
+
+        cancellation.cancel_write_nonblocking();
+
+        assert_eq!(epoch.load(Ordering::Acquire), 1);
+        let arm_error = match write_state.arm_statement(epoch.load(Ordering::Acquire)) {
+            Ok(_) => panic!("a pre-start cancellation was lost at statement arm"),
+            Err(error) => error,
+        };
+        assert_eq!(arm_error.kind(), EngineErrorKind::Cancelled);
+        let _commit = write_state.lock_commit_linearization();
+        assert_eq!(
+            connection.query_row("SELECT 1", [], |row| row.get::<_, i64>(0)),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn nonblocking_write_cancellation_does_not_wait_after_finalization_wins() {
+        let (_connection, cancellation, write_state, epoch) = write_cancellation_fixture();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let finalizer_state = Arc::clone(&write_state);
+        let finalizer = thread::spawn(move || {
+            let _commit = finalizer_state.lock_commit_linearization();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let canceller = thread::spawn(move || {
+            cancellation.cancel_write_nonblocking();
+            returned_tx.send(()).unwrap();
+        });
+        let returned_before_release = returned_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+
+        release_tx.send(()).unwrap();
+        finalizer.join().unwrap();
+        canceller.join().unwrap();
+
+        assert!(
+            returned_before_release,
+            "write cancellation waited behind child finalization"
+        );
+        assert_eq!(epoch.load(Ordering::Acquire), 0);
     }
 }
