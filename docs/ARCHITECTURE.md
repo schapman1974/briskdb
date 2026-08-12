@@ -29,9 +29,9 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, logical Sharded read target selection and scatter/gather, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
-| `storage` | Versioned routing and authoritative logical manifest, one-time table registration, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
-| `import` | Offline source-schema preflight, explicit placement-plan validation, exact-value row routing into private staging, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, implicit Global placement, or protocol-specific behavior |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, generated-ID policy and codec types, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, logical Sharded read target selection and scatter/gather, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
+| `storage` | Versioned routing and authoritative logical manifest, persisted generated-ID policies and immutable allocation-owner slots, one-time table registration, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
+| `import` | Offline source-schema preflight, explicit placement-plan validation, exact-value row routing into private staging, explicit no-generation catalog declarations, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, generated-ID inference, implicit Global placement, or protocol-specific behavior |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
 | `protocol::postgres` | BriskDB-owned bounded protocol-3.0 framing, finite parameter validation, selected identity/status, per-connection core-session ownership, query-deferral responses, and private compile/query-parser seam around the exactly pinned `pgwire` library | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
@@ -458,6 +458,15 @@ v7-to-v8 transaction clears all legacy advisory table rows, reseals the
 manifest, and preserves routing, logical databases, migration history, shard
 schema, and application data.
 
+Version 9 adds the authoritative `briskdb_generated_ids` catalog and immutable
+`briskdb_allocation_owners` map. The v8-to-v9 transaction assigns every existing
+table explicit policy `None`, seeds each physical shard's same-numbered owner
+slot, raises the downgrade fence, and changes the semantic manifest checksum to
+version 2 so both new tables are covered. It preserves routing, placement,
+schema history, shard files, and application rows. Version 9 freezes and
+validates the `native_range_v1` ID encoding; insert rewriting and physical
+`sqlite_sequence` seeding remain later work.
+
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4
 migration remains manifest-atomic. The v4-to-v5 step first validates the v4
@@ -475,6 +484,8 @@ an empty journal, and fencing v5 readers. The v6-to-v7 step is also
 manifest-only and begins in `Verifying`; it cannot manufacture a historical
 checksum that v6 never stored. The v7-to-v8 step is likewise manifest-only and
 clears advisory table rows before installing the authoritative-catalog fence.
+The v8-to-v9 step is also manifest-only: it adds explicit generated-ID policies
+and stable owner slots, installs checksum version 2, and changes no shard file.
 There is no automatic downgrade; an older binary requires a backup from before
 the newer format.
 
@@ -613,6 +624,50 @@ ordinary operations, status calls, and migrations then fail with
 possible. BriskDB exposes no repair, rebaseline, or detailed integrity status
 API here; richer migration administration and status surfaces remain issue
 #53.
+
+## Generated-ID boundary
+
+Generated IDs are authoritative catalog policy, never a conclusion drawn from
+mutable shard DDL. `GeneratedIdPolicy::None` means BriskDB classifies every
+stored signed integer as a legacy value and claims no generation authority for
+it; that includes caller-supplied and previously imported SQLite-generated
+values. `NativeRangeV1` is valid only when its
+named column is the same physically non-null Int64 key that owns a `Sharded`
+table. Import and every legacy manifest upgrade select `None` explicitly, so an
+old `AUTOINCREMENT` clause or a marker-looking imported value cannot silently
+enable BriskDB generation.
+
+The version-1 native value is a positive signed 64-bit integer with bit 62 set,
+an immutable 10-bit allocation-owner slot in bits 61 through 52, and a 52-bit
+owner-local sequence in bits 51 through 0:
+
+```text
+0 | 1 | owner slot (10 bits) | local sequence (52 bits)
+63  62       61..52                    51..0
+```
+
+Owner slots are stable identities rather than a live shard-count ordinal. The
+manifest initially assigns each physical shard its same-numbered slot, but a
+future shard-map change must retain every allocated slot rather than
+renumbering IDs. Local sequence zero is reserved; valid native sequences are
+`1..=2^52-1`, slots are `0..=1023`, and the greatest encoding is `i64::MAX`.
+Policy-aware classification treats values without the marker, including
+negative imported values, as legacy. A marker with reserved local sequence zero
+is corrupt. The strict native decoder instead rejects every non-native value,
+and unsupported persisted encoding versions fail closed before decoding.
+
+This design keeps SQLite upstream. In particular, a schema function cannot
+replace the allocator for an exact `INTEGER PRIMARY KEY`: that declaration is a
+rowid alias, and SQLite's special insert path chooses an omitted or NULL rowid
+without evaluating a column `DEFAULT`. Moving allocation into a side-effecting
+UDF would also put durable allocator state behind connection-local registration
+and retry-sensitive schema evaluation, while a single shared allocator would
+serialize the writers sharding is meant to separate. The later native allocator
+therefore reserves one disjoint range per owner and lets unmodified SQLite
+advance its own shard-local `AUTOINCREMENT` state. This issue persists and
+validates the policy, codec, and owner slots only; physical
+`sqlite_sequence` validation and seeding belong to issue #128, and omitted-key
+SQL translation belongs to issue #130.
 
 The opt-in `experimental-vtab` feature adds a separate, read-only SQLite
 coordinator that statically registers `brisk_shard`. It proves a no-fork logical

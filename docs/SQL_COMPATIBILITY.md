@@ -817,9 +817,9 @@ underlying execution semantics.
   prefix selects one of 4,096 virtual buckets through the versioned
   compatibility algorithm.
 - The final physical shard is read from the validated, generation-stamped
-  bucket map retained in manifest version 8. Routing generation 1 preserves
+  bucket map retained in manifest version 9. Routing generation 1 preserves
   the earlier modulo placement for every supported shard count.
-- Manifest version 8 retains the read-only catalog view introduced in v4, with
+- Manifest version 9 retains the read-only catalog view introduced in v4, with
   a journaled schema generation from 0 through 2,147,483,647 and default
   database ID 1 named `default`. `Database::register_tables` may populate its
   table rows exactly once during initialization after proving that every shard
@@ -920,7 +920,9 @@ than cross-file atomicity. Version 7 adds the semantic manifest root, explicit
 integrity states, and generation-bound shard-schema fingerprints; journal,
 state, checksum, and catalog changes reseal atomically within the manifest.
 Version 8 retains those integrity rules and includes authoritative table
-registration in the same semantic root.
+registration in the same semantic root. Version 9 adds explicit generated-ID
+policies and immutable allocation-owner slots, upgrades the manifest root to
+checksum version 2, and preserves every existing table as policy `None`.
 See the [manifest storage-format contract](STORAGE_FORMAT.md).
 
 Scatter reads combine committed results from multiple SQLite files. They do not

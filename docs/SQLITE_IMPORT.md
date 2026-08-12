@@ -104,7 +104,10 @@ staging. The source file identity is retained and rechecked so a path
 replacement cannot silently change which database is imported. Cancellation
 interrupts SQLite work during this preflight. Tables and supported indexes are
 then created identically on every target shard and the complete authoritative
-catalog is registered while all tables are empty.
+catalog is registered while all tables are empty. Every imported table is
+registered with the explicit `GeneratedIdPolicy::None` policy. The importer
+never infers generated-ID authority from `INTEGER PRIMARY KEY`,
+`AUTOINCREMENT`, a `DEFAULT` expression, or `sqlite_sequence`.
 
 Rows retain their SQLite storage classes. Sharded rows use separate physical
 connections and visit one selected shard; the implementation does not use
@@ -112,8 +115,12 @@ connections and visit one selected shard; the implementation does not use
 SQLite commits as one transaction. Global rows visit every shard only by their
 declaration. Generated columns are recomputed from copied ordinary columns.
 The source `sqlite_sequence` high-water mark is installed on every physical
-copy. Automatic generation of a Sharded key remains unsupported because
-independent SQLite allocators cannot choose one globally owned value.
+copy as source-schema state; it is not generated-ID catalog metadata and does
+not opt the table into `native_range_v1`. Existing integer keys, including
+values copied from an `AUTOINCREMENT` table, remain explicit legacy values and
+route through the ordinary Int64 shard-key encoding. Enabling a generated-ID
+policy for imported data requires a future explicit conversion that proves the
+key domain and seeds every allocator; import never guesses.
 Preserved implicit `rowid` values remain shard-local physical locators after
 import; they are neither globally unique logical identities nor authoritative
 shard keys. Declared primary and unique constraints retain global meaning

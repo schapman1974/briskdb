@@ -11,24 +11,24 @@ permitted; later migration opens never create a missing replacement, use
 SQLite's no-follow mode, and revalidate the freshly opened layout identity
 inside the same manifest transaction before changing journal state.
 
-## Current format: version 8
+## Current format: version 9
 
 SQLite header fields identify the file and its format:
 
 | Header field | Value | Meaning |
 | --- | --- | --- |
 | `PRAGMA application_id` | `0x42524442` (`BRDB`) | Permanent BriskDB manifest-family marker |
-| `PRAGMA user_version` | `8` | Authoritative manifest schema version |
+| `PRAGMA user_version` | `9` | Authoritative manifest schema version |
 
 The application ID prevents an accidental foreign SQLite file from being
 adopted as a manifest. It is not authentication or tamper protection: a process
 that can write the data directory can forge it and the unkeyed checksums
 described below.
 
-Version 8 has eleven strict manifest tables. It retains the v7 routing,
-logical-catalog, physical-layout, application-schema migration, and integrity
-tables; replaces the downgrade fence; and makes newly registered table rows
-authoritative.
+Version 9 has thirteen strict manifest tables. It retains the v8 routing,
+authoritative logical catalog, physical layout, application-schema migration,
+and integrity tables; replaces the downgrade fence; and adds generated-ID
+policy and immutable allocation-owner metadata without changing a shard file.
 
 ```sql
 CREATE TABLE briskdb_manifest (
@@ -38,7 +38,7 @@ CREATE TABLE briskdb_manifest (
 
 CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
-        CHECK (requires_manifest_version >= 8)
+        CHECK (requires_manifest_version >= 9)
 ) STRICT;
 
 CREATE TABLE briskdb_routing (
@@ -132,6 +132,50 @@ CREATE TABLE briskdb_tables (
     )
 ) STRICT;
 
+CREATE TABLE briskdb_generated_ids (
+    table_id INTEGER PRIMARY KEY CHECK (table_id > 0),
+    policy INTEGER NOT NULL CHECK (policy >= 0),
+    generated_column TEXT COLLATE BINARY
+        CHECK (
+            generated_column IS NULL OR (
+                length(generated_column) BETWEEN 1 AND 63
+                AND instr(generated_column, char(0)) = 0
+                AND generated_column NOT GLOB '*[^a-z0-9_]*'
+                AND substr(generated_column, 1, 1) GLOB '[a-z_]'
+                AND generated_column <> 'briskdb'
+                AND generated_column NOT GLOB 'briskdb_*'
+                AND generated_column NOT GLOB 'sqlite_*'
+            )
+        ),
+    encoding_version INTEGER
+        CHECK (encoding_version IS NULL OR encoding_version > 0),
+    FOREIGN KEY (table_id)
+        REFERENCES briskdb_tables (table_id)
+        ON DELETE RESTRICT,
+    CHECK (
+        (
+            policy = 0
+            AND generated_column IS NULL
+            AND encoding_version IS NULL
+        )
+        OR
+        (
+            policy > 0
+            AND generated_column IS NOT NULL
+            AND encoding_version IS NOT NULL
+        )
+    )
+) STRICT;
+
+CREATE TABLE briskdb_allocation_owners (
+    owner_slot INTEGER PRIMARY KEY CHECK (owner_slot BETWEEN 0 AND 1023),
+    physical_shard_id INTEGER NOT NULL UNIQUE
+        CHECK (physical_shard_id BETWEEN 0 AND 63),
+    FOREIGN KEY (physical_shard_id)
+        REFERENCES briskdb_physical_shards (shard_id)
+        ON DELETE RESTRICT
+) STRICT;
+
 CREATE TABLE briskdb_shard_layout (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     layout_id BLOB NOT NULL
@@ -202,27 +246,28 @@ CREATE TABLE briskdb_integrity (
 ```
 
 The manifest, metadata, routing, schema-catalog, shard-layout, and integrity
-tables each contain exactly one row. The v8 downgrade-fence row is exactly `8`.
+tables each contain exactly one row. The v9 downgrade-fence row is exactly `9`.
 The two integrity-version columns deliberately accept any positive integer so
 a future digest encoding can remain structurally readable long enough for an
-older binary to reject it as `FailedPrecondition`; v8 writers emit only `1`.
+older binary to reject it as `FailedPrecondition`; v9 writers emit manifest
+digest version `2` and schema digest version `1`.
 Zero or negative versions are malformed and are `DataCorruption`.
 `briskdb_manifest.shard_count` is immutable and is the initial routing modulus;
 it is also the live physical-shard count. Physical IDs are exactly
 `0..shard_count - 1`. Filenames remain derived by trusted code as
 `shards/{shard_id:04}.sqlite` and are never read from catalog-controlled paths.
-Version 8 supports only the `active` physical-shard lifecycle state. Adding
+Version 9 supports only the `active` physical-shard lifecycle state. Adding
 provisioning, draining, or retirement states to the routing catalog requires a
 later format and state-machine change. The separate shard-layout state governs
 only startup identity reconciliation.
 
 ### Logical catalog
 
-Every fresh or upgraded v8 manifest contains logical database ID `1` named
+Every fresh or upgraded v9 manifest contains logical database ID `1` named
 `default`. A fresh or pre-v6 upgrade begins at application-schema
 generation `0`; each completed journal row advances it by exactly one, through
 a maximum of `2,147,483,647`. The schema-catalog singleton also contains
-identifier encoding version `1` and default database ID `1`. Version 8 permits
+identifier encoding version `1` and default database ID `1`. Version 9 permits
 at most 64 logical databases and 4,096 table rows. Database and table IDs are
 positive; table names are unique within their owning database, and every table
 references an existing database.
@@ -264,7 +309,74 @@ shard key and every possible collision meets on one owner. An `INTEGER PRIMARY
 KEY` rowid alias is different: it is a visible declared key and is validated by
 the ordinary shard-key and unique-locality rules.
 
-The loaded `Catalog` remains read-only to observers. Version 8 adds the one-time
+### Generated-ID policies and allocation owners
+
+`briskdb_generated_ids` contains exactly one row for every
+`briskdb_tables` row and no others. Policy is stored separately from physical
+SQLite DDL so a mutable `AUTOINCREMENT` clause, `DEFAULT`, or `sqlite_sequence`
+row can never grant allocation authority by inference. The stable codes are:
+
+| `policy` | Rust policy | `generated_column` | `encoding_version` |
+| --- | --- | --- | --- |
+| `0` | `GeneratedIdPolicy::None` | null | null |
+| `1` | `GeneratedIdPolicy::NativeRangeV1` | The table's canonical Int64 shard-key column | `1` |
+
+The SQL shape permits a positive future policy or encoding so an older binary
+can distinguish an unsupported format from malformed storage. The reader first
+verifies the version-2 semantic root, so an unsealed change remains
+`DataCorruption`; with a valid root, it returns `FailedPrecondition` as soon as
+a structurally admitted positive policy or encoding is newer than it supports.
+It does not apply current-version relational semantics to that future format.
+For supported policy and encoding
+codes, zero or negative encodings, null native fields, a noncanonical column,
+missing or extra policy rows, and relational disagreement are `DataCorruption`.
+Current cross-table validation accepts `native_range_v1` only for a `Sharded`
+table whose generated column exactly equals its visible, physically non-null
+`Int64` shard key. `Global`, `Catalog`, Text, Binary, and a different generated
+column fail closed. Registration persists the policy in the same manifest
+transaction as its table row; an exact retry compares it as part of
+idempotency.
+
+`briskdb_allocation_owners` contains exactly one row for every active physical
+shard and maps each physical shard to one unique slot. Version 9 seeds
+`owner_slot = physical_shard_id`, so current slots are the contiguous range
+`0..shard_count - 1`. The slot is an immutable ID namespace, not a value that
+may be recomputed from a later shard count or bucket map. Version 9 exposes no
+owner-map mutation. A future resharding format must preserve every allocated
+slot and explicitly add any new owner; reassigning a used slot would make old
+IDs ambiguous. Missing, duplicate, out-of-range, noncontiguous initial, or
+foreign-shard mappings are corruption.
+
+Native range encoding version 1 uses these signed 64-bit fields:
+
+```text
+bit       63  62  61................52  51........................0
+meaning    0   1    owner slot (10)       local sequence (52)
+mask           0x4000_0000_0000_0000      0x000f_ffff_ffff_ffff
+```
+
+Owner slots are `0..=1023`. Local sequence zero is reserved as the allocator
+floor and is not a valid row ID; valid values are `1..=2^52-1`. Thus every
+native ID is positive, disjoint per owner, and the maximum owner and local
+sequence encode to `i64::MAX`. Encoding rejects an owner or sequence outside
+those bounds before arithmetic. Under `NativeRangeV1`, negative values and
+marker-clear positive values classify as explicit legacy IDs, while a
+marker-set value with local sequence zero is `DataCorruption`; all other
+marker-set values decode to their owner and local sequence. Under `None`, every
+signed integer—including a marker-looking imported value—is legacy. The strict
+native decoder rejects rather than classifies negative and marker-clear values.
+
+Version 9 only defines the policy and stable namespace; it does not rewrite an
+insert or seed physical `sqlite_sequence`. That work belongs to issue #128.
+Exact `INTEGER PRIMARY KEY` cannot be replaced by a schema `DEFAULT` function:
+it is a rowid alias, and SQLite chooses an omitted or NULL rowid through its
+special insert path instead of evaluating a column default. A side-effecting
+allocation UDF would also make schema evaluation connection-local and
+retry-sensitive; putting its counter in one central file would recreate one
+serialized writer. The no-fork design instead lets unmodified SQLite allocate
+inside disjoint shard-local ranges after those ranges are explicitly installed.
+
+The loaded `Catalog` remains read-only to observers. Version 8 added the one-time
 `Database::register_tables` mutation boundary for an empty table catalog. The
 caller supplies the complete declaration set for the storage-default logical
 database. On every shard, the ordinary application-table names must exactly
@@ -278,9 +390,9 @@ Every primary or unique key on a sharded table must include its shard-key column
 with `BINARY` collation, so every possible collision has one physical owner.
 Application foreign keys, triggers, and virtual tables are temporarily
 unsupported for every registered physical table. Registration assigns table IDs
-after sorting by logical database and canonical table name, commits the rows
-and refreshed manifest root atomically, and publishes the replacement catalog
-only after revalidation.
+after sorting by logical database and canonical table name, commits each table
+and its explicit generated-ID policy row, refreshes the manifest root
+atomically, and publishes the replacement catalog only after revalidation.
 
 Registration is initialization-only and requires exclusive live ownership of
 the data root. An exact complete repeat is a read-only idempotent success;
@@ -304,7 +416,8 @@ the committed replacement fails `FailedPrecondition` rather than publishing
 conflicting catalog snapshots. A new registration must not be attempted through
 the pending handle.
 
-Fresh v8 initialization leaves `briskdb_tables` empty. The v7-to-v8 migration
+Fresh v9 initialization leaves `briskdb_tables` and `briskdb_generated_ids`
+empty. The v7-to-v8 migration
 also clears all v7 table rows because those rows were advisory and were never
 proved against the physical schema; silently promoting them would create false
 routing authority. The upgrade preserves logical databases, routing, schema
@@ -349,7 +462,7 @@ additional `Applying` row may exist, and it must target
 `schema_generation + 1`. Its stored source generation, shard count, SQL text,
 digest, state, and progress are validated on every manifest open. Any journal
 history requires the physical layout to be `Ready`; `Creating` and `Adopting`
-manifests have an empty journal. Fresh v8 initialization and pre-v6 upgrades
+manifests have an empty journal. Fresh v9 initialization and pre-v6 upgrades
 begin with an empty journal at generation 0.
 
 The retained journal proves which exact batches BriskDB coordinated; it does
@@ -391,8 +504,8 @@ restart as repair after any reported `DataCorruption`; whole-shard corruption
 drills and failure handling remain issue #68. Those storage failures retain
 their own error kinds and do not themselves justify rebaselining data.
 
-Manifest digest version 1 is a full 32-byte, unkeyed BLAKE3 digest. The stream
-begins with `briskdb.manifest.semantic-root.v1` plus its terminating NUL. It
+Manifest digest version 2 is a full 32-byte, unkeyed BLAKE3 digest. The stream
+begins with `briskdb.manifest.semantic-root.v2` plus its terminating NUL. It
 then encodes the length-prefixed name `application_id` and its tagged integer,
 followed by the length-prefixed name `user_version` and its tagged integer.
 These tables and columns follow in fixed order:
@@ -403,10 +516,12 @@ These tables and columns follow in fixed order:
 | `briskdb_metadata` | `requires_manifest_version` |
 | `briskdb_routing` | `singleton`, `hash_version`, `key_encoding_version`, `bucket_algorithm_version`, `virtual_bucket_count`, `map_generation` |
 | `briskdb_physical_shards` | `shard_id`, `lifecycle_state` |
+| `briskdb_allocation_owners` | `owner_slot`, `physical_shard_id` |
 | `briskdb_virtual_buckets` | `bucket_id`, `physical_shard_id` |
 | `briskdb_logical_databases` | `database_id`, `database_name` |
 | `briskdb_schema_catalog` | `singleton`, `identifier_encoding_version`, `schema_generation`, `default_database_id` |
 | `briskdb_tables` | `table_id`, `database_id`, `table_name`, `placement`, `shard_key_column`, `shard_key_type` |
+| `briskdb_generated_ids` | `table_id`, `policy`, `generated_column`, `encoding_version` |
 | `briskdb_shard_layout` | `singleton`, `layout_id`, `shard_application_id`, `shard_metadata_version`, `layout_state` |
 | `briskdb_schema_migrations` | `target_generation`, `source_generation`, `migration_id`, `digest_version`, `sql_text`, `shard_count`, `migration_state`, `next_shard` |
 | `briskdb_integrity` | `singleton`, `manifest_digest_version`, `schema_digest_version`, `database_state`, `committed_schema_digest`, `target_schema_digest` |
@@ -424,7 +539,7 @@ self-reference; its version, database state, and schema digest fields are
 covered. Frozen SQL definitions, STRICT flags, indexes, and foreign keys are
 validated separately rather than encoded as semantic rows.
 
-Every BriskDB-owned v8 manifest mutation recalculates the root after its row
+Every BriskDB-owned v9 manifest mutation recalculates the root after its row
 changes and before the same transaction commits. Progress acknowledgement,
 migration publication/finalization, layout publication, state changes, and
 catalog changes therefore cannot commit with a stale root through supported
@@ -432,7 +547,14 @@ code. Hashing semantic values instead of the raw SQLite file makes the root
 stable across WAL checkpoints, page relocation, and `VACUUM`; it deliberately
 does not cover SQLite page bytes, rollback journals, WAL, or shared memory.
 
-The frozen four-shard v8 fixture with layout ID
+Digest version 1 remains frozen solely to verify and migrate version-7 and
+version-8 manifests. It uses the
+`briskdb.manifest.semantic-root.v1` domain and the same encoding, but omits the
+two version-9 tables. A v9 manifest must store version 2; storing version 1 in
+an otherwise v9 shape is corruption, and an unsupported future positive digest
+version is a failed precondition.
+
+The frozen four-shard v8/version-1 fixture with layout ID
 `000102030405060708090a0b0c0d0e0f`, committed schema fingerprint `5a` repeated
 32 times, and the catalog rows in
 `manifest_semantic_digest_v1_has_a_frozen_golden_vector` hashes to
@@ -564,7 +686,7 @@ The routing singleton contains exactly these generation-1 values:
 | `key_encoding_version` | `1` | Canonical bytes defined below for raw, explicit, and typed inferred routing keys |
 | `bucket_algorithm_version` | `1` | Compatibility-preserving range algorithm below |
 | `virtual_bucket_count` | `4096` | Fixed virtual bucket space `0..4095` |
-| `map_generation` | `1` | Initial committed bucket map and the only generation version 8 can interpret |
+| `map_generation` | `1` | Initial committed bucket map and the only generation version 9 can interpret |
 
 Every bucket ID exists exactly once and references an active physical shard.
 Every physical shard owns at least one bucket. The generation-1 map partitions
@@ -606,7 +728,7 @@ vectors freeze the exact key bytes, BLAKE3 prefix, little-endian hash integer,
 bucket ID, and persisted physical shard.
 
 `map_generation` is separate from manifest `user_version` and from
-`schema_generation`. Version 8 accepts only routing generation 1 and validates
+`schema_generation`. Version 9 accepts only routing generation 1 and validates
 its exact deterministic assignment; no public map-mutation operation exists
 yet. A future format that can commit a changed map must bump `user_version` and
 its downgrade fence as well as `map_generation`. That requirement makes this
@@ -617,12 +739,32 @@ At each open, BriskDB validates the exact objects, columns, strict flags, frozen
 schema SQL, singleton rows, logical identifiers and limits, metadata codes,
 supported algorithm values, contiguous physical and bucket IDs, active
 lifecycle states, assignments, coverage, and foreign keys. A recognized
-version-8 manifest that violates any invariant is `DataCorruption` and is
+version-9 manifest that violates any invariant is `DataCorruption` and is
 rejected before shard connections are opened. The same locked transaction
 returns routing and logical rows as one coherent shared snapshot. Request
 routing performs no manifest query and cannot fall back to modulo after a failed
 validation; only successful migration finalization publishes a newer logical
 schema generation into the snapshot.
+
+## Previous version 8
+
+Version 8 has the eleven manifest tables retained from version 7. It has no
+`briskdb_generated_ids` or `briskdb_allocation_owners` table, its exact
+downgrade fence requires version 8, and it stores semantic manifest digest
+version 1. Its authoritative `briskdb_tables` rows have no generated-ID field;
+every such table therefore migrates as explicit `GeneratedIdPolicy::None`.
+
+The atomic v8-to-v9 transaction creates one `None` policy row for every table,
+creates one allocation-owner row for every active physical shard with
+`owner_slot = physical_shard_id`, replaces the downgrade fence, changes the
+integrity row to manifest digest version 2, stamps `user_version = 9`, and
+reseals the version-2 semantic root. It preserves all table placement and shard
+keys, routing and map generation, logical database and schema generation,
+migration history and progress, layout and durable integrity state,
+application-schema fingerprints, shard files, and application rows. All of
+those manifest changes commit or roll back together; the migration neither
+opens nor mutates a shard. A version-8 reader rejects the version-9 header
+before it could ignore generated-ID policy or owner-slot authority.
 
 ## Previous version 7
 
@@ -752,8 +894,8 @@ CREATE TABLE briskdb_metadata (
 ```
 
 The fence contains exactly `2`. A current opener validates this complete format
-before applying the numbered v2-to-v3, v3-to-v4, v4-to-v5, v5-to-v6, and
-v6-to-v7 and v7-to-v8 transactions.
+before applying the numbered v2-to-v3, v3-to-v4, v4-to-v5, v5-to-v6,
+v6-to-v7, v7-to-v8, and v8-to-v9 transactions.
 
 ## Legacy version 1
 
@@ -802,22 +944,26 @@ returning:
    Reject a foreign file, a newer version, a requested shard-count mismatch, a
    stale root, or another invalid recognized state before changing it.
 5. Apply each compile-time registered manifest migration with static SQL and
-   bound data. The destination application ID and `user_version` are the final
-   mutations; validate the complete destination and commit one numbered step at
-   a time. The v6-to-v7 transaction adds an integrity row in `Verifying`; the
+   bound data. Stamp the destination application ID and `user_version` only
+   after the schema/data change, then refresh the version-selected semantic
+   root, validate the complete destination, and commit one numbered step at a
+   time. The v6-to-v7 transaction adds an integrity row in `Verifying`; the
    v7-to-v8 transaction clears advisory table rows and installs the
-   authoritative-catalog downgrade fence. Older formats therefore cannot be
-   mistaken for checksummed or authoritative-catalog data.
+   authoritative-catalog downgrade fence; and v8-to-v9 installs explicit
+   generated-ID policies, allocation-owner slots, and semantic digest version
+   2. Older formats therefore cannot be mistaken for checksummed,
+   authoritative-catalog, or allocator-authority data.
 6. Fresh initialization is allowed only beside an otherwise empty physical
-   layout and commits v8 physical state `Creating`, integrity state
+   layout and commits v9 physical state `Creating`, integrity state
    `Verifying`, generation 0, and an empty migration journal. An existing
    v1/v2/v3 manifest first advances through v4; the v4-to-v5 transaction commits
    a random 16-byte layout ID and physical state `Adopting` before any shard
    file changes. The v5-to-v6 step creates the journal, v6-to-v7 establishes
    the unsealed integrity row, and v7-to-v8 establishes an empty authoritative
-   table catalog.
+   table catalog. The v8-to-v9 step adds the empty generated-policy catalog and
+   immutable owner map.
 7. If the validated integrity state is `Degraded`, fail startup without
-   changing it. Otherwise, if a validated v8 manifest contains one `Applying`
+   changing it. Otherwise, if a validated v9 manifest contains one `Applying`
    migration, require state `Migrating`, validate every shard against the
    trusted source/target fingerprint for its exact journal-prefix position,
    and resume it in ascending order. The final transaction publishes the
@@ -843,8 +989,9 @@ returning:
     `Database`, or `Engine`.
 
 SQLite transactional DDL keeps each numbered manifest step atomic within
-`manifest.sqlite`. A version-1 upgrade commits versions 2, 3, 4, 5, 6, 7, and
-then 8; a version-2 upgrade begins at 3, and so on. The v3-to-v4 step still creates the
+`manifest.sqlite`. A version-1 upgrade commits versions 2 through 9; a
+version-2 upgrade begins at 3, and so on. The v3-to-v4 step
+still creates the
 logical catalog, inserts database ID 1 named `default` plus the
 schema-generation-0 singleton, and leaves the table catalog empty.
 
@@ -865,7 +1012,9 @@ schema generation 0 and has no journal history. The v6-to-v7 step also changes
 no shard; it establishes a first fingerprint only after later cross-file
 consensus verification. The v7-to-v8 step changes no shard and clears advisory
 `briskdb_tables` rows rather than inferring or blessing declarations from
-physical DDL.
+physical DDL. The v8-to-v9 step likewise changes no shard: it records every
+existing authoritative table as `None`, seeds owner slots from immutable
+physical shard IDs, and changes the manifest checksum domain.
 
 A new application-schema migration follows a separate durable protocol:
 
@@ -935,11 +1084,13 @@ later storage-hardening certification.
 
 ## Compatibility and operations
 
-- Version 1 upgrades through versions 2, 3, 4, 5, 6, 7, and 8; later versions
+- Version 1 upgrades through versions 2, 3, 4, 5, 6, 7, 8, and 9; later versions
   begin at the next numbered transaction. Opening is therefore potentially
   mutating. An active v6 journal is completed before its v7 transaction.
 - There is no automatic downgrade. Older readers are fenced by the incompatible
-  metadata schema and authoritative header. In particular, a version-7 reader
+  metadata schema and authoritative header. In particular, a version-8 reader
+  rejects `user_version = 9` before it can ignore generated-ID policy and owner
+  mappings, a version-7 reader
   rejects `user_version = 8` before it can treat authoritative table rows as
   advisory, and a version-6 reader rejects version 7 before it can ignore
   integrity state.
@@ -992,7 +1143,7 @@ header value, format version, digest input, routing metadata, schema
 fingerprint, journal record, or recovery step. Listener settings are not
 persisted. Because engine open and its existing recovery precede listener
 binding, a later bind failure does not undo a migration or recovery transaction
-that already committed; a subsequent startup revalidates the same version-8
+that already committed; a subsequent startup revalidates the same version-9
 layout normally.
 
 Issue #29's pinned `pgwire` dependency and issue #30's production startup,
@@ -1037,7 +1188,8 @@ the in-process coordination is intentionally not a distributed lock.
 
 ## Verification contract
 
-Tests cover fresh creation and every v1/v2/v3/v4/v5/v6/v7-to-v8 upgrade, every
+Tests cover fresh creation and every v1/v2/v3/v4/v5/v6/v7/v8 upgrade path to
+v9, every
 manifest layout and integrity state, the exact shard header and metadata row,
 dynamic schema generations, retained migration history, checksum golden
 vectors, and no-op ready reopen. Failure
@@ -1052,10 +1204,12 @@ being published before full strict revalidation. Concurrent openers exercise
 matching and conflicting shard counts and layout transitions.
 
 Catalog tests continue to cover default logical metadata, every placement and
-shard-key type code, identifier and relational corruption, row limits,
-v7 advisory-row clearing, atomic registration and commit ambiguity, exact
-idempotency, empty-schema and key/constraint validation, immutable public
-lookups, stale-handle exclusion, and migration enforcement. Routing tests
+shard-key type code, every generated-ID policy and encoding boundary,
+legacy/native classification, immutable allocation-owner coverage, identifier
+and relational corruption, row limits, v7 advisory-row clearing, v8 explicit
+`None` migration, atomic registration and commit ambiguity, exact idempotency,
+empty-schema and key/constraint validation, immutable public lookups,
+stale-handle exclusion, and migration enforcement. Routing tests
 freeze golden hash/bucket/shard vectors,
 cover every algorithm state for every supported shard count, prove the final
 map lookup with a synthetic reassignment, and exercise parallel and reopen

@@ -5,7 +5,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use super::{EngineError, EngineErrorKind, EngineResult, RoutingCatalog};
+use super::{AllocationOwnerMap, EngineError, EngineErrorKind, EngineResult, RoutingCatalog};
 
 pub(crate) const IDENTIFIER_ENCODING_VERSION: u32 = 1;
 pub(crate) const DEFAULT_LOGICAL_DATABASE_ID: u64 = 1;
@@ -121,6 +121,80 @@ pub enum ShardKeyType {
     Binary,
 }
 
+/// Versioned policy for values BriskDB may generate for one logical table.
+///
+/// A policy is authoritative catalog metadata. BriskDB never infers it from a
+/// physical SQLite `DEFAULT`, `AUTOINCREMENT` clause, or `sqlite_sequence`
+/// row. New policy variants may be added in later releases, so callers must
+/// retain a wildcard arm when matching it.
+///
+/// ```compile_fail
+/// use briskdb::core::GeneratedIdPolicy;
+///
+/// fn policy_name(policy: GeneratedIdPolicy) -> &'static str {
+///     match policy {
+///         GeneratedIdPolicy::None => "none",
+///         GeneratedIdPolicy::NativeRangeV1 { .. } => "native_range_v1",
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use briskdb::core::GeneratedIdPolicy;
+///
+/// let _ = GeneratedIdPolicy::NativeRangeV1 {
+///     column: "id".to_owned(),
+/// };
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GeneratedIdPolicy {
+    /// BriskDB does not generate an ID for this table.
+    #[default]
+    None,
+    /// SQLite allocates from a positive signed 64-bit range namespaced by an
+    /// immutable allocation-owner slot.
+    ///
+    /// Construction is intentionally restricted to
+    /// [`GeneratedIdPolicy::native_range_v1`] so the stored column name always
+    /// satisfies the canonical catalog-identifier contract.
+    #[non_exhaustive]
+    NativeRangeV1 {
+        /// Canonical generated column name.
+        column: String,
+    },
+}
+
+impl GeneratedIdPolicy {
+    /// Construct the first native shard-range policy for a canonical column.
+    pub fn native_range_v1(column: impl Into<String>) -> EngineResult<Self> {
+        let column = column.into();
+        ensure_catalog_identifier(&column)?;
+        Ok(Self::NativeRangeV1 { column })
+    }
+
+    pub(crate) fn native_range_v1_from_validated(column: String) -> Self {
+        debug_assert!(validate_catalog_identifier(&column));
+        Self::NativeRangeV1 { column }
+    }
+
+    /// Return the generated column, or `None` when generation is disabled.
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::NativeRangeV1 { column } => Some(column),
+        }
+    }
+
+    /// Return the persisted codec version, or `None` for the `None` policy.
+    pub const fn encoding_version(&self) -> Option<u32> {
+        match self {
+            Self::None => None,
+            Self::NativeRangeV1 { .. } => Some(1),
+        }
+    }
+}
+
 /// Single-column shard-key declaration for a sharded table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardKeyMetadata {
@@ -175,6 +249,7 @@ pub struct TableDeclaration {
     database_id: LogicalDatabaseId,
     name: String,
     placement: TablePlacement,
+    generated_id_policy: GeneratedIdPolicy,
 }
 
 impl TableDeclaration {
@@ -207,7 +282,16 @@ impl TableDeclaration {
             database_id,
             name,
             placement,
+            generated_id_policy: GeneratedIdPolicy::None,
         })
+    }
+
+    /// Replace this table's generated-ID policy after validating it against
+    /// the declared placement and shard key.
+    pub fn with_generated_id_policy(mut self, policy: GeneratedIdPolicy) -> EngineResult<Self> {
+        ensure_generated_id_policy_compatible(&self.placement, &policy)?;
+        self.generated_id_policy = policy;
+        Ok(self)
     }
 
     /// Return the owning logical database.
@@ -225,8 +309,20 @@ impl TableDeclaration {
         &self.placement
     }
 
-    pub(crate) fn into_parts(self) -> (LogicalDatabaseId, String, TablePlacement) {
-        (self.database_id, self.name, self.placement)
+    /// Return the authoritative generated-ID policy.
+    pub const fn generated_id_policy(&self) -> &GeneratedIdPolicy {
+        &self.generated_id_policy
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (LogicalDatabaseId, String, TablePlacement, GeneratedIdPolicy) {
+        (
+            self.database_id,
+            self.name,
+            self.placement,
+            self.generated_id_policy,
+        )
     }
 }
 
@@ -237,23 +333,46 @@ pub struct TableMetadata {
     database_id: LogicalDatabaseId,
     name: String,
     placement: TablePlacement,
+    generated_id_policy: GeneratedIdPolicy,
 }
 
 impl TableMetadata {
+    #[allow(dead_code)]
     pub(crate) fn from_validated(
         id: u64,
         database_id: u64,
         name: String,
         placement: TablePlacement,
     ) -> Self {
+        Self::from_validated_with_generated_id_policy(
+            id,
+            database_id,
+            name,
+            placement,
+            GeneratedIdPolicy::None,
+        )
+    }
+
+    pub(crate) fn from_validated_with_generated_id_policy(
+        id: u64,
+        database_id: u64,
+        name: String,
+        placement: TablePlacement,
+        generated_id_policy: GeneratedIdPolicy,
+    ) -> Self {
         debug_assert!(id > 0);
         debug_assert!(database_id > 0);
         debug_assert!(validate_catalog_identifier(&name));
+        debug_assert!(generated_id_policy_is_compatible(
+            &placement,
+            &generated_id_policy
+        ));
         Self {
             id: TableId::from_validated(id),
             database_id: LogicalDatabaseId::from_validated(database_id),
             name,
             placement,
+            generated_id_policy,
         }
     }
 
@@ -275,6 +394,62 @@ impl TableMetadata {
     /// Return the table placement and any shard-key declaration.
     pub const fn placement(&self) -> &TablePlacement {
         &self.placement
+    }
+
+    /// Return the authoritative generated-ID policy loaded from the manifest.
+    pub const fn generated_id_policy(&self) -> &GeneratedIdPolicy {
+        &self.generated_id_policy
+    }
+}
+
+fn ensure_generated_id_policy_compatible(
+    placement: &TablePlacement,
+    policy: &GeneratedIdPolicy,
+) -> EngineResult<()> {
+    if generated_id_policy_is_compatible(placement, policy) {
+        return Ok(());
+    }
+
+    let diagnostic = match (placement, policy) {
+        (TablePlacement::Sharded(shard_key), GeneratedIdPolicy::NativeRangeV1 { column: _ })
+            if shard_key.key_type() != ShardKeyType::Int64 =>
+        {
+            format!(
+                "native_range_v1 generated IDs require an Int64 shard key, but table shard key {} has a different type",
+                shard_key.column()
+            )
+        }
+        (TablePlacement::Sharded(shard_key), GeneratedIdPolicy::NativeRangeV1 { column }) => {
+            format!(
+                "native_range_v1 generated column {column} must be the table shard key {}",
+                shard_key.column()
+            )
+        }
+        (_, GeneratedIdPolicy::NativeRangeV1 { .. }) => {
+            "native_range_v1 generated IDs require Sharded table placement".to_owned()
+        }
+        (_, GeneratedIdPolicy::None) => {
+            "the None generated-ID policy is unexpectedly incompatible".to_owned()
+        }
+    };
+    Err(EngineError::new(
+        EngineErrorKind::InvalidArgument,
+        diagnostic,
+    ))
+}
+
+fn generated_id_policy_is_compatible(
+    placement: &TablePlacement,
+    policy: &GeneratedIdPolicy,
+) -> bool {
+    match policy {
+        GeneratedIdPolicy::None => true,
+        GeneratedIdPolicy::NativeRangeV1 { column } => matches!(
+            placement,
+            TablePlacement::Sharded(shard_key)
+                if shard_key.key_type() == ShardKeyType::Int64
+                    && shard_key.column() == column
+        ),
     }
 }
 
@@ -477,11 +652,34 @@ impl Catalog {
 pub(crate) struct CatalogSnapshot {
     routing: RoutingCatalog,
     logical: Catalog,
+    allocation_owners: Option<AllocationOwnerMap>,
 }
 
 impl CatalogSnapshot {
+    /// Construct a pre-v9 snapshot that has no durable generated-ID owner map.
     pub(crate) fn from_validated_parts(routing: RoutingCatalog, logical: Catalog) -> Self {
-        Self { routing, logical }
+        Self {
+            routing,
+            logical,
+            allocation_owners: None,
+        }
+    }
+
+    /// Construct a v9 snapshot retaining its validated durable owner map.
+    pub(crate) fn from_validated_parts_with_allocation_owners(
+        routing: RoutingCatalog,
+        logical: Catalog,
+        allocation_owners: AllocationOwnerMap,
+    ) -> Self {
+        debug_assert_eq!(
+            allocation_owners.physical_shard_count(),
+            routing.shard_count()
+        );
+        Self {
+            routing,
+            logical,
+            allocation_owners: Some(allocation_owners),
+        }
     }
 
     pub(crate) const fn routing(&self) -> &RoutingCatalog {
@@ -490,6 +688,10 @@ impl CatalogSnapshot {
 
     pub(crate) const fn logical(&self) -> &Catalog {
         &self.logical
+    }
+
+    pub(crate) const fn allocation_owners(&self) -> Option<&AllocationOwnerMap> {
+        self.allocation_owners.as_ref()
     }
 }
 
@@ -528,6 +730,11 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
+    use crate::core::{
+        BUCKET_ALGORITHM_VERSION, HASH_VERSION, INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION,
+        VIRTUAL_BUCKET_COUNT, initial_physical_shard,
+    };
+
     use super::*;
 
     fn sample_catalog() -> Catalog {
@@ -559,6 +766,20 @@ mod tests {
                 ),
             ]
             .into_boxed_slice(),
+        )
+    }
+
+    fn sample_routing_catalog(shard_count: u16) -> RoutingCatalog {
+        RoutingCatalog::from_validated_parts(
+            shard_count,
+            HASH_VERSION,
+            KEY_ENCODING_VERSION,
+            BUCKET_ALGORITHM_VERSION,
+            INITIAL_MAP_GENERATION,
+            (0..VIRTUAL_BUCKET_COUNT)
+                .map(|bucket| initial_physical_shard(bucket, shard_count))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         )
     }
 
@@ -600,6 +821,7 @@ mod tests {
         assert_eq!(declaration.database_id(), database);
         assert_eq!(declaration.name(), "accounts");
         assert_eq!(declaration.placement(), &TablePlacement::Sharded(shard_key));
+        assert_eq!(declaration.generated_id_policy(), &GeneratedIdPolicy::None);
 
         assert_eq!(
             TableDeclaration::global(database, "countries")
@@ -628,6 +850,93 @@ mod tests {
                 EngineErrorKind::InvalidArgument
             );
         }
+    }
+
+    #[test]
+    fn generated_id_policies_are_owned_versioned_and_shard_key_scoped() {
+        let database = LogicalDatabaseId::new(9).unwrap();
+        let policy = GeneratedIdPolicy::native_range_v1("id").unwrap();
+        assert_eq!(policy.column(), Some("id"));
+        assert_eq!(policy.encoding_version(), Some(1));
+        assert_eq!(GeneratedIdPolicy::None.column(), None);
+        assert_eq!(GeneratedIdPolicy::None.encoding_version(), None);
+        assert_eq!(GeneratedIdPolicy::default(), GeneratedIdPolicy::None);
+
+        let declaration = TableDeclaration::sharded(
+            database,
+            "events",
+            ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+        )
+        .unwrap()
+        .with_generated_id_policy(policy.clone())
+        .unwrap();
+        assert_eq!(declaration.generated_id_policy(), &policy);
+
+        let metadata = TableMetadata::from_validated_with_generated_id_policy(
+            1,
+            database.get(),
+            "events".to_owned(),
+            declaration.placement().clone(),
+            policy.clone(),
+        );
+        assert_eq!(metadata.generated_id_policy(), &policy);
+
+        let (_, name, placement, recovered_policy) = declaration.into_parts();
+        assert_eq!(name, "events");
+        assert!(matches!(placement, TablePlacement::Sharded(_)));
+        assert_eq!(recovered_policy, policy);
+
+        for invalid in ["", "GeneratedId", "two-words", "sqlite_sequence"] {
+            assert_eq!(
+                GeneratedIdPolicy::native_range_v1(invalid)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn generated_id_policy_rejects_incompatible_table_declarations() {
+        let database = LogicalDatabaseId::new(9).unwrap();
+
+        let mismatched = TableDeclaration::sharded(
+            database,
+            "events",
+            ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+        )
+        .unwrap()
+        .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+        .unwrap_err();
+        assert_eq!(mismatched.kind(), EngineErrorKind::InvalidArgument);
+
+        for key_type in [ShardKeyType::Text, ShardKeyType::Binary] {
+            let error = TableDeclaration::sharded(
+                database,
+                "events",
+                ShardKeyMetadata::new("id", key_type).unwrap(),
+            )
+            .unwrap()
+            .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+        }
+
+        for declaration in [
+            TableDeclaration::global(database, "events").unwrap(),
+            TableDeclaration::catalog(database, "events").unwrap(),
+        ] {
+            let error = declaration
+                .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+        }
+
+        let disabled = TableDeclaration::global(database, "events")
+            .unwrap()
+            .with_generated_id_policy(GeneratedIdPolicy::None)
+            .unwrap();
+        assert_eq!(disabled.generated_id_policy(), &GeneratedIdPolicy::None);
     }
 
     #[test]
@@ -716,6 +1025,28 @@ mod tests {
         assert_send_sync_static::<TableDeclaration>();
         assert_send_sync_static::<ShardKeyMetadata>();
         assert_send_sync_static::<ShardKeyType>();
+        assert_send_sync_static::<GeneratedIdPolicy>();
+    }
+
+    #[test]
+    fn catalog_snapshot_distinguishes_pre_v9_and_persisted_owner_metadata() {
+        let legacy =
+            CatalogSnapshot::from_validated_parts(sample_routing_catalog(4), sample_catalog());
+        assert_eq!(legacy.allocation_owners(), None);
+
+        let owners = AllocationOwnerMap::try_from_pairs(
+            4,
+            vec![(0, 0), (1, 1), (2, 2), (3, 3)].into_boxed_slice(),
+        )
+        .unwrap();
+        let current = CatalogSnapshot::from_validated_parts_with_allocation_owners(
+            sample_routing_catalog(4),
+            sample_catalog(),
+            owners.clone(),
+        );
+        assert_eq!(current.allocation_owners(), Some(&owners));
+        assert_ne!(legacy, current);
+        assert_eq!(current.clone(), current);
     }
 
     #[test]

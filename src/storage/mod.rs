@@ -64,10 +64,11 @@ impl CatalogReplacementGuard<'_> {
     ) -> EngineResult<Arc<CatalogSnapshot>> {
         if current.routing() != replacement.routing()
             || current.logical().schema_generation() != replacement.logical().schema_generation()
+            || current.allocation_owners() != replacement.allocation_owners()
         {
             return Err(EngineError::new(
                 EngineErrorKind::Internal,
-                "table registration changed routing or schema-generation metadata",
+                "table registration changed routing, allocation-owner, or schema-generation metadata",
             ));
         }
         let replacement = Arc::new(replacement);
@@ -302,6 +303,7 @@ fn immutable_catalog_metadata_matches(left: &CatalogSnapshot, right: &CatalogSna
     let left_logical = left.logical();
     let right_logical = right.logical();
     left.routing() == right.routing()
+        && left.allocation_owners() == right.allocation_owners()
         && left_logical.identifier_encoding_version() == right_logical.identifier_encoding_version()
         && left_logical.default_database().id() == right_logical.default_database().id()
         && left_logical.logical_databases() == right_logical.logical_databases()
@@ -1065,6 +1067,7 @@ fn declarations_match_catalog(catalog: &Catalog, declarations: &[TableDeclaratio
             table.database_id() == declaration.database_id()
                 && table.name() == declaration.name()
                 && table.placement() == declaration.placement()
+                && table.generated_id_policy() == declaration.generated_id_policy()
         })
 }
 
@@ -2065,6 +2068,8 @@ mod tests {
             manifest
                 .execute_batch(
                     "BEGIN IMMEDIATE;
+                     DROP TABLE briskdb_generated_ids;
+                     DROP TABLE briskdb_allocation_owners;
                      DROP TABLE briskdb_integrity;
                      DROP TABLE briskdb_metadata;
                      CREATE TABLE briskdb_metadata (
@@ -2162,6 +2167,8 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_generated_ids;
+                 DROP TABLE briskdb_allocation_owners;
                  DROP TABLE briskdb_integrity;
                  DROP TABLE briskdb_metadata;
                  CREATE TABLE briskdb_metadata (
@@ -2253,6 +2260,8 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_generated_ids;
+                 DROP TABLE briskdb_allocation_owners;
                  DROP TABLE briskdb_integrity;
                  DROP TABLE briskdb_metadata;
                  CREATE TABLE briskdb_metadata (
@@ -2702,7 +2711,7 @@ mod tests {
         assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
         assert_eq!(
             error.to_string(),
-            "manifest table briskdb_manifest has an incompatible definition"
+            "manifest semantic checksum does not match its authoritative contents"
         );
     }
 
@@ -3107,6 +3116,76 @@ mod tests {
                 crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap()
             )
         );
+    }
+
+    #[test]
+    fn native_generated_id_policy_registers_and_reopens_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 3).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE events (
+                     id INTEGER PRIMARY KEY,
+                     payload BLOB
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        let policy = crate::core::GeneratedIdPolicy::native_range_v1("id").unwrap();
+        let declaration = TableDeclaration::sharded(
+            logical_database,
+            "events",
+            crate::core::ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+        )
+        .unwrap()
+        .with_generated_id_policy(policy.clone())
+        .unwrap();
+
+        database.register_tables(vec![declaration.clone()]).unwrap();
+        assert_eq!(
+            database
+                .catalog()
+                .table("default", "events")
+                .unwrap()
+                .unwrap()
+                .generated_id_policy(),
+            &policy
+        );
+        database.register_tables(vec![declaration]).unwrap();
+        drop(database);
+
+        let reopened = Database::open(temp.path(), 3).unwrap();
+        assert_eq!(
+            reopened
+                .catalog()
+                .table("default", "events")
+                .unwrap()
+                .unwrap()
+                .generated_id_policy(),
+            &policy
+        );
+    }
+
+    #[test]
+    fn native_generated_id_policy_rejects_a_nullable_physical_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast("CREATE TABLE events (id INTEGER, payload BLOB)")
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        let declaration = TableDeclaration::sharded(
+            logical_database,
+            "events",
+            crate::core::ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+        )
+        .unwrap()
+        .with_generated_id_policy(crate::core::GeneratedIdPolicy::native_range_v1("id").unwrap())
+        .unwrap();
+
+        let error = database.register_tables(vec![declaration]).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(database.catalog().tables().is_empty());
     }
 
     #[test]
