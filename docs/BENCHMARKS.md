@@ -126,9 +126,10 @@ cargo test --release --locked --features experimental-vtab --lib \
   -- --ignored --exact --nocapture --test-threads=1
 ```
 
-The issue #126 implementation was measured on 2026-08-12 from branch
-`issue-126-read-only-vtab`, based on `f71f705`, on the repository's Apple M1 Pro
-(10 cores, 16 GiB RAM), internal APFS volume, macOS/Darwin 25.2.0, and Rust
+The issue #126 implementation was measured on 2026-08-12 at implementation
+commit `7f0d598` (from branch `issue-126-read-only-vtab`, based on `f71f705`) on
+the repository's Apple M1 Pro (10 cores, 16 GiB RAM), internal APFS volume,
+macOS/Darwin 25.2.0, and Rust
 1.94.1 `aarch64-apple-darwin`. Each fresh fixture contained 256 deterministic
 rows per shard in both a hash-routed table and a native-ID table. The measured
 facade used validated OS-level `SQLITE_OPEN_READ_ONLY` handles for both bootstrap
