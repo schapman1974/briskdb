@@ -102,6 +102,126 @@ and investigate correctness separately from performance. Record the exact
 branch or commit and `EngineOptions` for engine comparisons; the canonical
 warm-pool control uses four connections and 32 queued operations per shard.
 
+## Experimental sharded virtual-table decision workload
+
+The `experimental-vtab` feature includes a no-fork, read-only `brisk_shard`
+candidate that must be compared with the established Rust scatter path before
+any rollout decision. The comparison uses equivalent registered fixtures and
+reports point lookup, full scan, `COUNT(*)`, and ordered limited-read results.
+Point lookup binds an exact typed shard-key equality; the other workloads expose
+the cost of reading through the virtual table before stock SQLite evaluates
+non-pushed aggregation, ordering, or limits.
+
+Run the virtual-table correctness tests and benchmark harness with the feature
+enabled. Record the exact command, revision, shard count, fixture row count,
+database size, filesystem, toolchain, and warm/cold-cache policy alongside any
+measurements. At minimum, exercise 2-, 10-, and 64-shard fixtures. Compare the
+same returned rows and duplicate semantics before comparing elapsed time or
+throughput.
+
+```bash
+cargo test --locked --all-features storage::sharded_vtab
+cargo test --release --locked --features experimental-vtab --lib \
+  storage::sharded_vtab::benchmarks::release_benchmark_matrix_reports_issue_126_comparison \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+The issue #126 implementation was measured on 2026-08-12 from branch
+`issue-126-read-only-vtab`, based on `f71f705`, on the repository's Apple M1 Pro
+(10 cores, 16 GiB RAM), internal APFS volume, macOS/Darwin 25.2.0, and Rust
+1.94.1 `aarch64-apple-darwin`. Each fresh fixture contained 256 deterministic
+rows per shard in both a hash-routed table and a native-ID table. The measured
+facade used validated OS-level `SQLITE_OPEN_READ_ONLY` handles for both bootstrap
+and child-shard access. The harness performed an untimed result/routing
+preflight and then took one fixture-size snapshot before any timed sample. It
+counts the logical file lengths reported by the filesystem for
+`manifest.sqlite`, an optional `manifest.sqlite-wal`, all expected
+`shards/NNNN.sqlite` files, and their optional `-wal` files. Missing WAL files
+count as zero. Volatile `-shm` files, directory metadata, filesystem block
+rounding, and unrelated temporary files are deliberately excluded.
+
+For every workload and path, the harness performs three untimed warm-up
+operations and an untimed calibration probe. Point probes start at 100
+operations; scan probes start with enough operations to process about 100,000
+logical rows. Calibration targets 500 ms and any measured sample shorter than
+250 ms is repeated with more iterations. The reported result is the median by
+throughput of five measured samples. Paired vtab/Engine samples alternate which
+path runs first; coordinator-only samples have no comparison path to alternate.
+Caches were warm; setup, schema migration, seeding, coordinator construction,
+correctness preflight, warm-up, and calibration were not timed.
+
+| Shards | Rows/shard/table | Manifest DB | Manifest WAL | Shard DBs | Shard WALs | Counted total |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 256 | 118,784 B | 0 B | 90,112 B | 0 B | 208,896 B |
+| 10 | 256 | 122,880 B | 0 B | 450,560 B | 0 B | 573,440 B |
+| 64 | 256 | 122,880 B | 0 B | 2,883,584 B | 0 B | 3,006,464 B |
+
+| Shards | Hash point: vtab | Hash point: Engine | vtab/Engine | Full scan: vtab | Full scan: Engine | vtab/Engine |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 4,957.00 ops/s | 37,967.69 ops/s | 0.131x | 1,130,050.19 rows/s | 3,184,983.99 rows/s | 0.355x |
+| 10 | 5,096.96 ops/s | 39,902.11 ops/s | 0.128x | 1,202,843.36 rows/s | 2,050,456.15 rows/s | 0.587x |
+| 64 | 4,754.41 ops/s | 32,304.24 ops/s | 0.147x | 1,162,523.00 rows/s | 2,061,907.79 rows/s | 0.564x |
+
+The coordinator-only workloads measured as follows. `COUNT(*)` and ordered
+`LIMIT` represent all logical input rows, even though they return one and 50
+rows respectively. The current Engine scatter surface rejects those forms, so
+the report does not invent a benchmark-only reducer for a false comparison.
+
+| Shards | `COUNT(*)` input rows/s | `ORDER BY ... LIMIT 50` input rows/s | Native-ID point ops/s |
+| ---: | ---: | ---: | ---: |
+| 2 | 1,448,435.79 | 1,229,253.95 | 7,147.31 |
+| 10 | 1,290,473.27 | 1,191,658.33 | 6,868.60 |
+| 64 | 1,332,706.05 | 1,366,877.11 | 7,323.54 |
+
+Exact harness records from the command above follow. The final test result was
+`1 passed; 0 failed` in 56.24 seconds.
+
+```text
+record	shards	rows_per_shard	path	workload	samples	median_iterations	median_elapsed_ms	median_ops_per_sec	median_logical_rows_per_sec
+fixture_record	shards	rows_per_shard	manifest_db_bytes	manifest_wal_bytes	shard_db_bytes	shard_wal_bytes	total_db_and_wal_bytes
+issue126_fixture_bytes	2	256	118784	0	90112	0	208896
+issue126_benchmark	2	256	vtab	hash_point	5	2221	448.053	4957.00	4957.00
+issue126_benchmark	2	256	engine_logical	hash_point	5	15774	415.459	37967.69	37967.69
+issue126_benchmark	2	256	vtab	hash_full	5	1036	469.388	2207.13	1130050.19
+issue126_benchmark	2	256	engine_logical	hash_full	5	3264	524.702	6220.67	3184983.99
+issue126_benchmark	2	256	vtab	count	5	1341	474.023	2828.98	1448435.79
+issue126_benchmark	2	256	vtab	order_limit_50	5	1221	508.562	2400.89	1229253.95
+issue126_benchmark	2	256	vtab	native_point	5	3662	512.361	7147.31	7147.31
+issue126_comparison	2	256	hash_point	0.131	hash_full	0.355
+issue126_fixture_bytes	10	256	122880	0	450560	0	573440
+issue126_benchmark	10	256	vtab	hash_point	5	2589	507.950	5096.96	5096.96
+issue126_benchmark	10	256	engine_logical	hash_point	5	21410	536.563	39902.11	39902.11
+issue126_benchmark	10	256	vtab	hash_full	5	235	500.148	469.86	1202843.36
+issue126_benchmark	10	256	engine_logical	hash_full	5	420	524.371	800.96	2050456.15
+issue126_benchmark	10	256	vtab	count	5	225	446.348	504.09	1290473.27
+issue126_benchmark	10	256	vtab	order_limit_50	5	236	506.991	465.49	1191658.33
+issue126_benchmark	10	256	vtab	native_point	5	3235	470.984	6868.60	6868.60
+issue126_comparison	10	256	hash_point	0.128	hash_full	0.587
+issue126_fixture_bytes	64	256	122880	0	2883584	0	3006464
+issue126_benchmark	64	256	vtab	hash_point	5	2455	516.363	4754.41	4754.41
+issue126_benchmark	64	256	engine_logical	hash_point	5	17959	555.933	32304.24	32304.24
+issue126_benchmark	64	256	vtab	hash_full	5	35	493.272	70.95	1162523.00
+issue126_benchmark	64	256	engine_logical	hash_full	5	66	524.439	125.85	2061907.79
+issue126_benchmark	64	256	vtab	count	5	42	516.339	81.34	1332706.05
+issue126_benchmark	64	256	vtab	order_limit_50	5	44	527.404	83.43	1366877.11
+issue126_benchmark	64	256	vtab	native_point	5	2894	395.164	7323.54	7323.54
+issue126_comparison	64	256	hash_point	0.147	hash_full	0.564
+```
+
+These are one-host engineering measurements rather than CI thresholds or a
+statistical capacity claim. They show that correctness and scale are viable,
+but the connection-per-child, materializing facade is currently about 6.8-7.8x
+slower for hash point reads and 1.7-2.8x slower for full scans than the pooled
+Rust Engine path. The issue #126 decision is therefore to retain the facade as
+an experimental complement and optimization foundation. It must not replace
+the Engine/protocol query path at this stage. Streaming child cursors and pooled
+read handles are the clearest measured follow-up opportunities.
+
+The decision record must report measurements for both paths, including startup
+where relevant, and explain whether the virtual-table boundary advances,
+remains experimental, or is rejected. The feature remains off the authoritative
+Engine and protocol paths until the separate rollout gate is approved.
+
 ## Initial snapshot
 
 The initial issue #3 branch was measured on 2026-08-07 with `cargo bench

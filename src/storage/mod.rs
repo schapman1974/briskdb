@@ -42,6 +42,9 @@ use crate::{
     sqlite_error,
 };
 
+#[cfg(feature = "experimental-vtab")]
+use crate::core::AllocationOwnerMap;
+
 pub(crate) const CONNECTION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = manifest::MAX_SCHEMA_MIGRATION_SQL_BYTES;
 
@@ -626,6 +629,11 @@ impl Storage {
         self.catalog.logical()
     }
 
+    #[cfg(feature = "experimental-vtab")]
+    pub(crate) fn allocation_owner_map(&self) -> Option<&AllocationOwnerMap> {
+        self.catalog.allocation_owners()
+    }
+
     pub(crate) fn register_tables(
         &mut self,
         declarations: Vec<TableDeclaration>,
@@ -892,6 +900,29 @@ impl Storage {
             self.ensure_shard_in_range(shard)?;
             let path = self.shard_path(shard);
             let connection = shard::open_existing(
+                &path,
+                shard,
+                self.catalog.logical().schema_generation(),
+                &self.shard_layout,
+            )?;
+            let expected_digest = self.schema_coordination.committed_schema_digest()?;
+            shard::verify_schema_digest(
+                &connection,
+                self.catalog.logical().schema_generation(),
+                &expected_digest,
+            )?;
+            attach_storage_authorizer(&connection)?;
+            Ok(connection)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    pub(crate) fn open_shard_read_only(&self, shard: u16) -> EngineResult<Connection> {
+        let result = (|| {
+            self.ensure_shard_in_range(shard)?;
+            let path = self.shard_path(shard);
+            let connection = shard::open_existing_read_only(
                 &path,
                 shard,
                 self.catalog.logical().schema_generation(),

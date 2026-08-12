@@ -106,6 +106,29 @@ not make that prepared pipeline public wire behavior. Authoritative table
 registration composes the SQLite frontend and planner into the existing HTTP
 execute/query rows as described above; it adds no HTTP field or route.
 
+The `experimental-vtab` Cargo feature also contains a read-only, internal
+`brisk_shard` coordinator for evaluating the no-fork virtual-table boundary. It
+is not an HTTP, PostgreSQL, or MySQL query interface and does not expand the
+table above. The module is statically registered into stock SQLite and opens
+validated physical children through OS-level SQLite read-only handles; it does
+not use `ATTACH`, runtime extension loading, a SQLite fork, or a storage-format
+change. Writes, schema operations, attachments, unsafe PRAGMAs, and extension
+loading are rejected.
+
+Within that feature gate only, a usable equality on the exact cataloged shard
+key requests one virtual-table argument without `omit`. Exact SQLite `INTEGER`,
+UTF-8 `TEXT`, and `BLOB` values can route matching `Int64`, `Text`, and `Binary`
+keys to one child, where the value is bound against the indexed physical key.
+A valid `native_range_v1` value uses its allocation owner; a legacy integer
+under that policy uses normal hash routing. `NULL` is empty, while a non-null
+type mismatch conservatively scans all placement targets. Unconstrained scans
+visit shards in ascending order and preserve duplicates as `UNION ALL`.
+SQLite applies remaining filters, aggregation, ordering, limits, and
+feature-local joins above the facade without pushdown. That stock-SQLite
+delegation is internal to the experimental coordinator; it does not expand the
+Engine or protocol contracts documented elsewhere in this file, including
+their rejection or delegation of unsupported advanced multi-shard SQL.
+
 Every HTTP database operation now calls the same protocol-neutral async engine
 used by PostgreSQL startup status and intended for issue-31 PostgreSQL SQL flow
 and the future MySQL adapter. Execute and query requests create a fresh `Ready`

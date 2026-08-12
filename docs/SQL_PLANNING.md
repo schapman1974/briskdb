@@ -70,6 +70,26 @@ sets: every shard for `Unconstrained`, or each distinct inferred owner for a
 finite multi-owner result. Catalog placement remains denied. This execution
 integration does not change this planner's meaning of `assigned_shard()`.
 
+The feature-gated `brisk_shard` coordinator is a separate experimental read
+path, not another `BoundStatementPlan` consumer and not a replacement for this
+authoritative Engine policy. Its `xBestIndex` requests one argument for a
+usable equality on the registered shard-key column without claiming `omit`.
+At `xFilter`, exact SQLite `INTEGER`, UTF-8 `TEXT`, and `BLOB` values route the
+matching `Int64`, `Text`, and `Binary` key types to one owner. A valid
+`native_range_v1` integer resolves through the immutable allocation-owner map;
+a legacy integer under the same policy follows normal hash routing. `NULL`
+produces no rows, while a storage-class mismatch scans all selected placement
+targets and lets SQLite recheck the predicate. The child equality is bound on
+the physical shard-key column so its local index remains available.
+
+Unconstrained virtual-table reads scan in ascending shard order and retain
+duplicates as `UNION ALL`. Stock SQLite evaluates other filtering, aggregation,
+ordering, limits, and feature-local joins above that scan without pushdown.
+This internal delegation does not expand the Engine's accepted multi-shard
+forms or change protocol behavior; those paths continue to reject or delegate
+forms outside their documented subset. Advanced filter, aggregate, order, and
+limit pushdown remains owned by issues #58 through #61.
+
 Populated-catalog raw execute/query uses the same internal planning result after
 SQLite parsing, common-subset validation, placeholder normalization, and strict
 translation. Execute still requires one assigned Sharded owner. Query uses one
