@@ -4,6 +4,9 @@ mod manifest;
 mod migration;
 mod schema_gate;
 mod shard;
+#[cfg(feature = "experimental-vtab")]
+#[allow(dead_code)]
+mod sharded_vtab;
 
 pub(crate) mod pool;
 pub(crate) use pool::{ConnectionOwner, ConnectionPools, PooledConnection};

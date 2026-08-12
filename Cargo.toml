@@ -11,6 +11,12 @@ repository = "https://github.com/schapman1974/briskdb"
 # publishing disabled while the exact post-0.62 parser snapshot is required.
 publish = false
 
+[features]
+default = []
+# Statically compile rusqlite's virtual-table API for the no-fork sharded-table
+# prototype. This does not enable SQLite's runtime extension loader.
+experimental-vtab = ["rusqlite/vtab"]
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
