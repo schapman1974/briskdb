@@ -439,8 +439,8 @@ foreign keys, virtual tables, and any change that breaks declared placement,
 Text collation, or one-owner uniqueness.
 
 The initial shard count is immutable, so resharding will require an explicit
-migration workflow. Opening upgrades exact version-1 through version-7
-manifests to version 8 through ordered, resumable steps.
+migration workflow. Opening upgrades exact version-1 through version-8
+manifests to version 9 through ordered, resumable steps.
 Version 3 introduced the versioned, generation-stamped 4,096-bucket routing
 map. Version 4 adds schema generation 0 and immutable logical metadata with
 default database ID 1 named `default`; identifier encoding version 1 accepts
@@ -493,6 +493,15 @@ foreign keys, triggers, and virtual tables are temporarily unsupported; every
 `BINARY` collation so uniqueness has one physical owner. The public catalog
 returned by `Database::catalog()` and `Engine::catalog()` remains read-only to
 observers.
+
+Version 9 adds one explicit generated-ID policy row per registered table and an
+immutable allocation-owner slot for every physical shard. The v8-to-v9
+migration preserves routing, placement, schema history, shard files, and rows;
+it assigns existing tables policy `None`, seeds `owner_slot = physical_shard_id`,
+raises the downgrade fence, and moves the semantic manifest checksum to version
+2 so both new catalogs are covered. This version defines and validates the
+`native_range_v1` ID format, but does not yet rewrite inserts or seed physical
+`sqlite_sequence` state.
 
 Registration marks schema admission `Pending` before its manifest commit. If
 that commit reports an ambiguous cleanup or I/O failure, close the registering

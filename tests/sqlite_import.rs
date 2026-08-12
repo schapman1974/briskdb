@@ -5,7 +5,10 @@ use std::{
 };
 
 use briskdb::{
-    core::{CancellationToken, Database, EngineErrorKind, ShardKeyType, TablePlacement},
+    core::{
+        CancellationToken, Database, EngineErrorKind, GeneratedIdPolicy, ShardKeyType,
+        TablePlacement,
+    },
     import::{
         SQLITE_IMPORT_RECEIPT_VERSION, SqliteImportKeyType, SqliteImportOptions,
         SqliteImportPlacement, SqliteImportPlan, SqliteImportReport, SqliteImportTableReport,
@@ -505,6 +508,11 @@ fn assert_sharded_catalog(database: &Database, table: &str, column: &str, key_ty
         "wrong catalog placement for {table}: {:?}",
         metadata.placement(),
     );
+    assert_eq!(
+        metadata.generated_id_policy(),
+        &GeneratedIdPolicy::None,
+        "SQLite import must never infer generated-ID authority for {table}",
+    );
 }
 
 fn assert_global_catalog(database: &Database, table: &str) {
@@ -515,6 +523,11 @@ fn assert_global_catalog(database: &Database, table: &str) {
         .find(|candidate| candidate.name() == table)
         .unwrap_or_else(|| panic!("missing catalog table {table}"));
     assert!(matches!(metadata.placement(), TablePlacement::Global));
+    assert_eq!(
+        metadata.generated_id_policy(),
+        &GeneratedIdPolicy::None,
+        "SQLite import must persist no generated-ID authority for {table}",
+    );
 }
 
 fn integer_routes(database: &Database, ids: impl IntoIterator<Item = i64>) -> BTreeMap<i64, u16> {

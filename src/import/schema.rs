@@ -17,8 +17,8 @@ use super::{
 };
 use crate::{
     core::{
-        CancellationToken, EngineError, EngineErrorKind, EngineResult, LogicalDatabaseId,
-        MAX_TABLES, ShardKeyMetadata, ShardKeyType, TableDeclaration,
+        CancellationToken, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
+        LogicalDatabaseId, MAX_TABLES, ShardKeyMetadata, ShardKeyType, TableDeclaration,
     },
     sqlite_error,
 };
@@ -332,13 +332,16 @@ impl SourceSnapshot {
     ) -> EngineResult<Vec<TableDeclaration>> {
         self.tables
             .iter()
-            .map(|table| match table.shard_key() {
-                Some(key) => TableDeclaration::sharded(
-                    database_id,
-                    table.name(),
-                    ShardKeyMetadata::new(key.column(), core_key_type(key.key_type()))?,
-                ),
-                None => TableDeclaration::global(database_id, table.name()),
+            .map(|table| {
+                let declaration = match table.shard_key() {
+                    Some(key) => TableDeclaration::sharded(
+                        database_id,
+                        table.name(),
+                        ShardKeyMetadata::new(key.column(), core_key_type(key.key_type()))?,
+                    ),
+                    None => TableDeclaration::global(database_id, table.name()),
+                }?;
+                declaration.with_generated_id_policy(GeneratedIdPolicy::None)
             })
             .collect()
     }

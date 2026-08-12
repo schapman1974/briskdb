@@ -230,7 +230,7 @@ SQL layer until issue #31.
 ## Storage-format and configuration boundary
 
 Classification is process-memory analysis over an already owned AST. It does
-not change manifest format version 8, manifest tables, logical catalog rows,
+not change the manifest format, manifest tables, logical catalog rows,
 routing-key encoding, virtual buckets, shard identity, SQLite headers,
 application-schema fingerprints, migration-journal records, WAL/synchronous
 mode, or filenames. It opens no database connection and performs no recovery

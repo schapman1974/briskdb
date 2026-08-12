@@ -70,6 +70,12 @@ fn assert_catalog_fixture(catalog: &core::Catalog) {
     assert_eq!(catalog.default_database().name(), "default");
     assert_eq!(catalog.logical_databases().len(), 1);
     assert_eq!(catalog.tables().len(), 3);
+    assert!(
+        catalog
+            .tables()
+            .iter()
+            .all(|table| table.generated_id_policy() == &core::GeneratedIdPolicy::None)
+    );
 
     let logical_database = catalog.default_database();
     assert_eq!(
@@ -889,12 +895,30 @@ fn logical_catalog_types_and_access_are_public_and_protocol_neutral() {
     assert_public_metadata::<core::TablePlacement>();
     assert_public_metadata::<core::ShardKeyMetadata>();
     assert_public_metadata::<core::ShardKeyType>();
+    assert_public_metadata::<core::GeneratedIdPolicy>();
 
     let _signed = core::ShardKeyType::Int64;
     let _text = core::ShardKeyType::Text;
     let _binary = core::ShardKeyType::Binary;
     let _global = core::TablePlacement::Global;
     let _catalog = core::TablePlacement::Catalog;
+    let generated_policy = core::GeneratedIdPolicy::native_range_v1("id").unwrap();
+    assert_eq!(generated_policy.column(), Some("id"));
+    assert_eq!(generated_policy.encoding_version(), Some(1));
+    assert_eq!(core::GeneratedIdPolicy::None.column(), None);
+
+    let generated_declaration = core::TableDeclaration::sharded(
+        core::LogicalDatabaseId::new(1).unwrap(),
+        "generated_rows",
+        core::ShardKeyMetadata::new("id", core::ShardKeyType::Int64).unwrap(),
+    )
+    .unwrap()
+    .with_generated_id_policy(generated_policy.clone())
+    .unwrap();
+    assert_eq!(
+        generated_declaration.generated_id_policy(),
+        &generated_policy
+    );
 
     let temp = tempfile::tempdir().unwrap();
     let database = Arc::new(core::Database::open(temp.path(), 4).unwrap());

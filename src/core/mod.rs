@@ -7,6 +7,7 @@ mod catalog;
 mod control;
 mod engine;
 mod error;
+pub(crate) mod generated_id;
 mod lifecycle;
 mod options;
 mod planner;
@@ -18,8 +19,8 @@ mod types;
 pub(crate) mod worker;
 
 pub use catalog::{
-    Catalog, LogicalDatabaseId, LogicalDatabaseMetadata, ShardKeyMetadata, ShardKeyType,
-    TableDeclaration, TableId, TableMetadata, TablePlacement,
+    Catalog, GeneratedIdPolicy, LogicalDatabaseId, LogicalDatabaseMetadata, ShardKeyMetadata,
+    ShardKeyType, TableDeclaration, TableId, TableMetadata, TablePlacement,
 };
 pub(crate) use catalog::{
     CatalogSnapshot, DEFAULT_LOGICAL_DATABASE_ID, DEFAULT_LOGICAL_DATABASE_NAME,
@@ -31,6 +32,7 @@ pub(crate) use control::{
 pub use control::{CancellationToken, RequestContext};
 pub use engine::{Engine, EngineStatus, Statement};
 pub use error::{EngineError, EngineErrorKind, EngineResult};
+pub(crate) use generated_id::AllocationOwnerMap;
 pub use lifecycle::{EngineState, ShutdownReport};
 pub(crate) use lifecycle::{Lifecycle, OperationLease};
 pub use options::{
