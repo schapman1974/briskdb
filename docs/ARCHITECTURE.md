@@ -614,6 +614,14 @@ possible. BriskDB exposes no repair, rebaseline, or detailed integrity status
 API here; richer migration administration and status surfaces remain issue
 #53.
 
+The opt-in `experimental-vtab` feature adds a separate, read-only SQLite
+coordinator that statically registers `brisk_shard`. It proves a no-fork logical
+table boundary while leaving the manifest, physical schemas, protocol behavior,
+and established scatter executor unchanged. Cursor ownership, schema admission,
+cancellation, bounded materialization, static-loading policy, and rejected
+alternatives are specified in the
+[experimental sharded virtual-table facade](SHARDED_VIRTUAL_TABLE.md).
+
 ## Session and asynchronous engine boundary
 
 `Session` is protocol-neutral mutable state owned by one frontend connection or
