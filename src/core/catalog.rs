@@ -653,6 +653,7 @@ pub(crate) struct CatalogSnapshot {
     routing: RoutingCatalog,
     logical: Catalog,
     allocation_owners: Option<AllocationOwnerMap>,
+    active_native_id_table_ids: Box<[TableId]>,
 }
 
 impl CatalogSnapshot {
@@ -662,6 +663,7 @@ impl CatalogSnapshot {
             routing,
             logical,
             allocation_owners: None,
+            active_native_id_table_ids: Box::new([]),
         }
     }
 
@@ -679,7 +681,23 @@ impl CatalogSnapshot {
             routing,
             logical,
             allocation_owners: Some(allocation_owners),
+            active_native_id_table_ids: Box::new([]),
         }
+    }
+
+    /// Attach the sorted manifest-validated set of allocator-active tables.
+    pub(crate) fn with_active_native_id_table_ids(mut self, table_ids: Box<[TableId]>) -> Self {
+        debug_assert!(table_ids.windows(2).all(|ids| ids[0] < ids[1]));
+        debug_assert!(table_ids.iter().all(|id| {
+            self.logical.table_by_id(*id).is_some_and(|table| {
+                matches!(
+                    table.generated_id_policy(),
+                    GeneratedIdPolicy::NativeRangeV1 { .. }
+                )
+            })
+        }));
+        self.active_native_id_table_ids = table_ids;
+        self
     }
 
     pub(crate) const fn routing(&self) -> &RoutingCatalog {
@@ -692,6 +710,16 @@ impl CatalogSnapshot {
 
     pub(crate) const fn allocation_owners(&self) -> Option<&AllocationOwnerMap> {
         self.allocation_owners.as_ref()
+    }
+
+    pub(crate) fn active_native_id_table_ids(&self) -> &[TableId] {
+        &self.active_native_id_table_ids
+    }
+
+    pub(crate) fn native_id_policy_is_active(&self, table_id: TableId) -> bool {
+        self.active_native_id_table_ids
+            .binary_search(&table_id)
+            .is_ok()
     }
 }
 

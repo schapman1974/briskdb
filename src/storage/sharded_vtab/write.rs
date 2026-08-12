@@ -22,17 +22,118 @@ use super::{
 #[cfg(test)]
 use super::{TestChildScanControl, TestChildScanGate};
 use crate::{
-    core::{EngineError, EngineErrorKind, EngineResult, OperationControl, Value},
+    core::{
+        EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy, GeneratedKey,
+        OperationControl, Value,
+        generated_id::{
+            AllocationOwnerSlot, GeneratedIdClassification, classify_generated_id,
+            native_range_v1_sequence_ceiling, native_range_v1_sequence_floor,
+        },
+    },
     sqlite_error,
     storage::{CONNECTION_BUSY_TIMEOUT, SchemaOperationGuard, Storage},
 };
 
 const CANCELLABLE_BUSY_SLICE: Duration = Duration::from_millis(25);
 
+fn validate_allocation_sequence_capacity(
+    connection: &Connection,
+    table: &str,
+    owner: AllocationOwnerSlot,
+) -> EngineResult<()> {
+    let sequence = read_allocation_sequence(connection, table)?;
+    let floor = native_range_v1_sequence_floor(owner);
+    let ceiling = native_range_v1_sequence_ceiling(owner);
+    if sequence < floor || sequence > ceiling {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!(
+                "native generated table {table} sequence {sequence} is outside owner {} range",
+                owner.get()
+            ),
+        ));
+    }
+    if sequence == ceiling {
+        return Err(EngineError::new(
+            EngineErrorKind::LimitExceeded,
+            format!(
+                "native generated table {table} exhausted allocation owner {}",
+                owner.get()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn read_allocation_sequence(connection: &Connection, table: &str) -> EngineResult<i64> {
+    let mut statement = connection
+        .prepare("SELECT seq FROM main.sqlite_sequence WHERE name = ?1 COLLATE BINARY")
+        .map_err(|error| allocation_sequence_read_error(error, table))?;
+    let mut rows = statement
+        .query([table])
+        .map_err(|error| allocation_sequence_read_error(error, table))?;
+    let sequence = match rows
+        .next()
+        .map_err(|error| allocation_sequence_read_error(error, table))?
+    {
+        Some(row) => match row
+            .get_ref(0)
+            .map_err(|error| allocation_sequence_read_error(error, table))?
+        {
+            ValueRef::Integer(sequence) => sequence,
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!("native generated table {table} has a non-integer SQLite sequence"),
+                ));
+            }
+        },
+        None => {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("native generated table {table} is missing its SQLite sequence"),
+            ));
+        }
+    };
+    if rows
+        .next()
+        .map_err(|error| allocation_sequence_read_error(error, table))?
+        .is_some()
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("native generated table {table} has duplicate SQLite sequences"),
+        ));
+    }
+
+    Ok(sequence)
+}
+
+fn allocation_sequence_read_error(error: rusqlite::Error, table: &str) -> EngineError {
+    let classified = sqlite_error::storage(error);
+    let diagnostic = format!("failed to read native generated sequence for table {table}");
+    if matches!(
+        classified.kind(),
+        EngineErrorKind::Busy
+            | EngineErrorKind::Cancelled
+            | EngineErrorKind::PermissionDenied
+            | EngineErrorKind::ReadOnly
+            | EngineErrorKind::StorageFull
+            | EngineErrorKind::OutOfMemory
+            | EngineErrorKind::StorageUnavailable
+    ) {
+        classified.context(diagnostic)
+    } else {
+        EngineError::from_source(EngineErrorKind::DataCorruption, diagnostic, classified)
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) struct CoordinatorWriteResult {
     pub(crate) affected_rows: usize,
+    pub(crate) shard: Option<u16>,
     pub(crate) explicit_key: Option<Value>,
+    pub(crate) generated_key: Option<GeneratedKey>,
 }
 
 impl CoordinatorWriteResult {
@@ -41,12 +142,30 @@ impl CoordinatorWriteResult {
         self.affected_rows
     }
 
+    /// Return the one physical shard mutated by this statement.
+    ///
+    /// A successful no-op (for example, an ignored constraint) has no shard
+    /// result. The writable coordinator still refuses to mutate two shards in
+    /// one transaction.
+    pub(crate) const fn shard(&self) -> Option<u16> {
+        self.shard
+    }
+
     /// Return the caller-supplied key reported for a successful INSERT.
     ///
-    /// UPDATE and DELETE do not produce a key. Generated keys remain outside
-    /// the current explicit-key coordinator contract.
+    /// UPDATE and DELETE do not produce a key. Automatically allocated values
+    /// are reported separately by [`Self::generated_key`].
     pub(crate) const fn explicit_key(&self) -> Option<&Value> {
         self.explicit_key.as_ref()
+    }
+
+    /// Return the SQLite-allocated key captured by the physical INSERT.
+    ///
+    /// Caller-supplied IDs are deliberately reported only by
+    /// [`Self::explicit_key`]; adapters can therefore distinguish generation
+    /// from an explicit value without inspecting SQL text.
+    pub(crate) const fn generated_key(&self) -> Option<&GeneratedKey> {
+        self.generated_key.as_ref()
     }
 }
 
@@ -243,9 +362,66 @@ impl WriteCoordinator {
         sql: &str,
         parameters: P,
     ) -> EngineResult<CoordinatorWriteResult> {
+        self.execute_dml_inner(sql, parameters, None)
+    }
+
+    /// Execute one preflighted single-row INSERT whose native generated key
+    /// was omitted by the caller.
+    ///
+    /// This is intentionally a narrow seam for the shared SQL planner added
+    /// by issue #130: the caller must identify both the catalog table and its
+    /// already-selected physical shard. Merely supplying NULL through
+    /// [`Self::execute_dml`] never enables allocation.
+    pub(crate) fn execute_generated_dml<P: Params>(
+        &mut self,
+        sql: &str,
+        parameters: P,
+        table_id: u64,
+        expected_shard: u16,
+    ) -> EngineResult<CoordinatorWriteResult> {
+        self.execute_dml_inner(
+            sql,
+            parameters,
+            Some(GeneratedInsertRequest {
+                table_id,
+                expected_shard: Some(expected_shard),
+            }),
+        )
+    }
+
+    /// Execute one generated INSERT and let the writable registry choose an
+    /// active, non-exhausted owner using a per-table round-robin cursor.
+    pub(crate) fn execute_generated_dml_auto<P: Params>(
+        &mut self,
+        sql: &str,
+        parameters: P,
+        table_id: u64,
+    ) -> EngineResult<CoordinatorWriteResult> {
+        self.execute_dml_inner(
+            sql,
+            parameters,
+            Some(GeneratedInsertRequest {
+                table_id,
+                expected_shard: None,
+            }),
+        )
+    }
+
+    fn execute_dml_inner<P: Params>(
+        &mut self,
+        sql: &str,
+        parameters: P,
+        generated: Option<GeneratedInsertRequest>,
+    ) -> EngineResult<CoordinatorWriteResult> {
         self.ensure_usable()?;
         let epoch = self.registry.cancellation_epoch.load(Ordering::Acquire);
         let statement_arm = self.registry.write_state().arm_statement(epoch)?;
+        let generated_arm = generated
+            .map(|request| {
+                self.registry.validate_generated_insert_request(request)?;
+                self.registry.write_state().arm_generated_insert(request)
+            })
+            .transpose()?;
         self.registry.write_state().reset_statement_outcome()?;
 
         let execution = (|| {
@@ -272,7 +448,12 @@ impl WriteCoordinator {
                 .map_err(sqlite_error::statement)
         })();
 
+        let execution = match (&generated_arm, execution) {
+            (Some(arm), Ok(changed)) => arm.require_consumed().map(|()| changed),
+            (_, execution) => execution,
+        };
         let result = self.reconcile_statement(execution);
+        drop(generated_arm);
         drop(statement_arm);
         result
     }
@@ -290,6 +471,34 @@ impl WriteCoordinator {
     ) -> EngineResult<CoordinatorWriteResult> {
         let parameters = crate::sql::sqlite_parameters(parameters)?;
         self.execute_dml(sql, rusqlite::params_from_iter(parameters))
+    }
+
+    /// Protocol-neutral counterpart to [`Self::execute_generated_dml`].
+    pub(crate) fn execute_generated_dml_values(
+        &mut self,
+        sql: &str,
+        parameters: &[Value],
+        table_id: u64,
+        expected_shard: u16,
+    ) -> EngineResult<CoordinatorWriteResult> {
+        let parameters = crate::sql::sqlite_parameters(parameters)?;
+        self.execute_generated_dml(
+            sql,
+            rusqlite::params_from_iter(parameters),
+            table_id,
+            expected_shard,
+        )
+    }
+
+    /// Protocol-neutral counterpart to [`Self::execute_generated_dml_auto`].
+    pub(crate) fn execute_generated_dml_values_auto(
+        &mut self,
+        sql: &str,
+        parameters: &[Value],
+        table_id: u64,
+    ) -> EngineResult<CoordinatorWriteResult> {
+        let parameters = crate::sql::sqlite_parameters(parameters)?;
+        self.execute_generated_dml_auto(sql, rusqlite::params_from_iter(parameters), table_id)
     }
 
     pub(crate) fn begin(&mut self) -> EngineResult<()> {
@@ -413,10 +622,26 @@ impl WriteCoordinator {
     }
 
     #[cfg(test)]
+    pub(super) fn last_insert_rowid_for_test(&self) -> i64 {
+        self.connection.last_insert_rowid()
+    }
+
+    #[cfg(test)]
     pub(super) fn install_statement_arm_gate_for_test(&self) -> TestChildScanControl {
         let (gate, control) = TestChildScanGate::channel();
         *self
             .statement_arm_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+        control
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_generated_target_gate_for_test(&self) -> TestChildScanControl {
+        let (gate, control) = TestChildScanGate::channel();
+        *self
+            .registry
+            .generated_target_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
         control
@@ -473,12 +698,16 @@ impl WriteCoordinator {
                 }),
                 Ok(FinalizedWrite::None) => execution.map(|_| CoordinatorWriteResult {
                     affected_rows: 0,
+                    shard: None,
                     explicit_key: None,
+                    generated_key: None,
                 }),
                 Ok(FinalizedWrite::Committed(outcome)) => {
                     execution.map(|_| CoordinatorWriteResult {
                         affected_rows: outcome.affected_rows,
+                        shard: outcome.shard,
                         explicit_key: outcome.explicit_key,
+                        generated_key: outcome.generated_key,
                     })
                 }
             };
@@ -505,7 +734,9 @@ impl WriteCoordinator {
         let outcome = self.registry.write_state().take_statement_outcome()?;
         execution.map(|_| CoordinatorWriteResult {
             affected_rows: outcome.affected_rows,
+            shard: outcome.shard,
             explicit_key: outcome.explicit_key,
+            generated_key: outcome.generated_key,
         })
     }
 
@@ -631,6 +862,7 @@ pub(super) struct WriteState {
     inner: Mutex<WriteTransactionState>,
     retained_schema_operation: Option<SchemaOperationGuard>,
     armed_statement_epoch: Mutex<Option<u64>>,
+    generated_insert: Mutex<Option<GeneratedInsertIntent>>,
     active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
     commit_linearization: Mutex<()>,
     nonblocking_cancel_requested: AtomicBool,
@@ -662,6 +894,7 @@ impl WriteState {
             inner: Mutex::new(WriteTransactionState::Idle),
             retained_schema_operation,
             armed_statement_epoch: Mutex::new(None),
+            generated_insert: Mutex::new(None),
             active_interrupt: Mutex::new(None),
             commit_linearization: Mutex::new(()),
             nonblocking_cancel_requested: AtomicBool::new(false),
@@ -781,6 +1014,92 @@ impl WriteState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if *armed == Some(epoch) {
             *armed = None;
+        }
+    }
+
+    fn arm_generated_insert(
+        self: &Arc<Self>,
+        request: GeneratedInsertRequest,
+    ) -> EngineResult<GeneratedInsertArm> {
+        let mut generated = self
+            .generated_insert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if generated.is_some() {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "native generated INSERT intent is already armed",
+            ));
+        }
+        *generated = Some(GeneratedInsertIntent {
+            request,
+            consumed: false,
+        });
+        Ok(GeneratedInsertArm {
+            state: Arc::clone(self),
+            request,
+        })
+    }
+
+    fn generated_insert_target(
+        &self,
+        registry: &Registry,
+        spec: &TableSpec,
+        shard_key: ValueRef<'_>,
+    ) -> EngineResult<Option<GeneratedInsertTargets>> {
+        let mut generated = self
+            .generated_insert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(intent) = generated.as_mut() else {
+            return Ok(None);
+        };
+        if intent.request.table_id != spec.id {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "native generated INSERT was preflighted for a different table than {}",
+                    spec.name
+                ),
+            ));
+        }
+        if !matches!(shard_key, ValueRef::Null) {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "native generated INSERT for {} unexpectedly supplied an explicit key",
+                    spec.name
+                ),
+            ));
+        }
+        if intent.consumed {
+            return Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "multi-row native generated INSERT is not supported until it can reserve a safe batch",
+            ));
+        }
+        intent.consumed = true;
+        let targets = match intent.request.expected_shard {
+            Some(shard) => GeneratedInsertTargets::Exact(shard),
+            None => GeneratedInsertTargets::Auto(registry.generated_insert_targets(spec)?),
+        };
+        registry.wait_after_generated_target_selection_for_test()?;
+        Ok(Some(targets))
+    }
+
+    fn reject_generated_non_insert(&self) -> EngineResult<()> {
+        if self
+            .generated_insert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "native generated INSERT intent reached a non-INSERT callback",
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -1038,7 +1357,9 @@ impl WriteState {
             WriteTransactionState::Idle => Ok(()),
             WriteTransactionState::Active(transaction) => {
                 transaction.affected_rows = 0;
+                transaction.statement_shard = None;
                 transaction.explicit_key = None;
+                transaction.generated_key = None;
                 Ok(())
             }
             WriteTransactionState::PendingCommit(_) | WriteTransactionState::PendingRollback(_) => {
@@ -1056,7 +1377,9 @@ impl WriteState {
             WriteTransactionState::Idle => Ok(WriteOutcome::default()),
             WriteTransactionState::Active(transaction) => Ok(WriteOutcome {
                 affected_rows: std::mem::take(&mut transaction.affected_rows),
+                shard: transaction.statement_shard.take(),
                 explicit_key: transaction.explicit_key.take(),
+                generated_key: transaction.generated_key.take(),
             }),
             WriteTransactionState::PendingCommit(_) | WriteTransactionState::PendingRollback(_) => {
                 Err(EngineError::new(
@@ -1093,7 +1416,16 @@ impl WriteState {
         conflict: ConflictMode,
     ) -> EngineResult<i64> {
         self.with_active(registry, |transaction| {
-            transaction.insert(registry, spec, values, conflict, &self.active_interrupt)
+            let shard_key = spec.write_shard_key(values)?;
+            let generated_shard = self.generated_insert_target(registry, spec, shard_key)?;
+            transaction.insert(
+                registry,
+                spec,
+                values,
+                conflict,
+                generated_shard,
+                &self.active_interrupt,
+            )
         })
     }
 
@@ -1103,6 +1435,7 @@ impl WriteState {
         spec: &TableSpec,
         locator: ValueRef<'_>,
     ) -> EngineResult<()> {
+        self.reject_generated_non_insert()?;
         self.with_active(registry, |transaction| {
             transaction.delete(registry, spec, locator, &self.active_interrupt)
         })
@@ -1119,6 +1452,7 @@ impl WriteState {
         no_change: &[bool],
         conflict: ConflictMode,
     ) -> EngineResult<()> {
+        self.reject_generated_non_insert()?;
         self.with_active(registry, |transaction| {
             transaction.update(
                 registry,
@@ -1326,6 +1660,236 @@ impl Drop for StatementEpochArm {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GeneratedInsertRequest {
+    table_id: u64,
+    expected_shard: Option<u16>,
+}
+
+#[derive(Debug)]
+enum GeneratedInsertTargets {
+    Exact(u16),
+    Auto(Box<[u16]>),
+}
+
+impl GeneratedInsertTargets {
+    fn candidates(&self) -> &[u16] {
+        match self {
+            Self::Exact(shard) => std::slice::from_ref(shard),
+            Self::Auto(shards) => shards,
+        }
+    }
+
+    const fn permits_capacity_fallback(&self) -> bool {
+        matches!(self, Self::Auto(_))
+    }
+}
+
+impl Registry {
+    fn generated_insert_targets(&self, spec: &TableSpec) -> EngineResult<Box<[u16]>> {
+        if spec.targets.is_empty() {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "native generated INSERT for {} has no eligible physical shard",
+                    spec.name
+                ),
+            ));
+        }
+        let owners = spec.allocation_owners.as_ref().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "registered native-ID table {} has no allocation-owner map",
+                    spec.name
+                ),
+            )
+        })?;
+        let target_count = u64::try_from(spec.targets.len()).map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::LimitExceeded,
+                "native generated target count does not fit the selection cursor",
+                error,
+            )
+        })?;
+        let start = spec.generated_shard_cursor.fetch_add(1, Ordering::Relaxed) % target_count;
+        let start = usize::try_from(start).expect("target cursor modulo length fits usize");
+        let mut eligible = Vec::with_capacity(spec.targets.len());
+        for offset in 0..spec.targets.len() {
+            let shard = spec.targets[(start + offset) % spec.targets.len()];
+            if owners.owner_for_physical_shard(shard).is_some() {
+                eligible.push(shard);
+            }
+        }
+        if eligible.is_empty() {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "native generated INSERT for {} has no active allocation owner",
+                    spec.name
+                ),
+            ));
+        }
+        Ok(eligible.into_boxed_slice())
+    }
+
+    fn validate_generated_insert_request(
+        &self,
+        request: GeneratedInsertRequest,
+    ) -> EngineResult<()> {
+        let spec = self.tables.get(&request.table_id).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "native generated INSERT refers to unknown table identity {}",
+                    request.table_id
+                ),
+            )
+        })?;
+        spec.ensure_writable()?;
+        if !spec.native_id_policy_active {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "native generated INSERT for {} is unavailable until its allocation policy is activated",
+                    spec.name
+                ),
+            ));
+        }
+        let GeneratedIdPolicy::NativeRangeV1 { column } = &spec.generated_id_policy else {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "registered table {} does not use native_range_v1 generation",
+                    spec.name
+                ),
+            ));
+        };
+        let shard_key = spec.shard_key.as_ref().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "registered native-ID table {} has no shard-key descriptor",
+                    spec.name
+                ),
+            )
+        })?;
+        let key_index = usize::try_from(shard_key.column_index).map_err(|_| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "registered native-ID table {} has an invalid key index",
+                    spec.name
+                ),
+            )
+        })?;
+        if shard_key.key_type != crate::core::ShardKeyType::Int64
+            || spec
+                .columns
+                .get(key_index)
+                .map(|column| column.name.as_str())
+                != Some(column.as_str())
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "registered native-ID policy for {} does not match its Int64 shard key",
+                    spec.name
+                ),
+            ));
+        }
+        let owners = spec.allocation_owners.as_ref().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "registered native-ID table {} has no allocation-owner map",
+                    spec.name
+                ),
+            )
+        })?;
+        if let Some(expected_shard) = request.expected_shard {
+            if !spec.targets.contains(&expected_shard) {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "native generated INSERT target shard {expected_shard} is not eligible for {}",
+                        spec.name
+                    ),
+                ));
+            }
+            if owners.owner_for_physical_shard(expected_shard).is_none() {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "native generated INSERT target shard {expected_shard} has no active allocation owner"
+                    ),
+                ));
+            }
+        } else if !spec
+            .targets
+            .iter()
+            .any(|shard| owners.owner_for_physical_shard(*shard).is_some())
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "native generated INSERT for {} has no active allocation owner",
+                    spec.name
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct GeneratedInsertIntent {
+    request: GeneratedInsertRequest,
+    consumed: bool,
+}
+
+struct GeneratedInsertArm {
+    state: Arc<WriteState>,
+    request: GeneratedInsertRequest,
+}
+
+impl GeneratedInsertArm {
+    fn require_consumed(&self) -> EngineResult<()> {
+        let generated = self
+            .state
+            .generated_insert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match generated.as_ref() {
+            Some(intent) if intent.request == self.request && intent.consumed => Ok(()),
+            Some(intent) if intent.request == self.request => Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "native generated INSERT completed without allocating a physical row",
+            )),
+            _ => Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "native generated INSERT intent changed during statement execution",
+            )),
+        }
+    }
+}
+
+impl Drop for GeneratedInsertArm {
+    fn drop(&mut self) {
+        let mut generated = self
+            .state
+            .generated_insert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if generated
+            .as_ref()
+            .is_some_and(|intent| intent.request == self.request)
+        {
+            *generated = None;
+        }
+    }
+}
+
 impl Drop for WriteState {
     fn drop(&mut self) {
         let state = self
@@ -1357,13 +1921,17 @@ struct WriteTransaction {
     savepoints: Vec<SavepointMark>,
     poison: Option<String>,
     affected_rows: usize,
+    statement_shard: Option<u16>,
     explicit_key: Option<Value>,
+    generated_key: Option<GeneratedKey>,
 }
 
 struct SavepointMark {
     number: i32,
     affected_rows: usize,
+    statement_shard: Option<u16>,
     explicit_key: Option<Value>,
+    generated_key: Option<GeneratedKey>,
 }
 
 impl WriteTransaction {
@@ -1375,7 +1943,9 @@ impl WriteTransaction {
             savepoints: Vec::new(),
             poison: None,
             affected_rows: 0,
+            statement_shard: None,
             explicit_key: None,
+            generated_key: None,
         }
     }
 
@@ -1413,6 +1983,18 @@ impl WriteTransaction {
             ));
         };
         self.affected_rows = affected_rows;
+        Ok(())
+    }
+
+    fn record_write_shard(&mut self, shard: u16) -> EngineResult<()> {
+        if self.statement_shard.is_some_and(|current| current != shard) {
+            self.poison("one statement reported mutations on two physical shards");
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "brisk_shard statement mutated more than one physical shard",
+            ));
+        }
+        self.statement_shard = Some(shard);
         Ok(())
     }
 
@@ -1538,6 +2120,46 @@ impl WriteTransaction {
         Ok(self.child.as_mut().expect("write child was installed"))
     }
 
+    /// Drop a capacity probe that acquired a physical writer lock but made no
+    /// change, so an auto-selected generated INSERT can try its next owner.
+    fn release_unmutated_generated_candidate(
+        &mut self,
+        active_interrupt: &Mutex<Option<Arc<InterruptHandle>>>,
+    ) -> EngineResult<()> {
+        if self.affected_rows != 0
+            || self.statement_shard.is_some()
+            || self.explicit_key.is_some()
+            || self.generated_key.is_some()
+        {
+            self.poison("generated allocation fallback followed a physical mutation");
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "native generated allocation cannot retry after a physical mutation",
+            ));
+        }
+        let Some(child) = self.child.take() else {
+            self.poison("generated allocation fallback lost its physical child");
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "native generated allocation retry has no physical child",
+            ));
+        };
+        let rollback = child
+            .connection
+            .execute_batch("ROLLBACK")
+            .map_err(sqlite_error::statement);
+        *active_interrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        if let Err(error) = rollback {
+            self.poison(format!(
+                "generated allocation capacity-probe rollback failed: {error}"
+            ));
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn savepoint(&mut self, number: i32) -> EngineResult<()> {
         if number < 0 {
             return Err(EngineError::new(
@@ -1571,7 +2193,9 @@ impl WriteTransaction {
         // level lets a later RELEASE of N followed by ROLLBACK TO an outer
         // level still reach the correct physical boundary.
         let affected_rows = self.affected_rows;
+        let statement_shard = self.statement_shard;
         let explicit_key = self.explicit_key.clone();
+        let generated_key = self.generated_key.clone();
         for missing in first_missing..=number {
             if let Some(child) = &self.child {
                 child
@@ -1582,7 +2206,9 @@ impl WriteTransaction {
             self.savepoints.push(SavepointMark {
                 number: missing,
                 affected_rows,
+                statement_shard,
                 explicit_key: explicit_key.clone(),
+                generated_key: generated_key.clone(),
             });
         }
         Ok(())
@@ -1622,7 +2248,9 @@ impl WriteTransaction {
                 .map_err(sqlite_error::statement)?;
         }
         self.affected_rows = self.savepoints[position].affected_rows;
+        self.statement_shard = self.savepoints[position].statement_shard;
         self.explicit_key = self.savepoints[position].explicit_key.clone();
+        self.generated_key = self.savepoints[position].generated_key.clone();
         self.savepoints.truncate(position + 1);
         Ok(())
     }
@@ -1633,11 +2261,22 @@ impl WriteTransaction {
         spec: &TableSpec,
         values: &[ValueRef<'_>],
         conflict: ConflictMode,
+        generated_targets: Option<GeneratedInsertTargets>,
         active_interrupt: &Mutex<Option<Arc<InterruptHandle>>>,
     ) -> EngineResult<i64> {
         spec.ensure_writable()?;
         let shard_key = spec.write_shard_key(values)?;
-        let shard = registry.write_target(spec, shard_key)?;
+        if let Some(targets) = generated_targets {
+            return self.insert_generated(
+                registry,
+                spec,
+                values,
+                conflict,
+                targets,
+                active_interrupt,
+            );
+        }
+        let shard = registry.insert_target(spec, shard_key)?;
         let sql = spec.insert_sql(conflict)?;
         let parameters = values
             .iter()
@@ -1665,6 +2304,7 @@ impl WriteTransaction {
             ));
         }
         self.record_physical_changes(changed)?;
+        self.record_write_shard(shard)?;
         let rowid = match &explicit_key {
             RawCell::Integer(value) => *value,
             _ => 0,
@@ -1672,6 +2312,167 @@ impl WriteTransaction {
         self.explicit_key = Some(raw_cell_to_value(explicit_key)?);
         self.ensure_healthy(registry)?;
         Ok(rowid)
+    }
+
+    fn insert_generated(
+        &mut self,
+        registry: &Registry,
+        spec: &TableSpec,
+        values: &[ValueRef<'_>],
+        conflict: ConflictMode,
+        targets: GeneratedInsertTargets,
+        active_interrupt: &Mutex<Option<Arc<InterruptHandle>>>,
+    ) -> EngineResult<i64> {
+        let owners = spec.allocation_owners.as_ref().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "registered native-ID table {} has no allocation-owner map",
+                    spec.name
+                ),
+            )
+        })?;
+        let (sql, parameters, generated_column) =
+            spec.generated_insert_sql_and_values(values, conflict)?;
+
+        let pinned_shard = self.child.as_ref().map(|child| child.shard);
+        let may_fallback = targets.permits_capacity_fallback() && pinned_shard.is_none();
+        let mut selected = None;
+        let candidates = targets.candidates();
+        for &shard in candidates {
+            if pinned_shard.is_some_and(|pinned| pinned != shard) {
+                continue;
+            }
+            let owner = owners.owner_for_physical_shard(shard).ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "native generated INSERT target shard {shard} has no active allocation owner"
+                    ),
+                )
+            })?;
+            let capacity = {
+                let child = self.pin(registry, shard, active_interrupt)?;
+                validate_allocation_sequence_capacity(&child.connection, &spec.name, owner)
+            };
+            match capacity {
+                Ok(()) => {
+                    selected = Some((shard, owner));
+                    break;
+                }
+                Err(error) if may_fallback && error.kind() == EngineErrorKind::LimitExceeded => {
+                    self.release_unmutated_generated_candidate(active_interrupt)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let Some((shard, owner)) = selected else {
+            return Err(EngineError::new(
+                if pinned_shard.is_some() {
+                    EngineErrorKind::FailedPrecondition
+                } else {
+                    EngineErrorKind::LimitExceeded
+                },
+                if pinned_shard.is_some() {
+                    format!(
+                        "native generated INSERT for {} cannot move an existing transaction to another shard",
+                        spec.name
+                    )
+                } else {
+                    format!(
+                        "native generated table {} exhausted every active allocation owner",
+                        spec.name
+                    )
+                },
+            ));
+        };
+        let insertion = (|| {
+            let child = self.pin(registry, shard, active_interrupt)?;
+            let mut statement = child
+                .connection
+                .prepare(&sql)
+                .map_err(sqlite_error::statement)?;
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(&parameters))
+                .map_err(sqlite_error::statement)?;
+            let generated = match rows.next().map_err(sqlite_error::statement)? {
+                Some(row) => row.get::<_, i64>(0).map_err(sqlite_error::statement)?,
+                // INSERT OR IGNORE can legitimately report no generated row.
+                None => return Ok(None),
+            };
+            if rows.next().map_err(sqlite_error::statement)?.is_some() {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "native generated INSERT returned more than one generated key",
+                ));
+            }
+            drop(rows);
+            drop(statement);
+            let sequence = read_allocation_sequence(&child.connection, &spec.name)?;
+            if sequence != generated {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!(
+                        "native generated table {} returned ID {generated} but SQLite recorded sequence {sequence}",
+                        spec.name
+                    ),
+                ));
+            }
+            let changed = usize::try_from(child.connection.changes()).map_err(|error| {
+                EngineError::from_source(
+                    EngineErrorKind::LimitExceeded,
+                    "SQLite generated INSERT change count does not fit usize",
+                    error,
+                )
+            })?;
+            Ok(Some((generated, changed)))
+        })();
+        let (generated, changed) = match insertion {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                self.ensure_healthy(registry)?;
+                return Ok(0);
+            }
+            Err(error) => {
+                self.poison_if_uncertain(&error);
+                return Err(error);
+            }
+        };
+
+        let decoded = match classify_generated_id(&spec.generated_id_policy, generated)? {
+            GeneratedIdClassification::NativeRangeV1(decoded) => decoded,
+            GeneratedIdClassification::Legacy(_) => {
+                self.poison("SQLite allocated a legacy value for a native generated ID");
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!(
+                        "SQLite allocated a non-native ID for registered table {}",
+                        spec.name
+                    ),
+                ));
+            }
+        };
+        if decoded.owner() != owner || owners.physical_shard(decoded.owner()) != Some(shard) {
+            self.poison("SQLite allocated a generated ID outside its shard owner range");
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "SQLite allocated native ID {generated} outside shard {shard}'s owner range"
+                ),
+            ));
+        }
+        if changed != 1 {
+            self.poison("physical generated INSERT did not report exactly one changed row");
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "brisk_shard physical generated INSERT did not change exactly one row",
+            ));
+        }
+        self.record_physical_changes(changed)?;
+        self.record_write_shard(shard)?;
+        self.generated_key = Some(GeneratedKey::new(generated_column, Value::Int64(generated)));
+        self.ensure_healthy(registry)?;
+        Ok(generated)
     }
 
     fn delete(
@@ -1706,6 +2507,9 @@ impl WriteTransaction {
         // row before its callback arrives, in which case native SQLite skips
         // the stale identity and reports no additional direct change.
         self.record_physical_changes(changed)?;
+        if changed != 0 {
+            self.record_write_shard(decoded.shard)?;
+        }
         self.ensure_healthy(registry)
     }
 
@@ -1784,6 +2588,9 @@ impl WriteTransaction {
         // away, or relocate the row. Treat its old locator as SQLite treats a
         // stale rowid: a successful zero-row no-op.
         self.record_physical_changes(changed)?;
+        if changed != 0 {
+            self.record_write_shard(decoded.shard)?;
+        }
         self.ensure_healthy(registry)
     }
 
@@ -1949,7 +2756,9 @@ impl WriteTransaction {
         }
         Ok(WriteOutcome {
             affected_rows: std::mem::take(&mut self.affected_rows),
+            shard: self.statement_shard.take(),
             explicit_key: self.explicit_key.take(),
+            generated_key: self.generated_key.take(),
         })
     }
 
@@ -1975,7 +2784,9 @@ struct WriteChild {
 #[derive(Debug, Default)]
 pub(super) struct WriteOutcome {
     pub(super) affected_rows: usize,
+    pub(super) shard: Option<u16>,
     pub(super) explicit_key: Option<Value>,
+    pub(super) generated_key: Option<GeneratedKey>,
 }
 
 pub(super) enum FinalizedWrite {
@@ -2047,11 +2858,71 @@ mod tests {
     fn coordinator_result_is_protocol_neutral() {
         let result = CoordinatorWriteResult {
             affected_rows: 1,
+            shard: Some(0),
             explicit_key: Some(Value::Int64(7)),
+            generated_key: None,
         };
         assert_eq!(result.affected_rows(), 1);
+        assert_eq!(result.shard(), Some(0));
         assert_eq!(result.explicit_key(), Some(&Value::Int64(7)));
+        assert_eq!(result.generated_key(), None);
         assert_eq!(super::super::MODULE_NAME, "brisk_shard");
+    }
+
+    #[test]
+    fn sqlite_returning_and_last_insert_rowid_match_on_the_same_connection() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE allocated (id INTEGER PRIMARY KEY AUTOINCREMENT);
+                 CREATE TABLE unrelated (id INTEGER PRIMARY KEY AUTOINCREMENT);",
+            )
+            .unwrap();
+        let owner = AllocationOwnerSlot::new(3).unwrap();
+        let floor = native_range_v1_sequence_floor(owner);
+        connection
+            .execute(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES ('allocated', ?1)",
+                [floor],
+            )
+            .unwrap();
+
+        let captured = connection
+            .query_row(
+                "INSERT INTO allocated DEFAULT VALUES RETURNING id",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            captured,
+            crate::core::generated_id::native_range_v1_first_id(owner)
+        );
+        assert_eq!(connection.last_insert_rowid(), captured);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'allocated'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            captured
+        );
+
+        // The captured RETURNING value is stable, while a later operation on
+        // the same handle demonstrates why adapters must not consult the
+        // ambient last_insert_rowid after releasing or reusing a connection.
+        connection
+            .execute("INSERT INTO unrelated DEFAULT VALUES", [])
+            .unwrap();
+        assert_ne!(connection.last_insert_rowid(), captured);
+        assert_eq!(
+            connection
+                .query_row("SELECT id FROM allocated", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            captured
+        );
     }
 
     #[test]

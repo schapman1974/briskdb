@@ -8,12 +8,16 @@ deferred to issue #31.
 
 ## Per-request context
 
-The existing `Engine::execute`, `query`, `broadcast`, and `status` methods, the
-crate-private explicit-shard inspection operation, plus `prepare_statement`,
-`bind_statement`, `describe_prepared`, `execute_portal`, and their logical read
-counterparts use a default `RequestContext`. `broadcast` now means a journaled
-application-schema migration. Frontends that have their own cancellation or
-deadline source can call the corresponding `*_with_context` method:
+The existing `Engine::execute`, `execute_write`, `query`, `broadcast`, and
+`status` methods, the crate-private explicit-shard inspection operation, plus
+`prepare_statement`, `bind_statement`, `describe_prepared`, `execute_portal`,
+and their logical read counterparts use a default `RequestContext`. `broadcast`
+now means a journaled application-schema migration. Frontends that have their
+own cancellation or deadline source can call the corresponding
+`*_with_context` method. `execute` and `execute_with_context` deliberately
+project the complete `WriteResult` down to an affected-row count; callers that
+need the generated-key result shape use `execute_write` or
+`execute_write_with_context`:
 
 ```rust
 use std::time::Duration;

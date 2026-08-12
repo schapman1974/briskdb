@@ -127,6 +127,10 @@ fn assert_catalog_fixture(catalog: &core::Catalog) {
 
 #[test]
 fn legacy_and_explicit_module_paths_are_both_available() {
+    fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
+
+    assert_owned_public::<core::GeneratedKey>();
+    assert_owned_public::<core::WriteResult>();
     let _legacy_database: Option<storage::Database> = None;
     let _core_database: Option<core::Database> = None;
     let _engine: Option<core::Engine> = None;
@@ -142,6 +146,10 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _ready = core::SessionState::Ready;
     let _closed = core::SessionState::Closed;
     let _statement = core::Statement::new("SELECT ?1", vec![core::Value::from(42_i64)]);
+    let generated_key = core::GeneratedKey::new("id", core::Value::Int64(41));
+    let write_result = core::WriteResult::with_generated_key(1, generated_key);
+    assert_eq!(write_result.rows_affected, 1);
+    assert_eq!(write_result.generated_key.unwrap().column, "id");
     let _prepared_statement_id: Option<core::PreparedStatementId> = None;
     let _portal_id: Option<core::PortalId> = None;
     let _describe_target: Option<core::DescribeTarget> = None;
@@ -189,6 +197,27 @@ fn legacy_and_explicit_module_paths_are_both_available() {
         error::mysql_error(core::EngineErrorKind::UniqueViolation).error_number,
         1062
     );
+}
+
+#[test]
+fn sqlite_import_generated_id_opt_in_is_public_owned_and_explicit() {
+    fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
+
+    assert_owned_public::<briskdb::import::SqliteGeneratedIdPlan>();
+    assert_owned_public::<briskdb::import::SqliteTableImportPlan>();
+    let ordinary = briskdb::import::SqliteTableImportPlan::sharded_by_primary_key("events");
+    assert_eq!(
+        ordinary.generated_id_plan(),
+        &briskdb::import::SqliteGeneratedIdPlan::None
+    );
+
+    let native = ordinary.with_native_range_v1("id").unwrap();
+    assert_eq!(native.generated_id_plan().column(), Some("id"));
+    assert!(matches!(
+        native.generated_id_plan(),
+        briskdb::import::SqliteGeneratedIdPlan::NativeRangeV1 { column, .. }
+            if column == "id"
+    ));
 }
 
 #[test]
@@ -1117,6 +1146,33 @@ async fn protocol_neutral_async_engine_surface_is_available() {
     assert_eq!(status.shutdown_grace(), Duration::from_millis(100));
 
     session.set_routing_key("public-controls").await.unwrap();
+    engine
+        .broadcast(
+            &session,
+            "CREATE TABLE public_write_result (id INTEGER PRIMARY KEY)".to_owned(),
+        )
+        .await
+        .unwrap();
+    let write = engine
+        .execute_write(
+            &session,
+            core::Statement::new("INSERT INTO public_write_result (id) VALUES (1)", vec![]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.value, core::WriteResult::without_generated_key(1));
+    let controlled_write = engine
+        .execute_write_with_context(
+            &session,
+            core::Statement::new("INSERT INTO public_write_result (id) VALUES (2)", vec![]),
+            core::RequestContext::new().with_deadline(Instant::now() + Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        controlled_write.value,
+        core::WriteResult::without_generated_key(1)
+    );
     let token = core::CancellationToken::new();
     let context = core::RequestContext::new()
         .with_cancellation_token(token.clone())

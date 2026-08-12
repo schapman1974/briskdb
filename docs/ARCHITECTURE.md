@@ -30,8 +30,8 @@ server ---------> protocol::http
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
 | `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, generated-ID policy and codec types, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, logical Sharded read target selection and scatter/gather, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
-| `storage` | Versioned routing and authoritative logical manifest, persisted generated-ID policies and immutable allocation-owner slots, one-time table registration, shard layout, migration journal and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
-| `import` | Offline source-schema preflight, explicit placement-plan validation, exact-value row routing into private staging, explicit no-generation catalog declarations, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, generated-ID inference, implicit Global placement, or protocol-specific behavior |
+| `storage` | Versioned routing and authoritative logical manifest, persisted generated-ID policy/activation and stable active/retired allocation-owner slots, recoverable one-time table provisioning, shard layout, migration journals and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
+| `import` | Offline source-schema preflight, explicit placement and generated-ID plan validation, exact-value row routing into private staging, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, generated-ID inference, implicit Global placement, or protocol-specific behavior |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
 | `protocol::postgres` | BriskDB-owned bounded protocol-3.0 framing, finite parameter validation, selected identity/status, per-connection core-session ownership, query-deferral responses, and private compile/query-parser seam around the exactly pinned `pgwire` library | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
@@ -458,14 +458,24 @@ v7-to-v8 transaction clears all legacy advisory table rows, reseals the
 manifest, and preserves routing, logical databases, migration history, shard
 schema, and application data.
 
-Version 9 adds the authoritative `briskdb_generated_ids` catalog and immutable
+Version 9 adds the authoritative `briskdb_generated_ids` catalog and stable
 `briskdb_allocation_owners` map. The v8-to-v9 transaction assigns every existing
 table explicit policy `None`, seeds each physical shard's same-numbered owner
 slot, raises the downgrade fence, and changes the semantic manifest checksum to
 version 2 so both new tables are covered. It preserves routing, placement,
 schema history, shard files, and application rows. Version 9 freezes and
-validates the `native_range_v1` ID encoding; insert rewriting and physical
-`sqlite_sequence` seeding remain later work.
+validates the `native_range_v1` ID encoding.
+
+Version 10 separates a generated-ID policy from its activation state, gives
+allocation owners explicit `Active` and `Retired` lifecycle, and adds the
+transient `briskdb_table_provisioning` journal plus its complete declaration
+rows. Exactly one active owner allocates on each physical shard; retired owners
+remain mapped so historical native IDs continue to route, but cannot receive a
+new insert. Manifest digest version 3 covers both lifecycle fields and both
+provisioning tables. Native policy activation proves exact `INTEGER PRIMARY KEY
+AUTOINCREMENT` storage and installs disjoint owner-local `sqlite_sequence`
+floors on every shard before catalog authority is published. Omitted-key
+dialect parsing and DDL rewriting remain later work.
 
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4
@@ -486,6 +496,10 @@ checksum that v6 never stored. The v7-to-v8 step is likewise manifest-only and
 clears advisory table rows before installing the authoritative-catalog fence.
 The v8-to-v9 step is also manifest-only: it adds explicit generated-ID policies
 and stable owner slots, installs checksum version 2, and changes no shard file.
+The v9-to-v10 step remains manifest-only: it preserves every policy but marks it
+inactive, marks existing owner rows active, creates empty provisioning tables,
+raises the fence, and installs checksum version 3. A migrated native policy must
+therefore be explicitly reprovisioned before it may generate a new key.
 There is no automatic downgrade; an older binary requires a backup from before
 the newer format.
 
@@ -511,10 +525,20 @@ lock through independently durable per-shard work and `Ready` publication. A
 lagging opener re-reads `Ready` and strictly validates instead of provisioning
 from a stale `Creating` observation. Only a locked, durable `Creating` state
 permits missing canonical shard files to be created and WAL to be enabled. The
-final strict shard opens and catalog reconciliation complete before the startup
-guard publishes `Ready`; ordinary work is never served against a persisted
-mixed-generation prefix. A first v7 open treats the consensus across all strict
-generation-bound shard-schema fingerprints as its trust-on-first-upgrade
+validated v10 manifest may also contain one active table-provisioning record.
+Startup then keeps admission `Pending`, revalidates the complete declarations
+and committed schema digest, and resumes the ascending `next_shard` prefix. A
+shard-local sequence seed commits before its separate manifest acknowledgement;
+if process loss lands between those boundaries, startup repeats that same seed
+idempotently rather than skipping it. Only after all shards are durable does one
+manifest transaction activate native policies, clear the transient journal,
+reseal digest version 3, and publish the replacement catalog. A conflict never
+causes BriskDB to infer a new request from partial shard state.
+
+The final strict shard opens and catalog reconciliation complete before the
+startup guard publishes `Ready`; ordinary work is never served against a
+persisted mixed-generation prefix. A first v7 open treats the consensus across
+all strict generation-bound shard-schema fingerprints as its trust-on-first-upgrade
 baseline. Later opens require that existing trusted fingerprint. A durable
 `Degraded` state is terminal; recovery replaces the complete manifest and
 shard set from one known-good consistent copy rather than rebaselining it.
@@ -554,17 +578,29 @@ relationships, triggers, and virtual tables are rejected.
 Every primary or unique key on a sharded
 table must contain the shard-key column with `BINARY` collation, which keeps
 that constraint's complete equality domain on one owner. The coordinator
-validates physical state before opening an immediate manifest transaction,
-assigns deterministic table IDs, reseals the semantic root, revalidates, and
-atomically publishes the replacement snapshot. An exact repeat is idempotent;
-any other replacement is rejected.
+validates physical state and assigns deterministic table IDs. A declaration set
+whose policies are all `None` is committed, resealed, revalidated, and published
+in one manifest transaction. A declaration set containing `NativeRangeV1`
+first commits a versioned provisioning identity, the complete declarations,
+the committed schema fingerprint, and `next_shard = 0`. It then seeds each
+shard's active-owner allocator floor and separately advances that durable
+prefix. A final manifest transaction publishes the catalog, changes native
+activation to `Active`, clears the provisioning rows, and reseals the semantic
+root. No live snapshot can observe a native policy as active before every shard
+is durable. An exact repeat is idempotent; any other replacement is rejected.
+A v9 catalog migrated with an inactive native policy may submit its exact
+declarations to this same journal while its physical tables remain empty; that
+path activates the preserved policy without changing a catalog row or ID.
 
-The registration guard changes admission to `Pending` before manifest commit.
-If SQLite reports an ambiguous commit cleanup or I/O failure, the registering
-handle deliberately keeps its old catalog and cannot serve ordinary work. The
-operator must close that stale handle and reopen the canonical root so startup
-can determine whether the old or complete new catalog committed; a live stale
-handle prevents a conflicting durable catalog from being published in-process.
+The registration guard changes admission to `Pending` before any manifest
+commit that can leave durable registration or provisioning state. If SQLite
+reports an ambiguous commit cleanup or I/O failure, the registering handle
+deliberately keeps its old catalog and cannot serve ordinary work. The operator
+must close that stale handle and reopen the canonical root so startup can
+distinguish no request, an exact resumable shard prefix, and the complete new
+catalog; a live stale handle prevents a conflicting durable catalog from being
+published in-process. Startup never serves work while a provisioning journal
+exists.
 
 Once registered, table placement is authoritative. A `Sharded` row has exactly
 one owner selected by its canonical key; only `Global` data is intentionally
@@ -635,11 +671,15 @@ Generated IDs are authoritative catalog policy, never a conclusion drawn from
 mutable shard DDL. `GeneratedIdPolicy::None` means BriskDB classifies every
 stored signed integer as a legacy value and claims no generation authority for
 it; that includes caller-supplied and previously imported SQLite-generated
-values. `NativeRangeV1` is valid only when its
-named column is the same physically non-null Int64 key that owns a `Sharded`
-table. Import and every legacy manifest upgrade select `None` explicitly, so an
-old `AUTOINCREMENT` clause or a marker-looking imported value cannot silently
-enable BriskDB generation.
+values. `NativeRangeV1` is valid only when its named column is the same `Int64`
+key that owns a `Sharded` table. Policy and activation are separate: an inactive
+native policy retains classification and explicit-key routing but cannot
+generate a key; activation additionally requires exact `INTEGER PRIMARY KEY
+AUTOINCREMENT` storage on every physical shard. Import defaults every table to
+`None` but may opt in through an explicit plan after proving that schema and the
+legacy key domain. Every pre-v9 manifest upgrade selects `None`; v9-to-v10
+preserves any native policy but marks it inactive. An old `AUTOINCREMENT` clause
+or marker-looking imported value therefore cannot silently enable generation.
 
 The version-1 native value is a positive signed 64-bit integer with bit 62 set,
 an immutable 10-bit allocation-owner slot in bits 61 through 52, and a 52-bit
@@ -651,9 +691,16 @@ owner-local sequence in bits 51 through 0:
 ```
 
 Owner slots are stable identities rather than a live shard-count ordinal. The
-manifest initially assigns each physical shard its same-numbered slot, but a
-future shard-map change must retain every allocated slot rather than
-renumbering IDs. Local sequence zero is reserved; valid native sequences are
+manifest initially assigns each physical shard its same-numbered active slot.
+Every physical shard has exactly one active owner allowed to allocate; a
+retired owner retains its physical mapping for historical native reads and
+existing-row mutation, while new inserts naming it fail closed. A future
+shard-map change must retain every allocated slot rather than renumbering or
+reusing IDs, and each shard's replacement owner must be strictly greater than
+all owners previously retired on that shard. This monotonic succession matches
+SQLite's `AUTOINCREMENT` rule: its committed high-water mark survives row
+deletion and cannot safely move into a lower owner's range. Local sequence zero
+is reserved; valid native sequences are
 `1..=2^52-1`, slots are `0..=1023`, and the greatest encoding is `i64::MAX`.
 Policy-aware classification treats values without the marker, including
 negative imported values, as legacy. A marker with reserved local sequence zero
@@ -666,12 +713,17 @@ rowid alias, and SQLite's special insert path chooses an omitted or NULL rowid
 without evaluating a column `DEFAULT`. Moving allocation into a side-effecting
 UDF would also put durable allocator state behind connection-local registration
 and retry-sensitive schema evaluation, while a single shared allocator would
-serialize the writers sharding is meant to separate. The later native allocator
+serialize the writers sharding is meant to separate. The native allocator
 therefore reserves one disjoint range per owner and lets unmodified SQLite
-advance its own shard-local `AUTOINCREMENT` state. This issue persists and
-validates the policy, codec, and owner slots only; physical
-`sqlite_sequence` validation and seeding belong to issue #128, and omitted-key
-SQL translation belongs to issue #130.
+advance its own shard-local `AUTOINCREMENT` state. Empty-table policy activation
+first journals the exact declarations and trusted schema digest, then seeds one
+shard and durably acknowledges its prefix at a time. Retries are idempotent and
+never lower an existing same-owner high-water mark. A crash after a shard commit
+but before acknowledgement repeats that shard; a crash at any other boundary
+resumes the exact identity, never a guessed request. Only final manifest
+publication activates policy and clears the journal. Every later shard
+admission rejects missing, duplicate, malformed, out-of-owner, or row-lagging
+allocator state. Omitted-key SQL translation belongs to issue #130.
 
 The `experimental-vtab` feature adds separate read-only and narrowly writable
 SQLite coordinators that statically register `brisk_shard`. They prove a
@@ -681,9 +733,9 @@ OS-level SQLite read-only handles, never attaches a shard, and never
 dynamically loads an extension. Trusted metadata supplies each declared
 schema. An exact, storage-class-compatible `Int64`, `Text`, or `Binary`
 shard-key equality can open only its owner and bind the equality on that
-physical child; `native_range_v1` IDs use the immutable owner map while legacy
-integers retain ordinary hash routing. `NULL` is empty and a type mismatch
-falls back to a full scan so SQLite can retain its comparison semantics.
+physical child; `native_range_v1` IDs use the stable active/retired owner map
+while legacy integers retain ordinary hash routing. `NULL` is empty and a type
+mismatch falls back to a full scan so SQLite can retain its comparison semantics.
 Unconstrained scans visit shards in ascending order with `UNION ALL` duplicate
 semantics. Remaining filters, aggregation, ordering, limits, and feature-local
 joins execute in the stock SQLite coordinator without pushdown. That read
@@ -695,15 +747,22 @@ in the
 [experimental sharded virtual-table facade](SHARDED_VIRTUAL_TABLE.md).
 
 The writable coordinator accepts explicit-key INSERT and exactly routed
-UPDATE/DELETE only. Its first operation pins one `BEGIN IMMEDIATE` child shard;
+UPDATE/DELETE. Its first operation pins one `BEGIN IMMEDIATE` child shard;
 reads used to locate UPDATE/DELETE rows reuse that child, and a second-shard
 attempt aborts the whole transaction. A hidden versioned locator carries the
 physical rowid or complete `WITHOUT ROWID` key without changing shard files.
 The wrapper reconciles stock-SQLite transaction and savepoint callbacks, then
 performs the fallible child commit before acknowledging success. Physical
 constraints and conservatively admitted co-located foreign keys remain
-authoritative. Missing/generated keys, Global writes, multi-shard transactions,
-`RETURNING`, defaults, generated columns, and triggers remain later work.
+authoritative. A narrow preflighted `native_range_v1` seam can arm one
+single-row omitted-key insert for an already admitted shard. It checks range
+capacity under the pinned child lock, omits the physical ID column, captures
+`INSERT ... RETURNING id` on that same handle, validates the owner and sequence,
+and publishes a protocol-neutral `GeneratedKey` only after successful
+reconciliation. Generic NULL inserts and a second generated callback remain
+rejected. Engine/HTTP omitted-key planning, Global writes, multi-shard
+transactions, caller-authored `RETURNING`, defaults, generated columns, and
+triggers remain later work.
 
 Engine integration has two independent opt-ins. The binary must be compiled
 with `experimental-vtab`, and `EngineOptions::with_experimental_vtab_writes(true)`
@@ -726,12 +785,12 @@ handle and reserve only their target shard, so an occupied shard 0 cannot stall
 writers whose metadata is already warm. A published schema-generation mismatch
 invalidates the cache and forces controlled rediscovery before another write.
 
-This integration is intentionally autocommit-only. Each `Engine::execute` or
-HTTP `/v1/execute` request owns one statement and drops its coordinator after
-that statement reconciles. `Session` still has no transaction state, HTTP still
-creates a fresh Session per request, and `BEGIN`, `COMMIT`, `ROLLBACK`,
-read-your-writes, and transaction shard pinning are deferred to the later
-session-transaction work.
+This integration is intentionally autocommit-only. Each `Engine::execute`,
+`Engine::execute_write`, or HTTP `/v1/execute` request owns one statement and
+drops its coordinator after that statement reconciles. `Session` still has no
+transaction state, HTTP still creates a fresh Session per request, and `BEGIN`,
+`COMMIT`, `ROLLBACK`, read-your-writes, and transaction shard pinning are
+deferred to the later session-transaction work.
 
 ## Session and asynchronous engine boundary
 

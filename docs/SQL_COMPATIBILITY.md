@@ -114,10 +114,14 @@ stock SQLite and opens validated physical children through OS-level SQLite
 handles; it does not use `ATTACH`, runtime extension loading, a SQLite fork, or
 a storage-format change. The writable wrapper accepts explicit-key Sharded
 INSERT and exactly routed UPDATE/DELETE, pins one physical transaction, and
-rejects cross-shard or Global writes. Schema operations, attachments, unsafe
-PRAGMAs, extension loading, generated/missing keys, defaults, generated
-columns, triggers, and `RETURNING` remain rejected. This surface is internal
-and cannot be reached by the query app or protocol adapters.
+rejects cross-shard or Global writes. An internal preflighted seam also permits
+one `native_range_v1` NULL callback for a single omitted-key row on an already
+selected shard; it captures the generated ID with child `RETURNING` on the same
+handle. Generic generated/missing-key SQL remains rejected until #130 supplies
+AST intent and protocol rendering. Schema operations, attachments, unsafe
+PRAGMAs, extension loading, defaults, generated columns, triggers, and
+caller-authored `RETURNING` remain rejected. This surface is internal and
+cannot be reached by the query app or protocol adapters.
 
 Within that feature gate only, a usable equality on the exact cataloged shard
 key requests one virtual-table argument without `omit`. Exact SQLite `INTEGER`,
@@ -796,7 +800,7 @@ engine used by PostgreSQL and HTTP.
 | Identifier quoting | Backticks by default | Opt-in compatibility translation emits safely escaped double-quoted SQLite identifiers; case and collation equivalence are not claimed |
 | Type system | Static signed/unsigned column types | Opt-in Rust translation maps a finite signed integer, Boolean, 64-bit float, text, and binary declaration set; unsigned declarations are rejected, and translation performs no value or result adaptation. Independently, BriskDB retains `UInt64` values without narrowing, while current SQLite binding rejects values above `i64::MAX` until a storage mapping exists |
 | Boolean | Commonly `TINYINT(1)` | Opt-in translation maps exactly `TINYINT(1)` to `BOOLEAN` and Boolean literals to `1`/`0`; wire/result metadata remains planned |
-| `AUTO_INCREMENT` | Table column attribute | Unsupported until generated-key semantics are designed |
+| `AUTO_INCREMENT` | Table column attribute | Native shard-range allocation exists below the SQL layer; dialect recognition and omitted-key planning remain #130 |
 | `UNSIGNED`, display widths | MySQL column attributes | Rejected by compatibility translation, except that exactly `TINYINT(1)` is the documented Boolean declaration |
 | `DATETIME`, `TIMESTAMP` | Distinct MySQL temporal behavior | No implicit compatibility; canonical timestamp encoding must be defined first |
 | `JSON` | Native MySQL JSON type | Planned JSON validation stored using the canonical BriskDB representation |

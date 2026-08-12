@@ -1,6 +1,6 @@
 # Standard SQLite import
 
-Status: implemented by roadmap issue #115
+Status: implemented by roadmap issues #115 and #128
 
 `briskdb-import` converts one ordinary SQLite database into a new BriskDB data
 directory. It is an offline initialization command, not a server endpoint and
@@ -63,6 +63,41 @@ two independent unique domains have no common column, preserving those
 constraints requires explicit Global placement or a separate schema redesign;
 the importer does not weaken uniqueness silently.
 
+### Explicit native generated IDs
+
+Generated-ID authority is disabled by default. A table opts into shard-local
+`native_range_v1` allocation only through its own plan entry:
+
+```json
+{
+  "name": "orders",
+  "placement": "sharded",
+  "shard_key": {
+    "strategy": "column",
+    "column": "id",
+    "key_type": "int64"
+  },
+  "generated_id": {
+    "policy": "native_range_v1",
+    "column": "id"
+  }
+}
+```
+
+Preflight requires that generated column to be the exact Sharded `Int64` key
+and that its source definition is exactly `INTEGER PRIMARY KEY AUTOINCREMENT`.
+Global tables, another generated column, another key type, plain `INTEGER
+PRIMARY KEY`, and `WITHOUT ROWID` tables fail before staging is created.
+
+Existing negative and pre-marker integer IDs remain legacy values and retain
+their ordinary hash routing. An opted-in source must not contain any positive
+ID with native format bit 62 set (`id >= 0x4000000000000000`); accepting one
+would make an imported legacy value indistinguishable from an owner-encoded
+native ID, so preflight rejects the source instead of guessing. Its source
+`sqlite_sequence` high-water mark must also be below that marker, even when the
+corresponding high ID was deleted: resetting such a history to an owner floor
+could otherwise reuse a numeric ID that had already committed.
+
 ## Foreign-key normalization
 
 The importer does not yet retain and prove the catalog's conservative
@@ -105,23 +140,32 @@ staging. The source file identity is retained and rechecked so a path
 replacement cannot silently change which database is imported. Cancellation
 interrupts SQLite work during this preflight. Tables and supported indexes are
 then created identically on every target shard and the complete authoritative
-catalog is registered while all tables are empty. Every imported table is
-registered with the explicit `GeneratedIdPolicy::None` policy. The importer
-never infers generated-ID authority from `INTEGER PRIMARY KEY`,
-`AUTOINCREMENT`, a `DEFAULT` expression, or `sqlite_sequence`.
+catalog is registered while all tables are empty. An omitted `generated_id`
+field registers the explicit `GeneratedIdPolicy::None` policy; only the
+validated plan field above registers `NativeRangeV1`. The importer never
+infers generated-ID authority from `INTEGER PRIMARY KEY`, `AUTOINCREMENT`, a
+`DEFAULT` expression, source rows, or `sqlite_sequence`.
 
 Rows retain their SQLite storage classes. Sharded rows use separate physical
 connections and visit one selected shard; the implementation does not use
 `ATTACH`, does not compute `hash % shard_count`, and does not describe multiple
 SQLite commits as one transaction. Global rows visit every shard only by their
 declaration. Generated columns are recomputed from copied ordinary columns.
-The source `sqlite_sequence` high-water mark is installed on every physical
-copy as source-schema state; it is not generated-ID catalog metadata and does
-not opt the table into `native_range_v1`. Existing integer keys, including
-values copied from an `AUTOINCREMENT` table, remain explicit legacy values and
-route through the ordinary Int64 shard-key encoding. Enabling a generated-ID
-policy for imported data requires a future explicit conversion that proves the
-key domain and seeds every allocator; import never guesses.
+For an ordinary table, the source `sqlite_sequence` high-water mark is
+installed on every physical copy as source-schema state; it is not generated-ID
+catalog metadata and cannot opt a table into `native_range_v1`. For an
+explicitly opted-in table, each empty physical copy instead receives the floor
+belonging to that shard's persisted allocation-owner slot. The floor has the
+native marker and owner bits with local sequence zero, which is reserved and
+never stored as a row ID; the shard-local SQLite allocator advances it to local
+sequence one. Imported legacy rows cannot overwrite that higher floor, and
+sequence verification uses the persisted owner map rather than assuming owner
+equals physical shard number.
+
+Thus existing integer keys copied from an `AUTOINCREMENT` table still remain
+explicit legacy values and route through the ordinary Int64 shard-key encoding
+even when the table explicitly enables subsequent native allocations. Import
+never relabels an existing key or infers policy from the source high-water mark.
 Preserved implicit `rowid` values remain shard-local physical locators after
 import; they are neither globally unique logical identities nor authoritative
 shard keys. Declared primary and unique constraints retain global meaning
@@ -137,6 +181,9 @@ source-schema digests, persisted routing versions and map generation, per-shard
 counts, and every explicit foreign-key omission. Receipt format version 2 also
 records each table's lowercase BLAKE3 logical-contents digest and its exact
 source `sqlite_sequence` high-water mark, or `null` when no sequence row exists.
+For an opted-in native table this report field deliberately remains the source
+value; the normalized plan digest records the opt-in, while physical
+verification separately proves every per-owner target floor.
 The logical digest covers the verified row multiset, including SQLite storage
 classes, generated values, and preserved implicit rowids; it is independent of
 row order and physical SQLite page layout.

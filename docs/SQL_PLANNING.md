@@ -60,6 +60,14 @@ normal successful result for a statement that is not sharded and for a read
 that still needs later scatter or empty-result planning. Every accepted write
 to a cataloged sharded table has `Some(shard)`.
 
+For an `Int64` key on a table with `native_range_v1`, inferred marker-set IDs
+resolve through the persisted allocation-owner map instead of the routing hash.
+Negative and marker-clear values retain the frozen legacy hash route. When an
+explicit session route is byte-for-byte the inferred integer's canonical
+decimal encoding, it reuses that owner-aware assignment; other explicit routes
+must still select the same physical shard. Reserved sequence floors and owners
+absent from the active map fail during planning, before pool admission.
+
 The [prepared execution lifecycle](SQL_PREPARED_STATEMENTS.md) consumes this
 result only after values are bound. Bind validates then discards one plan;
 execution creates another under its current schema guard. Compatibility

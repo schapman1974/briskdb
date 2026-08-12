@@ -46,6 +46,16 @@ impl AllocationOwnerSlot {
     }
 }
 
+/// Durable lifecycle state for one native-range allocation namespace.
+///
+/// Retired owners remain routable so committed historical IDs can still be
+/// read, but they are never selected for a new SQLite allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum AllocationOwnerState {
+    Active,
+    Retired,
+}
+
 /// Immutable, bidirectional assignment of generated-ID owner slots to
 /// physical SQLite shards.
 ///
@@ -55,7 +65,7 @@ impl AllocationOwnerSlot {
 /// the same immutable runtime snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AllocationOwnerMap {
-    by_owner: Box<[(AllocationOwnerSlot, u16)]>,
+    by_owner: Box<[(AllocationOwnerSlot, u16, AllocationOwnerState)]>,
     by_physical_shard: Box<[AllocationOwnerSlot]>,
 }
 
@@ -66,27 +76,53 @@ impl AllocationOwnerMap {
         physical_shard_count: u16,
         pairs: Box<[(u16, u16)]>,
     ) -> EngineResult<Self> {
+        Self::try_from_assignments(
+            physical_shard_count,
+            pairs
+                .into_vec()
+                .into_iter()
+                .map(|(owner, physical_shard)| {
+                    (owner, physical_shard, AllocationOwnerState::Active)
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    }
+
+    /// Validate active and historical owner assignments for the current
+    /// physical shard set and normalize them into owner-slot order.
+    ///
+    /// Every physical shard has exactly one active allocator. Any number of
+    /// retired owners may retain a route to that shard, and every owner slot
+    /// appears at most once across both lifecycle states. The active owner for
+    /// a shard must be greater than all of its retired owners so SQLite's
+    /// non-decreasing `AUTOINCREMENT` high-water mark remains in the active
+    /// owner's encoded range.
+    pub(crate) fn try_from_assignments(
+        physical_shard_count: u16,
+        assignments: Box<[(u16, u16, AllocationOwnerState)]>,
+    ) -> EngineResult<Self> {
         if physical_shard_count == 0 {
             return Err(EngineError::new(
                 EngineErrorKind::InvalidArgument,
                 "an allocation-owner map requires at least one physical shard",
             ));
         }
-        if pairs.len() != usize::from(physical_shard_count) {
+        if assignments.len() < usize::from(physical_shard_count) {
             return Err(EngineError::new(
                 EngineErrorKind::InvalidArgument,
-                "an allocation-owner map must contain exactly one entry per physical shard",
+                "an allocation-owner map must contain an active entry for every physical shard",
             ));
         }
 
-        let mut by_owner = pairs
+        let mut by_owner = assignments
             .into_vec()
             .into_iter()
-            .map(|(owner, physical_shard)| {
-                AllocationOwnerSlot::new(owner).map(|owner| (owner, physical_shard))
+            .map(|(owner, physical_shard, state)| {
+                AllocationOwnerSlot::new(owner).map(|owner| (owner, physical_shard, state))
             })
             .collect::<EngineResult<Vec<_>>>()?;
-        by_owner.sort_unstable_by_key(|(owner, _)| *owner);
+        by_owner.sort_unstable_by_key(|(owner, _, _)| *owner);
         if by_owner
             .windows(2)
             .any(|entries| entries[0].0 == entries[1].0)
@@ -98,8 +134,8 @@ impl AllocationOwnerMap {
         }
 
         let mut by_physical_shard = vec![None; usize::from(physical_shard_count)];
-        for &(owner, physical_shard) in &by_owner {
-            let Some(entry) = by_physical_shard.get_mut(usize::from(physical_shard)) else {
+        for &(owner, physical_shard, state) in &by_owner {
+            let Some(active_owner) = by_physical_shard.get_mut(usize::from(physical_shard)) else {
                 return Err(EngineError::new(
                     EngineErrorKind::InvalidArgument,
                     format!(
@@ -108,11 +144,11 @@ impl AllocationOwnerMap {
                     ),
                 ));
             };
-            if entry.replace(owner).is_some() {
+            if state == AllocationOwnerState::Active && active_owner.replace(owner).is_some() {
                 return Err(EngineError::new(
                     EngineErrorKind::InvalidArgument,
                     format!(
-                        "physical shard {physical_shard} cannot have more than one allocation owner"
+                        "physical shard {physical_shard} cannot have more than one active allocation owner"
                     ),
                 ));
             }
@@ -129,6 +165,22 @@ impl AllocationOwnerMap {
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
+        for &(retired_owner, physical_shard, state) in &by_owner {
+            if state != AllocationOwnerState::Retired {
+                continue;
+            }
+            let active_owner = by_physical_shard[usize::from(physical_shard)];
+            if active_owner <= retired_owner {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!(
+                        "active allocation owner {} for physical shard {physical_shard} must be greater than retired owner {}",
+                        active_owner.get(),
+                        retired_owner.get()
+                    ),
+                ));
+            }
+        }
 
         Ok(Self {
             by_owner: by_owner.into_boxed_slice(),
@@ -138,9 +190,20 @@ impl AllocationOwnerMap {
 
     pub(crate) fn physical_shard(&self, owner: AllocationOwnerSlot) -> Option<u16> {
         self.by_owner
-            .binary_search_by_key(&owner, |(candidate, _)| *candidate)
+            .binary_search_by_key(&owner, |(candidate, _, _)| *candidate)
             .ok()
             .map(|index| self.by_owner[index].1)
+    }
+
+    pub(crate) fn owner_state(&self, owner: AllocationOwnerSlot) -> Option<AllocationOwnerState> {
+        self.by_owner
+            .binary_search_by_key(&owner, |(candidate, _, _)| *candidate)
+            .ok()
+            .map(|index| self.by_owner[index].2)
+    }
+
+    pub(crate) fn owner_is_active(&self, owner: AllocationOwnerSlot) -> bool {
+        self.owner_state(owner) == Some(AllocationOwnerState::Active)
     }
 
     pub(crate) fn owner_for_physical_shard(
@@ -160,7 +223,15 @@ impl AllocationOwnerMap {
     pub(crate) fn pairs(&self) -> impl ExactSizeIterator<Item = (u16, u16)> + '_ {
         self.by_owner
             .iter()
-            .map(|(owner, physical_shard)| (owner.get(), *physical_shard))
+            .map(|(owner, physical_shard, _)| (owner.get(), *physical_shard))
+    }
+
+    pub(crate) fn assignments(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (u16, u16, AllocationOwnerState)> + '_ {
+        self.by_owner
+            .iter()
+            .map(|(owner, physical_shard, state)| (owner.get(), *physical_shard, *state))
     }
 }
 
@@ -250,6 +321,29 @@ pub(crate) fn classify_generated_id(
     }
 }
 
+/// Classify a caller-supplied value without treating malformed input as
+/// corruption of already-committed storage.
+///
+/// In particular, the owner-local sequence-zero sentinel is valid only in
+/// `sqlite_sequence`; callers cannot insert it as a row ID.
+pub(crate) fn classify_caller_generated_id(
+    policy: &GeneratedIdPolicy,
+    encoded: i64,
+) -> EngineResult<GeneratedIdClassification> {
+    match policy {
+        GeneratedIdPolicy::None => Ok(GeneratedIdClassification::Legacy(encoded)),
+        GeneratedIdPolicy::NativeRangeV1 { .. } => {
+            decode_native_range_v1_with_reserved_error(encoded, EngineErrorKind::InvalidArgument)
+                .map(|decoded| {
+                    decoded.map_or(
+                        GeneratedIdClassification::Legacy(encoded),
+                        GeneratedIdClassification::NativeRangeV1,
+                    )
+                })
+        }
+    }
+}
+
 /// SQLite `sqlite_sequence` floor for an empty owner-local table.
 ///
 /// This sentinel contains the v1 marker and owner but local sequence zero, so
@@ -259,11 +353,32 @@ pub(crate) fn native_range_v1_sequence_floor(owner: AllocationOwnerSlot) -> i64 
     i64::try_from(sequence_floor_bits(owner)).expect("native_range_v1 reserves the signed high bit")
 }
 
+/// First row ID SQLite allocates after an owner-local sequence floor.
+pub(crate) fn native_range_v1_first_id(owner: AllocationOwnerSlot) -> i64 {
+    native_range_v1_sequence_floor(owner)
+        .checked_add(1)
+        .expect("every native-range owner has a non-empty signed ID interval")
+}
+
+/// Last row ID that belongs to an owner-local allocation range.
+pub(crate) fn native_range_v1_sequence_ceiling(owner: AllocationOwnerSlot) -> i64 {
+    NativeRangeV1Id::new(owner, MAX_NATIVE_RANGE_V1_LOCAL_SEQUENCE)
+        .expect("the codec's maximum local sequence is valid")
+        .encode()
+}
+
 fn sequence_floor_bits(owner: AllocationOwnerSlot) -> u64 {
     NATIVE_RANGE_V1_FORMAT_MARKER | (u64::from(owner.get()) << NATIVE_RANGE_V1_OWNER_SHIFT)
 }
 
 fn decode_native_range_v1(encoded: i64) -> EngineResult<Option<NativeRangeV1Id>> {
+    decode_native_range_v1_with_reserved_error(encoded, EngineErrorKind::DataCorruption)
+}
+
+fn decode_native_range_v1_with_reserved_error(
+    encoded: i64,
+    reserved_error_kind: EngineErrorKind,
+) -> EngineResult<Option<NativeRangeV1Id>> {
     if encoded < 0 {
         return Ok(None);
     }
@@ -275,7 +390,7 @@ fn decode_native_range_v1(encoded: i64) -> EngineResult<Option<NativeRangeV1Id>>
     let local_sequence = bits & MAX_NATIVE_RANGE_V1_LOCAL_SEQUENCE;
     if local_sequence == 0 {
         return Err(EngineError::new(
-            EngineErrorKind::DataCorruption,
+            reserved_error_kind,
             "native_range_v1 row ID contains the reserved local sequence zero",
         ));
     }
@@ -344,9 +459,25 @@ mod tests {
                 EngineErrorKind::DataCorruption
             );
             assert_eq!(
-                floor.checked_add(1).unwrap(),
+                native_range_v1_first_id(owner),
                 NativeRangeV1Id::new(owner, 1).unwrap().encode()
             );
+            assert_eq!(
+                native_range_v1_sequence_ceiling(owner),
+                NativeRangeV1Id::new(owner, MAX_NATIVE_RANGE_V1_LOCAL_SEQUENCE)
+                    .unwrap()
+                    .encode()
+            );
+        }
+    }
+
+    #[test]
+    fn caller_classification_rejects_reserved_floors_as_input_not_corruption() {
+        for owner in [0, 1, 63, MAX_ALLOCATION_OWNER_SLOT] {
+            let floor = native_range_v1_sequence_floor(AllocationOwnerSlot::new(owner).unwrap());
+            let error = classify_caller_generated_id(&native_policy(), floor).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+            assert!(error.diagnostic().contains("sequence zero"));
         }
     }
 
@@ -413,6 +544,7 @@ mod tests {
     fn codec_types_are_owned_send_and_sync() {
         fn assert_owned<T: Clone + Send + Sync + 'static>() {}
         assert_owned::<AllocationOwnerSlot>();
+        assert_owned::<AllocationOwnerState>();
         assert_owned::<AllocationOwnerMap>();
         assert_owned::<NativeRangeV1Id>();
         assert_owned::<GeneratedIdClassification>();
@@ -441,6 +573,105 @@ mod tests {
             None
         );
         assert_eq!(map.owner_for_physical_shard(4), None);
+    }
+
+    #[test]
+    fn retired_owners_keep_historical_routes_but_cannot_allocate() {
+        let map = AllocationOwnerMap::try_from_assignments(
+            2,
+            vec![
+                (7, 0, AllocationOwnerState::Retired),
+                (8, 0, AllocationOwnerState::Active),
+                (11, 1, AllocationOwnerState::Active),
+            ]
+            .into_boxed_slice(),
+        )
+        .unwrap();
+
+        let retired = AllocationOwnerSlot::new(7).unwrap();
+        let replacement = AllocationOwnerSlot::new(8).unwrap();
+        assert_eq!(map.physical_shard(retired), Some(0));
+        assert_eq!(
+            map.owner_state(retired),
+            Some(AllocationOwnerState::Retired)
+        );
+        assert!(!map.owner_is_active(retired));
+        assert_eq!(map.owner_for_physical_shard(0), Some(replacement));
+        assert!(map.owner_is_active(replacement));
+        assert_eq!(
+            map.assignments().collect::<Vec<_>>(),
+            [
+                (7, 0, AllocationOwnerState::Retired),
+                (8, 0, AllocationOwnerState::Active),
+                (11, 1, AllocationOwnerState::Active),
+            ]
+        );
+    }
+
+    #[test]
+    fn replacement_owner_must_advance_past_every_retired_owner_on_its_shard() {
+        let error = AllocationOwnerMap::try_from_assignments(
+            2,
+            vec![
+                (9, 0, AllocationOwnerState::Retired),
+                (8, 0, AllocationOwnerState::Active),
+                (0, 1, AllocationOwnerState::Active),
+            ]
+            .into_boxed_slice(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+        assert_eq!(
+            error.diagnostic(),
+            "active allocation owner 8 for physical shard 0 must be greater than retired owner 9"
+        );
+
+        // Succession is monotonic per physical shard, not a global ordering
+        // between otherwise independent shard allocators.
+        let valid = AllocationOwnerMap::try_from_assignments(
+            2,
+            vec![
+                (7, 0, AllocationOwnerState::Retired),
+                (9, 0, AllocationOwnerState::Retired),
+                (10, 0, AllocationOwnerState::Active),
+                (1, 1, AllocationOwnerState::Active),
+            ]
+            .into_boxed_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            valid.owner_for_physical_shard(0),
+            Some(AllocationOwnerSlot::new(10).unwrap())
+        );
+        assert_eq!(
+            valid.owner_for_physical_shard(1),
+            Some(AllocationOwnerSlot::new(1).unwrap())
+        );
+    }
+
+    #[test]
+    fn owner_lifecycle_requires_one_active_allocator_per_shard() {
+        for assignments in [
+            vec![
+                (0, 0, AllocationOwnerState::Retired),
+                (1, 1, AllocationOwnerState::Active),
+            ],
+            vec![
+                (0, 0, AllocationOwnerState::Active),
+                (1, 0, AllocationOwnerState::Active),
+                (2, 1, AllocationOwnerState::Active),
+            ],
+            vec![
+                (0, 0, AllocationOwnerState::Active),
+                (0, 1, AllocationOwnerState::Retired),
+                (2, 1, AllocationOwnerState::Active),
+            ],
+        ] {
+            assert!(
+                AllocationOwnerMap::try_from_assignments(2, assignments.into_boxed_slice())
+                    .is_err()
+            );
+        }
     }
 
     #[test]
