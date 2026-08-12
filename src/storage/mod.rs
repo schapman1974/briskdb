@@ -25,7 +25,7 @@ use std::{
 };
 
 use rusqlite::{
-    Connection, OpenFlags,
+    Connection, OpenFlags, TransactionBehavior,
     hooks::{AuthAction, AuthContext, Authorization},
 };
 
@@ -36,15 +36,20 @@ pub(crate) use schema_gate::{SchemaGateSnapshot, SchemaGateState};
 pub(crate) use schema_gate::{SchemaMigrationGuard, SchemaOperationGuard};
 
 pub use crate::core::Database;
+#[cfg(any(feature = "experimental-vtab", test))]
+use crate::core::TableId;
 use crate::{
     core::{
-        Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult, MAX_TABLES,
-        ShardKeyType, TableDeclaration, TablePlacement,
+        Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
+        MAX_TABLES, ShardKeyType, TableDeclaration, TablePlacement,
+        generated_id::{
+            NATIVE_RANGE_V1_FORMAT_MARKER, native_range_v1_sequence_ceiling,
+            native_range_v1_sequence_floor,
+        },
     },
     sqlite_error,
 };
 
-#[cfg(feature = "experimental-vtab")]
 use crate::core::AllocationOwnerMap;
 
 pub(crate) const CONNECTION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -309,6 +314,7 @@ fn immutable_catalog_metadata_matches(left: &CatalogSnapshot, right: &CatalogSna
     let right_logical = right.logical();
     left.routing() == right.routing()
         && left.allocation_owners() == right.allocation_owners()
+        && left.active_native_id_table_ids() == right.active_native_id_table_ids()
         && left_logical.identifier_encoding_version() == right_logical.identifier_encoding_version()
         && left_logical.default_database().id() == right_logical.default_database().id()
         && left_logical.logical_databases() == right_logical.logical_databases()
@@ -488,8 +494,15 @@ impl Storage {
                 return Err(error);
             }
         };
-        let (catalog, shard_layout, active_migration, mut integrity) =
-            loaded.into_parts_with_migration();
+        let (
+            catalog,
+            shard_layout,
+            active_migration,
+            mut integrity,
+            active_native_id_table_ids,
+            active_table_provisioning,
+        ) = loaded.into_parts_with_recovery();
+        let catalog = catalog.with_active_native_id_table_ids(active_native_id_table_ids);
         let catalog = schema_coordination.register_catalog(catalog)?;
         schema_coordination.publish_schema_digests(
             integrity.committed_schema_digest(),
@@ -507,7 +520,7 @@ impl Storage {
 
         if let Some(active_migration) = active_migration {
             startup.mark_pending_on_drop();
-            let recovery = (|| {
+            let recovery: EngineResult<()> = (|| {
                 validate_schema_migration_checksum_prefix(
                     &root.join("shards"),
                     requested_shards,
@@ -559,12 +572,53 @@ impl Storage {
             }
         };
 
-        let storage = Self {
+        let mut storage = Self {
             root,
             catalog,
             shard_layout: ready_layout,
             schema_coordination,
         };
+        if let Some(mut provisioning) = active_table_provisioning {
+            startup.mark_pending_on_drop();
+            let recovery: EngineResult<()> = (|| {
+                storage.validate_empty_table_declarations(provisioning.declarations())?;
+                while provisioning.next_shard() < provisioning.shard_count() {
+                    let shard_id = provisioning.next_shard();
+                    storage.seed_native_range_v1_sequences_on_shard(
+                        provisioning.declarations(),
+                        shard_id,
+                    )?;
+                    provisioning = manifest::advance_native_table_provisioning(
+                        &mut manifest,
+                        requested_shards,
+                        &provisioning,
+                        shard_id + 1,
+                    )?;
+                }
+                let replacement_guard = storage
+                    .schema_coordination
+                    .reserve_catalog_replacement(&storage.catalog)?;
+                let replacement = manifest::finalize_native_table_provisioning(
+                    &mut manifest,
+                    requested_shards,
+                    &provisioning,
+                    || {},
+                )?;
+                storage.catalog = replacement_guard.publish(&storage.catalog, replacement)?;
+                Ok::<(), EngineError>(())
+            })();
+            if let Err(error) = recovery {
+                if error.kind() == EngineErrorKind::DataCorruption {
+                    storage.mark_schema_degraded();
+                    let _ = manifest::mark_degraded(
+                        &mut manifest,
+                        requested_shards,
+                        &storage.shard_layout,
+                    );
+                }
+                return Err(error);
+            }
+        }
         let verification = storage.verify_current_schema_consensus(integrity);
         let observed_digest = match verification {
             Ok(digest) => digest,
@@ -631,9 +685,13 @@ impl Storage {
         self.catalog.logical()
     }
 
-    #[cfg(feature = "experimental-vtab")]
     pub(crate) fn allocation_owner_map(&self) -> Option<&AllocationOwnerMap> {
         self.catalog.allocation_owners()
+    }
+
+    #[cfg(any(feature = "experimental-vtab", test))]
+    pub(crate) fn native_id_policy_is_active(&self, table_id: TableId) -> bool {
+        self.catalog.native_id_policy_is_active(table_id)
     }
 
     pub(crate) fn register_tables(
@@ -646,16 +704,36 @@ impl Storage {
 
     fn register_tables_inner(&mut self, declarations: Vec<TableDeclaration>) -> EngineResult<()> {
         self.validate_table_declaration_request(&declarations)?;
-        if !self.catalog.logical().tables().is_empty() {
+        let catalog_is_empty = self.catalog.logical().tables().is_empty();
+        if !catalog_is_empty && !declarations_match_catalog(self.catalog.logical(), &declarations) {
             let _operation = self.enter_schema_operation()?;
-            return if declarations_match_catalog(self.catalog.logical(), &declarations) {
-                Ok(())
-            } else {
-                Err(EngineError::new(
-                    EngineErrorKind::FailedPrecondition,
-                    "the authoritative table catalog is already registered",
-                ))
-            };
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "the authoritative table catalog is already registered",
+            ));
+        }
+        let has_native_policy = declarations.iter().any(|declaration| {
+            matches!(
+                declaration.generated_id_policy(),
+                GeneratedIdPolicy::NativeRangeV1 { .. }
+            )
+        });
+        let every_native_policy_is_active = !has_native_policy
+            || declarations.iter().all(|declaration| {
+                !matches!(
+                    declaration.generated_id_policy(),
+                    GeneratedIdPolicy::NativeRangeV1 { .. }
+                ) || self
+                    .catalog
+                    .logical()
+                    .table("default", declaration.name())
+                    .ok()
+                    .flatten()
+                    .is_some_and(|table| self.catalog.native_id_policy_is_active(table.id()))
+            });
+        if !catalog_is_empty && every_native_policy_is_active {
+            let _operation = self.enter_schema_operation()?;
+            return Ok(());
         }
         let mut migration = self.schema_coordination.gate.begin_new_migration()?;
         migration.wait_for_quiescence_blocking();
@@ -668,12 +746,59 @@ impl Storage {
             let manifest_path = self.root.join("manifest.sqlite");
             let mut manifest_connection = open_existing_manifest(&manifest_path)?;
             configure_manifest_connection(&manifest_connection)?;
-            let replacement = manifest::register_table_catalog(
-                &mut manifest_connection,
-                self.shard_count(),
-                declarations,
-                || migration.mark_pending_on_drop(),
-            )?;
+            let replacement = if has_native_policy {
+                let committed_schema_digest = self.schema_coordination.committed_schema_digest()?;
+                let classification = manifest::begin_native_table_provisioning(
+                    &mut manifest_connection,
+                    self.shard_count(),
+                    declarations.clone(),
+                    committed_schema_digest,
+                    || migration.mark_pending_on_drop(),
+                )?;
+                let mut provisioning = match classification {
+                    manifest::NativeTableProvisioningClassification::Active(provisioning) => {
+                        provisioning
+                    }
+                    manifest::NativeTableProvisioningClassification::Complete => {
+                        return Err(EngineError::new(
+                            EngineErrorKind::FailedPrecondition,
+                            "table provisioning is already complete in the manifest; reopen this stale handle",
+                        ));
+                    }
+                    manifest::NativeTableProvisioningClassification::Absent => {
+                        return Err(EngineError::new(
+                            EngineErrorKind::Internal,
+                            "table provisioning did not create its durable journal",
+                        ));
+                    }
+                };
+                while provisioning.next_shard() < provisioning.shard_count() {
+                    let shard_id = provisioning.next_shard();
+                    self.seed_native_range_v1_sequences_on_shard(
+                        provisioning.declarations(),
+                        shard_id,
+                    )?;
+                    provisioning = manifest::advance_native_table_provisioning(
+                        &mut manifest_connection,
+                        self.shard_count(),
+                        &provisioning,
+                        shard_id + 1,
+                    )?;
+                }
+                manifest::finalize_native_table_provisioning(
+                    &mut manifest_connection,
+                    self.shard_count(),
+                    &provisioning,
+                    || migration.mark_pending_on_drop(),
+                )?
+            } else {
+                manifest::register_table_catalog(
+                    &mut manifest_connection,
+                    self.shard_count(),
+                    declarations,
+                    || migration.mark_pending_on_drop(),
+                )?
+            };
             let replacement = replacement_guard.publish(&self.catalog, replacement)?;
             self.catalog = replacement;
             Ok(())
@@ -727,6 +852,151 @@ impl Storage {
             }
         }
         Ok(())
+    }
+
+    /// Seed every native table's shard-local AUTOINCREMENT source before the
+    /// authoritative catalog can publish the policy.
+    ///
+    /// Each shard is committed independently, so a process exit can leave a
+    /// prefix seeded. Publication is deliberately last, and retries install at
+    /// least the same durable owner floor without lowering a valid same-owner
+    /// high-water mark left by earlier committed-and-deleted rows.
+    #[cfg(test)]
+    fn seed_native_range_v1_sequences(
+        &self,
+        declarations: &[TableDeclaration],
+    ) -> EngineResult<()> {
+        for shard_id in 0..self.shard_count() {
+            self.seed_native_range_v1_sequences_on_shard(declarations, shard_id)?;
+        }
+        Ok(())
+    }
+
+    fn seed_native_range_v1_sequences_on_shard(
+        &self,
+        declarations: &[TableDeclaration],
+        shard_id: u16,
+    ) -> EngineResult<()> {
+        let native_tables = declarations
+            .iter()
+            .filter_map(|declaration| match declaration.generated_id_policy() {
+                GeneratedIdPolicy::NativeRangeV1 { column } => {
+                    Some((declaration.name(), column.as_str()))
+                }
+                GeneratedIdPolicy::None => None,
+            })
+            .collect::<Vec<_>>();
+        if native_tables.is_empty() {
+            return Ok(());
+        }
+        let allocation_owners = self.catalog.allocation_owners().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "native_range_v1 registration requires a durable allocation-owner map",
+            )
+        })?;
+
+        let owner = allocation_owners
+            .owner_for_physical_shard(shard_id)
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!(
+                        "physical shard {shard_id} has no durable native-range allocation owner"
+                    ),
+                )
+            })?;
+        let floor = native_range_v1_sequence_floor(owner);
+        let ceiling = native_range_v1_sequence_ceiling(owner);
+        let marker = i64::try_from(NATIVE_RANGE_V1_FORMAT_MARKER)
+            .expect("the native-range marker reserves the signed high bit");
+        let mut connection = self.open_shard(shard_id)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error::storage)?;
+        for &(table, column) in &native_tables {
+            let quoted_table = quote_identifier(table);
+            let has_rows = transaction
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {quoted_table} LIMIT 1)"),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(sqlite_error::storage)?;
+            if has_rows != 0 {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "table {table} must remain empty on physical shard {shard_id} while native_range_v1 is provisioned"
+                    ),
+                ));
+            }
+            if !shard::native_generated_column_is_exact(&transaction, table, column)? {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "generated column {column} on table {table} must be exactly INTEGER PRIMARY KEY AUTOINCREMENT on physical shard {shard_id}"
+                    ),
+                ));
+            }
+            let (row_count, integer_count) = transaction
+                .query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(typeof(seq) = 'integer'), 0)
+                         FROM main.sqlite_sequence
+                         WHERE name = ?1 COLLATE BINARY",
+                    [table],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(sqlite_error::storage)?;
+            match (row_count, integer_count) {
+                (0, 0) => {
+                    transaction
+                        .execute(
+                            "INSERT INTO main.sqlite_sequence(name, seq) VALUES (?1, ?2)",
+                            rusqlite::params![table, floor],
+                        )
+                        .map_err(sqlite_error::storage)?;
+                }
+                (1, 1) => {
+                    let sequence = transaction
+                        .query_row(
+                            "SELECT seq FROM main.sqlite_sequence
+                                 WHERE name = ?1 COLLATE BINARY",
+                            [table],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(sqlite_error::storage)?;
+                    if sequence < marker {
+                        transaction
+                            .execute(
+                                "UPDATE main.sqlite_sequence SET seq = ?2
+                                     WHERE name = ?1 COLLATE BINARY",
+                                rusqlite::params![table, floor],
+                            )
+                            .map_err(sqlite_error::storage)?;
+                    } else if !(floor..=ceiling).contains(&sequence) {
+                        return Err(EngineError::new(
+                            EngineErrorKind::FailedPrecondition,
+                            format!(
+                                "table {table} on physical shard {shard_id} has sqlite_sequence value {sequence} in a conflicting native allocation-owner range"
+                            ),
+                        ));
+                    }
+                    // Preserve a same-owner high-water mark. Lowering it,
+                    // even while the table is empty, could reuse an ID
+                    // that was committed and later deleted.
+                }
+                _ => {
+                    return Err(EngineError::new(
+                        EngineErrorKind::FailedPrecondition,
+                        format!(
+                            "table {table} on physical shard {shard_id} must have at most one integer sqlite_sequence row before native_range_v1 registration"
+                        ),
+                    ));
+                }
+            }
+        }
+        transaction.commit().map_err(sqlite_error::storage)
     }
 
     fn validate_empty_table_declarations(
@@ -918,6 +1188,7 @@ impl Storage {
                 self.catalog.logical().schema_generation(),
                 &expected_digest,
             )?;
+            self.validate_native_range_v1_state(&connection, shard)?;
             attach_storage_authorizer(&connection)?;
             Ok(connection)
         })();
@@ -997,6 +1268,7 @@ impl Storage {
                 self.catalog.logical().schema_generation(),
                 &expected_digest,
             )?;
+            self.validate_native_range_v1_state(&connection, shard)?;
             attach_storage_authorizer(&connection)?;
             Ok(connection)
         })();
@@ -1072,8 +1344,16 @@ impl Storage {
         // Establish trusted and cross-shard digest agreement everywhere before
         // enforcing compatibility policy. Otherwise a policy error on an early
         // shard could mask later corruption and prevent terminal degradation.
-        for connection in &verified_connections {
-            shard::validate_registered_table_schema(connection, self.catalog.logical())?;
+        for (shard_id, connection) in verified_connections.iter().enumerate() {
+            shard::validate_registered_table_schema_with_active_native_ids(
+                connection,
+                self.catalog.logical(),
+                self.catalog.active_native_id_table_ids(),
+            )?;
+            self.validate_native_range_v1_state(
+                connection,
+                u16::try_from(shard_id).expect("the validated shard set fits u16"),
+            )?;
         }
         Ok(consensus)
     }
@@ -1098,7 +1378,8 @@ impl Storage {
                 connection,
                 self.catalog.logical().schema_generation(),
                 &expected_digest,
-            )
+            )?;
+            self.validate_native_range_v1_state(connection, shard)
         })();
         self.fail_closed_on_corruption(result)
     }
@@ -1124,9 +1405,33 @@ impl Storage {
                 self.catalog.logical().schema_generation(),
                 &expected_digest,
             )?;
+            self.validate_native_range_v1_state(connection, shard)?;
             attach_storage_authorizer(connection)
         })();
         self.fail_closed_on_corruption(result)
+    }
+
+    fn validate_native_range_v1_state(
+        &self,
+        connection: &Connection,
+        physical_shard: u16,
+    ) -> EngineResult<()> {
+        if self.catalog.active_native_id_table_ids().is_empty() {
+            return Ok(());
+        }
+        let allocation_owners = self.catalog.allocation_owners().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "native_range_v1 catalog is missing its durable allocation-owner map",
+            )
+        })?;
+        shard::validate_native_range_v1_state_with_active_ids(
+            connection,
+            self.catalog.logical(),
+            allocation_owners,
+            physical_shard,
+            Some(self.catalog.active_native_id_table_ids()),
+        )
     }
 
     fn ensure_shard_in_range(&self, shard: u16) -> EngineResult<()> {
@@ -1354,6 +1659,17 @@ fn validate_empty_table_declaration(
                 declaration.name()
             ),
         ));
+    }
+    if let GeneratedIdPolicy::NativeRangeV1 { column } = declaration.generated_id_policy() {
+        if !shard::native_generated_column_is_exact(connection, declaration.name(), column)? {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "generated column {column} on table {} must be exactly INTEGER PRIMARY KEY AUTOINCREMENT on physical shard {shard_id}",
+                    declaration.name()
+                ),
+            ));
+        }
     }
     let affinity = sqlite_affinity(declared_type);
     let compatible = matches!(
@@ -2208,7 +2524,10 @@ mod tests {
             manifest
                 .execute_batch(
                     "BEGIN IMMEDIATE;
+                     DROP TABLE briskdb_table_provisioning_declarations;
+                     DROP TABLE briskdb_table_provisioning;
                      DROP TABLE briskdb_generated_ids;
+                     DROP INDEX briskdb_one_active_owner_per_shard;
                      DROP TABLE briskdb_allocation_owners;
                      DROP TABLE briskdb_integrity;
                      DROP TABLE briskdb_metadata;
@@ -2307,7 +2626,10 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_table_provisioning_declarations;
+                 DROP TABLE briskdb_table_provisioning;
                  DROP TABLE briskdb_generated_ids;
+                 DROP INDEX briskdb_one_active_owner_per_shard;
                  DROP TABLE briskdb_allocation_owners;
                  DROP TABLE briskdb_integrity;
                  DROP TABLE briskdb_metadata;
@@ -2400,7 +2722,10 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_table_provisioning_declarations;
+                 DROP TABLE briskdb_table_provisioning;
                  DROP TABLE briskdb_generated_ids;
+                 DROP INDEX briskdb_one_active_owner_per_shard;
                  DROP TABLE briskdb_allocation_owners;
                  DROP TABLE briskdb_integrity;
                  DROP TABLE briskdb_metadata;
@@ -3214,6 +3539,394 @@ mod tests {
             .unwrap();
     }
 
+    fn native_events_declaration(database_id: crate::core::LogicalDatabaseId) -> TableDeclaration {
+        TableDeclaration::sharded(
+            database_id,
+            "events",
+            crate::core::ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+        )
+        .unwrap()
+        .with_generated_id_policy(crate::core::GeneratedIdPolicy::native_range_v1("id").unwrap())
+        .unwrap()
+    }
+
+    fn create_registered_native_storage(root: &Path, shard_count: u16) -> Storage {
+        let mut storage = Storage::open(root, shard_count).unwrap();
+        let mut migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        storage
+            .apply_schema_migration(
+                "CREATE TABLE events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     payload BLOB
+                 )",
+                &mut migration,
+                None,
+            )
+            .unwrap();
+        migration.publish_ready().unwrap();
+        let declaration =
+            native_events_declaration(storage.logical_catalog().default_database().id());
+        storage.register_tables(vec![declaration]).unwrap();
+        storage
+    }
+
+    #[test]
+    fn degradation_preserves_active_native_provisioning_and_startup_does_not_replay_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let mut migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        storage
+            .apply_schema_migration(
+                "CREATE TABLE events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     payload BLOB
+                 )",
+                &mut migration,
+                None,
+            )
+            .unwrap();
+        migration.publish_ready().unwrap();
+
+        let declaration =
+            native_events_declaration(storage.logical_catalog().default_database().id());
+        let committed_schema_digest = storage
+            .schema_coordination
+            .committed_schema_digest()
+            .unwrap();
+        let mut manifest_connection =
+            open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        let active = match manifest::begin_native_table_provisioning(
+            &mut manifest_connection,
+            2,
+            vec![declaration],
+            committed_schema_digest,
+            || {},
+        )
+        .unwrap()
+        {
+            manifest::NativeTableProvisioningClassification::Active(active) => active,
+            classification => panic!("unexpected classification: {classification:?}"),
+        };
+        let provisioning_id = active.provisioning_id();
+
+        manifest::mark_degraded(&mut manifest_connection, 2, &storage.shard_layout).unwrap();
+        assert_eq!(
+            manifest::current_integrity(&manifest_connection, 2)
+                .unwrap()
+                .state(),
+            manifest::DatabaseIntegrityState::Degraded
+        );
+        assert_eq!(
+            manifest_connection
+                .query_row(
+                    "SELECT provisioning_id, next_shard
+                     FROM briskdb_table_provisioning
+                     WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u16>(1)?)),
+                )
+                .unwrap(),
+            (provisioning_id.to_vec(), 0)
+        );
+        assert_eq!(
+            manifest_connection
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_table_provisioning_declarations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        drop(manifest_connection);
+        drop(storage);
+
+        for shard in 0..2 {
+            assert_eq!(
+                Connection::open(shard_file(temp.path(), shard))
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_sequence WHERE name = 'events'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+
+        let reopen_error = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(reopen_error.kind(), EngineErrorKind::DataCorruption);
+        assert!(reopen_error.to_string().contains("persistently degraded"));
+
+        let manifest_connection =
+            open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        assert_eq!(
+            manifest::current_integrity(&manifest_connection, 2)
+                .unwrap()
+                .state(),
+            manifest::DatabaseIntegrityState::Degraded
+        );
+        assert_eq!(
+            manifest_connection
+                .query_row(
+                    "SELECT provisioning_id, next_shard
+                     FROM briskdb_table_provisioning
+                     WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u16>(1)?)),
+                )
+                .unwrap(),
+            (provisioning_id.to_vec(), 0)
+        );
+        assert_eq!(
+            manifest_connection
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_table_provisioning_declarations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        drop(manifest_connection);
+        for shard in 0..2 {
+            assert_eq!(
+                Connection::open(shard_file(temp.path(), shard))
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_sequence WHERE name = 'events'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn startup_recovers_every_native_provisioning_commit_boundary() {
+        use crate::core::generated_id::native_range_v1_sequence_floor;
+
+        // `seeded` may exceed the acknowledged prefix by one to model the
+        // crash window after a shard commit and before journal advancement.
+        for (acknowledged, seeded) in [(0_u16, 0_u16), (0, 1), (2, 3), (4, 4)] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 4).unwrap();
+            let mut migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            storage
+                .apply_schema_migration(
+                    "CREATE TABLE events (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         payload BLOB
+                     )",
+                    &mut migration,
+                    None,
+                )
+                .unwrap();
+            migration.publish_ready().unwrap();
+            let declaration =
+                native_events_declaration(storage.logical_catalog().default_database().id());
+            let committed_schema_digest = storage
+                .schema_coordination
+                .committed_schema_digest()
+                .unwrap();
+            let mut manifest_connection =
+                open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+            configure_manifest_connection(&manifest_connection).unwrap();
+            let mut provisioning = match manifest::begin_native_table_provisioning(
+                &mut manifest_connection,
+                4,
+                vec![declaration],
+                committed_schema_digest,
+                || {},
+            )
+            .unwrap()
+            {
+                manifest::NativeTableProvisioningClassification::Active(provisioning) => {
+                    provisioning
+                }
+                classification => panic!("unexpected classification: {classification:?}"),
+            };
+            for shard in 0..seeded {
+                storage
+                    .seed_native_range_v1_sequences_on_shard(provisioning.declarations(), shard)
+                    .unwrap();
+                if shard < acknowledged {
+                    provisioning = manifest::advance_native_table_provisioning(
+                        &mut manifest_connection,
+                        4,
+                        &provisioning,
+                        shard + 1,
+                    )
+                    .unwrap();
+                }
+            }
+            assert_eq!(provisioning.next_shard(), acknowledged);
+            drop(manifest_connection);
+            drop(storage);
+
+            let reopened = Storage::open(temp.path(), 4).unwrap();
+            let table = reopened
+                .logical_catalog()
+                .table("default", "events")
+                .unwrap()
+                .unwrap();
+            assert!(reopened.native_id_policy_is_active(table.id()));
+            for shard in 0..4 {
+                let owner = reopened
+                    .allocation_owner_map()
+                    .unwrap()
+                    .owner_for_physical_shard(shard)
+                    .unwrap();
+                assert_eq!(
+                    reopened
+                        .open_shard(shard)
+                        .unwrap()
+                        .query_row(
+                            "SELECT seq FROM sqlite_sequence WHERE name = 'events'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    native_range_v1_sequence_floor(owner)
+                );
+            }
+            let mut manifest_connection =
+                open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+            assert!(
+                manifest::classify_native_table_provisioning(
+                    &mut manifest_connection,
+                    4,
+                    vec![native_events_declaration(
+                        reopened.logical_catalog().default_database().id(),
+                    )],
+                    reopened
+                        .schema_coordination
+                        .committed_schema_digest()
+                        .unwrap(),
+                )
+                .unwrap()
+                    == manifest::NativeTableProvisioningClassification::Complete
+            );
+            drop(manifest_connection);
+            drop(reopened);
+
+            let second_reopen = Storage::open(temp.path(), 4).unwrap();
+            let table = second_reopen
+                .logical_catalog()
+                .table("default", "events")
+                .unwrap()
+                .unwrap();
+            assert!(second_reopen.native_id_policy_is_active(table.id()));
+        }
+    }
+
+    #[test]
+    fn finalized_native_provisioning_stays_pending_until_stale_handle_closes() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let mut schema = storage.begin_schema_migration().unwrap();
+        schema.wait_for_quiescence_blocking();
+        storage
+            .apply_schema_migration(
+                "CREATE TABLE events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     payload BLOB
+                 )",
+                &mut schema,
+                None,
+            )
+            .unwrap();
+        schema.publish_ready().unwrap();
+
+        let declaration =
+            native_events_declaration(storage.logical_catalog().default_database().id());
+        let committed_schema_digest = storage
+            .schema_coordination
+            .committed_schema_digest()
+            .unwrap();
+        let mut registration = storage.begin_schema_migration().unwrap();
+        registration.wait_for_quiescence_blocking();
+        let mut manifest_connection =
+            open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        let mut provisioning = match manifest::begin_native_table_provisioning(
+            &mut manifest_connection,
+            2,
+            vec![declaration],
+            committed_schema_digest,
+            || registration.mark_pending_on_drop(),
+        )
+        .unwrap()
+        {
+            manifest::NativeTableProvisioningClassification::Active(provisioning) => provisioning,
+            classification => panic!("unexpected classification: {classification:?}"),
+        };
+        while provisioning.next_shard() < provisioning.shard_count() {
+            let shard = provisioning.next_shard();
+            storage
+                .seed_native_range_v1_sequences_on_shard(provisioning.declarations(), shard)
+                .unwrap();
+            provisioning = manifest::advance_native_table_provisioning(
+                &mut manifest_connection,
+                2,
+                &provisioning,
+                shard + 1,
+            )
+            .unwrap();
+        }
+
+        // Simulate process loss after manifest finalization but before the
+        // returned catalog can be published into the live Storage handle.
+        let durable_replacement = manifest::finalize_native_table_provisioning(
+            &mut manifest_connection,
+            2,
+            &provisioning,
+            || registration.mark_pending_on_drop(),
+        )
+        .unwrap();
+        assert_eq!(durable_replacement.active_native_id_table_ids().len(), 1);
+        drop(durable_replacement);
+        drop(manifest_connection);
+        drop(registration);
+
+        assert!(storage.logical_catalog().tables().is_empty());
+        assert_eq!(
+            storage.schema_gate_snapshot().state,
+            SchemaGateState::Pending
+        );
+        assert_eq!(
+            storage.enter_schema_operation().unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        let conflict = Storage::open(temp.path(), 2).unwrap_err();
+        assert_eq!(conflict.kind(), EngineErrorKind::FailedPrecondition);
+        assert_eq!(
+            storage.schema_gate_snapshot().state,
+            SchemaGateState::Pending
+        );
+        drop(storage);
+
+        let reopened = Storage::open(temp.path(), 2).unwrap();
+        let table = reopened
+            .logical_catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap();
+        assert!(reopened.native_id_policy_is_active(table.id()));
+        assert_eq!(
+            reopened.schema_gate_snapshot().state,
+            SchemaGateState::Ready
+        );
+    }
+
     #[test]
     fn table_registration_is_authoritative_persistent_and_idempotent() {
         let temp = tempfile::tempdir().unwrap();
@@ -3265,7 +3978,7 @@ mod tests {
         database
             .broadcast(
                 "CREATE TABLE events (
-                     id INTEGER PRIMARY KEY,
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                      payload BLOB
                  )",
             )
@@ -3295,15 +4008,764 @@ mod tests {
         drop(database);
 
         let reopened = Database::open(temp.path(), 3).unwrap();
+        let reopened_table = reopened
+            .catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened_table.generated_id_policy(), &policy);
+        drop(reopened);
+
+        let reopened = Storage::open(temp.path(), 3).unwrap();
+        let reopened_table = reopened
+            .logical_catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap();
+        assert!(reopened.native_id_policy_is_active(reopened_table.id()));
+        for shard in 0..3 {
+            reopened.open_shard(shard).unwrap();
+        }
+    }
+
+    #[test]
+    fn file_backed_v9_native_policy_upgrades_inactive_without_autoincrement() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let mut migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        storage
+            .apply_schema_migration(
+                "CREATE TABLE events (
+                     id INTEGER PRIMARY KEY,
+                     payload BLOB
+                 )",
+                &mut migration,
+                None,
+            )
+            .unwrap();
+        migration.publish_ready().unwrap();
+        let declaration =
+            native_events_declaration(storage.logical_catalog().default_database().id());
+        let mut manifest_connection =
+            open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+        manifest::install_v9_native_catalog_for_test(
+            &mut manifest_connection,
+            2,
+            std::slice::from_ref(&declaration),
+        )
+        .unwrap();
+        manifest::inspect_with_v9_plan_for_test(&manifest_connection, 2).unwrap();
+        drop(manifest_connection);
+        drop(storage);
+
+        let mut upgraded = Storage::open(temp.path(), 2).unwrap();
+        let table = upgraded
+            .logical_catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            table.generated_id_policy(),
+            declaration.generated_id_policy()
+        );
+        assert!(!upgraded.native_id_policy_is_active(table.id()));
+        for shard in 0..2 {
+            let connection = upgraded.open_shard(shard).unwrap();
+            assert!(
+                !connection
+                    .query_row(
+                        "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_schema
+                         WHERE type = 'table' AND name = 'sqlite_sequence'
+                     )",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
+
+        // Activation checks the physical shape before publishing a journal;
+        // the old v9 policy remains readable and ordinary admission remains ready.
+        let error = upgraded.register_tables(vec![declaration]).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(error.diagnostic().contains("AUTOINCREMENT"));
+        assert_eq!(
+            upgraded.schema_gate_snapshot().state,
+            SchemaGateState::Ready
+        );
+
+        let manifest_connection =
+            open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+        let identity_before = manifest_connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap();
+        let root_before = manifest_connection
+            .query_row(
+                "SELECT manifest_digest FROM briskdb_integrity WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        let error = manifest::inspect_with_v9_plan_for_test(&manifest_connection, 2).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert_eq!(
+            manifest_connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            identity_before
+        );
+        assert_eq!(
+            manifest_connection
+                .query_row(
+                    "SELECT manifest_digest FROM briskdb_integrity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .unwrap(),
+            root_before
+        );
+        drop(manifest_connection);
+        drop(upgraded);
+
+        let reopened = Storage::open(temp.path(), 2).unwrap();
+        let table = reopened
+            .logical_catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap();
+        assert!(!reopened.native_id_policy_is_active(table.id()));
+
+        #[cfg(feature = "experimental-vtab")]
+        {
+            let mut coordinator = WriteCoordinator::open(reopened.clone()).unwrap();
+            let error = coordinator
+                .execute_generated_dml_auto(
+                    "INSERT INTO events (payload) VALUES (x'01')",
+                    [],
+                    table.id().get(),
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+            assert_eq!(
+                reopened
+                    .open_shard(0)
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn native_generated_id_policy_requires_exact_autoincrement_storage() {
+        for schema in [
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, payload BLOB)",
+            "CREATE TABLE events (id INTEGER NOT NULL UNIQUE, payload BLOB)",
+            "CREATE TABLE events (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT DEFAULT 7,
+                 payload BLOB
+             )",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut database = Database::open(temp.path(), 2).unwrap();
+            database.broadcast(schema).unwrap();
+            let declaration = native_events_declaration(database.catalog().default_database().id());
+
+            let error = database.register_tables(vec![declaration]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                EngineErrorKind::FailedPrecondition,
+                "{schema}"
+            );
+            assert!(
+                error
+                    .diagnostic()
+                    .contains("INTEGER PRIMARY KEY AUTOINCREMENT"),
+                "{}",
+                error.diagnostic()
+            );
+            assert!(database.catalog().tables().is_empty());
+        }
+    }
+
+    #[test]
+    fn native_sequence_provisioning_is_idempotent_for_2_4_8_and_10_shards() {
+        use crate::core::generated_id::{
+            AllocationOwnerSlot, native_range_v1_first_id, native_range_v1_sequence_floor,
+        };
+
+        for shard_count in [2, 4, 8, 10] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut storage = Storage::open(temp.path(), shard_count).unwrap();
+            let mut migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            storage
+                .apply_schema_migration(
+                    "CREATE TABLE events (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         payload BLOB
+                     )",
+                    &mut migration,
+                    None,
+                )
+                .unwrap();
+            migration.publish_ready().unwrap();
+            let declaration =
+                native_events_declaration(storage.logical_catalog().default_database().id());
+
+            storage
+                .seed_native_range_v1_sequences(std::slice::from_ref(&declaration))
+                .unwrap();
+            storage
+                .seed_native_range_v1_sequences(std::slice::from_ref(&declaration))
+                .unwrap();
+            storage.register_tables(vec![declaration.clone()]).unwrap();
+            storage.register_tables(vec![declaration]).unwrap();
+
+            for shard_id in 0..shard_count {
+                let owner = AllocationOwnerSlot::new(shard_id).unwrap();
+                let connection = Connection::open(shard_file(temp.path(), shard_id)).unwrap();
+                let rows = connection
+                    .query_row(
+                        "SELECT COUNT(*), MIN(seq), MAX(seq)
+                         FROM sqlite_sequence WHERE name = 'events'",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    rows,
+                    (
+                        1,
+                        native_range_v1_sequence_floor(owner),
+                        native_range_v1_sequence_floor(owner)
+                    ),
+                    "shard count {shard_count}, shard {shard_id}"
+                );
+                let allocated = connection
+                    .query_row(
+                        "INSERT INTO events (payload) VALUES (x'01') RETURNING id",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                assert_eq!(allocated, native_range_v1_first_id(owner));
+            }
+            drop(storage);
+            Storage::open(temp.path(), shard_count).unwrap();
+        }
+    }
+
+    #[test]
+    fn native_sequence_provisioning_never_lowers_a_deleted_same_owner_high_water() {
+        use crate::core::generated_id::{AllocationOwnerSlot, native_range_v1_first_id};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(temp.path(), 2).unwrap();
+        let mut migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        storage
+            .apply_schema_migration(
+                "CREATE TABLE events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     payload BLOB
+                 )",
+                &mut migration,
+                None,
+            )
+            .unwrap();
+        migration.publish_ready().unwrap();
+
+        let owner = AllocationOwnerSlot::new(0).unwrap();
+        let committed_high_water = native_range_v1_first_id(owner) + 24;
+        let connection = storage.open_shard(0).unwrap();
+        connection
+            .execute(
+                "INSERT INTO events (id, payload) VALUES (?1, x'01')",
+                [committed_high_water],
+            )
+            .unwrap();
+        connection
+            .execute("DELETE FROM events WHERE id = ?1", [committed_high_water])
+            .unwrap();
+        drop(connection);
+
+        let declaration =
+            native_events_declaration(storage.logical_catalog().default_database().id());
+        storage.register_tables(vec![declaration]).unwrap();
+
+        let connection = storage.open_shard(0).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'events'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            committed_high_water
+        );
+        let next = connection
+            .query_row(
+                "INSERT INTO events (payload) VALUES (x'02') RETURNING id",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(next, committed_high_water + 1);
+    }
+
+    #[test]
+    fn native_sequence_provisioning_rejects_a_conflicting_owner_high_water() {
+        use crate::core::generated_id::{AllocationOwnerSlot, native_range_v1_first_id};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(temp.path(), 2).unwrap();
+        let mut migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        storage
+            .apply_schema_migration(
+                "CREATE TABLE events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     payload BLOB
+                 )",
+                &mut migration,
+                None,
+            )
+            .unwrap();
+        migration.publish_ready().unwrap();
+
+        let conflicting = native_range_v1_first_id(AllocationOwnerSlot::new(0).unwrap()) + 9;
+        let connection = storage.open_shard(1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO events (id, payload) VALUES (?1, x'01')",
+                [conflicting],
+            )
+            .unwrap();
+        connection
+            .execute("DELETE FROM events WHERE id = ?1", [conflicting])
+            .unwrap();
+        drop(connection);
+
+        let declaration =
+            native_events_declaration(storage.logical_catalog().default_database().id());
+        let error = storage.register_tables(vec![declaration]).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(
+            error
+                .diagnostic()
+                .contains("conflicting native allocation-owner")
+        );
+        assert!(storage.logical_catalog().tables().is_empty());
+        assert_eq!(
+            storage.schema_gate_snapshot().state,
+            SchemaGateState::Pending
+        );
+        assert_eq!(
+            storage.enter_schema_operation().unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+
+        let connection = Connection::open(shard_file(temp.path(), 1)).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'events'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            conflicting
+        );
+    }
+
+    #[test]
+    fn native_allocator_state_tampering_fails_closed() {
+        use crate::core::generated_id::{
+            AllocationOwnerSlot, native_range_v1_first_id, native_range_v1_sequence_ceiling,
+            native_range_v1_sequence_floor,
+        };
+
+        enum Tamper {
+            Missing,
+            Duplicate,
+            NonInteger,
+            BelowFloor,
+            AboveCeiling,
+            SequenceBehindRow,
+            ForeignOwnerRow,
+        }
+
+        for tamper in [
+            Tamper::Missing,
+            Tamper::Duplicate,
+            Tamper::NonInteger,
+            Tamper::BelowFloor,
+            Tamper::AboveCeiling,
+            Tamper::SequenceBehindRow,
+            Tamper::ForeignOwnerRow,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = create_registered_native_storage(temp.path(), 2);
+            let physical_shard = if matches!(tamper, Tamper::ForeignOwnerRow) {
+                1
+            } else {
+                0
+            };
+            let owner = AllocationOwnerSlot::new(physical_shard).unwrap();
+            let floor = native_range_v1_sequence_floor(owner);
+            let ceiling = native_range_v1_sequence_ceiling(owner);
+            let connection = Connection::open(shard_file(temp.path(), physical_shard)).unwrap();
+            match tamper {
+                Tamper::Missing => {
+                    connection
+                        .execute("DELETE FROM sqlite_sequence WHERE name = 'events'", [])
+                        .unwrap();
+                }
+                Tamper::Duplicate => {
+                    connection
+                        .execute(
+                            "INSERT INTO sqlite_sequence(name, seq) VALUES ('events', ?1)",
+                            [floor],
+                        )
+                        .unwrap();
+                }
+                Tamper::NonInteger => {
+                    connection
+                        .execute(
+                            "UPDATE sqlite_sequence SET seq = 'invalid' WHERE name = 'events'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                Tamper::BelowFloor => {
+                    connection
+                        .execute(
+                            "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'events'",
+                            [floor - 1],
+                        )
+                        .unwrap();
+                }
+                Tamper::AboveCeiling => {
+                    connection
+                        .execute(
+                            "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'events'",
+                            [ceiling + 1],
+                        )
+                        .unwrap();
+                }
+                Tamper::SequenceBehindRow => {
+                    connection
+                        .execute(
+                            "INSERT INTO events (id, payload) VALUES (?1, x'01')",
+                            [native_range_v1_first_id(owner) + 5],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'events'",
+                            [floor],
+                        )
+                        .unwrap();
+                }
+                Tamper::ForeignOwnerRow => {
+                    let foreign = native_range_v1_first_id(AllocationOwnerSlot::new(0).unwrap());
+                    connection
+                        .execute(
+                            "INSERT INTO events (id, payload) VALUES (?1, x'01')",
+                            [foreign],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'events'",
+                            [floor],
+                        )
+                        .unwrap();
+                }
+            }
+            drop(connection);
+
+            let error = storage.open_shard(physical_shard).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+            assert!(error.diagnostic().contains("native_range_v1"));
+        }
+    }
+
+    #[test]
+    fn native_allocator_accepts_an_exhausted_owner_at_its_exact_ceiling() {
+        use crate::core::generated_id::{AllocationOwnerSlot, native_range_v1_sequence_ceiling};
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = create_registered_native_storage(temp.path(), 2);
+        let ceiling = native_range_v1_sequence_ceiling(AllocationOwnerSlot::new(0).unwrap());
+        let connection = Connection::open(shard_file(temp.path(), 0)).unwrap();
+        connection
+            .execute(
+                "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'events'",
+                [ceiling],
+            )
+            .unwrap();
+        drop(connection);
+
+        storage.open_shard(0).unwrap();
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[test]
+    fn retired_owner_rows_survive_reopen_while_new_allocation_uses_replacement_owner() {
+        use crate::core::generated_id::{
+            AllocationOwnerSlot, NativeRangeV1Id, native_range_v1_first_id,
+            native_range_v1_sequence_floor,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = create_registered_native_storage(temp.path(), 2);
+        let old_owner = storage
+            .allocation_owner_map()
+            .unwrap()
+            .owner_for_physical_shard(0)
+            .unwrap();
+        let old_id = NativeRangeV1Id::new(old_owner, 5).unwrap().encode();
+        storage
+            .open_shard(0)
+            .unwrap()
+            .execute(
+                "INSERT INTO events (id, payload) VALUES (?1, x'6f6c64')",
+                [old_id],
+            )
+            .unwrap();
+        drop(storage);
+
+        let replacement_owner = AllocationOwnerSlot::new(100).unwrap();
+        let mut manifest_connection =
+            open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        manifest::replace_allocation_owner_for_test(
+            &mut manifest_connection,
+            2,
+            old_owner.get(),
+            replacement_owner.get(),
+            0,
+        )
+        .unwrap();
+        drop(manifest_connection);
+        Connection::open(shard_file(temp.path(), 0))
+            .unwrap()
+            .execute(
+                "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'events'",
+                [native_range_v1_sequence_floor(replacement_owner)],
+            )
+            .unwrap();
+
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let owners = storage.allocation_owner_map().unwrap();
+        assert_eq!(owners.physical_shard(old_owner), Some(0));
+        assert!(!owners.owner_is_active(old_owner));
+        assert_eq!(owners.owner_for_physical_shard(0), Some(replacement_owner));
+        for shard in 0..2 {
+            storage.open_shard(shard).unwrap();
+        }
+
+        let reader = sharded_vtab::ReadCoordinator::open(storage.clone()).unwrap();
+        assert_eq!(
+            reader
+                .connection()
+                .query_row(
+                    "SELECT payload FROM events WHERE id = ?1",
+                    [old_id],
+                    |row| { row.get::<_, Vec<u8>>(0) }
+                )
+                .unwrap(),
+            b"old"
+        );
+        drop(reader);
+
+        let retired_candidate = NativeRangeV1Id::new(old_owner, 6).unwrap().encode();
+        let error = WriteCoordinator::open(storage.clone())
+            .unwrap()
+            .execute_dml(
+                "INSERT INTO events (id, payload) VALUES (?1, x'6e6577')",
+                [retired_candidate],
+            )
+            .unwrap_err();
+        // SQLite surfaces an xUpdate module rejection as SQLITE_ERROR; the
+        // shared planner preserves FailedPrecondition before this callback.
+        assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+        assert!(error.diagnostic().contains("retired allocation owner"));
+
+        let table_id = storage
+            .logical_catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap()
+            .id()
+            .get();
+        let generated = WriteCoordinator::open(storage.clone())
+            .unwrap()
+            .execute_generated_dml(
+                "INSERT INTO events (payload) VALUES (x'6e6577')",
+                [],
+                table_id,
+                0,
+            )
+            .unwrap();
+        assert_eq!(generated.shard(), Some(0));
+        assert_eq!(
+            generated.generated_key().unwrap().value,
+            crate::core::Value::Int64(native_range_v1_first_id(replacement_owner))
+        );
+
+        let deleted = WriteCoordinator::open(storage.clone())
+            .unwrap()
+            .execute_dml("DELETE FROM events WHERE id = ?1", [old_id])
+            .unwrap();
+        assert_eq!(deleted.affected_rows(), 1);
+        drop(storage);
+
+        let reopened = Storage::open(temp.path(), 2).unwrap();
         assert_eq!(
             reopened
-                .catalog()
-                .table("default", "events")
+                .open_shard(0)
                 .unwrap()
-                .unwrap()
-                .generated_id_policy(),
-            &policy
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE id = ?1",
+                    [old_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
         );
+        assert_eq!(
+            reopened
+                .allocation_owner_map()
+                .unwrap()
+                .physical_shard(old_owner),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[test]
+    fn lower_owner_replacement_is_rejected_after_a_deleted_committed_high_water() {
+        use crate::core::generated_id::{
+            AllocationOwnerSlot, NativeRangeV1Id, native_range_v1_sequence_floor,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = create_registered_native_storage(temp.path(), 2);
+        let original_owner = storage
+            .allocation_owner_map()
+            .unwrap()
+            .owner_for_physical_shard(0)
+            .unwrap();
+        drop(storage);
+
+        let active_owner = AllocationOwnerSlot::new(100).unwrap();
+        let mut manifest_connection =
+            open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        manifest::replace_allocation_owner_for_test(
+            &mut manifest_connection,
+            2,
+            original_owner.get(),
+            active_owner.get(),
+            0,
+        )
+        .unwrap();
+        drop(manifest_connection);
+
+        Connection::open(shard_file(temp.path(), 0))
+            .unwrap()
+            .execute(
+                "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'events'",
+                [native_range_v1_sequence_floor(active_owner)],
+            )
+            .unwrap();
+
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let connection = storage.open_shard(0).unwrap();
+        let deleted_high_water = connection
+            .query_row(
+                "INSERT INTO events (payload) VALUES (x'01') RETURNING id",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            NativeRangeV1Id::decode(deleted_high_water).unwrap().owner(),
+            active_owner
+        );
+        connection
+            .execute("DELETE FROM events WHERE id = ?1", [deleted_high_water])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE id = ?1",
+                    [deleted_high_water],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'events'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            deleted_high_water
+        );
+        drop(connection);
+        drop(storage);
+
+        let mut manifest_connection =
+            open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+        configure_manifest_connection(&manifest_connection).unwrap();
+        let error = manifest::replace_allocation_owner_for_test(
+            &mut manifest_connection,
+            2,
+            active_owner.get(),
+            50,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+        assert!(error.diagnostic().contains("must be greater"));
+        drop(manifest_connection);
+
+        let reopened = Storage::open(temp.path(), 2).unwrap();
+        assert_eq!(
+            reopened
+                .allocation_owner_map()
+                .unwrap()
+                .owner_for_physical_shard(0),
+            Some(active_owner)
+        );
+        let connection = reopened.open_shard(0).unwrap();
+        let next = connection
+            .query_row(
+                "INSERT INTO events (payload) VALUES (x'02') RETURNING id",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(next, deleted_high_water + 1);
+        assert_eq!(NativeRangeV1Id::decode(next).unwrap().owner(), active_owner);
     }
 
     #[test]
@@ -3808,9 +5270,9 @@ mod tests {
             let mut database = Database::open(temp.path(), 2).unwrap();
             database
                 .broadcast(
-                    "CREATE TABLE parents (id INTEGER PRIMARY KEY);
+                    "CREATE TABLE parents (id INTEGER PRIMARY KEY AUTOINCREMENT);
                      CREATE TABLE children (
-                         id INTEGER PRIMARY KEY REFERENCES parents(id)
+                         id INTEGER PRIMARY KEY AUTOINCREMENT REFERENCES parents(id)
                      );",
                 )
                 .unwrap();

@@ -12,13 +12,14 @@ use same_file::Handle;
 
 use super::{
     MAX_SQLITE_IMPORT_ROW_BYTES, OmittedForeignKey, SQLITE_IMPORT_PLAN_VERSION,
-    SqliteForeignKeyPolicy, SqliteImportKeyType, SqliteImportPlacement, SqliteImportPlan,
-    SqliteShardKeyPlan, SqliteTableImportPlan,
+    SqliteForeignKeyPolicy, SqliteGeneratedIdPlan, SqliteImportKeyType, SqliteImportPlacement,
+    SqliteImportPlan, SqliteShardKeyPlan, SqliteTableImportPlan,
 };
 use crate::{
     core::{
         CancellationToken, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
         LogicalDatabaseId, MAX_TABLES, ShardKeyMetadata, ShardKeyType, TableDeclaration,
+        generated_id::NATIVE_RANGE_V1_FORMAT_MARKER,
     },
     sqlite_error,
 };
@@ -45,6 +46,7 @@ pub(super) struct SourceTable {
     placement: SqliteImportPlacement,
     columns: Vec<SourceColumn>,
     shard_key: Option<SourceShardKey>,
+    generated_id_policy: GeneratedIdPolicy,
     rowid_projection: Option<String>,
     without_rowid: bool,
     strict: bool,
@@ -229,6 +231,12 @@ impl SourceSnapshot {
                     Some(resolve_shard_key(&connection, &raw, &columns, shard_key)?)
                 }
             };
+            let generated_id_policy = resolve_generated_id_policy(
+                &connection,
+                &raw,
+                shard_key.as_ref(),
+                table_plan.generated_id_plan(),
+            )?;
 
             tables.push(SourceTable {
                 name: raw.name,
@@ -238,6 +246,7 @@ impl SourceSnapshot {
                 placement: table_plan.placement().clone(),
                 columns,
                 shard_key,
+                generated_id_policy,
                 rowid_projection,
                 without_rowid: raw.without_rowid,
                 strict: raw.strict,
@@ -341,7 +350,7 @@ impl SourceSnapshot {
                     ),
                     None => TableDeclaration::global(database_id, table.name()),
                 }?;
-                declaration.with_generated_id_policy(GeneratedIdPolicy::None)
+                declaration.with_generated_id_policy(table.generated_id_policy().clone())
             })
             .collect()
     }
@@ -374,6 +383,10 @@ impl SourceTable {
 
     pub(super) const fn shard_key(&self) -> Option<&SourceShardKey> {
         self.shard_key.as_ref()
+    }
+
+    pub(super) const fn generated_id_policy(&self) -> &GeneratedIdPolicy {
+        &self.generated_id_policy
     }
 
     /// Unshadowed SQLite magic name used to preserve an implicit rowid.
@@ -869,6 +882,79 @@ fn resolve_shard_key(
         column: column.name.clone(),
         key_type,
     })
+}
+
+fn resolve_generated_id_policy(
+    connection: &Connection,
+    table: &RawTable,
+    shard_key: Option<&SourceShardKey>,
+    plan: &SqliteGeneratedIdPlan,
+) -> EngineResult<GeneratedIdPolicy> {
+    let SqliteGeneratedIdPlan::NativeRangeV1 { column } = plan else {
+        return Ok(GeneratedIdPolicy::None);
+    };
+    let policy = GeneratedIdPolicy::native_range_v1(column.clone())?;
+    let key = shard_key.ok_or_else(|| {
+        precondition(format!(
+            "source table {} cannot enable native_range_v1 unless it is Sharded",
+            table.name
+        ))
+    })?;
+    if key.column() != column || key.key_type() != SqliteImportKeyType::Int64 {
+        return Err(precondition(format!(
+            "native_range_v1 column {}.{} must be the table's Sharded Int64 key",
+            table.name, column
+        )));
+    }
+
+    let (declared_type, _, _, primary_key, auto_increment) = connection
+        .column_metadata(Some("main"), table.name.as_str(), column.as_str())
+        .map_err(sqlite_error::storage)?;
+    let exact_integer =
+        declared_type.is_some_and(|declared| declared.to_bytes().eq_ignore_ascii_case(b"INTEGER"));
+    if !exact_integer || !primary_key || !auto_increment || table.without_rowid {
+        return Err(precondition(format!(
+            "native_range_v1 column {}.{} must be exactly INTEGER PRIMARY KEY AUTOINCREMENT",
+            table.name, column
+        )));
+    }
+
+    let marker = i64::try_from(NATIVE_RANGE_V1_FORMAT_MARKER)
+        .expect("native_range_v1 marker fits in a signed SQLite INTEGER");
+    let marked_id_exists = connection
+        .query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {} WHERE {} >= ?1)",
+                quote_identifier(&table.name),
+                quote_identifier(column)
+            ),
+            [marker],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    if marked_id_exists {
+        return Err(precondition(format!(
+            "source table {} contains an ID in the reserved native_range_v1 namespace; imported IDs must remain legacy-routed",
+            table.name
+        )));
+    }
+    let marked_sequence_exists = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM main.sqlite_sequence
+                 WHERE name = ?1 AND typeof(seq) = 'integer' AND seq >= ?2
+             )",
+            (table.name.as_str(), marker),
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    if marked_sequence_exists {
+        return Err(precondition(format!(
+            "source table {} has a sqlite_sequence high-water mark in the reserved native_range_v1 namespace; resetting it could reuse a previously committed ID",
+            table.name
+        )));
+    }
+    Ok(policy)
 }
 
 fn resolve_rowid_projection(
@@ -1865,6 +1951,10 @@ mod tests {
         SqliteTableImportPlan::sharded_by_primary_key(name)
     }
 
+    fn native_primary(name: &str, column: &str) -> SqliteTableImportPlan {
+        sharded_primary(name).with_native_range_v1(column).unwrap()
+    }
+
     #[test]
     fn inventories_exact_schema_counts_indexes_sequences_and_generated_columns() {
         let source = create_source(
@@ -1913,6 +2003,119 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+        assert_eq!(table.generated_id_policy(), &GeneratedIdPolicy::None);
+    }
+
+    #[test]
+    fn native_range_import_is_explicit_and_reaches_the_table_declaration() {
+        let source = create_source(
+            "CREATE TABLE records(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 value TEXT NOT NULL
+             );
+             INSERT INTO records(id, value) VALUES (-7, 'negative'), (11, 'legacy');",
+        );
+        let snapshot = SourceSnapshot::open(
+            source.path(),
+            &SqliteImportPlan::new(vec![native_primary("records", "id")]),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.tables()[0].generated_id_policy(),
+            &GeneratedIdPolicy::native_range_v1("id").unwrap()
+        );
+        let declarations = snapshot
+            .table_declarations(LogicalDatabaseId::new(1).unwrap())
+            .unwrap();
+        assert_eq!(
+            declarations[0].generated_id_policy(),
+            &GeneratedIdPolicy::native_range_v1("id").unwrap()
+        );
+    }
+
+    #[test]
+    fn native_range_import_requires_the_exact_autoincrement_shard_key() {
+        let no_autoincrement =
+            create_source("CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL);");
+        let error = SourceSnapshot::open(
+            no_autoincrement.path(),
+            &SqliteImportPlan::new(vec![native_primary("records", "id")]),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(
+            error
+                .diagnostic()
+                .contains("exactly INTEGER PRIMARY KEY AUTOINCREMENT"),
+            "{error}"
+        );
+
+        let wrong_column = create_source(
+            "CREATE TABLE records(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 other INTEGER NOT NULL
+             );",
+        );
+        let error = SourceSnapshot::open(
+            wrong_column.path(),
+            &SqliteImportPlan::new(vec![native_primary("records", "other")]),
+        )
+        .unwrap_err();
+        assert!(error.diagnostic().contains("Sharded Int64 key"), "{error}");
+
+        let global = create_source(
+            "CREATE TABLE records(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);",
+        );
+        let error = SourceSnapshot::open(
+            global.path(),
+            &SqliteImportPlan::new(vec![
+                SqliteTableImportPlan::global("records")
+                    .with_native_range_v1("id")
+                    .unwrap(),
+            ]),
+        )
+        .unwrap_err();
+        assert!(
+            error.diagnostic().contains("unless it is Sharded"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_range_import_rejects_source_ids_in_the_marked_namespace() {
+        let marked = i64::try_from(NATIVE_RANGE_V1_FORMAT_MARKER).unwrap() + 1;
+        let source = create_source(&format!(
+            "CREATE TABLE records(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL);
+             INSERT INTO records(id, value) VALUES ({marked}, 'already-marked');"
+        ));
+        let error = SourceSnapshot::open(
+            source.path(),
+            &SqliteImportPlan::new(vec![native_primary("records", "id")]),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(
+            error
+                .diagnostic()
+                .contains("reserved native_range_v1 namespace"),
+            "{error}"
+        );
+
+        let deleted = create_source(&format!(
+            "CREATE TABLE records(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL);
+             INSERT INTO records(id, value) VALUES ({marked}, 'committed-then-deleted');
+             DELETE FROM records;"
+        ));
+        let error = SourceSnapshot::open(
+            deleted.path(),
+            &SqliteImportPlan::new(vec![native_primary("records", "id")]),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(
+            error.diagnostic().contains("resetting it could reuse"),
+            "{error}"
         );
     }
 

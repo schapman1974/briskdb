@@ -154,11 +154,12 @@ BRISKDB_EXPERIMENTAL_VTAB_WRITES=true \
   cargo run --features experimental-vtab -- --data-dir ./briskdb-data --shards 4
 ```
 
-This opt-in changes only validated `Engine::execute` autocommit DML for a
-populated catalog, including the `/v1/execute` adapter. `/v1/query` and the
-admin browser continue to use the established metadata-driven scatter/gather
-readers. `BEGIN`, `COMMIT`, `ROLLBACK`, and transactions spanning HTTP requests
-are not enabled by this flag.
+This opt-in changes only validated `Engine::execute` and
+`Engine::execute_write` autocommit DML for a populated catalog, including the
+`/v1/execute` adapter. `/v1/query` and the admin browser continue to use the
+established metadata-driven scatter/gather readers. `BEGIN`, `COMMIT`,
+`ROLLBACK`, and transactions spanning HTTP requests are not enabled by this
+flag.
 
 To initialize a new data directory from an existing standard SQLite file, use
 the separate offline importer. The destination must not already exist, and the
@@ -474,8 +475,8 @@ unsafe or malformed foreign keys, virtual tables, and any change that breaks
 declared placement, Text collation, or one-owner uniqueness.
 
 The initial shard count is immutable, so resharding will require an explicit
-migration workflow. Opening upgrades exact version-1 through version-8
-manifests to version 9 through ordered, resumable steps.
+migration workflow. Opening upgrades exact version-1 through version-9
+manifests to version 10 through ordered, resumable steps.
 Version 3 introduced the versioned, generation-stamped 4,096-bucket routing
 map. Version 4 adds schema generation 0 and immutable logical metadata with
 default database ID 1 named `default`; identifier encoding version 1 accepts
@@ -537,9 +538,29 @@ immutable allocation-owner slot for every physical shard. The v8-to-v9
 migration preserves routing, placement, schema history, shard files, and rows;
 it assigns existing tables policy `None`, seeds `owner_slot = physical_shard_id`,
 raises the downgrade fence, and moves the semantic manifest checksum to version
-2 so both new catalogs are covered. This version defines and validates the
-`native_range_v1` ID format, but does not yet rewrite inserts or seed physical
-`sqlite_sequence` state.
+2 so both new catalogs are covered. This version defines the persisted
+`native_range_v1` ID format but does not activate allocation.
+
+Version 10 adds generated-policy activation, active/retired allocation-owner
+lifecycle, and a checksummed table-provisioning journal. The v9-to-v10 upgrade
+preserves every policy but marks it inactive, retains each prior owner as the
+active owner of its shard, raises the downgrade fence, and advances the
+semantic manifest checksum to version 3. Every later owner successor for a
+physical shard must have a greater slot than all of that shard's retired
+owners, preserving SQLite's non-decreasing `AUTOINCREMENT` high-water mark.
+Explicit activation requires the shard key to be exactly `INTEGER PRIMARY KEY
+AUTOINCREMENT` on every shard.
+Registration first commits the complete provisioning request, then installs
+each owner's reserved `sqlite_sequence` floor while all tables are empty, and
+publishes authority only after every floor is durable. Startup replays the
+journal's exact durable prefix idempotently. Reopen and shard admission validate
+the sequence range, owner-local rows, and high-water mark before use. Encoded
+explicit IDs route through active or retired persisted owners; new explicit IDs
+are rejected for retired owners, while marker-clear and negative legacy IDs
+keep their original hash route. An internal coordinator seam can allocate and
+capture one preflighted omitted-key row on an eligible active shard, but no
+public Engine or HTTP SQL path can invoke it yet. SQL declarations, omitted-key
+Engine planning, and response rendering remain issue #130.
 
 Registration marks schema admission `Pending` before its manifest commit. If
 that commit reports an ambiguous cleanup or I/O failure, close the registering

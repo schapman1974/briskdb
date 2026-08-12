@@ -14,7 +14,9 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::{
-    core::{CancellationToken, Database, EngineError, EngineErrorKind, EngineResult},
+    core::{
+        CancellationToken, Database, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
+    },
     storage::{MAX_SCHEMA_MIGRATION_SQL_BYTES, Storage},
 };
 
@@ -88,12 +90,54 @@ pub enum SqliteForeignKeyPolicy {
     Omit,
 }
 
+/// Explicit generated-ID policy for one imported SQLite table.
+///
+/// Existing import plans omit this field and retain the historical behavior:
+/// every imported key is caller-owned and routed by the legacy hash codec.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum SqliteGeneratedIdPlan {
+    /// Do not enable BriskDB-generated IDs for this table.
+    #[default]
+    None,
+    /// Seed one SQLite `AUTOINCREMENT` range per physical shard after
+    /// validating the named column as the table's signed-integer shard key.
+    #[non_exhaustive]
+    NativeRangeV1 {
+        /// Exact canonical lowercase generated column name.
+        column: String,
+    },
+}
+
+impl SqliteGeneratedIdPlan {
+    /// Construct an explicitly enabled native shard-range policy.
+    pub fn native_range_v1(column: impl Into<String>) -> EngineResult<Self> {
+        let column = column.into();
+        GeneratedIdPolicy::native_range_v1(column.clone())?;
+        Ok(Self::NativeRangeV1 { column })
+    }
+
+    /// Return the generated column, or `None` when generation is disabled.
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::NativeRangeV1 { column } => Some(column),
+        }
+    }
+}
+
+const fn generated_id_plan_is_none(policy: &SqliteGeneratedIdPlan) -> bool {
+    matches!(policy, SqliteGeneratedIdPlan::None)
+}
+
 /// Complete explicit import declaration for one source table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqliteTableImportPlan {
     name: String,
     placement: SqliteImportPlacement,
     foreign_keys: SqliteForeignKeyPolicy,
+    generated_id: SqliteGeneratedIdPlan,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -112,6 +156,8 @@ struct SqliteTableImportPlanWire {
     shard_key: Option<SqliteShardKeyPlan>,
     #[serde(default)]
     foreign_keys: SqliteForeignKeyPolicy,
+    #[serde(default)]
+    generated_id: SqliteGeneratedIdPlan,
 }
 
 #[derive(Serialize)]
@@ -122,6 +168,8 @@ struct SqliteTableImportPlanRef<'a> {
     shard_key: Option<&'a SqliteShardKeyPlan>,
     #[serde(skip_serializing_if = "foreign_key_policy_is_reject")]
     foreign_keys: SqliteForeignKeyPolicy,
+    #[serde(skip_serializing_if = "generated_id_plan_is_none")]
+    generated_id: &'a SqliteGeneratedIdPlan,
 }
 
 const fn foreign_key_policy_is_reject(policy: &SqliteForeignKeyPolicy) -> bool {
@@ -149,6 +197,7 @@ impl<'de> Deserialize<'de> for SqliteTableImportPlan {
             name: wire.name,
             placement,
             foreign_keys: wire.foreign_keys,
+            generated_id: wire.generated_id,
         })
     }
 }
@@ -169,6 +218,7 @@ impl Serialize for SqliteTableImportPlan {
             placement,
             shard_key,
             foreign_keys: self.foreign_keys,
+            generated_id: &self.generated_id,
         }
         .serialize(serializer)
     }
@@ -190,6 +240,7 @@ impl SqliteTableImportPlan {
                 },
             },
             foreign_keys: SqliteForeignKeyPolicy::Reject,
+            generated_id: SqliteGeneratedIdPlan::None,
         }
     }
 
@@ -201,6 +252,7 @@ impl SqliteTableImportPlan {
                 shard_key: SqliteShardKeyPlan::PrimaryKey,
             },
             foreign_keys: SqliteForeignKeyPolicy::Reject,
+            generated_id: SqliteGeneratedIdPlan::None,
         }
     }
 
@@ -210,6 +262,7 @@ impl SqliteTableImportPlan {
             name: name.into(),
             placement: SqliteImportPlacement::Global,
             foreign_keys: SqliteForeignKeyPolicy::Reject,
+            generated_id: SqliteGeneratedIdPlan::None,
         }
     }
 
@@ -218,6 +271,16 @@ impl SqliteTableImportPlan {
     pub fn with_foreign_key_policy(mut self, policy: SqliteForeignKeyPolicy) -> Self {
         self.foreign_keys = policy;
         self
+    }
+
+    /// Enable the native shard-local SQLite allocator for one generated key.
+    ///
+    /// Source-schema preflight still proves that this exact column is the
+    /// Sharded `Int64` key and is declared `INTEGER PRIMARY KEY
+    /// AUTOINCREMENT`; merely selecting the policy cannot weaken those checks.
+    pub fn with_native_range_v1(mut self, column: impl Into<String>) -> EngineResult<Self> {
+        self.generated_id = SqliteGeneratedIdPlan::native_range_v1(column)?;
+        Ok(self)
     }
 
     /// Return the exact declared source table name.
@@ -233,6 +296,11 @@ impl SqliteTableImportPlan {
     /// Return the source foreign-key policy.
     pub const fn foreign_key_policy(&self) -> SqliteForeignKeyPolicy {
         self.foreign_keys
+    }
+
+    /// Return the explicitly selected generated-ID import policy.
+    pub const fn generated_id_plan(&self) -> &SqliteGeneratedIdPlan {
+        &self.generated_id
     }
 }
 
@@ -636,6 +704,29 @@ mod tests {
             &SqliteImportPlacement::Sharded {
                 shard_key: SqliteShardKeyPlan::PrimaryKey
             }
+        );
+        assert_eq!(table.generated_id_plan(), &SqliteGeneratedIdPlan::None);
+        assert_eq!(
+            serde_json::to_string(&table).unwrap(),
+            r#"{"name":"events","placement":"sharded","shard_key":{"strategy":"primary_key"}}"#
+        );
+
+        let native: SqliteTableImportPlan = serde_json::from_str(
+            r#"{"name":"events","placement":"sharded","generated_id":{"policy":"native_range_v1","column":"id"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            native.generated_id_plan(),
+            &SqliteGeneratedIdPlan::NativeRangeV1 {
+                column: "id".to_owned()
+            }
+        );
+        assert_eq!(
+            SqliteTableImportPlan::sharded_by_primary_key("events")
+                .with_native_range_v1("Bad-Id")
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidArgument
         );
 
         assert!(

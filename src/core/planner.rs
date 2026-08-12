@@ -8,7 +8,9 @@ use crate::sql::{
 };
 
 use super::{
-    Catalog, EngineError, EngineErrorKind, EngineResult, LogicalDatabaseId, TablePlacement, Value,
+    AllocationOwnerMap, Catalog, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
+    LogicalDatabaseId, TableMetadata, TablePlacement, Value,
+    generated_id::{GeneratedIdClassification, classify_caller_generated_id},
 };
 
 /// Borrowed typed shard key encoded identically by every routing entry point.
@@ -178,6 +180,7 @@ pub(super) struct BoundStatementPlanInput<'a> {
     statement_index: usize,
     parameters: &'a [Value],
     explicit_routing_key: Option<&'a [u8]>,
+    allocation_owners: Option<&'a AllocationOwnerMap>,
 }
 
 impl<'a> BoundStatementPlanInput<'a> {
@@ -196,7 +199,16 @@ impl<'a> BoundStatementPlanInput<'a> {
             statement_index,
             parameters,
             explicit_routing_key,
+            allocation_owners: None,
         }
+    }
+
+    pub(super) const fn with_allocation_owners(
+        mut self,
+        allocation_owners: Option<&'a AllocationOwnerMap>,
+    ) -> Self {
+        self.allocation_owners = allocation_owners;
+        self
     }
 }
 
@@ -239,6 +251,7 @@ where
         statement_index,
         parameters,
         explicit_routing_key,
+        allocation_owners,
     } = input;
     let classification = classify_normalized_statements(normalized)?;
     let behavior = classification.behavior(statement_index).ok_or_else(|| {
@@ -250,6 +263,10 @@ where
     let schema_generation = catalog.schema_generation();
     let inference = infer_shard_keys(catalog, database, normalized, statement_index, parameters)?;
     validate_inference_shape(&inference)?;
+    let inferred_table = inference
+        .table_id()
+        .and_then(|table| catalog.table_by_id(table))
+        .filter(|table| table.database_id() == database);
 
     let mut unique_routes = HashMap::<&ShardKeyValue, PlannedRoute>::new();
     let mut inferred_routes = Vec::with_capacity(inference.values().len());
@@ -260,7 +277,13 @@ where
         }
         let key_bytes = canonical_key_bytes(value);
         let route = PlannedRoute {
-            shard: shard_for_key(&key_bytes),
+            shard: route_inferred_value(
+                inferred_table,
+                allocation_owners,
+                value,
+                &key_bytes,
+                &mut shard_for_key,
+            )?,
             key_bytes,
         };
         unique_routes.insert(value, route.clone());
@@ -268,9 +291,19 @@ where
     }
     drop(unique_routes);
 
-    let explicit_route = explicit_routing_key.map(|key| PlannedRoute {
-        shard: shard_for_key(key),
-        key_bytes: Arc::from(key),
+    let explicit_route = explicit_routing_key.map(|key| {
+        // A protocol routing key that is byte-for-byte the canonical inferred
+        // key must resolve through the same table policy. In particular, a
+        // native-range integer is owner-routed rather than re-hashed merely
+        // because it arrived through session context as decimal text.
+        let shard = inferred_routes
+            .iter()
+            .find(|route| route.key_bytes() == key)
+            .map_or_else(|| shard_for_key(key), PlannedRoute::shard);
+        PlannedRoute {
+            shard,
+            key_bytes: Arc::from(key),
+        }
     });
 
     let shard_key_column = sharded_key_column(catalog, database, &inference)?;
@@ -278,6 +311,7 @@ where
         .map(|column| routed_dml_shape(normalized, statement_index, column))
         .transpose()?
         .flatten();
+    reject_retired_owner_insert(dml, inferred_table, allocation_owners, inference.values())?;
     let inferred_shards = inferred_shards(&inferred_routes);
 
     if matches!(
@@ -318,6 +352,51 @@ where
         explicit_route,
         assigned_shard,
     })
+}
+
+fn reject_retired_owner_insert(
+    dml: Option<RoutedDml>,
+    table: Option<&TableMetadata>,
+    allocation_owners: Option<&AllocationOwnerMap>,
+    values: &[ShardKeyValue],
+) -> EngineResult<()> {
+    if dml != Some(RoutedDml::Insert) {
+        return Ok(());
+    }
+    let Some(table) = table else {
+        return Ok(());
+    };
+    let GeneratedIdPolicy::NativeRangeV1 { .. } = table.generated_id_policy() else {
+        return Ok(());
+    };
+    let owners = allocation_owners.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "native_range_v1 table metadata is missing its allocation-owner map",
+        )
+    })?;
+    for value in values {
+        let ShardKeyValue::Int64(value) = value else {
+            continue;
+        };
+        let GeneratedIdClassification::NativeRangeV1(native) =
+            classify_caller_generated_id(table.generated_id_policy(), *value)?
+        else {
+            continue;
+        };
+        if owners.physical_shard(native.owner()).is_some()
+            && !owners.owner_is_active(native.owner())
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "native_range_v1 owner {} is retired and cannot accept new IDs",
+                    native.owner().get()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,6 +528,49 @@ fn planning_invariant() -> EngineError {
     )
 }
 
+fn route_inferred_value<F>(
+    table: Option<&TableMetadata>,
+    allocation_owners: Option<&AllocationOwnerMap>,
+    value: &ShardKeyValue,
+    canonical_key: &[u8],
+    shard_for_key: &mut F,
+) -> EngineResult<u16>
+where
+    F: FnMut(&[u8]) -> u16,
+{
+    let Some(table) = table else {
+        return Ok(shard_for_key(canonical_key));
+    };
+    let (GeneratedIdPolicy::NativeRangeV1 { .. }, ShardKeyValue::Int64(value)) =
+        (table.generated_id_policy(), value)
+    else {
+        return Ok(shard_for_key(canonical_key));
+    };
+
+    let classification = classify_caller_generated_id(table.generated_id_policy(), *value)?;
+    let GeneratedIdClassification::NativeRangeV1(native) = classification else {
+        // Negative and pre-marker values deliberately retain the frozen legacy
+        // hash route so imported identifiers never move when native allocation
+        // is enabled explicitly for future rows.
+        return Ok(shard_for_key(canonical_key));
+    };
+    let owners = allocation_owners.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "native_range_v1 table metadata is missing its allocation-owner map",
+        )
+    })?;
+    owners.physical_shard(native.owner()).ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "native_range_v1 owner {} is not assigned to an active physical shard",
+                native.owner().get()
+            ),
+        )
+    })
+}
+
 fn canonical_key_bytes(value: &ShardKeyValue) -> Arc<[u8]> {
     let canonical = match value {
         ShardKeyValue::Int64(value) => {
@@ -544,6 +666,41 @@ mod tests {
             ]
             .into_boxed_slice(),
         )
+    }
+
+    fn native_range_catalog() -> Catalog {
+        Catalog::from_validated_parts(
+            1,
+            7,
+            DEFAULT_DATABASE,
+            vec![LogicalDatabaseMetadata::from_validated(
+                DEFAULT_DATABASE,
+                "default".to_owned(),
+            )]
+            .into_boxed_slice(),
+            vec![TableMetadata::from_validated_with_generated_id_policy(
+                EVENTS_TABLE,
+                DEFAULT_DATABASE,
+                "native_events".to_owned(),
+                TablePlacement::Sharded(ShardKeyMetadata::from_validated(
+                    "id".to_owned(),
+                    ShardKeyType::Int64,
+                )),
+                GeneratedIdPolicy::native_range_v1("id").unwrap(),
+            )]
+            .into_boxed_slice(),
+        )
+    }
+
+    fn owner_map(shard_count: u16) -> AllocationOwnerMap {
+        AllocationOwnerMap::try_from_pairs(
+            shard_count,
+            (0..shard_count)
+                .map(|shard| (shard, shard))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+        .unwrap()
     }
 
     fn register_engine_catalog_fixture(database: &mut Database) {
@@ -1113,6 +1270,184 @@ mod tests {
             let diagnostic = error.to_string();
             assert!(!diagnostic.contains("different-shard-context"));
             assert!(!diagnostic.contains("private"));
+        }
+    }
+
+    #[test]
+    fn native_ids_route_by_persisted_owner_and_canonical_explicit_context() {
+        let catalog = native_range_catalog();
+        let owners = owner_map(4);
+        let owner = owners.owner_for_physical_shard(2).unwrap();
+        let value = crate::core::generated_id::NativeRangeV1Id::new(owner, 41)
+            .unwrap()
+            .encode();
+        let normalized = normalize(
+            SqlDialect::Sqlite,
+            "INSERT INTO native_events (id) VALUES (?1)",
+        );
+        let explicit = value.to_string();
+        let plan = plan_bound_statement(
+            BoundStatementPlanInput::new(
+                &catalog,
+                database_id(DEFAULT_DATABASE),
+                &normalized,
+                0,
+                &[Value::Int64(value)],
+                Some(explicit.as_bytes()),
+            )
+            .with_allocation_owners(Some(&owners)),
+            RoutingProvenance::new(1, 1, 1, 1),
+            |_| 3,
+        )
+        .unwrap();
+
+        assert_eq!(plan.inferred_routes()[0].shard(), 2);
+        assert_eq!(plan.explicit_route().unwrap().shard(), 2);
+        assert_eq!(plan.assigned_shard(), Some(2));
+    }
+
+    #[test]
+    fn native_policy_preserves_legacy_hash_routes_exactly() {
+        let catalog = native_range_catalog();
+        let owners = owner_map(4);
+        let routing = routing_catalog(4);
+        for value in [-19_i64, 0, 42, 0x3fff_ffff_ffff_ffff] {
+            let normalized = normalize(
+                SqlDialect::Sqlite,
+                "SELECT * FROM native_events WHERE id = ?1",
+            );
+            let expected = routing.shard_for_key(value.to_string().as_bytes());
+            let plan = plan_bound_statement(
+                BoundStatementPlanInput::new(
+                    &catalog,
+                    database_id(DEFAULT_DATABASE),
+                    &normalized,
+                    0,
+                    &[Value::Int64(value)],
+                    None,
+                )
+                .with_allocation_owners(Some(&owners)),
+                RoutingProvenance::new(1, 1, 1, 1),
+                |key| routing.shard_for_key(key),
+            )
+            .unwrap();
+            assert_eq!(plan.inferred_routes()[0].shard(), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn retired_native_owner_routes_reads_but_rejects_new_explicit_ids() {
+        let catalog = native_range_catalog();
+        let owners = AllocationOwnerMap::try_from_assignments(
+            2,
+            vec![
+                (
+                    0,
+                    0,
+                    crate::core::generated_id::AllocationOwnerState::Retired,
+                ),
+                (
+                    2,
+                    0,
+                    crate::core::generated_id::AllocationOwnerState::Active,
+                ),
+                (
+                    1,
+                    1,
+                    crate::core::generated_id::AllocationOwnerState::Active,
+                ),
+            ]
+            .into_boxed_slice(),
+        )
+        .unwrap();
+        let retired_id = crate::core::generated_id::NativeRangeV1Id::new(
+            crate::core::generated_id::AllocationOwnerSlot::new(0).unwrap(),
+            41,
+        )
+        .unwrap()
+        .encode();
+
+        for source in [
+            "SELECT * FROM native_events WHERE id = ?1",
+            "DELETE FROM native_events WHERE id = ?1",
+        ] {
+            let normalized = normalize(SqlDialect::Sqlite, source);
+            let plan = plan_bound_statement(
+                BoundStatementPlanInput::new(
+                    &catalog,
+                    database_id(DEFAULT_DATABASE),
+                    &normalized,
+                    0,
+                    &[Value::Int64(retired_id)],
+                    None,
+                )
+                .with_allocation_owners(Some(&owners)),
+                RoutingProvenance::new(1, 1, 1, 1),
+                |_| 1,
+            )
+            .unwrap();
+            assert_eq!(plan.assigned_shard(), Some(0), "{source}");
+        }
+
+        let insert = normalize(
+            SqlDialect::Sqlite,
+            "INSERT INTO native_events (id) VALUES (?1)",
+        );
+        let error = plan_bound_statement(
+            BoundStatementPlanInput::new(
+                &catalog,
+                database_id(DEFAULT_DATABASE),
+                &insert,
+                0,
+                &[Value::Int64(retired_id)],
+                None,
+            )
+            .with_allocation_owners(Some(&owners)),
+            RoutingProvenance::new(1, 1, 1, 1),
+            |_| 1,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(error.diagnostic().contains("retired"));
+    }
+
+    #[test]
+    fn reserved_or_unassigned_native_owners_fail_before_execution() {
+        let catalog = native_range_catalog();
+        let owners = owner_map(4);
+        let normalized = normalize(
+            SqlDialect::Sqlite,
+            "INSERT INTO native_events (id) VALUES (?1)",
+        );
+        let reserved = crate::core::generated_id::native_range_v1_sequence_floor(
+            owners.owner_for_physical_shard(1).unwrap(),
+        );
+        let unassigned = crate::core::generated_id::NativeRangeV1Id::new(
+            crate::core::generated_id::AllocationOwnerSlot::new(9).unwrap(),
+            1,
+        )
+        .unwrap()
+        .encode();
+
+        for (value, kind) in [
+            (reserved, EngineErrorKind::InvalidArgument),
+            (unassigned, EngineErrorKind::FailedPrecondition),
+        ] {
+            let error = plan_bound_statement(
+                BoundStatementPlanInput::new(
+                    &catalog,
+                    database_id(DEFAULT_DATABASE),
+                    &normalized,
+                    0,
+                    &[Value::Int64(value)],
+                    None,
+                )
+                .with_allocation_owners(Some(&owners)),
+                RoutingProvenance::new(1, 1, 1, 1),
+                |_| 0,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), kind, "{value}: {error}");
         }
     }
 

@@ -49,14 +49,14 @@ enable it with `EngineOptions::with_experimental_vtab_writes(true)`; the server
 maps `--experimental-vtab-writes` and
 `BRISKDB_EXPERIMENTAL_VTAB_WRITES=true` to that same option.
 
-With both gates enabled, `Engine::execute` and HTTP `/v1/execute` dispatch a
-write through the coordinator only after the authoritative catalog, common SQL
-frontend, bound values, caller route, and single-owner write policy
-have accepted one Sharded target. The returned `shard` remains the planner's
-assigned owner. `rows_affected` comes from the reconciled physical child, and a
-successful response is produced only after the autocommit child transaction
-commits under BriskDB's configured SQLite WAL and synchronous policy. The
-endpoint's request and response shapes do not change.
+With both gates enabled, `Engine::execute`, `Engine::execute_write`, and HTTP
+`/v1/execute` dispatch a write through the coordinator only after the
+authoritative catalog, common SQL frontend, bound values, caller route, and
+single-owner write policy have accepted one Sharded target. The returned
+`shard` remains the planner's assigned owner. `rows_affected` comes from the
+reconciled physical child, and a successful response is produced only after the
+autocommit child transaction commits under BriskDB's configured SQLite WAL and
+synchronous policy. The endpoint's request and response shapes do not change.
 
 The Engine caches the validated physical table descriptors for the current
 schema generation. One serialized cold bootstrap discovers them through a
@@ -65,11 +65,22 @@ opens reuse those immutable descriptors and reserve only the DML target shard,
 preserving independent-shard writer progress. Schema-generation publication
 invalidates the cache and makes the next write rediscover descriptors.
 
-This Engine bridge currently rejects a target table that declares
-`native_range_v1`, including writes that supply an explicit ID. Issue #128 owns
-making Engine planning, returned-shard reporting, and per-shard admission use
-the encoded allocation owner consistently. The storage-internal coordinator's
-native-ID behavior is not exposed through Engine before that work lands.
+For a target table declaring `native_range_v1`, an explicit valid native ID is
+routed through its persisted allocation owner at planning, pool admission,
+coordinator execution, and returned-shard reporting. Marker-clear and negative
+legacy IDs retain the exact ordinary Int64 hash route. A reserved sequence
+floor or an owner absent from the active map is rejected before mutation.
+
+The coordinator also has a narrow generated-insert seam for issue #130's
+planner: a caller that has already proven one omitted-key row and selected one
+eligible shard can arm exactly one callback. The child uses
+`INSERT ... RETURNING id`, checks `sqlite_sequence` and decoded ownership on the
+same pinned handle, and retains the generated key only after successful
+reconciliation. `Engine::execute_write` has the protocol-neutral result shape
+needed to carry that data, but every currently accepted Engine statement returns
+`generated_key: None`: Engine and HTTP SQL planning still reject omitted shard
+keys. Dialect translation, Engine invocation, and public response rendering
+belong to #130.
 
 The integration opens an ephemeral coordinator for one statement. It does not
 retain a coordinator in `Session`, and it does not add `BEGIN`, `COMMIT`,
@@ -201,17 +212,18 @@ This is why several alternatives are excluded:
 
 ## Current non-goals
 
-The writable coordinator provides explicit-key DML on one pinned Sharded child,
-and the opt-in Engine/HTTP integration exposes only one-statement autocommit
-writes. It does not provide missing/generated keys, replicated Global writes,
-multi-shard or session transactions, `RETURNING`, physical defaults, generated
-columns, physical triggers, client-created virtual-table indexes or triggers,
-`ALTER TABLE`, aggregate/order/limit/join pushdown, parallel shard scans, or a
-public virtual-table query API. The physical-default restriction is
-intentional: SQLite's `xUpdate` arguments do not distinguish an omitted column
-from explicit `NULL`. Generated keys and omitted-key SQL integration remain
-owned by issues #128 through #130, and the broader rollout gate remains owned
-by #131.
+The writable coordinator provides explicit-key DML and the preflighted
+single-row native allocation seam on one pinned Sharded child. The opt-in
+Engine/HTTP integration currently exposes only explicit-key one-statement
+autocommit writes. It does not provide general missing-key SQL, replicated
+Global writes, multi-shard or session transactions, caller-authored
+`RETURNING`, physical defaults, generated columns, physical triggers,
+client-created virtual-table indexes or triggers, `ALTER TABLE`,
+aggregate/order/limit/join pushdown, parallel shard scans, or a public
+virtual-table query API. The physical-default restriction is intentional:
+SQLite's `xUpdate` arguments do not distinguish an omitted column from explicit
+`NULL`, so only an AST-preflighted intent may enable allocation. Omitted-key SQL
+integration remains owned by #130, and the broader rollout gate by #131.
 
 The established protocol planner stays authoritative. The writable coordinator
 is kept behind both `experimental-vtab` and the runtime option and cannot be

@@ -10,7 +10,8 @@ use rusqlite::{
 use crate::{
     core::{
         CancellationToken, CanonicalShardKeyRef, EngineError, EngineErrorKind, EngineResult,
-        ShardKeyType, TablePlacement, canonical_shard_key_bytes,
+        GeneratedIdPolicy, ShardKeyType, TablePlacement, canonical_shard_key_bytes,
+        generated_id::{AllocationOwnerMap, AllocationOwnerSlot, native_range_v1_sequence_floor},
     },
     sqlite_error,
     storage::Storage,
@@ -80,7 +81,12 @@ fn copy_and_verify_on_connections(
     begin_target_transactions(targets)?;
     let copied = (|| {
         let expectations = copy_tables(source, storage, targets, cancellation)?;
-        restore_sequences(source.sequences(), targets, cancellation)?;
+        restore_sequences(
+            source,
+            storage.allocation_owner_map(),
+            targets,
+            cancellation,
+        )?;
         commit_target_transactions(targets, cancellation, fault)?;
         Ok(expectations)
     })();
@@ -94,7 +100,12 @@ fn copy_and_verify_on_connections(
 
     ensure_not_cancelled(cancellation)?;
     let reports = verify_tables(source, storage, targets, &expectations, cancellation)?;
-    verify_sequences(source.sequences(), targets, cancellation)?;
+    verify_sequences(
+        source,
+        storage.allocation_owner_map(),
+        targets,
+        cancellation,
+    )?;
     for (shard, connection) in targets.iter().enumerate() {
         ensure_not_cancelled(cancellation)?;
         verify_quick_check(connection, shard)?;
@@ -216,7 +227,7 @@ fn validate_committed_placement(storage: &Storage, table: &SourceTable) -> Engin
             ),
         )
     })?;
-    let matches = match (table.placement(), committed.placement()) {
+    let placement_matches = match (table.placement(), committed.placement()) {
         (SqliteImportPlacement::Global, TablePlacement::Global) => table.shard_key().is_none(),
         (SqliteImportPlacement::Sharded { .. }, TablePlacement::Sharded(committed_key)) => {
             table.shard_key().is_some_and(|source_key| {
@@ -226,7 +237,7 @@ fn validate_committed_placement(storage: &Storage, table: &SourceTable) -> Engin
         }
         _ => false,
     };
-    if matches {
+    if placement_matches && table.generated_id_policy() == committed.generated_id_policy() {
         Ok(())
     } else {
         Err(EngineError::new(
@@ -509,15 +520,17 @@ fn canonical_key_for_import<'a>(
 }
 
 fn restore_sequences(
-    sequences: &[SourceSequence],
+    source: &SourceSnapshot,
+    allocation_owners: Option<&AllocationOwnerMap>,
     targets: &[Connection],
     cancellation: &CancellationToken,
 ) -> EngineResult<()> {
+    let native_tables = native_range_v1_tables(source);
     for (shard, connection) in targets.iter().enumerate() {
         ensure_not_cancelled(cancellation)?;
         let exists = sqlite_sequence_exists(connection)?;
         if !exists {
-            if sequences.is_empty() {
+            if source.sequences().is_empty() && native_tables.is_empty() {
                 continue;
             }
             return Err(EngineError::new(
@@ -527,10 +540,26 @@ fn restore_sequences(
                 ),
             ));
         }
-        connection
-            .execute("DELETE FROM main.sqlite_sequence", [])
+        let sequence_names = connection
+            .prepare("SELECT name FROM main.sqlite_sequence ORDER BY rowid")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
             .map_err(sqlite_error::storage)?;
-        for sequence in sequences {
+        for name in sequence_names {
+            if !native_tables.iter().any(|table| table == &name) {
+                connection
+                    .execute("DELETE FROM main.sqlite_sequence WHERE name = ?1", [&name])
+                    .map_err(sqlite_error::storage)?;
+            }
+        }
+        for sequence in source
+            .sequences()
+            .iter()
+            .filter(|sequence| !native_tables.iter().any(|table| table == sequence.table()))
+        {
             ensure_not_cancelled(cancellation)?;
             connection
                 .execute(
@@ -543,8 +572,96 @@ fn restore_sequences(
                     ))
                 })?;
         }
+        if !native_tables.is_empty() {
+            let owner = import_allocation_owner(allocation_owners, shard)?;
+            let floor = native_range_v1_sequence_floor(owner);
+            for table in &native_tables {
+                ensure_not_cancelled(cancellation)?;
+                validate_imported_native_sequence_floor(connection, table, floor, shard)?;
+            }
+        }
     }
     Ok(())
+}
+
+fn validate_imported_native_sequence_floor(
+    connection: &Connection,
+    table: &str,
+    floor: i64,
+    shard: usize,
+) -> EngineResult<()> {
+    let rows = connection
+        .query_row(
+            "SELECT count(*) FROM main.sqlite_sequence WHERE name = ?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    if rows != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!(
+                "native_range_v1 import table {table} has {rows} sqlite_sequence rows on physical shard {shard}; expected exactly one provisioned owner floor"
+            ),
+        ));
+    }
+    let observed = connection
+        .query_row(
+            "SELECT seq FROM main.sqlite_sequence WHERE name = ?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            sqlite_error::storage(error).context(format!(
+                "native_range_v1 import table {table} has a malformed sqlite_sequence value on physical shard {shard}"
+            ))
+        })?;
+    if observed != floor {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!(
+                "native_range_v1 import table {table} has sqlite_sequence {observed} on physical shard {shard}; expected provisioned owner floor {floor}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn import_allocation_owner(
+    allocation_owners: Option<&AllocationOwnerMap>,
+    shard: usize,
+) -> EngineResult<AllocationOwnerSlot> {
+    let shard = u16::try_from(shard).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::LimitExceeded,
+            "SQLite import shard index exceeds its supported representation",
+            error,
+        )
+    })?;
+    allocation_owners
+        .and_then(|owners| owners.owner_for_physical_shard(shard))
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "native_range_v1 SQLite import is missing an allocation owner for physical shard {shard}"
+                ),
+            )
+        })
+}
+
+fn native_range_v1_tables(source: &SourceSnapshot) -> Vec<String> {
+    source
+        .tables()
+        .iter()
+        .filter(|table| {
+            matches!(
+                table.generated_id_policy(),
+                GeneratedIdPolicy::NativeRangeV1 { .. }
+            )
+        })
+        .map(|table| table.name().to_owned())
+        .collect()
 }
 
 fn verify_tables(
@@ -691,17 +808,28 @@ fn scan_target_table(
 }
 
 fn verify_sequences(
-    source: &[SourceSequence],
+    source: &SourceSnapshot,
+    allocation_owners: Option<&AllocationOwnerMap>,
     targets: &[Connection],
     cancellation: &CancellationToken,
 ) -> EngineResult<()> {
-    let mut expected = source
+    let native_tables = native_range_v1_tables(source);
+    let mut ordinary_expected = source
+        .sequences()
         .iter()
+        .filter(|sequence| !native_tables.iter().any(|table| table == sequence.table()))
         .map(|sequence| (sequence.table().to_owned(), sequence.seq()))
         .collect::<Vec<_>>();
-    expected.sort();
+    ordinary_expected.sort();
     for (shard, connection) in targets.iter().enumerate() {
         ensure_not_cancelled(cancellation)?;
+        let mut expected = ordinary_expected.clone();
+        if !native_tables.is_empty() {
+            let floor =
+                native_range_v1_sequence_floor(import_allocation_owner(allocation_owners, shard)?);
+            expected.extend(native_tables.iter().map(|table| (table.clone(), floor)));
+        }
+        expected.sort();
         if !sqlite_sequence_exists(connection)? {
             if expected.is_empty() {
                 continue;
@@ -960,6 +1088,88 @@ fn row_count_overflow() -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequence_restore_keeps_native_owner_floors_instead_of_source_high_water() {
+        let source_file = tempfile::NamedTempFile::new().unwrap();
+        let source_connection = Connection::open(source_file.path()).unwrap();
+        source_connection
+            .execute_batch(
+                "CREATE TABLE native_ids(
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     value TEXT NOT NULL
+                 );
+                 CREATE TABLE legacy_ids(
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     value TEXT NOT NULL
+                 );
+                 INSERT INTO native_ids(id, value) VALUES (17, 'legacy-native-table');
+                 INSERT INTO legacy_ids(id, value) VALUES (23, 'legacy-table');",
+            )
+            .unwrap();
+        drop(source_connection);
+        let plan = super::super::SqliteImportPlan::new(vec![
+            super::super::SqliteTableImportPlan::sharded_by_primary_key("native_ids")
+                .with_native_range_v1("id")
+                .unwrap(),
+            super::super::SqliteTableImportPlan::sharded_by_primary_key("legacy_ids"),
+        ]);
+        let source = SourceSnapshot::open(source_file.path(), &plan).unwrap();
+        let owners =
+            AllocationOwnerMap::try_from_pairs(2, vec![(7, 0), (3, 1)].into_boxed_slice()).unwrap();
+        let targets = (0..2)
+            .map(|shard| {
+                let connection = Connection::open_in_memory().unwrap();
+                connection
+                    .execute_batch(
+                        "CREATE TABLE native_ids(
+                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                             value TEXT NOT NULL
+                         );
+                         CREATE TABLE legacy_ids(
+                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                             value TEXT NOT NULL
+                         );",
+                    )
+                    .unwrap();
+                let owner = owners.owner_for_physical_shard(shard).unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO sqlite_sequence(name, seq) VALUES ('native_ids', ?1)",
+                        [native_range_v1_sequence_floor(owner)],
+                    )
+                    .unwrap();
+                connection
+            })
+            .collect::<Vec<_>>();
+
+        restore_sequences(&source, Some(&owners), &targets, &CancellationToken::new()).unwrap();
+        verify_sequences(&source, Some(&owners), &targets, &CancellationToken::new()).unwrap();
+        for (shard, connection) in targets.iter().enumerate() {
+            let native: i64 = connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'native_ids'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let owner = owners
+                .owner_for_physical_shard(u16::try_from(shard).unwrap())
+                .unwrap();
+            assert_eq!(native, native_range_v1_sequence_floor(owner));
+            assert_ne!(native, 17);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT seq FROM sqlite_sequence WHERE name = 'legacy_ids'",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                23
+            );
+        }
+    }
 
     #[test]
     fn multiset_digest_is_order_independent_and_multiplicity_sensitive() {

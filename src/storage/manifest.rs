@@ -5,6 +5,9 @@ use rusqlite::{Connection, Transaction, TransactionBehavior, types::ValueRef};
 #[cfg(test)]
 use std::cell::Cell;
 
+#[cfg(all(test, feature = "experimental-vtab"))]
+use crate::core::generated_id::AllocationOwnerSlot;
+use crate::core::generated_id::AllocationOwnerState;
 use crate::{
     core::{
         AllocationOwnerMap, BUCKET_ALGORITHM_VERSION, Catalog, CatalogSnapshot,
@@ -12,7 +15,7 @@ use crate::{
         EngineResult, GeneratedIdPolicy, HASH_VERSION, IDENTIFIER_ENCODING_VERSION,
         INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION, LogicalDatabaseMetadata,
         MAX_LOGICAL_DATABASES, MAX_TABLES, RoutingCatalog, ShardKeyMetadata, ShardKeyType,
-        TableDeclaration, TableMetadata, TablePlacement, VIRTUAL_BUCKET_COUNT,
+        TableDeclaration, TableId, TableMetadata, TablePlacement, VIRTUAL_BUCKET_COUNT,
         initial_physical_shard, validate_catalog_identifier,
     },
     sqlite_error,
@@ -31,7 +34,8 @@ const V6_SCHEMA_VERSION: u32 = 6;
 const V7_SCHEMA_VERSION: u32 = 7;
 const V8_SCHEMA_VERSION: u32 = 8;
 const V9_SCHEMA_VERSION: u32 = 9;
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = V9_SCHEMA_VERSION;
+const V10_SCHEMA_VERSION: u32 = 10;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = V10_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
 
 pub(super) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = 65_536;
@@ -39,11 +43,15 @@ pub(super) const MAX_SCHEMA_GENERATION: u64 = i32::MAX as u64;
 const SCHEMA_MIGRATION_DIGEST_VERSION: u32 = 1;
 const SCHEMA_MIGRATION_APPLYING: i64 = 1;
 const SCHEMA_MIGRATION_COMPLETE: i64 = 2;
+const TABLE_PROVISIONING_DIGEST_VERSION: u32 = 1;
 const V1_MANIFEST_DIGEST_VERSION: u32 = 1;
 const V2_MANIFEST_DIGEST_VERSION: u32 = 2;
+const V3_MANIFEST_DIGEST_VERSION: u32 = 3;
 pub(super) const SCHEMA_DIGEST_VERSION: u32 = 1;
 const V1_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v1\0";
 const V2_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v2\0";
+const V3_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v3\0";
+const TABLE_PROVISIONING_DIGEST_DOMAIN: &[u8] = b"briskdb.table-provisioning.v1\0";
 
 const DATABASE_STATE_VERIFYING: i64 = 1;
 const DATABASE_STATE_READY: i64 = 2;
@@ -59,8 +67,12 @@ const TEXT_SHARD_KEY_TYPE: i64 = 2;
 const BINARY_SHARD_KEY_TYPE: i64 = 3;
 const GENERATED_ID_POLICY_NONE: i64 = 0;
 const GENERATED_ID_POLICY_NATIVE_RANGE_V1: i64 = 1;
+const GENERATED_ID_INACTIVE: i64 = 0;
+const GENERATED_ID_ACTIVE: i64 = 1;
 const NATIVE_RANGE_V1_ENCODING_VERSION: u32 = 1;
 const MAX_ALLOCATION_OWNER_SLOT: i64 = 1_023;
+const ALLOCATION_OWNER_ACTIVE: i64 = 1;
+const ALLOCATION_OWNER_RETIRED: i64 = 2;
 
 const ACTIVE_LIFECYCLE_STATE: &str = "active";
 
@@ -120,6 +132,10 @@ const V8_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
 const V9_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
         CHECK (requires_manifest_version >= 9)
+) STRICT";
+const V10_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 10)
 ) STRICT";
 const V3_ROUTING_TABLE_SQL: &str = "CREATE TABLE briskdb_routing (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -248,6 +264,42 @@ const V9_GENERATED_IDS_TABLE_SQL: &str = "CREATE TABLE briskdb_generated_ids (
         )
     )
 ) STRICT";
+const V10_GENERATED_IDS_TABLE_SQL: &str = "CREATE TABLE briskdb_generated_ids (
+    table_id INTEGER PRIMARY KEY CHECK (table_id > 0),
+    policy INTEGER NOT NULL CHECK (policy >= 0),
+    generated_column TEXT COLLATE BINARY
+        CHECK (
+            generated_column IS NULL OR (
+                length(generated_column) BETWEEN 1 AND 63
+                AND instr(generated_column, char(0)) = 0
+                AND generated_column NOT GLOB '*[^a-z0-9_]*'
+                AND substr(generated_column, 1, 1) GLOB '[a-z_]'
+                AND generated_column <> 'briskdb'
+                AND generated_column NOT GLOB 'briskdb_*'
+                AND generated_column NOT GLOB 'sqlite_*'
+            )
+        ),
+    encoding_version INTEGER
+        CHECK (encoding_version IS NULL OR encoding_version > 0),
+    activation_state INTEGER NOT NULL CHECK (activation_state IN (0, 1)),
+    FOREIGN KEY (table_id)
+        REFERENCES briskdb_tables (table_id)
+        ON DELETE RESTRICT,
+    CHECK (
+        (
+            policy = 0
+            AND generated_column IS NULL
+            AND encoding_version IS NULL
+            AND activation_state = 0
+        )
+        OR
+        (
+            policy > 0
+            AND generated_column IS NOT NULL
+            AND encoding_version IS NOT NULL
+        )
+    )
+) STRICT";
 const V9_ALLOCATION_OWNERS_TABLE_SQL: &str = "CREATE TABLE briskdb_allocation_owners (
     owner_slot INTEGER PRIMARY KEY CHECK (owner_slot BETWEEN 0 AND 1023),
     physical_shard_id INTEGER NOT NULL UNIQUE
@@ -255,6 +307,99 @@ const V9_ALLOCATION_OWNERS_TABLE_SQL: &str = "CREATE TABLE briskdb_allocation_ow
     FOREIGN KEY (physical_shard_id)
         REFERENCES briskdb_physical_shards (shard_id)
         ON DELETE RESTRICT
+) STRICT";
+const V10_ALLOCATION_OWNERS_TABLE_SQL: &str = "CREATE TABLE briskdb_allocation_owners (
+    owner_slot INTEGER PRIMARY KEY CHECK (owner_slot BETWEEN 0 AND 1023),
+    physical_shard_id INTEGER NOT NULL
+        CHECK (physical_shard_id BETWEEN 0 AND 63),
+    owner_state INTEGER NOT NULL CHECK (owner_state IN (1, 2)),
+    FOREIGN KEY (physical_shard_id)
+        REFERENCES briskdb_physical_shards (shard_id)
+        ON DELETE RESTRICT
+) STRICT";
+const V10_ACTIVE_OWNER_INDEX_SQL: &str = "CREATE UNIQUE INDEX briskdb_one_active_owner_per_shard
+ON briskdb_allocation_owners (physical_shard_id)
+WHERE owner_state = 1";
+const V10_TABLE_PROVISIONING_SQL: &str = "CREATE TABLE briskdb_table_provisioning (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    provisioning_id BLOB NOT NULL
+        CHECK (typeof(provisioning_id) = 'blob' AND length(provisioning_id) = 32),
+    digest_version INTEGER NOT NULL CHECK (digest_version = 1),
+    schema_digest_version INTEGER NOT NULL CHECK (schema_digest_version = 1),
+    committed_schema_digest BLOB NOT NULL
+        CHECK (typeof(committed_schema_digest) = 'blob' AND length(committed_schema_digest) = 32),
+    shard_count INTEGER NOT NULL CHECK (shard_count BETWEEN 2 AND 64),
+    declaration_count INTEGER NOT NULL CHECK (declaration_count BETWEEN 1 AND 4096),
+    next_shard INTEGER NOT NULL CHECK (next_shard BETWEEN 0 AND shard_count)
+) STRICT";
+const V10_TABLE_PROVISIONING_DECLARATIONS_SQL: &str =
+    "CREATE TABLE briskdb_table_provisioning_declarations (
+    provisioning_singleton INTEGER NOT NULL CHECK (provisioning_singleton = 1),
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 4095),
+    database_id INTEGER NOT NULL CHECK (database_id > 0),
+    table_name TEXT NOT NULL COLLATE BINARY
+        CHECK (
+            length(table_name) BETWEEN 1 AND 63
+            AND instr(table_name, char(0)) = 0
+            AND table_name NOT GLOB '*[^a-z0-9_]*'
+            AND substr(table_name, 1, 1) GLOB '[a-z_]'
+            AND table_name <> 'briskdb'
+            AND table_name NOT GLOB 'briskdb_*'
+            AND table_name NOT GLOB 'sqlite_*'
+        ),
+    placement INTEGER NOT NULL CHECK (placement IN (1, 2, 3)),
+    shard_key_column TEXT COLLATE BINARY
+        CHECK (
+            shard_key_column IS NULL OR (
+                length(shard_key_column) BETWEEN 1 AND 63
+                AND instr(shard_key_column, char(0)) = 0
+                AND shard_key_column NOT GLOB '*[^a-z0-9_]*'
+                AND substr(shard_key_column, 1, 1) GLOB '[a-z_]'
+                AND shard_key_column <> 'briskdb'
+                AND shard_key_column NOT GLOB 'briskdb_*'
+                AND shard_key_column NOT GLOB 'sqlite_*'
+            )
+        ),
+    shard_key_type INTEGER
+        CHECK (shard_key_type IS NULL OR shard_key_type IN (1, 2, 3)),
+    generated_policy INTEGER NOT NULL CHECK (generated_policy >= 0),
+    generated_column TEXT COLLATE BINARY,
+    generated_encoding_version INTEGER
+        CHECK (generated_encoding_version IS NULL OR generated_encoding_version > 0),
+    PRIMARY KEY (provisioning_singleton, ordinal),
+    UNIQUE (provisioning_singleton, database_id, table_name),
+    FOREIGN KEY (provisioning_singleton)
+        REFERENCES briskdb_table_provisioning (singleton)
+        ON DELETE CASCADE,
+    FOREIGN KEY (database_id)
+        REFERENCES briskdb_logical_databases (database_id)
+        ON DELETE RESTRICT,
+    CHECK (
+        (
+            placement = 1
+            AND shard_key_column IS NOT NULL
+            AND shard_key_type IS NOT NULL
+        )
+        OR
+        (
+            placement IN (2, 3)
+            AND shard_key_column IS NULL
+            AND shard_key_type IS NULL
+        )
+    ),
+    CHECK (
+        (
+            generated_policy = 0
+            AND generated_column IS NULL
+            AND generated_encoding_version IS NULL
+        )
+        OR
+        (
+            generated_policy > 0
+            AND generated_column IS NOT NULL
+            AND generated_encoding_version IS NOT NULL
+        )
+    )
 ) STRICT";
 const V5_SHARD_LAYOUT_TABLE_SQL: &str = "CREATE TABLE briskdb_shard_layout (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -465,6 +610,51 @@ pub(super) enum SchemaMigrationClassification {
     Complete(SchemaMigration),
 }
 
+/// One fully validated, checksummed table-provisioning journal.
+///
+/// The durable prefix means every shard below `next_shard` has committed the
+/// exact native-range sequence seed for every declaration in this journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NativeTableProvisioning {
+    provisioning_id: [u8; 32],
+    committed_schema_digest: [u8; 32],
+    shard_count: u16,
+    declarations: Box<[TableDeclaration]>,
+    next_shard: u16,
+}
+
+impl NativeTableProvisioning {
+    #[cfg(test)]
+    pub(super) const fn provisioning_id(&self) -> [u8; 32] {
+        self.provisioning_id
+    }
+
+    #[cfg(test)]
+    pub(super) const fn committed_schema_digest(&self) -> [u8; 32] {
+        self.committed_schema_digest
+    }
+
+    pub(super) const fn shard_count(&self) -> u16 {
+        self.shard_count
+    }
+
+    pub(super) fn declarations(&self) -> &[TableDeclaration] {
+        &self.declarations
+    }
+
+    pub(super) const fn next_shard(&self) -> u16 {
+        self.next_shard
+    }
+}
+
+/// Exact classification of a requested table-provisioning operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NativeTableProvisioningClassification {
+    Absent,
+    Active(NativeTableProvisioning),
+    Complete,
+}
+
 #[derive(Clone, Copy)]
 struct Migration {
     from: u32,
@@ -483,6 +673,8 @@ struct ManifestSnapshot {
     active_migration: Option<SchemaMigration>,
     integrity: Option<ManifestIntegrity>,
     allocation_owners: Option<AllocationOwnerMap>,
+    active_native_id_table_ids: Box<[TableId]>,
+    active_table_provisioning: Option<NativeTableProvisioning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,6 +683,8 @@ pub(super) struct LoadedManifest {
     shard_layout: ShardLayout,
     active_migration: Option<SchemaMigration>,
     integrity: ManifestIntegrity,
+    active_native_id_table_ids: Box<[TableId]>,
+    active_table_provisioning: Option<NativeTableProvisioning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +711,12 @@ impl LoadedManifest {
         self.active_migration.as_ref()
     }
 
+    #[cfg(test)]
+    pub(super) fn active_table_provisioning(&self) -> Option<&NativeTableProvisioning> {
+        self.active_table_provisioning.as_ref()
+    }
+
+    #[cfg(test)]
     pub(super) fn into_parts_with_migration(
         self,
     ) -> (
@@ -530,6 +730,27 @@ impl LoadedManifest {
             self.shard_layout,
             self.active_migration,
             self.integrity,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(super) fn into_parts_with_recovery(
+        self,
+    ) -> (
+        CatalogSnapshot,
+        ShardLayout,
+        Option<SchemaMigration>,
+        ManifestIntegrity,
+        Box<[TableId]>,
+        Option<NativeTableProvisioning>,
+    ) {
+        (
+            self.catalog,
+            self.shard_layout,
+            self.active_migration,
+            self.integrity,
+            self.active_native_id_table_ids,
+            self.active_table_provisioning,
         )
     }
 }
@@ -591,6 +812,13 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v8_to_v9,
         validate: validate_v9,
     },
+    Migration {
+        from: V9_SCHEMA_VERSION,
+        to: V10_SCHEMA_VERSION,
+        name: "native_id_activation_and_table_provisioning",
+        apply: migrate_v9_to_v10,
+        validate: validate_v10,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -604,8 +832,8 @@ struct MigrationPlan<'a> {
 const CURRENT_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: CURRENT_SCHEMA_VERSION,
     migrations: MIGRATIONS,
-    initialize_current: create_v9_schema,
-    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v9,
+    initialize_current: create_v10_schema,
+    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v10,
 };
 
 // Startup uses this frozen plan only to finish an already-active v6 journal
@@ -675,6 +903,7 @@ pub(super) fn load_or_create_manifest_with_fresh_layout(
         fresh_layout_allowed,
         &mut |_| Ok(()),
     )?;
+    let active_native_id_table_ids = std::mem::take(&mut snapshot.active_native_id_table_ids);
     let catalog = catalog_snapshot_from_parts(
         snapshot.routing_catalog.take(),
         snapshot.logical_catalog.take(),
@@ -697,6 +926,8 @@ pub(super) fn load_or_create_manifest_with_fresh_layout(
         shard_layout,
         active_migration: snapshot.active_migration,
         integrity,
+        active_native_id_table_ids,
+        active_table_provisioning: snapshot.active_table_provisioning,
     })
 }
 
@@ -1434,6 +1665,628 @@ fn current_manifest_snapshot(
     }
 }
 
+/// Classify an exact native table-provisioning request without changing it.
+#[cfg(test)]
+pub(super) fn classify_native_table_provisioning(
+    connection: &mut Connection,
+    requested_shards: u16,
+    declarations: Vec<TableDeclaration>,
+    committed_schema_digest: [u8; 32],
+) -> EngineResult<NativeTableProvisioningClassification> {
+    let declarations = normalize_table_provisioning_declarations(declarations)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    let result = classify_native_table_provisioning_snapshot(
+        &snapshot,
+        &declarations,
+        committed_schema_digest,
+    )?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(result)
+}
+
+/// Durably publish a pending native table-provisioning journal before any
+/// shard-local sequence is seeded.
+pub(super) fn begin_native_table_provisioning<F>(
+    connection: &mut Connection,
+    requested_shards: u16,
+    declarations: Vec<TableDeclaration>,
+    committed_schema_digest: [u8; 32],
+    on_commit_attempted: F,
+) -> EngineResult<NativeTableProvisioningClassification>
+where
+    F: FnOnce(),
+{
+    let mut on_commit_attempted = Some(on_commit_attempted);
+    let declarations = normalize_table_provisioning_declarations(declarations)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    match classify_native_table_provisioning_snapshot(
+        &snapshot,
+        &declarations,
+        committed_schema_digest,
+    )? {
+        NativeTableProvisioningClassification::Active(active) => {
+            on_commit_attempted
+                .take()
+                .expect("table-provisioning commit callback is one-shot")();
+            transaction.commit().map_err(sqlite_error::storage)?;
+            return Ok(NativeTableProvisioningClassification::Active(active));
+        }
+        NativeTableProvisioningClassification::Complete => {
+            transaction.commit().map_err(sqlite_error::storage)?;
+            return Ok(NativeTableProvisioningClassification::Complete);
+        }
+        NativeTableProvisioningClassification::Absent => {}
+    }
+    ensure_table_registration_ready(&snapshot)?;
+    if snapshot.active_migration.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "table provisioning cannot run during an application-schema migration",
+        ));
+    }
+    let integrity = snapshot.integrity.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "table provisioning requires checksummed integrity metadata",
+        )
+    })?;
+    if integrity.committed_schema_digest() != Some(committed_schema_digest) {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "table provisioning schema digest does not match the committed schema",
+        ));
+    }
+    let catalog = snapshot.logical_catalog.as_ref().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "table provisioning validation omitted the logical catalog",
+        )
+    })?;
+    for declaration in declarations.iter() {
+        if catalog.database_by_id(declaration.database_id()).is_none() {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!(
+                    "table {} references an unknown logical database",
+                    declaration.name()
+                ),
+            ));
+        }
+    }
+    if !catalog.tables().is_empty() && !declarations_match_catalog_owned(&declarations, catalog) {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "the authoritative table catalog is already registered with different declarations",
+        ));
+    }
+
+    let provisioning_id =
+        table_provisioning_id(&declarations, requested_shards, committed_schema_digest);
+    transaction
+        .execute(
+            "INSERT INTO briskdb_table_provisioning (
+                singleton,
+                provisioning_id,
+                digest_version,
+                schema_digest_version,
+                committed_schema_digest,
+                shard_count,
+                declaration_count,
+                next_shard
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            rusqlite::params![
+                provisioning_id.as_slice(),
+                TABLE_PROVISIONING_DIGEST_VERSION,
+                SCHEMA_DIGEST_VERSION,
+                committed_schema_digest.as_slice(),
+                requested_shards,
+                i64::try_from(declarations.len()).expect("bounded declaration count fits SQLite"),
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO briskdb_table_provisioning_declarations (
+                    provisioning_singleton,
+                    ordinal,
+                    database_id,
+                    table_name,
+                    placement,
+                    shard_key_column,
+                    shard_key_type,
+                    generated_policy,
+                    generated_column,
+                    generated_encoding_version
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .map_err(sqlite_error::storage)?;
+        for (ordinal, declaration) in declarations.iter().enumerate() {
+            let (placement, shard_column, shard_type) =
+                encoded_table_placement(declaration.placement());
+            let (policy, generated_column, encoding_version) =
+                encoded_generated_id_policy(declaration.generated_id_policy());
+            insert
+                .execute(rusqlite::params![
+                    i64::try_from(ordinal).expect("bounded ordinal fits SQLite"),
+                    i64::try_from(declaration.database_id().get()).map_err(|error| {
+                        EngineError::from_source(
+                            EngineErrorKind::NumericOutOfRange,
+                            "table-provisioning database ID does not fit in SQLite",
+                            error,
+                        )
+                    })?,
+                    declaration.name(),
+                    placement,
+                    shard_column,
+                    shard_type,
+                    policy,
+                    generated_column,
+                    encoding_version,
+                ])
+                .map_err(sqlite_error::storage)?;
+        }
+    }
+    refresh_manifest_digest(&transaction)?;
+    let current = current_manifest_snapshot(&transaction, requested_shards)?;
+    let active = current.active_table_provisioning.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "table provisioning did not publish its journal",
+        )
+    })?;
+    ensure_same_native_table_provisioning_request(&active, &declarations, committed_schema_digest)?;
+    on_commit_attempted
+        .take()
+        .expect("table-provisioning commit callback is one-shot")();
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(NativeTableProvisioningClassification::Active(active))
+}
+
+/// Advance the durable seeded-shard prefix by exactly one shard.
+pub(super) fn advance_native_table_provisioning(
+    connection: &mut Connection,
+    requested_shards: u16,
+    expected: &NativeTableProvisioning,
+    next_shard: u16,
+) -> EngineResult<NativeTableProvisioning> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    let active = snapshot.active_table_provisioning.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "table provisioning is no longer active",
+        )
+    })?;
+    ensure_same_native_table_provisioning(&active, expected)?;
+    if next_shard == active.next_shard {
+        transaction.commit().map_err(sqlite_error::storage)?;
+        return Ok(active);
+    }
+    if next_shard != active.next_shard.saturating_add(1) || next_shard > active.shard_count {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "table-provisioning progress must advance by exactly one shard",
+        ));
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE briskdb_table_provisioning
+             SET next_shard = ?1
+             WHERE singleton = 1
+               AND provisioning_id = ?2
+               AND next_shard = ?3",
+            rusqlite::params![
+                next_shard,
+                active.provisioning_id.as_slice(),
+                active.next_shard,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    if changed != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "table-provisioning progress changed concurrently",
+        ));
+    }
+    refresh_manifest_digest(&transaction)?;
+    let advanced = current_manifest_snapshot(&transaction, requested_shards)?
+        .active_table_provisioning
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "table-provisioning progress update lost its journal",
+            )
+        })?;
+    ensure_same_native_table_provisioning(&advanced, expected)?;
+    if advanced.next_shard != next_shard {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "table-provisioning progress did not persist",
+        ));
+    }
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(advanced)
+}
+
+#[cfg(all(test, feature = "experimental-vtab"))]
+pub(super) fn replace_allocation_owner_for_test(
+    connection: &mut Connection,
+    requested_shards: u16,
+    retired_owner: u16,
+    replacement_owner: u16,
+    physical_shard: u16,
+) -> EngineResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    ensure_table_registration_ready(&snapshot)?;
+    if snapshot.active_migration.is_some() || snapshot.active_table_provisioning.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "allocation-owner test transition requires no active recovery journal",
+        ));
+    }
+    let retired_owner = AllocationOwnerSlot::new(retired_owner)?;
+    let replacement_owner = AllocationOwnerSlot::new(replacement_owner)?;
+    let current_owners = snapshot.allocation_owners.as_ref().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "allocation-owner test transition requires a current owner map",
+        )
+    })?;
+    if current_owners.owner_for_physical_shard(physical_shard) != Some(retired_owner) {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "allocation-owner test transition did not identify one active owner",
+        ));
+    }
+    let proposed = current_owners
+        .assignments()
+        .map(|(owner, shard, state)| {
+            if owner == retired_owner.get() {
+                (owner, shard, AllocationOwnerState::Retired)
+            } else {
+                (owner, shard, state)
+            }
+        })
+        .chain(std::iter::once((
+            replacement_owner.get(),
+            physical_shard,
+            AllocationOwnerState::Active,
+        )))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    AllocationOwnerMap::try_from_assignments(requested_shards, proposed)?;
+
+    let changed = transaction
+        .execute(
+            "UPDATE briskdb_allocation_owners
+             SET owner_state = ?1
+             WHERE owner_slot = ?2
+               AND physical_shard_id = ?3
+               AND owner_state = ?4",
+            rusqlite::params![
+                ALLOCATION_OWNER_RETIRED,
+                retired_owner.get(),
+                physical_shard,
+                ALLOCATION_OWNER_ACTIVE,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    if changed != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "allocation-owner test transition did not identify one active owner",
+        ));
+    }
+    transaction
+        .execute(
+            "INSERT INTO briskdb_allocation_owners (
+                owner_slot, physical_shard_id, owner_state
+             ) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                replacement_owner.get(),
+                physical_shard,
+                ALLOCATION_OWNER_ACTIVE,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    refresh_manifest_digest(&transaction)?;
+    let verified = current_manifest_snapshot(&transaction, requested_shards)?;
+    let owners = verified.allocation_owners.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "allocation-owner transition validation omitted its owner map",
+        )
+    })?;
+    if owners.physical_shard(retired_owner) != Some(physical_shard)
+        || owners.owner_is_active(retired_owner)
+        || owners.owner_for_physical_shard(physical_shard) != Some(replacement_owner)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "allocation-owner transition did not preserve historical and active routing",
+        ));
+    }
+    transaction.commit().map_err(sqlite_error::storage)
+}
+
+#[cfg(test)]
+pub(super) fn install_v9_native_catalog_for_test(
+    connection: &mut Connection,
+    requested_shards: u16,
+    declarations: &[TableDeclaration],
+) -> EngineResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    ensure_table_registration_ready(&snapshot)?;
+    if snapshot
+        .logical_catalog
+        .as_ref()
+        .is_none_or(|catalog| !catalog.tables().is_empty())
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "v9 compatibility fixture requires an empty authoritative catalog",
+        ));
+    }
+    insert_authoritative_table_catalog(&transaction, declarations, false)?;
+    downgrade_v10_manifest_to_v9_for_test(&transaction)?;
+    set_identity(&transaction, V9_SCHEMA_VERSION)?;
+    refresh_manifest_digest(&transaction)?;
+    let objects = schema_objects(&transaction)?;
+    validate_v9(&transaction, requested_shards, &objects)?;
+    transaction.commit().map_err(sqlite_error::storage)
+}
+
+#[cfg(test)]
+pub(super) fn inspect_with_v9_plan_for_test(
+    connection: &Connection,
+    requested_shards: u16,
+) -> EngineResult<()> {
+    const V9_PLAN: MigrationPlan<'static> = MigrationPlan {
+        current_version: V9_SCHEMA_VERSION,
+        migrations: MIGRATIONS,
+        initialize_current: create_v9_schema,
+        initialize_interrupted_legacy: migrate_interrupted_legacy_to_v9,
+    };
+    inspect_with_plan(connection, requested_shards, V9_PLAN).map(|_| ())
+}
+
+#[cfg(test)]
+fn downgrade_v10_manifest_to_v9_for_test(connection: &Connection) -> EngineResult<()> {
+    connection
+        .execute_batch(
+            "DROP TABLE briskdb_table_provisioning_declarations;
+             DROP TABLE briskdb_table_provisioning;
+             DROP INDEX briskdb_one_active_owner_per_shard;
+             ALTER TABLE briskdb_generated_ids RENAME TO briskdb_generated_ids_v10;
+             ALTER TABLE briskdb_allocation_owners RENAME TO briskdb_allocation_owners_v10;",
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(V9_GENERATED_IDS_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "INSERT INTO briskdb_generated_ids
+             SELECT table_id, policy, generated_column, encoding_version
+             FROM briskdb_generated_ids_v10",
+            [],
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(V9_ALLOCATION_OWNERS_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "INSERT INTO briskdb_allocation_owners
+             SELECT owner_slot, physical_shard_id
+             FROM briskdb_allocation_owners_v10",
+            [],
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(
+            "DROP TABLE briskdb_generated_ids_v10;
+             DROP TABLE briskdb_allocation_owners_v10;
+             DROP TABLE briskdb_metadata;",
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(V9_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "INSERT INTO briskdb_metadata VALUES (?1)",
+            [V9_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "UPDATE briskdb_integrity SET manifest_digest_version = ?1",
+            [V2_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
+/// Atomically publish the authoritative catalog and activate native policies
+/// after every shard-local sequence seed is durable.
+pub(super) fn finalize_native_table_provisioning<F>(
+    connection: &mut Connection,
+    requested_shards: u16,
+    expected: &NativeTableProvisioning,
+    on_commit_attempted: F,
+) -> EngineResult<CatalogSnapshot>
+where
+    F: FnOnce(),
+{
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    let Some(active) = snapshot.active_table_provisioning else {
+        let declarations = expected.declarations.to_vec();
+        let classification = classify_native_table_provisioning_snapshot(
+            &snapshot,
+            &declarations,
+            expected.committed_schema_digest,
+        )?;
+        if classification == NativeTableProvisioningClassification::Complete {
+            let catalog = catalog_snapshot_from_manifest(snapshot)?;
+            transaction.commit().map_err(sqlite_error::storage)?;
+            return Ok(catalog);
+        }
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "table provisioning is no longer active",
+        ));
+    };
+    ensure_same_native_table_provisioning(&active, expected)?;
+    if active.next_shard != active.shard_count {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "table provisioning cannot finish before every shard is durable",
+        ));
+    }
+    let catalog = snapshot.logical_catalog.as_ref().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "table provisioning finalization omitted the logical catalog",
+        )
+    })?;
+    if catalog.tables().is_empty() {
+        insert_authoritative_table_catalog(&transaction, &active.declarations, true)?;
+    } else if !declarations_match_catalog_owned(&active.declarations, catalog) {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "table provisioning finalization found a conflicting catalog",
+        ));
+    } else {
+        transaction
+            .execute(
+                "UPDATE briskdb_generated_ids
+                 SET activation_state = ?1
+                 WHERE policy = ?2",
+                rusqlite::params![GENERATED_ID_ACTIVE, GENERATED_ID_POLICY_NATIVE_RANGE_V1,],
+            )
+            .map_err(sqlite_error::storage)?;
+    }
+    transaction
+        .execute("DELETE FROM briskdb_table_provisioning_declarations", [])
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute("DELETE FROM briskdb_table_provisioning", [])
+        .map_err(sqlite_error::storage)?;
+    refresh_manifest_digest(&transaction)?;
+    let finalized = current_manifest_snapshot(&transaction, requested_shards)?;
+    if finalized.active_table_provisioning.is_some()
+        || !native_table_provisioning_complete(&finalized, &active.declarations)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "table-provisioning finalization did not publish the active catalog",
+        ));
+    }
+    let catalog = catalog_snapshot_from_manifest(finalized)?;
+    on_commit_attempted();
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(catalog)
+}
+
+fn classify_native_table_provisioning_snapshot(
+    snapshot: &ManifestSnapshot,
+    declarations: &[TableDeclaration],
+    committed_schema_digest: [u8; 32],
+) -> EngineResult<NativeTableProvisioningClassification> {
+    if let Some(active) = snapshot.active_table_provisioning.as_ref() {
+        ensure_same_native_table_provisioning_request(
+            active,
+            declarations,
+            committed_schema_digest,
+        )?;
+        return Ok(NativeTableProvisioningClassification::Active(
+            active.clone(),
+        ));
+    }
+    if native_table_provisioning_complete(snapshot, declarations) {
+        return Ok(NativeTableProvisioningClassification::Complete);
+    }
+    Ok(NativeTableProvisioningClassification::Absent)
+}
+
+fn native_table_provisioning_complete(
+    snapshot: &ManifestSnapshot,
+    declarations: &[TableDeclaration],
+) -> bool {
+    let Some(catalog) = snapshot.logical_catalog.as_ref() else {
+        return false;
+    };
+    if !declarations_match_catalog_owned(declarations, catalog) {
+        return false;
+    }
+    let expected = catalog
+        .tables()
+        .iter()
+        .filter(|table| {
+            matches!(
+                table.generated_id_policy(),
+                GeneratedIdPolicy::NativeRangeV1 { .. }
+            )
+        })
+        .map(TableMetadata::id)
+        .collect::<Vec<_>>();
+    expected.as_slice() == snapshot.active_native_id_table_ids.as_ref()
+}
+
+fn ensure_same_native_table_provisioning_request(
+    active: &NativeTableProvisioning,
+    declarations: &[TableDeclaration],
+    committed_schema_digest: [u8; 32],
+) -> EngineResult<()> {
+    if active.declarations.as_ref() != declarations
+        || active.committed_schema_digest != committed_schema_digest
+        || active.provisioning_id
+            != table_provisioning_id(declarations, active.shard_count, committed_schema_digest)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "a different table-provisioning operation is already active",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_same_native_table_provisioning(
+    observed: &NativeTableProvisioning,
+    expected: &NativeTableProvisioning,
+) -> EngineResult<()> {
+    if observed.provisioning_id != expected.provisioning_id
+        || observed.committed_schema_digest != expected.committed_schema_digest
+        || observed.shard_count != expected.shard_count
+        || observed.declarations != expected.declarations
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "table-provisioning identity changed while it was being applied",
+        ));
+    }
+    Ok(())
+}
+
 /// Atomically install the complete authoritative table catalog.
 ///
 /// Physical-table and emptiness validation belongs to the storage coordinator,
@@ -1484,6 +2337,12 @@ where
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error::storage)?;
     let current = current_manifest_snapshot(&transaction, requested_shards)?;
+    if current.active_table_provisioning.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "table registration cannot run during native table provisioning",
+        ));
+    }
     ensure_table_registration_ready(&current)?;
     let current_catalog = current.logical_catalog.as_ref().ok_or_else(|| {
         EngineError::new(
@@ -1555,9 +2414,16 @@ where
                         table_id,
                         policy,
                         generated_column,
-                        encoding_version
-                     ) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![table_id, policy, generated_column, encoding_version,],
+                        encoding_version,
+                        activation_state
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        table_id,
+                        policy,
+                        generated_column,
+                        encoding_version,
+                        GENERATED_ID_INACTIVE,
+                    ],
                 )
                 .map_err(sqlite_error::storage)?;
         }
@@ -1593,6 +2459,82 @@ where
     Ok(replacement)
 }
 
+fn insert_authoritative_table_catalog(
+    transaction: &Transaction<'_>,
+    declarations: &[TableDeclaration],
+    activate_native: bool,
+) -> EngineResult<()> {
+    let mut insert_table = transaction
+        .prepare(
+            "INSERT INTO briskdb_tables (
+                table_id,
+                database_id,
+                table_name,
+                placement,
+                shard_key_column,
+                shard_key_type
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .map_err(sqlite_error::storage)?;
+    let mut insert_policy = transaction
+        .prepare(
+            "INSERT INTO briskdb_generated_ids (
+                table_id,
+                policy,
+                generated_column,
+                encoding_version,
+                activation_state
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .map_err(sqlite_error::storage)?;
+    for (index, declaration) in declarations.iter().enumerate() {
+        let table_id = i64::try_from(index + 1).expect("bounded table ID fits in SQLite");
+        let database_id = i64::try_from(declaration.database_id().get()).map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::NumericOutOfRange,
+                format!(
+                    "logical database ID for table {} does not fit in SQLite",
+                    declaration.name()
+                ),
+                error,
+            )
+        })?;
+        let (placement, shard_key_column, shard_key_type) =
+            encoded_table_placement(declaration.placement());
+        insert_table
+            .execute(rusqlite::params![
+                table_id,
+                database_id,
+                declaration.name(),
+                placement,
+                shard_key_column,
+                shard_key_type,
+            ])
+            .map_err(sqlite_error::storage)?;
+        let (policy, generated_column, encoding_version) =
+            encoded_generated_id_policy(declaration.generated_id_policy());
+        let activation_state = if activate_native
+            && matches!(
+                declaration.generated_id_policy(),
+                GeneratedIdPolicy::NativeRangeV1 { .. }
+            ) {
+            GENERATED_ID_ACTIVE
+        } else {
+            GENERATED_ID_INACTIVE
+        };
+        insert_policy
+            .execute(rusqlite::params![
+                table_id,
+                policy,
+                generated_column,
+                encoding_version,
+                activation_state,
+            ])
+            .map_err(sqlite_error::storage)?;
+    }
+    Ok(())
+}
+
 fn ensure_table_registration_ready(snapshot: &ManifestSnapshot) -> EngineResult<()> {
     if snapshot.active_migration.is_some() {
         return Err(EngineError::new(
@@ -1620,11 +2562,12 @@ fn ensure_table_registration_ready(snapshot: &ManifestSnapshot) -> EngineResult<
 }
 
 fn catalog_snapshot_from_manifest(snapshot: ManifestSnapshot) -> EngineResult<CatalogSnapshot> {
-    catalog_snapshot_from_parts(
+    let catalog = catalog_snapshot_from_parts(
         snapshot.routing_catalog,
         snapshot.logical_catalog,
         snapshot.allocation_owners,
-    )
+    )?;
+    Ok(catalog.with_active_native_id_table_ids(snapshot.active_native_id_table_ids))
 }
 
 fn catalog_snapshot_from_parts(
@@ -1672,6 +2615,119 @@ fn declarations_match_catalog(
                     && generated_id_policy == table.generated_id_policy()
             },
         )
+}
+
+fn declarations_match_catalog_owned(declarations: &[TableDeclaration], catalog: &Catalog) -> bool {
+    declarations.len() == catalog.tables().len()
+        && declarations
+            .iter()
+            .zip(catalog.tables())
+            .all(|(declaration, table)| {
+                declaration.database_id() == table.database_id()
+                    && declaration.name() == table.name()
+                    && declaration.placement() == table.placement()
+                    && declaration.generated_id_policy() == table.generated_id_policy()
+            })
+}
+
+fn is_sorted_unique_declarations(declarations: &[TableDeclaration]) -> bool {
+    declarations.windows(2).all(|rows| {
+        (rows[0].database_id(), rows[0].name()) < (rows[1].database_id(), rows[1].name())
+    })
+}
+
+fn normalize_table_provisioning_declarations(
+    declarations: Vec<TableDeclaration>,
+) -> EngineResult<Box<[TableDeclaration]>> {
+    if declarations.is_empty() {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "table provisioning requires at least one declaration",
+        ));
+    }
+    if declarations.len() > MAX_TABLES {
+        return Err(EngineError::new(
+            EngineErrorKind::LimitExceeded,
+            format!("table provisioning exceeds its {MAX_TABLES}-table limit"),
+        ));
+    }
+    let mut declarations = declarations;
+    declarations.sort_by(|left, right| {
+        (left.database_id(), left.name()).cmp(&(right.database_id(), right.name()))
+    });
+    if !is_sorted_unique_declarations(&declarations) {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "table provisioning contains a duplicate logical table",
+        ));
+    }
+    if !declarations.iter().any(|declaration| {
+        matches!(
+            declaration.generated_id_policy(),
+            GeneratedIdPolicy::NativeRangeV1 { .. }
+        )
+    }) {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "table provisioning requires a native generated-ID declaration",
+        ));
+    }
+    Ok(declarations.into_boxed_slice())
+}
+
+fn table_provisioning_id(
+    declarations: &[TableDeclaration],
+    shard_count: u16,
+    committed_schema_digest: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(TABLE_PROVISIONING_DIGEST_DOMAIN);
+    hasher.update(&TABLE_PROVISIONING_DIGEST_VERSION.to_le_bytes());
+    hasher.update(&shard_count.to_le_bytes());
+    hasher.update(&committed_schema_digest);
+    hasher.update(
+        &u64::try_from(declarations.len())
+            .expect("bounded declaration count fits u64")
+            .to_le_bytes(),
+    );
+    for declaration in declarations {
+        hasher.update(&declaration.database_id().get().to_le_bytes());
+        hash_manifest_name(&mut hasher, declaration.name().as_bytes());
+        let (placement, column, key_type) = encoded_table_placement(declaration.placement());
+        hasher.update(&placement.to_le_bytes());
+        hash_optional_provisioning_text(&mut hasher, column);
+        hash_optional_provisioning_integer(&mut hasher, key_type);
+        let (policy, generated_column, encoding_version) =
+            encoded_generated_id_policy(declaration.generated_id_policy());
+        hasher.update(&policy.to_le_bytes());
+        hash_optional_provisioning_text(&mut hasher, generated_column);
+        hash_optional_provisioning_integer(&mut hasher, encoding_version);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn hash_optional_provisioning_text(hasher: &mut blake3::Hasher, value: Option<&str>) {
+    match value {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(value) => {
+            hasher.update(&[1]);
+            hash_manifest_name(hasher, value.as_bytes());
+        }
+    }
+}
+
+fn hash_optional_provisioning_integer(hasher: &mut blake3::Hasher, value: Option<i64>) {
+    match value {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(value) => {
+            hasher.update(&[1]);
+            hasher.update(&value.to_le_bytes());
+        }
+    }
 }
 
 fn encoded_generated_id_policy(policy: &GeneratedIdPolicy) -> (i64, Option<&str>, Option<i64>) {
@@ -2116,6 +3172,11 @@ fn create_v9_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineRe
     migrate_v8_to_v9(transaction, shard_count)
 }
 
+fn create_v10_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
+    create_v9_schema(transaction, shard_count)?;
+    migrate_v9_to_v10(transaction, shard_count)
+}
+
 fn migrate_interrupted_legacy_to_v6(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -2149,6 +3210,7 @@ fn migrate_interrupted_legacy_to_v8(
     create_v8_schema(transaction, shard_count)
 }
 
+#[cfg(test)]
 fn migrate_interrupted_legacy_to_v9(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -2157,6 +3219,16 @@ fn migrate_interrupted_legacy_to_v9(
         .execute_batch("DROP TABLE briskdb_metadata;")
         .map_err(sqlite_error::storage)?;
     create_v9_schema(transaction, shard_count)
+}
+
+fn migrate_interrupted_legacy_to_v10(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v10_schema(transaction, shard_count)
 }
 
 #[cfg(test)]
@@ -2496,6 +3568,91 @@ fn migrate_v8_to_v9(transaction: &Transaction<'_>, _shard_count: u16) -> EngineR
     Ok(())
 }
 
+fn migrate_v9_to_v10(transaction: &Transaction<'_>, _shard_count: u16) -> EngineResult<()> {
+    transaction
+        .execute_batch(
+            "ALTER TABLE briskdb_allocation_owners RENAME TO briskdb_allocation_owners_v9;",
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V10_ALLOCATION_OWNERS_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_allocation_owners (
+                owner_slot, physical_shard_id, owner_state
+             )
+             SELECT owner_slot, physical_shard_id, ?1
+             FROM briskdb_allocation_owners_v9
+             ORDER BY owner_slot",
+            [ALLOCATION_OWNER_ACTIVE],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch("DROP TABLE briskdb_allocation_owners_v9;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V10_ACTIVE_OWNER_INDEX_SQL)
+        .map_err(sqlite_error::storage)?;
+
+    transaction
+        .execute_batch("ALTER TABLE briskdb_generated_ids RENAME TO briskdb_generated_ids_v9;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V10_GENERATED_IDS_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_generated_ids (
+                table_id,
+                policy,
+                generated_column,
+                encoding_version,
+                activation_state
+             )
+             SELECT table_id,
+                    policy,
+                    generated_column,
+                    encoding_version,
+                    ?1
+             FROM briskdb_generated_ids_v9
+             ORDER BY table_id",
+            [GENERATED_ID_INACTIVE],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch("DROP TABLE briskdb_generated_ids_v9;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V10_TABLE_PROVISIONING_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V10_TABLE_PROVISIONING_DECLARATIONS_SQL)
+        .map_err(sqlite_error::storage)?;
+
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V10_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V10_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "UPDATE briskdb_integrity
+             SET manifest_digest_version = ?1
+             WHERE singleton = 1",
+            [V3_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
 fn add_v5_schema(transaction: &Transaction<'_>, state: ShardLayoutState) -> EngineResult<()> {
     transaction
         .execute_batch("DROP TABLE briskdb_metadata;")
@@ -2799,6 +3956,27 @@ fn v9_objects() -> Vec<SchemaObject> {
     objects
 }
 
+fn v10_objects() -> Vec<SchemaObject> {
+    let mut objects = v9_objects();
+    objects.push(SchemaObject {
+        object_type: "index".to_owned(),
+        name: "briskdb_one_active_owner_per_shard".to_owned(),
+    });
+    for name in [
+        "briskdb_table_provisioning",
+        "briskdb_table_provisioning_declarations",
+    ] {
+        objects.push(SchemaObject {
+            object_type: "table".to_owned(),
+            name: name.to_owned(),
+        });
+    }
+    objects.sort_by(|left, right| {
+        (&left.object_type, &left.name).cmp(&(&right.object_type, &right.name))
+    });
+    objects
+}
+
 fn schema_objects(connection: &Connection) -> EngineResult<Vec<SchemaObject>> {
     let mut statement = connection
         .prepare(
@@ -2915,6 +4093,14 @@ fn validate_table(
         "briskdb_allocation_owners" => {
             "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
              FROM pragma_table_xinfo('briskdb_allocation_owners') LIMIT ?1"
+        }
+        "briskdb_table_provisioning" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_table_provisioning') LIMIT ?1"
+        }
+        "briskdb_table_provisioning_declarations" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_table_provisioning_declarations') LIMIT ?1"
         }
         _ => {
             return Err(EngineError::new(
@@ -3106,6 +4292,8 @@ fn validate_v2(
         active_migration: None,
         integrity: None,
         allocation_owners: None,
+        active_native_id_table_ids: Box::new([]),
+        active_table_provisioning: None,
     })
 }
 
@@ -3136,6 +4324,8 @@ fn validate_v3(
         active_migration: None,
         integrity: None,
         allocation_owners: None,
+        active_native_id_table_ids: Box::new([]),
+        active_table_provisioning: None,
     })
 }
 
@@ -3430,6 +4620,38 @@ fn validate_v9(
     Ok(snapshot)
 }
 
+fn validate_v10(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    let mut snapshot = validate_integrity_manifest_with_definition(
+        connection,
+        requested_shards,
+        objects,
+        IntegrityManifestDefinition {
+            version: V10_SCHEMA_VERSION,
+            downgrade_fence_sql: V10_DOWNGRADE_FENCE_SQL,
+            expected_objects: &v10_objects(),
+            expected_manifest_digest_version: V3_MANIFEST_DIGEST_VERSION,
+            generated_ids: true,
+        },
+    )?;
+    snapshot.allocation_owners = Some(validate_allocation_owners(
+        connection,
+        snapshot.shard_count,
+    )?);
+    snapshot.active_native_id_table_ids = validate_active_native_id_tables(connection)?;
+    snapshot.active_table_provisioning = validate_table_provisioning(
+        connection,
+        snapshot.shard_count,
+        snapshot.logical_catalog.as_ref(),
+        snapshot.active_migration.as_ref(),
+        snapshot.integrity,
+    )?;
+    Ok(snapshot)
+}
+
 fn validate_integrity_manifest(
     connection: &Connection,
     requested_shards: u16,
@@ -3458,6 +4680,14 @@ struct IntegrityManifestDefinition<'a> {
     expected_objects: &'a [SchemaObject],
     expected_manifest_digest_version: u32,
     generated_ids: bool,
+}
+
+fn generated_ids_table_sql(version: u32) -> &'static str {
+    if version >= V10_SCHEMA_VERSION {
+        V10_GENERATED_IDS_TABLE_SQL
+    } else {
+        V9_GENERATED_IDS_TABLE_SQL
+    }
 }
 
 fn validate_integrity_manifest_with_definition(
@@ -3612,7 +4842,7 @@ fn validate_manifest_semantic_root(
             "manifest checksum version must be positive",
         ));
     }
-    if *version > i64::from(V2_MANIFEST_DIGEST_VERSION) {
+    if *version > i64::from(V3_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -3751,6 +4981,52 @@ const V2_GENERATED_IDS_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
     columns: &["table_id", "policy", "generated_column", "encoding_version"],
     sql: "SELECT table_id, policy, generated_column, encoding_version FROM briskdb_generated_ids ORDER BY table_id",
 };
+const V3_GENERATED_IDS_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
+    table: "briskdb_generated_ids",
+    columns: &[
+        "table_id",
+        "policy",
+        "generated_column",
+        "encoding_version",
+        "activation_state",
+    ],
+    sql: "SELECT table_id, policy, generated_column, encoding_version, activation_state FROM briskdb_generated_ids ORDER BY table_id",
+};
+const V3_ALLOCATION_OWNERS_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
+    table: "briskdb_allocation_owners",
+    columns: &["owner_slot", "physical_shard_id", "owner_state"],
+    sql: "SELECT owner_slot, physical_shard_id, owner_state FROM briskdb_allocation_owners ORDER BY owner_slot",
+};
+const V3_TABLE_PROVISIONING_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
+    table: "briskdb_table_provisioning",
+    columns: &[
+        "singleton",
+        "provisioning_id",
+        "digest_version",
+        "schema_digest_version",
+        "committed_schema_digest",
+        "shard_count",
+        "declaration_count",
+        "next_shard",
+    ],
+    sql: "SELECT singleton, provisioning_id, digest_version, schema_digest_version, committed_schema_digest, shard_count, declaration_count, next_shard FROM briskdb_table_provisioning ORDER BY singleton",
+};
+const V3_TABLE_PROVISIONING_DECLARATIONS_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
+    table: "briskdb_table_provisioning_declarations",
+    columns: &[
+        "provisioning_singleton",
+        "ordinal",
+        "database_id",
+        "table_name",
+        "placement",
+        "shard_key_column",
+        "shard_key_type",
+        "generated_policy",
+        "generated_column",
+        "generated_encoding_version",
+    ],
+    sql: "SELECT provisioning_singleton, ordinal, database_id, table_name, placement, shard_key_column, shard_key_type, generated_policy, generated_column, generated_encoding_version FROM briskdb_table_provisioning_declarations ORDER BY provisioning_singleton, ordinal",
+};
 
 fn manifest_semantic_digest_for_version(
     connection: &Connection,
@@ -3773,6 +5049,21 @@ fn manifest_semantic_digest_for_version(
                 }
             }
             (V2_MANIFEST_DIGEST_DOMAIN, queries)
+        }
+        V3_MANIFEST_DIGEST_VERSION => {
+            let mut queries = Vec::with_capacity(V1_MANIFEST_DIGEST_QUERIES.len() + 4);
+            for query in V1_MANIFEST_DIGEST_QUERIES {
+                queries.push(query);
+                if query.table == "briskdb_physical_shards" {
+                    queries.push(&V3_ALLOCATION_OWNERS_DIGEST_QUERY);
+                }
+                if query.table == "briskdb_tables" {
+                    queries.push(&V3_GENERATED_IDS_DIGEST_QUERY);
+                    queries.push(&V3_TABLE_PROVISIONING_DIGEST_QUERY);
+                    queries.push(&V3_TABLE_PROVISIONING_DECLARATIONS_DIGEST_QUERY);
+                }
+            }
+            (V3_MANIFEST_DIGEST_DOMAIN, queries)
         }
         0 => {
             return Err(EngineError::new(
@@ -3908,7 +5199,7 @@ fn refresh_manifest_digest_if_checksummed(connection: &Connection) -> EngineResu
     if application_id == MANIFEST_APPLICATION_ID
         && matches!(
             u32::try_from(version),
-            Ok(V7_SCHEMA_VERSION | V8_SCHEMA_VERSION | V9_SCHEMA_VERSION)
+            Ok(V7_SCHEMA_VERSION | V8_SCHEMA_VERSION | V9_SCHEMA_VERSION | V10_SCHEMA_VERSION)
         )
     {
         let _ = refresh_manifest_digest(connection)?;
@@ -3972,7 +5263,7 @@ fn validate_manifest_integrity(
             "manifest checksum version must be positive",
         ));
     }
-    if *manifest_version > i64::from(V2_MANIFEST_DIGEST_VERSION) {
+    if *manifest_version > i64::from(V3_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -4154,21 +5445,26 @@ fn validate_catalog_manifest(
     )?;
     validate_table_sql(connection, "briskdb_tables", V4_TABLES_TABLE_SQL)?;
     if definition.generated_ids {
-        validate_table(
-            connection,
-            "briskdb_generated_ids",
-            &[
-                TableColumn::expected(0, "table_id", "INTEGER", false, 1),
-                TableColumn::expected(1, "policy", "INTEGER", true, 0),
-                TableColumn::expected(2, "generated_column", "TEXT", false, 0),
-                TableColumn::expected(3, "encoding_version", "INTEGER", false, 0),
-            ],
-            true,
-        )?;
+        let mut columns = vec![
+            TableColumn::expected(0, "table_id", "INTEGER", false, 1),
+            TableColumn::expected(1, "policy", "INTEGER", true, 0),
+            TableColumn::expected(2, "generated_column", "TEXT", false, 0),
+            TableColumn::expected(3, "encoding_version", "INTEGER", false, 0),
+        ];
+        if definition.version >= V10_SCHEMA_VERSION {
+            columns.push(TableColumn::expected(
+                4,
+                "activation_state",
+                "INTEGER",
+                true,
+                0,
+            ));
+        }
+        validate_table(connection, "briskdb_generated_ids", &columns, true)?;
         validate_table_sql(
             connection,
             "briskdb_generated_ids",
-            V9_GENERATED_IDS_TABLE_SQL,
+            generated_ids_table_sql(definition.version),
         )?;
     }
 
@@ -4193,6 +5489,8 @@ fn validate_catalog_manifest(
         active_migration: None,
         integrity: None,
         allocation_owners: None,
+        active_native_id_table_ids: Box::new([]),
+        active_table_provisioning: None,
     })
 }
 
@@ -4270,43 +5568,85 @@ fn validate_allocation_owners(
     connection: &Connection,
     shard_count: u16,
 ) -> EngineResult<AllocationOwnerMap> {
+    let current = read_identity(connection)?.1 >= i64::from(V10_SCHEMA_VERSION);
     validate_table(
         connection,
         "briskdb_allocation_owners",
-        &[
-            TableColumn::expected(0, "owner_slot", "INTEGER", false, 1),
-            TableColumn::expected(1, "physical_shard_id", "INTEGER", true, 0),
-        ],
+        &if current {
+            vec![
+                TableColumn::expected(0, "owner_slot", "INTEGER", false, 1),
+                TableColumn::expected(1, "physical_shard_id", "INTEGER", true, 0),
+                TableColumn::expected(2, "owner_state", "INTEGER", true, 0),
+            ]
+        } else {
+            vec![
+                TableColumn::expected(0, "owner_slot", "INTEGER", false, 1),
+                TableColumn::expected(1, "physical_shard_id", "INTEGER", true, 0),
+            ]
+        },
         true,
     )?;
     validate_table_sql(
         connection,
         "briskdb_allocation_owners",
-        V9_ALLOCATION_OWNERS_TABLE_SQL,
+        if current {
+            V10_ALLOCATION_OWNERS_TABLE_SQL
+        } else {
+            V9_ALLOCATION_OWNERS_TABLE_SQL
+        },
     )?;
 
+    if current {
+        let sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'briskdb_one_active_owner_per_shard'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| manifest_read_error(error, "failed to inspect active-owner index"))?;
+        if normalize_schema_sql(&sql) != normalize_schema_sql(V10_ACTIVE_OWNER_INDEX_SQL) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "allocation-owner active index has an incompatible definition",
+            ));
+        }
+    }
+
+    let sql = if current {
+        "SELECT owner_slot, physical_shard_id, owner_state
+         FROM briskdb_allocation_owners
+         ORDER BY owner_slot
+         LIMIT 1025"
+    } else {
+        "SELECT owner_slot, physical_shard_id, 1 AS owner_state
+         FROM briskdb_allocation_owners
+         ORDER BY owner_slot
+         LIMIT 1025"
+    };
     let rows = connection
-        .prepare(
-            "SELECT owner_slot, physical_shard_id
-             FROM briskdb_allocation_owners
-             ORDER BY owner_slot
-             LIMIT 1025",
-        )
+        .prepare(sql)
         .and_then(|mut statement| {
             statement
-                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
                 .collect::<Result<Vec<_>, _>>()
         })
         .map_err(|error| manifest_read_error(error, "failed to read allocation-owner metadata"))?;
-    if rows.len() != usize::from(shard_count) {
+    if rows.len() < usize::from(shard_count) || rows.len() > 1_024 {
         return Err(EngineError::new(
             EngineErrorKind::DataCorruption,
-            "allocation-owner metadata must contain exactly one row per physical shard",
+            "allocation-owner metadata has an invalid number of historical owners",
         ));
     }
 
     let mut owners = Vec::with_capacity(rows.len());
-    for (expected, (owner_slot, physical_shard_id)) in (0..shard_count).zip(rows) {
+    for (ordinal, (owner_slot, physical_shard_id, owner_state)) in rows.into_iter().enumerate() {
         if !(0..=MAX_ALLOCATION_OWNER_SLOT).contains(&owner_slot) {
             return Err(EngineError::new(
                 EngineErrorKind::DataCorruption,
@@ -4327,23 +5667,405 @@ fn validate_allocation_owners(
                 error,
             )
         })?;
-        // Version 9 establishes the immutable initial mapping. A future shard
-        // lifecycle version may append owners, but v9 never infers or remaps.
-        if owner_slot != expected || physical_shard_id != expected {
+        if !current
+            && (owner_slot != u16::try_from(ordinal).expect("bounded owner ordinal fits u16")
+                || physical_shard_id != owner_slot)
+        {
             return Err(EngineError::new(
                 EngineErrorKind::DataCorruption,
                 "allocation-owner metadata does not match the immutable v9 owner mapping",
             ));
         }
-        owners.push((owner_slot, physical_shard_id));
+        let state = match owner_state {
+            ALLOCATION_OWNER_ACTIVE => AllocationOwnerState::Active,
+            ALLOCATION_OWNER_RETIRED => AllocationOwnerState::Retired,
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    "allocation-owner metadata has an unsupported lifecycle state",
+                ));
+            }
+        };
+        owners.push((owner_slot, physical_shard_id, state));
     }
-    AllocationOwnerMap::try_from_pairs(shard_count, owners.into_boxed_slice()).map_err(|error| {
+    AllocationOwnerMap::try_from_assignments(shard_count, owners.into_boxed_slice()).map_err(
+        |error| {
+            EngineError::from_source(
+                EngineErrorKind::DataCorruption,
+                "allocation-owner metadata does not define one active allocator with monotonic succession per shard",
+                error,
+            )
+        },
+    )
+}
+
+fn validate_active_native_id_tables(connection: &Connection) -> EngineResult<Box<[TableId]>> {
+    let rows = connection
+        .prepare(
+            "SELECT table_id, policy, activation_state
+             FROM briskdb_generated_ids
+             ORDER BY table_id
+             LIMIT 4097",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| {
+            manifest_read_error(error, "failed to read generated-ID activation metadata")
+        })?;
+    if rows.len() > MAX_TABLES {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "generated-ID activation metadata exceeds the table limit",
+        ));
+    }
+    let mut active = Vec::new();
+    for (table_id, policy, state) in rows {
+        match (policy, state) {
+            (GENERATED_ID_POLICY_NONE, GENERATED_ID_INACTIVE) => {}
+            (GENERATED_ID_POLICY_NATIVE_RANGE_V1, GENERATED_ID_INACTIVE) => {}
+            (GENERATED_ID_POLICY_NATIVE_RANGE_V1, GENERATED_ID_ACTIVE) => {
+                active.push(TableId::from_validated(positive_catalog_id(
+                    table_id, "table",
+                )?));
+            }
+            (_, GENERATED_ID_ACTIVE) if policy > GENERATED_ID_POLICY_NATIVE_RANGE_V1 => {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!("table {table_id} activates a newer generated-ID policy"),
+                ));
+            }
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!("table {table_id} has inconsistent generated-ID activation metadata"),
+                ));
+            }
+        }
+    }
+    Ok(active.into_boxed_slice())
+}
+
+fn validate_table_provisioning(
+    connection: &Connection,
+    expected_shard_count: u16,
+    catalog: Option<&Catalog>,
+    active_migration: Option<&SchemaMigration>,
+    integrity: Option<ManifestIntegrity>,
+) -> EngineResult<Option<NativeTableProvisioning>> {
+    validate_table(
+        connection,
+        "briskdb_table_provisioning",
+        &[
+            TableColumn::expected(0, "singleton", "INTEGER", false, 1),
+            TableColumn::expected(1, "provisioning_id", "BLOB", true, 0),
+            TableColumn::expected(2, "digest_version", "INTEGER", true, 0),
+            TableColumn::expected(3, "schema_digest_version", "INTEGER", true, 0),
+            TableColumn::expected(4, "committed_schema_digest", "BLOB", true, 0),
+            TableColumn::expected(5, "shard_count", "INTEGER", true, 0),
+            TableColumn::expected(6, "declaration_count", "INTEGER", true, 0),
+            TableColumn::expected(7, "next_shard", "INTEGER", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_table_provisioning",
+        V10_TABLE_PROVISIONING_SQL,
+    )?;
+    validate_table(
+        connection,
+        "briskdb_table_provisioning_declarations",
+        &[
+            TableColumn::expected(0, "provisioning_singleton", "INTEGER", true, 1),
+            TableColumn::expected(1, "ordinal", "INTEGER", true, 2),
+            TableColumn::expected(2, "database_id", "INTEGER", true, 0),
+            TableColumn::expected(3, "table_name", "TEXT", true, 0),
+            TableColumn::expected(4, "placement", "INTEGER", true, 0),
+            TableColumn::expected(5, "shard_key_column", "TEXT", false, 0),
+            TableColumn::expected(6, "shard_key_type", "INTEGER", false, 0),
+            TableColumn::expected(7, "generated_policy", "INTEGER", true, 0),
+            TableColumn::expected(8, "generated_column", "TEXT", false, 0),
+            TableColumn::expected(9, "generated_encoding_version", "INTEGER", false, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_table_provisioning_declarations",
+        V10_TABLE_PROVISIONING_DECLARATIONS_SQL,
+    )?;
+
+    let singleton_rows = connection
+        .prepare(
+            "SELECT singleton,
+                    provisioning_id,
+                    digest_version,
+                    schema_digest_version,
+                    committed_schema_digest,
+                    shard_count,
+                    declaration_count,
+                    next_shard
+             FROM briskdb_table_provisioning
+             ORDER BY singleton
+             LIMIT 3",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| manifest_read_error(error, "failed to read table-provisioning journal"))?;
+    if singleton_rows.is_empty() {
+        let declaration_exists = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM briskdb_table_provisioning_declarations
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| {
+                manifest_read_error(error, "failed to inspect table-provisioning declarations")
+            })?;
+        if declaration_exists {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "table-provisioning declarations exist without their journal",
+            ));
+        }
+        return Ok(None);
+    }
+    if singleton_rows.len() != 1 || singleton_rows[0].0 != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "table provisioning must contain exactly its singleton journal",
+        ));
+    }
+    if active_migration.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "table provisioning cannot overlap an application-schema migration",
+        ));
+    }
+    let (_, id, digest_version, schema_version, committed, shards, count, next) =
+        &singleton_rows[0];
+    if *digest_version != i64::from(TABLE_PROVISIONING_DIGEST_VERSION)
+        || *schema_version != i64::from(SCHEMA_DIGEST_VERSION)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "table-provisioning journal has unsupported digest metadata",
+        ));
+    }
+    let provisioning_id = digest_from_blob(id, "table-provisioning identifier")?;
+    let committed_schema_digest = digest_from_blob(committed, "table-provisioning schema digest")?;
+    let integrity_state = integrity.map(ManifestIntegrity::state);
+    if integrity.and_then(ManifestIntegrity::committed_schema_digest)
+        != Some(committed_schema_digest)
+        || !matches!(
+            integrity_state,
+            Some(DatabaseIntegrityState::Ready | DatabaseIntegrityState::Degraded)
+        )
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "table provisioning does not match a valid committed schema",
+        ));
+    }
+    let shard_count = u16::try_from(*shards).map_err(|error| {
         EngineError::from_source(
             EngineErrorKind::DataCorruption,
-            "allocation-owner metadata is not a complete one-to-one mapping",
+            "table-provisioning shard count is outside the supported range",
             error,
         )
-    })
+    })?;
+    let next_shard = u16::try_from(*next).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "table-provisioning progress is outside the supported range",
+            error,
+        )
+    })?;
+    if shard_count != expected_shard_count || next_shard > shard_count {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "table provisioning has inconsistent shard progress",
+        ));
+    }
+    let declaration_count = usize::try_from(*count).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "table-provisioning declaration count is outside the supported range",
+            error,
+        )
+    })?;
+    let declarations = read_table_provisioning_declarations(connection, declaration_count)?;
+    if table_provisioning_id(&declarations, shard_count, committed_schema_digest) != provisioning_id
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "table-provisioning identifier does not match its declarations",
+        ));
+    }
+    if !declarations.iter().any(|declaration| {
+        matches!(
+            declaration.generated_id_policy(),
+            GeneratedIdPolicy::NativeRangeV1 { .. }
+        )
+    }) {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "table provisioning does not contain a native generated-ID policy",
+        ));
+    }
+    if let Some(catalog) = catalog {
+        if !catalog.tables().is_empty() && !declarations_match_catalog_owned(&declarations, catalog)
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "table provisioning declarations conflict with the authoritative catalog",
+            ));
+        }
+    }
+    Ok(Some(NativeTableProvisioning {
+        provisioning_id,
+        committed_schema_digest,
+        shard_count,
+        declarations,
+        next_shard,
+    }))
+}
+
+fn read_table_provisioning_declarations(
+    connection: &Connection,
+    expected_count: usize,
+) -> EngineResult<Box<[TableDeclaration]>> {
+    let limit = i64::try_from(MAX_TABLES + 1).expect("table journal limit fits SQLite");
+    let rows = connection
+        .prepare(
+            "SELECT ordinal,
+                    database_id,
+                    table_name,
+                    placement,
+                    shard_key_column,
+                    shard_key_type,
+                    generated_policy,
+                    generated_column,
+                    generated_encoding_version
+             FROM briskdb_table_provisioning_declarations
+             ORDER BY ordinal
+             LIMIT ?1",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([limit], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| {
+            manifest_read_error(error, "failed to read table-provisioning declarations")
+        })?;
+    if rows.len() != expected_count || rows.is_empty() || rows.len() > MAX_TABLES {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "table-provisioning declaration count is inconsistent",
+        ));
+    }
+    let mut declarations = Vec::with_capacity(rows.len());
+    for (
+        expected_ordinal,
+        (
+            ordinal,
+            database_id,
+            name,
+            placement_code,
+            shard_column,
+            shard_type,
+            generated_policy,
+            generated_column,
+            generated_version,
+        ),
+    ) in rows.into_iter().enumerate()
+    {
+        if ordinal != i64::try_from(expected_ordinal).expect("bounded ordinal fits SQLite") {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "table-provisioning declaration ordinals are not contiguous",
+            ));
+        }
+        let database_id = crate::core::LogicalDatabaseId::new(positive_catalog_id(
+            database_id,
+            "logical database",
+        )?)
+        .map_err(|error| error.context("invalid table-provisioning database ID"))?;
+        let placement = match (placement_code, shard_column, shard_type) {
+            (SHARDED_PLACEMENT, Some(column), Some(key_type)) => TablePlacement::Sharded(
+                ShardKeyMetadata::new(column, decode_shard_key_type(key_type, 1)?)
+                    .map_err(|error| error.context("invalid table-provisioning shard key"))?,
+            ),
+            (GLOBAL_PLACEMENT, None, None) => TablePlacement::Global,
+            (CATALOG_PLACEMENT, None, None) => TablePlacement::Catalog,
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    "table-provisioning declaration has inconsistent placement",
+                ));
+            }
+        };
+        let policy = decode_generated_id_policy(
+            1,
+            &placement,
+            Some(generated_policy),
+            generated_column,
+            generated_version,
+        )?;
+        let declaration = match placement {
+            TablePlacement::Sharded(key) => TableDeclaration::sharded(database_id, name, key),
+            TablePlacement::Global => TableDeclaration::global(database_id, name),
+            TablePlacement::Catalog => TableDeclaration::catalog(database_id, name),
+        }
+        .and_then(|declaration| declaration.with_generated_id_policy(policy))
+        .map_err(|error| error.context("invalid table-provisioning declaration"))?;
+        declarations.push(declaration);
+    }
+    if !is_sorted_unique_declarations(&declarations) {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "table-provisioning declarations are not in canonical order",
+        ));
+    }
+    Ok(declarations.into_boxed_slice())
 }
 
 fn validate_schema_catalog_configuration(
@@ -5328,6 +7050,8 @@ mod tests {
 
     use rusqlite::OptionalExtension;
 
+    use crate::core::generated_id::AllocationOwnerSlot;
+
     use super::*;
 
     type StoredTableMetadataRow = (i64, i64, String, i64, Option<String>, Option<i64>);
@@ -5664,20 +7388,48 @@ mod tests {
             )
             .unwrap();
         if has_generated_ids {
-            connection
-                .execute(
-                    "INSERT INTO briskdb_generated_ids (
-                        table_id,
-                        policy,
-                        generated_column,
-                        encoding_version
-                     )
-                     SELECT table_id, ?1, NULL, NULL
-                     FROM briskdb_tables
-                     ORDER BY table_id",
-                    [GENERATED_ID_POLICY_NONE],
+            let has_activation = connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_xinfo('briskdb_generated_ids')
+                        WHERE name = 'activation_state'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
                 )
                 .unwrap();
+            if has_activation {
+                connection
+                    .execute(
+                        "INSERT INTO briskdb_generated_ids (
+                            table_id,
+                            policy,
+                            generated_column,
+                            encoding_version,
+                            activation_state
+                         )
+                         SELECT table_id, ?1, NULL, NULL, ?2
+                         FROM briskdb_tables
+                         ORDER BY table_id",
+                        rusqlite::params![GENERATED_ID_POLICY_NONE, GENERATED_ID_INACTIVE],
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute(
+                        "INSERT INTO briskdb_generated_ids (
+                            table_id,
+                            policy,
+                            generated_column,
+                            encoding_version
+                         )
+                         SELECT table_id, ?1, NULL, NULL
+                         FROM briskdb_tables
+                         ORDER BY table_id",
+                        [GENERATED_ID_POLICY_NONE],
+                    )
+                    .unwrap();
+            }
         }
         refresh_manifest_digest_if_checksummed(connection).unwrap();
     }
@@ -5687,7 +7439,7 @@ mod tests {
             identity(connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(connection).unwrap(), v9_objects());
+        assert_eq!(schema_objects(connection).unwrap(), v10_objects());
         assert_eq!(
             connection
                 .query_row(
@@ -5754,7 +7506,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V2_MANIFEST_DIGEST_VERSION)
+            i64::from(V3_MANIFEST_DIGEST_VERSION)
         );
         let (layout_id, application_id, metadata_version, state) = shard_layout_row(connection);
         assert_eq!(layout_id.len(), 16);
@@ -5862,7 +7614,16 @@ mod tests {
         );
         assert_eq!(
             resumed_steps,
-            [(2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9),]
+            [
+                (2, 3),
+                (3, 4),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 8),
+                (8, 9),
+                (9, 10),
+            ]
         );
         assert_generation_one_catalog(&connection, 4);
         assert_eq!(quick_check(&connection), "ok");
@@ -6018,7 +7779,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_to_v9_persists_explicit_none_policies_and_owner_slots() {
+    fn v8_to_current_persists_explicit_none_policies_and_owner_slots() {
         let mut connection = Connection::open_in_memory().unwrap();
         create_ready_v8_manifest(&mut connection, 4);
         insert_valid_table_catalog(&connection);
@@ -6045,9 +7806,9 @@ mod tests {
 
         assert_eq!(
             identity(&connection),
-            (MANIFEST_APPLICATION_ID, i64::from(V9_SCHEMA_VERSION))
+            (MANIFEST_APPLICATION_ID, i64::from(V10_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v9_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v10_objects());
         assert_eq!(table_metadata_rows(&connection), tables_before);
         assert_eq!(logical_databases(&connection), databases_before);
         assert_eq!(routing_configuration(&connection), routing_before);
@@ -6090,7 +7851,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V2_MANIFEST_DIGEST_VERSION)
+            i64::from(V3_MANIFEST_DIGEST_VERSION)
         );
         assert_eq!(
             manifest_semantic_digest(&connection).unwrap(),
@@ -6107,6 +7868,300 @@ mod tests {
         );
         assert_eq!(identity(&connection), identity_before);
         assert_eq!(stored_manifest_digest(&connection), root_before);
+    }
+
+    #[test]
+    fn v9_native_policy_migrates_inactive_without_losing_catalog_metadata() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let database = crate::core::LogicalDatabaseId::new(1).unwrap();
+        let declarations = vec![
+            TableDeclaration::sharded(
+                database,
+                "events",
+                ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+            )
+            .unwrap()
+            .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+            .unwrap(),
+        ];
+        let ready_digest = [0x5a; 32];
+        let active = match begin_native_table_provisioning(
+            &mut connection,
+            4,
+            declarations.clone(),
+            ready_digest,
+            || {},
+        )
+        .unwrap()
+        {
+            NativeTableProvisioningClassification::Active(active) => active,
+            other => panic!("unexpected provisioning classification: {other:?}"),
+        };
+        let mut progress = active;
+        for next in 1..=4 {
+            progress =
+                advance_native_table_provisioning(&mut connection, 4, &progress, next).unwrap();
+        }
+        finalize_native_table_provisioning(&mut connection, 4, &progress, || {}).unwrap();
+
+        connection
+            .execute(
+                "UPDATE briskdb_generated_ids SET activation_state = 0 WHERE table_id = 1",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE briskdb_table_provisioning_declarations;
+                 DROP TABLE briskdb_table_provisioning;
+                 DROP INDEX briskdb_one_active_owner_per_shard;
+                 ALTER TABLE briskdb_generated_ids RENAME TO briskdb_generated_ids_v10;
+                 ALTER TABLE briskdb_allocation_owners RENAME TO briskdb_allocation_owners_v10;",
+            )
+            .unwrap();
+        connection
+            .execute_batch(V9_GENERATED_IDS_TABLE_SQL)
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO briskdb_generated_ids
+                 SELECT table_id, policy, generated_column, encoding_version
+                 FROM briskdb_generated_ids_v10",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(V9_ALLOCATION_OWNERS_TABLE_SQL)
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO briskdb_allocation_owners
+                 SELECT owner_slot, physical_shard_id
+                 FROM briskdb_allocation_owners_v10",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE briskdb_generated_ids_v10;
+                 DROP TABLE briskdb_allocation_owners_v10;
+                 DROP TABLE briskdb_metadata;",
+            )
+            .unwrap();
+        connection.execute_batch(V9_DOWNGRADE_FENCE_SQL).unwrap();
+        connection
+            .execute("INSERT INTO briskdb_metadata VALUES (9)", [])
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE briskdb_integrity SET manifest_digest_version = 2",
+                [],
+            )
+            .unwrap();
+        set_identity(&connection, V9_SCHEMA_VERSION).unwrap();
+        refresh_manifest_digest(&connection).unwrap();
+
+        let loaded = load_or_create_manifest(&mut connection, 4).unwrap();
+        let table = loaded
+            .catalog
+            .logical()
+            .table("default", "events")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            table.generated_id_policy(),
+            &GeneratedIdPolicy::native_range_v1("id").unwrap()
+        );
+        assert!(loaded.catalog.active_native_id_table_ids().is_empty());
+        assert_eq!(identity(&connection).1, i64::from(V10_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn table_provisioning_journal_is_exact_monotonic_and_atomic() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let database = crate::core::LogicalDatabaseId::new(1).unwrap();
+        let declarations = vec![
+            TableDeclaration::global(database, "countries").unwrap(),
+            TableDeclaration::sharded(
+                database,
+                "events",
+                ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+            )
+            .unwrap()
+            .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+            .unwrap(),
+        ];
+        let schema_digest = [0x5a; 32];
+
+        let active = match begin_native_table_provisioning(
+            &mut connection,
+            4,
+            declarations.clone(),
+            schema_digest,
+            || {},
+        )
+        .unwrap()
+        {
+            NativeTableProvisioningClassification::Active(active) => active,
+            other => panic!("unexpected provisioning classification: {other:?}"),
+        };
+        assert_eq!(active.next_shard(), 0);
+        assert_eq!(active.declarations(), declarations.as_slice());
+        assert_eq!(active.committed_schema_digest(), schema_digest);
+        assert_eq!(
+            active.provisioning_id(),
+            [
+                0x2a, 0x5e, 0xc9, 0x09, 0x53, 0x3f, 0xa2, 0x27, 0x8e, 0xaa, 0x36, 0xee, 0xf0, 0x1a,
+                0x24, 0xba, 0xc5, 0xe9, 0xf2, 0x25, 0x54, 0x9c, 0xf6, 0xf4, 0xa8, 0x9b, 0x3d, 0xfa,
+                0xe7, 0x57, 0xda, 0x2c,
+            ]
+        );
+        assert_eq!(
+            begin_native_table_provisioning(
+                &mut connection,
+                4,
+                declarations.clone(),
+                schema_digest,
+                || {},
+            )
+            .unwrap(),
+            NativeTableProvisioningClassification::Active(active.clone())
+        );
+        let conflict = vec![
+            TableDeclaration::sharded(
+                database,
+                "other_events",
+                ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+            )
+            .unwrap()
+            .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+            .unwrap(),
+        ];
+        assert_eq!(
+            begin_native_table_provisioning(&mut connection, 4, conflict, schema_digest, || {})
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert_eq!(
+            advance_native_table_provisioning(&mut connection, 4, &active, 2)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            finalize_native_table_provisioning(&mut connection, 4, &active, || {})
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+
+        let mut progress = active;
+        for next in 1..=4 {
+            progress =
+                advance_native_table_provisioning(&mut connection, 4, &progress, next).unwrap();
+            assert_eq!(progress.next_shard(), next);
+        }
+        let mut commit_attempted = false;
+        let catalog = finalize_native_table_provisioning(&mut connection, 4, &progress, || {
+            commit_attempted = true;
+        })
+        .unwrap();
+        assert!(commit_attempted);
+        assert_eq!(catalog.logical().tables().len(), 2);
+        assert_eq!(catalog.active_native_id_table_ids().len(), 1);
+        assert!(
+            load_or_create_manifest(&mut connection, 4)
+                .unwrap()
+                .active_table_provisioning()
+                .is_none()
+        );
+        assert_eq!(
+            classify_native_table_provisioning(
+                &mut connection,
+                4,
+                declarations.clone(),
+                schema_digest,
+            )
+            .unwrap(),
+            NativeTableProvisioningClassification::Complete
+        );
+        assert_eq!(
+            finalize_native_table_provisioning(&mut connection, 4, &progress, || {}).unwrap(),
+            catalog
+        );
+    }
+
+    #[test]
+    fn retired_owners_route_history_while_replacement_owners_allocate() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        connection
+            .execute(
+                "UPDATE briskdb_allocation_owners
+                 SET owner_state = ?1
+                 WHERE owner_slot = 0",
+                [ALLOCATION_OWNER_RETIRED],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO briskdb_allocation_owners (
+                    owner_slot, physical_shard_id, owner_state
+                 ) VALUES (100, 0, ?1)",
+                [ALLOCATION_OWNER_ACTIVE],
+            )
+            .unwrap();
+        refresh_manifest_digest(&connection).unwrap();
+        let catalog = load_or_create_catalog(&mut connection, 4).unwrap();
+        let owners = catalog.allocation_owners().unwrap();
+        assert_eq!(
+            owners.physical_shard(AllocationOwnerSlot::from_validated(0)),
+            Some(0)
+        );
+        assert_eq!(
+            owners.owner_for_physical_shard(0),
+            Some(AllocationOwnerSlot::from_validated(100))
+        );
+        assert_eq!(
+            owners
+                .assignments()
+                .filter(|(_, shard, _)| *shard == 0)
+                .collect::<Vec<_>>(),
+            [
+                (0, 0, AllocationOwnerState::Retired),
+                (100, 0, AllocationOwnerState::Active),
+            ]
+        );
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[test]
+    fn allocation_owner_lifecycle_rejects_a_lower_successor_atomically() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        replace_allocation_owner_for_test(&mut connection, 4, 0, 100, 0).unwrap();
+        let root_before = stored_manifest_digest(&connection);
+        let owners_before = allocation_owner_rows(&connection);
+
+        let error = replace_allocation_owner_for_test(&mut connection, 4, 100, 50, 0).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+        assert!(error.diagnostic().contains("must be greater"));
+
+        assert_eq!(stored_manifest_digest(&connection), root_before);
+        assert_eq!(allocation_owner_rows(&connection), owners_before);
+        let owners = load_or_create_catalog(&mut connection, 4)
+            .unwrap()
+            .allocation_owners()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            owners.owner_for_physical_shard(0),
+            Some(AllocationOwnerSlot::from_validated(100))
+        );
+        assert!(owners.owner_is_active(AllocationOwnerSlot::from_validated(100)));
     }
 
     #[test]
@@ -6169,6 +8224,170 @@ mod tests {
                     [(0, 0), (1, 1), (2, 2), (3, 3)]
                 );
                 assert_eq!(generated_id_rows(&connection).len(), tables_before.len());
+            }
+        }
+    }
+
+    #[test]
+    fn v9_to_v10_failures_and_panics_roll_back_exactly_and_retry() {
+        for failing_phase in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ] {
+            for inject_panic in [false, true] {
+                let mut connection = Connection::open_in_memory().unwrap();
+                create_ready_current_manifest(&mut connection, 4);
+                let database = crate::core::LogicalDatabaseId::new(1).unwrap();
+                let declarations = vec![
+                    TableDeclaration::sharded(
+                        database,
+                        "events",
+                        ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+                    )
+                    .unwrap()
+                    .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+                    .unwrap(),
+                ];
+                install_v9_native_catalog_for_test(&mut connection, 4, &declarations).unwrap();
+
+                let root_before = stored_manifest_digest(&connection);
+                let databases_before = logical_databases(&connection);
+                let tables_before = table_metadata_rows(&connection);
+                let generated_ids_before = generated_id_rows(&connection);
+                let owners_before = allocation_owner_rows(&connection);
+                let objects_before = schema_objects(&connection).unwrap();
+                let fence_before = connection
+                    .query_row(
+                        "SELECT requires_manifest_version FROM briskdb_metadata",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                let digest_version_before = connection
+                    .query_row(
+                        "SELECT manifest_digest_version
+                         FROM briskdb_integrity
+                         WHERE singleton = 1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+
+                let attempt = catch_unwind(AssertUnwindSafe(|| {
+                    load_or_create_with_hook(&mut connection, 4, |point| {
+                        if point.from == V9_SCHEMA_VERSION && point.phase == failing_phase {
+                            if inject_panic {
+                                panic!("injected v9 to v10 migration panic");
+                            }
+                            return Err(EngineError::new(
+                                EngineErrorKind::Internal,
+                                "injected v9 to v10 migration failure",
+                            ));
+                        }
+                        Ok(())
+                    })
+                }));
+                if inject_panic {
+                    assert!(attempt.is_err());
+                } else {
+                    assert_eq!(
+                        attempt.unwrap().unwrap_err().kind(),
+                        EngineErrorKind::Internal
+                    );
+                }
+
+                assert_eq!(
+                    identity(&connection),
+                    (MANIFEST_APPLICATION_ID, i64::from(V9_SCHEMA_VERSION))
+                );
+                assert_eq!(schema_objects(&connection).unwrap(), objects_before);
+                assert_eq!(logical_databases(&connection), databases_before);
+                assert_eq!(table_metadata_rows(&connection), tables_before);
+                assert_eq!(generated_id_rows(&connection), generated_ids_before);
+                assert_eq!(allocation_owner_rows(&connection), owners_before);
+                assert_eq!(stored_manifest_digest(&connection), root_before);
+                assert_eq!(manifest_semantic_digest(&connection).unwrap(), root_before);
+                assert_eq!(quick_check(&connection), "ok");
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT requires_manifest_version FROM briskdb_metadata",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    fence_before
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT manifest_digest_version
+                             FROM briskdb_integrity
+                             WHERE singleton = 1",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    digest_version_before
+                );
+
+                let loaded = load_or_create_catalog(&mut connection, 4).unwrap();
+                let table = loaded
+                    .logical()
+                    .table("default", "events")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    table.generated_id_policy(),
+                    &GeneratedIdPolicy::native_range_v1("id").unwrap()
+                );
+                assert!(loaded.active_native_id_table_ids().is_empty());
+                assert_eq!(generated_id_rows(&connection), generated_ids_before);
+                assert_eq!(allocation_owner_rows(&connection), owners_before);
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*)
+                             FROM briskdb_generated_ids
+                             WHERE activation_state != ?1",
+                            [GENERATED_ID_INACTIVE],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*)
+                             FROM briskdb_allocation_owners
+                             WHERE owner_state != ?1",
+                            [ALLOCATION_OWNER_ACTIVE],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT (SELECT COUNT(*) FROM briskdb_table_provisioning) +
+                                    (SELECT COUNT(*) FROM briskdb_table_provisioning_declarations)",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    identity(&connection),
+                    (MANIFEST_APPLICATION_ID, i64::from(V10_SCHEMA_VERSION))
+                );
+                assert_eq!(schema_objects(&connection).unwrap(), v10_objects());
+                assert_eq!(
+                    manifest_semantic_digest(&connection).unwrap(),
+                    stored_manifest_digest(&connection)
+                );
             }
         }
     }
@@ -6416,7 +8635,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_semantic_digest_v2_orders_catalog_rows_by_frozen_keys() {
+    fn manifest_semantic_digest_v3_orders_catalog_rows_by_frozen_keys() {
         let mut forward = Connection::open_in_memory().unwrap();
         let mut reverse = Connection::open_in_memory().unwrap();
         for connection in [&mut forward, &mut reverse] {
@@ -6439,31 +8658,68 @@ mod tests {
                  INSERT INTO briskdb_tables VALUES (21, 9, 'audit_log', 3, NULL, NULL);
                  INSERT INTO briskdb_tables VALUES (8, 1, 'countries', 2, NULL, NULL);
                  INSERT INTO briskdb_tables VALUES (3, 1, 'accounts', 1, 'tenant_id', 2);
-                 INSERT INTO briskdb_generated_ids VALUES (55, 0, NULL, NULL);
-                 INSERT INTO briskdb_generated_ids VALUES (34, 0, NULL, NULL);
-                 INSERT INTO briskdb_generated_ids VALUES (21, 0, NULL, NULL);
-                 INSERT INTO briskdb_generated_ids VALUES (8, 0, NULL, NULL);
-                 INSERT INTO briskdb_generated_ids VALUES (3, 0, NULL, NULL);",
+                 INSERT INTO briskdb_generated_ids VALUES (55, 0, NULL, NULL, 0);
+                 INSERT INTO briskdb_generated_ids VALUES (34, 0, NULL, NULL, 0);
+                 INSERT INTO briskdb_generated_ids VALUES (21, 0, NULL, NULL, 0);
+                 INSERT INTO briskdb_generated_ids VALUES (8, 0, NULL, NULL, 0);
+                 INSERT INTO briskdb_generated_ids VALUES (3, 0, NULL, NULL, 0);",
             )
             .unwrap();
 
         let digest = refresh_manifest_digest(&forward).unwrap();
         assert_eq!(digest, refresh_manifest_digest(&reverse).unwrap());
+    }
+
+    #[test]
+    fn manifest_semantic_digest_v3_has_a_frozen_golden_vector() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        connection
+            .execute(
+                "UPDATE briskdb_shard_layout
+                 SET layout_id = x'000102030405060708090a0b0c0d0e0f'
+                 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        refresh_manifest_digest(&connection).unwrap();
+        let database = crate::core::LogicalDatabaseId::new(1).unwrap();
+        let declarations = vec![
+            TableDeclaration::global(database, "countries").unwrap(),
+            TableDeclaration::sharded(
+                database,
+                "events",
+                ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+            )
+            .unwrap()
+            .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+            .unwrap(),
+        ];
+        let active =
+            begin_native_table_provisioning(&mut connection, 4, declarations, [0x5a; 32], || {})
+                .unwrap();
+        assert!(matches!(
+            active,
+            NativeTableProvisioningClassification::Active(_)
+        ));
+
+        let digest = manifest_semantic_digest(&connection).unwrap();
         assert_eq!(
             digest,
             [
-                0xb4, 0xc6, 0xcb, 0x52, 0x95, 0xc1, 0x43, 0xf8, 0xe5, 0xf9, 0x3c, 0x96, 0xa3, 0x96,
-                0x84, 0xa7, 0xca, 0xd3, 0x72, 0x50, 0x13, 0x68, 0x7b, 0x07, 0x94, 0xd8, 0x2f, 0x58,
-                0x0f, 0x0e, 0xed, 0xf0,
+                0x14, 0xd3, 0xd7, 0x26, 0x2d, 0x98, 0x5b, 0x0a, 0x6d, 0xe3, 0x57, 0x23, 0xe8, 0xa6,
+                0x21, 0xec, 0x49, 0xf9, 0x81, 0x52, 0xc4, 0xa7, 0xa8, 0xaf, 0xcf, 0xee, 0x50, 0xb9,
+                0x98, 0x34, 0xd1, 0x5c,
             ]
         );
+        assert_eq!(stored_manifest_digest(&connection), digest);
     }
 
     #[test]
     fn semantic_root_covers_every_authoritative_manifest_table_and_integrity_state() {
         let mutations = [
             "UPDATE briskdb_manifest SET singleton = 2 WHERE singleton = 1",
-            "UPDATE briskdb_metadata SET requires_manifest_version = 10",
+            "UPDATE briskdb_metadata SET requires_manifest_version = 11",
             "UPDATE briskdb_routing SET hash_version = 2 WHERE singleton = 1",
             "UPDATE briskdb_physical_shards SET lifecycle_state = 'retired' WHERE shard_id = 0",
             "UPDATE briskdb_allocation_owners SET owner_slot = 100 WHERE owner_slot = 0",
@@ -6471,9 +8727,11 @@ mod tests {
             "UPDATE briskdb_logical_databases SET database_name = 'primary' WHERE database_id = 1",
             "UPDATE briskdb_schema_catalog SET identifier_encoding_version = 2 WHERE singleton = 1",
             "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 2, NULL, NULL)",
-            "INSERT INTO briskdb_generated_ids VALUES (1, 0, NULL, NULL)",
+            "INSERT INTO briskdb_generated_ids VALUES (1, 0, NULL, NULL, 0)",
             "UPDATE briskdb_shard_layout SET layout_id = randomblob(16) WHERE singleton = 1",
             "INSERT INTO briskdb_schema_migrations VALUES (1, 0, randomblob(32), 1, 'SELECT 1', 4, 2, 4)",
+            "INSERT INTO briskdb_table_provisioning VALUES (1, zeroblob(32), 1, 1, zeroblob(32), 4, 1, 0)",
+            "INSERT INTO briskdb_table_provisioning_declarations VALUES (1, 0, 1, 'events', 1, 'id', 1, 1, 'id', 1)",
             "UPDATE briskdb_integrity SET database_state = 4 WHERE singleton = 1",
             "UPDATE briskdb_integrity SET committed_schema_digest = randomblob(32) WHERE singleton = 1",
         ];
@@ -6557,7 +8815,7 @@ mod tests {
     fn resealed_generated_id_relational_tampering_fails_closed() {
         for mutation in [
             "DELETE FROM briskdb_generated_ids WHERE table_id = 3",
-            "INSERT INTO briskdb_generated_ids VALUES (999, 0, NULL, NULL)",
+            "INSERT INTO briskdb_generated_ids VALUES (999, 0, NULL, NULL, 0)",
             "UPDATE briskdb_generated_ids
              SET policy = 1, generated_column = 'id', encoding_version = 1
              WHERE table_id = 8",
@@ -6595,8 +8853,14 @@ mod tests {
     fn resealed_allocation_owner_relational_tampering_fails_closed() {
         for mutation in [
             "DELETE FROM briskdb_allocation_owners WHERE owner_slot = 0",
-            "UPDATE briskdb_allocation_owners SET owner_slot = 100 WHERE owner_slot = 0",
+            "UPDATE briskdb_allocation_owners SET owner_state = 2 WHERE owner_slot = 0",
             "UPDATE briskdb_allocation_owners SET physical_shard_id = 63 WHERE owner_slot = 0",
+            "UPDATE briskdb_allocation_owners
+             SET owner_slot = 100, owner_state = 2
+             WHERE owner_slot = 0;
+             INSERT INTO briskdb_allocation_owners (
+                 owner_slot, physical_shard_id, owner_state
+             ) VALUES (50, 0, 1)",
         ] {
             let mut connection = Connection::open_in_memory().unwrap();
             create_ready_current_manifest(&mut connection, 4);
@@ -6620,7 +8884,7 @@ mod tests {
     #[test]
     fn integrity_versions_lengths_and_forged_state_invariants_fail_closed() {
         for (version_column, unsupported_version) in
-            [("manifest_digest_version", 3), ("schema_digest_version", 2)]
+            [("manifest_digest_version", 4), ("schema_digest_version", 2)]
         {
             let mut unsupported = Connection::open_in_memory().unwrap();
             create_ready_current_manifest(&mut unsupported, 4);
@@ -6848,7 +9112,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v9_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v10_objects());
         assert_eq!(
             shard_layout_row(&connection).3,
             ShardLayoutState::Adopting.code()
@@ -6872,7 +9136,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v9_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v10_objects());
         assert_eq!(layout.state(), ShardLayoutState::Ready);
         assert_eq!(shard_layout_row(&connection), layout_before);
         assert_eq!(catalog.logical().schema_generation(), 0);
@@ -6964,7 +9228,7 @@ mod tests {
                 identity(&connection),
                 (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
             );
-            assert_eq!(schema_objects(&connection).unwrap(), v9_objects());
+            assert_eq!(schema_objects(&connection).unwrap(), v10_objects());
         }
 
         let mut connection = Connection::open_in_memory().unwrap();
@@ -8584,7 +10848,7 @@ mod tests {
         for mutation in [
             "DELETE FROM briskdb_metadata",
             "DELETE FROM briskdb_manifest",
-            "INSERT INTO briskdb_metadata VALUES (9)",
+            "INSERT INTO briskdb_metadata VALUES (11)",
             "DELETE FROM briskdb_routing",
             "DELETE FROM briskdb_virtual_buckets WHERE bucket_id = 4095",
             "DELETE FROM briskdb_physical_shards WHERE shard_id = 3",
@@ -8805,9 +11069,10 @@ mod tests {
                         table_id,
                         policy,
                         generated_column,
-                        encoding_version
+                        encoding_version,
+                        activation_state
                      )
-                     SELECT table_id, 0, NULL, NULL
+                     SELECT table_id, 0, NULL, NULL, 0
                      FROM briskdb_tables
                      ORDER BY table_id",
                     [],

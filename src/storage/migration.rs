@@ -1018,7 +1018,7 @@ fn preflight_one_shard(
                 layout,
             )?;
             shard::verify_schema_digest(&connection, source_generation, expected_source_digest)?;
-            shard::preflight_schema_migration_on_connection_with_digest_and_catalog(
+            shard::preflight_schema_migration_on_connection_with_digest_and_catalog_snapshot(
                 &mut connection,
                 path,
                 shard_id,
@@ -1026,7 +1026,7 @@ fn preflight_one_shard(
                 target_generation,
                 layout,
                 sql,
-                catalog.logical(),
+                catalog,
             )
         }
         Some(control) => {
@@ -1041,7 +1041,7 @@ fn preflight_one_shard(
                     layout,
                 )?;
                 shard::verify_schema_digest(connection, source_generation, expected_source_digest)?;
-                shard::preflight_schema_migration_on_connection_with_digest_and_catalog(
+                shard::preflight_schema_migration_on_connection_with_digest_and_catalog_snapshot(
                     connection,
                     path,
                     shard_id,
@@ -1049,7 +1049,7 @@ fn preflight_one_shard(
                     target_generation,
                     layout,
                     sql,
-                    catalog.logical(),
+                    catalog,
                 )
             })
         }

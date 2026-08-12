@@ -484,6 +484,8 @@ struct Registry {
     child_scan_complete_gate: Mutex<Option<TestChildScanGate>>,
     #[cfg(test)]
     write_child_busy_gate: Mutex<Option<TestChildScanGate>>,
+    #[cfg(test)]
+    generated_target_gate: Mutex<Option<TestChildScanGate>>,
 }
 
 #[derive(Debug)]
@@ -683,6 +685,8 @@ impl Registry {
             child_scan_complete_gate: Mutex::new(None),
             #[cfg(test)]
             write_child_busy_gate: Mutex::new(None),
+            #[cfg(test)]
+            generated_target_gate: Mutex::new(None),
         }))
     }
 
@@ -698,6 +702,24 @@ impl Registry {
                 return Err(EngineError::new(
                     EngineErrorKind::Internal,
                     "writable child-busy test gate timed out or disconnected",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_after_generated_target_selection_for_test(&self) -> EngineResult<()> {
+        #[cfg(test)]
+        {
+            let gate = self
+                .generated_target_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if gate.is_some_and(|gate| !gate.wait_for_release()) {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "native generated target-selection test gate timed out or disconnected",
                 ));
             }
         }
@@ -742,6 +764,7 @@ impl Registry {
             let spec = TableSpec::from_physical_table(
                 shard,
                 table,
+                storage.native_id_policy_is_active(table.id()),
                 allocation_owners.cloned(),
                 targets.into_boxed_slice(),
             )?;
@@ -945,6 +968,35 @@ impl Registry {
             ));
         }
         Ok(target)
+    }
+
+    /// Resolve an explicit INSERT target while preventing new rows from being
+    /// introduced into a retired native-ID namespace. Historical IDs remain
+    /// routable through `write_target` for delete/update lookup semantics.
+    fn insert_target(&self, spec: &TableSpec, value: ValueRef<'_>) -> EngineResult<u16> {
+        if let (GeneratedIdPolicy::NativeRangeV1 { .. }, ValueRef::Integer(value)) =
+            (&spec.generated_id_policy, value)
+        {
+            if let GeneratedIdClassification::NativeRangeV1(id) =
+                classify_generated_id(&spec.generated_id_policy, value)?
+            {
+                if let Some(owners) = spec.allocation_owners.as_ref() {
+                    if owners.physical_shard(id.owner()).is_some()
+                        && !owners.owner_is_active(id.owner())
+                    {
+                        return Err(EngineError::new(
+                            EngineErrorKind::FailedPrecondition,
+                            format!(
+                                "native ID for {} uses retired allocation owner {}",
+                                spec.name,
+                                id.owner().get()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        self.write_target(spec, value)
     }
 
     fn cancelled(&self, scan_epoch: u64) -> bool {
@@ -1186,7 +1238,9 @@ struct TableSpec {
     targets: Box<[u16]>,
     shard_key: Option<ShardKeySpec>,
     generated_id_policy: GeneratedIdPolicy,
+    native_id_policy_active: bool,
     allocation_owners: Option<Arc<AllocationOwnerMap>>,
+    generated_shard_cursor: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -1239,6 +1293,7 @@ impl TableSpec {
     fn from_physical_table(
         connection: &Connection,
         table: &TableMetadata,
+        native_id_policy_active: bool,
         allocation_owners: Option<Arc<AllocationOwnerMap>>,
         targets: Box<[u16]>,
     ) -> EngineResult<Self> {
@@ -1518,7 +1573,9 @@ impl TableSpec {
             targets,
             shard_key,
             generated_id_policy: table.generated_id_policy().clone(),
+            native_id_policy_active,
             allocation_owners,
+            generated_shard_cursor: AtomicU64::new(0),
         })
     }
 
@@ -1598,6 +1655,82 @@ impl TableSpec {
         ))
     }
 
+    fn generated_insert_sql_and_values(
+        &self,
+        values: &[ValueRef<'_>],
+        conflict: ConflictMode,
+    ) -> EngineResult<(String, Vec<RawCell>, String)> {
+        self.ensure_writable()?;
+        if values.len() != self.column_count {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                format!(
+                    "brisk_shard received an invalid generated INSERT shape for {}",
+                    self.name
+                ),
+            ));
+        }
+        let generated_column = self.generated_id_policy.column().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!("registered table {} has no generated-ID policy", self.name),
+            )
+        })?;
+        let generated_index = self
+            .columns
+            .iter()
+            .position(|column| column.name == generated_column)
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!(
+                        "registered generated column {}.{} is absent from the physical schema",
+                        self.name, generated_column
+                    ),
+                )
+            })?;
+        if !matches!(values[generated_index], ValueRef::Null) {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "generated INSERT for {} supplied an explicit {} value",
+                    self.name, generated_column
+                ),
+            ));
+        }
+
+        let mut columns = Vec::with_capacity(self.column_count.saturating_sub(1));
+        let mut parameters = Vec::with_capacity(self.column_count.saturating_sub(1));
+        for (index, (column, value)) in self.columns.iter().zip(values).enumerate() {
+            if index == generated_index {
+                continue;
+            }
+            columns.push(quote_identifier(&column.name));
+            parameters.push(RawCell::try_copy_from(*value)?);
+        }
+        let placeholders = (1..=parameters.len())
+            .map(|position| format!("?{position}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert = if columns.is_empty() {
+            format!(
+                "INSERT{} INTO main.{} DEFAULT VALUES RETURNING {}",
+                write_conflict_clause(conflict),
+                quote_identifier(&self.name),
+                quote_identifier(generated_column),
+            )
+        } else {
+            format!(
+                "INSERT{} INTO main.{} ({}) VALUES ({placeholders}) RETURNING {}",
+                write_conflict_clause(conflict),
+                quote_identifier(&self.name),
+                columns.join(", "),
+                quote_identifier(generated_column),
+            )
+        };
+        Ok((insert, parameters, generated_column.to_owned()))
+    }
+
     fn delete_sql(&self) -> EngineResult<String> {
         self.ensure_writable()?;
         let locator = self.locator.as_ref().ok_or_else(|| {
@@ -1634,6 +1767,15 @@ impl TableSpec {
         for ((column, value), unchanged) in self.columns.iter().zip(values).zip(no_change) {
             if *unchanged {
                 continue;
+            }
+            if self.generated_id_policy.column() == Some(column.name.as_str()) {
+                return Err(EngineError::new(
+                    EngineErrorKind::ReadOnly,
+                    format!(
+                        "native generated identity {}.{} cannot be updated",
+                        self.name, column.name
+                    ),
+                ));
             }
             if column.generated {
                 return Err(EngineError::new(
@@ -2834,8 +2976,11 @@ mod tests {
                          payload TEXT NOT NULL
                      ) WITHOUT ROWID;
                      CREATE TABLE native_events (
-                         id INTEGER PRIMARY KEY NOT NULL,
+                         id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
                          payload TEXT NOT NULL
+                     ) STRICT;
+                     CREATE TABLE native_id_only (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT
                      ) STRICT;",
                     &mut migration,
                     None,
@@ -2867,6 +3012,14 @@ mod tests {
                     TableDeclaration::sharded(
                         database_id,
                         "native_events",
+                        ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+                    )
+                    .unwrap()
+                    .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+                    .unwrap(),
+                    TableDeclaration::sharded(
+                        database_id,
+                        "native_id_only",
                         ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
                     )
                     .unwrap()
@@ -2937,6 +3090,26 @@ mod tests {
                 blob_keys,
                 native_ids,
             }
+        }
+
+        fn native_table_id(&self) -> u64 {
+            self.storage
+                .logical_catalog()
+                .table("default", "native_events")
+                .unwrap()
+                .unwrap()
+                .id()
+                .get()
+        }
+
+        fn native_id_only_table_id(&self) -> u64 {
+            self.storage
+                .logical_catalog()
+                .table("default", "native_id_only")
+                .unwrap()
+                .unwrap()
+                .id()
+                .get()
         }
     }
 
@@ -5766,6 +5939,1038 @@ mod tests {
                 .unwrap(),
             "native-explicit"
         );
+    }
+
+    #[test]
+    fn writable_native_generation_captures_returning_id_on_selected_child() {
+        let fixture = TypedRoutingFixture::new(2);
+        let table_id = fixture.native_table_id();
+        let owner = fixture
+            .storage
+            .allocation_owner_map()
+            .unwrap()
+            .owner_for_physical_shard(1)
+            .unwrap();
+        let expected = NativeRangeV1Id::new(owner, 2).unwrap().encode();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let result = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES (?1)",
+                ["generated-on-one"],
+                table_id,
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(result.affected_rows(), 1);
+        assert_eq!(result.shard(), Some(1));
+        assert_eq!(result.explicit_key(), None);
+        assert_eq!(
+            result.generated_key(),
+            Some(&crate::core::GeneratedKey::new(
+                "id",
+                Value::Int64(expected)
+            ))
+        );
+        assert_eq!(coordinator.last_insert_rowid_for_test(), expected);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(1)
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM native_events WHERE id = ?1",
+                    [expected],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "generated-on-one"
+        );
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM native_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn writable_native_generation_auto_selects_round_robin_active_owners() {
+        let fixture = TypedRoutingFixture::new(2);
+        let table_id = fixture.native_table_id();
+        let owners = fixture.storage.allocation_owner_map().unwrap().clone();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        for expected_shard in 0..2 {
+            let result = coordinator
+                .execute_generated_dml_auto(
+                    "INSERT INTO native_events (payload) VALUES (?1)",
+                    [format!("auto-{expected_shard}")],
+                    table_id,
+                )
+                .unwrap();
+            assert_eq!(result.shard(), Some(expected_shard));
+            let generated = match &result.generated_key().unwrap().value {
+                Value::Int64(value) => *value,
+                value => panic!("unexpected generated value: {value:?}"),
+            };
+            let decoded = NativeRangeV1Id::decode(generated).unwrap();
+            assert_eq!(owners.physical_shard(decoded.owner()), Some(expected_shard));
+            assert!(owners.owner_is_active(decoded.owner()));
+        }
+    }
+
+    #[test]
+    fn writable_native_generation_auto_skips_exhausted_owners() {
+        let fixture = TypedRoutingFixture::new(2);
+        let owners = fixture.storage.allocation_owner_map().unwrap();
+        let exhausted_owner = owners.owner_for_physical_shard(0).unwrap();
+        let ceiling = crate::core::generated_id::native_range_v1_sequence_ceiling(exhausted_owner);
+        fixture
+            .storage
+            .open_shard(0)
+            .unwrap()
+            .execute(
+                "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'native_events'",
+                [ceiling],
+            )
+            .unwrap();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let result = coordinator
+            .execute_generated_dml_auto(
+                "INSERT INTO native_events (payload) VALUES ('fallback')",
+                [],
+                fixture.native_table_id(),
+            )
+            .unwrap();
+        assert_eq!(result.shard(), Some(1));
+        let generated = match &result.generated_key().unwrap().value {
+            Value::Int64(value) => *value,
+            value => panic!("unexpected generated value: {value:?}"),
+        };
+        assert_eq!(
+            owners.physical_shard(NativeRangeV1Id::decode(generated).unwrap().owner()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn writable_native_generation_auto_retries_when_selected_owner_exhausts_before_lock() {
+        let fixture = TypedRoutingFixture::new(2);
+        let owners = fixture.storage.allocation_owner_map().unwrap().clone();
+        let first_owner = owners.owner_for_physical_shard(0).unwrap();
+        let ceiling = crate::core::generated_id::native_range_v1_sequence_ceiling(first_owner);
+        fixture
+            .storage
+            .open_shard(0)
+            .unwrap()
+            .execute(
+                "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'native_events'",
+                [ceiling - 1],
+            )
+            .unwrap();
+
+        let coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let mut gate = coordinator.install_generated_target_gate_for_test();
+        let table_id = fixture.native_table_id();
+        let worker = thread::spawn(move || {
+            let mut coordinator = coordinator;
+            coordinator.execute_generated_dml_auto(
+                "INSERT INTO native_events (payload) VALUES ('raced-fallback')",
+                [],
+                table_id,
+            )
+        });
+
+        gate.wait_until_started();
+        let competing = fixture
+            .storage
+            .open_shard(0)
+            .unwrap()
+            .query_row(
+                "INSERT INTO native_events (payload) VALUES ('last-on-zero') RETURNING id",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(competing, ceiling);
+        gate.release();
+
+        let result = worker.join().unwrap().unwrap();
+        assert_eq!(result.affected_rows(), 1);
+        assert_eq!(result.shard(), Some(1));
+        let generated = match &result.generated_key().unwrap().value {
+            Value::Int64(value) => *value,
+            value => panic!("unexpected generated value: {value:?}"),
+        };
+        assert_eq!(
+            owners.physical_shard(NativeRangeV1Id::decode(generated).unwrap().owner()),
+            Some(1)
+        );
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM native_events WHERE payload = 'raced-fallback'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(1)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM native_events WHERE payload = 'raced-fallback'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn writable_native_generation_auto_reports_all_active_owners_exhausted() {
+        let fixture = TypedRoutingFixture::new(2);
+        for shard in 0..2 {
+            let owner = fixture
+                .storage
+                .allocation_owner_map()
+                .unwrap()
+                .owner_for_physical_shard(shard)
+                .unwrap();
+            let ceiling = crate::core::generated_id::native_range_v1_sequence_ceiling(owner);
+            fixture
+                .storage
+                .open_shard(shard)
+                .unwrap()
+                .execute(
+                    "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'native_events'",
+                    [ceiling],
+                )
+                .unwrap();
+        }
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let error = coordinator
+            .execute_generated_dml_auto(
+                "INSERT INTO native_events (payload) VALUES ('all-exhausted')",
+                [],
+                fixture.native_table_id(),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        assert!(error.diagnostic().contains("exhausted every active"));
+        for shard in 0..2 {
+            assert_eq!(
+                fixture
+                    .storage
+                    .open_shard(shard)
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM native_events WHERE payload = 'all-exhausted'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn writable_native_generation_requires_an_explicit_intent() {
+        let fixture = TypedRoutingFixture::new(2);
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let error = coordinator
+            .execute_dml(
+                "INSERT INTO native_events (payload) VALUES ('not-authorized')",
+                [],
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::NotNullViolation);
+        assert_eq!(
+            (0..2)
+                .map(|shard| fixture
+                    .storage
+                    .open_shard(shard)
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM native_events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap())
+                .sum::<i64>(),
+            2
+        );
+    }
+
+    #[test]
+    fn writable_native_generation_rejects_multiple_callbacks_and_rolls_back() {
+        let fixture = TypedRoutingFixture::new(2);
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let error = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('first'), ('second')",
+                [],
+                fixture.native_table_id(),
+                0,
+            )
+            .unwrap_err();
+
+        // The virtual-table module preserves the rejection diagnostic; the
+        // outer SQLite statement classifies a module callback rejection as an
+        // invalid query.
+        assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+        assert!(
+            error
+                .to_string()
+                .contains("multi-row native generated INSERT")
+        );
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM native_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn writable_native_generation_rollback_discards_row_and_result_state() {
+        let fixture = TypedRoutingFixture::new(2);
+        let table_id = fixture.native_table_id();
+        let owner = fixture
+            .storage
+            .allocation_owner_map()
+            .unwrap()
+            .owner_for_physical_shard(0)
+            .unwrap();
+        let rolled_back_id = NativeRangeV1Id::new(owner, 2).unwrap().encode();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        coordinator.begin().unwrap();
+        let pending = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('rolled-back')",
+                [],
+                table_id,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            pending.generated_key().unwrap().value,
+            Value::Int64(rolled_back_id)
+        );
+        coordinator.rollback().unwrap();
+
+        let committed = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('committed')",
+                [],
+                table_id,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            committed.generated_key().unwrap().value,
+            Value::Int64(rolled_back_id)
+        );
+        let connection = fixture.storage.open_shard(0).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM native_events WHERE payload = 'rolled-back'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM native_events WHERE payload = 'committed'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn writable_native_generation_supports_id_only_default_values() {
+        let fixture = TypedRoutingFixture::new(2);
+        let owner = fixture
+            .storage
+            .allocation_owner_map()
+            .unwrap()
+            .owner_for_physical_shard(0)
+            .unwrap();
+        let expected = NativeRangeV1Id::new(owner, 1).unwrap().encode();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let result = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_id_only DEFAULT VALUES",
+                [],
+                fixture.native_id_only_table_id(),
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(result.generated_key().unwrap().column, "id");
+        assert_eq!(
+            result.generated_key().unwrap().value,
+            Value::Int64(expected)
+        );
+        assert_eq!(result.shard(), Some(0));
+    }
+
+    #[test]
+    fn writable_native_generation_constraint_failure_does_not_leak_a_key() {
+        let fixture = TypedRoutingFixture::new(2);
+        let table_id = fixture.native_table_id();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let error = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES (NULL)",
+                [],
+                table_id,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::NotNullViolation);
+
+        let successful = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('after-constraint')",
+                [],
+                table_id,
+                0,
+            )
+            .unwrap();
+        assert!(successful.generated_key().is_some());
+        assert_eq!(successful.affected_rows(), 1);
+    }
+
+    #[test]
+    fn writable_native_generation_commit_failure_never_acknowledges_the_key() {
+        let fixture = TypedRoutingFixture::new(2);
+        let table_id = fixture.native_table_id();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        coordinator.fail_next_commit_for_test();
+
+        let error = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('failed-commit')",
+                [],
+                table_id,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::StorageUnavailable);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM native_events WHERE payload = 'failed-commit'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        let recovered = WriteCoordinator::open(fixture.storage.clone())
+            .unwrap()
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('after-failed-commit')",
+                [],
+                table_id,
+                0,
+            )
+            .unwrap();
+        assert!(recovered.generated_key().is_some());
+    }
+
+    #[test]
+    fn writable_native_generation_or_ignore_exposes_no_key_and_rolls_back_its_sequence_attempt() {
+        let TypedRoutingFixture { _temp, storage, .. } = TypedRoutingFixture::new(2);
+        let table_id = storage
+            .logical_catalog()
+            .table("default", "native_events")
+            .unwrap()
+            .unwrap()
+            .id()
+            .get();
+        let owner = storage
+            .allocation_owner_map()
+            .unwrap()
+            .owner_for_physical_shard(0)
+            .unwrap();
+        let committed_id = NativeRangeV1Id::new(owner, 1).unwrap().encode();
+        let next_id = NativeRangeV1Id::new(owner, 2).unwrap().encode();
+        let mut coordinator = WriteCoordinator::open(storage.clone()).unwrap();
+
+        let ignored = coordinator
+            .execute_generated_dml(
+                "INSERT OR IGNORE INTO native_events (payload) VALUES (NULL)",
+                [],
+                table_id,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(ignored.affected_rows(), 0);
+        assert_eq!(ignored.shard(), None);
+        assert_eq!(ignored.generated_key(), None);
+        assert_eq!(ignored.explicit_key(), None);
+        drop(coordinator);
+
+        let sequence = storage
+            .open_shard(0)
+            .unwrap()
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'native_events'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        // The facade delegates non-REPLACE physical conflicts as OR ABORT and
+        // lets the outer virtual-table statement apply IGNORE. The failed
+        // child statement therefore rolls back its sequence attempt instead
+        // of committing the gap that direct SQLite OR IGNORE would retain.
+        assert_eq!(sequence, committed_id);
+        assert_eq!(
+            storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM native_events WHERE id = ?1",
+                    [next_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        drop(storage);
+        let reopened = Storage::open(_temp.path(), 2).unwrap();
+        assert_eq!(
+            reopened
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'native_events'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            committed_id
+        );
+        let inserted = WriteCoordinator::open(reopened.clone())
+            .unwrap()
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('after-ignored-gap')",
+                [],
+                table_id,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            inserted.generated_key().unwrap().value,
+            Value::Int64(next_id)
+        );
+        assert_ne!(next_id, committed_id);
+        let connection = reopened.open_shard(0).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT payload FROM native_events WHERE id = ?1",
+                    [next_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "after-ignored-gap"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'native_events'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            next_id
+        );
+    }
+
+    #[test]
+    fn writable_native_generation_preflight_mismatch_does_not_mutate() {
+        let fixture = TypedRoutingFixture::new(2);
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let outside = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('outside')",
+                [],
+                fixture.native_table_id(),
+                2,
+            )
+            .unwrap_err();
+        assert_eq!(outside.kind(), EngineErrorKind::FailedPrecondition);
+
+        let explicit = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_events (id, payload) VALUES (?1, 'explicit')",
+                [fixture.native_ids[0]],
+                fixture.native_table_id(),
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(explicit.kind(), EngineErrorKind::InvalidQuery);
+        assert!(
+            explicit
+                .to_string()
+                .contains("unexpectedly supplied an explicit key")
+        );
+        assert_eq!(
+            (0..2)
+                .map(|shard| fixture
+                    .storage
+                    .open_shard(shard)
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM native_events WHERE payload IN ('outside', 'explicit')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap())
+                .sum::<i64>(),
+            0
+        );
+    }
+
+    #[test]
+    fn writable_native_generated_identity_cannot_be_updated_even_in_place() {
+        let fixture = TypedRoutingFixture::new(2);
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let error = coordinator
+            .execute_dml(
+                "UPDATE native_events SET id = id WHERE id = ?1",
+                [fixture.native_ids[0]],
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::ReadOnly);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM native_events WHERE id = ?1",
+                    [fixture.native_ids[0]],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn writable_native_generation_reopens_with_the_persisted_sequence() {
+        let TypedRoutingFixture { _temp, storage, .. } = TypedRoutingFixture::new(2);
+        let table_id = storage
+            .logical_catalog()
+            .table("default", "native_events")
+            .unwrap()
+            .unwrap()
+            .id()
+            .get();
+        let owner = storage
+            .allocation_owner_map()
+            .unwrap()
+            .owner_for_physical_shard(1)
+            .unwrap();
+        let first_expected = NativeRangeV1Id::new(owner, 2).unwrap().encode();
+        let second_expected = NativeRangeV1Id::new(owner, 3).unwrap().encode();
+
+        let first = WriteCoordinator::open(storage.clone())
+            .unwrap()
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('before-reopen')",
+                [],
+                table_id,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            first.generated_key().unwrap().value,
+            Value::Int64(first_expected)
+        );
+        drop(storage);
+
+        let reopened = Storage::open(_temp.path(), 2).unwrap();
+        assert_eq!(
+            reopened
+                .logical_catalog()
+                .table("default", "native_events")
+                .unwrap()
+                .unwrap()
+                .id()
+                .get(),
+            table_id
+        );
+        let second = WriteCoordinator::open(reopened.clone())
+            .unwrap()
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('after-reopen')",
+                [],
+                table_id,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            second.generated_key().unwrap().value,
+            Value::Int64(second_expected)
+        );
+        assert_eq!(
+            reopened
+                .open_shard(1)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM native_events
+                     WHERE payload IN ('before-reopen', 'after-reopen')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn writable_native_generation_stops_at_the_owner_ceiling() {
+        let fixture = TypedRoutingFixture::new(2);
+        let owner = fixture
+            .storage
+            .allocation_owner_map()
+            .unwrap()
+            .owner_for_physical_shard(0)
+            .unwrap();
+        let ceiling = crate::core::generated_id::native_range_v1_sequence_ceiling(owner);
+        fixture
+            .storage
+            .open_shard(0)
+            .unwrap()
+            .execute(
+                "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'native_events'",
+                [ceiling],
+            )
+            .unwrap();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let error = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('outside-range')",
+                [],
+                fixture.native_table_id(),
+                0,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM native_events WHERE payload = 'outside-range'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn writable_native_auto_generation_is_concurrent_unique_and_uses_every_wal() {
+        const ROUNDS_PER_SHARD: usize = 3;
+
+        for shard_count in [2_u16, 4, 8, 10] {
+            let fixture = TypedRoutingFixture::new(shard_count);
+            let table_id = fixture.native_table_id();
+
+            // Pin a pre-write read snapshot on every physical database. This
+            // prevents a closing writer from resetting its WAL before the
+            // assertions below can prove that each independent file received
+            // frames from this concurrent workload.
+            let mut wal_readers = Vec::with_capacity(usize::from(shard_count));
+            for shard in 0..shard_count {
+                let path = fixture
+                    ._temp
+                    .path()
+                    .join("shards")
+                    .join(format!("{shard:04}.sqlite"));
+                let reader = Connection::open(path).unwrap();
+                reader
+                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+                reader.execute_batch("BEGIN DEFERRED").unwrap();
+                reader
+                    .query_row("SELECT COUNT(*) FROM native_events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap();
+                wal_readers.push(reader);
+            }
+
+            let worker_count = usize::from(shard_count);
+            let inserts_per_worker = worker_count * ROUNDS_PER_SHARD;
+            let barrier = Arc::new(std::sync::Barrier::new(worker_count));
+            let mut workers = Vec::with_capacity(worker_count);
+            for worker in 0..worker_count {
+                let storage = fixture.storage.clone();
+                let barrier = Arc::clone(&barrier);
+                workers.push(thread::spawn(move || {
+                    let mut coordinator = WriteCoordinator::open(storage).unwrap();
+                    barrier.wait();
+                    (0..inserts_per_worker)
+                        .map(|insert| {
+                            let result = coordinator
+                                .execute_generated_dml_auto(
+                                    "INSERT INTO native_events (payload) VALUES (?1)",
+                                    [format!("auto-concurrent-{worker}-{insert}")],
+                                    table_id,
+                                )
+                                .unwrap();
+                            let shard = result.shard().expect("generated write selected a shard");
+                            let generated = match &result.generated_key().unwrap().value {
+                                Value::Int64(value) => *value,
+                                value => panic!("unexpected generated value: {value:?}"),
+                            };
+                            (shard, generated)
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+
+            let results = workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>();
+            let expected_total = worker_count * inserts_per_worker;
+            assert_eq!(results.len(), expected_total);
+
+            let owners = fixture.storage.allocation_owner_map().unwrap();
+            let mut unique_ids = BTreeSet::new();
+            let mut seen_shards = BTreeSet::new();
+            let mut rows_per_shard = vec![0_usize; worker_count];
+            let mut maximum_per_shard = vec![i64::MIN; worker_count];
+            for (shard, generated) in results {
+                assert!(
+                    unique_ids.insert(generated),
+                    "duplicate generated ID {generated} with {shard_count} shards"
+                );
+                seen_shards.insert(shard);
+                rows_per_shard[usize::from(shard)] += 1;
+                maximum_per_shard[usize::from(shard)] =
+                    maximum_per_shard[usize::from(shard)].max(generated);
+
+                let decoded = NativeRangeV1Id::decode(generated).unwrap();
+                assert_eq!(owners.physical_shard(decoded.owner()), Some(shard));
+                assert!(owners.owner_is_active(decoded.owner()));
+            }
+            assert_eq!(unique_ids.len(), expected_total);
+            assert_eq!(seen_shards, (0..shard_count).collect::<BTreeSet<_>>());
+
+            let expected_per_shard = worker_count * ROUNDS_PER_SHARD;
+            for shard in 0..shard_count {
+                let index = usize::from(shard);
+                assert_eq!(rows_per_shard[index], expected_per_shard);
+                let connection = fixture.storage.open_shard(shard).unwrap();
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM native_events
+                             WHERE payload LIKE 'auto-concurrent-%'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    i64::try_from(expected_per_shard).unwrap(),
+                    "shard count {shard_count}, shard {shard}"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT seq FROM sqlite_sequence WHERE name = 'native_events'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    maximum_per_shard[index],
+                    "shard count {shard_count}, shard {shard}"
+                );
+                assert_eq!(
+                    connection
+                        .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    "wal"
+                );
+                let wal = fixture
+                    ._temp
+                    .path()
+                    .join("shards")
+                    .join(format!("{shard:04}.sqlite-wal"));
+                assert!(
+                    std::fs::metadata(&wal).unwrap().len() > 32,
+                    "shard count {shard_count}, shard {shard} did not retain a WAL frame"
+                );
+            }
+            drop(wal_readers);
+        }
+    }
+
+    #[test]
+    fn writable_native_generation_is_concurrent_and_unique_across_supported_shard_counts() {
+        for shard_count in [2_u16, 4, 8, 10] {
+            let fixture = TypedRoutingFixture::new(shard_count);
+            let table_id = fixture.native_table_id();
+            let barrier = Arc::new(std::sync::Barrier::new(usize::from(shard_count)));
+            let mut workers = Vec::new();
+            for shard in 0..shard_count {
+                let storage = fixture.storage.clone();
+                let barrier = Arc::clone(&barrier);
+                workers.push(thread::spawn(move || {
+                    let mut coordinator = WriteCoordinator::open(storage).unwrap();
+                    barrier.wait();
+                    let result = coordinator
+                        .execute_generated_dml(
+                            "INSERT INTO native_events (payload) VALUES (?1)",
+                            [format!("concurrent-{shard}")],
+                            table_id,
+                            shard,
+                        )
+                        .unwrap();
+                    let generated = match &result.generated_key().unwrap().value {
+                        Value::Int64(value) => *value,
+                        value => panic!("unexpected generated value: {value:?}"),
+                    };
+                    (shard, result.shard(), generated)
+                }));
+            }
+
+            let results = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>();
+            let unique = results
+                .iter()
+                .map(|(_, _, generated)| *generated)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(unique.len(), usize::from(shard_count));
+            let owners = fixture.storage.allocation_owner_map().unwrap();
+            for (expected_shard, actual_shard, generated) in results {
+                assert_eq!(actual_shard, Some(expected_shard));
+                let decoded = NativeRangeV1Id::decode(generated).unwrap();
+                assert_eq!(owners.physical_shard(decoded.owner()), Some(expected_shard));
+                assert_eq!(decoded.local_sequence(), 2);
+                let connection = fixture.storage.open_shard(expected_shard).unwrap();
+                assert_eq!(
+                    connection
+                        .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    "wal"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM native_events WHERE id = ?1",
+                            [generated],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn writable_native_generation_cancellation_before_callback_exposes_no_key() {
+        let fixture = TypedRoutingFixture::new(2);
+        let table_id = fixture.native_table_id();
+        let coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let cancellation = coordinator.cancellation_handle();
+        let mut gate = coordinator.install_statement_arm_gate_for_test();
+        let worker = thread::spawn(move || {
+            let mut coordinator = coordinator;
+            let result = coordinator.execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('cancelled-generated')",
+                [],
+                table_id,
+                0,
+            );
+            (coordinator, result)
+        });
+
+        gate.wait_until_started();
+        cancellation.cancel();
+        gate.release();
+
+        let (mut coordinator, result) = worker.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), EngineErrorKind::Cancelled);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM native_events WHERE payload = 'cancelled-generated'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let after = coordinator
+            .execute_generated_dml(
+                "INSERT INTO native_events (payload) VALUES ('after-cancel')",
+                [],
+                table_id,
+                0,
+            )
+            .unwrap();
+        assert!(after.generated_key().is_some());
     }
 
     #[test]

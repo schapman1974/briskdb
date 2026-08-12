@@ -13,8 +13,13 @@ use rusqlite::{
 
 use crate::{
     core::{
-        Catalog, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy, ShardKeyType,
-        TableDeclaration, TablePlacement,
+        AllocationOwnerMap, Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult,
+        GeneratedIdPolicy, ShardKeyType, TableDeclaration, TableId, TablePlacement,
+        generated_id::{
+            AllocationOwnerSlot, MAX_ALLOCATION_OWNER_SLOT, NATIVE_RANGE_V1_FORMAT_MARKER,
+            native_range_v1_first_id, native_range_v1_sequence_ceiling,
+            native_range_v1_sequence_floor,
+        },
     },
     sqlite_error,
 };
@@ -623,6 +628,7 @@ pub(super) fn preflight_schema_migration_on_connection_with_digest(
 /// Connection-level digesting preflight that also preserves the complete
 /// authoritative table catalog. The catalog check runs inside the rollback
 /// transaction after the SQL batch, before its target digest is trusted.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn preflight_schema_migration_on_connection_with_digest_and_catalog(
     connection: &mut Connection,
@@ -642,7 +648,35 @@ pub(super) fn preflight_schema_migration_on_connection_with_digest_and_catalog(
         target_generation,
         layout,
         sql,
-        Some(catalog),
+        Some((catalog, None)),
+    )
+}
+
+/// Catalog-preserving preflight that also distinguishes manifest-activated
+/// native allocators from v9 policy metadata that has not been provisioned.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn preflight_schema_migration_on_connection_with_digest_and_catalog_snapshot(
+    connection: &mut Connection,
+    path: &Path,
+    shard_id: u16,
+    source_generation: u64,
+    target_generation: u64,
+    layout: &ShardLayout,
+    sql: &str,
+    catalog: &CatalogSnapshot,
+) -> EngineResult<(SchemaMigrationShardState, SchemaDigest)> {
+    preflight_schema_migration_on_connection_with_digest_inner(
+        connection,
+        path,
+        shard_id,
+        source_generation,
+        target_generation,
+        layout,
+        sql,
+        Some((
+            catalog.logical(),
+            Some(catalog.active_native_id_table_ids()),
+        )),
     )
 }
 
@@ -655,9 +689,9 @@ fn preflight_schema_migration_on_connection_with_digest_inner(
     target_generation: u64,
     layout: &ShardLayout,
     sql: &str,
-    catalog: Option<&Catalog>,
+    catalog: Option<(&Catalog, Option<&[TableId]>)>,
 ) -> EngineResult<(SchemaMigrationShardState, SchemaDigest)> {
-    if catalog.is_some_and(|catalog| !catalog.tables().is_empty()) {
+    if catalog.is_some_and(|(catalog, _)| !catalog.tables().is_empty()) {
         crate::sql::validate_authoritative_schema_migration(sql)?;
     }
     let initial = validate_schema_migration_connection(
@@ -669,8 +703,8 @@ fn preflight_schema_migration_on_connection_with_digest_inner(
         layout,
     )?;
     if initial == SchemaMigrationShardState::Target {
-        if let Some(catalog) = catalog {
-            validate_registered_table_schema(connection, catalog)?;
+        if let Some((catalog, active)) = catalog {
+            validate_registered_table_schema_inner(connection, catalog, active)?;
         }
         let digest = calculate_schema_digest(connection, target_generation)?;
         return Ok((initial, digest));
@@ -699,8 +733,8 @@ fn preflight_schema_migration_on_connection_with_digest_inner(
             target_generation,
             layout,
         )?;
-        if let Some(catalog) = catalog {
-            validate_registered_table_schema(connection, catalog)?;
+        if let Some((catalog, active)) = catalog {
+            validate_registered_table_schema_inner(connection, catalog, active)?;
         }
         let digest = calculate_schema_digest(connection, target_generation)?;
         return Ok((state, digest));
@@ -709,8 +743,8 @@ fn preflight_schema_migration_on_connection_with_digest_inner(
     let reserved_before = reserved_schema_snapshot(&transaction)?;
     execute_schema_migration_batch(&transaction, sql)?;
     ensure_reserved_schema_unchanged(&reserved_before, &transaction)?;
-    if let Some(catalog) = catalog {
-        validate_registered_table_schema(&transaction, catalog)?;
+    if let Some((catalog, active)) = catalog {
+        validate_registered_table_schema_inner(&transaction, catalog, active)?;
     }
     ensure_no_foreign_key_violations(&transaction)?;
     let target_digest = calculate_schema_digest(&transaction, target_generation)?;
@@ -742,9 +776,26 @@ fn preflight_schema_migration_on_connection_with_digest_inner(
 /// such declaration must have a physical table, and Catalog declarations must
 /// remain manifest-only. Sharded keys additionally retain the representation
 /// required by deterministic routing.
+#[cfg(test)]
 pub(super) fn validate_registered_table_schema(
     connection: &Connection,
     catalog: &Catalog,
+) -> EngineResult<()> {
+    validate_registered_table_schema_inner(connection, catalog, None)
+}
+
+pub(super) fn validate_registered_table_schema_with_active_native_ids(
+    connection: &Connection,
+    catalog: &Catalog,
+    active_native_id_table_ids: &[TableId],
+) -> EngineResult<()> {
+    validate_registered_table_schema_inner(connection, catalog, Some(active_native_id_table_ids))
+}
+
+fn validate_registered_table_schema_inner(
+    connection: &Connection,
+    catalog: &Catalog,
+    active_native_id_table_ids: Option<&[TableId]>,
 ) -> EngineResult<()> {
     if catalog.tables().is_empty() {
         return Ok(());
@@ -912,6 +963,19 @@ pub(super) fn validate_registered_table_schema(
                 "has an incompatible SQLite declared type",
             ));
         }
+        let native_policy_is_active =
+            active_native_id_table_ids.is_none_or(|ids| ids.binary_search(&table.id()).is_ok());
+        if native_policy_is_active {
+            if let GeneratedIdPolicy::NativeRangeV1 { column } = table.generated_id_policy() {
+                if !native_generated_column_is_exact(connection, table.name(), column)? {
+                    return Err(registered_shard_key_error(
+                        table.name(),
+                        column,
+                        "must remain exactly INTEGER PRIMARY KEY AUTOINCREMENT",
+                    ));
+                }
+            }
+        }
         if matches!(shard_key.key_type(), ShardKeyType::Text)
             && !shard_key_uses_binary_collation(connection, table.name(), shard_key.column())?
         {
@@ -943,6 +1007,217 @@ pub(super) fn validate_registered_table_schema(
         )?;
     }
     Ok(())
+}
+
+/// Validate the durable allocator state for every activated native-range
+/// table on one physical shard.
+///
+/// Registration seeds the reserved owner-local floor while every table is
+/// empty. Once the catalog is authoritative, a missing, duplicate, non-integer
+/// or cross-owner state is committed-storage corruption and must fail closed.
+pub(super) fn validate_native_range_v1_state_with_active_ids(
+    connection: &Connection,
+    catalog: &Catalog,
+    owners: &AllocationOwnerMap,
+    physical_shard: u16,
+    active_native_id_table_ids: Option<&[TableId]>,
+) -> EngineResult<()> {
+    let opened_snapshot = connection.is_autocommit();
+    if opened_snapshot {
+        connection
+            .execute_batch("BEGIN DEFERRED")
+            .map_err(sqlite_error::storage)?;
+    }
+    let validation = validate_native_range_v1_state_inner(
+        connection,
+        catalog,
+        owners,
+        physical_shard,
+        active_native_id_table_ids,
+    );
+    let snapshot_release = if opened_snapshot {
+        connection
+            .execute_batch("ROLLBACK")
+            .map_err(sqlite_error::storage)
+    } else {
+        Ok(())
+    };
+    match (validation, snapshot_release) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => {
+            Err(error.context("failed to release the native-range allocator validation snapshot"))
+        }
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn validate_native_range_v1_state_inner(
+    connection: &Connection,
+    catalog: &Catalog,
+    owners: &AllocationOwnerMap,
+    physical_shard: u16,
+    active_native_id_table_ids: Option<&[TableId]>,
+) -> EngineResult<()> {
+    let owner = owners
+        .owner_for_physical_shard(physical_shard)
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "physical shard {physical_shard} has no active native-range allocation owner"
+                ),
+            )
+        })?;
+    let floor = native_range_v1_sequence_floor(owner);
+    let first = native_range_v1_first_id(owner);
+    let ceiling = native_range_v1_sequence_ceiling(owner);
+
+    for table in catalog.tables() {
+        if active_native_id_table_ids.is_some_and(|ids| ids.binary_search(&table.id()).is_err()) {
+            continue;
+        }
+        let GeneratedIdPolicy::NativeRangeV1 { column } = table.generated_id_policy() else {
+            continue;
+        };
+        let (row_count, integer_count) = connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(typeof(seq) = 'integer'), 0)
+                 FROM main.sqlite_sequence
+                 WHERE name = ?1 COLLATE BINARY",
+                [table.name()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|error| native_range_state_read_error(error, table.name()))?;
+        if row_count != 1 || integer_count != 1 {
+            return Err(native_range_state_error(
+                table.name(),
+                format!(
+                    "sqlite_sequence must contain exactly one integer row, found {row_count} rows and {integer_count} integer rows"
+                ),
+            ));
+        }
+        let sequence = connection
+            .query_row(
+                "SELECT seq FROM main.sqlite_sequence
+                 WHERE name = ?1 COLLATE BINARY",
+                [table.name()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| native_range_state_read_error(error, table.name()))?;
+        if !(floor..=ceiling).contains(&sequence) {
+            return Err(native_range_state_error(
+                table.name(),
+                format!(
+                    "sqlite_sequence value {sequence} is outside owner {} range {floor}..={ceiling}",
+                    owner.get()
+                ),
+            ));
+        }
+
+        let quoted_table = quote_identifier(table.name());
+        let quoted_column = quote_identifier(column);
+        let foreign_probes =
+            foreign_native_id_probe_sql(&quoted_table, &quoted_column, owners, physical_shard)?;
+        let mut foreign_native_id = None;
+        for probe in foreign_probes {
+            foreign_native_id = connection
+                .query_row(&probe, [], |row| row.get::<_, i64>(0))
+                .optional()
+                .map_err(|error| native_range_state_read_error(error, table.name()))?;
+            if foreign_native_id.is_some() {
+                break;
+            }
+        }
+        if let Some(value) = foreign_native_id {
+            return Err(native_range_state_error(
+                table.name(),
+                format!(
+                    "row ID {value} does not belong to a native-range owner routed to physical shard {physical_shard}"
+                ),
+            ));
+        }
+
+        let maximum_native_id = connection
+            .query_row(
+                &format!(
+                    "SELECT MAX({quoted_column}) FROM {quoted_table}
+                     WHERE {quoted_column} BETWEEN ?1 AND ?2"
+                ),
+                (first, ceiling),
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|error| native_range_state_read_error(error, table.name()))?;
+        if maximum_native_id.is_some_and(|maximum| sequence < maximum) {
+            return Err(native_range_state_error(
+                table.name(),
+                format!(
+                    "sqlite_sequence value {sequence} is below committed native row ID {}",
+                    maximum_native_id.expect("is_some_and observed a value")
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build indexed range probes for every gap outside the owner ranges routed to
+/// one shard. Unlike a bitwise owner predicate, every probe can seek
+/// through the INTEGER PRIMARY KEY instead of scanning all native rows.
+fn foreign_native_id_probe_sql(
+    quoted_table: &str,
+    quoted_column: &str,
+    owners: &AllocationOwnerMap,
+    physical_shard: u16,
+) -> EngineResult<Box<[String]>> {
+    let mut routable = owners
+        .assignments()
+        .filter(|(_, shard, _)| *shard == physical_shard)
+        .map(|(owner, _, _)| AllocationOwnerSlot::from_validated(owner))
+        .collect::<Vec<_>>();
+    routable.sort_unstable_by_key(|owner| owner.get());
+    routable.dedup();
+    if routable.is_empty() {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("physical shard {physical_shard} has no routable native-range owner"),
+        ));
+    }
+
+    let marker = i64::try_from(NATIVE_RANGE_V1_FORMAT_MARKER)
+        .expect("the native-range marker reserves the signed high bit");
+    let maximum_owner = AllocationOwnerSlot::new(MAX_ALLOCATION_OWNER_SLOT)
+        .expect("the native-range maximum owner is valid");
+    let maximum = native_range_v1_sequence_ceiling(maximum_owner);
+    let mut next_gap_start = Some(marker);
+    let mut gaps = Vec::with_capacity(routable.len() + 1);
+    for owner in routable {
+        let Some(gap_start) = next_gap_start else {
+            break;
+        };
+        let first = native_range_v1_first_id(owner);
+        if gap_start < first {
+            gaps.push((gap_start, first - 1));
+        }
+        next_gap_start = native_range_v1_sequence_ceiling(owner).checked_add(1);
+    }
+    if let Some(gap_start) = next_gap_start.filter(|start| *start <= maximum) {
+        gaps.push((gap_start, maximum));
+    }
+    debug_assert!(
+        !gaps.is_empty(),
+        "every owner range reserves local sequence zero"
+    );
+
+    Ok(gaps
+        .into_iter()
+        .map(|(lower, upper)| {
+            format!(
+                "SELECT {quoted_column} FROM {quoted_table} \
+                 WHERE {quoted_column} BETWEEN {lower} AND {upper} LIMIT 1"
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice())
 }
 
 /// Validate one registration candidate against the complete authoritative
@@ -1553,6 +1828,33 @@ pub(super) fn shard_key_uses_binary_collation(
     Ok(collation.is_some_and(|name| name.to_bytes().eq_ignore_ascii_case(b"BINARY")))
 }
 
+pub(super) fn native_generated_column_is_exact(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> EngineResult<bool> {
+    let (declared_type, _, _, primary_key, auto_increment) = connection
+        .column_metadata(Some("main"), table, column)
+        .map_err(sqlite_error::storage)?;
+    let exact_shape = connection
+        .query_row(
+            "SELECT COUNT(*) = 1
+                    AND COALESCE(MAX(dflt_value IS NULL), 0) = 1
+                    AND COALESCE(MAX(pk), 0) = 1
+                    AND COALESCE(MAX(hidden), 1) = 0
+             FROM pragma_table_xinfo(?1)
+             WHERE name = ?2 COLLATE BINARY",
+            (table, column),
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(exact_shape
+        && declared_type
+            .is_some_and(|declared_type| declared_type.to_bytes().eq_ignore_ascii_case(b"INTEGER"))
+        && primary_key
+        && auto_increment)
+}
+
 fn registered_shard_key_is_non_null(
     connection: &Connection,
     table: &str,
@@ -1602,6 +1904,37 @@ fn registered_shard_key_error(table: &str, column: &str, detail: &str) -> Engine
             "schema migration violates the authoritative table catalog: shard key {column} on table {table} {detail}"
         ),
     )
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn native_range_state_error(table: &str, detail: impl std::fmt::Display) -> EngineError {
+    EngineError::new(
+        EngineErrorKind::DataCorruption,
+        format!("native_range_v1 allocator state for table {table} is invalid: {detail}"),
+    )
+}
+
+fn native_range_state_read_error(error: rusqlite::Error, table: &str) -> EngineError {
+    let classified = sqlite_error::storage(error);
+    let diagnostic =
+        format!("failed to validate native_range_v1 allocator state for table {table}");
+    if matches!(
+        classified.kind(),
+        EngineErrorKind::Busy
+            | EngineErrorKind::Cancelled
+            | EngineErrorKind::PermissionDenied
+            | EngineErrorKind::ReadOnly
+            | EngineErrorKind::StorageFull
+            | EngineErrorKind::OutOfMemory
+            | EngineErrorKind::StorageUnavailable
+    ) {
+        classified.context(diagnostic)
+    } else {
+        EngineError::from_source(EngineErrorKind::DataCorruption, diagnostic, classified)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

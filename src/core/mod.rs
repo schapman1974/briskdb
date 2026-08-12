@@ -58,7 +58,8 @@ pub(crate) use routing::{
 pub(crate) use scatter::merge_scatter_results;
 pub use session::{Session, SessionId, SessionState};
 pub use types::{
-    Column, DataType, Decimal, ParseDecimalError, ResultSet, ResultSetShapeError, Row, Value,
+    Column, DataType, Decimal, GeneratedKey, ParseDecimalError, ResultSet, ResultSetShapeError,
+    Row, Value, WriteResult,
 };
 pub(crate) use worker::BlockingPool;
 
@@ -78,8 +79,6 @@ pub(crate) enum RawDataOperation {
 pub(crate) struct RawDataPlan {
     pub(crate) shard: u16,
     pub(crate) sqlite_sql: String,
-    #[cfg(feature = "experimental-vtab")]
-    pub(crate) native_range_v1: bool,
 }
 
 #[derive(Debug)]
@@ -187,7 +186,8 @@ impl Database {
                 0,
                 params,
                 Some(shard_key.as_bytes()),
-            ),
+            )
+            .with_allocation_owners(self.storage.allocation_owner_map()),
             planner::RoutingProvenance::new(
                 hash_version,
                 key_encoding_version,
@@ -197,23 +197,9 @@ impl Database {
             |key| self.shard_for_key(key),
         )?;
         let shard = raw_data_execution_shard(&plan, catalog, operation)?;
-        #[cfg(feature = "experimental-vtab")]
-        let native_range_v1 = plan
-            .inference()
-            .table_id()
-            .and_then(|table| catalog.table_by_id(table))
-            .is_some_and(|table| {
-                matches!(
-                    table.generated_id_policy(),
-                    GeneratedIdPolicy::NativeRangeV1 { .. }
-                )
-            });
-
         Ok(Some(RawDataPlan {
             shard,
             sqlite_sql: translated.sqlite_sql().to_owned(),
-            #[cfg(feature = "experimental-vtab")]
-            native_range_v1,
         }))
     }
 

@@ -19,6 +19,67 @@ use rusqlite::{Connection, OpenFlags, params, types::ValueRef};
 
 const SHARD_COUNT: u16 = 3;
 
+#[test]
+fn explicit_native_range_import_preserves_legacy_rows_and_owner_floors() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source_path = temporary.path().join("native-source.sqlite");
+    let destination = temporary.path().join("native-imported");
+    let source = Connection::open(&source_path).unwrap();
+    source
+        .execute_batch(
+            "CREATE TABLE records(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 value TEXT NOT NULL
+             );
+             INSERT INTO records(id, value) VALUES (-9, 'negative'), (17, 'legacy');",
+        )
+        .unwrap();
+    drop(source);
+    let plan = SqliteImportPlan::new(vec![
+        SqliteTableImportPlan::sharded_by_primary_key("records")
+            .with_native_range_v1("id")
+            .unwrap(),
+    ]);
+
+    import_sqlite_database(
+        &source_path,
+        &destination,
+        &plan,
+        SqliteImportOptions::new(4).unwrap(),
+    )
+    .unwrap();
+
+    let database = Database::open(&destination, 4).unwrap();
+    let metadata = database
+        .catalog()
+        .tables()
+        .iter()
+        .find(|table| table.name() == "records")
+        .unwrap();
+    assert_eq!(
+        metadata.generated_id_policy(),
+        &GeneratedIdPolicy::native_range_v1("id").unwrap()
+    );
+    let routes = integer_routes(&database, [-9, 17]);
+    drop(database);
+
+    let shards = open_shards(&destination, 4);
+    assert_integer_owners(&shards, "records", &routes);
+    for (shard, connection) in shards.iter().enumerate() {
+        let sequence = connection
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'records'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let expected_floor =
+            0x4000_0000_0000_0000_i64 + i64::try_from(shard).unwrap() * (1_i64 << 52);
+        assert_eq!(sequence, expected_floor);
+        assert_ne!(sequence, 17);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RawValue {
     Null,

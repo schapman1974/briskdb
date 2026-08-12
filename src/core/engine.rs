@@ -380,7 +380,8 @@ impl Engine {
                 statement_index,
                 parameters,
                 explicit_routing_key,
-            ),
+            )
+            .with_allocation_owners(self.inner.database.storage.allocation_owner_map()),
             super::planner::RoutingProvenance::new(
                 hash_version,
                 key_encoding_version,
@@ -1034,12 +1035,32 @@ impl Engine {
     }
 
     /// Execute a routed statement and return its selected shard.
+    ///
+    /// This compatibility method returns only the affected-row count. Use
+    /// [`Engine::execute_write`] when generated-key result data is needed.
     pub async fn execute(
         &self,
         session: &Session,
         statement: Statement,
     ) -> EngineResult<Routed<usize>> {
-        self.execute_with_context(session, statement, RequestContext::new())
+        self.execute_write(session, statement)
+            .await
+            .map(write_rows_affected)
+    }
+
+    /// Execute a routed statement with the result shape used for generated keys.
+    ///
+    /// The current public SQL planner rejects an omitted generated shard key,
+    /// so every statement accepted through this public planned path returns a
+    /// [`super::WriteResult`] whose `generated_key` is `None`. Roadmap issue
+    /// #130 will connect the lower-level same-connection allocator result to
+    /// this boundary.
+    pub async fn execute_write(
+        &self,
+        session: &Session,
+        statement: Statement,
+    ) -> EngineResult<Routed<super::WriteResult>> {
+        self.execute_write_with_context(session, statement, RequestContext::new())
             .await
     }
 
@@ -1062,15 +1083,36 @@ impl Engine {
             ExecuteOwnerPolicy::ReuseValidatedCatalogWrite,
         )
         .await
+        .map(write_rows_affected)
     }
 
     /// Execute a routed statement with explicit request controls.
+    ///
+    /// This compatibility method returns only the affected-row count. Use
+    /// [`Engine::execute_write_with_context`] to retain the complete write
+    /// result shape.
     pub async fn execute_with_context(
         &self,
         session: &Session,
         statement: Statement,
         context: RequestContext,
     ) -> EngineResult<Routed<usize>> {
+        self.execute_write_with_context(session, statement, context)
+            .await
+            .map(write_rows_affected)
+    }
+
+    /// Execute a routed statement with explicit request controls and the result
+    /// shape used for same-connection generated-key capture.
+    ///
+    /// Omitted generated-key Engine planning remains roadmap issue #130, so
+    /// currently accepted Engine statements return `generated_key: None`.
+    pub async fn execute_write_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<super::WriteResult>> {
         self.execute_with_context_and_owner(
             session,
             statement,
@@ -1080,13 +1122,143 @@ impl Engine {
         .await
     }
 
+    /// Execute one preflighted native-ID INSERT on a caller-admitted shard.
+    ///
+    /// This crate-private seam deliberately does not parse an omitted-key SQL
+    /// form or choose a shard. Roadmap issue #130 owns that public planning;
+    /// its planner can call this method only after proving a single-row INSERT
+    /// and selecting an eligible physical owner.
+    #[cfg(feature = "experimental-vtab")]
+    #[allow(dead_code)] // Connected to public omitted-key planning by issue #130.
+    pub(crate) async fn execute_generated_write(
+        &self,
+        session: &Session,
+        statement: Statement,
+        table: super::TableId,
+        target_shard: u16,
+    ) -> EngineResult<Routed<super::WriteResult>> {
+        self.execute_generated_write_with_context(
+            session,
+            statement,
+            table,
+            target_shard,
+            RequestContext::new(),
+        )
+        .await
+    }
+
+    /// Execute a preflighted native-ID INSERT with request controls.
+    #[cfg(feature = "experimental-vtab")]
+    #[allow(dead_code)] // Connected to public omitted-key planning by issue #130.
+    pub(crate) async fn execute_generated_write_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        table: super::TableId,
+        target_shard: u16,
+        context: RequestContext,
+    ) -> EngineResult<Routed<super::WriteResult>> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if !self.inner.options.experimental_vtab_writes() {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "experimental virtual-table writes are disabled",
+            )));
+        }
+        if target_shard >= self.shard_count() {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!(
+                    "native generated INSERT target shard {target_shard} is outside shard count {}",
+                    self.shard_count()
+                ),
+            )));
+        }
+        let Some(table_metadata) = self.catalog().table_by_id(table) else {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!("native generated INSERT refers to unknown table identity {table}"),
+            )));
+        };
+        if !matches!(
+            table_metadata.generated_id_policy(),
+            super::GeneratedIdPolicy::NativeRangeV1 { .. }
+        ) {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "registered table {} does not use native_range_v1 generation",
+                    table_metadata.name()
+                ),
+            )));
+        }
+        if !self
+            .inner
+            .database
+            .storage
+            .native_id_policy_is_active(table)
+        {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "native_range_v1 generation is not active for registered table {}",
+                    table_metadata.name()
+                ),
+            )));
+        }
+        let Some(allocation_owners) = self.inner.database.storage.allocation_owner_map() else {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "native generated INSERT has no allocation-owner map",
+            )));
+        };
+        if allocation_owners
+            .owner_for_physical_shard(target_shard)
+            .is_none()
+        {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "native generated INSERT target shard {target_shard} has no active allocation owner"
+                ),
+            )));
+        }
+
+        let (sql, params) = statement.into_parts();
+        let value = self
+            .run_coordinator_write(
+                &mut operation,
+                target_shard,
+                ConnectionOwner::new(session.id().get()),
+                schema_operation,
+                guard,
+                sql,
+                params,
+                Some(table),
+            )
+            .await;
+        let value = operation.finish_started(value)?;
+        Ok(Routed {
+            shard: target_shard,
+            value,
+        })
+    }
+
     async fn execute_with_context_and_owner(
         &self,
         session: &Session,
         statement: Statement,
         context: RequestContext,
         owner_policy: ExecuteOwnerPolicy,
-    ) -> EngineResult<Routed<usize>> {
+    ) -> EngineResult<Routed<super::WriteResult>> {
         let mut operation = self.operation(context)?;
         let schema_operation = match self.inner.database.storage.enter_schema_operation() {
             Ok(guard) => guard,
@@ -1111,16 +1283,6 @@ impl Engine {
             Err(error) => return operation.finish(Err(error)),
         };
         let catalog_authoritative = plan.is_some();
-        #[cfg(feature = "experimental-vtab")]
-        if catalog_authoritative
-            && self.inner.options.experimental_vtab_writes()
-            && plan.as_ref().is_some_and(|plan| plan.native_range_v1)
-        {
-            return operation.finish(Err(EngineError::new(
-                EngineErrorKind::Unsupported,
-                "experimental virtual-table Engine writes do not yet support native_range_v1 tables",
-            )));
-        }
         let owner = match (owner_policy, plan.is_some()) {
             (ExecuteOwnerPolicy::ReuseValidatedCatalogWrite, true) => {
                 ConnectionOwner::stateless_catalog_write()
@@ -1148,6 +1310,7 @@ impl Engine {
                     guard,
                     sql,
                     params,
+                    None,
                 )
                 .await;
             let value = operation.finish_started(value)?;
@@ -1173,6 +1336,7 @@ impl Engine {
             )
             .await;
         let value = operation.finish_started(value)?;
+        let value = super::WriteResult::without_generated_key(value);
         Ok(Routed { shard, value })
     }
 
@@ -1193,7 +1357,8 @@ impl Engine {
         session: OwnedMutexGuard<SessionInner>,
         sql: String,
         params: Vec<Value>,
-    ) -> EngineResult<usize> {
+        generated_table: Option<super::TableId>,
+    ) -> EngineResult<super::WriteResult> {
         // A cold registry cache briefly owns an unpooled read-only shard-0
         // handle; the physical DML child later owns the target-shard handle.
         // Serialize that one-time discovery, reserve every real handle through
@@ -1286,9 +1451,28 @@ impl Engine {
                 worker_control
                     .arm(Arc::new(move || cancellation.cancel_write_nonblocking()))
                     .map_err(CancellationReason::error)?;
-                coordinator
-                    .execute_dml_values(&sql, &params)
-                    .map(|result| result.affected_rows())
+                let result = match generated_table {
+                    Some(table) => coordinator.execute_generated_dml_values(
+                        &sql,
+                        &params,
+                        table.get(),
+                        shard,
+                    )?,
+                    None => coordinator.execute_dml_values(&sql, &params)?,
+                };
+                if result.shard().is_some_and(|actual| actual != shard) {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        format!(
+                            "writable coordinator mutated shard {}, but Engine admitted shard {shard}",
+                            result.shard().expect("checked as present")
+                        ),
+                    ));
+                }
+                Ok(super::WriteResult {
+                    rows_affected: result.affected_rows(),
+                    generated_key: result.generated_key().cloned(),
+                })
             })();
             drop(registry_bootstrap_gate);
             if result
@@ -2348,6 +2532,13 @@ fn pending_cancellation_reason(
     }
 }
 
+fn write_rows_affected(result: Routed<super::WriteResult>) -> Routed<usize> {
+    Routed {
+        shard: result.shard,
+        value: result.value.rows_affected,
+    }
+}
+
 fn required_routing_key(session: &SessionInner) -> EngineResult<&str> {
     session.routing_key().ok_or_else(|| {
         EngineError::new(
@@ -2436,6 +2627,52 @@ mod tests {
             .unwrap();
         let engine = Engine::from_database_with_options(Arc::new(database), options).unwrap();
         (temp, engine)
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    fn engine_with_native_events(shards: u16) -> (tempfile::TempDir, Engine, crate::core::TableId) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), shards).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE native_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payload TEXT NOT NULL
+                 );
+                 CREATE TABLE ordinary_events (
+                    id INTEGER PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "native_events",
+                    ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap()
+                .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+                .unwrap(),
+                TableDeclaration::sharded(
+                    logical_database,
+                    "ordinary_events",
+                    ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let table = database
+            .catalog()
+            .table("default", "native_events")
+            .unwrap()
+            .unwrap()
+            .id();
+        let options = EngineOptions::default().with_experimental_vtab_writes(true);
+        let engine = Engine::from_database_with_options(Arc::new(database), options).unwrap();
+        (temp, engine, table)
     }
 
     fn engine_with_prepared_catalog(
@@ -7453,15 +7690,15 @@ mod tests {
 
     #[cfg(feature = "experimental-vtab")]
     #[tokio::test]
-    async fn experimental_vtab_engine_rejects_native_range_targets_before_coordinator_open() {
+    async fn experimental_vtab_engine_routes_explicit_native_ids_to_their_owner() {
         let temp = tempfile::tempdir().unwrap();
         let mut database = Database::open(temp.path(), 4).unwrap();
         database
             .broadcast(
                 "CREATE TABLE native_events (
-                     id INTEGER PRIMARY KEY NOT NULL,
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                      payload TEXT NOT NULL
-                 ) STRICT",
+                 )",
             )
             .unwrap();
         let logical_database = database.catalog().default_database().id();
@@ -7514,31 +7751,49 @@ mod tests {
         let engine = Engine::from_database_with_options(Arc::new(database), options).unwrap();
         let session = engine.session();
 
-        // A valid explicit native ID would otherwise make the planner reserve
-        // and report its hash-selected shard while the coordinator writes to
-        // its encoded allocation owner. The reserved floor is more severe:
-        // the coordinator classifies it as corruption. Both must stop at the
-        // same client-facing Engine preflight while storage is still healthy.
-        for value in [native_id, reserved_floor] {
-            session.set_routing_key(value.to_string()).await.unwrap();
-            let error = engine
-                .execute(
-                    &session,
-                    Statement::new(
-                        "INSERT INTO native_events (id, payload) VALUES (?1, 'rejected')",
-                        vec![Value::Int64(value)],
-                    ),
-                )
-                .await
-                .unwrap_err();
-            assert_eq!(error.kind(), EngineErrorKind::Unsupported);
-            assert!(error.diagnostic().contains("native_range_v1"));
-            assert_eq!(session.state().await, SessionState::Ready);
-            assert_eq!(
-                engine.inner.database.storage.schema_gate_snapshot().state,
-                crate::storage::SchemaGateState::Ready
-            );
-        }
+        // The planner, pool admission, coordinator callback, and reported
+        // shard must all use the persisted allocation owner rather than the
+        // ordinary hash route for the decimal routing-context bytes.
+        session
+            .set_routing_key(native_id.to_string())
+            .await
+            .unwrap();
+        let inserted = engine
+            .execute_write(
+                &session,
+                Statement::new(
+                    "INSERT INTO native_events (id, payload) VALUES (?1, 'owner-routed')",
+                    vec![Value::Int64(native_id)],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inserted.shard, owner_shard);
+        assert_eq!(inserted.value.rows_affected, 1);
+        assert_eq!(inserted.value.generated_key, None);
+
+        // A sequence floor has native marker bits but is not a valid row ID.
+        // Reject it as caller input without degrading authoritative storage.
+        session
+            .set_routing_key(reserved_floor.to_string())
+            .await
+            .unwrap();
+        let error = engine
+            .execute(
+                &session,
+                Statement::new(
+                    "INSERT INTO native_events (id, payload) VALUES (?1, 'reserved')",
+                    vec![Value::Int64(reserved_floor)],
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+        assert_eq!(session.state().await, SessionState::Ready);
+        assert_eq!(
+            engine.inner.database.storage.schema_gate_snapshot().state,
+            crate::storage::SchemaGateState::Ready
+        );
 
         for shard in 0..engine.shard_count() {
             assert_eq!(
@@ -7552,14 +7807,289 @@ mod tests {
                         row.get::<_, i64>(0)
                     })
                     .unwrap(),
+                if shard == owner_shard { 1 } else { 0 },
+                "shard {shard}"
+            );
+        }
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_engine_generated_write_returns_the_routed_physical_key() {
+        let (temp, engine, table) = engine_with_native_events(2);
+        let session = engine.session();
+
+        // Issue #130 will select this target from public omitted-key SQL. This
+        // lower seam accepts only that already-admitted decision and does not
+        // require a session routing-key surrogate.
+        let inserted = engine
+            .execute_generated_write(
+                &session,
+                Statement::new(
+                    "INSERT INTO native_events (payload) VALUES (?1)",
+                    vec![Value::from("engine-generated")],
+                ),
+                table,
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(inserted.shard, 1);
+        assert_eq!(inserted.value.rows_affected, 1);
+        let generated = inserted.value.generated_key.unwrap();
+        assert_eq!(generated.column, "id");
+        let Value::Int64(generated_id) = generated.value else {
+            panic!("native_range_v1 must return an Int64 generated key");
+        };
+        let decoded = crate::core::generated_id::NativeRangeV1Id::decode(generated_id).unwrap();
+        assert_eq!(
+            engine
+                .inner
+                .database
+                .storage
+                .allocation_owner_map()
+                .unwrap()
+                .physical_shard(decoded.owner()),
+            Some(1)
+        );
+        assert_eq!(
+            rusqlite::Connection::open(temp.path().join("shards/0001.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM native_events WHERE id = ?1",
+                    [generated_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "engine-generated"
+        );
+        assert_eq!(
+            rusqlite::Connection::open(temp.path().join("shards/0000.sqlite"))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM native_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_generated_known_commit_wins_a_late_engine_cancellation() {
+        let (temp, engine, table) = engine_with_native_events(2);
+        let session = Arc::new(engine.session());
+        let token = CancellationToken::new();
+        let context = RequestContext::new().with_cancellation_token(token.clone());
+        let commit_gate = engine.inner.registry_schema_cache.install_commit_gate();
+        let cancellation_observer = engine
+            .inner
+            .registry_schema_cache
+            .install_cancellation_observer();
+
+        let write_engine = engine.clone();
+        let write_session = Arc::clone(&session);
+        let write = tokio::spawn(async move {
+            write_engine
+                .execute_generated_write_with_context(
+                    &write_session,
+                    Statement::new(
+                        "INSERT INTO native_events (payload) VALUES (?1)",
+                        vec![Value::from("committed-after-cancellation")],
+                    ),
+                    table,
+                    1,
+                    context,
+                )
+                .await
+        });
+        let mut commit_gate = timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                commit_gate.wait_until_started();
+                commit_gate
+            }),
+        )
+        .await
+        .expect("the generated child finalizer must claim the commit decision")
+        .unwrap();
+
+        assert!(token.cancel());
+        timeout(Duration::from_secs(2), async {
+            while !cancellation_observer.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late cancellation must reach the generated commit linearization point");
+        commit_gate.release();
+
+        let inserted = timeout(Duration::from_secs(2), write)
+            .await
+            .expect("the known generated commit must finish after cancellation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(inserted.shard, 1);
+        assert_eq!(inserted.value.rows_affected, 1);
+        let generated = inserted.value.generated_key.unwrap();
+        assert_eq!(generated.column, "id");
+        let Value::Int64(generated_id) = generated.value else {
+            panic!("native_range_v1 must return an Int64 generated key");
+        };
+        let decoded = crate::core::generated_id::NativeRangeV1Id::decode(generated_id).unwrap();
+        assert_eq!(
+            engine
+                .inner
+                .database
+                .storage
+                .allocation_owner_map()
+                .unwrap()
+                .physical_shard(decoded.owner()),
+            Some(1)
+        );
+        assert_eq!(
+            rusqlite::Connection::open(temp.path().join("shards/0001.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM native_events WHERE id = ?1",
+                    [generated_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "committed-after-cancellation"
+        );
+        assert_eq!(session.state().await, SessionState::Ready);
+        assert_eq!(
+            engine.inner.database.storage.schema_gate_snapshot().state,
+            crate::storage::SchemaGateState::Ready
+        );
+        for shard in 0..engine.shard_count() {
+            wait_for_pool_occupancy(&engine, shard, 0, 0).await;
+        }
+        assert_eq!(engine.active_operations_for_test(), 0);
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_engine_generated_write_rejects_multirow_without_mutation() {
+        let (temp, engine, table) = engine_with_native_events(2);
+        let session = engine.session();
+
+        let error = engine
+            .execute_generated_write(
+                &session,
+                Statement::new(
+                    "INSERT INTO native_events (payload) VALUES ('first'), ('second')",
+                    vec![],
+                ),
+                table,
+                0,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+        assert!(
+            error
+                .diagnostic()
+                .contains("multi-row native generated INSERT")
+        );
+        assert_eq!(session.state().await, SessionState::Ready);
+        for shard in 0..engine.shard_count() {
+            assert_eq!(
+                rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM native_events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
                 0,
                 "shard {shard}"
             );
         }
-        let pools = engine.pool_snapshot_for_test().unwrap();
-        assert!(pools.shards.iter().all(|shard| {
-            shard.active == 0 && shard.queued == 0 && shard.opened == 0 && shard.checkouts == 0
-        }));
+        assert_eq!(engine.active_operations_for_test(), 0);
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn experimental_vtab_engine_generated_write_validates_admission_before_mutation() {
+        let (temp, engine, native_table) = engine_with_native_events(2);
+        let session = engine.session();
+        let ordinary_table = engine
+            .catalog()
+            .table("default", "ordinary_events")
+            .unwrap()
+            .unwrap()
+            .id();
+
+        let cases = [
+            (native_table, 2, EngineErrorKind::InvalidArgument),
+            (ordinary_table, 0, EngineErrorKind::FailedPrecondition),
+            (
+                crate::core::TableId::new(u64::MAX).unwrap(),
+                0,
+                EngineErrorKind::InvalidArgument,
+            ),
+        ];
+        for (table, shard, expected) in cases {
+            let error = engine
+                .execute_generated_write(
+                    &session,
+                    Statement::new(
+                        "INSERT INTO native_events (payload) VALUES ('must-not-run')",
+                        vec![],
+                    ),
+                    table,
+                    shard,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), expected);
+            assert_eq!(session.state().await, SessionState::Ready);
+        }
+
+        let cancellation = CancellationToken::new();
+        assert!(cancellation.cancel());
+        let error = engine
+            .execute_generated_write_with_context(
+                &session,
+                Statement::new(
+                    "INSERT INTO native_events (payload) VALUES ('cancelled')",
+                    vec![],
+                ),
+                native_table,
+                0,
+                RequestContext::new().with_cancellation_token(cancellation),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+
+        for shard in 0..engine.shard_count() {
+            let connection =
+                rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                    .unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM native_events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0,
+                "shard {shard}"
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM ordinary_events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0,
+                "shard {shard}"
+            );
+        }
+        assert_eq!(engine.active_operations_for_test(), 0);
     }
 
     #[cfg(feature = "experimental-vtab")]

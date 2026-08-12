@@ -138,6 +138,69 @@ impl From<Decimal> for Value {
     }
 }
 
+/// One generated column value captured by the write that produced it.
+///
+/// Adapters must render the typed [`Value`] directly from this result instead
+/// of consulting connection-local SQLite state after a pooled handle has been
+/// released. Native-range IDs are represented as [`Value::Int64`]. Values
+/// produced by the Engine always use the canonical logical catalog column.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct GeneratedKey {
+    /// Canonical logical column name from the table catalog.
+    pub column: String,
+    /// Generated value captured on the same physical SQLite connection.
+    pub value: Value,
+}
+
+impl GeneratedKey {
+    /// Construct a generated-key value.
+    ///
+    /// This protocol-neutral container does not validate `column`; Engine
+    /// results provide the stronger canonical-catalog-name guarantee described
+    /// on [`GeneratedKey`].
+    pub fn new(column: impl Into<String>, value: Value) -> Self {
+        Self {
+            column: column.into(),
+            value,
+        }
+    }
+}
+
+/// Protocol-neutral outcome of one logical write.
+///
+/// The native-range allocation contract accepts at most one automatically
+/// generated row per statement, so `generated_key` is singular. Statements
+/// with explicit keys, updates, and deletes return `None`. The current public
+/// Engine SQL planner also returns `None` because omitted generated-key
+/// planning remains roadmap issue #130.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct WriteResult {
+    /// Rows durably affected by the reconciled physical operation.
+    pub rows_affected: usize,
+    /// Generated key captured before the owning SQLite handle was released.
+    pub generated_key: Option<GeneratedKey>,
+}
+
+impl WriteResult {
+    /// Construct a write result that did not allocate a key.
+    pub const fn without_generated_key(rows_affected: usize) -> Self {
+        Self {
+            rows_affected,
+            generated_key: None,
+        }
+    }
+
+    /// Construct a write result containing one generated key.
+    pub fn with_generated_key(rows_affected: usize, generated_key: GeneratedKey) -> Self {
+        Self {
+            rows_affected,
+            generated_key: Some(generated_key),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Decimal {
     representation: String,
@@ -394,6 +457,20 @@ mod tests {
         assert_eq!(Value::from(true).as_str(), None);
         assert_eq!(Value::from(vec![1_u8, 2]).as_bytes(), Some(&[1, 2][..]));
         assert_eq!(Value::Null.as_bytes(), None);
+    }
+
+    #[test]
+    fn write_results_carry_generated_keys_without_connection_state() {
+        let ordinary = WriteResult::without_generated_key(2);
+        assert_eq!(ordinary.rows_affected, 2);
+        assert_eq!(ordinary.generated_key, None);
+
+        let generated = WriteResult::with_generated_key(
+            1,
+            GeneratedKey::new("id", Value::Int64(0x4000_0000_0000_0001)),
+        );
+        assert_eq!(generated.rows_affected, 1);
+        assert_eq!(generated.generated_key.unwrap().column, "id");
     }
 
     #[test]
