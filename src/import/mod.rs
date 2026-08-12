@@ -75,8 +75,8 @@ pub enum SqliteImportPlacement {
     Global,
 }
 
-/// Policy for source foreign-key clauses, which authoritative catalogs do not
-/// yet support.
+/// Policy for source foreign-key clauses, whose authoritative co-location is
+/// not yet planned and retained by the importer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SqliteForeignKeyPolicy {

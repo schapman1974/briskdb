@@ -1890,7 +1890,7 @@ mod tests {
             ),
             (
                 "ALTER TABLE accounts ADD COLUMN observed INTEGER CHECK(total_changes() >= 0)",
-                EngineErrorKind::PermissionDenied,
+                EngineErrorKind::FailedPrecondition,
             ),
         ] {
             let error = run_sql_with_hook(&storage, sql, |_| Ok(())).unwrap_err();

@@ -65,9 +65,10 @@ the importer does not weaken uniqueness silently.
 
 ## Foreign-key normalization
 
-Authoritative foreign-key placement is not implemented yet. A source table
-with any foreign key is rejected by default before a staging directory is
-created. A plan may explicitly select `"foreign_keys":"omit"` for that table:
+The importer does not yet retain and prove the catalog's conservative
+foreign-key co-location matrix. A source table with any foreign key is
+therefore rejected by default before a staging directory is created. A plan may
+explicitly select `"foreign_keys":"omit"` for that table:
 
 ```json
 {

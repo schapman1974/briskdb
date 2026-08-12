@@ -546,8 +546,12 @@ is `Sharded` or `Global`, each `Catalog` declaration remains manifest-only, and
 every sharded key is a visible, physically non-null column with compatible
 SQLite affinity. The non-null `INTEGER PRIMARY KEY` rowid alias is accepted,
 but SQLite's nullable legacy primary-key forms are not. Text keys must use
-SQLite `BINARY` collation. Application foreign keys, triggers, and virtual
-tables are temporarily rejected. Every primary or unique key on a sharded
+SQLite `BINARY` collation. Foreign keys are accepted only when catalog
+placement proves that the parent is present in the same physical file:
+matching Sharded keys with the same generated-ID routing domain,
+Sharded-to-Global, or Global-to-Global. Missing, Catalog, or cross-placement
+relationships, triggers, and virtual tables are rejected.
+Every primary or unique key on a sharded
 table must contain the shard-key column with `BINARY` collation, which keeps
 that constraint's complete equality domain on one owner. The coordinator
 validates physical state before opening an immediate manifest transaction,
@@ -568,9 +572,9 @@ replicated, and `Catalog` data is not an application-shard table. Registration
 accepts only empty physical tables, so it cannot bless or repartition existing
 duplicates. Every later schema-migration preflight must preserve the exact
 registered table set on all shards and each sharded key's required column and
-affinity and `BINARY` Text collation. It also preserves one-owner unique keys
-and the temporary foreign-key, trigger, and virtual-table restrictions before a
-journal can be published.
+affinity and `BINARY` Text collation. It also preserves one-owner unique keys,
+the conservative foreign-key co-location and SQLite-enforcement rules, and the
+trigger and virtual-table restrictions before a journal can be published.
 
 Core routing still hashes the exact key bytes, derives a versioned virtual
 bucket, and reads the final physical shard from the snapshot without querying
@@ -612,8 +616,8 @@ reserved-state access. Before registration, its legacy batch may also contain
 DML. With a populated authoritative catalog, an additional parser gate rejects
 row-moving DML, `CREATE TABLE AS SELECT`, `DROP TABLE`, and `CREATE TRIGGER`;
 postflight validation also rejects any resulting trigger, virtual table,
-foreign key, invalid unique key, or placement/key change. Because SQLite does
-not reveal an
+unsafe or malformed foreign key, invalid unique key, or placement/key change.
+Because SQLite does not reveal an
 `ALTER TABLE ... RENAME TO` destination to the authorizer, the coordinator also
 compares the reserved schema before and after the batch. The exact format,
 numeric codes, downgrade policy, recovery cases, and tests are documented in
@@ -669,11 +673,12 @@ validates the policy, codec, and owner slots only; physical
 `sqlite_sequence` validation and seeding belong to issue #128, and omitted-key
 SQL translation belongs to issue #130.
 
-The opt-in `experimental-vtab` feature adds a separate, read-only SQLite
-coordinator that statically registers `brisk_shard`. It proves a no-fork logical
-table boundary while leaving the manifest, physical schemas, protocol behavior,
-and established scatter executor unchanged. It opens validated physical children
-through OS-level SQLite read-only handles, never attaches a shard, and never
+The opt-in `experimental-vtab` feature adds separate read-only and narrowly
+writable SQLite coordinators that statically register `brisk_shard`. They prove
+a no-fork logical table boundary while leaving the manifest, physical schemas,
+protocol behavior, and established scatter executor unchanged. The read-only
+coordinator opens validated physical children through OS-level SQLite read-only
+handles, never attaches a shard, and never
 dynamically loads an extension. Trusted metadata supplies each declared
 schema. An exact, storage-class-compatible `Int64`, `Text`, or `Binary`
 shard-key equality can open only its owner and bind the equality on that
@@ -688,6 +693,18 @@ protocol SQL contract. Cursor ownership, schema admission, cancellation,
 bounded materialization, static-loading policy, and rejected alternatives are
 specified in the
 [experimental sharded virtual-table facade](SHARDED_VIRTUAL_TABLE.md).
+
+The writable coordinator accepts explicit-key INSERT and exactly routed
+UPDATE/DELETE only. Its first operation pins one `BEGIN IMMEDIATE` child shard;
+reads used to locate UPDATE/DELETE rows reuse that child, and a second-shard
+attempt aborts the whole transaction. A hidden versioned locator carries the
+physical rowid or complete `WITHOUT ROWID` key without changing shard files.
+The wrapper reconciles stock-SQLite transaction and savepoint callbacks, then
+performs the fallible child commit before acknowledging success. Physical
+constraints and conservatively admitted co-located foreign keys remain
+authoritative. Missing/generated keys, Global writes, multi-shard
+transactions, `RETURNING`, defaults, generated columns, triggers, and public
+protocol integration remain later work.
 
 ## Session and asynchronous engine boundary
 
@@ -783,9 +800,10 @@ not a distributed coordination mechanism.
 Every-shard preflight executes the complete batch inside a rollback-only
 transaction. When the authoritative table catalog is populated, that tentative
 schema must still contain exactly its declared physical tables, compatible
-sharded keys, `BINARY` Text collation, and one-owner unique constraints, with no
-application foreign key, trigger, or virtual table. The catalog-aware migration
-gate also rejects row-moving DML, table drops, and trigger creation before
+sharded keys, `BINARY` Text collation, one-owner unique constraints, and only
+conservatively co-located, SQLite-enforceable foreign keys, with no application
+trigger or virtual table. The catalog-aware migration gate also rejects
+row-moving DML, table drops, and trigger creation before
 preflight. Only after all preflights succeed does the coordinator record the
 exact SQL and its BLAKE3 identity, then visit shards in ascending order. One
 shard's complete batch and target `user_version` commit atomically, followed by a separate

@@ -388,8 +388,11 @@ non-null `INTEGER PRIMARY KEY` rowid alias qualifies; nullable legacy
 primary-key forms do not. A Text shard key must use SQLite `BINARY` collation.
 Every primary or unique key on a sharded table must include its shard-key column
 with `BINARY` collation, so every possible collision has one physical owner.
-Application foreign keys, triggers, and virtual tables are temporarily
-unsupported for every registered physical table. Registration assigns table IDs
+Foreign keys are accepted only when authoritative placement proves local
+enforcement: matching co-sharded keys in the same generated-ID routing domain,
+Sharded-to-Global, or Global-to-Global. Missing, Catalog, cross-placement, or
+SQLite-unenforceable relationships, triggers, and virtual tables are
+unsupported. Registration assigns table IDs
 after sorting by logical database and canonical table name, commits each table
 and its explicit generated-ID policy row, refreshes the manifest root
 atomically, and publishes the replacement catalog only after revalidation.
@@ -401,8 +404,9 @@ declarations fail without replacing the catalog. Once populated, the catalog
 cannot be edited in place. A later journaled schema migration must preserve the
 exact registered physical table set on every shard and retain every sharded
 key's visible, physically non-null column, compatible affinity, Text collation,
-and one-owner unique keys. It must not introduce an application foreign key,
-trigger, or virtual table. A populated-catalog migration also rejects row-moving
+and one-owner unique keys. Foreign-key changes must retain the same conservative
+co-location rules; a migration must not introduce a trigger or virtual table.
+A populated-catalog migration also rejects row-moving
 DML, `CREATE TABLE ... AS SELECT`, `DROP TABLE`, and `CREATE TRIGGER`. A
 violation is rejected before journal or shard publication.
 
@@ -672,8 +676,8 @@ After registration, BriskDB parses the exact submitted SQLite batch before
 preflight and rejects row-moving `INSERT`, `UPDATE`, `DELETE`, `MERGE`, or
 `TRUNCATE`, `CREATE TABLE ... AS SELECT`, `DROP TABLE`, and `CREATE TRIGGER`.
 Rollback-only postflight then rechecks the complete authoritative table set,
-key affinity/nullability/collation, unique-key locality, and the ban on
-application foreign keys, triggers, and virtual tables. Parsing never replaces
+key affinity/nullability/collation, unique-key locality, conservative
+foreign-key co-location, and the ban on triggers and virtual tables. Parsing never replaces
 the exact submitted bytes used for migration identity.
 
 ### Routing catalog

@@ -252,8 +252,9 @@ declaration also names a visible, physically non-null column with compatible
 `Int64`, text, or binary affinity. SQLite's non-null `INTEGER PRIMARY KEY`
 rowid alias is accepted; nullable legacy primary-key forms are not. Text keys
 use SQLite `BINARY` collation, and every primary/unique key on a sharded table
-must include its shard key with `BINARY` collation. Application foreign keys,
-triggers, and virtual tables are temporarily unsupported. An exact repeat is
+must include its shard key with `BINARY` collation. Application foreign keys
+are accepted only for conservatively proven local placement; unsafe foreign
+keys, triggers, and virtual tables are unsupported. An exact repeat is
 idempotent, but a different or partial replacement is rejected. Registration
 is an initialization boundary, not an online catalog-editing API; close and
 reopen the registering handle after an ambiguous manifest-commit error.
@@ -435,8 +436,8 @@ After durable partial progress, ordinary work receives non-retryable
 retained permanently for recovery and idempotency, so migration batches must
 not contain passwords, tokens, or other sensitive literals. Once the catalog is
 registered, migration rejects row-moving DML, table drops, trigger creation,
-foreign keys, virtual tables, and any change that breaks declared placement,
-Text collation, or one-owner uniqueness.
+unsafe or malformed foreign keys, virtual tables, and any change that breaks
+declared placement, Text collation, or one-owner uniqueness.
 
 The initial shard count is immutable, so resharding will require an explicit
 migration workflow. Opening upgrades exact version-1 through version-8
@@ -487,8 +488,11 @@ it preserves logical databases, routing, schema history, shard files, and rows.
 `Database::register_tables` can then install one complete declaration set only
 after its matching physical tables are empty. Once installed, migrations must
 preserve that exact physical table set and every sharded key's required column
-and affinity. Text shard keys use SQLite `BINARY` collation. Application
-foreign keys, triggers, and virtual tables are temporarily unsupported; every
+and affinity. Text shard keys use SQLite `BINARY` collation. Foreign keys are
+accepted only when authoritative placement proves local enforcement (matching
+co-sharded keys with the same generated-ID routing domain, Sharded-to-Global,
+or Global-to-Global); unsafe relationships, triggers, and virtual tables remain
+unsupported. Every
 `PRIMARY KEY` or `UNIQUE` key on a sharded table must include its shard key with
 `BINARY` collation so uniqueness has one physical owner. The public catalog
 returned by `Database::catalog()` and `Engine::catalog()` remains read-only to

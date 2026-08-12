@@ -126,9 +126,10 @@ impl Database {
     /// database before it is wrapped in an [`Engine`]. Every declared physical
     /// table must already exist with the same empty schema on all shards.
     /// Sharded text keys use `BINARY` collation, every unique key must include
-    /// the shard key, and foreign keys, triggers, and virtual tables are not yet
-    /// supported. The catalog can be registered exactly once; later table
-    /// changes belong to a journaled schema-and-catalog migration.
+    /// the shard key, and foreign keys must prove authoritative co-location.
+    /// Triggers and virtual tables are not yet supported. The catalog can be
+    /// registered exactly once; later table changes belong to a journaled
+    /// schema-and-catalog migration.
     pub fn register_tables(&mut self, declarations: Vec<TableDeclaration>) -> EngineResult<()> {
         self.storage.register_tables(declarations)
     }

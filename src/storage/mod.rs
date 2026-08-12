@@ -804,7 +804,12 @@ impl Storage {
             }
             for declaration in declarations {
                 if !matches!(declaration.placement(), TablePlacement::Catalog) {
-                    validate_empty_table_declaration(&connection, shard_id, declaration)?;
+                    validate_empty_table_declaration(
+                        &connection,
+                        shard_id,
+                        declaration,
+                        declarations,
+                    )?;
                 }
             }
         }
@@ -1168,6 +1173,7 @@ fn validate_empty_table_declaration(
     connection: &Connection,
     shard_id: u16,
     declaration: &TableDeclaration,
+    declarations: &[TableDeclaration],
 ) -> EngineResult<()> {
     let quoted_table = quote_identifier(declaration.name());
     let has_rows = connection
@@ -1188,7 +1194,7 @@ fn validate_empty_table_declaration(
     }
 
     let TablePlacement::Sharded(shard_key) = declaration.placement() else {
-        shard::validate_authoritative_table_constraints(connection, declaration.name(), None)?;
+        shard::validate_declared_table_constraints(connection, declaration, declarations)?;
         return Ok(());
     };
     let mut statement = connection
@@ -1275,11 +1281,7 @@ fn validate_empty_table_declaration(
             ),
         ));
     }
-    shard::validate_authoritative_table_constraints(
-        connection,
-        declaration.name(),
-        Some(shard_key),
-    )?;
+    shard::validate_declared_table_constraints(connection, declaration, declarations)?;
     Ok(())
 }
 
@@ -3577,34 +3579,6 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let mut database = Database::open(temp.path(), 2).unwrap();
-        database
-            .broadcast(
-                "CREATE TABLE parents (tenant_id TEXT PRIMARY KEY NOT NULL);
-                 CREATE TABLE children (
-                     tenant_id TEXT PRIMARY KEY NOT NULL,
-                     FOREIGN KEY (tenant_id) REFERENCES parents (tenant_id)
-                 );",
-            )
-            .unwrap();
-        let logical_database = database.catalog().default_database().id();
-        let declarations = ["parents", "children"]
-            .into_iter()
-            .map(|table| {
-                TableDeclaration::sharded(
-                    logical_database,
-                    table,
-                    crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
-                )
-                .unwrap()
-            })
-            .collect();
-        assert_eq!(
-            database.register_tables(declarations).unwrap_err().kind(),
-            EngineErrorKind::FailedPrecondition
-        );
-
-        let temp = tempfile::tempdir().unwrap();
-        let mut database = Database::open(temp.path(), 2).unwrap();
         create_registered_table_schema(&database);
         database
             .broadcast(
@@ -3620,6 +3594,295 @@ mod tests {
                 .kind(),
             EngineErrorKind::FailedPrecondition
         );
+    }
+
+    #[test]
+    fn registration_accepts_colocated_foreign_keys_and_sqlite_enforces_them_locally() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE countries (
+                     code TEXT PRIMARY KEY,
+                     label TEXT NOT NULL
+                 );
+                 CREATE TABLE regions (
+                     code TEXT PRIMARY KEY,
+                     country_code TEXT NOT NULL REFERENCES countries(code)
+                 );
+                 CREATE TABLE parents (
+                     tenant_id TEXT PRIMARY KEY NOT NULL
+                 );
+                 CREATE TABLE children (
+                     tenant_id TEXT PRIMARY KEY NOT NULL,
+                     country_code TEXT NOT NULL REFERENCES countries(code),
+                     FOREIGN KEY (tenant_id) REFERENCES parents
+                 );",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        let text_key =
+            || crate::core::ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap();
+        database
+            .register_tables(vec![
+                TableDeclaration::global(logical_database, "countries").unwrap(),
+                TableDeclaration::sharded(logical_database, "children", text_key()).unwrap(),
+                TableDeclaration::sharded(logical_database, "parents", text_key()).unwrap(),
+                TableDeclaration::global(logical_database, "regions").unwrap(),
+            ])
+            .unwrap();
+
+        let tenant = (0_u64..)
+            .map(|candidate| format!("tenant-{candidate}"))
+            .find(|candidate| database.shard_for_key(candidate.as_bytes()) == 0)
+            .unwrap();
+        for shard in 0..2 {
+            let physical = Connection::open(shard_file(temp.path(), shard)).unwrap();
+            physical.pragma_update(None, "foreign_keys", "ON").unwrap();
+            assert_eq!(
+                physical
+                    .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            physical
+                .execute("INSERT INTO countries VALUES ('US', 'United States')", [])
+                .unwrap();
+        }
+        Connection::open(shard_file(temp.path(), 1))
+            .unwrap()
+            .execute("INSERT INTO parents VALUES (?1)", [&tenant])
+            .unwrap();
+
+        let values = [
+            crate::core::Value::from(tenant.clone()),
+            crate::core::Value::from("US"),
+        ];
+        let error = database
+            .execute(
+                &tenant,
+                "INSERT INTO children (tenant_id, country_code) VALUES (?1, ?2)",
+                &values,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::ForeignKeyViolation);
+        assert_eq!(
+            Connection::open(shard_file(temp.path(), 0))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM children", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        database
+            .execute(
+                &tenant,
+                "INSERT INTO parents (tenant_id) VALUES (?1)",
+                &[crate::core::Value::from(tenant.clone())],
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .execute(
+                    &tenant,
+                    "INSERT INTO children (tenant_id, country_code) VALUES (?1, ?2)",
+                    &values,
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn registration_rejects_colocated_foreign_keys_with_different_generated_id_routing_domains() {
+        for native_child in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut database = Database::open(temp.path(), 2).unwrap();
+            database
+                .broadcast(
+                    "CREATE TABLE parents (id INTEGER PRIMARY KEY);
+                     CREATE TABLE children (
+                         id INTEGER PRIMARY KEY REFERENCES parents(id)
+                     );",
+                )
+                .unwrap();
+
+            // A native ID owned by shard 0 need not hash to shard 0 under the
+            // legacy None policy. Equal SQLite values therefore prove
+            // co-location only when both tables use the same routing domain.
+            let owner = crate::core::generated_id::AllocationOwnerSlot::new(0).unwrap();
+            let divergent = (1_u64..10_000)
+                .map(|sequence| {
+                    crate::core::generated_id::NativeRangeV1Id::new(owner, sequence)
+                        .unwrap()
+                        .encode()
+                })
+                .find(|id| database.shard_for_key(id.to_string().as_bytes()) != 0)
+                .unwrap();
+            assert_ne!(database.shard_for_key(divergent.to_string().as_bytes()), 0);
+
+            let logical_database = database.catalog().default_database().id();
+            let int_key = || crate::core::ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap();
+            let mut child =
+                TableDeclaration::sharded(logical_database, "children", int_key()).unwrap();
+            let mut parent =
+                TableDeclaration::sharded(logical_database, "parents", int_key()).unwrap();
+            if native_child {
+                child = child
+                    .with_generated_id_policy(
+                        crate::core::GeneratedIdPolicy::native_range_v1("id").unwrap(),
+                    )
+                    .unwrap();
+            } else {
+                parent = parent
+                    .with_generated_id_policy(
+                        crate::core::GeneratedIdPolicy::native_range_v1("id").unwrap(),
+                    )
+                    .unwrap();
+            }
+
+            let error = database.register_tables(vec![child, parent]).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+            assert!(
+                error
+                    .diagnostic()
+                    .contains("different generated-ID routing domains"),
+                "{}",
+                error.diagnostic()
+            );
+            assert!(database.catalog().tables().is_empty());
+        }
+    }
+
+    #[test]
+    fn registration_rejects_foreign_keys_without_a_safe_placement_proof() {
+        #[derive(Clone, Copy)]
+        enum Placement<'a> {
+            Sharded(&'a str, ShardKeyType),
+            Global,
+            Catalog,
+        }
+
+        let scenarios = [
+            (
+                "CREATE TABLE parents (
+                     tenant_id TEXT NOT NULL,
+                     parent_id INTEGER NOT NULL,
+                     PRIMARY KEY (tenant_id, parent_id)
+                 );
+                 CREATE TABLE children (
+                     tenant_id TEXT PRIMARY KEY NOT NULL,
+                     parent_tenant TEXT NOT NULL,
+                     parent_id INTEGER NOT NULL,
+                     FOREIGN KEY (parent_tenant, parent_id)
+                         REFERENCES parents (tenant_id, parent_id)
+                 );",
+                vec![
+                    Placement::Sharded("tenant_id", ShardKeyType::Text),
+                    Placement::Sharded("tenant_id", ShardKeyType::Text),
+                ],
+                vec!["children", "parents"],
+                "does not map child shard key",
+            ),
+            (
+                "CREATE TABLE parents (id INTEGER PRIMARY KEY);
+                 CREATE TABLE children (
+                     tenant_id TEXT PRIMARY KEY NOT NULL,
+                     FOREIGN KEY (tenant_id) REFERENCES parents(id)
+                 );",
+                vec![
+                    Placement::Sharded("tenant_id", ShardKeyType::Text),
+                    Placement::Sharded("id", ShardKeyType::Int64),
+                ],
+                vec!["children", "parents"],
+                "different authoritative types",
+            ),
+            (
+                "CREATE TABLE parents (tenant_id TEXT PRIMARY KEY NOT NULL);
+                 CREATE TABLE children (
+                     id INTEGER PRIMARY KEY,
+                     tenant_id TEXT NOT NULL REFERENCES parents(tenant_id)
+                 );",
+                vec![
+                    Placement::Global,
+                    Placement::Sharded("tenant_id", ShardKeyType::Text),
+                ],
+                vec!["children", "parents"],
+                "Global child cannot reference a Sharded parent",
+            ),
+            (
+                "CREATE TABLE children (
+                     tenant_id TEXT PRIMARY KEY NOT NULL,
+                     FOREIGN KEY (tenant_id) REFERENCES missing_parent(tenant_id)
+                 );",
+                vec![Placement::Sharded("tenant_id", ShardKeyType::Text)],
+                vec!["children"],
+                "missing authoritative table",
+            ),
+            (
+                "CREATE TABLE children (
+                     tenant_id TEXT PRIMARY KEY NOT NULL,
+                     FOREIGN KEY (tenant_id) REFERENCES audit_catalog(id)
+                 );",
+                vec![
+                    Placement::Catalog,
+                    Placement::Sharded("tenant_id", ShardKeyType::Text),
+                ],
+                vec!["audit_catalog", "children"],
+                "catalog-only table",
+            ),
+            (
+                "CREATE TABLE parents (tenant_id TEXT PRIMARY KEY NOT NULL);
+                 CREATE TABLE children (
+                     tenant_id TEXT PRIMARY KEY NOT NULL,
+                     FOREIGN KEY (tenant_id) REFERENCES parents(tenant_id)
+                         ON UPDATE CASCADE
+                 );",
+                vec![
+                    Placement::Sharded("tenant_id", ShardKeyType::Text),
+                    Placement::Sharded("tenant_id", ShardKeyType::Text),
+                ],
+                vec!["children", "parents"],
+                "ON UPDATE CASCADE",
+            ),
+        ];
+
+        for (schema, placements, names, diagnostic) in scenarios {
+            let temp = tempfile::tempdir().unwrap();
+            let mut database = Database::open(temp.path(), 2).unwrap();
+            database.broadcast(schema).unwrap();
+            let logical_database = database.catalog().default_database().id();
+            let declarations = names
+                .into_iter()
+                .zip(placements)
+                .map(|(name, placement)| match placement {
+                    Placement::Sharded(column, key_type) => TableDeclaration::sharded(
+                        logical_database,
+                        name,
+                        crate::core::ShardKeyMetadata::new(column, key_type).unwrap(),
+                    )
+                    .unwrap(),
+                    Placement::Global => TableDeclaration::global(logical_database, name).unwrap(),
+                    Placement::Catalog => {
+                        TableDeclaration::catalog(logical_database, name).unwrap()
+                    }
+                })
+                .collect();
+
+            let error = database.register_tables(declarations).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                EngineErrorKind::FailedPrecondition,
+                "{schema}"
+            );
+            assert!(
+                error.diagnostic().contains(diagnostic),
+                "{schema}: {}",
+                error.diagnostic()
+            );
+            assert!(database.catalog().tables().is_empty());
+        }
     }
 
     #[test]

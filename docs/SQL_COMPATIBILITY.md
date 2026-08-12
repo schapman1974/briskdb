@@ -106,14 +106,18 @@ not make that prepared pipeline public wire behavior. Authoritative table
 registration composes the SQLite frontend and planner into the existing HTTP
 execute/query rows as described above; it adds no HTTP field or route.
 
-The `experimental-vtab` Cargo feature also contains a read-only, internal
-`brisk_shard` coordinator for evaluating the no-fork virtual-table boundary. It
-is not an HTTP, PostgreSQL, or MySQL query interface and does not expand the
-table above. The module is statically registered into stock SQLite and opens
-validated physical children through OS-level SQLite read-only handles; it does
-not use `ATTACH`, runtime extension loading, a SQLite fork, or a storage-format
-change. Writes, schema operations, attachments, unsafe PRAGMAs, and extension
-loading are rejected.
+The `experimental-vtab` Cargo feature also contains internal read-only and
+explicit-key writable `brisk_shard` coordinators for evaluating the no-fork
+virtual-table boundary. They are not HTTP, PostgreSQL, or MySQL query interfaces
+and do not expand the table above. The module is statically registered into
+stock SQLite and opens validated physical children through OS-level SQLite
+handles; it does not use `ATTACH`, runtime extension loading, a SQLite fork, or
+a storage-format change. The writable wrapper accepts explicit-key Sharded
+INSERT and exactly routed UPDATE/DELETE, pins one physical transaction, and
+rejects cross-shard or Global writes. Schema operations, attachments, unsafe
+PRAGMAs, extension loading, generated/missing keys, defaults, generated
+columns, triggers, and `RETURNING` remain rejected. This surface is internal
+and cannot be reached by the query app or protocol adapters.
 
 Within that feature gate only, a usable equality on the exact cataloged shard
 key requests one virtual-table argument without `omit`. Exact SQLite `INTEGER`,
@@ -224,8 +228,9 @@ also compares the reserved schema before and after the migration transaction.
 When the authoritative catalog is populated, migration parsing additionally
 rejects `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE`,
 `CREATE TABLE ... AS SELECT`, `DROP TABLE`, and `CREATE TRIGGER`. Final
-rollback-only validation rejects application foreign keys, triggers, virtual
-tables, invalid unique keys, and any table-placement or shard-key change.
+rollback-only validation accepts only conservatively co-located foreign keys
+and rejects unsafe foreign keys, triggers, virtual tables, invalid unique keys,
+and any table-placement or shard-key change.
 
 SQLite also retains `last_insert_rowid()`, `changes()`, and `total_changes()` on
 the physical connection after ordinary writes. A write-bearing handle may be
@@ -286,9 +291,11 @@ authoritative catalog is populated, however, every tentative shard schema must
 still contain exactly the declared `Sharded` and `Global` tables, no physical
 `Catalog` table, and each sharded key with its required column, affinity, and
 `BINARY` Text collation. Every sharded primary/unique key must still include the
-shard key with `BINARY` collation, and application foreign keys, triggers, and
-virtual tables remain prohibited. Row-moving DML, table drops, and trigger
-creation are rejected before this rollback-only check. A violation fails
+shard key with `BINARY` collation. Foreign keys must prove matching co-sharded
+keys in the same generated-ID routing domain, Sharded-to-Global, or
+Global-to-Global placement, and SQLite must accept the referenced parent key;
+triggers and virtual tables remain prohibited. Row-moving DML, table drops, and
+trigger creation are rejected before this rollback-only check. A violation fails
 preflight before journal publication. Richer
 migration/history APIs remain issue #53. Manifest v8 retains the v7
 generation-bound persistent-schema fingerprint requirement in addition to this
@@ -849,8 +856,9 @@ underlying execution semantics.
   has the same complete, empty physical table set. A sharded declaration names
   one visible, physically non-null `Int64`, text, or binary key column; the
   `INTEGER PRIMARY KEY` rowid alias qualifies, but nullable legacy primary-key
-  forms do not. Text keys must use SQLite `BINARY` collation. Application
-  foreign keys, triggers, and virtual tables are temporarily unsupported, and
+  forms do not. Text keys must use SQLite `BINARY` collation. Foreign keys must
+  satisfy the conservative local-enforcement matrix; triggers and virtual
+  tables remain unsupported, and
   every sharded primary/unique key must contain the shard key with `BINARY`
   collation.
 - Registration changes schema admission to `Pending` before manifest commit.
@@ -901,8 +909,8 @@ underlying execution semantics.
   serving work. Once tables are registered, preflight also rejects a migration
   that changes the complete physical table set or a sharded key's required
   column, affinity, or Text collation; creates row-moving DML, drops a table, or
-  creates a trigger; introduces a foreign key, trigger, or virtual table; or
-  breaks one-owner unique-key locality.
+  creates a trigger; introduces an unsafe or malformed foreign key, trigger, or
+  virtual table; or breaks one-owner unique-key locality.
 
 ### Planned stable contract
 
