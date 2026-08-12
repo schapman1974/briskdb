@@ -339,17 +339,18 @@ detail never includes the retained SQL.
 
 With a populated authoritative catalog, row-moving DML,
 `CREATE TABLE ... AS SELECT`, `DROP TABLE`, `CREATE TRIGGER`, or a final schema
-containing an application foreign key, trigger, virtual table, invalid
-primary/unique key, or changed placement/key invariant is
+containing an unsafe or SQLite-unenforceable foreign key, trigger, virtual table,
+invalid primary/unique key, or changed placement/key invariant is
 `FailedPrecondition` before journal publication.
 
 Manifest v8 table registration reports malformed, empty, duplicate, or
 unknown-database declarations as `InvalidArgument` and an oversized catalog as
 `LimitExceeded`. A nonempty physical table, an incomplete or differing physical
 table set, a catalog-table shadow, an invalid sharded key or Text collation, a
-sharded primary/unique key without its `BINARY` shard-key term, any application
-foreign key, trigger, or virtual table, another live owner, or an attempted
-replacement of an already populated catalog is `FailedPrecondition`. The same
+sharded primary/unique key without its `BINARY` shard-key term, an unsafe or
+SQLite-unenforceable foreign key, trigger, or virtual table, another live owner,
+or an attempted replacement of an already populated catalog is
+`FailedPrecondition`. The same
 complete declaration set is idempotent. Schema SQL that would violate a
 populated authoritative catalog is also `FailedPrecondition` before a journal
 or shard mutation is published.

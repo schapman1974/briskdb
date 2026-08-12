@@ -5,7 +5,7 @@
 //! changing any physical shard schema.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::c_int,
     sync::{
         Arc, Mutex,
@@ -21,8 +21,9 @@ use rusqlite::{
     hooks::{AuthAction, AuthContext, Authorization},
     types::{ToSql, ToSqlOutput, ValueRef},
     vtab::{
-        Context, CreateVTab, Filters, IndexConstraintOp, IndexInfo, VTab, VTabConfig,
-        VTabConnection, VTabCursor, VTabKind, read_only_module,
+        ConflictMode, Context, CreateVTab, Filters, IndexConstraintOp, IndexInfo, Inserts,
+        TransactionVTab, UpdateVTab, Updates, VTab, VTabConfig, VTabConnection, VTabCursor,
+        VTabKind, read_only_module,
     },
 };
 
@@ -44,6 +45,14 @@ const ROW_ACCOUNTING_BYTES: usize = size_of::<Vec<RawCell>>() * 4 + ALLOCATION_O
 const VALUE_ACCOUNTING_BYTES: usize = size_of::<RawCell>();
 const SCAN_PLAN: c_int = 0;
 const SHARD_KEY_EQUALITY_PLAN: c_int = 1;
+const LOCATOR_COLUMN_NAME: &str = "__briskdb_locator";
+
+mod locator;
+mod module_v2;
+mod write;
+
+#[allow(unused_imports)]
+pub(crate) use write::{CoordinatorWriteResult, WriteCoordinator};
 
 /// A separate SQLite coordinator whose logical tables are backed by BriskDB
 /// shard files. The coordinator never attaches those files to its own schema.
@@ -116,6 +125,7 @@ impl ReadCoordinator {
             epoch: Arc::clone(&registry.cancellation_epoch),
             active_child_scans: Arc::clone(&registry.active_child_scans),
             interrupt: Arc::new(connection.get_interrupt_handle()),
+            write_state: registry.write_state.clone(),
         };
         Ok(Self {
             connection,
@@ -181,15 +191,29 @@ pub(crate) struct CoordinatorCancellation {
     epoch: Arc<AtomicU64>,
     active_child_scans: Arc<Mutex<usize>>,
     interrupt: Arc<InterruptHandle>,
+    write_state: Option<Arc<write::WriteState>>,
 }
 
 impl CoordinatorCancellation {
     pub(crate) fn cancel(&self) {
+        // Child COMMIT is the durability linearization point: cancellation
+        // either wins this mutex before COMMIT and forces rollback through the
+        // epoch check, or waits until a completed COMMIT has won. Interrupting
+        // an in-flight durable commit could only turn a known result into an
+        // ambiguous one, so that narrow finalization window is deliberately
+        // non-cancellable.
+        let _commit = self
+            .write_state
+            .as_ref()
+            .map(|state| state.lock_commit_linearization());
         let _active_child_scans = self
             .active_child_scans
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.epoch.fetch_add(1, Ordering::AcqRel);
+        if let Some(write_state) = &self.write_state {
+            write_state.interrupt_child();
+        }
         self.interrupt.interrupt();
     }
 }
@@ -280,6 +304,63 @@ fn attach_coordinator_authorizer(connection: &Connection) -> EngineResult<()> {
         .map_err(sqlite_error::storage)
 }
 
+fn attach_writable_coordinator_authorizer(
+    connection: &Connection,
+    registry: &Registry,
+    allow_transaction_control: Arc<std::sync::atomic::AtomicBool>,
+) -> EngineResult<()> {
+    let registered_tables = registry
+        .tables
+        .values()
+        .map(|table| table.name.clone())
+        .collect::<BTreeSet<_>>();
+    connection
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if context
+                .database_name
+                .is_some_and(|database| !database.eq_ignore_ascii_case("main"))
+                || context.accessor.is_some()
+            {
+                return Authorization::Deny;
+            }
+            match context.action {
+                AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
+                AuthAction::Read { table_name, .. } => {
+                    if registered_tables.contains(table_name) {
+                        Authorization::Allow
+                    } else {
+                        Authorization::Deny
+                    }
+                }
+                AuthAction::Insert { table_name }
+                | AuthAction::Delete { table_name }
+                | AuthAction::Update { table_name, .. } => {
+                    if registered_tables.contains(table_name) {
+                        Authorization::Allow
+                    } else {
+                        Authorization::Deny
+                    }
+                }
+                AuthAction::Function { function_name }
+                    if !function_name.eq_ignore_ascii_case("load_extension") =>
+                {
+                    Authorization::Allow
+                }
+                AuthAction::Transaction { .. } | AuthAction::Savepoint { .. }
+                    if allow_transaction_control.load(Ordering::Acquire) =>
+                {
+                    Authorization::Allow
+                }
+                AuthAction::Pragma {
+                    pragma_name,
+                    pragma_value: None,
+                } if pragma_name.eq_ignore_ascii_case("database_list") => Authorization::Allow,
+                _ => Authorization::Deny,
+            }
+        }))
+        .map_err(sqlite_error::storage)
+}
+
 fn register_module(connection: &Connection, registry: Arc<Registry>) -> SqliteResult<()> {
     connection.create_module(
         c"brisk_shard",
@@ -292,6 +373,8 @@ struct Registry {
     storage: Storage,
     schema_generation: u64,
     tables: BTreeMap<u64, Arc<TableSpec>>,
+    mode: CoordinatorMode,
+    write_state: Option<Arc<write::WriteState>>,
     limits: CursorLimits,
     cancellation_epoch: Arc<AtomicU64>,
     active_child_scans: Arc<Mutex<usize>>,
@@ -302,6 +385,12 @@ struct Registry {
     child_scan_gate: Mutex<Option<TestChildScanGate>>,
     #[cfg(test)]
     child_scan_complete_gate: Mutex<Option<TestChildScanGate>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordinatorMode {
+    ReadOnly,
+    Writable,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -321,12 +410,28 @@ impl Default for CursorLimits {
 
 impl Registry {
     fn build_admitted(storage: Storage) -> EngineResult<Arc<Self>> {
-        Self::build_admitted_with_limits(storage, CursorLimits::default())
+        Self::build_admitted_with_limits_and_mode(
+            storage,
+            CursorLimits::default(),
+            CoordinatorMode::ReadOnly,
+        )
     }
 
     fn build_admitted_with_limits(
         storage: Storage,
         limits: CursorLimits,
+    ) -> EngineResult<Arc<Self>> {
+        Self::build_admitted_with_limits_and_mode(storage, limits, CoordinatorMode::ReadOnly)
+    }
+
+    fn build_writable(storage: Storage, limits: CursorLimits) -> EngineResult<Arc<Self>> {
+        Self::build_admitted_with_limits_and_mode(storage, limits, CoordinatorMode::Writable)
+    }
+
+    fn build_admitted_with_limits_and_mode(
+        storage: Storage,
+        limits: CursorLimits,
+        mode: CoordinatorMode,
     ) -> EngineResult<Arc<Self>> {
         if limits.rows == 0 || limits.bytes == 0 {
             return Err(EngineError::new(
@@ -369,10 +474,14 @@ impl Registry {
             tables.insert(table.id().get(), Arc::new(spec));
         }
 
+        let write_state =
+            matches!(mode, CoordinatorMode::Writable).then(|| Arc::new(write::WriteState::new()));
         Ok(Arc::new(Self {
             storage,
             schema_generation,
             tables,
+            mode,
+            write_state,
             limits,
             cancellation_epoch: Arc::new(AtomicU64::new(0)),
             active_child_scans: Arc::new(Mutex::new(0)),
@@ -388,6 +497,12 @@ impl Registry {
 
     fn table(&self, id: u64) -> Option<Arc<TableSpec>> {
         self.tables.get(&id).cloned()
+    }
+
+    fn write_state(&self) -> &Arc<write::WriteState> {
+        self.write_state
+            .as_ref()
+            .expect("writable coordinator registry has shared write state")
     }
 
     fn equality_scan(
@@ -477,6 +592,100 @@ impl Registry {
         Ok(target.map_or(EqualityTargets::All, EqualityTargets::One))
     }
 
+    fn write_target(&self, spec: &TableSpec, value: ValueRef<'_>) -> EngineResult<u16> {
+        let shard_key = spec.shard_key.as_ref().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Unsupported,
+                format!("registered table {} has no writable shard key", spec.name),
+            )
+        })?;
+        #[allow(unreachable_patterns)]
+        let target = match (shard_key.key_type, value) {
+            (_, ValueRef::Null) => {
+                return Err(EngineError::new(
+                    EngineErrorKind::NotNullViolation,
+                    format!("registered table {} shard key cannot be NULL", spec.name),
+                ));
+            }
+            (ShardKeyType::Int64, ValueRef::Integer(value)) => {
+                match classify_generated_id(&spec.generated_id_policy, value)? {
+                    GeneratedIdClassification::Legacy(value) => self.storage.shard_for_key(
+                        &canonical_shard_key_bytes(CanonicalShardKeyRef::Int64(value)),
+                    ),
+                    GeneratedIdClassification::NativeRangeV1(id) => spec
+                        .allocation_owners
+                        .as_ref()
+                        .ok_or_else(|| {
+                            EngineError::new(
+                                EngineErrorKind::DataCorruption,
+                                format!(
+                                    "registered native-ID table {} has no allocation-owner map",
+                                    spec.name
+                                ),
+                            )
+                        })?
+                        .physical_shard(id.owner())
+                        .ok_or_else(|| {
+                            EngineError::new(
+                                EngineErrorKind::FailedPrecondition,
+                                format!(
+                                    "native ID for {} refers to an unassigned allocation owner",
+                                    spec.name
+                                ),
+                            )
+                        })?,
+                }
+            }
+            (ShardKeyType::Text, ValueRef::Text(value)) => {
+                let value = std::str::from_utf8(value).map_err(|error| {
+                    EngineError::from_source(
+                        EngineErrorKind::InvalidTextEncoding,
+                        format!(
+                            "registered table {} shard key is not valid UTF-8",
+                            spec.name
+                        ),
+                        error,
+                    )
+                })?;
+                self.storage
+                    .shard_for_key(&canonical_shard_key_bytes(CanonicalShardKeyRef::Text(
+                        value,
+                    )))
+            }
+            (ShardKeyType::Binary, ValueRef::Blob(value)) => self.storage.shard_for_key(
+                &canonical_shard_key_bytes(CanonicalShardKeyRef::Binary(value)),
+            ),
+            (ShardKeyType::Int64, _) | (ShardKeyType::Text, _) | (ShardKeyType::Binary, _) => {
+                return Err(EngineError::new(
+                    EngineErrorKind::TypeMismatch,
+                    format!(
+                        "registered table {} shard key has the wrong SQLite storage class",
+                        spec.name
+                    ),
+                ));
+            }
+            (_, _) => {
+                return Err(EngineError::new(
+                    EngineErrorKind::Unsupported,
+                    format!(
+                        "registered table {} uses an unsupported shard-key type",
+                        spec.name
+                    ),
+                ));
+            }
+        };
+        if !spec.targets.contains(&target) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "registered table {} routed outside its declared writable target set",
+                    spec.name
+                ),
+            ));
+        }
+        Ok(target)
+    }
+
     fn cancelled(&self, scan_epoch: u64) -> bool {
         self.cancellation_epoch.load(Ordering::Acquire) != scan_epoch
     }
@@ -492,6 +701,17 @@ impl Registry {
     ) -> EngineResult<(Vec<Vec<RawCell>>, usize)> {
         if self.cancelled(scan_epoch) {
             return Err(cancelled_error());
+        }
+        if self.mode == CoordinatorMode::Writable {
+            return self.write_state().read_shard_rows(
+                self,
+                spec,
+                shard_id,
+                equality,
+                scan_epoch,
+                remaining_rows,
+                remaining_bytes,
+            );
         }
 
         let connection = self.storage.open_shard_read_only(shard_id)?;
@@ -691,14 +911,60 @@ impl Drop for TrackedChildConnection {
 struct TableSpec {
     id: u64,
     name: String,
-    declared_schema: String,
+    read_declared_schema: String,
+    write_declared_schema: String,
     select_sql: String,
     point_select_sql: Option<String>,
+    locator_select_sql: Option<String>,
+    locator_point_select_sql: Option<String>,
+    columns: Box<[PhysicalColumnSpec]>,
+    locator: Option<PhysicalLocatorSpec>,
+    write_unsupported: Option<String>,
     column_count: usize,
     targets: Box<[u16]>,
     shard_key: Option<ShardKeySpec>,
     generated_id_policy: GeneratedIdPolicy,
     allocation_owners: Option<Arc<AllocationOwnerMap>>,
+}
+
+#[derive(Debug, Clone)]
+struct PhysicalColumnSpec {
+    name: String,
+    default_sql: Option<String>,
+    generated: bool,
+}
+
+#[derive(Debug, Clone)]
+enum PhysicalLocatorSpec {
+    Rowid { expression: String },
+    PrimaryKey { columns: Box<[String]> },
+}
+
+impl PhysicalLocatorSpec {
+    fn expressions(&self) -> Box<[String]> {
+        match self {
+            Self::Rowid { expression } => vec![expression.clone()].into_boxed_slice(),
+            Self::PrimaryKey { columns } => columns.clone(),
+        }
+    }
+
+    fn value_count(&self) -> usize {
+        match self {
+            Self::Rowid { .. } => 1,
+            Self::PrimaryKey { columns } => columns.len(),
+        }
+    }
+
+    fn predicate_sql(&self) -> String {
+        match self {
+            Self::Rowid { expression } => format!("{expression} = ?"),
+            Self::PrimaryKey { columns } => columns
+                .iter()
+                .map(|column| format!("{} IS ?", quote_identifier(column)))
+                .collect::<Vec<_>>()
+                .join(" AND "),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -716,18 +982,18 @@ impl TableSpec {
     ) -> EngineResult<Self> {
         let id = table.id().get();
         let name = table.name();
-        let strict = connection
+        let (strict, without_rowid) = connection
             .query_row(
-                "SELECT strict
+                "SELECT strict, wr
                  FROM pragma_table_list
                  WHERE schema = 'main' AND name = ?1 COLLATE BINARY AND type = 'table'",
                 [name],
-                |row| row.get::<_, bool>(0),
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
             )
             .map_err(sqlite_error::storage)?;
         let mut statement = connection
             .prepare(
-                "SELECT name, type, hidden
+                "SELECT name, type, \"notnull\", dflt_value, pk, hidden
                  FROM pragma_table_xinfo(?1)
                  ORDER BY cid",
             )
@@ -738,6 +1004,9 @@ impl TableSpec {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })
             .map_err(sqlite_error::storage)?
@@ -749,7 +1018,7 @@ impl TableSpec {
                 format!("registered table {name} has no physical columns"),
             ));
         }
-        if columns.iter().any(|(_, _, hidden)| *hidden == 1) {
+        if columns.iter().any(|(_, _, _, _, _, hidden)| *hidden == 1) {
             return Err(EngineError::new(
                 EngineErrorKind::Unsupported,
                 format!("registered table {name} has a hidden virtual-table column"),
@@ -758,7 +1027,7 @@ impl TableSpec {
 
         let declared_columns = columns
             .iter()
-            .map(|(column, declared_type, _)| {
+            .map(|(column, declared_type, not_null, default_sql, _, _)| {
                 let (_, collation, _, _, _) = connection
                     .column_metadata(None::<&str>, name, column)
                     .map_err(sqlite_error::storage)?;
@@ -786,18 +1055,32 @@ impl TableSpec {
                 } else {
                     sqlite_affinity(declared_type)
                 };
-                Ok(format!(
+                let mut declaration = format!(
                     "{} {} COLLATE {}",
                     quote_identifier(column),
                     affinity_name(affinity),
                     quote_identifier(collation)
-                ))
+                );
+                if *not_null != 0 {
+                    declaration.push_str(" NOT NULL");
+                }
+                if let Some(default_sql) = default_sql {
+                    declaration.push_str(" DEFAULT (");
+                    declaration.push_str(default_sql);
+                    declaration.push(')');
+                }
+                Ok(declaration)
             })
-            .collect::<EngineResult<Vec<_>>>()?
-            .join(", ");
+            .collect::<EngineResult<Vec<_>>>()?;
+        let read_declared_schema = format!("CREATE TABLE x({})", declared_columns.join(", "));
+        let write_declared_schema = format!(
+            "CREATE TABLE x({}, {} BLOB HIDDEN PRIMARY KEY NOT NULL) WITHOUT ROWID",
+            declared_columns.join(", "),
+            quote_identifier(LOCATOR_COLUMN_NAME)
+        );
         let projected_columns = columns
             .iter()
-            .map(|(column, _, _)| quote_identifier(column))
+            .map(|(column, _, _, _, _, _)| quote_identifier(column))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -806,7 +1089,7 @@ impl TableSpec {
             TablePlacement::Sharded(metadata) => {
                 let column_index = columns
                     .iter()
-                    .position(|(column, _, _)| column == metadata.column())
+                    .position(|(column, _, _, _, _, _)| column == metadata.column())
                     .ok_or_else(|| {
                         EngineError::new(
                             EngineErrorKind::DataCorruption,
@@ -846,15 +1129,129 @@ impl TableSpec {
             _ => None,
         };
 
+        let physical_columns = columns
+            .iter()
+            .map(
+                |(column, _, _, default_sql, _, hidden)| PhysicalColumnSpec {
+                    name: column.clone(),
+                    default_sql: default_sql.clone(),
+                    generated: matches!(*hidden, 2 | 3),
+                },
+            )
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        let locator = if without_rowid {
+            let mut primary_key = columns
+                .iter()
+                .filter(|(_, _, _, _, primary_key, _)| *primary_key > 0)
+                .map(|(column, _, _, _, primary_key, _)| (*primary_key, column.clone()))
+                .collect::<Vec<_>>();
+            primary_key.sort_unstable_by_key(|(position, _)| *position);
+            (!primary_key.is_empty()).then(|| PhysicalLocatorSpec::PrimaryKey {
+                columns: primary_key
+                    .into_iter()
+                    .map(|(_, column)| column)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            })
+        } else {
+            let physical_names = columns
+                .iter()
+                .map(|(column, _, _, _, _, _)| column.as_str())
+                .collect::<Vec<_>>();
+            ["rowid", "_rowid_", "oid"]
+                .into_iter()
+                .find(|candidate| {
+                    physical_names
+                        .iter()
+                        .all(|column| !column.eq_ignore_ascii_case(candidate))
+                })
+                .map(|expression| PhysicalLocatorSpec::Rowid {
+                    expression: expression.to_owned(),
+                })
+        };
+
+        let has_trigger = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM main.sqlite_schema
+                     WHERE type = 'trigger' AND tbl_name = ?1 COLLATE BINARY
+                 )",
+                [name],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sqlite_error::storage)?;
+        let write_unsupported = if !matches!(table.placement(), TablePlacement::Sharded(_)) {
+            Some(format!(
+                "registered table {name} is not Sharded; the writable facade does not mutate replicated or catalog placement"
+            ))
+        } else if columns
+            .iter()
+            .any(|(column, _, _, _, _, _)| column.eq_ignore_ascii_case(LOCATOR_COLUMN_NAME))
+        {
+            Some(format!(
+                "registered table {name} conflicts with the reserved writable row locator"
+            ))
+        } else if physical_columns
+            .iter()
+            .any(|column| column.default_sql.is_some())
+        {
+            Some(format!(
+                "registered table {name} has physical defaults; SQLite xUpdate cannot distinguish an omitted value from explicit NULL"
+            ))
+        } else if physical_columns.iter().any(|column| column.generated) {
+            Some(format!(
+                "registered table {name} has generated columns, which are not writable through the explicit-key facade"
+            ))
+        } else if has_trigger {
+            Some(format!(
+                "registered table {name} has physical triggers, which are not supported by the writable facade"
+            ))
+        } else if locator.is_none() {
+            Some(format!(
+                "registered table {name} has no unambiguous physical row identity for writable scans"
+            ))
+        } else {
+            None
+        };
+
+        let (locator_select_sql, locator_point_select_sql) = locator
+            .as_ref()
+            .map(|locator| {
+                let locator_columns = locator.expressions().join(", ");
+                let select = format!(
+                    "SELECT {projected_columns}, {locator_columns} FROM main.{}",
+                    quote_identifier(name)
+                );
+                let point = match table.placement() {
+                    TablePlacement::Sharded(metadata) => Some(format!(
+                        "SELECT {projected_columns}, {locator_columns} FROM main.{} WHERE {} = ?1",
+                        quote_identifier(name),
+                        quote_identifier(metadata.column())
+                    )),
+                    _ => None,
+                };
+                (select, point)
+            })
+            .map_or((None, None), |(select, point)| (Some(select), point));
+
         Ok(Self {
             id,
             name: name.to_owned(),
-            declared_schema: format!("CREATE TABLE x({declared_columns})"),
+            read_declared_schema,
+            write_declared_schema,
             select_sql: format!(
                 "SELECT {projected_columns} FROM main.{}",
                 quote_identifier(name)
             ),
             point_select_sql,
+            locator_select_sql,
+            locator_point_select_sql,
+            columns: physical_columns,
+            locator,
+            write_unsupported,
             column_count: columns.len(),
             targets,
             shard_key,
@@ -869,6 +1266,190 @@ impl TableSpec {
             quote_identifier(&self.name),
             self.id
         )
+    }
+
+    fn ensure_writable(&self) -> EngineResult<()> {
+        if let Some(reason) = &self.write_unsupported {
+            Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                reason.clone(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn write_shard_key<'a>(&self, values: &'a [ValueRef<'a>]) -> EngineResult<ValueRef<'a>> {
+        self.ensure_writable()?;
+        if values.len() != self.column_count {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                format!(
+                    "brisk_shard received {} values for {} physical columns on {}",
+                    values.len(),
+                    self.column_count,
+                    self.name
+                ),
+            ));
+        }
+        let shard_key = self.shard_key.as_ref().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Unsupported,
+                format!("registered table {} has no writable shard key", self.name),
+            )
+        })?;
+        values
+            .get(usize::try_from(shard_key.column_index).map_err(|_| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    format!(
+                        "registered table {} has an invalid shard-key index",
+                        self.name
+                    ),
+                )
+            })?)
+            .copied()
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    format!("registered table {} shard-key value is missing", self.name),
+                )
+            })
+    }
+
+    fn insert_sql(&self, conflict: ConflictMode) -> EngineResult<String> {
+        self.ensure_writable()?;
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| quote_identifier(&column.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = (1..=self.column_count)
+            .map(|position| format!("?{position}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!(
+            "INSERT{} INTO main.{} ({columns}) VALUES ({placeholders})",
+            write_conflict_clause(conflict),
+            quote_identifier(&self.name)
+        ))
+    }
+
+    fn delete_sql(&self) -> EngineResult<String> {
+        self.ensure_writable()?;
+        let locator = self.locator.as_ref().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Unsupported,
+                format!("registered table {} has no writable row locator", self.name),
+            )
+        })?;
+        Ok(format!(
+            "DELETE FROM main.{} WHERE {}",
+            quote_identifier(&self.name),
+            locator.predicate_sql()
+        ))
+    }
+
+    fn update_sql_and_values(
+        &self,
+        values: &[ValueRef<'_>],
+        no_change: &[bool],
+        conflict: ConflictMode,
+    ) -> EngineResult<(String, Vec<RawCell>)> {
+        self.ensure_writable()?;
+        if values.len() != self.column_count || no_change.len() != self.column_count {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                format!(
+                    "brisk_shard received an invalid update shape for {}",
+                    self.name
+                ),
+            ));
+        }
+        let mut assignments = Vec::new();
+        let mut parameters = Vec::new();
+        for ((column, value), unchanged) in self.columns.iter().zip(values).zip(no_change) {
+            if *unchanged {
+                continue;
+            }
+            if column.generated {
+                return Err(EngineError::new(
+                    EngineErrorKind::ReadOnly,
+                    format!(
+                        "generated column {}.{} is read-only through brisk_shard",
+                        self.name, column.name
+                    ),
+                ));
+            }
+            parameters.push(RawCell::try_copy_from(*value)?);
+            assignments.push(format!(
+                "{} = ?{}",
+                quote_identifier(&column.name),
+                parameters.len()
+            ));
+        }
+        if assignments.is_empty() {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                format!("brisk_shard update for {} changed no columns", self.name),
+            ));
+        }
+        let locator = self.locator.as_ref().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Unsupported,
+                format!("registered table {} has no writable row locator", self.name),
+            )
+        })?;
+        Ok((
+            format!(
+                "UPDATE{} main.{} SET {} WHERE {}",
+                write_conflict_clause(conflict),
+                quote_identifier(&self.name),
+                assignments.join(", "),
+                locator.predicate_sql()
+            ),
+            parameters,
+        ))
+    }
+
+    fn decode_locator(&self, value: ValueRef<'_>) -> EngineResult<locator::DecodedLocator> {
+        self.ensure_writable()?;
+        let ValueRef::Blob(bytes) = value else {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "brisk_shard row locator must be an opaque BLOB",
+            ));
+        };
+        let decoded = locator::decode(self.id, bytes)?;
+        let expected_values = self
+            .locator
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::Unsupported,
+                    format!("registered table {} has no writable row locator", self.name),
+                )
+            })?
+            .value_count();
+        if decoded.values.len() != expected_values || !self.targets.contains(&decoded.shard) {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "brisk_shard row locator does not match the registered physical table",
+            ));
+        }
+        Ok(decoded)
+    }
+}
+
+const fn write_conflict_clause(conflict: ConflictMode) -> &'static str {
+    if matches!(conflict, ConflictMode::Replace) {
+        " OR REPLACE"
+    } else {
+        // The physical schema may declare its own ON CONFLICT policy. Force
+        // each child operation to ABORT so the coordinator's conflict mode,
+        // reported through sqlite3_vtab_on_conflict(), remains authoritative.
+        " OR ABORT"
     }
 }
 
@@ -937,6 +1518,7 @@ impl LifecycleCounters {
 struct BriskShardTable {
     // SQLite requires its base object to be the first field.
     _base: ffi::sqlite3_vtab,
+    database_handle: *mut ffi::sqlite3,
     registry: Arc<Registry>,
     spec: Arc<TableSpec>,
 }
@@ -967,11 +1549,34 @@ unsafe impl<'vtab> VTab<'vtab> for BriskShardTable {
             .ok_or_else(|| module_error(format!("unknown brisk_shard table ID {id}")))?;
 
         database.config(VTabConfig::DirectOnly)?;
+        if registry.mode == CoordinatorMode::Writable {
+            // rusqlite's safe wrapper omits the required third vararg for
+            // SQLITE_VTAB_CONSTRAINT_SUPPORT. Use stock SQLite's supported C
+            // API directly so conflict modes can be delegated correctly.
+            let result_code = unsafe {
+                ffi::sqlite3_vtab_config(
+                    database.handle(),
+                    ffi::SQLITE_VTAB_CONSTRAINT_SUPPORT,
+                    1_i32,
+                )
+            };
+            if result_code != ffi::SQLITE_OK {
+                return Err(SqliteError::SqliteFailure(
+                    ffi::Error::new(result_code),
+                    Some("could not enable brisk_shard constraint support".to_owned()),
+                ));
+            }
+        }
         registry.lifecycle.connects.fetch_add(1, Ordering::Relaxed);
+        let database_handle = unsafe { database.handle() };
         Ok((
-            spec.declared_schema.clone(),
+            match registry.mode {
+                CoordinatorMode::ReadOnly => spec.read_declared_schema.clone(),
+                CoordinatorMode::Writable => spec.write_declared_schema.clone(),
+            },
             Self {
                 _base: ffi::sqlite3_vtab::default(),
+                database_handle,
                 registry,
                 spec,
             },
@@ -1048,6 +1653,131 @@ impl<'vtab> CreateVTab<'vtab> for BriskShardTable {
     }
 }
 
+impl<'vtab> UpdateVTab<'vtab> for BriskShardTable {
+    fn delete(&mut self, locator: ValueRef<'_>) -> SqliteResult<()> {
+        self.registry
+            .write_state()
+            .execute_delete(&self.registry, &self.spec, locator)
+            .map_err(vtab_error)
+    }
+
+    fn insert(&mut self, arguments: &Inserts<'_>) -> SqliteResult<i64> {
+        let expected = self
+            .spec
+            .column_count
+            .checked_add(3)
+            .ok_or_else(|| module_error("brisk_shard writable column count overflowed"))?;
+        let values = arguments.iter().collect::<Vec<_>>();
+        if values.len() != expected || !matches!(values[0], ValueRef::Null) {
+            return Err(module_error(format!(
+                "brisk_shard INSERT received an invalid argument shape for {}",
+                self.spec.name
+            )));
+        }
+        if !matches!(values[1], ValueRef::Null)
+            || !matches!(values[2 + self.spec.column_count], ValueRef::Null)
+        {
+            return Err(vtab_error(EngineError::new(
+                EngineErrorKind::ReadOnly,
+                "brisk_shard opaque row locator cannot be supplied by INSERT",
+            )));
+        }
+        let conflict = unsafe { arguments.on_conflict(self.database_handle) };
+        self.registry
+            .write_state()
+            .execute_insert(
+                &self.registry,
+                &self.spec,
+                &values[2..2 + self.spec.column_count],
+                conflict,
+            )
+            .map_err(vtab_error)
+    }
+
+    fn update(&mut self, arguments: &Updates<'_>) -> SqliteResult<()> {
+        let expected = self
+            .spec
+            .column_count
+            .checked_add(3)
+            .ok_or_else(|| module_error("brisk_shard writable column count overflowed"))?;
+        let values = arguments.iter().collect::<Vec<_>>();
+        if values.len() != expected || matches!(values[0], ValueRef::Null) {
+            return Err(module_error(format!(
+                "brisk_shard UPDATE received an invalid argument shape for {}",
+                self.spec.name
+            )));
+        }
+        let hidden_value = values[2 + self.spec.column_count];
+        if !matches!(
+            (values[0], values[1], hidden_value),
+            (ValueRef::Blob(old), ValueRef::Blob(new), ValueRef::Blob(hidden))
+                if old == new && old == hidden
+        ) {
+            return Err(vtab_error(EngineError::new(
+                EngineErrorKind::ReadOnly,
+                "brisk_shard opaque row locator cannot be changed",
+            )));
+        }
+        let no_change = (0..self.spec.column_count)
+            .map(|column| arguments.no_change(column + 2))
+            .collect::<Vec<_>>();
+        let conflict = unsafe { arguments.on_conflict(self.database_handle) };
+        self.registry
+            .write_state()
+            .execute_update(
+                &self.registry,
+                &self.spec,
+                values[0],
+                values[1],
+                &values[2..2 + self.spec.column_count],
+                &no_change,
+                conflict,
+            )
+            .map_err(vtab_error)
+    }
+}
+
+impl<'vtab> TransactionVTab<'vtab> for BriskShardTable {
+    fn begin(&mut self) -> SqliteResult<()> {
+        write::map_callback(self.registry.write_state().begin(&self.registry))
+    }
+
+    fn sync(&mut self) -> SqliteResult<()> {
+        write::map_callback(self.registry.write_state().sync(&self.registry))
+    }
+
+    fn commit(&mut self) -> SqliteResult<()> {
+        write::map_callback(self.registry.write_state().mark_commit(&self.registry))
+    }
+
+    fn rollback(&mut self) -> SqliteResult<()> {
+        self.registry.write_state().mark_rollback();
+        Ok(())
+    }
+}
+
+impl BriskShardTable {
+    fn savepoint(&mut self, number: c_int) -> SqliteResult<()> {
+        write::map_callback(
+            self.registry
+                .write_state()
+                .savepoint(&self.registry, number),
+        )
+    }
+
+    fn release(&mut self, number: c_int) -> SqliteResult<()> {
+        write::map_callback(self.registry.write_state().release(&self.registry, number))
+    }
+
+    fn rollback_to(&mut self, number: c_int) -> SqliteResult<()> {
+        write::map_callback(
+            self.registry
+                .write_state()
+                .rollback_to(&self.registry, number),
+        )
+    }
+}
+
 impl Drop for BriskShardTable {
     fn drop(&mut self) {
         self.registry
@@ -1097,6 +1827,15 @@ impl BriskShardCursor {
     }
 
     fn begin_scan(&mut self) -> SqliteResult<()> {
+        if self.registry.mode == CoordinatorMode::Writable {
+            self.spec.ensure_writable().map_err(vtab_error)?;
+            if self.targets.len() != 1 {
+                return Err(vtab_error(EngineError::new(
+                    EngineErrorKind::Unsupported,
+                    "writable brisk_shard UPDATE and DELETE require an exact shard-key equality",
+                )));
+            }
+        }
         let operation = self
             .registry
             .storage
@@ -1250,6 +1989,14 @@ unsafe impl VTabCursor for BriskShardCursor {
             .fetch_add(1, Ordering::Relaxed);
         let column = usize::try_from(column)
             .map_err(|_| module_error("negative brisk_shard column index"))?;
+        if self.registry.mode == CoordinatorMode::Writable
+            && column < self.spec.column_count
+            && context.no_change()
+        {
+            // Leaving the result unset is the signal that lets SQLite mark
+            // this argv slot with sqlite3_value_nochange() for xUpdate.
+            return Ok(());
+        }
         let value = self
             .rows
             .get(self.row_index)
@@ -1473,6 +2220,7 @@ mod tests {
         collections::BTreeSet,
         sync::{Arc, mpsc},
         thread,
+        time::Instant,
     };
 
     use rusqlite::{ErrorCode, MAIN_DB, params, types::ValueRef};
@@ -1523,6 +2271,12 @@ mod tests {
     }
 
     struct Fixture {
+        temp: tempfile::TempDir,
+        storage: Storage,
+        keys: [i64; 2],
+    }
+
+    struct WritableFixture {
         temp: tempfile::TempDir,
         storage: Storage,
         keys: [i64; 2],
@@ -1619,6 +2373,92 @@ mod tests {
                         .query_row("SELECT COUNT(*) FROM events", [], |row| {
                             row.get::<_, i64>(0)
                         })
+                        .unwrap()
+                })
+                .sum()
+        }
+    }
+
+    impl WritableFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let mut storage = Storage::open(temp.path(), 2).unwrap();
+            let mut migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            storage
+                .apply_schema_migration(
+                    "CREATE TABLE parents (
+                         tenant_id INTEGER NOT NULL,
+                         parent_id INTEGER NOT NULL,
+                         label TEXT NOT NULL,
+                         PRIMARY KEY (tenant_id, parent_id)
+                     );
+                     CREATE TABLE items (
+                         tenant_id INTEGER NOT NULL,
+                         item_id INTEGER NOT NULL,
+                         parent_id INTEGER NOT NULL,
+                         code TEXT NOT NULL,
+                         quantity INTEGER NOT NULL CHECK (quantity > 0),
+                         PRIMARY KEY (tenant_id, item_id),
+                         UNIQUE (tenant_id, code),
+                         FOREIGN KEY (tenant_id, parent_id)
+                             REFERENCES parents (tenant_id, parent_id)
+                     );
+                     CREATE INDEX items_quantity_idx
+                         ON items (tenant_id, quantity);",
+                    &mut migration,
+                    None,
+                )
+                .unwrap();
+            migration.publish_ready().unwrap();
+            let database_id = storage.logical_catalog().default_database().id();
+            storage
+                .register_tables(vec![
+                    TableDeclaration::sharded(
+                        database_id,
+                        "parents",
+                        ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+                    )
+                    .unwrap(),
+                    TableDeclaration::sharded(
+                        database_id,
+                        "items",
+                        ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+                    )
+                    .unwrap(),
+                ])
+                .unwrap();
+            let keys = std::array::from_fn(|expected| {
+                (1_i64..)
+                    .find(|key| {
+                        storage.shard_for_key(key.to_string().as_bytes()) == expected as u16
+                    })
+                    .unwrap()
+            });
+            for (shard, key) in keys.into_iter().enumerate() {
+                storage
+                    .open_shard(u16::try_from(shard).unwrap())
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO parents VALUES (?1, 1, ?2)",
+                        params![key, format!("parent-{shard}")],
+                    )
+                    .unwrap();
+            }
+            Self {
+                temp,
+                storage,
+                keys,
+            }
+        }
+
+        fn item_count(&self) -> i64 {
+            (0..2)
+                .map(|shard| {
+                    self.storage
+                        .open_shard(shard)
+                        .unwrap()
+                        .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))
                         .unwrap()
                 })
                 .sum()
@@ -3545,5 +4385,1409 @@ mod tests {
             .copied()
             .collect::<BTreeSet<_>>();
         assert_eq!(opened, BTreeSet::from([0, 1]));
+    }
+
+    #[test]
+    fn writable_coordinator_inserts_an_explicit_key_on_its_owner_shard() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let result = coordinator
+            .execute_dml(
+                "INSERT INTO events
+                 (tenant_id, event_id, payload, amount, raw, optional, category)
+                 VALUES (?1, 2, 'written', 3.5, x'01', NULL, 'beta')",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        assert_eq!(result.affected_rows, 1);
+        assert_eq!(result.explicit_key, Some(Value::Int64(fixture.keys[0])));
+        assert_eq!(fixture.physical_row_count(), 3);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM events WHERE tenant_id = ?1 AND event_id = 2",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "written"
+        );
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn writable_coordinator_updates_and_deletes_through_opaque_locators() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let updated = coordinator
+            .execute_dml(
+                "UPDATE events
+                 SET payload = 'updated', optional = 'present'
+                 WHERE tenant_id = ?1 AND event_id = 1",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        assert_eq!(updated.affected_rows, 1);
+        assert_eq!(updated.explicit_key, None);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT payload || ':' || optional FROM events
+                     WHERE tenant_id = ?1 AND event_id = 1",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "updated:present"
+        );
+
+        let deleted = coordinator
+            .execute_dml(
+                "DELETE FROM events WHERE tenant_id = ?1 AND event_id = 1",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        assert_eq!(deleted.affected_rows, 1);
+        assert_eq!(fixture.physical_row_count(), 1);
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn writable_explicit_transactions_commit_rollback_and_nested_savepoints() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        coordinator.begin().unwrap();
+        coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES (?1, 2, 'kept', 2.0, x'02', NULL, 'beta')",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        coordinator.savepoint("outer").unwrap();
+        coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES (?1, 3, 'discarded', 3.0, x'03', NULL, 'gamma')",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        coordinator.savepoint("inner").unwrap();
+        coordinator
+            .execute_dml(
+                "UPDATE events SET payload = 'also-discarded'
+                 WHERE tenant_id = ?1 AND event_id = 1",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        coordinator.rollback_to("outer").unwrap();
+        coordinator.release("outer").unwrap();
+        coordinator.commit().unwrap();
+        assert!(!coordinator.in_transaction());
+
+        let shard = fixture.storage.open_shard(0).unwrap();
+        assert_eq!(
+            shard
+                .query_row(
+                    "SELECT GROUP_CONCAT(event_id || ':' || payload, ',')
+                     FROM events WHERE tenant_id = ?1 ORDER BY event_id",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "1:zero,2:kept"
+        );
+
+        coordinator.begin().unwrap();
+        coordinator
+            .execute_dml(
+                "DELETE FROM events WHERE tenant_id = ?1 AND event_id = 2",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        coordinator.rollback().unwrap();
+        assert_eq!(fixture.physical_row_count(), 3);
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn writable_late_enlistment_preserves_preexisting_nested_savepoints() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        coordinator.begin().unwrap();
+        coordinator.savepoint("outer").unwrap();
+        coordinator.savepoint("inner").unwrap();
+        coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES
+                 (?1, 2, 'rolled-back', 2.0, x'02', NULL, 'beta')",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+
+        // SQLite late-enlists the virtual table at only the deepest level.
+        // Releasing that level must not erase the physical boundary for an
+        // outer savepoint that existed before the first virtual-table write.
+        coordinator.release("inner").unwrap();
+        coordinator.rollback_to("outer").unwrap();
+        coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES
+                 (?1, 3, 'kept-after-rollback', 3.0, x'03', NULL, 'gamma')",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        coordinator.release("outer").unwrap();
+        coordinator.commit().unwrap();
+
+        let shard = fixture.storage.open_shard(0).unwrap();
+        assert_eq!(
+            shard
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE tenant_id = ?1 AND event_id = 2",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            shard
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE tenant_id = ?1 AND event_id = 3",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(fixture.physical_row_count(), 3);
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn writable_savepoint_callback_failures_abort_both_transaction_layers() {
+        for operation in [
+            write::SavepointOperation::Savepoint,
+            write::SavepointOperation::Release,
+            write::SavepointOperation::RollbackTo,
+        ] {
+            let fixture = Fixture::new();
+            let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+            coordinator.begin().unwrap();
+            coordinator
+                .execute_dml(
+                    "INSERT INTO events VALUES
+                     (?1, 2, 'must-roll-back', 2.0, x'02', NULL, 'beta')",
+                    [fixture.keys[0]],
+                )
+                .unwrap();
+            if operation != write::SavepointOperation::Savepoint {
+                coordinator.savepoint("guard").unwrap();
+            }
+
+            coordinator.fail_next_savepoint_operation_for_test(operation);
+            let error = match operation {
+                write::SavepointOperation::Savepoint => coordinator.savepoint("guard"),
+                write::SavepointOperation::Release => coordinator.release("guard"),
+                write::SavepointOperation::RollbackTo => coordinator.rollback_to("guard"),
+            }
+            .unwrap_err();
+
+            assert_eq!(error.kind(), EngineErrorKind::StorageUnavailable);
+            assert!(!coordinator.in_transaction(), "operation={operation:?}");
+            assert!(
+                !coordinator.write_state_for_test().has_active_child(),
+                "operation={operation:?}"
+            );
+            assert_eq!(fixture.physical_row_count(), 2, "operation={operation:?}");
+
+            // A proven rollback restores the wrapper to an idle, reusable
+            // state; only an unprovable rollback marks it broken.
+            coordinator
+                .execute_dml(
+                    "INSERT INTO events VALUES
+                     (?1, 2, 'recovered', 2.0, x'02', NULL, 'beta')",
+                    [fixture.keys[0]],
+                )
+                .unwrap();
+            assert_eq!(fixture.physical_row_count(), 3, "operation={operation:?}");
+        }
+    }
+
+    #[test]
+    fn writable_savepoint_corruption_marks_storage_degraded_and_rolls_back() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        coordinator.begin().unwrap();
+        coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES
+                 (?1, 2, 'must-roll-back', 2.0, x'02', NULL, 'beta')",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        coordinator.savepoint("guard").unwrap();
+        coordinator.fail_next_savepoint_corruption_for_test(write::SavepointOperation::Release);
+
+        let error = coordinator.release("guard").unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert!(!coordinator.in_transaction());
+        assert_eq!(
+            fixture.storage.schema_gate_snapshot().state,
+            crate::storage::SchemaGateState::Degraded
+        );
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 0);
+        assert_eq!(
+            Connection::open(fixture.temp.path().join("shards/0000.sqlite"))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn writable_cross_shard_attempts_roll_back_without_partial_effects() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let error = coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES
+                 (?1, 2, 'first', 1.0, x'01', NULL, 'one'),
+                 (?2, 2, 'second', 2.0, x'02', NULL, 'two')",
+                params![fixture.keys[0], fixture.keys[1]],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+        assert_eq!(fixture.physical_row_count(), 2);
+
+        let moved = coordinator
+            .execute_dml(
+                "UPDATE OR IGNORE events SET tenant_id = ?2
+                 WHERE tenant_id = ?1 AND event_id = 1",
+                params![fixture.keys[0], fixture.keys[1]],
+            )
+            .unwrap_err();
+        assert_eq!(moved.kind(), EngineErrorKind::InvalidQuery);
+        assert_eq!(fixture.physical_row_count(), 2);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT tenant_id FROM events WHERE event_id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            fixture.keys[0]
+        );
+
+        coordinator.begin().unwrap();
+        coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES (?1, 2, 'first', 1.0, x'01', NULL, 'one')",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        let error = coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES (?1, 2, 'second', 2.0, x'02', NULL, 'two')",
+                [fixture.keys[1]],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+        assert!(!coordinator.in_transaction());
+        assert_eq!(fixture.physical_row_count(), 2);
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn writable_physical_checks_nullability_and_local_foreign_keys_are_authoritative() {
+        let fixture = WritableFixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let inserted = coordinator
+            .execute_dml(
+                "INSERT INTO items VALUES (?1, 1, 1, 'first-code', 5)",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        assert_eq!(inserted.affected_rows, 1);
+        assert_eq!(inserted.explicit_key, Some(Value::Int64(fixture.keys[0])));
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT code FROM items WHERE tenant_id = ?1 AND item_id = 1",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "first-code"
+        );
+
+        let check = coordinator
+            .execute_dml(
+                "INSERT INTO items VALUES (?1, 2, 1, 'bad-check', 0)",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(check.kind(), EngineErrorKind::CheckViolation);
+
+        let not_null = coordinator
+            .execute_dml(
+                "INSERT INTO items VALUES (?1, 2, 1, NULL, 1)",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(not_null.kind(), EngineErrorKind::NotNullViolation);
+
+        let foreign_key = coordinator
+            .execute_dml(
+                "INSERT INTO items VALUES (?1, 2, 999, 'bad-parent', 1)",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(foreign_key.kind(), EngineErrorKind::ForeignKeyViolation);
+        assert_eq!(fixture.item_count(), 1);
+    }
+
+    #[test]
+    fn writable_two_tables_share_one_pinned_child_and_read_uncommitted_writes() {
+        let fixture = WritableFixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        coordinator.begin().unwrap();
+        coordinator
+            .execute_dml(
+                "INSERT INTO parents VALUES (?1, 2, 'new-parent')",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        coordinator
+            .execute_dml(
+                "INSERT INTO items VALUES (?1, 10, 2, 'new-item', 1)",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        coordinator
+            .execute_dml(
+                "UPDATE items SET quantity = 7
+                 WHERE tenant_id = ?1 AND item_id = 10",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        coordinator.commit().unwrap();
+
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT quantity FROM items WHERE tenant_id = ?1 AND item_id = 10",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn writable_conflict_modes_preserve_sqlite_statement_semantics() {
+        for (mode, expected_count) in [("ABORT", 1), ("FAIL", 2), ("IGNORE", 2)] {
+            let fixture = WritableFixture::new();
+            let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+            coordinator
+                .execute_dml(
+                    "INSERT INTO items VALUES (?1, 1, 1, 'duplicate', 1)",
+                    [fixture.keys[0]],
+                )
+                .unwrap();
+            let sql = format!(
+                "INSERT OR {mode} INTO items VALUES
+                 (?1, 2, 1, 'first-in-statement', 1),
+                 (?1, 3, 1, 'duplicate', 1)"
+            );
+            let result = coordinator.execute_dml(&sql, [fixture.keys[0]]);
+            if mode == "IGNORE" {
+                assert_eq!(result.unwrap().affected_rows, 1);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), EngineErrorKind::UniqueViolation);
+            }
+            assert_eq!(fixture.item_count(), expected_count, "mode={mode}");
+        }
+
+        let fixture = WritableFixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        coordinator
+            .execute_dml(
+                "INSERT INTO items VALUES (?1, 1, 1, 'duplicate', 1)",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .execute_dml(
+                    "INSERT OR REPLACE INTO items VALUES (?1, 2, 1, 'duplicate', 9)",
+                    [fixture.keys[0]],
+                )
+                .unwrap()
+                .affected_rows,
+            1
+        );
+        assert_eq!(fixture.item_count(), 1);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT item_id FROM items WHERE tenant_id = ?1 AND code = 'duplicate'",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+
+        let fixture = WritableFixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        coordinator
+            .execute_dml(
+                "INSERT INTO items VALUES (?1, 1, 1, 'duplicate', 1)",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        coordinator.begin().unwrap();
+        coordinator
+            .execute_dml(
+                "INSERT INTO items VALUES (?1, 2, 1, 'before-rollback', 1)",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        let error = coordinator
+            .execute_dml(
+                "INSERT OR ROLLBACK INTO items VALUES (?1, 3, 1, 'duplicate', 1)",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::UniqueViolation);
+        assert!(!coordinator.in_transaction());
+        assert_eq!(fixture.item_count(), 1);
+    }
+
+    #[test]
+    fn writable_child_sql_overrides_physical_schema_conflict_policies() {
+        let fixture = WritableFixture::new();
+        let operation = fixture.storage.enter_schema_operation().unwrap();
+        let registry =
+            Registry::build_writable(fixture.storage.clone(), CursorLimits::default()).unwrap();
+        drop(operation);
+        let spec = registry
+            .tables
+            .values()
+            .find(|spec| spec.name == "items")
+            .unwrap();
+
+        let physical = Connection::open_in_memory().unwrap();
+        physical
+            .execute_batch(
+                "CREATE TABLE items (
+                     tenant_id INTEGER NOT NULL,
+                     item_id INTEGER NOT NULL,
+                     parent_id INTEGER NOT NULL,
+                     code TEXT NOT NULL,
+                     quantity INTEGER NOT NULL,
+                     PRIMARY KEY (tenant_id, item_id),
+                     UNIQUE (tenant_id, code) ON CONFLICT IGNORE
+                 );
+                 INSERT INTO items VALUES (1, 1, 1, 'first', 1);",
+            )
+            .unwrap();
+
+        let insert_abort = spec.insert_sql(ConflictMode::Abort).unwrap();
+        assert!(insert_abort.starts_with("INSERT OR ABORT INTO"));
+        assert_eq!(
+            physical
+                .execute(&insert_abort, params![1, 2, 1, "first", 1])
+                .unwrap_err()
+                .sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        let insert_ignore = spec.insert_sql(ConflictMode::Ignore).unwrap();
+        assert_eq!(insert_ignore, insert_abort);
+        assert_eq!(
+            physical
+                .execute(&insert_ignore, params![1, 2, 1, "first", 1])
+                .unwrap_err()
+                .sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        assert_eq!(
+            physical
+                .execute(
+                    &spec.insert_sql(ConflictMode::Replace).unwrap(),
+                    params![1, 2, 1, "first", 1],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            physical
+                .query_row("SELECT item_id FROM items", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+
+        physical
+            .execute_batch(
+                "DELETE FROM items;
+                 INSERT INTO items VALUES (1, 1, 1, 'first', 1);
+                 INSERT INTO items VALUES (1, 2, 1, 'second', 1);",
+            )
+            .unwrap();
+        let second_rowid = physical
+            .query_row(
+                "SELECT rowid FROM items WHERE tenant_id = 1 AND item_id = 2",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let update_values = [
+            ValueRef::Integer(1),
+            ValueRef::Integer(2),
+            ValueRef::Integer(1),
+            ValueRef::Text(b"first"),
+            ValueRef::Integer(1),
+        ];
+        let no_change = [true, true, true, false, true];
+        let (update_abort, mut update_parameters) = spec
+            .update_sql_and_values(&update_values, &no_change, ConflictMode::Abort)
+            .unwrap();
+        assert!(update_abort.starts_with("UPDATE OR ABORT"));
+        update_parameters.push(RawCell::Integer(second_rowid));
+        assert_eq!(
+            physical
+                .execute(
+                    &update_abort,
+                    rusqlite::params_from_iter(&update_parameters),
+                )
+                .unwrap_err()
+                .sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+
+        let (update_replace, mut replace_parameters) = spec
+            .update_sql_and_values(&update_values, &no_change, ConflictMode::Replace)
+            .unwrap();
+        assert!(update_replace.starts_with("UPDATE OR REPLACE"));
+        replace_parameters.push(RawCell::Integer(second_rowid));
+        assert_eq!(
+            physical
+                .execute(
+                    &update_replace,
+                    rusqlite::params_from_iter(&replace_parameters),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            physical
+                .query_row("SELECT item_id FROM items", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn writable_surface_rejects_global_multishard_ddl_returning_and_locator_mutation() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        let global = coordinator
+            .execute_dml("INSERT INTO countries VALUES ('CA', 'Canada')", [])
+            .unwrap_err();
+        assert_eq!(global.kind(), EngineErrorKind::InvalidQuery);
+        for shard in 0..2 {
+            assert_eq!(
+                fixture
+                    .storage
+                    .open_shard(shard)
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM countries", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                1
+            );
+        }
+
+        let scan = coordinator
+            .execute_dml("UPDATE events SET payload = 'unsafe-scan'", [])
+            .unwrap_err();
+        assert_eq!(scan.kind(), EngineErrorKind::InvalidQuery);
+        assert_eq!(fixture.physical_row_count(), 2);
+
+        let returning = coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES
+                 (?1, 2, 'returning', 1.0, x'01', NULL, 'one')
+                 RETURNING event_id",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(returning.kind(), EngineErrorKind::Unsupported);
+        assert_eq!(fixture.physical_row_count(), 2);
+
+        for sql in [
+            "DROP TABLE events",
+            "ATTACH DATABASE ':memory:' AS escaped",
+            "BEGIN",
+        ] {
+            assert_eq!(
+                coordinator.execute_dml(sql, []).unwrap_err().kind(),
+                EngineErrorKind::PermissionDenied,
+                "sql={sql}"
+            );
+        }
+
+        let locator = coordinator
+            .execute_dml(
+                "INSERT INTO events
+                 (tenant_id, event_id, payload, amount, raw, optional, category,
+                  __briskdb_locator)
+                 VALUES (?1, 2, 'locator', 1.0, x'01', NULL, 'one', x'00')",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(locator.kind(), EngineErrorKind::ReadOnly);
+        assert_eq!(fixture.physical_row_count(), 2);
+
+        let null_locator = coordinator
+            .execute_dml(
+                "UPDATE events
+                 SET payload = 'must-not-land', __briskdb_locator = NULL
+                 WHERE tenant_id = ?1 AND event_id = 1",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(null_locator.kind(), EngineErrorKind::ReadOnly);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM events WHERE tenant_id = ?1 AND event_id = 1",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "zero"
+        );
+
+        // Rejections that did not poison a physical transaction leave the
+        // wrapper reusable.
+        assert_eq!(
+            coordinator
+                .execute_dml(
+                    "INSERT INTO events VALUES
+                     (?1, 2, 'after-errors', 1.0, x'01', NULL, 'one')",
+                    [fixture.keys[0]],
+                )
+                .unwrap()
+                .affected_rows,
+            1
+        );
+    }
+
+    #[test]
+    fn writable_update_conflict_ignore_and_replace_are_delegated_physically() {
+        let fixture = WritableFixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        for (item_id, code) in [(1, "first"), (2, "second")] {
+            coordinator
+                .execute_dml(
+                    "INSERT INTO items VALUES (?1, ?2, 1, ?3, 1)",
+                    params![fixture.keys[0], item_id, code],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            coordinator
+                .execute_dml(
+                    "UPDATE OR IGNORE items SET code = 'first'
+                     WHERE tenant_id = ?1 AND item_id = 2",
+                    [fixture.keys[0]],
+                )
+                .unwrap()
+                .affected_rows,
+            0
+        );
+        assert_eq!(fixture.item_count(), 2);
+
+        assert_eq!(
+            coordinator
+                .execute_dml(
+                    "UPDATE OR REPLACE items SET code = 'first'
+                     WHERE tenant_id = ?1 AND item_id = 2",
+                    [fixture.keys[0]],
+                )
+                .unwrap()
+                .affected_rows,
+            1
+        );
+        assert_eq!(fixture.item_count(), 1);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT item_id FROM items WHERE tenant_id = ?1 AND code = 'first'",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn writable_multirow_replace_skips_a_later_invalidated_locator_and_counts_physical_updates() {
+        let fixture = WritableFixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        for (item_id, code) in [(1, "first"), (2, "second")] {
+            coordinator
+                .execute_dml(
+                    "INSERT INTO items VALUES (?1, ?2, 1, ?3, 1)",
+                    params![fixture.keys[0], item_id, code],
+                )
+                .unwrap();
+        }
+
+        // Whichever materialized row SQLite updates first takes the other
+        // row's unique code, so OR REPLACE removes the still-pending row.
+        // Native SQLite then treats that later stale row identity as a no-op.
+        let updated = coordinator
+            .execute_dml(
+                "UPDATE OR REPLACE items
+                 SET code = CASE item_id
+                     WHEN 1 THEN 'second'
+                     ELSE 'first'
+                 END
+                 WHERE tenant_id = ?1 AND item_id IN (1, 2)",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+
+        assert_eq!(updated.affected_rows, 1);
+        assert_eq!(fixture.item_count(), 1);
+    }
+
+    #[test]
+    fn writable_fk_cascade_skips_later_invalidated_locator_and_counts_direct_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(temp.path(), 2).unwrap();
+        let mut migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        storage
+            .apply_schema_migration(
+                "CREATE TABLE cascade_nodes (
+                     tenant_id INTEGER NOT NULL,
+                     node_id INTEGER NOT NULL,
+                     parent_id INTEGER,
+                     PRIMARY KEY (tenant_id, node_id),
+                     FOREIGN KEY (tenant_id, parent_id)
+                         REFERENCES cascade_nodes (tenant_id, node_id)
+                         ON DELETE CASCADE
+                 );",
+                &mut migration,
+                None,
+            )
+            .unwrap();
+        migration.publish_ready().unwrap();
+        let database_id = storage.logical_catalog().default_database().id();
+        storage
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    database_id,
+                    "cascade_nodes",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let key = (1_i64..)
+            .find(|key| storage.shard_for_key(key.to_string().as_bytes()) == 0)
+            .unwrap();
+        let shard = storage.open_shard(0).unwrap();
+        shard
+            .execute("INSERT INTO cascade_nodes VALUES (?1, 1, NULL)", [key])
+            .unwrap();
+        shard
+            .execute("INSERT INTO cascade_nodes VALUES (?1, 2, 1)", [key])
+            .unwrap();
+        shard
+            .execute(
+                "UPDATE cascade_nodes SET parent_id = 2
+                 WHERE tenant_id = ?1 AND node_id = 1",
+                [key],
+            )
+            .unwrap();
+        drop(shard);
+
+        let mut coordinator = WriteCoordinator::open(storage.clone()).unwrap();
+        let deleted = coordinator
+            .execute_dml("DELETE FROM cascade_nodes WHERE tenant_id = ?1", [key])
+            .unwrap();
+
+        // The first direct delete cascades to the second materialized row.
+        // Like sqlite3_changes(), affected_rows excludes the FK side effect.
+        assert_eq!(deleted.affected_rows, 1);
+        assert_eq!(
+            storage
+                .open_shard(0)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM cascade_nodes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn writable_affected_rows_are_per_statement_for_bulk_single_shard_dml() {
+        let fixture = WritableFixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let inserted = coordinator
+            .execute_dml(
+                "INSERT INTO items VALUES
+                 (?1, 1, 1, 'one', 1),
+                 (?1, 2, 1, 'two', 2),
+                 (?1, 3, 1, 'three', 3)",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        assert_eq!(inserted.affected_rows, 3);
+        assert_eq!(inserted.explicit_key, Some(Value::Int64(fixture.keys[0])));
+        assert_eq!(
+            coordinator
+                .execute_dml(
+                    "UPDATE items SET quantity = quantity + 10 WHERE tenant_id = ?1",
+                    [fixture.keys[0]],
+                )
+                .unwrap()
+                .affected_rows,
+            3
+        );
+        assert_eq!(
+            coordinator
+                .execute_dml("DELETE FROM items WHERE tenant_id = ?1", [fixture.keys[0]])
+                .unwrap()
+                .affected_rows,
+            3
+        );
+        assert_eq!(fixture.item_count(), 0);
+    }
+
+    #[test]
+    fn writable_locators_cover_without_rowid_text_blob_and_explicit_native_ids() {
+        let fixture = TypedRoutingFixture::new(2);
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+        assert_eq!(
+            coordinator
+                .execute_dml(
+                    "UPDATE text_events SET payload = 'text-updated' WHERE id = ?1",
+                    [&fixture.text_keys[0]],
+                )
+                .unwrap()
+                .affected_rows,
+            1
+        );
+        assert_eq!(
+            coordinator
+                .execute_dml(
+                    "DELETE FROM blob_events WHERE id = ?1",
+                    [&fixture.blob_keys[1]]
+                )
+                .unwrap()
+                .affected_rows,
+            1
+        );
+        let decoded = NativeRangeV1Id::decode(fixture.native_ids[0]).unwrap();
+        let second_native = NativeRangeV1Id::new(decoded.owner(), 2).unwrap().encode();
+        let inserted = coordinator
+            .execute_dml(
+                "INSERT INTO native_events VALUES (?1, 'native-explicit')",
+                [second_native],
+            )
+            .unwrap();
+        assert_eq!(inserted.explicit_key, Some(Value::Int64(second_native)));
+
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM text_events WHERE id = ?1",
+                    [&fixture.text_keys[0]],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "text-updated"
+        );
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(1)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM blob_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM native_events WHERE id = ?1",
+                    [second_native],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "native-explicit"
+        );
+    }
+
+    #[test]
+    fn writable_distinct_shards_progress_while_same_shard_writer_is_locked() {
+        let fixture = Fixture::new();
+        let blocker = fixture.storage.open_shard(0).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        for shard in 0..2_u16 {
+            let storage = fixture.storage.clone();
+            let key = fixture.keys[usize::from(shard)];
+            let completed = completed_tx.clone();
+            workers.push(thread::spawn(move || {
+                let mut coordinator = WriteCoordinator::open(storage).unwrap();
+                let result = coordinator.execute_dml(
+                    "INSERT INTO events VALUES
+                     (?1, 2, 'concurrent', 1.0, x'01', NULL, 'one')",
+                    [key],
+                );
+                completed.send((shard, result)).unwrap();
+            }));
+        }
+        drop(completed_tx);
+
+        let (first_shard, first_result) = completed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the unlocked shard writer did not complete independently");
+        assert_eq!(first_shard, 1);
+        assert_eq!(first_result.unwrap().affected_rows, 1);
+
+        blocker.execute_batch("COMMIT").unwrap();
+        let (second_shard, second_result) = completed_rx
+            .recv_timeout(TEST_SYNC_TIMEOUT)
+            .expect("the blocked same-shard writer did not resume");
+        assert_eq!(second_shard, 0);
+        assert_eq!(second_result.unwrap().affected_rows, 1);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(fixture.physical_row_count(), 4);
+    }
+
+    #[test]
+    fn writable_cancellation_interrupts_lock_wait_rolls_back_and_allows_reuse() {
+        let fixture = Fixture::new();
+        let blocker = fixture.storage.open_shard(0).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let cancellation = coordinator.cancellation_handle();
+        let write_state = coordinator.write_state_for_test();
+        let key = fixture.keys[0];
+        let worker = thread::spawn(move || {
+            let mut coordinator = coordinator;
+            let result = coordinator.execute_dml(
+                "INSERT INTO events VALUES
+                 (?1, 2, 'cancelled', 1.0, x'01', NULL, 'one')",
+                [key],
+            );
+            (coordinator, result)
+        });
+
+        let deadline = Instant::now() + TEST_SYNC_TIMEOUT;
+        while !write_state.has_active_child() {
+            assert!(
+                Instant::now() < deadline,
+                "writable child did not reach its cancellable lock wait"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        cancellation.cancel();
+        let (mut coordinator, result) = worker.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), EngineErrorKind::Cancelled);
+        assert_eq!(fixture.physical_row_count(), 2);
+
+        blocker.execute_batch("COMMIT").unwrap();
+        assert_eq!(
+            coordinator
+                .execute_dml(
+                    "INSERT INTO events VALUES
+                     (?1, 2, 'after-cancel', 1.0, x'01', NULL, 'one')",
+                    [fixture.keys[0]],
+                )
+                .unwrap()
+                .affected_rows,
+            1
+        );
+        assert_eq!(fixture.physical_row_count(), 3);
+    }
+
+    #[test]
+    fn writable_cancellation_after_statement_arm_cannot_be_lost_before_first_callback() {
+        let fixture = Fixture::new();
+        let coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let cancellation = coordinator.cancellation_handle();
+        let mut gate = coordinator.install_statement_arm_gate_for_test();
+        let key = fixture.keys[0];
+        let worker = thread::spawn(move || {
+            let mut coordinator = coordinator;
+            let result = coordinator.execute_dml(
+                "INSERT INTO events VALUES
+                 (?1, 2, 'cancelled-before-callback', 1.0, x'01', NULL, 'one')",
+                [key],
+            );
+            (coordinator, result)
+        });
+
+        gate.wait_until_started();
+        cancellation.cancel();
+        gate.release();
+
+        let (mut coordinator, result) = worker.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), EngineErrorKind::Cancelled);
+        assert_eq!(fixture.physical_row_count(), 2);
+
+        assert_eq!(
+            coordinator
+                .execute_dml(
+                    "INSERT INTO events VALUES
+                     (?1, 2, 'after-cancel', 1.0, x'01', NULL, 'one')",
+                    [fixture.keys[0]],
+                )
+                .unwrap()
+                .affected_rows,
+            1
+        );
+        assert_eq!(fixture.physical_row_count(), 3);
+    }
+
+    #[test]
+    fn writable_drop_rolls_back_connection_loss_and_commits_survive_reopen() {
+        let fixture = Fixture::new();
+        {
+            let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+            coordinator.begin().unwrap();
+            coordinator
+                .execute_dml(
+                    "INSERT INTO events VALUES
+                     (?1, 2, 'lost-connection', 1.0, x'01', NULL, 'one')",
+                    [fixture.keys[0]],
+                )
+                .unwrap();
+            // Dropping the only wrapper is the supported connection-loss path.
+        }
+        assert_eq!(fixture.physical_row_count(), 2);
+
+        {
+            let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+            coordinator
+                .execute_dml(
+                    "INSERT INTO events VALUES
+                     (?1, 2, 'durable', 1.0, x'01', NULL, 'one')",
+                    [fixture.keys[0]],
+                )
+                .unwrap();
+        }
+        let reopened = Storage::open(fixture.temp.path(), 2).unwrap();
+        assert_eq!(
+            reopened
+                .open_shard(0)
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM events WHERE tenant_id = ?1 AND event_id = 2",
+                    [fixture.keys[0]],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "durable"
+        );
+    }
+
+    #[test]
+    fn writable_child_commit_failure_is_surfaced_before_acknowledgement_and_recovers_on_reopen() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        coordinator.fail_next_commit_for_test();
+        let error = coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES
+                 (?1, 2, 'must-not-commit', 1.0, x'01', NULL, 'one')",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::StorageUnavailable);
+        assert_eq!(fixture.physical_row_count(), 2);
+        assert_eq!(
+            coordinator
+                .execute_dml(
+                    "INSERT INTO events VALUES
+                     (?1, 2, 'not-reusable', 1.0, x'01', NULL, 'one')",
+                    [fixture.keys[0]],
+                )
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        drop(coordinator);
+
+        let mut reopened = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .execute_dml(
+                    "INSERT INTO events VALUES
+                     (?1, 2, 'recovered', 1.0, x'01', NULL, 'one')",
+                    [fixture.keys[0]],
+                )
+                .unwrap()
+                .affected_rows,
+            1
+        );
+        assert_eq!(fixture.physical_row_count(), 3);
+    }
+
+    #[test]
+    fn writable_child_operation_corruption_marks_storage_degraded() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        coordinator.begin().unwrap();
+        coordinator.fail_next_write_corruption_for_test();
+        let error = coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES
+                 (?1, 2, 'must-not-land', 1.0, x'01', NULL, 'one')",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert!(!coordinator.in_transaction());
+        assert_eq!(
+            fixture.storage.schema_gate_snapshot().state,
+            crate::storage::SchemaGateState::Degraded
+        );
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 0);
+        assert_eq!(
+            Connection::open(fixture.temp.path().join("shards/0000.sqlite"))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn writable_child_commit_corruption_marks_storage_degraded_before_acknowledgement() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        coordinator.fail_next_commit_corruption_for_test();
+        let error = coordinator
+            .execute_dml(
+                "INSERT INTO events VALUES
+                 (?1, 2, 'must-roll-back', 1.0, x'01', NULL, 'one')",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            fixture.storage.schema_gate_snapshot().state,
+            crate::storage::SchemaGateState::Degraded
+        );
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 0);
+        assert_eq!(
+            Connection::open(fixture.temp.path().join("shards/0000.sqlite"))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn writable_local_foreign_key_does_not_accept_a_parent_on_the_wrong_shard() {
+        let fixture = WritableFixture::new();
+        fixture
+            .storage
+            .open_shard(0)
+            .unwrap()
+            .execute(
+                "DELETE FROM parents WHERE tenant_id = ?1",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+        fixture
+            .storage
+            .open_shard(1)
+            .unwrap()
+            .execute(
+                "INSERT INTO parents VALUES (?1, 1, 'wrong-owner')",
+                [fixture.keys[0]],
+            )
+            .unwrap();
+
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let error = coordinator
+            .execute_dml(
+                "INSERT INTO items VALUES (?1, 1, 1, 'must-fail', 1)",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::ForeignKeyViolation);
+        assert_eq!(fixture.item_count(), 0);
+    }
+
+    #[test]
+    fn writable_defaults_and_generated_columns_fail_closed_until_their_issues_land() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(temp.path(), 2).unwrap();
+        let mut migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        storage
+            .apply_schema_migration(
+                "CREATE TABLE default_events (
+                     id INTEGER PRIMARY KEY,
+                     payload TEXT NOT NULL DEFAULT 'defaulted'
+                 );
+                 CREATE TABLE generated_events (
+                     id INTEGER PRIMARY KEY,
+                     base INTEGER NOT NULL,
+                     doubled INTEGER GENERATED ALWAYS AS (base * 2) STORED
+                 );",
+                &mut migration,
+                None,
+            )
+            .unwrap();
+        migration.publish_ready().unwrap();
+        let database_id = storage.logical_catalog().default_database().id();
+        storage
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    database_id,
+                    "default_events",
+                    ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+                TableDeclaration::sharded(
+                    database_id,
+                    "generated_events",
+                    ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let key = (1_i64..)
+            .find(|key| storage.shard_for_key(key.to_string().as_bytes()) == 0)
+            .unwrap();
+        let mut coordinator = WriteCoordinator::open(storage.clone()).unwrap();
+
+        for (sql, parameters) in [
+            (
+                "INSERT INTO default_events (id, payload) VALUES (?1, 'explicit')",
+                [key],
+            ),
+            (
+                "INSERT INTO generated_events (id, base) VALUES (?1, 3)",
+                [key],
+            ),
+        ] {
+            assert_eq!(
+                coordinator.execute_dml(sql, parameters).unwrap_err().kind(),
+                EngineErrorKind::InvalidQuery,
+                "sql={sql}"
+            );
+        }
+        for table in ["default_events", "generated_events"] {
+            assert_eq!(
+                storage
+                    .open_shard(0)
+                    .unwrap()
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn writable_stale_coordinator_fails_before_opening_or_mutating_a_child() {
+        let fixture = Fixture::new();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let mut migration = fixture.storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        fixture
+            .storage
+            .apply_schema_migration(
+                "ALTER TABLE events ADD COLUMN note TEXT",
+                &mut migration,
+                None,
+            )
+            .unwrap();
+        migration.publish_ready().unwrap();
+
+        let error = coordinator
+            .execute_dml(
+                "INSERT INTO events
+                 (tenant_id, event_id, payload, amount, raw, optional, category)
+                 VALUES (?1, 2, 'stale', 1.0, x'01', NULL, 'one')",
+                [fixture.keys[0]],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+        assert_eq!(fixture.physical_row_count(), 2);
+        assert_eq!(fixture.storage.schema_gate_snapshot().active_operations, 0);
     }
 }

@@ -19,6 +19,27 @@ The read contract is:
   replicated physically; and
 - `Catalog` placement is never declared in the coordinator schema.
 
+Issue #127 adds a separate internal writable coordinator. Its explicit-key
+contract is deliberately narrower:
+
+- `INSERT` routes from an exact catalog shard-key value and returns both the
+  SQLite affected-row count and the caller's explicit key to BriskDB;
+- `UPDATE` and `DELETE` require an exact shard-key equality, read the selected
+  row through the pinned writable child transaction, and identify it with a
+  hidden, versioned, table-bound locator containing the shard and physical
+  rowid or complete `WITHOUT ROWID` primary key;
+- the first read or write pins the transaction to one validated physical shard,
+  and any attempt to enlist a second shard or move a shard key aborts the whole
+  logical transaction without a partial durable effect; and
+- explicit transactions, nested savepoints, rollback, SQLite conflict modes,
+  cancellation, connection loss, and child commit failures are reconciled by a
+  wrapper that never exposes the raw writable coordinator connection.
+
+Cancellation and child commit have one explicit durability boundary. If
+cancellation wins before physical `COMMIT`, the child rolls back; once physical
+`COMMIT` begins, it wins and is allowed to finish so BriskDB never reports a
+cancelled result for a write that may already be durable.
+
 For a usable equality constraint on the exact declared shard-key column,
 `xBestIndex` requests one argument but deliberately does not set `omit`.
 `xFilter` prunes to one physical child only when the bound SQLite storage class
@@ -96,6 +117,26 @@ including attempts to turn `query_only` back off. The Cargo feature adds only
 rusqlite's virtual-table bindings; it does not add loader bindings or enable the
 bundled SQLite library's disabled-by-default extension-loading capability.
 
+The writable coordinator instead registers a stock-SQLite version-2 module.
+rusqlite supplies the normal `xUpdate` and transaction callbacks; a small
+in-tree bridge fills SQLite's public `xSavepoint`, `xRelease`, and
+`xRollbackTo` slots. This is an API adapter, not an SQLite patch or fork. The
+writable coordinator enables virtual-table constraint support, leaves
+`query_only` off only on itself, and opens exactly one validated writable child
+with `BEGIN IMMEDIATE`, `synchronous=FULL`, WAL, and `foreign_keys=ON` verified.
+Its fail-closed authorizer permits top-level DML only against registered virtual
+tables. DDL, `ATTACH`, `DETACH`, caller transaction SQL, unsafe PRAGMAs,
+indirect trigger/view execution, and extension loading remain denied.
+
+All physical SQLite constraints and indexes remain authoritative. Registration
+accepts a local foreign key only when placement proves co-location: a Sharded
+child may reference a co-sharded parent through corresponding shard keys in the
+same generated-ID routing domain or a Global parent, and a Global child may
+reference only a Global parent. Unsafe, missing, Catalog, cross-placement, or
+SQLite-unenforceable relationships fail closed. Physical
+`UNIQUE`, primary-key, `NOT NULL`, `CHECK`, strict typing, and admitted local
+foreign-key errors retain their SQLite result codes through the facade.
+
 ## Why the physical format stays ordinary SQLite
 
 All virtual objects live in the coordinator database. A physical shard still
@@ -117,14 +158,23 @@ This is why several alternatives are excluded:
 
 ## Current non-goals
 
-This boundary does not provide writes, generated-ID allocation, distributed
-transactions, aggregate/order/limit/join pushdown, parallel shard scans, or a
-public query API. It does not change protocol behavior. The current `Engine`,
-HTTP surface, and protocol planner remain authoritative. Advanced filter,
-aggregate, order, and limit pushdown remains owned by issues #58 through #61.
-Issues #127 through #131 separately cover explicit-key writes, native and
-optional hi/lo generated IDs, generated-key SQL integration, and the final
-rollout gate.
+The internal writable coordinator now provides explicit-key DML on one pinned
+Sharded child. It does not provide missing/generated keys, replicated Global
+writes, multi-shard transactions, `RETURNING`, physical defaults, generated
+columns, physical triggers, client-created virtual-table indexes or triggers,
+`ALTER TABLE`, aggregate/order/limit/join pushdown, parallel shard scans, or a
+public query API. The physical-default restriction is intentional: SQLite's
+`xUpdate` arguments do not distinguish an omitted column from explicit `NULL`.
+Generated keys and omitted-key SQL integration remain owned by issues #128
+through #130, and rollout remains owned by #131.
+
+This does not change protocol behavior. The current `Engine`, HTTP surface,
+query app, and protocol planner remain authoritative. The writable coordinator
+is kept behind `experimental-vtab` and cannot be reached through a raw
+connection. Additional indexes continue to live on the ordinary physical
+tables and are used by child SQLite statements; SQLite does not permit adding
+indexes or triggers directly to a virtual table. Schema changes remain the
+journaled migration system's responsibility.
 
 Only the exact typed shard-key equality described above narrows a scan. Other
 predicates, and a type-mismatched equality whose SQLite affinity semantics

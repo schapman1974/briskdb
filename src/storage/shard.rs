@@ -1,7 +1,7 @@
 //! Physical-shard identity, provisioning, and strict reopen validation.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -12,7 +12,10 @@ use rusqlite::{
 };
 
 use crate::{
-    core::{Catalog, EngineError, EngineErrorKind, EngineResult, ShardKeyType, TablePlacement},
+    core::{
+        Catalog, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy, ShardKeyType,
+        TableDeclaration, TablePlacement,
+    },
     sqlite_error,
 };
 
@@ -682,10 +685,10 @@ fn preflight_schema_migration_on_connection_with_digest_inner(
     let reserved_before = reserved_schema_snapshot(&transaction)?;
     execute_schema_migration_batch(&transaction, sql)?;
     ensure_reserved_schema_unchanged(&reserved_before, &transaction)?;
-    ensure_no_foreign_key_violations(&transaction)?;
     if let Some(catalog) = catalog {
         validate_registered_table_schema(&transaction, catalog)?;
     }
+    ensure_no_foreign_key_violations(&transaction)?;
     let target_digest = calculate_schema_digest(&transaction, target_generation)?;
     transaction.rollback().map_err(sqlite_error::storage)?;
 
@@ -811,7 +814,26 @@ pub(super) fn validate_registered_table_schema(
             continue;
         }
         let TablePlacement::Sharded(shard_key) = table.placement() else {
-            validate_authoritative_table_constraints(connection, table.name(), None)?;
+            validate_authoritative_table_constraints(
+                connection,
+                table.name(),
+                AuthoritativeTableConstraints::new(table.placement(), table.generated_id_policy()),
+                |parent| {
+                    catalog
+                        .tables()
+                        .iter()
+                        .find(|candidate| {
+                            candidate.database_id() == table.database_id()
+                                && candidate.name().eq_ignore_ascii_case(parent)
+                        })
+                        .map(|candidate| {
+                            AuthoritativeTableConstraints::new(
+                                candidate.placement(),
+                                candidate.generated_id_policy(),
+                            )
+                        })
+                },
+            )?;
             continue;
         };
         let mut statement = connection
@@ -875,39 +897,497 @@ pub(super) fn validate_registered_table_schema(
                 "must retain SQLite BINARY collation",
             ));
         }
-        validate_authoritative_table_constraints(connection, table.name(), Some(shard_key))?;
+        validate_authoritative_table_constraints(
+            connection,
+            table.name(),
+            AuthoritativeTableConstraints::new(table.placement(), table.generated_id_policy()),
+            |parent| {
+                catalog
+                    .tables()
+                    .iter()
+                    .find(|candidate| {
+                        candidate.database_id() == table.database_id()
+                            && candidate.name().eq_ignore_ascii_case(parent)
+                    })
+                    .map(|candidate| {
+                        AuthoritativeTableConstraints::new(
+                            candidate.placement(),
+                            candidate.generated_id_policy(),
+                        )
+                    })
+            },
+        )?;
     }
     Ok(())
 }
 
+/// Validate one registration candidate against the complete authoritative
+/// declaration set. Foreign-key safety depends on both sides' placements, so
+/// validating declarations independently would admit unresolved relationships.
+pub(super) fn validate_declared_table_constraints(
+    connection: &Connection,
+    declaration: &TableDeclaration,
+    declarations: &[TableDeclaration],
+) -> EngineResult<()> {
+    validate_authoritative_table_constraints(
+        connection,
+        declaration.name(),
+        AuthoritativeTableConstraints::new(
+            declaration.placement(),
+            declaration.generated_id_policy(),
+        ),
+        |parent| {
+            declarations
+                .iter()
+                .find(|candidate| {
+                    candidate.database_id() == declaration.database_id()
+                        && candidate.name().eq_ignore_ascii_case(parent)
+                })
+                .map(|candidate| {
+                    AuthoritativeTableConstraints::new(
+                        candidate.placement(),
+                        candidate.generated_id_policy(),
+                    )
+                })
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthoritativeTableConstraints<'a> {
+    placement: &'a TablePlacement,
+    generated_id_policy: &'a GeneratedIdPolicy,
+}
+
+impl<'a> AuthoritativeTableConstraints<'a> {
+    const fn new(
+        placement: &'a TablePlacement,
+        generated_id_policy: &'a GeneratedIdPolicy,
+    ) -> Self {
+        Self {
+            placement,
+            generated_id_policy,
+        }
+    }
+}
+
 /// Enforce constraints that SQLite can only check inside one physical file.
-/// Foreign keys need an explicit co-location policy that is not implemented
-/// yet. Every unique key of a Sharded table must contain its routing key using
+/// Every unique key of a Sharded table must contain its routing key using
 /// BINARY collation so two different owners cannot both accept the same value.
-pub(super) fn validate_authoritative_table_constraints(
+/// Foreign keys are accepted only when authoritative placements prove that the
+/// referenced parent row is present in the same physical file.
+fn validate_authoritative_table_constraints<'a, T>(
     connection: &Connection,
     table: &str,
-    shard_key: Option<&crate::core::ShardKeyMetadata>,
-) -> EngineResult<()> {
-    let has_foreign_key = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list(?1))",
-            [table],
-            |row| row.get::<_, bool>(0),
+    authoritative: AuthoritativeTableConstraints<'_>,
+    authoritative_table: T,
+) -> EngineResult<()>
+where
+    T: Fn(&str) -> Option<AuthoritativeTableConstraints<'a>>,
+{
+    require_foreign_keys_enabled(connection)?;
+    validate_authoritative_foreign_keys(connection, table, authoritative, authoritative_table)?;
+
+    let TablePlacement::Sharded(shard_key) = authoritative.placement else {
+        return Ok(());
+    };
+    validate_authoritative_unique_constraints(connection, table, shard_key)
+}
+
+fn require_foreign_keys_enabled(connection: &Connection) -> EngineResult<()> {
+    let enabled = connection
+        .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+        .map_err(sqlite_error::storage)?;
+    if enabled != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "SQLite foreign-key enforcement is not enabled on a validated shard connection",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ForeignKeyBuilder {
+    parent_table: String,
+    on_update: String,
+    on_delete: String,
+    match_name: String,
+    terms: Vec<ForeignKeyTerm>,
+}
+
+#[derive(Debug)]
+struct ForeignKeyTerm {
+    sequence: i64,
+    child_column: String,
+    parent_column: Option<String>,
+}
+
+fn validate_authoritative_foreign_keys<'a, T>(
+    connection: &Connection,
+    child_table: &str,
+    child: AuthoritativeTableConstraints<'_>,
+    authoritative_table: T,
+) -> EngineResult<()>
+where
+    T: Fn(&str) -> Option<AuthoritativeTableConstraints<'a>>,
+{
+    let mut statement = connection
+        .prepare(
+            "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete, \"match\"
+             FROM pragma_foreign_key_list(?1)
+             ORDER BY id, seq",
         )
         .map_err(sqlite_error::storage)?;
-    if has_foreign_key {
+    let rows = statement
+        .query_map([child_table], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(sqlite_error::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error::storage)?;
+
+    let mut foreign_keys = BTreeMap::<i64, ForeignKeyBuilder>::new();
+    for (
+        id,
+        sequence,
+        parent_table,
+        child_column,
+        parent_column,
+        on_update,
+        on_delete,
+        match_name,
+    ) in rows
+    {
+        let foreign_key = foreign_keys.entry(id).or_insert_with(|| ForeignKeyBuilder {
+            parent_table: parent_table.clone(),
+            on_update: on_update.clone(),
+            on_delete: on_delete.clone(),
+            match_name: match_name.clone(),
+            terms: Vec::new(),
+        });
+        if !foreign_key.parent_table.eq_ignore_ascii_case(&parent_table)
+            || !foreign_key.on_update.eq_ignore_ascii_case(&on_update)
+            || !foreign_key.on_delete.eq_ignore_ascii_case(&on_delete)
+            || !foreign_key.match_name.eq_ignore_ascii_case(&match_name)
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("foreign-key metadata for table {child_table} is inconsistent"),
+            ));
+        }
+        foreign_key.terms.push(ForeignKeyTerm {
+            sequence,
+            child_column,
+            parent_column,
+        });
+    }
+
+    let has_foreign_keys = !foreign_keys.is_empty();
+    for (id, mut foreign_key) in foreign_keys {
+        if !foreign_key.match_name.eq_ignore_ascii_case("NONE") {
+            return Err(foreign_key_precondition(
+                child_table,
+                id,
+                format!("uses unsupported MATCH mode {}", foreign_key.match_name),
+            ));
+        }
+        foreign_key.terms.sort_by_key(|term| term.sequence);
+        if foreign_key
+            .terms
+            .iter()
+            .enumerate()
+            .any(|(expected, term)| term.sequence != expected as i64)
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("foreign-key metadata for table {child_table} has invalid term order"),
+            ));
+        }
+
+        let Some(parent) = authoritative_table(&foreign_key.parent_table) else {
+            return Err(foreign_key_precondition(
+                child_table,
+                id,
+                format!(
+                    "references missing authoritative table {}",
+                    foreign_key.parent_table
+                ),
+            ));
+        };
+        if matches!(parent.placement, TablePlacement::Catalog) {
+            return Err(foreign_key_precondition(
+                child_table,
+                id,
+                format!("references catalog-only table {}", foreign_key.parent_table),
+            ));
+        }
+
+        resolve_implicit_parent_columns(
+            connection,
+            child_table,
+            &foreign_key.parent_table,
+            &mut foreign_key.terms,
+        )?;
+        validate_foreign_key_placement(child_table, id, child, parent, &foreign_key)?;
+    }
+    if has_foreign_keys {
+        validate_sqlite_foreign_key_schema(connection, child_table)?;
+    }
+    Ok(())
+}
+
+/// Ask SQLite to compile, but not execute, DML against a foreign-key child.
+/// SQLite resolves every referenced parent key while building this program, so
+/// malformed parent columns, missing UNIQUE keys, and incompatible parent-index
+/// collations fail here instead of surfacing later as generic `SQLITE_ERROR`.
+fn validate_sqlite_foreign_key_schema(
+    connection: &Connection,
+    child_table: &str,
+) -> EngineResult<()> {
+    let quoted_table = format!("\"{}\"", child_table.replace('"', "\"\""));
+    let sql = format!("EXPLAIN DELETE FROM {quoted_table} WHERE 0");
+    match connection.prepare(&sql) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let classified = sqlite_error::storage(error);
+            if matches!(
+                classified.kind(),
+                EngineErrorKind::Busy
+                    | EngineErrorKind::Cancelled
+                    | EngineErrorKind::PermissionDenied
+                    | EngineErrorKind::ReadOnly
+                    | EngineErrorKind::StorageFull
+                    | EngineErrorKind::OutOfMemory
+                    | EngineErrorKind::StorageUnavailable
+                    | EngineErrorKind::DataCorruption
+            ) {
+                return Err(classified.context(format!(
+                    "failed to validate foreign-key schema involving table {child_table}"
+                )));
+            }
+            Err(EngineError::from_source(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "foreign-key schema involving table {child_table} cannot be enforced by SQLite"
+                ),
+                classified,
+            ))
+        }
+    }
+}
+
+fn resolve_implicit_parent_columns(
+    connection: &Connection,
+    child_table: &str,
+    parent_table: &str,
+    terms: &mut [ForeignKeyTerm],
+) -> EngineResult<()> {
+    if terms.iter().all(|term| term.parent_column.is_some()) {
+        return Ok(());
+    }
+    if terms.iter().any(|term| term.parent_column.is_some()) {
         return Err(EngineError::new(
-            EngineErrorKind::FailedPrecondition,
+            EngineErrorKind::DataCorruption,
             format!(
-                "table {table} declares a foreign key, but authoritative foreign-key co-location is not supported"
+                "foreign key from {child_table} to {parent_table} mixes explicit and implicit parent columns"
             ),
         ));
     }
 
-    let Some(shard_key) = shard_key else {
-        return Ok(());
-    };
+    let mut statement = connection
+        .prepare("SELECT name FROM pragma_table_xinfo(?1) WHERE pk <> 0 ORDER BY pk")
+        .map_err(sqlite_error::storage)?;
+    let parent_key = statement
+        .query_map([parent_table], |row| row.get::<_, String>(0))
+        .map_err(sqlite_error::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error::storage)?;
+    if parent_key.is_empty() || parent_key.len() != terms.len() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "foreign key from {child_table} to {parent_table} omits referenced columns, but the parent has no matching resolvable primary key"
+            ),
+        ));
+    }
+    for (term, parent_column) in terms.iter_mut().zip(parent_key) {
+        term.parent_column = Some(parent_column);
+    }
+    Ok(())
+}
+
+fn validate_foreign_key_placement(
+    child_table: &str,
+    id: i64,
+    child: AuthoritativeTableConstraints<'_>,
+    parent: AuthoritativeTableConstraints<'_>,
+    foreign_key: &ForeignKeyBuilder,
+) -> EngineResult<()> {
+    #[allow(unreachable_patterns)]
+    match (child.placement, parent.placement) {
+        (TablePlacement::Sharded(child_key), TablePlacement::Sharded(parent_key)) => {
+            if child_key.key_type() != parent_key.key_type() {
+                return Err(foreign_key_precondition(
+                    child_table,
+                    id,
+                    "maps shard keys with different authoritative types",
+                ));
+            }
+            if !generated_id_routing_domains_match(
+                child.generated_id_policy,
+                parent.generated_id_policy,
+            ) {
+                return Err(foreign_key_precondition(
+                    child_table,
+                    id,
+                    "maps shard keys with different generated-ID routing domains",
+                ));
+            }
+            let mapped_terms = foreign_key
+                .terms
+                .iter()
+                .filter(|term| term.child_column.eq_ignore_ascii_case(child_key.column()))
+                .collect::<Vec<_>>();
+            let parent_key_terms = foreign_key
+                .terms
+                .iter()
+                .filter(|term| {
+                    term.parent_column
+                        .as_deref()
+                        .is_some_and(|column| column.eq_ignore_ascii_case(parent_key.column()))
+                })
+                .count();
+            if mapped_terms.len() != 1
+                || parent_key_terms != 1
+                || !mapped_terms[0]
+                    .parent_column
+                    .as_deref()
+                    .is_some_and(|column| column.eq_ignore_ascii_case(parent_key.column()))
+            {
+                return Err(foreign_key_precondition(
+                    child_table,
+                    id,
+                    format!(
+                        "does not map child shard key {} exactly once to parent shard key {}",
+                        child_key.column(),
+                        parent_key.column()
+                    ),
+                ));
+            }
+            validate_shard_key_foreign_key_actions(child_table, id, child_key.column(), foreign_key)
+        }
+        (TablePlacement::Sharded(child_key), TablePlacement::Global) => {
+            if foreign_key
+                .terms
+                .iter()
+                .any(|term| term.child_column.eq_ignore_ascii_case(child_key.column()))
+            {
+                validate_shard_key_foreign_key_actions(
+                    child_table,
+                    id,
+                    child_key.column(),
+                    foreign_key,
+                )?;
+            }
+            Ok(())
+        }
+        (TablePlacement::Global, TablePlacement::Global) => Ok(()),
+        (TablePlacement::Global, TablePlacement::Sharded(_)) => Err(foreign_key_precondition(
+            child_table,
+            id,
+            "a Global child cannot reference a Sharded parent",
+        )),
+        (TablePlacement::Catalog, _) => Err(foreign_key_precondition(
+            child_table,
+            id,
+            "a Catalog child cannot have a physical foreign key",
+        )),
+        (_, TablePlacement::Catalog) => Err(foreign_key_precondition(
+            child_table,
+            id,
+            "a physical child cannot reference a Catalog parent",
+        )),
+        (_, _) => Err(foreign_key_precondition(
+            child_table,
+            id,
+            "uses an unsupported authoritative placement relationship",
+        )),
+    }
+}
+
+fn generated_id_routing_domains_match(
+    child: &GeneratedIdPolicy,
+    parent: &GeneratedIdPolicy,
+) -> bool {
+    matches!(
+        (child, parent),
+        (GeneratedIdPolicy::None, GeneratedIdPolicy::None)
+            | (
+                GeneratedIdPolicy::NativeRangeV1 { .. },
+                GeneratedIdPolicy::NativeRangeV1 { .. }
+            )
+    )
+}
+
+fn validate_shard_key_foreign_key_actions(
+    child_table: &str,
+    id: i64,
+    shard_key: &str,
+    foreign_key: &ForeignKeyBuilder,
+) -> EngineResult<()> {
+    if !foreign_key.on_update.eq_ignore_ascii_case("NO ACTION")
+        && !foreign_key.on_update.eq_ignore_ascii_case("RESTRICT")
+    {
+        return Err(foreign_key_precondition(
+            child_table,
+            id,
+            format!(
+                "uses ON UPDATE {} on shard key {shard_key}",
+                foreign_key.on_update
+            ),
+        ));
+    }
+    if foreign_key.on_delete.eq_ignore_ascii_case("SET NULL")
+        || foreign_key.on_delete.eq_ignore_ascii_case("SET DEFAULT")
+    {
+        return Err(foreign_key_precondition(
+            child_table,
+            id,
+            format!(
+                "uses ON DELETE {} on shard key {shard_key}",
+                foreign_key.on_delete
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn foreign_key_precondition(
+    child_table: &str,
+    id: i64,
+    detail: impl std::fmt::Display,
+) -> EngineError {
+    EngineError::new(
+        EngineErrorKind::FailedPrecondition,
+        format!("foreign key {id} on table {child_table} {detail}"),
+    )
+}
+
+fn validate_authoritative_unique_constraints(
+    connection: &Connection,
+    table: &str,
+    shard_key: &crate::core::ShardKeyMetadata,
+) -> EngineResult<()> {
     let mut statement = connection
         .prepare(
             "SELECT name, origin
@@ -2488,7 +2968,10 @@ fn denies_schema_migration_action(context: AuthContext<'_>) -> bool {
         AuthAction::Pragma {
             pragma_name,
             pragma_value,
-        } => pragma_value.is_some() || matches_persistent_pragma(pragma_name),
+        } => {
+            (pragma_value.is_some() && !pragma_name.eq_ignore_ascii_case("quick_check"))
+                || matches_persistent_pragma(pragma_name)
+        }
         AuthAction::Insert { table_name } | AuthAction::Delete { table_name } => {
             is_reserved_name(table_name)
         }
@@ -3027,13 +3510,15 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE accounts (
-                     id INTEGER PRIMARY KEY,
+                "CREATE TABLE countries (
+                     code TEXT NOT NULL,
                      display_name TEXT NOT NULL
                  ) STRICT;
-                 CREATE TABLE countries (
-                     code TEXT PRIMARY KEY,
-                     display_name TEXT NOT NULL
+                 CREATE UNIQUE INDEX countries_code_unique ON countries(code);
+                 CREATE TABLE accounts (
+                     id INTEGER PRIMARY KEY,
+                     display_name TEXT NOT NULL,
+                     country_code TEXT REFERENCES countries(code)
                  ) STRICT;",
             )
             .unwrap();
@@ -3049,6 +3534,29 @@ mod tests {
         .unwrap();
         assert_eq!(state, SchemaMigrationShardState::Source);
         assert!(!schema_object_exists(&path, "accounts_display_name_idx"));
+
+        let (state, _) = preflight_with_catalog(
+            &path,
+            &ready,
+            "ALTER TABLE accounts ADD COLUMN billing_country TEXT REFERENCES countries(code)",
+            &catalog,
+        )
+        .unwrap();
+        assert_eq!(state, SchemaMigrationShardState::Source);
+        let connection = Connection::open(&path).unwrap();
+        assert!(
+            !connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM pragma_table_xinfo('accounts')
+                         WHERE name = 'billing_country'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        drop(connection);
 
         for (sql, transient_object) in [
             (
@@ -3106,6 +3614,7 @@ mod tests {
                 "CREATE UNIQUE INDEX accounts_display_unique ON accounts (display_name)",
                 Some("accounts_display_unique"),
             ),
+            ("DROP INDEX countries_code_unique", None),
             (
                 "CREATE TRIGGER accounts_move AFTER INSERT ON accounts
                  BEGIN DELETE FROM accounts WHERE id = NEW.id; END",
@@ -3129,6 +3638,7 @@ mod tests {
             }
             assert_eq!(identity(&path), (SHARD_APPLICATION_ID, 0), "{sql}");
         }
+        assert!(schema_object_exists(&path, "countries_code_unique"));
 
         let empty = empty_catalog();
         let (state, _) = preflight_with_catalog(
@@ -3140,6 +3650,100 @@ mod tests {
         .unwrap();
         assert_eq!(state, SchemaMigrationShardState::Source);
         assert!(!schema_object_exists(&path, "legacy_unregistered"));
+    }
+
+    #[test]
+    fn catalog_aware_schema_validation_accepts_only_colocated_foreign_keys() {
+        let catalog = catalog_with_registered_tables();
+        let safe = Connection::open_in_memory().unwrap();
+        safe.pragma_update(None, "foreign_keys", "ON").unwrap();
+        safe.execute_batch(
+            "CREATE TABLE countries (
+                 code TEXT PRIMARY KEY,
+                 display_name TEXT NOT NULL
+             ) STRICT;
+             CREATE TABLE accounts (
+                 id INTEGER PRIMARY KEY,
+                 display_name TEXT NOT NULL,
+                 country_code TEXT REFERENCES countries
+             ) STRICT;",
+        )
+        .unwrap();
+        validate_registered_table_schema(&safe, &catalog).unwrap();
+
+        let unsafe_catalog_parent = Connection::open_in_memory().unwrap();
+        unsafe_catalog_parent
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        unsafe_catalog_parent
+            .execute_batch(
+                "CREATE TABLE countries (
+                     code TEXT PRIMARY KEY,
+                     display_name TEXT NOT NULL
+                 ) STRICT;
+                 CREATE TABLE accounts (
+                     id INTEGER PRIMARY KEY,
+                     display_name TEXT NOT NULL,
+                     catalog_id INTEGER REFERENCES audit_catalog(id)
+                 ) STRICT;",
+            )
+            .unwrap();
+        let error = validate_registered_table_schema(&unsafe_catalog_parent, &catalog).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(error.diagnostic().contains("catalog-only table"));
+    }
+
+    #[test]
+    fn declared_foreign_keys_must_have_a_sqlite_enforceable_parent_key() {
+        for schema in [
+            "CREATE TABLE countries (code TEXT NOT NULL);
+             CREATE TABLE children (
+                 tenant_id TEXT PRIMARY KEY NOT NULL,
+                 country_code TEXT REFERENCES countries(code)
+             );",
+            "CREATE TABLE countries (code TEXT PRIMARY KEY);
+             CREATE TABLE children (
+                 tenant_id TEXT PRIMARY KEY NOT NULL,
+                 country_code TEXT REFERENCES countries(missing_code)
+             );",
+            "CREATE TABLE countries (code TEXT COLLATE NOCASE NOT NULL);
+             CREATE UNIQUE INDEX countries_code_unique
+                 ON countries(code COLLATE BINARY);
+             CREATE TABLE children (
+                 tenant_id TEXT PRIMARY KEY NOT NULL,
+                 country_code TEXT REFERENCES countries(code)
+             );",
+        ] {
+            let connection = Connection::open_in_memory().unwrap();
+            connection
+                .pragma_update(None, "foreign_keys", "ON")
+                .unwrap();
+            connection.execute_batch(schema).unwrap();
+            let database = crate::core::LogicalDatabaseId::new(1).unwrap();
+            let child = TableDeclaration::sharded(
+                database,
+                "children",
+                ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+            )
+            .unwrap();
+            let declarations = [
+                child.clone(),
+                TableDeclaration::global(database, "countries").unwrap(),
+            ];
+
+            let error = validate_declared_table_constraints(&connection, &child, &declarations)
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                EngineErrorKind::FailedPrecondition,
+                "{schema}"
+            );
+            assert!(
+                error.diagnostic().contains("cannot be enforced by SQLite"),
+                "{schema}: {}",
+                error.diagnostic()
+            );
+        }
     }
 
     #[test]
@@ -3161,7 +3765,7 @@ mod tests {
         let shard_key =
             ShardKeyMetadata::from_validated("tenant_id".to_owned(), ShardKeyType::Text);
 
-        validate_authoritative_table_constraints(&connection, "records", Some(&shard_key)).unwrap();
+        validate_authoritative_unique_constraints(&connection, "records", &shard_key).unwrap();
     }
 
     #[test]
@@ -4227,6 +4831,13 @@ mod tests {
             },
             None,
         )));
+        assert!(!denies_schema_migration_action(context(
+            AuthAction::Pragma {
+                pragma_name: "quick_check",
+                pragma_value: Some("widgets"),
+            },
+            Some("main"),
+        )));
         assert!(denies_schema_migration_action(context(
             AuthAction::Transaction {
                 operation: TransactionOperation::Begin,
@@ -4271,5 +4882,42 @@ mod tests {
             },
             None,
         )));
+    }
+
+    #[test]
+    fn migration_authorizer_allows_sqlites_strict_table_quick_check_for_a_new_foreign_key() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        connection.execute_batch(SHARD_METADATA_TABLE_SQL).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE parents (id INTEGER PRIMARY KEY) STRICT;
+                 CREATE TABLE children (id INTEGER PRIMARY KEY) STRICT;",
+            )
+            .unwrap();
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        execute_schema_migration_batch(
+            &transaction,
+            "ALTER TABLE children ADD COLUMN parent_id INTEGER REFERENCES parents(id)",
+        )
+        .unwrap();
+        transaction.rollback().unwrap();
+        assert!(
+            !connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM pragma_table_xinfo('children')
+                         WHERE name = 'parent_id'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
     }
 }
