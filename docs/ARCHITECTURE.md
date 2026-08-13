@@ -103,7 +103,8 @@ address or `None`.
 The HTTP address remains `Config::listen`. The independent
 `Config::postgres_listen` is either a numeric socket address or disabled with
 `None`; the binary maps the exact `disabled` CLI/environment sentinel to that
-option. The process default enables loopback `127.0.0.1:5433`. See the
+option. The process default disables PostgreSQL; callers may explicitly enable
+loopback `127.0.0.1:5433`. See the
 [PostgreSQL listener contract](POSTGRES_LISTENER.md) for the full grammar and
 startup order.
 

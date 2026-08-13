@@ -48,8 +48,9 @@ claiming to be a drop-in PostgreSQL or MySQL replacement.
 
 ## Current implementation
 
-Only the experimental HTTP network interface can execute SQL network requests
-today. The separately configured loopback PostgreSQL listener implements exact
+The initial alpha is HTTP-first: only the experimental HTTP network interface
+can execute SQL network requests today. The disabled-by-default, separately
+configured loopback PostgreSQL listener implements exact
 protocol-3.0 startup, logical database/user selection, BriskDB parameter
 status, and tracked session termination through a pinned `pgwire` 0.36.3
 boundary. It rejects SQL with fixed `0A000` responses until issue #31. There is
