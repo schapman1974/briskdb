@@ -66,6 +66,8 @@ offline, staged conversion of one ordinary SQLite database into an explicitly
 cataloged BriskDB layout with exactly-once Sharded row placement.
 The [manifest storage-format contract](docs/STORAGE_FORMAT.md) defines versioned
 startup migrations, downgrade behavior, and recovery boundaries.
+The [stopped-server backup contract](docs/OFFLINE_BACKUP.md) defines the
+supported alpha procedure for copying and restoring one complete data directory.
 Contributions follow the repository's [test-first completion policy](CONTRIBUTING.md).
 The [benchmark baseline](docs/BENCHMARKS.md) defines the reproducible storage
 workloads used to measure the current prototype.
@@ -661,6 +663,11 @@ asynchronous cleanup contract.
 Independent `Database` and `Engine` handles in one process that resolve to the
 same canonical data directory share schema coordination. Separate BriskDB
 server processes must not use the same data directory.
+
+The supported alpha backup is a complete data-directory copy made only after
+every BriskDB process using it has stopped. Restore into a new empty directory
+with the same release and shard count; never mix individual files or backup
+times. See the [stopped-server backup procedure](docs/OFFLINE_BACKUP.md).
 
 The `/admin` browser's fixed development login is separate from the planned
 authentication and role model. Near-term work includes that model, richer
