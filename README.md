@@ -1,6 +1,7 @@
 # BriskDB
 
 [![CI](https://github.com/schapman1974/briskdb/actions/workflows/ci.yml/badge.svg)](https://github.com/schapman1974/briskdb/actions/workflows/ci.yml)
+[![Release](https://github.com/schapman1974/briskdb/actions/workflows/release.yml/badge.svg)](https://github.com/schapman1974/briskdb/actions/workflows/release.yml)
 
 BriskDB is an experimental Rust server that spreads keyed workloads across
 multiple SQLite databases. It takes the central sharding model proven in
@@ -79,6 +80,13 @@ operating-system, Rust, and filesystem boundaries.
 
 BriskDB supports Rust 1.85 and newer stable releases. CI tests the declared
 minimum supported Rust version (MSRV) and the latest stable toolchain.
+
+Prebuilt alpha archives are published on the [GitHub releases
+page](https://github.com/schapman1974/briskdb/releases). Each release contains
+native server and import binaries for Ubuntu 24.04 and macOS on x86-64 and
+ARM64, plus release notes, the license, and SHA-256 checksums. Only Ubuntu 24.04
+x86-64 receives the full required test suite; the other archives are preview
+artifacts built and startup-smoke-tested on native GitHub-hosted runners.
 
 ## Current foundation
 

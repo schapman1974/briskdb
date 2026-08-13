@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-aarch64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos-x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            platform: macos-aarch64
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --target "${{ matrix.target }}"
+
+      - name: Select stable Rust
+        run: rustup default stable
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "briskdb"))')"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match package version $version" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build locked release binaries
+        run: cargo build --release --locked --bins --target "${{ matrix.target }}"
+
+      - name: Smoke-test native server
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/briskdb"
+          "$binary" --version | grep -F "briskdb $VERSION"
+          data_dir="$(mktemp -d)"
+          "$binary" \
+            --listen 127.0.0.1:17654 \
+            --postgres-listen disabled \
+            --data-dir "$data_dir/database" \
+            --shards 2 &
+          server_pid=$!
+          cleanup() {
+            kill -TERM "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+            rm -rf "$data_dir"
+          }
+          trap cleanup EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:17654/admin >/dev/null; then
+              kill -TERM "$server_pid"
+              wait "$server_pid"
+              trap - EXIT
+              rm -rf "$data_dir"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server did not become ready" >&2
+          exit 1
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="briskdb-v${VERSION}-${{ matrix.platform }}"
+          mkdir -p "dist/$archive"
+          cp "target/${{ matrix.target }}/release/briskdb" "dist/$archive/"
+          cp "target/${{ matrix.target }}/release/briskdb-import" "dist/$archive/"
+          cp README.md RELEASE_NOTES.md LICENSE ROADMAP.md CONTRIBUTING.md "dist/$archive/"
+          cp -R docs "dist/$archive/docs"
+          tar -C dist -czf "dist/$archive.tar.gz" "$archive"
+          tar -tzf "dist/$archive.tar.gz" | grep -F "$archive/docs/OFFLINE_BACKUP.md"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: briskdb-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub prerelease
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          pattern: briskdb-*
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --prerelease \
+            --title "BriskDB $GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md
