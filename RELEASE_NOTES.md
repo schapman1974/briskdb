@@ -24,8 +24,8 @@ Ubuntu 24.04 x86-64 is the only full-suite CI-supported platform. The other
 archives are preview builds that are compiled and startup-smoke-tested on native
 GitHub-hosted runners. Verify downloads against `SHA256SUMS`.
 
-The Linux release assets also contain `briskdb_0.1.0~alpha.2-1_amd64.deb` and
-`briskdb_0.1.0~alpha.2-1_arm64.deb`. Each package is installed, started through
+The Linux release assets also contain `briskdb_0.1.0.alpha.2-1_amd64.deb` and
+`briskdb_0.1.0.alpha.2-1_arm64.deb`. Each package is installed, started through
 systemd, queried over loopback HTTP, checked through journald, reinstalled with
 a locally modified conffile, and removed while retaining configuration and
 database state on its native Ubuntu 24.04 release runner.
