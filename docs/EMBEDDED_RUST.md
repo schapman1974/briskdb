@@ -80,6 +80,15 @@ logs and is not a compatibility contract.
 Schema changes use `BriskDb::migrate()` and the crash-resumable migration
 journal. Ordinary DDL is deliberately rejected through the write method.
 
+The embedding host owns process cancellation. It can call `begin_close()` to
+stop admission synchronously, `close_with_grace()` to select a finite drain
+period, or await `close_when_cancelled()` with a host-owned `CancellationToken`.
+BriskDB does not install signal handlers. `checkpoint()` performs a passive,
+bounded WAL checkpoint on every shard and reports incomplete progress without
+blocking active writers.
+
 The initial library is async and requires a caller-managed Tokio runtime. The
 typed dedicated-runtime and document-support modes are reserved and fail with
 `unsupported` before storage is touched until their implementations land.
+The host may install any tracing subscriber it wants; the library emits through
+the normal `tracing` facade and never configures global logging itself.

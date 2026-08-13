@@ -30,7 +30,7 @@ pub(crate) use control::{
     CancelOnDrop, CancellationReason, OperationControl, wait_for_cancellation, wait_pending,
 };
 pub use control::{CancellationToken, RequestContext};
-pub use engine::{Engine, EngineStatus, Statement};
+pub use engine::{CheckpointReport, CheckpointShardReport, Engine, EngineStatus, Statement};
 pub use error::{EngineError, EngineErrorKind, EngineResult};
 pub(crate) use generated_id::AllocationOwnerMap;
 pub use lifecycle::{EngineState, ShutdownReport};

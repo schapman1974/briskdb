@@ -8,8 +8,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::core::{
-    Catalog, Engine, EngineOptions, EngineResult, EngineState, EngineStatus, Executed, ResultSet,
-    Routed, Session, ShutdownReport, Statement, WriteResult,
+    CancellationToken, Catalog, CheckpointReport, Engine, EngineOptions, EngineResult, EngineState,
+    EngineStatus, Executed, RequestContext, ResultSet, Routed, Session, ShutdownReport, Statement,
+    WriteResult,
 };
 use crate::{EngineError, EngineErrorKind};
 
@@ -200,6 +201,11 @@ impl BriskDb {
         &self.engine
     }
 
+    /// Return the immutable engine resource and lifecycle options.
+    pub fn options(&self) -> EngineOptions {
+        self.engine.options()
+    }
+
     /// Create an independent frontend session owned by this database.
     pub fn session(&self) -> Session {
         self.engine.session()
@@ -246,6 +252,19 @@ impl BriskDb {
         self.engine.broadcast(session, sql.into()).await
     }
 
+    /// Ask SQLite to passively checkpoint every physical shard.
+    pub async fn checkpoint(&self) -> EngineResult<CheckpointReport> {
+        self.engine.checkpoint().await
+    }
+
+    /// Passively checkpoint every shard with host-supplied request controls.
+    pub async fn checkpoint_with_context(
+        &self,
+        context: RequestContext,
+    ) -> EngineResult<CheckpointReport> {
+        self.engine.checkpoint_with_context(context).await
+    }
+
     /// Return the immutable logical database and table catalog.
     pub fn catalog(&self) -> &Catalog {
         self.engine.catalog()
@@ -261,8 +280,37 @@ impl BriskDb {
         self.engine.state()
     }
 
+    /// Stop admitting new work without waiting for active work to drain.
+    ///
+    /// This is synchronous and idempotent. Call [`BriskDb::close`] or
+    /// [`BriskDb::close_with_grace`] afterward to finish cleanup.
+    pub fn begin_close(&self) -> EngineState {
+        self.engine.begin_shutdown()
+    }
+
     /// Explicitly drain work and close idle SQLite handles.
     pub async fn close(&self) -> EngineResult<ShutdownReport> {
         self.engine.shutdown().await
+    }
+
+    /// Explicitly close using a host-selected finite grace period.
+    pub async fn close_with_grace(
+        &self,
+        grace: std::time::Duration,
+    ) -> EngineResult<ShutdownReport> {
+        self.engine.shutdown_with_grace(grace).await
+    }
+
+    /// Wait for a host-owned cancellation token, then close explicitly.
+    ///
+    /// Dropping this future before cancellation has no side effects. This lets
+    /// an embedding host compose its own signal, task, or service lifecycle
+    /// without BriskDB installing a process signal handler.
+    pub async fn close_when_cancelled(
+        &self,
+        cancellation: CancellationToken,
+    ) -> EngineResult<ShutdownReport> {
+        cancellation.cancelled().await;
+        self.close().await
     }
 }
