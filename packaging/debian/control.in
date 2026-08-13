@@ -1,0 +1,13 @@
+Package: briskdb
+Version: @DEBIAN_VERSION@
+Architecture: @ARCHITECTURE@
+Maintainer: BriskDB Maintainers <schapman1974@users.noreply.github.com>
+Installed-Size: @INSTALLED_SIZE@
+Depends: libc6 (>= 2.38), adduser, init-system-helpers
+Section: database
+Priority: optional
+Homepage: https://github.com/schapman1974/briskdb
+Description: experimental sharded SQLite server
+ BriskDB spreads keyed workloads across multiple bundled SQLite databases.
+ This alpha package installs the server, import utility, systemd service,
+ administrator configuration, and documentation.

@@ -1,0 +1,27 @@
+# BriskDB systemd service configuration.
+# After editing, run: sudo systemctl restart briskdb
+
+# The alpha HTTP endpoint has no authentication or TLS and must remain loopback.
+BRISKDB_LISTEN=127.0.0.1:7654
+
+# PostgreSQL supports startup/session handling but cannot execute SQL yet.
+BRISKDB_POSTGRES_LISTEN=disabled
+
+# Persistent package-managed state location. Back up this complete directory
+# only while the service is stopped.
+BRISKDB_DATA_DIR=/var/lib/briskdb/data
+BRISKDB_SHARDS=4
+
+# Engine resource limits.
+BRISKDB_CONNECTIONS_PER_SHARD=4
+BRISKDB_QUEUE_CAPACITY_PER_SHARD=32
+BRISKDB_MAX_RESULT_ROWS=10000
+BRISKDB_MAX_RESULT_BYTES=16777216
+BRISKDB_MAX_PREPARED_STATEMENTS_PER_SESSION=128
+BRISKDB_MAX_PORTALS_PER_SESSION=128
+BRISKDB_MAX_RETAINED_BOUND_VALUE_BYTES=16777216
+BRISKDB_REQUEST_TIMEOUT_MS=30000
+BRISKDB_SHUTDOWN_GRACE_MS=30000
+
+# Logs are written to journald. Examples: briskdb=debug, info, warn.
+RUST_LOG=briskdb=info

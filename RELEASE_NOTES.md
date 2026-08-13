@@ -1,7 +1,13 @@
-# BriskDB 0.1.0-alpha.1
+# BriskDB 0.1.0-alpha.2
 
-This is the first BriskDB alpha release. It is intended for local evaluation
+This is the second BriskDB alpha release. It is intended for local evaluation
 and development, not production deployment.
+
+This update adds native `amd64` and `arm64` Debian packages. Installing a
+package creates an unprivileged `briskdb` service account, installs a hardened
+`briskdb.service`, keeps administrator configuration in
+`/etc/default/briskdb`, stores database state in `/var/lib/briskdb`, and sends
+stdout/stderr logs to the systemd journal.
 
 ## Included binaries
 
@@ -17,6 +23,12 @@ for:
 Ubuntu 24.04 x86-64 is the only full-suite CI-supported platform. The other
 archives are preview builds that are compiled and startup-smoke-tested on native
 GitHub-hosted runners. Verify downloads against `SHA256SUMS`.
+
+The Linux release assets also contain `briskdb_0.1.0~alpha.2-1_amd64.deb` and
+`briskdb_0.1.0~alpha.2-1_arm64.deb`. Each package is installed, started through
+systemd, queried over loopback HTTP, checked through journald, reinstalled with
+a locally modified conffile, and removed while retaining configuration and
+database state on its native Ubuntu 24.04 release runner.
 
 ## What is available
 
@@ -52,5 +64,5 @@ Unknown, malformed, partially migrated, or newer layouts fail closed.
 Before opening existing data, stop the old process and make a complete backup
 as described in `docs/OFFLINE_BACKUP.md`. Startup may migrate the data.
 In-place downgrade is unsupported; rollback requires restoring the complete
-pre-upgrade backup. This first published release has no on-disk format change
-relative to the source revision from which it was cut.
+pre-upgrade backup. This release has no on-disk format change from
+`0.1.0-alpha.1`.

@@ -1,0 +1,40 @@
+#!/bin/sh
+set -e
+
+if ! getent group briskdb >/dev/null; then
+    addgroup --system briskdb
+fi
+
+if ! getent passwd briskdb >/dev/null; then
+    adduser --system \
+        --ingroup briskdb \
+        --home /var/lib/briskdb \
+        --no-create-home \
+        --shell /usr/sbin/nologin \
+        --gecos "BriskDB service" \
+        briskdb
+fi
+
+install -d -o briskdb -g briskdb -m 0750 /var/lib/briskdb
+
+if deb-systemd-helper debian-installed briskdb.service; then
+    deb-systemd-helper unmask briskdb.service >/dev/null || true
+    if deb-systemd-helper --quiet was-enabled briskdb.service; then
+        deb-systemd-helper enable briskdb.service >/dev/null || true
+    else
+        deb-systemd-helper update-state briskdb.service >/dev/null || true
+    fi
+else
+    deb-systemd-helper enable briskdb.service >/dev/null || true
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null || true
+    if systemctl --system --quiet is-active briskdb.service; then
+        deb-systemd-invoke restart briskdb.service >/dev/null || true
+    else
+        deb-systemd-invoke start briskdb.service >/dev/null || true
+    fi
+fi
+
+exit 0
