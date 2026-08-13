@@ -63,9 +63,21 @@ until it has repeatable automated coverage. See the
 
 Maintainers also develop and run the full suite on `aarch64-apple-darwin`.
 macOS is useful for development and benchmark comparisons, but it is
-best-effort until it has a required CI job. Linux ARM64, Intel macOS, Windows,
-the musl target, 32-bit targets, big-endian targets, mobile platforms, and
-WebAssembly are not currently tested or supported.
+best-effort until it has a required full-suite CI job.
+
+Every tagged alpha release also builds and startup-smoke-tests native archives
+on these GitHub-hosted runners:
+
+- Ubuntu 24.04 x86-64 (`x86_64-unknown-linux-gnu`);
+- Ubuntu 24.04 ARM64 (`aarch64-unknown-linux-gnu`);
+- macOS Intel x86-64 (`x86_64-apple-darwin`); and
+- macOS Apple Silicon ARM64 (`aarch64-apple-darwin`).
+
+Those release artifacts are previews outside Ubuntu 24.04 x86-64. Their native
+jobs verify the locked release build, CLI version, HTTP startup, admin endpoint,
+and clean termination, but do not run the full storage and integration suite.
+Windows, the musl target, 32-bit targets, big-endian targets, mobile platforms,
+and WebAssembly are not currently tested or supported.
 
 Reports from unlisted targets are welcome. A target moves into the supported
 tier only after repeatable CI coverage exists for its compile, test, and
