@@ -24,15 +24,19 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             platform: linux-x86_64
+            deb_architecture: amd64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             platform: linux-aarch64
+            deb_architecture: arm64
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             platform: macos-x86_64
+            deb_architecture: none
           - runner: macos-15
             target: aarch64-apple-darwin
             platform: macos-aarch64
+            deb_architecture: none
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -104,11 +108,42 @@ jobs:
           tar -C dist -czf "dist/$archive.tar.gz" "$archive"
           tar -tzf "dist/$archive.tar.gz" | grep -F "$archive/docs/OFFLINE_BACKUP.md"
 
+      - name: Build Debian package
+        if: matrix.deb_architecture != 'none'
+        shell: bash
+        run: |
+          packaging/debian/build-deb.sh \
+            "target/${{ matrix.target }}/release" \
+            "${{ matrix.deb_architecture }}" \
+            "$VERSION" \
+            dist
+
+      - name: Install and smoke-test Debian service
+        if: matrix.deb_architecture != 'none'
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(dist/*.deb)
+          if [[ ${#packages[@]} -ne 1 || ! -f "${packages[0]}" ]]; then
+            echo "expected exactly one Debian package" >&2
+            exit 1
+          fi
+          packaging/debian/test-deb-service.sh "${packages[0]}"
+
       - name: Upload release archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: briskdb-${{ matrix.platform }}
           path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Debian package
+        if: matrix.deb_architecture != 'none'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: briskdb-deb-${{ matrix.deb_architecture }}
+          path: dist/*.deb
           if-no-files-found: error
           retention-days: 7
 
@@ -135,7 +170,7 @@ jobs:
 
       - name: Create checksums
         working-directory: dist
-        run: sha256sum *.tar.gz > SHA256SUMS
+        run: sha256sum *.tar.gz *.deb > SHA256SUMS
 
       - name: Publish prerelease
         env:

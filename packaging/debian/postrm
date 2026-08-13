@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = purge ]; then
+    deb-systemd-helper purge briskdb.service >/dev/null || true
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null || true
+fi
+
+# The service account and /var/lib/briskdb are deliberately retained. Database
+# removal must be an explicit administrator action after a verified backup.
+exit 0

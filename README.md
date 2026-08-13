@@ -87,6 +87,9 @@ native server and import binaries for Ubuntu 24.04 and macOS on x86-64 and
 ARM64, plus release notes, the license, and SHA-256 checksums. Only Ubuntu 24.04
 x86-64 receives the full required test suite; the other archives are preview
 artifacts built and startup-smoke-tested on native GitHub-hosted runners.
+Linux releases also include installable `amd64` and `arm64` Debian packages.
+The [Debian service guide](docs/DEBIAN_INSTALL.md) covers systemd configuration,
+state, logging, upgrades, removal, and the planned signed APT repository.
 
 ## Current foundation
 

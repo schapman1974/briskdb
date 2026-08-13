@@ -1,0 +1,46 @@
+[Unit]
+Description=BriskDB sharded SQLite server
+Documentation=https://github.com/schapman1974/briskdb
+After=local-fs.target network.target
+ConditionFileIsExecutable=/usr/bin/briskdb
+
+[Service]
+Type=simple
+User=briskdb
+Group=briskdb
+EnvironmentFile=-/etc/default/briskdb
+WorkingDirectory=/var/lib/briskdb
+ExecStart=/usr/bin/briskdb
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=40s
+StateDirectory=briskdb
+StateDirectoryMode=0750
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=briskdb
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
