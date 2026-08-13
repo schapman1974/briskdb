@@ -52,7 +52,7 @@ impl FromStr for ListenerSetting {
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
-    /// Address on which the HTTP server listens.
+    /// Loopback address on which the unauthenticated HTTP server listens.
     #[arg(long, env = "BRISKDB_LISTEN", default_value = "127.0.0.1:7654")]
     listen: SocketAddr,
 

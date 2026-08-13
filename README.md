@@ -194,7 +194,9 @@ cargo run --bin briskdb-import -- \
 See the [import contract](docs/SQLITE_IMPORT.md) for schema support,
 verification, cancellation, and publication behavior.
 
-The HTTP listener defaults to `127.0.0.1:7654`. The separate PostgreSQL TCP
+The unauthenticated HTTP listener defaults to `127.0.0.1:7654` and currently
+requires an IPv4 or IPv6 loopback address. A non-loopback value is rejected
+before the engine opens or either listener binds. The separate PostgreSQL TCP
 listener defaults to `127.0.0.1:5433`. Set either an explicit socket address or
 the exact value `disabled` with `--postgres-listen`; the corresponding
 environment variable is `BRISKDB_POSTGRES_LISTEN`. Command-line input takes
@@ -202,9 +204,8 @@ precedence over the environment, which takes precedence over the default. The
 HTTP address, data directory, and shard count can also be supplied with
 `BRISKDB_LISTEN`, `BRISKDB_DATA_DIR`, and `BRISKDB_SHARDS`.
 
-An enabled PostgreSQL address must be IPv4 or IPv6 loopback in the current
-phase. A non-loopback value is rejected before the engine opens or either
-listener binds.
+An enabled PostgreSQL address must also be IPv4 or IPv6 loopback in the current
+phase.
 
 ```bash
 # Keep the existing HTTP service and do not bind the PostgreSQL port.
@@ -227,9 +228,10 @@ The explorer is read-only: select a logical table, see its exact logical row
 total, then move through live shard-major pages of at most 200 rows. Sharded
 tables visit every owning file; Global tables visit canonical shard 0 once.
 Browser sessions are held only in process memory, expire after eight hours,
-and disappear on restart. The fixed credentials are a development convenience;
-keep this experimental HTTP service on a trusted network. Existing `/health`
-and `/v1/*` behavior is unchanged. See the
+and disappear on restart. The fixed credentials are a development convenience,
+not a security boundary; the server therefore refuses non-loopback HTTP
+addresses until authentication and TLS are implemented. Existing `/health` and
+`/v1/*` behavior is unchanged. See the
 [admin browser contract](docs/ADMIN_BROWSER.md) for the route, table-filtering,
 pagination, and session boundaries.
 
@@ -345,7 +347,8 @@ instead. An example point response is:
 ## Deliberate boundaries
 
 This is an initial scaffold, not a production database yet. The current API
-accepts SQL and should only be exposed on a trusted network. The HTTP adapter
+accepts SQL without authentication, so server startup restricts HTTP to an IPv4
+or IPv6 loopback address. The HTTP adapter
 creates an ephemeral session for each data request, so session state and
 transactions cannot span HTTP requests. Each shard has its own bounded pool, so
 routed work queued for one shard does not consume another shard's capacity.
