@@ -4,7 +4,7 @@ version = "0.1.0-alpha.3"
 edition = "2024"
 rust-version = "1.85"
 default-run = "briskdb"
-description = "A small, fast, sharded SQLite server"
+description = "Sharded SQLite with HTTP/PostgreSQL today and MongoDB/MySQL frontends planned"
 license = "MIT"
 repository = "https://github.com/schapman1974/briskdb"
 # Cargo packaging removes Git source pins from dependencies. Keep registry
