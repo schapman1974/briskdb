@@ -1791,9 +1791,10 @@ BriskDB will not sign altered manifest payload while reporting the failure.
 The current deployment boundary remains local storage and one BriskDB process
 per data directory. Independent handles inside that process share a gate,
 schema fingerprints, and live catalog coordination keyed by the canonical
-root. A formal backup/restore workflow is not implemented. Recovery to an older
-binary requires a backup from before the unsupported format. Separate server
-processes against one data
+root. The supported alpha recovery workflow is the complete stopped-directory
+copy documented in [offline backup](OFFLINE_BACKUP.md); coordinated online
+backup remains unimplemented. Recovery to an older binary requires a backup
+from before the unsupported format. Separate server processes against one data
 directory are unsupported even though SQLite and the manifest use file locks;
 the in-process coordination is intentionally not a distributed lock. The
 `hilo_v1` reservation transaction is deliberately stronger at its narrow

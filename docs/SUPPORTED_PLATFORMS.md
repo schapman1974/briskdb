@@ -95,10 +95,11 @@ Admin browser sessions likewise belong to one process, but are not part of that
 data-directory registry: their absolute eight-hour state is memory-only and is
 discarded on restart.
 Do not copy, move, edit, or separately open the manifest, shard, WAL, or shared
-memory files while the server is running. Backup, restore, multi-process
-access, filesystem-fault behavior, and crash-recovery guarantees will become
-supported only when their roadmap issues add the corresponding automated
-tests.
+memory files while the server is running. The stopped-server,
+complete-directory procedure in [offline backup](OFFLINE_BACKUP.md) is supported
+and tested. Live or partial copies, coordinated online backup, multi-process
+access, filesystem-fault behavior, and broader crash-recovery guarantees remain
+unsupported until their roadmap issues add corresponding automated tests.
 
 Opening a data directory can transactionally upgrade `manifest.sqlite` and can
 resume a manifest-recorded cross-file shard provisioning, adoption, or
