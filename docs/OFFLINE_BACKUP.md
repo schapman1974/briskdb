@@ -62,6 +62,8 @@ cargo run --locked -- --data-dir /srv/briskdb-restored --shards 4
 Restoring into a different absolute path is supported. Restoring only one
 shard, mixing recovery points, copying while the server is running, or using an
 older BriskDB binary against a newer format is unsupported.
+For release upgrades and rollback, follow the additional requirements in the
+[pre-1.0 compatibility policy](PRE_1_COMPATIBILITY.md).
 
 ## Automated evidence
 
