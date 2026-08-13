@@ -17,9 +17,10 @@ The first implementation has one exact built-in credential pair:
 
 This is a temporary development convenience, not the user/role, password
 rotation, or transport-encryption work described by roadmap issues #56 and #64.
-Anyone who can reach the HTTP listener knows these credentials. Keep the current
-HTTP service on a trusted network and do not treat this login as a production
-identity boundary. The existing `/health` and `/v1/*` endpoints retain their
+Anyone who can reach the HTTP listener knows these credentials. Server startup
+therefore restricts the current unauthenticated HTTP service to an IPv4 or IPv6
+loopback address. Do not treat this login as a production identity boundary.
+The existing `/health` and `/v1/*` endpoints retain their
 previous behavior and are not made authenticated by issue #106.
 
 A successful login creates an opaque session from 32 operating-system-random

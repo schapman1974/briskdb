@@ -72,7 +72,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// [`run`] remains the compatibility entry point and delegates here with
 /// [`EngineOptions::default`].
 pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> anyhow::Result<()> {
-    validate_postgres_listener(&config)?;
+    validate_listener_addresses(&config)?;
     let engine = Engine::open_with_options(&config.data_dir, config.shards, options).await?;
     let listeners = match BoundListeners::bind(&config).await {
         Ok(listeners) => listeners,
@@ -139,7 +139,13 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
     serve_listeners_with_shutdown(listeners, engine, signal).await
 }
 
-fn validate_postgres_listener(config: &Config) -> anyhow::Result<()> {
+fn validate_listener_addresses(config: &Config) -> anyhow::Result<()> {
+    if !config.listen.ip().is_loopback() {
+        anyhow::bail!(
+            "unauthenticated HTTP startup requires a loopback listen address; received {}",
+            config.listen
+        );
+    }
     if let Some(address) = config
         .postgres_listen
         .filter(|address| !address.ip().is_loopback())
@@ -780,6 +786,41 @@ mod tests {
             "PostgreSQL wire startup currently requires a loopback listen address; received 0.0.0.0:0"
         );
         assert!(!data_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn non_loopback_http_activation_fails_before_database_or_listener_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("database");
+        let error = run(Config {
+            listen: "0.0.0.0:0".parse().unwrap(),
+            postgres_listen: Some("127.0.0.1:0".parse().unwrap()),
+            data_dir: data_dir.clone(),
+            shards: 2,
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unauthenticated HTTP startup requires a loopback listen address; received 0.0.0.0:0"
+        );
+        assert!(!data_dir.exists());
+    }
+
+    #[test]
+    fn listener_validation_accepts_ipv4_and_ipv6_loopback_addresses() {
+        for listen in ["127.0.0.1:7654", "[::1]:7654"] {
+            for postgres_listen in [None, Some("127.0.0.1:5433"), Some("[::1]:5433")] {
+                validate_listener_addresses(&Config {
+                    listen: listen.parse().unwrap(),
+                    postgres_listen: postgres_listen.map(|address| address.parse().unwrap()),
+                    data_dir: PathBuf::from("unused"),
+                    shards: 2,
+                })
+                .unwrap();
+            }
+        }
     }
 
     #[tokio::test]
