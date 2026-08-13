@@ -1,13 +1,56 @@
-# BriskDB 0.1.0-alpha.2
+# BriskDB 0.1.0-alpha.3
 
-This is the second BriskDB alpha release. It is intended for local evaluation
+This is the third BriskDB alpha release. It is intended for local evaluation
 and development, not production deployment.
 
-This update adds native `amd64` and `arm64` Debian packages. Installing a
-package creates an unprivileged `briskdb` service account, installs a hardened
-`briskdb.service`, keeps administrator configuration in
-`/etc/default/briskdb`, stores database state in `/var/lib/briskdb`, and sends
-stdout/stderr logs to the systemd journal.
+This update makes the disabled-by-default PostgreSQL listener query-capable for
+the first time. After initializing a registered catalog with `briskdb-import`,
+a standard PostgreSQL simple-query client can execute one `SELECT`, `INSERT`,
+`UPDATE`, or `DELETE` statement at a time through BriskDB's shared catalog,
+shard routing, limits, session lifecycle, and fixed-error boundary.
+
+## PostgreSQL quickstart
+
+The complete copy/paste workflow for creating a SQLite source, importing it,
+starting BriskDB, and using `psql` is in
+`docs/POSTGRES_QUICKSTART.md`. The listener remains disabled by default. Enable
+it only on loopback:
+
+```bash
+briskdb \
+  --data-dir /path/to/imported-briskdb-data \
+  --shards 4 \
+  --postgres-listen 127.0.0.1:5433
+```
+
+Psycopg 3 has been exercised against the standalone alpha.3 binaries. Use
+`psycopg.ClientCursor`, which performs client-side parameter binding and sends
+the supported simple-query protocol:
+
+```python
+import psycopg
+from psycopg import ClientCursor
+
+connection = psycopg.connect(
+    "host=127.0.0.1 port=5433 user=briskdb "
+    "dbname=default sslmode=disable",
+    autocommit=True,
+)
+
+with ClientCursor(connection) as cursor:
+    cursor.execute(
+        "INSERT INTO records (tenant_id, payload) VALUES (%s, %s)",
+        ("tenant-a", "hello"),
+    )
+    cursor.execute(
+        "SELECT tenant_id, payload FROM records WHERE tenant_id = %s",
+        ("tenant-a",),
+    )
+    print(cursor.fetchone())
+```
+
+The ordinary Psycopg cursor uses PostgreSQL's extended-query protocol and is
+not compatible with this release.
 
 ## Included binaries
 
@@ -21,14 +64,16 @@ for:
 - macOS Apple Silicon ARM64.
 
 Ubuntu 24.04 x86-64 is the only full-suite CI-supported platform. The other
-archives are preview builds that are compiled and startup-smoke-tested on native
+archives are preview builds compiled and startup-smoke-tested on native
 GitHub-hosted runners. Verify downloads against `SHA256SUMS`.
 
-The Linux release assets also contain `briskdb_0.1.0.alpha.2-1_amd64.deb` and
-`briskdb_0.1.0.alpha.2-1_arm64.deb`. Each package is installed, started through
-systemd, queried over loopback HTTP, checked through journald, reinstalled with
-a locally modified conffile, and removed while retaining configuration and
-database state on its native Ubuntu 24.04 release runner.
+Linux release assets also contain
+`briskdb_0.1.0.alpha.3-1_amd64.deb` and
+`briskdb_0.1.0.alpha.3-1_arm64.deb`. Each package installs an unprivileged
+`briskdb` account, hardened systemd service, administrator configuration under
+`/etc/default/briskdb`, persistent state under `/var/lib/briskdb`, and journald
+logging. Native Ubuntu release runners install, start, query, reinstall, and
+remove each package while verifying configuration and database retention.
 
 ## What is available
 
@@ -38,15 +83,24 @@ database state on its native Ubuntu 24.04 release runner.
 - An HTTP SQL interface and embedded read-only admin browser on loopback.
 - Versioned manifest migrations, generated-key policies, prepared statements,
   standard SQLite import, and a tested stopped-server backup/restore procedure.
-- A disabled-by-default PostgreSQL endpoint for protocol startup and session
-  handling only.
+- A disabled-by-default loopback PostgreSQL endpoint with protocol 3.0 startup,
+  registered-table simple queries, text-format rows, DML command tags, fixed
+  safe SQLSTATE errors, recovery, and prepared-object cleanup.
+- Native archives for four OS/architecture combinations and native Debian
+  packages for Ubuntu 24.04 `amd64` and `arm64`.
 
 ## Critical alpha boundaries
 
-- HTTP has no authentication, authorization, or TLS and is restricted to
-  loopback. Do not expose it to a network.
-- PostgreSQL cannot execute SQL yet. It is disabled by default and, when
-  explicitly enabled on loopback, supports only startup/session handling.
+- There is no authentication, authorization, or TLS. HTTP and PostgreSQL are
+  restricted to loopback. Do not expose either listener to a network.
+- PostgreSQL extended-query protocol is unsupported. Parameters sent through
+  Parse/Bind/Execute, server-side prepared statements, transactions, DDL,
+  `COPY`, and binary results are unavailable. Psycopg must use
+  `psycopg.ClientCursor`; an ordinary cursor's unsupported pipelined extended
+  sequence closes that connection.
+- PostgreSQL accepts exactly one simple-query statement per message and only
+  operates on an offline imported/registered catalog. It does not provide an
+  online `CREATE TABLE` workflow or full PostgreSQL compatibility.
 - General cross-shard transactions are unsupported. Global ordering,
   pagination, and aggregation pushdown are incomplete, and BriskDB does not
   claim full SQL compatibility.
@@ -65,4 +119,4 @@ Before opening existing data, stop the old process and make a complete backup
 as described in `docs/OFFLINE_BACKUP.md`. Startup may migrate the data.
 In-place downgrade is unsupported; rollback requires restoring the complete
 pre-upgrade backup. This release has no on-disk format change from
-`0.1.0-alpha.1`.
+`0.1.0-alpha.1` or `0.1.0-alpha.2`.
