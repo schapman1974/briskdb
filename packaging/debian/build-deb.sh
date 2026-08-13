@@ -15,6 +15,12 @@ if [[ $# -eq 2 && "$1" == "--print-debian-version" ]]; then
     exit 0
 fi
 
+if [[ $# -eq 2 && "$1" == "--print-package-filename" ]]; then
+    debian_version=$(to_debian_version "$2")
+    printf 'briskdb_%s_ARCH.deb\n' "${debian_version//\~/.}"
+    exit 0
+fi
+
 if [[ $# -ne 4 ]]; then
     echo "usage: $0 BINARY_DIRECTORY DEBIAN_ARCHITECTURE CARGO_VERSION OUTPUT_DIRECTORY" >&2
     exit 2
@@ -41,7 +47,8 @@ for binary in briskdb briskdb-import; do
 done
 
 debian_version=$(to_debian_version "$cargo_version")
-package_basename="briskdb_${debian_version}_${architecture}"
+filename_version=${debian_version//\~/.}
+package_basename="briskdb_${filename_version}_${architecture}"
 temporary_directory=$(mktemp -d)
 package_root="$temporary_directory/$package_basename"
 cleanup() {

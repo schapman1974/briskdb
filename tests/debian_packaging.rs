@@ -52,6 +52,16 @@ fn cargo_versions_convert_to_debian_versions_without_shell_tilde_expansion() {
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
     }
+
+    let output = Command::new(&builder)
+        .args(["--print-package-filename", "0.1.0-alpha.2"])
+        .output()
+        .expect("package builder must print its external filename");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "briskdb_0.1.0.alpha.2-1_ARCH.deb"
+    );
 }
 
 #[test]
