@@ -306,6 +306,199 @@ where relevant, and explain whether the virtual-table boundary advances,
 remains experimental, or is rejected. The feature remains off the authoritative
 Engine and protocol paths until the separate rollout gate is approved.
 
+## Issue #131 final rollout matrix
+
+The final rollout harness is separate from the historical issue #126 and #129
+measurements above. Those runs remain useful snapshots, but they used different
+shard counts, sampling windows, and fixture contracts. The issue #131 harness
+freezes one ten-shard comparison at exactly 2, 4, 8, and 10 concurrent clients
+across five workload families:
+
+| Workload | Facade path | Independent existing path |
+| --- | --- | --- |
+| Point read | read-only virtual-table coordinator | logical Engine router |
+| Scatter read | read-only virtual-table coordinator | logical Engine scatter/gather |
+| Explicit-key write | writable virtual-table coordinator | routed Engine write |
+| `native_range_v1` omitted-key write | writable virtual-table coordinator | unavailable |
+| `hilo_v1` omitted-key write | writable virtual-table coordinator | unavailable |
+
+The two generated-write comparator cells are deliberately reported as
+`unsupported`, with a fixed reason. Public Engine omitted-key writes delegate
+to the writable virtual-table coordinator, so timing that call as an
+"existing-router" control would compare the implementation with itself. The
+report validator rejects fabricated trials for those cells and also rejects an
+unexplained missing cell.
+
+For every client-count/workload/trial tuple, the harness builds one closed
+template and byte-copies it for each executable path. The report includes a
+BLAKE3 digest over the relative file names and contents and refuses paired
+results whose baseline digests differ. Both copies therefore start with the
+same manifest, catalog, shard databases, schema, allocation-owner state, and
+256 deterministic `benchmark_hash` rows per shard. Volatile `-shm` files are
+excluded from the template. Paired paths bind the same SQL and values. Each
+copy keeps production `WAL`, `synchronous=FULL`, and foreign-key behavior; no
+benchmark-only durability relaxation is allowed.
+
+The rest of the contract is also fixed:
+
+- 100 untimed warm-up operations per client;
+- three measured trials per executable cell;
+- 10 seconds per trial, released through a common start barrier;
+- one telemetry observation every 50 milliseconds plus baseline and final
+  observations;
+- four Engine connections and 32 queued operations per shard; and
+- two Tokio runtime threads with at most ten blocking threads.
+
+Timing includes operation execution, contention, the final worker rendezvous,
+and telemetry overhead. Setup, template creation/copying, schema/catalog
+validation, coordinator/session construction, and warm-up are excluded. Path
+order alternates by trial. Both paths use the normal warm operating-system
+cache policy; the harness does not claim cold-cache results.
+
+Each trial records successful operations and classified busy, cancelled,
+constraint, corruption, storage-full, and other errors. It also records:
+
+- user-plus-system process CPU from `getrusage` and CPU as a percentage of wall
+  time (which may exceed 100% on a multicore host);
+- baseline and final current RSS from `ps`, plus the maximum of
+  baseline/50 ms/final samples and its growth above that trial's baseline;
+  compare the growth rather than absolute RSS because allocator/runtime pages
+  may be retained between cases. Process-lifetime high-water RSS from
+  `getrusage` is emitted only as a diagnostic, normalizing the macOS byte and
+  Linux KiB conventions;
+- baseline, final, and sampled peak bytes across the manifest and all shard WAL
+  files. Peak file-size growth per successful operation is emitted only as a
+  diagnostic: checkpoints and WAL reuse make file size non-monotonic, so it
+  cannot prove bytes written or pass the resource gate;
+- total and per-shard sampled Engine pool active/queued occupancy (zero for the
+  direct facade path, which has no Engine pool); 50 ms samples are diagnostic
+  and do not claim a true high-water mark; and
+- per-shard successful touches plus minimum, maximum, mean, and maximum/mean
+  skew.
+
+Point and explicit-key workloads rotate the deterministic routed key by both
+client and operation, so every trial exercises all ten shards even when only
+two, four, or eight clients are active. Generated-ID placement remains the
+production allocator's decision and its observed per-shard distribution is
+reported rather than forced by the benchmark.
+
+The 50 ms snapshots are deterministic accounting points, not a continuous
+profiler, so a very brief occupancy spike can fall between samples. RSS is also
+diagnostic because all trials share one process and may reuse allocations from
+earlier cases. WAL file-size deltas are diagnostic because they are not a
+monotonic counter of frames written. RSS, WAL, and sampled pool occupancy
+therefore remain explicitly unresolved and keep the benchmark gate at `HOLD`.
+CPU includes sampler work in both paired paths and is compared per successful
+operation. Every successful point read or write must report one valid shard;
+every scatter read must report all ten distinct shards. A mismatch is counted
+as an error rather than silently inflating throughput.
+
+Timed point reads compare the exact key, row number, and payload. Timed scatter
+reads fully materialize the result and verify its row count; untimed warm-up
+operations verify an order-independent content fingerprint against the
+precomputed fixture fingerprint. This keeps full validation on both paths
+without adding a large common hashing cost to the measured interval. After the
+final telemetry sample, an untimed reconciliation opens the manifest and every
+shard, runs `PRAGMA quick_check` and `pragma_foreign_key_check`, and compares
+every acknowledged write key with the physical rows after subtracting tracked
+warm-up keys. Generated IDs must also be globally unique, and native-range and
+hi/lo IDs must decode and route to their physical shard. A failed
+reconciliation rejects the trial before it can enter the report.
+
+Run the fast matrix/report accounting test and the real two-path telemetry
+smoke test first:
+
+```bash
+cargo test --locked --features experimental-vtab --lib \
+  storage::sharded_vtab::benchmarks::rollout_benchmark_matrix_and_report_account_for_every_frozen_case_and_metric \
+  -- --exact
+
+cargo test --locked --features experimental-vtab --lib \
+  storage::sharded_vtab::benchmarks::rollout_benchmark_smoke_executes_both_independent_read_paths_with_real_telemetry \
+  -- --exact
+```
+
+The process sampler currently requires Unix `getrusage` and `ps`. Run the full
+optimized matrix on a quiet machine with:
+
+```bash
+cargo test --release --locked --features experimental-vtab --lib \
+  storage::sharded_vtab::benchmarks::release_benchmark_matrix_reports_issue_131_rollout_gate \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+The full command executes 96 ten-second trials and takes at least 16 minutes,
+plus fixture and warm-up time. Its TSV output includes the frozen controls,
+baseline digest, throughput, CPU, current/sampled-peak RSS, lifetime-peak RSS
+diagnostic, WAL measurements, sampled pool occupancy, shard skew, error classes,
+and telemetry sample count for every executed trial, plus eight typed
+unsupported comparator records. It then emits median case rows, paired
+throughput/CPU-per-operation ratios, diagnostic WAL file-size ratios, explicit
+failure or unresolved reasons, and an overall benchmark `HOLD`/`PASS` row. Known snapshot
+and live-protocol blockers are included so this benchmark-only summary cannot
+claim full rollout. Attach the complete output and correctness results to the
+decision record. Do not substitute historical issue #126/#129 numbers or turn
+an unavailable comparator into a ratio.
+
+## Issue #131 frozen rollout result (2026-08-12)
+
+The full optimized command above completed in 1,057.76 seconds on an Apple M1
+Pro (10 cores, 16 GiB), macOS 26.2, Rust/Cargo 1.94.1. This was an interactive
+host with normal background services, not a dedicated benchmark runner. The
+alternating path order and byte-identical paired fixtures remain important
+controls for that reason.
+
+All 96 timed trials completed. They reported zero operation errors, and every
+post-trial manifest/shard quick check, foreign-key check, acknowledged-row
+reconciliation, generated-ID uniqueness check, and placement check completed
+without rejecting a trial. The report also contains the eight required typed
+unavailable records. The complete 159-line artifact is
+[issue-131-rollout-2026-08-12.tsv](benchmarks/issue-131-rollout-2026-08-12.tsv)
+(SHA-256
+`6fbdf6d0ccd7fa9f8d8f8fac8b4963b3e20787646fbd1432717cdea1b7a5cac3`).
+
+The paired medians were:
+
+| Clients | Workload | Facade ops/s | Engine ops/s | Throughput ratio | CPU/op ratio | Gate |
+| ---: | --- | ---: | ---: | ---: | ---: | --- |
+| 2 | point read | 3,221.272 | 58,312.984 | 0.055 | 13.466 | fail |
+| 2 | scatter read | 321.495 | 1,862.361 | 0.173 | 1.239 | fail |
+| 2 | explicit write | 1,917.859 | 5,572.737 | 0.344 | 11.920 | fail |
+| 4 | point read | 3,573.597 | 76,976.795 | 0.046 | 12.824 | fail |
+| 4 | scatter read | 370.214 | 2,617.840 | 0.141 | 2.143 | fail |
+| 4 | explicit write | 2,086.287 | 10,397.291 | 0.201 | 7.981 | fail |
+| 8 | point read | 3,489.517 | 102,936.149 | 0.034 | 19.004 | fail |
+| 8 | scatter read | 351.913 | 4,062.149 | 0.087 | 7.053 | fail |
+| 8 | explicit write | 2,129.595 | 5,439.228 | 0.392 | 1.733 | fail |
+| 10 | point read | 3,621.235 | 109,586.853 | 0.033 | 22.423 | fail |
+| 10 | scatter read | 365.763 | 5,643.218 | 0.065 | 12.299 | fail |
+| 10 | explicit write | 2,420.113 | 4,734.179 | 0.511 | 1.261 | fail |
+
+Every throughput ratio is below the frozen 0.80 threshold. Every CPU ratio
+except the two-client scatter result exceeds the 1.25 ceiling; the ten-client
+explicit-write CPU ratio misses narrowly at 1.261. Sampled RSS, sampled pool
+occupancy, and WAL file-size ratios remain diagnostics and cannot turn a case
+into a pass.
+
+The standalone generated-write medians were:
+
+| Clients | Native ops/s | Native minimum/client | Native spread | Hi/lo ops/s | Hi/lo minimum/client | Hi/lo max/mean |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 1,931.623 | 9,590 | 2 | 2,065.439 | 9,846 | 1.031 |
+| 4 | 2,016.159 | 5,010 | 4 | 2,627.435 | 6,080 | 1.032 |
+| 8 | 2,095.238 | 2,524 | 8 | 2,559.076 | 3,098 | 1.031 |
+| 10 | 2,308.715 | 2,216 | 10 | 2,724.337 | 2,674 | 1.029 |
+
+No generated-write case met the prerequisite of at least 10,000 successful
+writes by every client in every trial, so none may pass the placement/skew
+gate. Native-range also observed spreads above its one-write bound. The
+established path remains honestly unavailable for both generated-ID policies.
+
+The issue #131 rollout decision is therefore **HOLD**. The facade remains
+experimental and off by default. Performance misses alone are sufficient;
+unresolved cross-shard snapshot semantics and missing live PostgreSQL/MySQL
+conformance independently keep the gate closed.
+
 ## Initial snapshot
 
 The initial issue #3 branch was measured on 2026-08-07 with `cargo bench

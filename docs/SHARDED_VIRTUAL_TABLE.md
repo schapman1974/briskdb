@@ -264,8 +264,9 @@ aggregate/order/limit/join pushdown, parallel shard scans, or a public
 virtual-table query API. The physical-default restriction is intentional:
 SQLite's `xUpdate` arguments do not distinguish an omitted column from explicit
 `NULL`, so only an AST-preflighted intent may enable allocation. Omitted-key SQL
-is limited to the issue #130 contract, and the broader rollout gate remains
-#131.
+is limited to the issue #130 contract. Issue #131 completed the broader
+[rollout gate](VTAB_ROLLOUT.md) with a hold decision: the facade remains
+experimental and off by default.
 
 The established protocol planner stays authoritative. The writable coordinator
 is kept behind both `experimental-vtab` and the runtime option and cannot be
@@ -280,6 +281,7 @@ might still match, materialize every reached shard before SQLite applies the
 outer operation. A shard over the prototype budget can therefore fail a
 small-looking aggregate or limited query. Separate child connections also
 observe independent SQLite snapshots, so the facade does not promise one
-cross-shard snapshot while writers commit. It must not be wired to the query
-app until streaming, request controls, consistency policy, and the rollout gate
-in #131 are complete.
+cross-shard snapshot while writers commit. The issue #131 gate therefore did
+not approve wiring it to the query app; streaming, request controls, a
+consistency policy, measured performance, and live wire-protocol parity remain
+required by [the decision record](VTAB_ROLLOUT.md).

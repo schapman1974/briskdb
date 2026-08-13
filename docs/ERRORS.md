@@ -55,6 +55,23 @@ queries and extended `Parse` use the engine `Unsupported` mapping (`0A000`) and
 never include query text. The complete sequencing is in
 [PostgreSQL startup and listener](POSTGRES_LISTENER.md).
 
+### Experimental virtual-table rollout boundary
+
+The cross-protocol error table does not by itself make the experimental
+virtual-table facade reachable from every frontend. The current rollout gate
+is intentionally asymmetric:
+
+| Surface | Reachability and tested unsupported behavior | Remaining dependency |
+| --- | --- | --- |
+| HTTP | A populated catalog with `experimental-vtab` and the write opt-in can reach the coordinator. The execute endpoint maps `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints, and attachments to the fixed `Unsupported` 501 problem; caller-authored DML `RETURNING` has that result through both data endpoints. All fail before pool admission, and protocol tests verify that the shard files are unchanged. | Transaction support still requires a protocol-neutral pinned transaction state machine. |
+| PostgreSQL | Production simple `Query` and extended `Parse` stop at fixed `Unsupported` / `0A000`, return idle recovery state, and never enter planning, pool admission, or the coordinator even when its engine has the write opt-in. | Query execution is issue #31; transaction state and shard pinning are issue #34. |
+| MySQL | There is no listener or command state machine. `mysql_error(Unsupported)` is only the deterministic future-adapter contract: error 1235, SQLSTATE `42000`, and the same safe message. | Listener and query flow are issues #40–#43; result/error encoding is issue #44; transactions are issue #47. |
+
+Consequently, issue #131 cannot declare cross-wire facade rollout complete
+until the PostgreSQL and MySQL dependencies above can run the same no-mutation
+conformance cases. Inventing a MySQL socket path in this rollout gate would
+duplicate those scoped frontend issues.
+
 Only `Busy` is retryable. A caller should retry it with bounded exponential
 backoff and jitter. No other HTTP status, SQLSTATE, or MySQL error number
 implies retryability in BriskDB; notably, `OutOfMemory` and

@@ -843,6 +843,110 @@ mod tests {
 
     #[cfg(feature = "experimental-vtab")]
     #[tokio::test]
+    async fn opted_in_vtab_http_rejects_transactional_and_unsupported_sql_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 4).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE records (
+                    tenant_id TEXT NOT NULL PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "records",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let database = Arc::new(database);
+        let options = EngineOptions::new(2, 16)
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let engine = Engine::from_database_with_options(Arc::clone(&database), options).unwrap();
+        let before = engine.pool_snapshot_for_test().unwrap();
+        let application = router_with_engine(engine.clone());
+        let mapping = http_error(EngineErrorKind::Unsupported);
+        let expected = json!({
+            "type": mapping.problem_type,
+            "title": mapping.title,
+            "status": mapping.status,
+            "detail": mapping.detail,
+            "code": EngineErrorKind::Unsupported.code()
+        });
+
+        let cases = [
+            (
+                "/v1/execute",
+                json!({"sql": "BEGIN", "shard_key": "blocked-tenant"}),
+            ),
+            (
+                "/v1/execute",
+                json!({"sql": "COMMIT", "shard_key": "blocked-tenant"}),
+            ),
+            (
+                "/v1/execute",
+                json!({"sql": "ROLLBACK", "shard_key": "blocked-tenant"}),
+            ),
+            (
+                "/v1/execute",
+                json!({"sql": "SAVEPOINT private_savepoint", "shard_key": "blocked-tenant"}),
+            ),
+            (
+                "/v1/execute",
+                json!({"sql": "ATTACH DATABASE ':memory:' AS private_db", "shard_key": "blocked-tenant"}),
+            ),
+            (
+                "/v1/execute",
+                json!({
+                    "sql": "INSERT INTO records (tenant_id, payload) VALUES (?1, ?2) RETURNING payload",
+                    "params": ["blocked-tenant", "must-not-be-stored"],
+                    "shard_key": "blocked-tenant"
+                }),
+            ),
+            (
+                "/v1/query",
+                json!({
+                    "sql": "INSERT INTO records (tenant_id, payload) VALUES (?1, ?2) RETURNING payload",
+                    "params": ["blocked-tenant", "must-not-be-stored"],
+                    "shard_key": "blocked-tenant"
+                }),
+            ),
+        ];
+
+        for (uri, body) in cases {
+            assert_eq!(
+                request_json(&application, Method::POST, uri, Some(body)).await,
+                (StatusCode::NOT_IMPLEMENTED, expected.clone()),
+                "unsupported request through {uri}"
+            );
+        }
+
+        assert_eq!(
+            engine.pool_snapshot_for_test().unwrap(),
+            before,
+            "unsupported SQL must fail before pool admission"
+        );
+        for shard in 0..database.shard_count() {
+            let rows =
+                rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM records", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap();
+            assert_eq!(rows, 0, "unsupported SQL mutated physical shard {shard}");
+        }
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
     async fn http_omitted_key_insert_returns_exact_generated_id_and_actual_owner() {
         let temp = tempfile::tempdir().unwrap();
         let mut database = Database::open(temp.path(), 4).unwrap();
