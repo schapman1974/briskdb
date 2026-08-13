@@ -50,6 +50,34 @@ The default database location is `/var/lib/briskdb/data`. The HTTP listener is
 `127.0.0.1:7654`, and PostgreSQL is disabled. The server rejects non-loopback
 listeners while authentication and TLS are absent.
 
+## Enable PostgreSQL queries
+
+PostgreSQL queries require an initialized registered catalog. Stop the service
+and import a standard SQLite database into a destination that does not already
+exist. The source and plan must be readable by the `briskdb` system user:
+
+```bash
+sudo systemctl stop briskdb
+sudo -u briskdb /usr/bin/briskdb-import \
+  --source /path/readable-by-briskdb/source.sqlite \
+  --data-dir /var/lib/briskdb/imported-data \
+  --plan /path/readable-by-briskdb/import-plan.json \
+  --shards 4
+```
+
+Set these values in `/etc/default/briskdb`, keeping the listener on loopback:
+
+```text
+BRISKDB_POSTGRES_LISTEN=127.0.0.1:5433
+BRISKDB_DATA_DIR=/var/lib/briskdb/imported-data
+BRISKDB_SHARDS=4
+```
+
+Restart the service, then use the `psql` commands in the
+[PostgreSQL query quickstart](POSTGRES_QUICKSTART.md). The initial interface
+supports one simple-query statement at a time; it has no authentication, TLS,
+DDL, transactions, parameters, or extended-query protocol yet.
+
 ## Logging
 
 The service writes structured text to stdout/stderr; systemd sends both streams

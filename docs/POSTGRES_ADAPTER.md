@@ -108,9 +108,9 @@ server:
    HTTP/PostgreSQL service, tracked termination, and shutdown cleanup.
 
 The issue-29 loopback command and its response tag remain only a private unit
-probe. They are not supported SQL or public protocol behavior. Production
-startup has separate raw-wire contract tests and deliberately returns `0A000`
-for queries until issue #31.
+probe. Production simple queries instead use the Engine's public
+prepare/describe/bind/logical-execute lifecycle and have separate raw-wire
+contract tests.
 
 ## Library fit and retained ownership
 
@@ -182,12 +182,16 @@ validation, emits BriskDB-owned status, and tracks that session through
 termination and server shutdown. It does not use the dependency's default
 startup values or protocol-version state.
 
-Issue #31 owns simple and extended query flow. Until then, every simple query
-and extended `Parse` receives a fixed `0A000` error with protocol recovery and
-no retained statement. Later roadmap issues retain their existing
-minor-version negotiation, type, transaction, cancellation, TLS/SCRAM,
-client-matrix, and row-streaming scopes. The exact live contract is in the
-[PostgreSQL listener document](POSTGRES_LISTENER.md).
+Issue #157 adds the bounded first slice of issue #31: one simple-query statement
+can execute registered-table reads and writes through the Engine, return
+text-format rows or command tags, clean up its temporary prepared objects, and
+recover after fixed public errors. Extended `Parse` remains fixed `0A000` with
+no retained dependency statement. Later roadmap issues retain their existing
+extended-query, minor-version negotiation, broader type, transaction,
+cancellation, TLS/SCRAM, client-matrix, and row-streaming scopes. The exact
+live contract and user workflow are in the
+[PostgreSQL listener document](POSTGRES_LISTENER.md) and
+[query quickstart](POSTGRES_QUICKSTART.md).
 
 ## Errors, configuration, and storage
 

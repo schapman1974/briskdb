@@ -4,7 +4,7 @@
 # The alpha HTTP endpoint has no authentication or TLS and must remain loopback.
 BRISKDB_LISTEN=127.0.0.1:7654
 
-# PostgreSQL supports startup/session handling but cannot execute SQL yet.
+# PostgreSQL simple queries are available on loopback but have no auth or TLS.
 BRISKDB_POSTGRES_LISTEN=disabled
 
 # Persistent package-managed state location. Back up this complete directory

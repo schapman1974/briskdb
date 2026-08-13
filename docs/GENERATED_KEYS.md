@@ -317,8 +317,10 @@ type/OID and result behavior remains coordinated with
 [issue #33](https://github.com/schapman1974/briskdb/issues/33). MySQL
 `AUTO_INCREMENT` result/status encoding remains coordinated with
 [issue #44](https://github.com/schapman1974/briskdb/issues/44). There is
-currently no MySQL listener, and the PostgreSQL listener still defers SQL
-execution.
+currently no MySQL listener. PostgreSQL simple queries can execute explicit-key
+writes; omitted generated-key inserts still depend on the documented compile
+and runtime coordinator gates, and the wire response exposes only the affected
+row command tag in this initial slice.
 
 This release does not promise PostgreSQL sequence objects or sequence options,
 MySQL session variables such as `LAST_INSERT_ID()`, caller-authored

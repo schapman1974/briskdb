@@ -15,7 +15,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::{Sink, SinkExt, StreamExt};
+use futures::{Sink, SinkExt, StreamExt, stream};
 use pgwire::{
     api::{
         ClientInfo, ClientPortalStore, DefaultClient, ErrorHandler, PgWireConnectionState,
@@ -23,7 +23,10 @@ use pgwire::{
         auth::StartupHandler,
         portal::Portal,
         query::{ExtendedQueryHandler, SimpleQueryHandler},
-        results::{DescribePortalResponse, DescribeStatementResponse, Response},
+        results::{
+            DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
+            FieldInfo, QueryResponse, Response, Tag,
+        },
         stmt::{NoopQueryParser, QueryParser, StoredStatement},
         store::PortalStore,
     },
@@ -32,7 +35,6 @@ use pgwire::{
         PgWireBackendMessage, PgWireFrontendMessage, ProtocolVersion, SslNegotiationMetaMessage,
         extendedquery::Parse,
         response::{GssEncResponse, ReadyForQuery, SslResponse, TransactionStatus},
-        simplequery::Query,
         startup::{Authentication, ParameterStatus},
     },
     tokio::server::{PgWireMessageServerCodec, process_error, process_message},
@@ -45,11 +47,12 @@ use tokio_util::codec::Framed;
 
 use crate::{
     core::{
-        DescribeTarget, Engine, EngineError, EngineResult, EngineStatus, LogicalDatabaseId,
-        PrepareRequest, PreparedStatementDescription, PreparedStatementId, Session, SessionId,
+        DataType, DescribeTarget, Engine, EngineError, EngineResult, EngineStatus,
+        LogicalDatabaseId, PrepareRequest, PreparedExecution, PreparedStatementDescription,
+        PreparedStatementId, ResultSet, Session, SessionId, Value,
     },
     protocol::error::postgres_error,
-    sql::{MAX_PARSED_SQL_BYTES, SqlDialect, SqlTranslationMode},
+    sql::{MAX_PARSED_SQL_BYTES, SqlDialect, SqlTranslationMode, StatementBehavior, WriteBehavior},
 };
 
 const POSTGRES_PROTOCOL_MAJOR: u16 = 3;
@@ -511,10 +514,73 @@ impl Connection {
     /// Read engine status through this connection's protocol-neutral session.
     ///
     /// Startup uses this operation to prove that the selected session can enter
-    /// the controlled async engine boundary. Query and prepared execution
-    /// remain later roadmap work.
+    /// the controlled async engine boundary.
     pub async fn status(&self) -> EngineResult<EngineStatus> {
         self.state.engine.status(&self.state.session).await
+    }
+
+    async fn execute_simple_query(
+        &self,
+        sql: &str,
+    ) -> EngineResult<(StatementBehavior, PreparedExecution)> {
+        let statement = self
+            .state
+            .engine
+            .prepare_statement(
+                &self.state.session,
+                PrepareRequest::new(
+                    self.state.database,
+                    SqlDialect::PostgreSql,
+                    SqlTranslationMode::Compatibility,
+                    sql,
+                ),
+            )
+            .await?;
+
+        let result = self.execute_prepared_simple_query(statement).await;
+        let cleanup = self
+            .state
+            .engine
+            .close_prepared_statement(&self.state.session, statement)
+            .await;
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(result), Ok(_)) => Ok(result),
+        }
+    }
+
+    async fn execute_prepared_simple_query(
+        &self,
+        statement: PreparedStatementId,
+    ) -> EngineResult<(StatementBehavior, PreparedExecution)> {
+        let description = self
+            .state
+            .engine
+            .describe_prepared(&self.state.session, DescribeTarget::Statement(statement))
+            .await?;
+        let behavior = description.behavior();
+        let portal = self
+            .state
+            .engine
+            .bind_statement(&self.state.session, statement, Vec::new())
+            .await?;
+        let result = self
+            .state
+            .engine
+            .execute_portal_logical(&self.state.session, portal)
+            .await
+            .map(|executed| (behavior, executed.value));
+        let cleanup = self
+            .state
+            .engine
+            .close_portal(&self.state.session, portal)
+            .await;
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(result), Ok(_)) => Ok(result),
+        }
     }
 
     /// Close this connection's core session.
@@ -553,6 +619,13 @@ struct WireConnectionState {
 }
 
 impl WireConnection {
+    fn installed(&self) -> PgWireResult<&Arc<Connection>> {
+        self.state
+            .connection
+            .get()
+            .ok_or_else(|| fatal_wire_error("08P01", "PostgreSQL startup has not completed"))
+    }
+
     async fn install(&self, user: &str, database: &str) -> PgWireResult<()> {
         if self.state.connection.get().is_some() {
             return Err(fatal_wire_error(
@@ -759,23 +832,126 @@ impl StartupHandler for WireHandlers {
 
 #[async_trait]
 impl SimpleQueryHandler for WireHandlers {
-    async fn on_query<C>(&self, _client: &mut C, _query: Query) -> PgWireResult<()>
+    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Err(unsupported_query_error())
+        let (behavior, execution) = self
+            .connection
+            .installed()?
+            .execute_simple_query(query)
+            .await
+            .map_err(engine_error_to_pgwire)?;
+        Ok(vec![simple_query_response(behavior, execution)?])
     }
+}
 
-    async fn do_query<C>(&self, _client: &mut C, _query: &str) -> PgWireResult<Vec<Response>>
-    where
-        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: fmt::Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        Err(unsupported_query_error())
+fn simple_query_response(
+    behavior: StatementBehavior,
+    execution: PreparedExecution,
+) -> PgWireResult<Response> {
+    match execution {
+        PreparedExecution::Rows(result) if matches!(behavior, StatementBehavior::Read) => {
+            result_set_response(result)
+        }
+        PreparedExecution::AffectedRows(rows) => {
+            Ok(Response::Execution(write_tag(behavior, rows)?))
+        }
+        PreparedExecution::GeneratedWrite(result) => Ok(Response::Execution(write_tag(
+            behavior,
+            result.rows_affected,
+        )?)),
+        _ => Err(internal_query_error()),
     }
+}
+
+fn write_tag(behavior: StatementBehavior, rows: usize) -> PgWireResult<Tag> {
+    let tag = match behavior {
+        StatementBehavior::Write(WriteBehavior::Insert) => {
+            Tag::new("INSERT").with_oid(0).with_rows(rows)
+        }
+        StatementBehavior::Write(WriteBehavior::Update) => Tag::new("UPDATE").with_rows(rows),
+        StatementBehavior::Write(WriteBehavior::Delete) => Tag::new("DELETE").with_rows(rows),
+        _ => return Err(internal_query_error()),
+    };
+    Ok(tag)
+}
+
+fn result_set_response(result: ResultSet) -> PgWireResult<Response> {
+    let (columns, rows) = result.into_parts();
+    let fields = Arc::new(
+        columns
+            .into_iter()
+            .map(|column| {
+                FieldInfo::new(
+                    column.name,
+                    None,
+                    None,
+                    postgres_type(column.data_type),
+                    FieldFormat::Text,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let encoded = rows
+        .into_iter()
+        .map(|row| encode_data_row(Arc::clone(&fields), row.into_values()))
+        .collect::<Vec<_>>();
+    if encoded.iter().any(Result::is_err) {
+        return Err(internal_query_error());
+    }
+    Ok(Response::Query(QueryResponse::new(
+        fields,
+        stream::iter(encoded),
+    )))
+}
+
+fn postgres_type(data_type: DataType) -> Type {
+    match data_type {
+        DataType::Boolean => Type::BOOL,
+        DataType::Int64 => Type::INT8,
+        DataType::UInt64 | DataType::Decimal => Type::NUMERIC,
+        DataType::Float64 => Type::FLOAT8,
+        DataType::Binary => Type::BYTEA,
+        DataType::Unknown | DataType::Null | DataType::Text => Type::TEXT,
+    }
+}
+
+fn encode_data_row(
+    fields: Arc<Vec<FieldInfo>>,
+    values: Vec<Value>,
+) -> PgWireResult<pgwire::messages::data::DataRow> {
+    let mut encoder = DataRowEncoder::new(fields);
+    for value in values {
+        match value {
+            Value::Null => encoder.encode_field(&None::<String>)?,
+            Value::Boolean(value) => encoder.encode_field(&value)?,
+            Value::Int64(value) => encoder.encode_field(&value)?,
+            Value::UInt64(value) => encoder.encode_field(&value.to_string())?,
+            Value::Float64(value) => encoder.encode_field(&value)?,
+            Value::Decimal(value) => encoder.encode_field(&value.into_string())?,
+            Value::Text(value) => encoder.encode_field(&value)?,
+            Value::InvalidText(_) => return Err(invalid_text_query_error()),
+            Value::Binary(value) => encoder.encode_field(&value)?,
+        }
+    }
+    encoder.finish()
+}
+
+fn internal_query_error() -> PgWireError {
+    engine_error_to_pgwire(EngineError::new(
+        crate::core::EngineErrorKind::Internal,
+        "the PostgreSQL response could not be encoded",
+    ))
+}
+
+fn invalid_text_query_error() -> PgWireError {
+    engine_error_to_pgwire(EngineError::new(
+        crate::core::EngineErrorKind::InvalidTextEncoding,
+        "PostgreSQL UTF8 output cannot represent stored invalid text",
+    ))
 }
 
 #[async_trait]
@@ -1043,7 +1219,7 @@ fn fatal_wire_error(code: &'static str, message: &'static str) -> PgWireError {
 fn unsupported_query_error() -> PgWireError {
     engine_error_to_pgwire(EngineError::new(
         crate::core::EngineErrorKind::Unsupported,
-        "PostgreSQL query flow is not implemented yet",
+        "the PostgreSQL extended query flow is not implemented yet",
     ))
 }
 
@@ -1348,6 +1524,145 @@ mod tests {
             .to_owned();
         assert_eq!(fields.next(), Some([].as_slice()));
         (name, value)
+    }
+
+    fn command_tag(body: &[u8]) -> &str {
+        let (terminator, tag) = body.split_last().unwrap();
+        assert_eq!(*terminator, 0);
+        std::str::from_utf8(tag).unwrap()
+    }
+
+    fn data_row(body: &[u8]) -> Vec<Option<Vec<u8>>> {
+        let count = usize::from(u16::from_be_bytes(body[..2].try_into().unwrap()));
+        let mut fields = Vec::with_capacity(count);
+        let mut offset = 2;
+        for _ in 0..count {
+            let length = i32::from_be_bytes(body[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            if length == -1 {
+                fields.push(None);
+            } else {
+                let length = usize::try_from(length).unwrap();
+                fields.push(Some(body[offset..offset + length].to_vec()));
+                offset += length;
+            }
+        }
+        assert_eq!(offset, body.len());
+        fields
+    }
+
+    fn row_description(body: &[u8]) -> Vec<(String, u32)> {
+        let count = usize::from(u16::from_be_bytes(body[..2].try_into().unwrap()));
+        let mut fields = Vec::with_capacity(count);
+        let mut offset = 2;
+        for _ in 0..count {
+            let end = body[offset..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|relative| offset + relative)
+                .unwrap();
+            let name = std::str::from_utf8(&body[offset..end]).unwrap().to_owned();
+            offset = end + 1;
+            offset += 4 + 2;
+            let oid = u32::from_be_bytes(body[offset..offset + 4].try_into().unwrap());
+            offset += 4 + 2 + 4 + 2;
+            fields.push((name, oid));
+        }
+        assert_eq!(offset, body.len());
+        fields
+    }
+
+    #[test]
+    fn simple_query_type_oids_and_text_values_are_stable() {
+        let cases = [
+            (DataType::Unknown, Type::TEXT),
+            (DataType::Null, Type::TEXT),
+            (DataType::Boolean, Type::BOOL),
+            (DataType::Int64, Type::INT8),
+            (DataType::UInt64, Type::NUMERIC),
+            (DataType::Float64, Type::FLOAT8),
+            (DataType::Decimal, Type::NUMERIC),
+            (DataType::Text, Type::TEXT),
+            (DataType::Binary, Type::BYTEA),
+        ];
+        for (data_type, expected) in cases {
+            assert_eq!(postgres_type(data_type), expected);
+        }
+
+        let types = [
+            DataType::Null,
+            DataType::Boolean,
+            DataType::Int64,
+            DataType::UInt64,
+            DataType::Float64,
+            DataType::Decimal,
+            DataType::Text,
+            DataType::Binary,
+        ];
+        let fields = Arc::new(
+            types
+                .into_iter()
+                .enumerate()
+                .map(|(index, data_type)| {
+                    FieldInfo::new(
+                        format!("field_{index}"),
+                        None,
+                        None,
+                        postgres_type(data_type),
+                        FieldFormat::Text,
+                    )
+                })
+                .collect(),
+        );
+        let row = encode_data_row(
+            fields,
+            vec![
+                Value::Null,
+                Value::Boolean(true),
+                Value::Int64(-42),
+                Value::UInt64(u64::MAX),
+                Value::Float64(1.5),
+                Value::decimal("12.3400").unwrap(),
+                Value::Text("hello".to_owned()),
+                Value::Binary(vec![0, 255]),
+            ],
+        )
+        .unwrap();
+        let mut body = row.field_count.to_be_bytes().to_vec();
+        body.extend_from_slice(&row.data);
+        assert_eq!(
+            data_row(&body),
+            [
+                None,
+                Some(b"t".to_vec()),
+                Some(b"-42".to_vec()),
+                Some(u64::MAX.to_string().into_bytes()),
+                Some(b"1.5".to_vec()),
+                Some(b"12.3400".to_vec()),
+                Some(b"hello".to_vec()),
+                Some(br"\x00ff".to_vec()),
+            ]
+        );
+
+        let invalid = encode_data_row(
+            Arc::new(vec![FieldInfo::new(
+                "invalid".to_owned(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )]),
+            vec![Value::InvalidText(vec![0x80])],
+        )
+        .unwrap_err();
+        let PgWireError::UserError(info) = invalid else {
+            panic!("invalid UTF-8 should use a fixed BriskDB wire error")
+        };
+        assert_eq!(info.code, "22021");
+        assert_eq!(
+            info.message,
+            postgres_error(EngineErrorKind::InvalidTextEncoding).message
+        );
     }
 
     async fn assert_eof(stream: &mut TcpStream) {
@@ -1747,8 +2062,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_query_is_fixed_unsupported_and_connection_remains_reusable() {
-        let (_temp, engine) = engine(2).await;
+    async fn simple_query_executes_registered_writes_and_reads_and_recovers_from_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = crate::core::Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE records (
+                    tenant_id TEXT NOT NULL PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                crate::core::TableDeclaration::sharded(
+                    logical_database,
+                    "records",
+                    crate::core::ShardKeyMetadata::new(
+                        "tenant_id",
+                        crate::core::ShardKeyType::Text,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let engine = Engine::from_database(Arc::new(database));
         let adapter = Adapter::new(engine.clone());
         let (address, wire, server) = spawn_wire_server(&adapter).await;
         let mut client = TcpStream::connect(address).await.unwrap();
@@ -1756,22 +2096,107 @@ mod tests {
         read_until_ready(&mut client).await;
         let core = Arc::clone(wire.connection().unwrap());
 
-        for query in [b"SELECT 'private query text'\0".as_slice(), b"\0"] {
-            client.write_all(&typed_packet(b'Q', query)).await.unwrap();
-            let frames = read_until_ready(&mut client).await;
-            assert_eq!(frames.len(), 2);
-            assert_eq!(frames[0].0, b'E');
-            let fields = message_fields(&frames[0].1);
-            assert_eq!(fields.get(&b'S').map(String::as_str), Some("ERROR"));
-            assert_eq!(fields.get(&b'C').map(String::as_str), Some("0A000"));
-            assert_eq!(
-                fields.get(&b'M').map(String::as_str),
-                Some(postgres_error(crate::core::EngineErrorKind::Unsupported).message)
-            );
-            assert!(!fields.get(&b'M').unwrap().contains("private query text"));
-            assert_eq!(frames[1], (b'Z', vec![b'I']));
-            assert_eq!(core.status().await.unwrap().shard_count(), 2);
+        client
+            .write_all(&typed_packet(
+                b'Q',
+                b"INSERT INTO records (tenant_id, payload) VALUES ('tenant-a', 'hello')\0",
+            ))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'C', b'Z']
+        );
+        assert_eq!(command_tag(&frames[0].1), "INSERT 0 1");
+
+        let duplicate = core
+            .execute_simple_query(
+                "INSERT INTO records (tenant_id, payload) VALUES ('tenant-a', 'duplicate')",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.kind(), EngineErrorKind::UniqueViolation);
+        for _ in 0..130 {
+            core.execute_simple_query("SELECT 1").await.unwrap();
         }
+
+        client
+            .write_all(&typed_packet(
+                b'Q',
+                b"SELECT tenant_id, payload FROM records WHERE tenant_id = 'tenant-a'\0",
+            ))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'T', b'D', b'C', b'Z']
+        );
+        assert_eq!(
+            row_description(&frames[0].1),
+            [
+                ("tenant_id".to_owned(), Type::TEXT.oid()),
+                ("payload".to_owned(), Type::TEXT.oid())
+            ]
+        );
+        assert_eq!(
+            data_row(&frames[1].1),
+            [Some(b"tenant-a".to_vec()), Some(b"hello".to_vec())]
+        );
+        assert_eq!(command_tag(&frames[2].1), "SELECT 1");
+
+        client
+            .write_all(&typed_packet(
+                b'Q',
+                b"UPDATE records SET payload = 'updated' WHERE tenant_id = 'tenant-a'\0",
+            ))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'C', b'Z']
+        );
+        assert_eq!(command_tag(&frames[0].1), "UPDATE 1");
+
+        client
+            .write_all(&typed_packet(
+                b'Q',
+                b"DELETE FROM records WHERE tenant_id = 'tenant-a'\0",
+            ))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'C', b'Z']
+        );
+        assert_eq!(command_tag(&frames[0].1), "DELETE 1");
+
+        client
+            .write_all(&typed_packet(
+                b'Q',
+                b"SELECT 'private query text'; SELECT 2\0",
+            ))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'E', b'Z']
+        );
+        let fields = message_fields(&frames[0].1);
+        assert_eq!(fields.get(&b'S').map(String::as_str), Some("ERROR"));
+        assert!(!fields.get(&b'M').unwrap().contains("private query text"));
+
+        client.write_all(&typed_packet(b'Q', b"\0")).await.unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'I', b'Z']
+        );
+        assert_eq!(core.status().await.unwrap().shard_count(), 2);
 
         finish_wire_server(&mut client, server).await;
         assert_eq!(core.state().await, SessionState::Closed);
@@ -1780,7 +2205,7 @@ mod tests {
 
     #[cfg(feature = "experimental-vtab")]
     #[tokio::test]
-    async fn opted_in_vtab_is_unreachable_from_deferred_postgres_query_flows() {
+    async fn extended_query_remains_blocked_when_simple_writes_are_enabled() {
         let temp = tempfile::tempdir().unwrap();
         let mut database = crate::core::Database::open(temp.path(), 2).unwrap();
         database
@@ -1811,7 +2236,6 @@ mod tests {
             .unwrap()
             .with_experimental_vtab_writes(true);
         let engine = Engine::from_database_with_options(Arc::clone(&database), options).unwrap();
-        let before = engine.pool_snapshot_for_test().unwrap();
         let adapter = Adapter::new(engine.clone());
         let (address, wire, server) = spawn_wire_server(&adapter).await;
         let mut client = TcpStream::connect(address).await.unwrap();
@@ -1819,12 +2243,7 @@ mod tests {
         read_until_ready(&mut client).await;
         let expected = postgres_error(EngineErrorKind::Unsupported);
 
-        for sql in [
-            "BEGIN",
-            "INSERT INTO records (tenant_id, payload) VALUES ('blocked-tenant', 'must-not-be-stored')",
-            "COMMIT",
-            "ROLLBACK",
-        ] {
+        for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
             let mut body = sql.as_bytes().to_vec();
             body.push(0);
             client.write_all(&typed_packet(b'Q', &body)).await.unwrap();
@@ -1866,11 +2285,6 @@ mod tests {
         client.write_all(&typed_packet(b'S', &[])).await.unwrap();
         assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
 
-        assert_eq!(
-            engine.pool_snapshot_for_test().unwrap(),
-            before,
-            "deferred PostgreSQL query flow must not admit storage work"
-        );
         for shard in 0..database.shard_count() {
             let rows =
                 rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
@@ -1879,7 +2293,10 @@ mod tests {
                         row.get::<_, i64>(0)
                     })
                     .unwrap();
-            assert_eq!(rows, 0, "PostgreSQL query mutated physical shard {shard}");
+            assert_eq!(
+                rows, 0,
+                "extended PostgreSQL query mutated physical shard {shard}"
+            );
         }
 
         finish_wire_server(&mut client, server).await;

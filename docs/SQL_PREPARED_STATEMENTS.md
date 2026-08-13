@@ -440,11 +440,11 @@ handling to that type.
 ## Dialect and adapter compatibility
 
 The lifecycle is implemented as a Rust engine API. Production PostgreSQL
-startup now validates identity and creates one selected core session, but every
-simple query and extended `Parse` stops at a fixed `0A000` response. That wire
-boundary creates no prepared statement or portal and does not yet enter this
-lifecycle. There is no MySQL listener. All three typed Rust input paths share
-the same planning and result path:
+startup validates identity and creates one selected core session. Each
+simple-query statement enters this lifecycle with no parameters, then closes
+its temporary statement and portal after execution or failure. Extended
+`Parse` still stops at fixed `0A000`. There is no MySQL listener. All three
+typed Rust input paths share the same planning and result path:
 
 | Input | Required mode and parameter form | Prepared execution result |
 | --- | --- | --- |
@@ -454,10 +454,11 @@ the same planning and result path:
 
 Each protocol adapter owns its message framing, authentication,
 statement/portal naming, wire parameter decoding, result type encoding, close
-acknowledgement, and protocol resynchronization. PostgreSQL startup framing and
-session ownership are implemented; issue #31 must map its query messages into
-this lifecycle rather than retain a SQLite handle, implement a second cache,
-interpolate values into SQL, or choose a physical shard itself.
+acknowledgement, and protocol resynchronization. PostgreSQL startup framing,
+session ownership, and parameter-free simple queries are implemented; issue
+#31 must map extended query messages into this lifecycle rather than retain a
+SQLite handle, implement a second cache, interpolate values into SQL, or choose
+a physical shard itself.
 
 ## Storage-format boundary
 
