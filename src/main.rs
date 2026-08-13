@@ -13,7 +13,7 @@ use briskdb::{
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_POSTGRES_LISTEN: &str = "127.0.0.1:5433";
+const DEFAULT_POSTGRES_LISTEN: &str = "disabled";
 
 /// Command-line representation of an optional TCP listener.
 ///
@@ -212,10 +212,7 @@ mod tests {
         let args = Args::try_parse_from(["briskdb"]).unwrap();
 
         assert_eq!(args.listen, "127.0.0.1:7654".parse().unwrap());
-        assert_eq!(
-            args.postgres_listen,
-            ListenerSetting::Address(DEFAULT_POSTGRES_LISTEN.parse().unwrap())
-        );
+        assert_eq!(args.postgres_listen, ListenerSetting::Disabled);
         assert_eq!(args.data_dir, PathBuf::from("./briskdb-data"));
         assert_eq!(args.shards, 4);
         assert_eq!(args.connections_per_shard, DEFAULT_CONNECTIONS_PER_SHARD);
@@ -432,6 +429,15 @@ mod tests {
         assert_eq!(args.postgres_listen, ListenerSetting::Disabled);
 
         let (config, _) = args.into_server_parts().unwrap();
+        assert_eq!(config.postgres_listen, None);
+    }
+
+    #[test]
+    fn postgres_listener_is_disabled_in_the_default_server_config() {
+        let args = Args::try_parse_from(["briskdb"]).unwrap();
+
+        let (config, _) = args.into_server_parts().unwrap();
+
         assert_eq!(config.postgres_listen, None);
     }
 

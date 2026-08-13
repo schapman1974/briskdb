@@ -1,10 +1,11 @@
 # PostgreSQL startup and listener contract
 
-BriskDB serves PostgreSQL protocol 3.0 startup on a separately configured
-loopback TCP listener. A successful startup selects one logical database,
-creates one protocol-neutral core session, publishes BriskDB-owned parameter
-status, and keeps the socket alive until `Terminate`, EOF, server shutdown, or
-a protocol failure. SQL query execution begins in roadmap issue #31.
+BriskDB can serve PostgreSQL protocol 3.0 startup on a disabled-by-default,
+separately configured loopback TCP listener. A successful startup selects one
+logical database, creates one protocol-neutral core session, publishes
+BriskDB-owned parameter status, and keeps the socket alive until `Terminate`,
+EOF, server shutdown, or a protocol failure. SQL query execution begins in
+roadmap issue #31.
 
 ## Process configuration
 
@@ -12,8 +13,8 @@ The binary exposes one value with one grammar:
 
 | Source | Default | Enabled value | Disabled value |
 | --- | --- | --- | --- |
-| CLI | `--postgres-listen 127.0.0.1:5433` | numeric loopback `SocketAddr`, such as `127.0.0.1:6543` or `[::1]:6543` | `--postgres-listen disabled` |
-| Environment | `BRISKDB_POSTGRES_LISTEN=127.0.0.1:5433` | the same numeric loopback grammar | `BRISKDB_POSTGRES_LISTEN=disabled` |
+| CLI | `--postgres-listen disabled` | `--postgres-listen 127.0.0.1:5433`, or another numeric loopback `SocketAddr` such as `[::1]:5433` | `--postgres-listen disabled` |
+| Environment | `BRISKDB_POSTGRES_LISTEN=disabled` | `BRISKDB_POSTGRES_LISTEN=127.0.0.1:5433`, or the same numeric loopback grammar | `BRISKDB_POSTGRES_LISTEN=disabled` |
 
 An explicit command-line value wins over the environment; the environment wins
 over the default. `disabled` is the exact lowercase sentinel. Empty values,
@@ -31,9 +32,9 @@ HTTP listener remains independently configured and always enabled.
 - `Some(address)` validates, binds, and serves PostgreSQL startup;
 - `None` skips its bind, accept branch, and shutdown work.
 
-The process-only `disabled` spelling is converted to `None` before entering the
-server library. `server::run` and `server::run_with_engine_options` retain their
-existing signatures.
+The default or explicit process-only `disabled` spelling is converted to `None`
+before entering the server library. `server::run` and
+`server::run_with_engine_options` retain their existing signatures.
 
 ## Startup and failure order
 
@@ -186,7 +187,7 @@ Library selection details and upgrade constraints are normative in the
 
 Automated coverage includes:
 
-- default, explicit IPv4/IPv6, environment, CLI-over-environment, disabled, and
+- disabled-by-default, explicit IPv4/IPv6, environment, CLI-over-environment, and
   malformed configuration values;
 - loopback validation before database or listener creation;
 - dual-listener binding, bind-failure cleanup, and clean retry;

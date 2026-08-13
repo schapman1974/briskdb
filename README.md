@@ -198,31 +198,33 @@ cargo run --bin briskdb-import -- \
 See the [import contract](docs/SQLITE_IMPORT.md) for schema support,
 verification, cancellation, and publication behavior.
 
-The unauthenticated HTTP listener defaults to `127.0.0.1:7654` and currently
-requires an IPv4 or IPv6 loopback address. A non-loopback value is rejected
-before the engine opens or either listener binds. The separate PostgreSQL TCP
-listener defaults to `127.0.0.1:5433`. Set either an explicit socket address or
-the exact value `disabled` with `--postgres-listen`; the corresponding
-environment variable is `BRISKDB_POSTGRES_LISTEN`. Command-line input takes
-precedence over the environment, which takes precedence over the default. The
-HTTP address, data directory, and shard count can also be supplied with
-`BRISKDB_LISTEN`, `BRISKDB_DATA_DIR`, and `BRISKDB_SHARDS`.
+The initial alpha is HTTP-first: HTTP is the only query-capable network
+interface, and the startup/session-only PostgreSQL listener is disabled by
+default. The unauthenticated HTTP listener defaults to `127.0.0.1:7654` and
+currently requires an IPv4 or IPv6 loopback address. A non-loopback value is
+rejected before the engine opens or either listener binds. Enable the separate
+PostgreSQL TCP listener with an explicit loopback socket address, or use the
+exact value `disabled` with `--postgres-listen`; the corresponding environment
+variable is `BRISKDB_POSTGRES_LISTEN`. Command-line input takes precedence over
+the environment, which takes precedence over the default. The HTTP address,
+data directory, and shard count can also be supplied with `BRISKDB_LISTEN`,
+`BRISKDB_DATA_DIR`, and `BRISKDB_SHARDS`.
 
 An enabled PostgreSQL address must also be IPv4 or IPv6 loopback in the current
 phase.
 
 ```bash
-# Keep the existing HTTP service and do not bind the PostgreSQL port.
-cargo run -- --postgres-listen disabled
+# Explicitly enable the startup/session-only PostgreSQL endpoint.
+cargo run -- --postgres-listen 127.0.0.1:5433
 
 # The environment has the same value grammar.
-BRISKDB_POSTGRES_LISTEN=disabled cargo run
+BRISKDB_POSTGRES_LISTEN=127.0.0.1:5433 cargo run
 ```
 
-The PostgreSQL listener currently accepts only loopback addresses. It supports
-protocol 3.0 startup and session selection, then reports fixed `0A000` errors
-for SQL until issue #31 adds simple and extended query execution. It is not yet
-a query-capable PostgreSQL interface. See the
+The disabled-by-default PostgreSQL listener accepts only loopback addresses. It
+supports protocol 3.0 startup and session selection, then reports fixed
+`0A000` errors for SQL until issue #31 adds simple and extended query execution.
+It is not yet a query-capable PostgreSQL interface. See the
 [listener contract](docs/POSTGRES_LISTENER.md) and
 [adapter decision record](docs/POSTGRES_ADAPTER.md).
 
