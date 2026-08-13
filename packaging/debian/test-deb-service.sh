@@ -44,12 +44,12 @@ printf '\n# package smoke-test local configuration\n' | sudo tee -a "$configurat
 sudo touch "$state_directory/package-smoke-state"
 sudo env DEBIAN_FRONTEND=noninteractive dpkg -i "$package"
 grep -F '# package smoke-test local configuration' "$configuration"
-test -f "$state_directory/package-smoke-state"
+sudo test -f "$state_directory/package-smoke-state"
 wait_for_service
 
 sudo env DEBIAN_FRONTEND=noninteractive dpkg -r briskdb
 test -f "$configuration"
-test -f "$state_directory/package-smoke-state"
+sudo test -f "$state_directory/package-smoke-state"
 if systemctl is-active --quiet briskdb.service; then
     echo "briskdb.service remained active after package removal" >&2
     exit 1
