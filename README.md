@@ -103,7 +103,8 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
   into the raw HTTP execute/query path, while an empty catalog alone retains
   the legacy pass-through behavior
 - A transactionally versioned `manifest.sqlite` with durable 4,096-bucket
-  routing plus logical-database and authoritative table-placement metadata
+  routing, logical-database and authoritative table-placement metadata, and
+  optional per-table durable `hilo_v1` ID block leasing
 - A supported offline SQLite importer with complete per-table placement plans,
   one physical owner for every Sharded row, explicit-only Global replication,
   exact-value verification, and atomic no-replace publication
@@ -113,7 +114,8 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
   recreated after initialization
 - Routed writes and catalog-aware logical query execution, with a separately
   compiled and runtime-enabled virtual-table coordinator for explicit-key
-  autocommit writes to registered Sharded tables
+  autocommit writes to registered Sharded tables and internal preflighted
+  generated-key seams for `native_range_v1` and `hilo_v1`
 - A crash-resumable, journaled schema-migration endpoint for every shard
 - A checksummed manifest, generation-bound shard-schema fingerprints, and
   fail-closed `Verifying`/`Ready`/`Migrating`/`Degraded` storage states
@@ -561,6 +563,25 @@ keep their original hash route. An internal coordinator seam can allocate and
 capture one preflighted omitted-key row on an eligible active shard, but no
 public Engine or HTTP SQL path can invoke it yet. SQL declarations, omitted-key
 Engine planning, and response rendering remain issue #130.
+
+Version 11 adds optional `hilo_v1`, a manifest-leased global sequence for one
+registered Sharded table. The generated column must be the table's exact
+visible `Int64` shard key and physically `INTEGER PRIMARY KEY` without
+`AUTOINCREMENT` on every shard. One immediate manifest transaction reserves a
+fixed block of 4,096 sequences before any target-shard write lock; an in-memory
+allocator then consumes that committed block and hash-routes each encoded ID
+across the ordinary persisted bucket map. The value interval is
+`0x2000_0000_0000_0001..=0x3fff_ffff_ffff_ffff`, disjoint from
+`native_range_v1`. A monotonic fence and random 32-byte process incarnation
+identify each committed lease without clocks or expiry. Committed ranges are
+never reclaimed: restart, crash, rollback, cancellation, and constraint
+failure may burn an ID or unused range tail, so gaps are expected and numeric
+order is allocation order, not commit order. The allocator promises uniqueness
+and non-reuse, not gapless IDs or global commit ordering. Explicit inserts may
+still use negative and positive pre-marker legacy IDs, which hash-route normally;
+the complete hi/lo namespace is allocator-owned and rejected when supplied by
+the caller. This release exposes generation through the lower coordinator seam;
+public DDL/omitted-key SQL and wire-result integration remain issue #130.
 
 Registration marks schema admission `Pending` before its manifest commit. If
 that commit reports an ambiguous cleanup or I/O failure, close the registering

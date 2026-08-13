@@ -7,19 +7,28 @@
 //!   storage::sharded_vtab::benchmarks::release_benchmark_matrix_reports_issue_126_comparison \
 //!   -- --ignored --exact --nocapture --test-threads=1
 //! ```
+//!
+//! Compare the two generated-ID allocators at 2, 4, 8, and 10 writers with:
+//!
+//! ```text
+//! cargo test --release --locked --features experimental-vtab --lib \
+//!   storage::sharded_vtab::benchmarks::release_benchmark_matrix_reports_issue_129_generated_write_comparison \
+//!   -- --ignored --exact --nocapture --test-threads=1
+//! ```
 
 use std::{
     fs,
     hint::black_box,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Barrier},
+    thread,
     time::{Duration, Instant},
 };
 
 use rusqlite::params;
 use tokio::runtime::{Builder, Runtime};
 
-use super::{MAX_CURSOR_BYTES, MAX_CURSOR_ROWS, ReadCoordinator, Storage};
+use super::{MAX_CURSOR_BYTES, MAX_CURSOR_ROWS, ReadCoordinator, Storage, WriteCoordinator};
 use crate::core::{
     Database, Engine, EngineOptions, GeneratedIdPolicy, ResultLimits, Session, ShardKeyMetadata,
     ShardKeyType, Statement, TableDeclaration, Value, generated_id::NativeRangeV1Id,
@@ -35,6 +44,9 @@ const WARMUP_OPERATIONS: usize = 3;
 const MIN_SAMPLE_DURATION: Duration = Duration::from_millis(250);
 const TARGET_SAMPLE_DURATION: Duration = Duration::from_millis(500);
 const MAX_CALIBRATED_ITERATIONS: usize = 1_000_000;
+const GENERATED_WRITE_SHARDS: u16 = 4;
+const GENERATED_WRITER_MATRIX: [usize; 4] = [2, 4, 8, 10];
+const GENERATED_WRITES_PER_WORKER: usize = 10_000;
 
 const CREATE_BENCHMARK_TABLES: &str = "
     CREATE TABLE benchmark_hash (
@@ -44,10 +56,27 @@ const CREATE_BENCHMARK_TABLES: &str = "
         PRIMARY KEY (tenant_id, row_no)
     ) STRICT;
     CREATE TABLE benchmark_native (
-        id INTEGER PRIMARY KEY NOT NULL,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         payload TEXT NOT NULL
     ) STRICT;
 ";
+
+const CREATE_GENERATED_WRITE_TABLES: &str = "
+    CREATE TABLE benchmark_generated_native (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        payload TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE benchmark_generated_hilo (
+        id INTEGER PRIMARY KEY,
+        payload TEXT NOT NULL
+    ) STRICT;
+";
+const NATIVE_GENERATED_INSERT_SQL: &str =
+    "INSERT INTO benchmark_generated_native (id, payload) VALUES (NULL, ?1)";
+const HILO_GENERATED_INSERT_SQL: &str =
+    "INSERT INTO benchmark_generated_hilo (id, payload) VALUES (NULL, ?1)";
+const NATIVE_GENERATED_COUNT_SQL: &str = "SELECT COUNT(*) FROM benchmark_generated_native";
+const HILO_GENERATED_COUNT_SQL: &str = "SELECT COUNT(*) FROM benchmark_generated_hilo";
 
 const HASH_POINT_SQL: &str = "
     SELECT tenant_id, row_no, payload
@@ -315,6 +344,192 @@ impl BenchmarkFixture {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneratedWritePolicy {
+    NativeRangeV1,
+    HiloV1,
+}
+
+impl GeneratedWritePolicy {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::NativeRangeV1 => "native_range_v1",
+            Self::HiloV1 => "hilo_v1",
+        }
+    }
+
+    const fn insert_sql(self) -> &'static str {
+        match self {
+            Self::NativeRangeV1 => NATIVE_GENERATED_INSERT_SQL,
+            Self::HiloV1 => HILO_GENERATED_INSERT_SQL,
+        }
+    }
+
+    const fn count_sql(self) -> &'static str {
+        match self {
+            Self::NativeRangeV1 => NATIVE_GENERATED_COUNT_SQL,
+            Self::HiloV1 => HILO_GENERATED_COUNT_SQL,
+        }
+    }
+}
+
+struct GeneratedWriteBenchmarkFixture {
+    storage: Storage,
+    native_table_id: u64,
+    hilo_table_id: u64,
+    _temp: tempfile::TempDir,
+}
+
+impl GeneratedWriteBenchmarkFixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("create issue #129 benchmark directory");
+        let mut database = Database::open(temp.path(), GENERATED_WRITE_SHARDS)
+            .expect("open issue #129 benchmark database");
+        database
+            .broadcast(CREATE_GENERATED_WRITE_TABLES)
+            .expect("create issue #129 generated-ID tables on every shard");
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "benchmark_generated_native",
+                    ShardKeyMetadata::new("id", ShardKeyType::Int64)
+                        .expect("declare benchmark native shard key"),
+                )
+                .expect("declare benchmark native table")
+                .with_generated_id_policy(
+                    GeneratedIdPolicy::native_range_v1("id")
+                        .expect("declare benchmark native generated-ID policy"),
+                )
+                .expect("apply benchmark native generated-ID policy"),
+                TableDeclaration::sharded(
+                    logical_database,
+                    "benchmark_generated_hilo",
+                    ShardKeyMetadata::new("id", ShardKeyType::Int64)
+                        .expect("declare benchmark hilo shard key"),
+                )
+                .expect("declare benchmark hilo table")
+                .with_generated_id_policy(
+                    GeneratedIdPolicy::hilo_v1("id")
+                        .expect("declare benchmark hilo generated-ID policy"),
+                )
+                .expect("apply benchmark hilo generated-ID policy"),
+            ])
+            .expect("register issue #129 benchmark catalog");
+        let native_table_id = database
+            .catalog()
+            .table("default", "benchmark_generated_native")
+            .expect("look up benchmark native table")
+            .expect("benchmark native table is registered")
+            .id()
+            .get();
+        let hilo_table_id = database
+            .catalog()
+            .table("default", "benchmark_generated_hilo")
+            .expect("look up benchmark hilo table")
+            .expect("benchmark hilo table is registered")
+            .id()
+            .get();
+        let storage = Storage::open(temp.path(), GENERATED_WRITE_SHARDS)
+            .expect("open issue #129 benchmark storage");
+        Self {
+            storage,
+            native_table_id,
+            hilo_table_id,
+            _temp: temp,
+        }
+    }
+
+    const fn table_id(&self, policy: GeneratedWritePolicy) -> u64 {
+        match policy {
+            GeneratedWritePolicy::NativeRangeV1 => self.native_table_id,
+            GeneratedWritePolicy::HiloV1 => self.hilo_table_id,
+        }
+    }
+
+    fn measure_concurrent_writes(
+        &self,
+        policy: GeneratedWritePolicy,
+        writers: usize,
+        writes_per_worker: usize,
+    ) -> Sample {
+        assert!(writers > 0);
+        assert!(writes_per_worker > 0);
+        let coordinators = (0..writers)
+            .map(|_| {
+                WriteCoordinator::open(self.storage.clone())
+                    .expect("open generated-write benchmark coordinator")
+            })
+            .collect::<Vec<_>>();
+        let barrier = Arc::new(Barrier::new(writers + 1));
+        let table_id = self.table_id(policy);
+        let sql = policy.insert_sql();
+
+        let (elapsed, affected_rows) = thread::scope(|scope| {
+            let handles = coordinators
+                .into_iter()
+                .enumerate()
+                .map(|(worker, mut coordinator)| {
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        let payload = format!("issue-129-{}-worker-{worker}", policy.name());
+                        barrier.wait();
+                        let mut affected_rows = 0_usize;
+                        for _ in 0..writes_per_worker {
+                            let result = coordinator
+                                .execute_generated_dml_auto(
+                                    sql,
+                                    params![payload.as_str()],
+                                    table_id,
+                                )
+                                .expect("execute generated-write benchmark insert");
+                            assert_eq!(result.affected_rows(), 1);
+                            assert!(result.generated_key().is_some());
+                            affected_rows = affected_rows
+                                .checked_add(result.affected_rows())
+                                .expect("benchmark affected-row count fits usize");
+                        }
+                        affected_rows
+                    })
+                })
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            barrier.wait();
+            let affected_rows = handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .expect("generated-write benchmark worker panicked")
+                })
+                .sum::<usize>();
+            (started.elapsed(), affected_rows)
+        });
+        let expected = writers
+            .checked_mul(writes_per_worker)
+            .expect("benchmark operation count fits usize");
+        assert_eq!(affected_rows, expected);
+        Sample {
+            iterations: affected_rows,
+            elapsed,
+        }
+    }
+
+    fn physical_row_count(&self, policy: GeneratedWritePolicy) -> usize {
+        let total = (0..GENERATED_WRITE_SHARDS)
+            .map(|shard| {
+                self.storage
+                    .open_shard(shard)
+                    .expect("open generated-write benchmark shard for counting")
+                    .query_row(policy.count_sql(), [], |row| row.get::<_, i64>(0))
+                    .expect("count generated-write benchmark rows")
+            })
+            .sum::<i64>();
+        usize::try_from(total).expect("generated-write benchmark count is non-negative")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FixtureDiskBytes {
     manifest_database: u64,
     manifest_wal: u64,
@@ -540,6 +755,20 @@ impl SampleSummary {
             operations_per_second * logical_rows_per_operation as f64,
         );
     }
+
+    fn report_generated_writes(self, policy: GeneratedWritePolicy, writers: usize) {
+        println!(
+            "issue129_generated_write\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.2}",
+            policy.name(),
+            GENERATED_WRITE_SHARDS,
+            writers,
+            GENERATED_WRITES_PER_WORKER,
+            self.sample_count,
+            self.median.iterations,
+            self.median.elapsed.as_secs_f64() * 1_000.0,
+            self.operations_per_second(),
+        );
+    }
 }
 
 fn measure_once(operation: &mut impl FnMut() -> usize, iterations: usize) -> Sample {
@@ -657,6 +886,88 @@ fn fixture_disk_bytes_counts_database_and_wal_files_but_not_shm() {
         }
     );
     assert_eq!(measured.total(), 97);
+}
+
+#[test]
+fn generated_write_benchmark_smoke_covers_the_frozen_writer_matrix_and_both_policies() {
+    assert_eq!(GENERATED_WRITER_MATRIX, [2, 4, 8, 10]);
+    assert_eq!(GENERATED_WRITE_SHARDS, 4);
+
+    let fixture = GeneratedWriteBenchmarkFixture::new();
+    for policy in [
+        GeneratedWritePolicy::NativeRangeV1,
+        GeneratedWritePolicy::HiloV1,
+    ] {
+        let sample = fixture.measure_concurrent_writes(policy, 2, 2);
+        assert_eq!(sample.iterations, 4);
+        assert_eq!(fixture.physical_row_count(policy), 4);
+    }
+}
+
+#[test]
+#[ignore = "manual release-mode issue #129 generated-ID benchmark"]
+fn release_benchmark_matrix_reports_issue_129_generated_write_comparison() {
+    if cfg!(debug_assertions) {
+        panic!("run this ignored benchmark with cargo test --release");
+    }
+    println!(
+        "record\tpolicy\tshards\twriters\twrites_per_worker\tsamples\tmedian_total_writes\tmedian_elapsed_ms\tmedian_writes_per_sec"
+    );
+    println!("comparison_record\tshards\twriters\thilo_over_native");
+
+    for writers in GENERATED_WRITER_MATRIX {
+        let fixture = GeneratedWriteBenchmarkFixture::new();
+        let mut native_samples = Vec::with_capacity(SAMPLE_COUNT);
+        let mut hilo_samples = Vec::with_capacity(SAMPLE_COUNT);
+        for sample in 0..SAMPLE_COUNT {
+            if sample % 2 == 0 {
+                native_samples.push(fixture.measure_concurrent_writes(
+                    GeneratedWritePolicy::NativeRangeV1,
+                    writers,
+                    GENERATED_WRITES_PER_WORKER,
+                ));
+                hilo_samples.push(fixture.measure_concurrent_writes(
+                    GeneratedWritePolicy::HiloV1,
+                    writers,
+                    GENERATED_WRITES_PER_WORKER,
+                ));
+            } else {
+                hilo_samples.push(fixture.measure_concurrent_writes(
+                    GeneratedWritePolicy::HiloV1,
+                    writers,
+                    GENERATED_WRITES_PER_WORKER,
+                ));
+                native_samples.push(fixture.measure_concurrent_writes(
+                    GeneratedWritePolicy::NativeRangeV1,
+                    writers,
+                    GENERATED_WRITES_PER_WORKER,
+                ));
+            }
+        }
+        let expected_rows = writers
+            .checked_mul(GENERATED_WRITES_PER_WORKER)
+            .and_then(|rows| rows.checked_mul(SAMPLE_COUNT))
+            .expect("benchmark row count fits usize");
+        assert_eq!(
+            fixture.physical_row_count(GeneratedWritePolicy::NativeRangeV1),
+            expected_rows
+        );
+        assert_eq!(
+            fixture.physical_row_count(GeneratedWritePolicy::HiloV1),
+            expected_rows
+        );
+
+        let native = SampleSummary::from_samples(native_samples);
+        let hilo = SampleSummary::from_samples(hilo_samples);
+        native.report_generated_writes(GeneratedWritePolicy::NativeRangeV1, writers);
+        hilo.report_generated_writes(GeneratedWritePolicy::HiloV1, writers);
+        println!(
+            "issue129_generated_comparison\t{}\t{}\t{:.3}",
+            GENERATED_WRITE_SHARDS,
+            writers,
+            hilo.operations_per_second() / native.operations_per_second(),
+        );
+    }
 }
 
 #[test]

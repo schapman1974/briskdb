@@ -70,17 +70,36 @@ routed through its persisted allocation owner at planning, pool admission,
 coordinator execution, and returned-shard reporting. Marker-clear and negative
 legacy IDs retain the exact ordinary Int64 hash route. A reserved sequence
 floor or an owner absent from the active map is rejected before mutation.
+For `hilo_v1`, negative and positive values below
+`0x2000_0000_0000_0000` remain explicit legacy IDs and use that ordinary hash
+route. Every value at or above the marker belongs to a generated-ID namespace
+and a caller-authored INSERT is rejected; only the allocator may introduce a
+hi/lo ID.
 
 The coordinator also has a narrow generated-insert seam for issue #130's
-planner: a caller that has already proven one omitted-key row and selected one
-eligible shard can arm exactly one callback. The child uses
-`INSERT ... RETURNING id`, checks `sqlite_sequence` and decoded ownership on the
-same pinned handle, and retains the generated key only after successful
-reconciliation. `Engine::execute_write` has the protocol-neutral result shape
-needed to carry that data, but every currently accepted Engine statement returns
-`generated_key: None`: Engine and HTTP SQL planning still reject omitted shard
-keys. Dialect translation, Engine invocation, and public response rendering
-belong to #130.
+planner. A caller that has already proven one omitted-key row can arm exactly
+one callback. For `native_range_v1`, the caller may select an eligible shard;
+the child uses `INSERT ... RETURNING id`, checks `sqlite_sequence` and decoded
+ownership on the same pinned handle, and retains the generated key only after
+successful reconciliation. For `hilo_v1`, the coordinator first irrevocably
+consumes an ID from a durable manifest-leased block, hashes that encoded value
+to its target shard, inserts it explicitly with `RETURNING`, and verifies the
+returned value. Leasing occurs before any target-shard write lock. A transaction
+that already pinned a child therefore rejects later hi/lo generation instead
+of moving to another shard. `Engine::execute_write` has the protocol-neutral
+result shape needed to carry that data, but every currently accepted Engine
+statement returns `generated_key: None`: Engine and HTTP SQL planning still
+reject omitted shard keys. Dialect translation, Engine invocation, and public
+response rendering belong to #130.
+
+Each hi/lo manifest write reserves 4,096 global per-table sequence values and
+records a monotonic fence plus a random 32-byte process incarnation. There is no
+clock, expiry, or lease reclamation. The fence identifies one committed block;
+it does not invalidate IDs from an older block. A restart or crash abandons the
+unconsumed tail, and an ID consumed before a rollback, cancellation, ignored
+insert, or constraint failure is never returned. Gaps are therefore normal.
+Numeric ID order is allocation order, not transaction commit order, and the
+contract does not promise a gapless sequence or global commit ordering.
 
 The integration opens an ephemeral coordinator for one statement. It does not
 retain a coordinator in `Session`, and it does not add `BEGIN`, `COMMIT`,
@@ -108,7 +127,9 @@ class mismatch is not a routing proof: it conservatively visits every normal
 target and leaves SQLite to apply its affinity and comparison rules. With
 `native_range_v1`, a valid encoded native integer maps its immutable owner slot
 through the catalog's allocation-owner map. An integer classified as legacy
-under that policy uses the ordinary canonical Int64 hash route instead. No ID
+under that policy uses the ordinary canonical Int64 hash route instead. Under
+`hilo_v1`, valid hi/lo IDs and accepted pre-marker legacy IDs both use that
+canonical hash route; reserved or incompatible namespaces fail closed. No ID
 allocation occurs on this read path.
 
 Normal SQLite evaluates remaining filtering, aggregation, ordering, limits, and

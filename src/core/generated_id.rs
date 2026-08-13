@@ -16,6 +16,14 @@ pub(crate) const MAX_ALLOCATION_OWNER_SLOT: u16 = (1_u16 << NATIVE_RANGE_V1_OWNE
 pub(crate) const MAX_NATIVE_RANGE_V1_LOCAL_SEQUENCE: u64 =
     (1_u64 << NATIVE_RANGE_V1_LOCAL_SEQUENCE_BITS) - 1;
 
+/// `hilo_v1` owns the positive signed interval whose two highest usable bits
+/// are `01`. Values at or above this marker are never legacy IDs under a
+/// `hilo_v1` policy; the native interval is therefore an incompatible stored
+/// namespace rather than something a hi/lo table may hash-route.
+pub(crate) const HILO_V1_FORMAT_MARKER: u64 = 0x2000_0000_0000_0000;
+pub(crate) const HILO_V1_SEQUENCE_BITS: u32 = 61;
+pub(crate) const MAX_HILO_V1_SEQUENCE: u64 = (1_u64 << HILO_V1_SEQUENCE_BITS) - 1;
+
 const NATIVE_RANGE_V1_OWNER_MASK: u64 =
     ((1_u64 << NATIVE_RANGE_V1_OWNER_BITS) - 1) << NATIVE_RANGE_V1_OWNER_SHIFT;
 
@@ -242,6 +250,48 @@ pub(crate) struct NativeRangeV1Id {
     local_sequence: u64,
 }
 
+/// Decoded sequence of one manifest-leased `hilo_v1` ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct HiloV1Id {
+    sequence: u64,
+}
+
+impl HiloV1Id {
+    pub(crate) fn new(sequence: u64) -> EngineResult<Self> {
+        if sequence == 0 {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "hilo_v1 sequence zero is reserved",
+            ));
+        }
+        if sequence > MAX_HILO_V1_SEQUENCE {
+            return Err(EngineError::new(
+                EngineErrorKind::NumericOutOfRange,
+                format!("hilo_v1 sequence {sequence} exceeds {MAX_HILO_V1_SEQUENCE}"),
+            ));
+        }
+        Ok(Self { sequence })
+    }
+
+    pub(crate) const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    pub(crate) fn encode(self) -> i64 {
+        i64::try_from(HILO_V1_FORMAT_MARKER | self.sequence)
+            .expect("hilo_v1 reserves the signed high bit")
+    }
+
+    pub(crate) fn decode(encoded: i64) -> EngineResult<Self> {
+        decode_hilo_v1(encoded)?.ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::NumericOutOfRange,
+                "value does not contain the hilo_v1 format marker",
+            )
+        })
+    }
+}
+
 impl NativeRangeV1Id {
     pub(crate) fn new(owner: AllocationOwnerSlot, local_sequence: u64) -> EngineResult<Self> {
         if local_sequence == 0 {
@@ -298,14 +348,19 @@ pub(crate) enum GeneratedIdClassification {
     Legacy(i64),
     /// A valid value allocated from one native owner range.
     NativeRangeV1(NativeRangeV1Id),
+    /// A valid value allocated from the manifest-backed hi/lo sequence.
+    HiloV1(HiloV1Id),
 }
 
 /// Classify one value without inferring generation policy from its bits.
 ///
 /// A table whose policy is `None` treats every signed 64-bit value as legacy,
-/// including values that resemble a native marker. A native-range table keeps
-/// negative and pre-marker values on the legacy routing path, allowing an
-/// explicitly validated transition without changing existing keys.
+/// including values that resemble a generated marker. A native-range table
+/// keeps negative and pre-native-marker values on the legacy routing path,
+/// allowing an explicitly validated transition without changing existing
+/// keys. A hi/lo table keeps only negative and pre-hi/lo-marker values on that
+/// path; its empty-only registration contract reserves every larger value for
+/// generated formats.
 pub(crate) fn classify_generated_id(
     policy: &GeneratedIdPolicy,
     encoded: i64,
@@ -316,6 +371,12 @@ pub(crate) fn classify_generated_id(
             decoded.map_or(
                 GeneratedIdClassification::Legacy(encoded),
                 GeneratedIdClassification::NativeRangeV1,
+            )
+        }),
+        GeneratedIdPolicy::HiloV1 { .. } => decode_hilo_v1(encoded).map(|decoded| {
+            decoded.map_or(
+                GeneratedIdClassification::Legacy(encoded),
+                GeneratedIdClassification::HiloV1,
             )
         }),
     }
@@ -341,6 +402,16 @@ pub(crate) fn classify_caller_generated_id(
                     )
                 })
         }
+        GeneratedIdPolicy::HiloV1 { .. } => {
+            decode_hilo_v1_with_reserved_error(encoded, EngineErrorKind::InvalidArgument).map(
+                |decoded| {
+                    decoded.map_or(
+                        GeneratedIdClassification::Legacy(encoded),
+                        GeneratedIdClassification::HiloV1,
+                    )
+                },
+            )
+        }
     }
 }
 
@@ -364,6 +435,25 @@ pub(crate) fn native_range_v1_first_id(owner: AllocationOwnerSlot) -> i64 {
 pub(crate) fn native_range_v1_sequence_ceiling(owner: AllocationOwnerSlot) -> i64 {
     NativeRangeV1Id::new(owner, MAX_NATIVE_RANGE_V1_LOCAL_SEQUENCE)
         .expect("the codec's maximum local sequence is valid")
+        .encode()
+}
+
+/// Reserved sequence-zero boundary immediately below the first hi/lo ID.
+pub(crate) fn hilo_v1_sequence_floor() -> i64 {
+    i64::try_from(HILO_V1_FORMAT_MARKER).expect("hilo_v1 reserves the signed high bit")
+}
+
+/// First value produced by the global per-table hi/lo sequence.
+pub(crate) fn hilo_v1_first_id() -> i64 {
+    HiloV1Id::new(1)
+        .expect("hilo_v1 sequence one is valid")
+        .encode()
+}
+
+/// Last value available to the global per-table hi/lo sequence.
+pub(crate) fn hilo_v1_sequence_ceiling() -> i64 {
+    HiloV1Id::new(MAX_HILO_V1_SEQUENCE)
+        .expect("the codec's maximum hi/lo sequence is valid")
         .encode()
 }
 
@@ -402,12 +492,47 @@ fn decode_native_range_v1_with_reserved_error(
     }))
 }
 
+fn decode_hilo_v1(encoded: i64) -> EngineResult<Option<HiloV1Id>> {
+    decode_hilo_v1_with_reserved_error(encoded, EngineErrorKind::DataCorruption)
+}
+
+fn decode_hilo_v1_with_reserved_error(
+    encoded: i64,
+    reserved_error_kind: EngineErrorKind,
+) -> EngineResult<Option<HiloV1Id>> {
+    if encoded < 0 {
+        return Ok(None);
+    }
+    let bits = u64::try_from(encoded).expect("non-negative i64 fits u64");
+    if bits < HILO_V1_FORMAT_MARKER {
+        return Ok(None);
+    }
+    if bits > (HILO_V1_FORMAT_MARKER | MAX_HILO_V1_SEQUENCE) {
+        return Err(EngineError::new(
+            reserved_error_kind,
+            "hilo_v1 row ID uses an incompatible generated-ID namespace",
+        ));
+    }
+    let sequence = bits & MAX_HILO_V1_SEQUENCE;
+    if sequence == 0 {
+        return Err(EngineError::new(
+            reserved_error_kind,
+            "hilo_v1 row ID contains the reserved sequence zero",
+        ));
+    }
+    Ok(Some(HiloV1Id { sequence }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn native_policy() -> GeneratedIdPolicy {
         GeneratedIdPolicy::native_range_v1("id").unwrap()
+    }
+
+    fn hilo_policy() -> GeneratedIdPolicy {
+        GeneratedIdPolicy::hilo_v1("id").unwrap()
     }
 
     #[test]
@@ -444,6 +569,85 @@ mod tests {
             assert_eq!(id.encode(), expected);
             assert_eq!(id.owner(), owner);
             assert_eq!(id.local_sequence(), local_sequence);
+        }
+    }
+
+    #[test]
+    fn hilo_global_sequence_round_trips_at_both_boundaries() {
+        for (sequence, expected) in [
+            (1, 0x2000_0000_0000_0001_i64),
+            (MAX_HILO_V1_SEQUENCE, 0x3fff_ffff_ffff_ffff),
+        ] {
+            let id = HiloV1Id::new(sequence).unwrap();
+            assert_eq!(id.sequence(), sequence);
+            assert_eq!(id.encode(), expected);
+            assert_eq!(HiloV1Id::decode(expected).unwrap(), id);
+            assert_eq!(
+                classify_generated_id(&hilo_policy(), expected).unwrap(),
+                GeneratedIdClassification::HiloV1(id)
+            );
+        }
+        assert_eq!(hilo_v1_sequence_floor(), 0x2000_0000_0000_0000);
+        assert_eq!(hilo_v1_first_id(), 0x2000_0000_0000_0001);
+        assert_eq!(hilo_v1_sequence_ceiling(), 0x3fff_ffff_ffff_ffff);
+        assert!(hilo_v1_sequence_ceiling() < NATIVE_RANGE_V1_FORMAT_MARKER as i64);
+    }
+
+    #[test]
+    fn hilo_zero_overflow_and_later_namespaces_fail_closed() {
+        assert_eq!(
+            HiloV1Id::new(0).unwrap_err().kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            HiloV1Id::new(MAX_HILO_V1_SEQUENCE + 1).unwrap_err().kind(),
+            EngineErrorKind::NumericOutOfRange
+        );
+
+        let floor = hilo_v1_sequence_floor();
+        assert_eq!(
+            classify_generated_id(&hilo_policy(), floor)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+        assert_eq!(
+            classify_caller_generated_id(&hilo_policy(), floor)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::InvalidArgument
+        );
+
+        for value in [NATIVE_RANGE_V1_FORMAT_MARKER as i64, i64::MAX] {
+            let stored = classify_generated_id(&hilo_policy(), value).unwrap_err();
+            assert_eq!(stored.kind(), EngineErrorKind::DataCorruption);
+            assert!(stored.diagnostic().contains("incompatible"));
+
+            let caller = classify_caller_generated_id(&hilo_policy(), value).unwrap_err();
+            assert_eq!(caller.kind(), EngineErrorKind::InvalidArgument);
+            assert!(caller.diagnostic().contains("incompatible"));
+            assert_eq!(
+                HiloV1Id::decode(value).unwrap_err().kind(),
+                EngineErrorKind::DataCorruption
+            );
+        }
+    }
+
+    #[test]
+    fn hilo_policy_preserves_only_negative_and_pre_marker_legacy_ids() {
+        for value in [i64::MIN, -1, 0, 1, (HILO_V1_FORMAT_MARKER - 1) as i64] {
+            assert_eq!(
+                classify_generated_id(&hilo_policy(), value).unwrap(),
+                GeneratedIdClassification::Legacy(value)
+            );
+            assert_eq!(
+                classify_caller_generated_id(&hilo_policy(), value).unwrap(),
+                GeneratedIdClassification::Legacy(value)
+            );
+            assert_eq!(
+                HiloV1Id::decode(value).unwrap_err().kind(),
+                EngineErrorKind::NumericOutOfRange
+            );
         }
     }
 
@@ -509,6 +713,9 @@ mod tests {
             -1,
             0,
             1,
+            HILO_V1_FORMAT_MARKER as i64,
+            0x2000_0000_0000_0001,
+            0x3fff_ffff_ffff_ffff,
             NATIVE_RANGE_V1_FORMAT_MARKER as i64,
             0x4000_0000_0000_0001,
             i64::MAX,
@@ -547,6 +754,7 @@ mod tests {
         assert_owned::<AllocationOwnerState>();
         assert_owned::<AllocationOwnerMap>();
         assert_owned::<NativeRangeV1Id>();
+        assert_owned::<HiloV1Id>();
         assert_owned::<GeneratedIdClassification>();
     }
 

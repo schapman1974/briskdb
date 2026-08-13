@@ -135,6 +135,7 @@ pub enum ShardKeyType {
 ///     match policy {
 ///         GeneratedIdPolicy::None => "none",
 ///         GeneratedIdPolicy::NativeRangeV1 { .. } => "native_range_v1",
+///         GeneratedIdPolicy::HiloV1 { .. } => "hilo_v1",
 ///     }
 /// }
 /// ```
@@ -143,6 +144,14 @@ pub enum ShardKeyType {
 /// use briskdb::core::GeneratedIdPolicy;
 ///
 /// let _ = GeneratedIdPolicy::NativeRangeV1 {
+///     column: "id".to_owned(),
+/// };
+/// ```
+///
+/// ```compile_fail
+/// use briskdb::core::GeneratedIdPolicy;
+///
+/// let _ = GeneratedIdPolicy::HiloV1 {
 ///     column: "id".to_owned(),
 /// };
 /// ```
@@ -163,6 +172,17 @@ pub enum GeneratedIdPolicy {
         /// Canonical generated column name.
         column: String,
     },
+    /// BriskDB leases durable blocks from one manifest-owned, per-table
+    /// sequence and hash-routes each generated ID to its physical shard.
+    ///
+    /// Construction is intentionally restricted to
+    /// [`GeneratedIdPolicy::hilo_v1`] so the stored column name always
+    /// satisfies the canonical catalog-identifier contract.
+    #[non_exhaustive]
+    HiloV1 {
+        /// Canonical generated column name.
+        column: String,
+    },
 }
 
 impl GeneratedIdPolicy {
@@ -178,11 +198,23 @@ impl GeneratedIdPolicy {
         Self::NativeRangeV1 { column }
     }
 
+    /// Construct the first durable manifest-backed hi/lo policy.
+    pub fn hilo_v1(column: impl Into<String>) -> EngineResult<Self> {
+        let column = column.into();
+        ensure_catalog_identifier(&column)?;
+        Ok(Self::HiloV1 { column })
+    }
+
+    pub(crate) fn hilo_v1_from_validated(column: String) -> Self {
+        debug_assert!(validate_catalog_identifier(&column));
+        Self::HiloV1 { column }
+    }
+
     /// Return the generated column, or `None` when generation is disabled.
     pub fn column(&self) -> Option<&str> {
         match self {
             Self::None => None,
-            Self::NativeRangeV1 { column } => Some(column),
+            Self::NativeRangeV1 { column } | Self::HiloV1 { column } => Some(column),
         }
     }
 
@@ -190,7 +222,7 @@ impl GeneratedIdPolicy {
     pub const fn encoding_version(&self) -> Option<u32> {
         match self {
             Self::None => None,
-            Self::NativeRangeV1 { .. } => Some(1),
+            Self::NativeRangeV1 { .. } | Self::HiloV1 { .. } => Some(1),
         }
     }
 }
@@ -410,23 +442,32 @@ fn ensure_generated_id_policy_compatible(
         return Ok(());
     }
 
+    let policy_name = match policy {
+        GeneratedIdPolicy::None => "none",
+        GeneratedIdPolicy::NativeRangeV1 { .. } => "native_range_v1",
+        GeneratedIdPolicy::HiloV1 { .. } => "hilo_v1",
+    };
     let diagnostic = match (placement, policy) {
-        (TablePlacement::Sharded(shard_key), GeneratedIdPolicy::NativeRangeV1 { column: _ })
-            if shard_key.key_type() != ShardKeyType::Int64 =>
-        {
+        (
+            TablePlacement::Sharded(shard_key),
+            GeneratedIdPolicy::NativeRangeV1 { .. } | GeneratedIdPolicy::HiloV1 { .. },
+        ) if shard_key.key_type() != ShardKeyType::Int64 => {
             format!(
-                "native_range_v1 generated IDs require an Int64 shard key, but table shard key {} has a different type",
+                "{policy_name} generated IDs require an Int64 shard key, but table shard key {} has a different type",
                 shard_key.column()
             )
         }
-        (TablePlacement::Sharded(shard_key), GeneratedIdPolicy::NativeRangeV1 { column }) => {
+        (
+            TablePlacement::Sharded(shard_key),
+            GeneratedIdPolicy::NativeRangeV1 { column } | GeneratedIdPolicy::HiloV1 { column },
+        ) => {
             format!(
-                "native_range_v1 generated column {column} must be the table shard key {}",
+                "{policy_name} generated column {column} must be the table shard key {}",
                 shard_key.column()
             )
         }
-        (_, GeneratedIdPolicy::NativeRangeV1 { .. }) => {
-            "native_range_v1 generated IDs require Sharded table placement".to_owned()
+        (_, GeneratedIdPolicy::NativeRangeV1 { .. } | GeneratedIdPolicy::HiloV1 { .. }) => {
+            format!("{policy_name} generated IDs require Sharded table placement")
         }
         (_, GeneratedIdPolicy::None) => {
             "the None generated-ID policy is unexpectedly incompatible".to_owned()
@@ -444,12 +485,14 @@ fn generated_id_policy_is_compatible(
 ) -> bool {
     match policy {
         GeneratedIdPolicy::None => true,
-        GeneratedIdPolicy::NativeRangeV1 { column } => matches!(
-            placement,
-            TablePlacement::Sharded(shard_key)
-                if shard_key.key_type() == ShardKeyType::Int64
-                    && shard_key.column() == column
-        ),
+        GeneratedIdPolicy::NativeRangeV1 { column } | GeneratedIdPolicy::HiloV1 { column } => {
+            matches!(
+                placement,
+                TablePlacement::Sharded(shard_key)
+                    if shard_key.key_type() == ShardKeyType::Int64
+                        && shard_key.column() == column
+            )
+        }
     }
 }
 
@@ -654,6 +697,7 @@ pub(crate) struct CatalogSnapshot {
     logical: Catalog,
     allocation_owners: Option<AllocationOwnerMap>,
     active_native_id_table_ids: Box<[TableId]>,
+    active_hilo_id_table_ids: Box<[TableId]>,
 }
 
 impl CatalogSnapshot {
@@ -664,6 +708,7 @@ impl CatalogSnapshot {
             logical,
             allocation_owners: None,
             active_native_id_table_ids: Box::new([]),
+            active_hilo_id_table_ids: Box::new([]),
         }
     }
 
@@ -682,6 +727,7 @@ impl CatalogSnapshot {
             logical,
             allocation_owners: Some(allocation_owners),
             active_native_id_table_ids: Box::new([]),
+            active_hilo_id_table_ids: Box::new([]),
         }
     }
 
@@ -716,8 +762,33 @@ impl CatalogSnapshot {
         &self.active_native_id_table_ids
     }
 
+    /// Attach the sorted manifest-validated set of active hi/lo tables.
+    pub(crate) fn with_active_hilo_id_table_ids(mut self, table_ids: Box<[TableId]>) -> Self {
+        debug_assert!(table_ids.windows(2).all(|ids| ids[0] < ids[1]));
+        debug_assert!(table_ids.iter().all(|id| {
+            self.logical.table_by_id(*id).is_some_and(|table| {
+                matches!(
+                    table.generated_id_policy(),
+                    GeneratedIdPolicy::HiloV1 { .. }
+                )
+            })
+        }));
+        self.active_hilo_id_table_ids = table_ids;
+        self
+    }
+
+    pub(crate) fn active_hilo_id_table_ids(&self) -> &[TableId] {
+        &self.active_hilo_id_table_ids
+    }
+
     pub(crate) fn native_id_policy_is_active(&self, table_id: TableId) -> bool {
         self.active_native_id_table_ids
+            .binary_search(&table_id)
+            .is_ok()
+    }
+
+    pub(crate) fn hilo_id_policy_is_active(&self, table_id: TableId) -> bool {
+        self.active_hilo_id_table_ids
             .binary_search(&table_id)
             .is_ok()
     }
@@ -922,6 +993,26 @@ mod tests {
                 EngineErrorKind::InvalidArgument
             );
         }
+
+        let hilo = GeneratedIdPolicy::hilo_v1("id").unwrap();
+        assert_eq!(hilo.column(), Some("id"));
+        assert_eq!(hilo.encoding_version(), Some(1));
+        assert_eq!(
+            GeneratedIdPolicy::hilo_v1("Invalid").unwrap_err().kind(),
+            EngineErrorKind::InvalidArgument
+        );
+        let hilo = TableDeclaration::sharded(
+            database,
+            "hilo_events",
+            ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+        )
+        .unwrap()
+        .with_generated_id_policy(hilo)
+        .unwrap();
+        assert!(matches!(
+            hilo.generated_id_policy(),
+            GeneratedIdPolicy::HiloV1 { .. }
+        ));
     }
 
     #[test]
@@ -958,6 +1049,30 @@ mod tests {
                 .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
                 .unwrap_err();
             assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+        }
+
+        for declaration in [
+            TableDeclaration::sharded(
+                database,
+                "events",
+                ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+            )
+            .unwrap(),
+            TableDeclaration::sharded(
+                database,
+                "events",
+                ShardKeyMetadata::new("id", ShardKeyType::Text).unwrap(),
+            )
+            .unwrap(),
+            TableDeclaration::global(database, "events").unwrap(),
+        ] {
+            assert_eq!(
+                declaration
+                    .with_generated_id_policy(GeneratedIdPolicy::hilo_v1("id").unwrap())
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::InvalidArgument
+            );
         }
 
         let disabled = TableDeclaration::global(database, "events")

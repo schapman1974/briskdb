@@ -115,20 +115,33 @@ handles; it does not use `ATTACH`, runtime extension loading, a SQLite fork, or
 a storage-format change. The writable wrapper accepts explicit-key Sharded
 INSERT and exactly routed UPDATE/DELETE, pins one physical transaction, and
 rejects cross-shard or Global writes. An internal preflighted seam also permits
-one `native_range_v1` NULL callback for a single omitted-key row on an already
-selected shard; it captures the generated ID with child `RETURNING` on the same
-handle. Generic generated/missing-key SQL remains rejected until #130 supplies
-AST intent and protocol rendering. Schema operations, attachments, unsafe
+one generated NULL callback for a single omitted-key row. `native_range_v1`
+allocates on an already selected shard and captures the ID with child
+`RETURNING` on the same handle. `hilo_v1` durably leases before taking a child
+write lock, consumes one global per-table ID, hash-routes it, inserts it
+explicitly, and verifies the returned value. A transaction that already pinned
+a shard rejects later hi/lo generation. Generic generated/missing-key SQL
+remains rejected until #130 supplies AST intent and protocol rendering. Schema
+operations, attachments, unsafe
 PRAGMAs, extension loading, defaults, generated columns, triggers, and
 caller-authored `RETURNING` remain rejected. This surface is internal and
 cannot be reached by the query app or protocol adapters.
+
+The lower `hilo_v1` seam reserves fixed 4,096-value blocks in the manifest and
+serves them from a fenced process-local cache. A monotonic fence and random
+32-byte process incarnation identify the committed reservation; no clock or
+expiry is involved. Committed ranges are never reclaimed. Restart, crash,
+rollback, cancellation, an ignored insert, or a constraint failure can burn IDs
+and leave gaps. The guarantee is uniqueness and non-reuse, not gaplessness or
+global commit ordering; numeric order records allocation order only.
 
 Within that feature gate only, a usable equality on the exact cataloged shard
 key requests one virtual-table argument without `omit`. Exact SQLite `INTEGER`,
 UTF-8 `TEXT`, and `BLOB` values can route matching `Int64`, `Text`, and `Binary`
 keys to one child, where the value is bound against the indexed physical key.
-A valid `native_range_v1` value uses its allocation owner; a legacy integer
-under that policy uses normal hash routing. `NULL` is empty, while a non-null
+A valid `native_range_v1` value uses its allocation owner. Valid `hilo_v1` IDs
+and policy-accepted legacy integers use normal hash routing; caller-authored
+hi/lo-namespace inserts are rejected. `NULL` is empty, while a non-null
 type mismatch conservatively scans all placement targets. Unconstrained scans
 visit shards in ascending order and preserve duplicates as `UNION ALL`.
 SQLite applies remaining filters, aggregation, ordering, limits, and

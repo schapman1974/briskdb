@@ -21,7 +21,10 @@ use crate::{
     sqlite_error,
 };
 
-use super::shard::{SHARD_APPLICATION_ID, SHARD_METADATA_VERSION, ShardLayout, ShardLayoutState};
+use super::{
+    hilo::DurableHiloLease,
+    shard::{SHARD_APPLICATION_ID, SHARD_METADATA_VERSION, ShardLayout, ShardLayoutState},
+};
 
 /// `BRDB` encoded as SQLite's 32-bit application identifier.
 pub(super) const MANIFEST_APPLICATION_ID: i64 = 0x4252_4442;
@@ -35,7 +38,8 @@ const V7_SCHEMA_VERSION: u32 = 7;
 const V8_SCHEMA_VERSION: u32 = 8;
 const V9_SCHEMA_VERSION: u32 = 9;
 const V10_SCHEMA_VERSION: u32 = 10;
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = V10_SCHEMA_VERSION;
+const V11_SCHEMA_VERSION: u32 = 11;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = V11_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
 
 pub(super) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = 65_536;
@@ -47,10 +51,12 @@ const TABLE_PROVISIONING_DIGEST_VERSION: u32 = 1;
 const V1_MANIFEST_DIGEST_VERSION: u32 = 1;
 const V2_MANIFEST_DIGEST_VERSION: u32 = 2;
 const V3_MANIFEST_DIGEST_VERSION: u32 = 3;
+const V4_MANIFEST_DIGEST_VERSION: u32 = 4;
 pub(super) const SCHEMA_DIGEST_VERSION: u32 = 1;
 const V1_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v1\0";
 const V2_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v2\0";
 const V3_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v3\0";
+const V4_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v4\0";
 const TABLE_PROVISIONING_DIGEST_DOMAIN: &[u8] = b"briskdb.table-provisioning.v1\0";
 
 const DATABASE_STATE_VERIFYING: i64 = 1;
@@ -67,9 +73,14 @@ const TEXT_SHARD_KEY_TYPE: i64 = 2;
 const BINARY_SHARD_KEY_TYPE: i64 = 3;
 const GENERATED_ID_POLICY_NONE: i64 = 0;
 const GENERATED_ID_POLICY_NATIVE_RANGE_V1: i64 = 1;
+const GENERATED_ID_POLICY_HILO_V1: i64 = 2;
 const GENERATED_ID_INACTIVE: i64 = 0;
 const GENERATED_ID_ACTIVE: i64 = 1;
 const NATIVE_RANGE_V1_ENCODING_VERSION: u32 = 1;
+const HILO_V1_ENCODING_VERSION: u32 = 1;
+pub(super) const HILO_V1_BLOCK_SIZE: u64 = 4_096;
+const MAX_HILO_V1_SEQUENCE: u64 = (1_u64 << 61) - 1;
+const HILO_V1_EXHAUSTED_HEAD: u64 = MAX_HILO_V1_SEQUENCE + 1;
 const MAX_ALLOCATION_OWNER_SLOT: i64 = 1_023;
 const ALLOCATION_OWNER_ACTIVE: i64 = 1;
 const ALLOCATION_OWNER_RETIRED: i64 = 2;
@@ -89,6 +100,13 @@ pub(super) fn fail_next_table_registration_post_commit_for_test() {
 #[cfg(test)]
 fn abort_table_registration_at_test_boundary(boundary: &str) {
     if std::env::var("BRISKDB_TABLE_REGISTRATION_ABORT_POINT").as_deref() == Ok(boundary) {
+        std::process::abort();
+    }
+}
+
+#[cfg(test)]
+fn abort_hilo_lease_at_test_boundary(boundary: &str) {
+    if std::env::var("BRISKDB_HILO_LEASE_ABORT_POINT").as_deref() == Ok(boundary) {
         std::process::abort();
     }
 }
@@ -136,6 +154,10 @@ const V9_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
 const V10_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
         CHECK (requires_manifest_version >= 10)
+) STRICT";
+const V11_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 11)
 ) STRICT";
 const V3_ROUTING_TABLE_SQL: &str = "CREATE TABLE briskdb_routing (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -398,6 +420,51 @@ const V10_TABLE_PROVISIONING_DECLARATIONS_SQL: &str =
             generated_policy > 0
             AND generated_column IS NOT NULL
             AND generated_encoding_version IS NOT NULL
+        )
+    )
+) STRICT";
+const V11_HILO_LEASES_TABLE_SQL: &str = "CREATE TABLE briskdb_hilo_leases (
+    table_id INTEGER PRIMARY KEY CHECK (table_id > 0),
+    block_size INTEGER NOT NULL CHECK (block_size = 4096),
+    next_sequence INTEGER NOT NULL
+        CHECK (next_sequence BETWEEN 1 AND 2305843009213693952),
+    fence_token INTEGER NOT NULL CHECK (fence_token >= 0),
+    last_owner_id BLOB
+        CHECK (
+            last_owner_id IS NULL
+            OR (typeof(last_owner_id) = 'blob' AND length(last_owner_id) = 32)
+        ),
+    last_first_sequence INTEGER
+        CHECK (
+            last_first_sequence IS NULL
+            OR last_first_sequence BETWEEN 1 AND 2305843009213693951
+        ),
+    last_last_sequence INTEGER
+        CHECK (
+            last_last_sequence IS NULL
+            OR last_last_sequence BETWEEN 1 AND 2305843009213693951
+        ),
+    FOREIGN KEY (table_id)
+        REFERENCES briskdb_generated_ids (table_id)
+        ON DELETE RESTRICT,
+    CHECK (
+        (
+            fence_token = 0
+            AND next_sequence = 1
+            AND last_owner_id IS NULL
+            AND last_first_sequence IS NULL
+            AND last_last_sequence IS NULL
+        )
+        OR
+        (
+            fence_token > 0
+            AND last_owner_id IS NOT NULL
+            AND last_first_sequence IS NOT NULL
+            AND last_last_sequence IS NOT NULL
+            AND last_first_sequence <= last_last_sequence
+            AND last_last_sequence < next_sequence
+            AND last_last_sequence = next_sequence - 1
+            AND last_last_sequence - last_first_sequence + 1 BETWEEN 1 AND block_size
         )
     )
 ) STRICT";
@@ -674,6 +741,7 @@ struct ManifestSnapshot {
     integrity: Option<ManifestIntegrity>,
     allocation_owners: Option<AllocationOwnerMap>,
     active_native_id_table_ids: Box<[TableId]>,
+    active_hilo_id_table_ids: Box<[TableId]>,
     active_table_provisioning: Option<NativeTableProvisioning>,
 }
 
@@ -684,6 +752,7 @@ pub(super) struct LoadedManifest {
     active_migration: Option<SchemaMigration>,
     integrity: ManifestIntegrity,
     active_native_id_table_ids: Box<[TableId]>,
+    active_hilo_id_table_ids: Box<[TableId]>,
     active_table_provisioning: Option<NativeTableProvisioning>,
 }
 
@@ -742,6 +811,7 @@ impl LoadedManifest {
         Option<SchemaMigration>,
         ManifestIntegrity,
         Box<[TableId]>,
+        Box<[TableId]>,
         Option<NativeTableProvisioning>,
     ) {
         (
@@ -750,6 +820,7 @@ impl LoadedManifest {
             self.active_migration,
             self.integrity,
             self.active_native_id_table_ids,
+            self.active_hilo_id_table_ids,
             self.active_table_provisioning,
         )
     }
@@ -819,6 +890,13 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v9_to_v10,
         validate: validate_v10,
     },
+    Migration {
+        from: V10_SCHEMA_VERSION,
+        to: V11_SCHEMA_VERSION,
+        name: "durable_hilo_v1_block_leases",
+        apply: migrate_v10_to_v11,
+        validate: validate_v11,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -832,8 +910,8 @@ struct MigrationPlan<'a> {
 const CURRENT_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: CURRENT_SCHEMA_VERSION,
     migrations: MIGRATIONS,
-    initialize_current: create_v10_schema,
-    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v10,
+    initialize_current: create_v11_schema,
+    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v11,
 };
 
 // Startup uses this frozen plan only to finish an already-active v6 journal
@@ -904,6 +982,7 @@ pub(super) fn load_or_create_manifest_with_fresh_layout(
         &mut |_| Ok(()),
     )?;
     let active_native_id_table_ids = std::mem::take(&mut snapshot.active_native_id_table_ids);
+    let active_hilo_id_table_ids = std::mem::take(&mut snapshot.active_hilo_id_table_ids);
     let catalog = catalog_snapshot_from_parts(
         snapshot.routing_catalog.take(),
         snapshot.logical_catalog.take(),
@@ -927,6 +1006,7 @@ pub(super) fn load_or_create_manifest_with_fresh_layout(
         active_migration: snapshot.active_migration,
         integrity,
         active_native_id_table_ids,
+        active_hilo_id_table_ids,
         active_table_provisioning: snapshot.active_table_provisioning,
     })
 }
@@ -1665,6 +1745,170 @@ fn current_manifest_snapshot(
     }
 }
 
+/// Reserve one durable global `hilo_v1` block before any target-shard write
+/// lock is acquired. A commit failure is deliberately not reconciled into a
+/// returned lease: if SQLite committed despite the error, that block remains
+/// burned and the next reservation advances beyond it.
+pub(super) fn reserve_hilo_v1_block(
+    connection: &mut Connection,
+    requested_shards: u16,
+    table_id: TableId,
+    owner_id: [u8; 32],
+) -> EngineResult<DurableHiloLease> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    ensure_table_registration_ready(&snapshot)?;
+    if snapshot.active_table_provisioning.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "hilo_v1 block reservation cannot run during table provisioning",
+        ));
+    }
+    let catalog = snapshot.logical_catalog.as_ref().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "hilo_v1 reservation validation omitted the logical catalog",
+        )
+    })?;
+    let table = catalog.table_by_id(table_id).ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            format!("hilo_v1 reservation refers to unknown table {table_id}"),
+        )
+    })?;
+    if !matches!(
+        table.generated_id_policy(),
+        GeneratedIdPolicy::HiloV1 { .. }
+    ) || snapshot
+        .active_hilo_id_table_ids
+        .binary_search(&table_id)
+        .is_err()
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("hilo_v1 generation is not active for table {table_id}"),
+        ));
+    }
+    let stored_table_id = i64::try_from(table_id.get()).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::NumericOutOfRange,
+            "hilo_v1 table ID does not fit in SQLite",
+            error,
+        )
+    })?;
+    let (stored_block_size, stored_next, stored_fence) = transaction
+        .query_row(
+            "SELECT block_size, next_sequence, fence_token
+             FROM briskdb_hilo_leases
+             WHERE table_id = ?1",
+            [stored_table_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| manifest_read_error(error, "failed to read hilo_v1 allocation head"))?;
+    if stored_block_size != i64::try_from(HILO_V1_BLOCK_SIZE).expect("block size fits i64") {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "hilo_v1 allocation head has an unsupported block size",
+        ));
+    }
+    let first_sequence = u64::try_from(stored_next).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "hilo_v1 allocation head is outside its numeric range",
+            error,
+        )
+    })?;
+    if first_sequence > MAX_HILO_V1_SEQUENCE {
+        return Err(EngineError::new(
+            EngineErrorKind::LimitExceeded,
+            format!("hilo_v1 table {table_id} exhausted its global sequence"),
+        ));
+    }
+    let fence_token = u64::try_from(stored_fence).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "hilo_v1 fence token is outside its numeric range",
+            error,
+        )
+    })?;
+    let next_fence = fence_token
+        .checked_add(1)
+        .filter(|value| *value <= i64::MAX as u64)
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::LimitExceeded,
+                format!("hilo_v1 table {table_id} exhausted its fence tokens"),
+            )
+        })?;
+    let last_sequence = first_sequence
+        .saturating_add(HILO_V1_BLOCK_SIZE - 1)
+        .min(MAX_HILO_V1_SEQUENCE);
+    let next_sequence = last_sequence
+        .checked_add(1)
+        .expect("the maximum hilo_v1 sequence has a representable sentinel");
+    let changed = transaction
+        .execute(
+            "UPDATE briskdb_hilo_leases
+             SET next_sequence = ?1,
+                 fence_token = ?2,
+                 last_owner_id = ?3,
+                 last_first_sequence = ?4,
+                 last_last_sequence = ?5
+             WHERE table_id = ?6
+               AND next_sequence = ?7
+               AND fence_token = ?8",
+            rusqlite::params![
+                i64::try_from(next_sequence).expect("hi/lo sentinel fits SQLite"),
+                i64::try_from(next_fence).expect("bounded hi/lo fence fits SQLite"),
+                owner_id.as_slice(),
+                i64::try_from(first_sequence).expect("hi/lo sequence fits SQLite"),
+                i64::try_from(last_sequence).expect("hi/lo sequence fits SQLite"),
+                stored_table_id,
+                stored_next,
+                stored_fence,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    if changed != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::Busy,
+            "hilo_v1 allocation head changed concurrently",
+        ));
+    }
+    refresh_manifest_digest(&transaction)?;
+    let verified = current_manifest_snapshot(&transaction, requested_shards)?;
+    if verified
+        .active_hilo_id_table_ids
+        .binary_search(&table_id)
+        .is_err()
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "hilo_v1 block reservation lost its active policy",
+        ));
+    }
+    #[cfg(test)]
+    abort_hilo_lease_at_test_boundary("before-commit");
+    transaction.commit().map_err(sqlite_error::storage)?;
+    #[cfg(test)]
+    abort_hilo_lease_at_test_boundary("after-commit");
+    Ok(DurableHiloLease::new(
+        table_id,
+        owner_id,
+        next_fence,
+        first_sequence,
+        last_sequence,
+    ))
+}
+
 /// Classify an exact native table-provisioning request without changing it.
 #[cfg(test)]
 pub(super) fn classify_native_table_provisioning(
@@ -1768,6 +2012,16 @@ where
 
     let provisioning_id =
         table_provisioning_id(&declarations, requested_shards, committed_schema_digest);
+    let initial_next_shard = if declarations.iter().any(|declaration| {
+        matches!(
+            declaration.generated_id_policy(),
+            GeneratedIdPolicy::NativeRangeV1 { .. }
+        )
+    }) {
+        0
+    } else {
+        requested_shards
+    };
     transaction
         .execute(
             "INSERT INTO briskdb_table_provisioning (
@@ -1779,7 +2033,7 @@ where
                 shard_count,
                 declaration_count,
                 next_shard
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 0)",
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 provisioning_id.as_slice(),
                 TABLE_PROVISIONING_DIGEST_VERSION,
@@ -1787,6 +2041,7 @@ where
                 committed_schema_digest.as_slice(),
                 requested_shards,
                 i64::try_from(declarations.len()).expect("bounded declaration count fits SQLite"),
+                initial_next_shard,
             ],
         )
         .map_err(sqlite_error::storage)?;
@@ -2069,7 +2324,8 @@ pub(super) fn inspect_with_v9_plan_for_test(
 fn downgrade_v10_manifest_to_v9_for_test(connection: &Connection) -> EngineResult<()> {
     connection
         .execute_batch(
-            "DROP TABLE briskdb_table_provisioning_declarations;
+            "DROP TABLE IF EXISTS briskdb_hilo_leases;
+             DROP TABLE briskdb_table_provisioning_declarations;
              DROP TABLE briskdb_table_provisioning;
              DROP INDEX briskdb_one_active_owner_per_shard;
              ALTER TABLE briskdb_generated_ids RENAME TO briskdb_generated_ids_v10;
@@ -2120,6 +2376,38 @@ fn downgrade_v10_manifest_to_v9_for_test(connection: &Connection) -> EngineResul
             [V2_MANIFEST_DIGEST_VERSION],
         )
         .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn downgrade_v11_manifest_to_v10_for_test(
+    connection: &Connection,
+    shard_count: u16,
+) -> EngineResult<()> {
+    connection
+        .execute_batch(
+            "DROP TABLE briskdb_hilo_leases;
+             DROP TABLE briskdb_metadata;",
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(V10_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V10_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "UPDATE briskdb_integrity SET manifest_digest_version = ?1 WHERE singleton = 1",
+            [V3_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    set_identity(connection, V10_SCHEMA_VERSION)?;
+    refresh_manifest_digest(connection)?;
+    validate_v10(connection, shard_count, &schema_objects(connection)?)?;
     Ok(())
 }
 
@@ -2180,11 +2468,33 @@ where
             .execute(
                 "UPDATE briskdb_generated_ids
                  SET activation_state = ?1
-                 WHERE policy = ?2",
-                rusqlite::params![GENERATED_ID_ACTIVE, GENERATED_ID_POLICY_NATIVE_RANGE_V1,],
+                 WHERE policy IN (?2, ?3)",
+                rusqlite::params![
+                    GENERATED_ID_ACTIVE,
+                    GENERATED_ID_POLICY_NATIVE_RANGE_V1,
+                    GENERATED_ID_POLICY_HILO_V1,
+                ],
             )
             .map_err(sqlite_error::storage)?;
     }
+    transaction
+        .execute(
+            "INSERT INTO briskdb_hilo_leases (
+                table_id, block_size, next_sequence, fence_token,
+                last_owner_id, last_first_sequence, last_last_sequence
+             )
+             SELECT table_id, ?1, 1, 0, NULL, NULL, NULL
+             FROM briskdb_generated_ids
+             WHERE policy = ?2 AND activation_state = ?3
+             ORDER BY table_id
+             ON CONFLICT(table_id) DO NOTHING",
+            rusqlite::params![
+                i64::try_from(HILO_V1_BLOCK_SIZE).expect("hi/lo block size fits SQLite"),
+                GENERATED_ID_POLICY_HILO_V1,
+                GENERATED_ID_ACTIVE,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
     transaction
         .execute("DELETE FROM briskdb_table_provisioning_declarations", [])
         .map_err(sqlite_error::storage)?;
@@ -2238,7 +2548,7 @@ fn native_table_provisioning_complete(
     if !declarations_match_catalog_owned(declarations, catalog) {
         return false;
     }
-    let expected = catalog
+    let expected_native = catalog
         .tables()
         .iter()
         .filter(|table| {
@@ -2249,7 +2559,19 @@ fn native_table_provisioning_complete(
         })
         .map(TableMetadata::id)
         .collect::<Vec<_>>();
-    expected.as_slice() == snapshot.active_native_id_table_ids.as_ref()
+    let expected_hilo = catalog
+        .tables()
+        .iter()
+        .filter(|table| {
+            matches!(
+                table.generated_id_policy(),
+                GeneratedIdPolicy::HiloV1 { .. }
+            )
+        })
+        .map(TableMetadata::id)
+        .collect::<Vec<_>>();
+    expected_native.as_slice() == snapshot.active_native_id_table_ids.as_ref()
+        && expected_hilo.as_slice() == snapshot.active_hilo_id_table_ids.as_ref()
 }
 
 fn ensure_same_native_table_provisioning_request(
@@ -2514,10 +2836,8 @@ fn insert_authoritative_table_catalog(
         let (policy, generated_column, encoding_version) =
             encoded_generated_id_policy(declaration.generated_id_policy());
         let activation_state = if activate_native
-            && matches!(
-                declaration.generated_id_policy(),
-                GeneratedIdPolicy::NativeRangeV1 { .. }
-            ) {
+            && !matches!(declaration.generated_id_policy(), GeneratedIdPolicy::None)
+        {
             GENERATED_ID_ACTIVE
         } else {
             GENERATED_ID_INACTIVE
@@ -2567,7 +2887,9 @@ fn catalog_snapshot_from_manifest(snapshot: ManifestSnapshot) -> EngineResult<Ca
         snapshot.logical_catalog,
         snapshot.allocation_owners,
     )?;
-    Ok(catalog.with_active_native_id_table_ids(snapshot.active_native_id_table_ids))
+    Ok(catalog
+        .with_active_native_id_table_ids(snapshot.active_native_id_table_ids)
+        .with_active_hilo_id_table_ids(snapshot.active_hilo_id_table_ids))
 }
 
 fn catalog_snapshot_from_parts(
@@ -2661,15 +2983,13 @@ fn normalize_table_provisioning_declarations(
             "table provisioning contains a duplicate logical table",
         ));
     }
-    if !declarations.iter().any(|declaration| {
-        matches!(
-            declaration.generated_id_policy(),
-            GeneratedIdPolicy::NativeRangeV1 { .. }
-        )
-    }) {
+    if !declarations
+        .iter()
+        .any(|declaration| !matches!(declaration.generated_id_policy(), GeneratedIdPolicy::None))
+    {
         return Err(EngineError::new(
             EngineErrorKind::InvalidArgument,
-            "table provisioning requires a native generated-ID declaration",
+            "table provisioning requires a generated-ID declaration",
         ));
     }
     Ok(declarations.into_boxed_slice())
@@ -2737,6 +3057,11 @@ fn encoded_generated_id_policy(policy: &GeneratedIdPolicy) -> (i64, Option<&str>
             GENERATED_ID_POLICY_NATIVE_RANGE_V1,
             Some(column),
             Some(i64::from(NATIVE_RANGE_V1_ENCODING_VERSION)),
+        ),
+        GeneratedIdPolicy::HiloV1 { column } => (
+            GENERATED_ID_POLICY_HILO_V1,
+            Some(column),
+            Some(i64::from(HILO_V1_ENCODING_VERSION)),
         ),
     }
 }
@@ -3177,6 +3502,11 @@ fn create_v10_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineR
     migrate_v9_to_v10(transaction, shard_count)
 }
 
+fn create_v11_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
+    create_v10_schema(transaction, shard_count)?;
+    migrate_v10_to_v11(transaction, shard_count)
+}
+
 fn migrate_interrupted_legacy_to_v6(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -3221,6 +3551,8 @@ fn migrate_interrupted_legacy_to_v9(
     create_v9_schema(transaction, shard_count)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn migrate_interrupted_legacy_to_v10(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -3229,6 +3561,16 @@ fn migrate_interrupted_legacy_to_v10(
         .execute_batch("DROP TABLE briskdb_metadata;")
         .map_err(sqlite_error::storage)?;
     create_v10_schema(transaction, shard_count)
+}
+
+fn migrate_interrupted_legacy_to_v11(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v11_schema(transaction, shard_count)
 }
 
 #[cfg(test)]
@@ -3653,6 +3995,33 @@ fn migrate_v9_to_v10(transaction: &Transaction<'_>, _shard_count: u16) -> Engine
     Ok(())
 }
 
+fn migrate_v10_to_v11(transaction: &Transaction<'_>, _shard_count: u16) -> EngineResult<()> {
+    transaction
+        .execute_batch(V11_HILO_LEASES_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V11_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V11_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "UPDATE briskdb_integrity
+             SET manifest_digest_version = ?1
+             WHERE singleton = 1",
+            [V4_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
 fn add_v5_schema(transaction: &Transaction<'_>, state: ShardLayoutState) -> EngineResult<()> {
     transaction
         .execute_batch("DROP TABLE briskdb_metadata;")
@@ -3977,6 +4346,18 @@ fn v10_objects() -> Vec<SchemaObject> {
     objects
 }
 
+fn v11_objects() -> Vec<SchemaObject> {
+    let mut objects = v10_objects();
+    objects.push(SchemaObject {
+        object_type: "table".to_owned(),
+        name: "briskdb_hilo_leases".to_owned(),
+    });
+    objects.sort_by(|left, right| {
+        (&left.object_type, &left.name).cmp(&(&right.object_type, &right.name))
+    });
+    objects
+}
+
 fn schema_objects(connection: &Connection) -> EngineResult<Vec<SchemaObject>> {
     let mut statement = connection
         .prepare(
@@ -4101,6 +4482,10 @@ fn validate_table(
         "briskdb_table_provisioning_declarations" => {
             "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
              FROM pragma_table_xinfo('briskdb_table_provisioning_declarations') LIMIT ?1"
+        }
+        "briskdb_hilo_leases" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_hilo_leases') LIMIT ?1"
         }
         _ => {
             return Err(EngineError::new(
@@ -4293,6 +4678,7 @@ fn validate_v2(
         integrity: None,
         allocation_owners: None,
         active_native_id_table_ids: Box::new([]),
+        active_hilo_id_table_ids: Box::new([]),
         active_table_provisioning: None,
     })
 }
@@ -4325,6 +4711,7 @@ fn validate_v3(
         integrity: None,
         allocation_owners: None,
         active_native_id_table_ids: Box::new([]),
+        active_hilo_id_table_ids: Box::new([]),
         active_table_provisioning: None,
     })
 }
@@ -4644,6 +5031,48 @@ fn validate_v10(
     snapshot.active_native_id_table_ids = validate_active_native_id_tables(connection)?;
     snapshot.active_table_provisioning = validate_table_provisioning(
         connection,
+        V10_SCHEMA_VERSION,
+        snapshot.shard_count,
+        snapshot.logical_catalog.as_ref(),
+        snapshot.active_migration.as_ref(),
+        snapshot.integrity,
+    )?;
+    Ok(snapshot)
+}
+
+fn validate_v11(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    let mut snapshot = validate_integrity_manifest_with_definition(
+        connection,
+        requested_shards,
+        objects,
+        IntegrityManifestDefinition {
+            version: V11_SCHEMA_VERSION,
+            downgrade_fence_sql: V11_DOWNGRADE_FENCE_SQL,
+            expected_objects: &v11_objects(),
+            expected_manifest_digest_version: V4_MANIFEST_DIGEST_VERSION,
+            generated_ids: true,
+        },
+    )?;
+    snapshot.allocation_owners = Some(validate_allocation_owners(
+        connection,
+        snapshot.shard_count,
+    )?);
+    snapshot.active_native_id_table_ids =
+        validate_active_generated_id_tables(connection, GENERATED_ID_POLICY_NATIVE_RANGE_V1)?;
+    snapshot.active_hilo_id_table_ids =
+        validate_active_generated_id_tables(connection, GENERATED_ID_POLICY_HILO_V1)?;
+    validate_hilo_v1_leases(
+        connection,
+        snapshot.logical_catalog.as_ref(),
+        &snapshot.active_hilo_id_table_ids,
+    )?;
+    snapshot.active_table_provisioning = validate_table_provisioning(
+        connection,
+        V11_SCHEMA_VERSION,
         snapshot.shard_count,
         snapshot.logical_catalog.as_ref(),
         snapshot.active_migration.as_ref(),
@@ -4842,7 +5271,7 @@ fn validate_manifest_semantic_root(
             "manifest checksum version must be positive",
         ));
     }
-    if *version > i64::from(V3_MANIFEST_DIGEST_VERSION) {
+    if *version > i64::from(V4_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -5027,6 +5456,19 @@ const V3_TABLE_PROVISIONING_DECLARATIONS_DIGEST_QUERY: ManifestDigestQuery = Man
     ],
     sql: "SELECT provisioning_singleton, ordinal, database_id, table_name, placement, shard_key_column, shard_key_type, generated_policy, generated_column, generated_encoding_version FROM briskdb_table_provisioning_declarations ORDER BY provisioning_singleton, ordinal",
 };
+const V4_HILO_LEASES_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
+    table: "briskdb_hilo_leases",
+    columns: &[
+        "table_id",
+        "block_size",
+        "next_sequence",
+        "fence_token",
+        "last_owner_id",
+        "last_first_sequence",
+        "last_last_sequence",
+    ],
+    sql: "SELECT table_id, block_size, next_sequence, fence_token, last_owner_id, last_first_sequence, last_last_sequence FROM briskdb_hilo_leases ORDER BY table_id",
+};
 
 fn manifest_semantic_digest_for_version(
     connection: &Connection,
@@ -5064,6 +5506,22 @@ fn manifest_semantic_digest_for_version(
                 }
             }
             (V3_MANIFEST_DIGEST_DOMAIN, queries)
+        }
+        V4_MANIFEST_DIGEST_VERSION => {
+            let mut queries = Vec::with_capacity(V1_MANIFEST_DIGEST_QUERIES.len() + 5);
+            for query in V1_MANIFEST_DIGEST_QUERIES {
+                queries.push(query);
+                if query.table == "briskdb_physical_shards" {
+                    queries.push(&V3_ALLOCATION_OWNERS_DIGEST_QUERY);
+                }
+                if query.table == "briskdb_tables" {
+                    queries.push(&V3_GENERATED_IDS_DIGEST_QUERY);
+                    queries.push(&V4_HILO_LEASES_DIGEST_QUERY);
+                    queries.push(&V3_TABLE_PROVISIONING_DIGEST_QUERY);
+                    queries.push(&V3_TABLE_PROVISIONING_DECLARATIONS_DIGEST_QUERY);
+                }
+            }
+            (V4_MANIFEST_DIGEST_DOMAIN, queries)
         }
         0 => {
             return Err(EngineError::new(
@@ -5199,7 +5657,11 @@ fn refresh_manifest_digest_if_checksummed(connection: &Connection) -> EngineResu
     if application_id == MANIFEST_APPLICATION_ID
         && matches!(
             u32::try_from(version),
-            Ok(V7_SCHEMA_VERSION | V8_SCHEMA_VERSION | V9_SCHEMA_VERSION | V10_SCHEMA_VERSION)
+            Ok(V7_SCHEMA_VERSION
+                | V8_SCHEMA_VERSION
+                | V9_SCHEMA_VERSION
+                | V10_SCHEMA_VERSION
+                | V11_SCHEMA_VERSION)
         )
     {
         let _ = refresh_manifest_digest(connection)?;
@@ -5263,7 +5725,7 @@ fn validate_manifest_integrity(
             "manifest checksum version must be positive",
         ));
     }
-    if *manifest_version > i64::from(V3_MANIFEST_DIGEST_VERSION) {
+    if *manifest_version > i64::from(V4_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -5472,7 +5934,12 @@ fn validate_catalog_manifest(
         validate_schema_catalog_configuration(connection, definition.generation_policy)?;
     let databases =
         validate_logical_databases(connection, catalog_configuration.default_database_id)?;
-    let tables = validate_table_metadata(connection, &databases, definition.generated_ids)?;
+    let tables = validate_table_metadata(
+        connection,
+        &databases,
+        definition.generated_ids,
+        definition.version,
+    )?;
     validate_foreign_keys(connection)?;
 
     Ok(ManifestSnapshot {
@@ -5490,6 +5957,7 @@ fn validate_catalog_manifest(
         integrity: None,
         allocation_owners: None,
         active_native_id_table_ids: Box::new([]),
+        active_hilo_id_table_ids: Box::new([]),
         active_table_provisioning: None,
     })
 }
@@ -5700,6 +6168,13 @@ fn validate_allocation_owners(
 }
 
 fn validate_active_native_id_tables(connection: &Connection) -> EngineResult<Box<[TableId]>> {
+    validate_active_generated_id_tables(connection, GENERATED_ID_POLICY_NATIVE_RANGE_V1)
+}
+
+fn validate_active_generated_id_tables(
+    connection: &Connection,
+    selected_policy: i64,
+) -> EngineResult<Box<[TableId]>> {
     let rows = connection
         .prepare(
             "SELECT table_id, policy, activation_state
@@ -5732,12 +6207,19 @@ fn validate_active_native_id_tables(connection: &Connection) -> EngineResult<Box
         match (policy, state) {
             (GENERATED_ID_POLICY_NONE, GENERATED_ID_INACTIVE) => {}
             (GENERATED_ID_POLICY_NATIVE_RANGE_V1, GENERATED_ID_INACTIVE) => {}
-            (GENERATED_ID_POLICY_NATIVE_RANGE_V1, GENERATED_ID_ACTIVE) => {
+            (GENERATED_ID_POLICY_HILO_V1, GENERATED_ID_INACTIVE) => {}
+            (
+                GENERATED_ID_POLICY_NATIVE_RANGE_V1 | GENERATED_ID_POLICY_HILO_V1,
+                GENERATED_ID_ACTIVE,
+            ) => {
+                if policy != selected_policy {
+                    continue;
+                }
                 active.push(TableId::from_validated(positive_catalog_id(
                     table_id, "table",
                 )?));
             }
-            (_, GENERATED_ID_ACTIVE) if policy > GENERATED_ID_POLICY_NATIVE_RANGE_V1 => {
+            (_, GENERATED_ID_ACTIVE) if policy > GENERATED_ID_POLICY_HILO_V1 => {
                 return Err(EngineError::new(
                     EngineErrorKind::FailedPrecondition,
                     format!("table {table_id} activates a newer generated-ID policy"),
@@ -5754,8 +6236,105 @@ fn validate_active_native_id_tables(connection: &Connection) -> EngineResult<Box
     Ok(active.into_boxed_slice())
 }
 
+fn validate_hilo_v1_leases(
+    connection: &Connection,
+    catalog: Option<&Catalog>,
+    active_hilo_tables: &[TableId],
+) -> EngineResult<()> {
+    validate_table(
+        connection,
+        "briskdb_hilo_leases",
+        &[
+            TableColumn::expected(0, "table_id", "INTEGER", false, 1),
+            TableColumn::expected(1, "block_size", "INTEGER", true, 0),
+            TableColumn::expected(2, "next_sequence", "INTEGER", true, 0),
+            TableColumn::expected(3, "fence_token", "INTEGER", true, 0),
+            TableColumn::expected(4, "last_owner_id", "BLOB", false, 0),
+            TableColumn::expected(5, "last_first_sequence", "INTEGER", false, 0),
+            TableColumn::expected(6, "last_last_sequence", "INTEGER", false, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(connection, "briskdb_hilo_leases", V11_HILO_LEASES_TABLE_SQL)?;
+    let rows = connection
+        .prepare(
+            "SELECT table_id, block_size, next_sequence, fence_token,
+                    last_owner_id, last_first_sequence, last_last_sequence
+             FROM briskdb_hilo_leases
+             ORDER BY table_id
+             LIMIT 4097",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| manifest_read_error(error, "failed to read hi/lo lease metadata"))?;
+    if rows.len() > MAX_TABLES || rows.len() != active_hilo_tables.len() {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "hi/lo lease metadata must contain exactly one row per active hilo_v1 table",
+        ));
+    }
+    let catalog = catalog.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "hi/lo lease validation omitted the logical catalog",
+        )
+    })?;
+    for (row, expected_id) in rows.into_iter().zip(active_hilo_tables) {
+        let (stored_id, block_size, next, fence, owner, first, last) = row;
+        let id = TableId::from_validated(positive_catalog_id(stored_id, "table")?);
+        if id != *expected_id
+            || block_size != i64::try_from(HILO_V1_BLOCK_SIZE).expect("block size fits i64")
+            || !(1..=i64::try_from(HILO_V1_EXHAUSTED_HEAD).expect("hi/lo head fits i64"))
+                .contains(&next)
+            || fence < 0
+            || catalog.table_by_id(id).is_none_or(|table| {
+                !matches!(
+                    table.generated_id_policy(),
+                    GeneratedIdPolicy::HiloV1 { .. }
+                )
+            })
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "hi/lo lease metadata conflicts with its active table policy",
+            ));
+        }
+        let initial =
+            fence == 0 && next == 1 && owner.is_none() && first.is_none() && last.is_none();
+        let leased = fence > 0
+            && owner.as_ref().is_some_and(|value| value.len() == 32)
+            && first.is_some_and(|value| value >= 1)
+            && last.is_some_and(|value| value >= first.unwrap_or_default())
+            && last == next.checked_sub(1)
+            && last.zip(first).is_some_and(|(last, first)| {
+                last - first < i64::try_from(HILO_V1_BLOCK_SIZE).unwrap()
+            });
+        if !initial && !leased {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "hi/lo lease metadata has an incoherent durable block",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_table_provisioning(
     connection: &Connection,
+    manifest_version: u32,
     expected_shard_count: u16,
     catalog: Option<&Catalog>,
     active_migration: Option<&SchemaMigration>,
@@ -5919,7 +6498,8 @@ fn validate_table_provisioning(
             error,
         )
     })?;
-    let declarations = read_table_provisioning_declarations(connection, declaration_count)?;
+    let declarations =
+        read_table_provisioning_declarations(connection, manifest_version, declaration_count)?;
     if table_provisioning_id(&declarations, shard_count, committed_schema_digest) != provisioning_id
     {
         return Err(EngineError::new(
@@ -5927,15 +6507,25 @@ fn validate_table_provisioning(
             "table-provisioning identifier does not match its declarations",
         ));
     }
-    if !declarations.iter().any(|declaration| {
+    if !declarations
+        .iter()
+        .any(|declaration| !matches!(declaration.generated_id_policy(), GeneratedIdPolicy::None))
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "table provisioning does not contain a generated-ID policy",
+        ));
+    }
+    let has_native = declarations.iter().any(|declaration| {
         matches!(
             declaration.generated_id_policy(),
             GeneratedIdPolicy::NativeRangeV1 { .. }
         )
-    }) {
+    });
+    if !has_native && next_shard != shard_count {
         return Err(EngineError::new(
             EngineErrorKind::DataCorruption,
-            "table provisioning does not contain a native generated-ID policy",
+            "hi/lo-only table provisioning must not claim pending shard-local work",
         ));
     }
     if let Some(catalog) = catalog {
@@ -5958,6 +6548,7 @@ fn validate_table_provisioning(
 
 fn read_table_provisioning_declarations(
     connection: &Connection,
+    manifest_version: u32,
     expected_count: usize,
 ) -> EngineResult<Box<[TableDeclaration]>> {
     let limit = i64::try_from(MAX_TABLES + 1).expect("table journal limit fits SQLite");
@@ -6046,6 +6637,7 @@ fn read_table_provisioning_declarations(
         let policy = decode_generated_id_policy(
             1,
             &placement,
+            manifest_version,
             Some(generated_policy),
             generated_column,
             generated_version,
@@ -6482,6 +7074,7 @@ fn validate_table_metadata(
     connection: &Connection,
     databases: &[LogicalDatabaseMetadata],
     generated_ids: bool,
+    manifest_version: u32,
 ) -> EngineResult<Box<[TableMetadata]>> {
     let sql = if generated_ids {
         "SELECT tables.table_id,
@@ -6602,6 +7195,7 @@ fn validate_table_metadata(
         let generated_id_policy = decode_generated_id_policy(
             table_id,
             &placement,
+            manifest_version,
             generated_policy,
             generated_column,
             generated_encoding_version,
@@ -6621,6 +7215,7 @@ fn validate_table_metadata(
 fn decode_generated_id_policy(
     table_id: u64,
     placement: &TablePlacement,
+    manifest_version: u32,
     policy: Option<i64>,
     column: Option<String>,
     encoding_version: Option<i64>,
@@ -6654,12 +7249,43 @@ fn decode_generated_id_policy(
             }
             Ok(GeneratedIdPolicy::native_range_v1_from_validated(column))
         }
-        (Some(policy), _, _) if policy > GENERATED_ID_POLICY_NATIVE_RANGE_V1 => {
+        (Some(GENERATED_ID_POLICY_HILO_V1), _, _) if manifest_version < V11_SCHEMA_VERSION => {
             Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
                 format!("table {table_id} uses a newer generated-ID policy"),
             ))
         }
+        (Some(GENERATED_ID_POLICY_HILO_V1), Some(column), Some(version)) => {
+            if !validate_catalog_identifier(&column) {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!("table {table_id} has an invalid generated-ID column"),
+                ));
+            }
+            if version <= 0 {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!("table {table_id} has an invalid generated-ID encoding version"),
+                ));
+            }
+            if version > i64::from(HILO_V1_ENCODING_VERSION) {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!("table {table_id} uses a newer generated-ID encoding version"),
+                ));
+            }
+            let TablePlacement::Sharded(shard_key) = placement else {
+                return Err(inconsistent_generated_id_policy(table_id));
+            };
+            if shard_key.key_type() != ShardKeyType::Int64 || shard_key.column() != column {
+                return Err(inconsistent_generated_id_policy(table_id));
+            }
+            Ok(GeneratedIdPolicy::hilo_v1_from_validated(column))
+        }
+        (Some(policy), _, _) if policy > GENERATED_ID_POLICY_HILO_V1 => Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("table {table_id} uses a newer generated-ID policy"),
+        )),
         (Some(policy), _, _) if policy < GENERATED_ID_POLICY_NONE => Err(EngineError::new(
             EngineErrorKind::DataCorruption,
             format!("table {table_id} has an invalid generated-ID policy code"),
@@ -7064,6 +7690,13 @@ mod tests {
         initialize_interrupted_legacy: migrate_interrupted_legacy_to_v8,
     };
 
+    const V10_PLAN: MigrationPlan<'static> = MigrationPlan {
+        current_version: V10_SCHEMA_VERSION,
+        migrations: MIGRATIONS,
+        initialize_current: create_v10_schema,
+        initialize_interrupted_legacy: migrate_interrupted_legacy_to_v10,
+    };
+
     fn create_legacy_manifest(connection: &Connection, shards: u16, version: u32) {
         create_empty_legacy_manifest(connection);
         connection
@@ -7124,6 +7757,68 @@ mod tests {
             mark_shard_layout_ready(connection, shards, &creating).unwrap();
         }
         seal_verified_schema(connection, shards, [0x5a; 32]).unwrap();
+    }
+
+    fn create_ready_v10_manifest(connection: &mut Connection, shards: u16) {
+        let transaction = connection.transaction().unwrap();
+        create_v10_schema(&transaction, shards).unwrap();
+        transaction
+            .execute(
+                "UPDATE briskdb_shard_layout SET layout_state = ?1 WHERE singleton = 1",
+                [ShardLayoutState::Ready.code()],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE briskdb_integrity
+                 SET database_state = ?1,
+                     committed_schema_digest = ?2,
+                     target_schema_digest = NULL
+                 WHERE singleton = 1",
+                rusqlite::params![DATABASE_STATE_READY, [0x5a_u8; 32].as_slice()],
+            )
+            .unwrap();
+        set_identity(&transaction, V10_SCHEMA_VERSION).unwrap();
+        refresh_manifest_digest(&transaction).unwrap();
+        validate_v10(&transaction, shards, &schema_objects(&transaction).unwrap()).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    fn activate_hilo_table(connection: &mut Connection, shards: u16) -> TableId {
+        let database = crate::core::LogicalDatabaseId::new(1).unwrap();
+        let declarations = vec![
+            TableDeclaration::sharded(
+                database,
+                "events",
+                ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+            )
+            .unwrap()
+            .with_generated_id_policy(GeneratedIdPolicy::hilo_v1("id").unwrap())
+            .unwrap(),
+        ];
+        let active = match begin_native_table_provisioning(
+            connection,
+            shards,
+            declarations,
+            [0x5a; 32],
+            || {},
+        )
+        .unwrap()
+        {
+            NativeTableProvisioningClassification::Active(active) => active,
+            other => panic!("unexpected hi/lo provisioning classification: {other:?}"),
+        };
+        assert_eq!(active.next_shard(), shards);
+        let catalog =
+            finalize_native_table_provisioning(connection, shards, &active, || {}).unwrap();
+        let table = catalog
+            .logical()
+            .table("default", "events")
+            .unwrap()
+            .unwrap();
+        assert_eq!(catalog.active_hilo_id_table_ids(), [table.id()]);
+        assert!(catalog.active_native_id_table_ids().is_empty());
+        table.id()
     }
 
     fn create_ready_v7_manifest(connection: &mut Connection, shards: u16) {
@@ -7439,7 +8134,7 @@ mod tests {
             identity(connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(connection).unwrap(), v10_objects());
+        assert_eq!(schema_objects(connection).unwrap(), v11_objects());
         assert_eq!(
             connection
                 .query_row(
@@ -7506,7 +8201,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V3_MANIFEST_DIGEST_VERSION)
+            i64::from(V4_MANIFEST_DIGEST_VERSION)
         );
         let (layout_id, application_id, metadata_version, state) = shard_layout_row(connection);
         assert_eq!(layout_id.len(), 16);
@@ -7623,6 +8318,7 @@ mod tests {
                 (7, 8),
                 (8, 9),
                 (9, 10),
+                (10, 11),
             ]
         );
         assert_generation_one_catalog(&connection, 4);
@@ -7649,6 +8345,439 @@ mod tests {
             .pragma_query_value(None, "data_version", |row| row.get(0))
             .unwrap();
         assert_eq!(before, after, "a current-version reopen must not write");
+    }
+
+    #[test]
+    fn v10_to_v11_is_atomic_retryable_and_fences_v10_readers() {
+        for failing_phase in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ] {
+            for inject_panic in [false, true] {
+                let mut connection = Connection::open_in_memory().unwrap();
+                create_ready_v10_manifest(&mut connection, 4);
+                let objects_before = schema_objects(&connection).unwrap();
+                let root_before = stored_manifest_digest(&connection);
+
+                let attempt = catch_unwind(AssertUnwindSafe(|| {
+                    load_or_create_with_hook(&mut connection, 4, |point| {
+                        if point.from == V10_SCHEMA_VERSION && point.phase == failing_phase {
+                            if inject_panic {
+                                panic!("injected v10 to v11 migration panic");
+                            }
+                            return Err(EngineError::new(
+                                EngineErrorKind::Internal,
+                                "injected v10 to v11 migration failure",
+                            ));
+                        }
+                        Ok(())
+                    })
+                }));
+                if inject_panic {
+                    assert!(attempt.is_err());
+                } else {
+                    assert_eq!(
+                        attempt.unwrap().unwrap_err().kind(),
+                        EngineErrorKind::Internal
+                    );
+                }
+                assert_eq!(identity(&connection).1, i64::from(V10_SCHEMA_VERSION));
+                assert_eq!(schema_objects(&connection).unwrap(), objects_before);
+                assert_eq!(stored_manifest_digest(&connection), root_before);
+                assert_eq!(manifest_semantic_digest(&connection).unwrap(), root_before);
+                assert_eq!(quick_check(&connection), "ok");
+
+                load_or_create_manifest(&mut connection, 4).unwrap();
+                assert_eq!(identity(&connection).1, i64::from(V11_SCHEMA_VERSION));
+                assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT manifest_digest_version FROM briskdb_integrity",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    i64::from(V4_MANIFEST_DIGEST_VERSION)
+                );
+                assert_eq!(
+                    connection
+                        .query_row("SELECT COUNT(*) FROM briskdb_hilo_leases", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap(),
+                    0
+                );
+                let identity_before = identity(&connection);
+                let root_before = stored_manifest_digest(&connection);
+                assert_eq!(
+                    inspect_with_plan(&connection, 4, V10_PLAN)
+                        .unwrap_err()
+                        .kind(),
+                    EngineErrorKind::FailedPrecondition
+                );
+                assert_eq!(identity(&connection), identity_before);
+                assert_eq!(stored_manifest_digest(&connection), root_before);
+            }
+        }
+    }
+
+    #[test]
+    fn hilo_activation_atomically_installs_one_global_lease_head() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let table_id = activate_hilo_table(&mut connection, 4);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT table_id, block_size, next_sequence, fence_token,
+                            last_owner_id, last_first_sequence, last_last_sequence
+                     FROM briskdb_hilo_leases",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (
+                i64::try_from(table_id.get()).unwrap(),
+                i64::try_from(HILO_V1_BLOCK_SIZE).unwrap(),
+                1,
+                0,
+                None,
+                None,
+                None,
+            )
+        );
+        assert_eq!(
+            manifest_semantic_digest(&connection).unwrap(),
+            stored_manifest_digest(&connection)
+        );
+    }
+
+    #[test]
+    fn hilo_lease_state_is_clock_independent_and_has_no_expiry_fields() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let table_id = activate_hilo_table(&mut connection, 4);
+
+        let columns = connection
+            .prepare("SELECT name FROM pragma_table_xinfo('briskdb_hilo_leases') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "table_id",
+                "block_size",
+                "next_sequence",
+                "fence_token",
+                "last_owner_id",
+                "last_first_sequence",
+                "last_last_sequence",
+            ]
+        );
+        assert!(columns.iter().all(|column| {
+            let column = column.to_ascii_lowercase();
+            !column.contains("time")
+                && !column.contains("clock")
+                && !column.contains("expire")
+                && !column.contains("ttl")
+        }));
+
+        let first = reserve_hilo_v1_block(&mut connection, 4, table_id, [0x71; 32]).unwrap();
+        thread::sleep(Duration::from_millis(2));
+        let second = reserve_hilo_v1_block(&mut connection, 4, table_id, [0x71; 32]).unwrap();
+        assert_eq!(
+            first,
+            DurableHiloLease::new(table_id, [0x71; 32], 1, 1, 4096)
+        );
+        assert_eq!(
+            second,
+            DurableHiloLease::new(table_id, [0x71; 32], 2, 4097, 8192)
+        );
+    }
+
+    #[test]
+    fn hilo_reservations_are_durable_fenced_and_part_of_the_semantic_root() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let table_id = activate_hilo_table(&mut connection, 4);
+        let initial_root = stored_manifest_digest(&connection);
+        let first_owner = [0x11; 32];
+        let second_owner = [0x22; 32];
+
+        let first = reserve_hilo_v1_block(&mut connection, 4, table_id, first_owner).unwrap();
+        assert_eq!(
+            first,
+            DurableHiloLease::new(table_id, first_owner, 1, 1, HILO_V1_BLOCK_SIZE)
+        );
+        let first_root = stored_manifest_digest(&connection);
+        assert_ne!(first_root, initial_root);
+        let second = reserve_hilo_v1_block(&mut connection, 4, table_id, second_owner).unwrap();
+        assert_eq!(
+            second,
+            DurableHiloLease::new(
+                table_id,
+                second_owner,
+                2,
+                HILO_V1_BLOCK_SIZE + 1,
+                HILO_V1_BLOCK_SIZE * 2,
+            )
+        );
+        assert_ne!(stored_manifest_digest(&connection), first_root);
+        assert_eq!(
+            manifest_semantic_digest(&connection).unwrap(),
+            stored_manifest_digest(&connection)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT next_sequence, fence_token, last_owner_id,
+                            last_first_sequence, last_last_sequence
+                     FROM briskdb_hilo_leases WHERE table_id = ?1",
+                    [i64::try_from(table_id.get()).unwrap()],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (8193, 2, second_owner.to_vec(), 4097, 8192)
+        );
+    }
+
+    #[test]
+    fn hilo_reservation_returns_a_partial_final_block_then_reports_both_limits() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let table_id = activate_hilo_table(&mut connection, 4);
+        let owner = [0x33; 32];
+        let final_first = MAX_HILO_V1_SEQUENCE - 2;
+        let previous_first = final_first - HILO_V1_BLOCK_SIZE;
+        connection
+            .execute(
+                "UPDATE briskdb_hilo_leases
+                 SET next_sequence = ?1, fence_token = 1, last_owner_id = ?2,
+                     last_first_sequence = ?3, last_last_sequence = ?4
+                 WHERE table_id = ?5",
+                rusqlite::params![
+                    i64::try_from(final_first).unwrap(),
+                    [0x22_u8; 32].as_slice(),
+                    i64::try_from(previous_first).unwrap(),
+                    i64::try_from(final_first - 1).unwrap(),
+                    i64::try_from(table_id.get()).unwrap(),
+                ],
+            )
+            .unwrap();
+        refresh_manifest_digest(&connection).unwrap();
+        assert_eq!(
+            reserve_hilo_v1_block(&mut connection, 4, table_id, owner).unwrap(),
+            DurableHiloLease::new(table_id, owner, 2, final_first, MAX_HILO_V1_SEQUENCE)
+        );
+        assert_eq!(
+            reserve_hilo_v1_block(&mut connection, 4, table_id, owner)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::LimitExceeded
+        );
+
+        connection
+            .execute(
+                "UPDATE briskdb_hilo_leases
+                 SET next_sequence = 8193, fence_token = ?1, last_owner_id = ?2,
+                     last_first_sequence = 4097, last_last_sequence = 8192
+                 WHERE table_id = ?3",
+                rusqlite::params![
+                    i64::MAX,
+                    owner.as_slice(),
+                    i64::try_from(table_id.get()).unwrap()
+                ],
+            )
+            .unwrap();
+        refresh_manifest_digest(&connection).unwrap();
+        assert_eq!(
+            reserve_hilo_v1_block(&mut connection, 4, table_id, owner)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::LimitExceeded
+        );
+    }
+
+    #[test]
+    fn hilo_lease_tampering_and_resealed_cardinality_loss_are_detected() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let table_id = activate_hilo_table(&mut connection, 4);
+        reserve_hilo_v1_block(&mut connection, 4, table_id, [0x44; 32]).unwrap();
+        connection
+            .execute(
+                "UPDATE briskdb_hilo_leases SET last_owner_id = ?1 WHERE table_id = ?2",
+                rusqlite::params![
+                    [0x45_u8; 32].as_slice(),
+                    i64::try_from(table_id.get()).unwrap()
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            current_manifest_snapshot(&connection, 4)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+        refresh_manifest_digest(&connection).unwrap();
+        connection
+            .execute(
+                "DELETE FROM briskdb_hilo_leases WHERE table_id = ?1",
+                [i64::try_from(table_id.get()).unwrap()],
+            )
+            .unwrap();
+        refresh_manifest_digest(&connection).unwrap();
+        assert_eq!(
+            current_manifest_snapshot(&connection, 4)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
+
+    #[test]
+    fn independent_connections_serialize_hilo_reservations_without_overlap() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.sqlite");
+        let mut setup = Connection::open(&path).unwrap();
+        setup.busy_timeout(Duration::from_secs(5)).unwrap();
+        create_ready_current_manifest(&mut setup, 4);
+        let table_id = activate_hilo_table(&mut setup, 4);
+        drop(setup);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for owner in [[0x51_u8; 32], [0x52_u8; 32]] {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                let mut connection = Connection::open(path).unwrap();
+                connection.busy_timeout(Duration::from_secs(5)).unwrap();
+                barrier.wait();
+                reserve_hilo_v1_block(&mut connection, 4, table_id, owner).unwrap()
+            }));
+        }
+        barrier.wait();
+        let leases = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        let owner_51_first = DurableHiloLease::new(table_id, [0x51; 32], 1, 1, 4096);
+        let owner_51_second = DurableHiloLease::new(table_id, [0x51; 32], 2, 4097, 8192);
+        let owner_52_first = DurableHiloLease::new(table_id, [0x52; 32], 1, 1, 4096);
+        let owner_52_second = DurableHiloLease::new(table_id, [0x52; 32], 2, 4097, 8192);
+        assert!(
+            (leases.contains(&owner_51_first) && leases.contains(&owner_52_second))
+                || (leases.contains(&owner_52_first) && leases.contains(&owner_51_second))
+        );
+        let mut observer = Connection::open(&path).unwrap();
+        let third = reserve_hilo_v1_block(&mut observer, 4, table_id, [0x53; 32]).unwrap();
+        assert_eq!(
+            third,
+            DurableHiloLease::new(table_id, [0x53; 32], 3, 8193, 12288)
+        );
+    }
+
+    #[test]
+    fn manifest_write_lock_contention_is_busy_and_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.sqlite");
+        let mut setup = Connection::open(&path).unwrap();
+        create_ready_current_manifest(&mut setup, 4);
+        let table_id = activate_hilo_table(&mut setup, 4);
+        drop(setup);
+
+        let mut holder = Connection::open(&path).unwrap();
+        let held = holder
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let mut contender = Connection::open(&path).unwrap();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        assert_eq!(
+            reserve_hilo_v1_block(&mut contender, 4, table_id, [0x61; 32])
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Busy
+        );
+        held.rollback().unwrap();
+        let lease = reserve_hilo_v1_block(&mut contender, 4, table_id, [0x61; 32]).unwrap();
+        assert_eq!(
+            lease,
+            DurableHiloLease::new(table_id, [0x61; 32], 1, 1, 4096)
+        );
+    }
+
+    #[test]
+    fn active_provisioning_journal_survives_degradation_and_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.sqlite");
+        let mut connection = Connection::open(&path).unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let database = crate::core::LogicalDatabaseId::new(1).unwrap();
+        let declarations = vec![
+            TableDeclaration::sharded(
+                database,
+                "events",
+                ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+            )
+            .unwrap()
+            .with_generated_id_policy(GeneratedIdPolicy::hilo_v1("id").unwrap())
+            .unwrap(),
+        ];
+        let active = match begin_native_table_provisioning(
+            &mut connection,
+            4,
+            declarations,
+            [0x5a; 32],
+            || {},
+        )
+        .unwrap()
+        {
+            NativeTableProvisioningClassification::Active(active) => active,
+            other => panic!("unexpected provisioning classification: {other:?}"),
+        };
+        let layout = current_manifest_snapshot(&connection, 4)
+            .unwrap()
+            .shard_layout
+            .unwrap();
+        mark_degraded(&mut connection, 4, &layout).unwrap();
+        assert_eq!(
+            current_integrity(&connection, 4).unwrap().state(),
+            DatabaseIntegrityState::Degraded
+        );
+        drop(connection);
+
+        let mut reopened = Connection::open(&path).unwrap();
+        let loaded = load_or_create_manifest(&mut reopened, 4).unwrap();
+        let (_, _, _, integrity, _, _, provisioning) = loaded.into_parts_with_recovery();
+        assert_eq!(integrity.state(), DatabaseIntegrityState::Degraded);
+        assert_eq!(provisioning, Some(active));
+        assert_eq!(
+            manifest_semantic_digest(&reopened).unwrap(),
+            stored_manifest_digest(&reopened)
+        );
     }
 
     #[test]
@@ -7806,9 +8935,9 @@ mod tests {
 
         assert_eq!(
             identity(&connection),
-            (MANIFEST_APPLICATION_ID, i64::from(V10_SCHEMA_VERSION))
+            (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v10_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
         assert_eq!(table_metadata_rows(&connection), tables_before);
         assert_eq!(logical_databases(&connection), databases_before);
         assert_eq!(routing_configuration(&connection), routing_before);
@@ -7851,7 +8980,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V3_MANIFEST_DIGEST_VERSION)
+            i64::from(V4_MANIFEST_DIGEST_VERSION)
         );
         assert_eq!(
             manifest_semantic_digest(&connection).unwrap(),
@@ -7913,7 +9042,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE briskdb_table_provisioning_declarations;
+                "DROP TABLE briskdb_hilo_leases;
+                 DROP TABLE briskdb_table_provisioning_declarations;
                  DROP TABLE briskdb_table_provisioning;
                  DROP INDEX briskdb_one_active_owner_per_shard;
                  ALTER TABLE briskdb_generated_ids RENAME TO briskdb_generated_ids_v10;
@@ -7974,7 +9104,7 @@ mod tests {
             &GeneratedIdPolicy::native_range_v1("id").unwrap()
         );
         assert!(loaded.catalog.active_native_id_table_ids().is_empty());
-        assert_eq!(identity(&connection).1, i64::from(V10_SCHEMA_VERSION));
+        assert_eq!(identity(&connection).1, i64::from(CURRENT_SCHEMA_VERSION));
     }
 
     #[test]
@@ -8381,9 +9511,9 @@ mod tests {
                 );
                 assert_eq!(
                     identity(&connection),
-                    (MANIFEST_APPLICATION_ID, i64::from(V10_SCHEMA_VERSION))
+                    (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
                 );
-                assert_eq!(schema_objects(&connection).unwrap(), v10_objects());
+                assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
                 assert_eq!(
                     manifest_semantic_digest(&connection).unwrap(),
                     stored_manifest_digest(&connection)
@@ -8702,6 +9832,7 @@ mod tests {
             active,
             NativeTableProvisioningClassification::Active(_)
         ));
+        downgrade_v11_manifest_to_v10_for_test(&connection, 4).unwrap();
 
         let digest = manifest_semantic_digest(&connection).unwrap();
         assert_eq!(
@@ -8716,10 +9847,38 @@ mod tests {
     }
 
     #[test]
+    fn manifest_semantic_digest_v4_has_a_frozen_hilo_lease_vector() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        connection
+            .execute(
+                "UPDATE briskdb_shard_layout
+                 SET layout_id = x'000102030405060708090a0b0c0d0e0f'
+                 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        refresh_manifest_digest(&connection).unwrap();
+        let table_id = activate_hilo_table(&mut connection, 4);
+        reserve_hilo_v1_block(&mut connection, 4, table_id, [0x6b; 32]).unwrap();
+
+        let digest = manifest_semantic_digest(&connection).unwrap();
+        assert_eq!(
+            digest,
+            [
+                0x5e, 0x6d, 0x41, 0xf6, 0x02, 0xcf, 0xaf, 0x77, 0x41, 0x4a, 0x90, 0x59, 0x5a, 0x7e,
+                0xa0, 0x37, 0x8e, 0x4e, 0x83, 0x07, 0x07, 0x06, 0xd6, 0x86, 0xed, 0x1f, 0x2b, 0xa7,
+                0xed, 0x67, 0x5d, 0xe6,
+            ]
+        );
+        assert_eq!(stored_manifest_digest(&connection), digest);
+    }
+
+    #[test]
     fn semantic_root_covers_every_authoritative_manifest_table_and_integrity_state() {
         let mutations = [
             "UPDATE briskdb_manifest SET singleton = 2 WHERE singleton = 1",
-            "UPDATE briskdb_metadata SET requires_manifest_version = 11",
+            "UPDATE briskdb_metadata SET requires_manifest_version = 12",
             "UPDATE briskdb_routing SET hash_version = 2 WHERE singleton = 1",
             "UPDATE briskdb_physical_shards SET lifecycle_state = 'retired' WHERE shard_id = 0",
             "UPDATE briskdb_allocation_owners SET owner_slot = 100 WHERE owner_slot = 0",
@@ -8728,6 +9887,7 @@ mod tests {
             "UPDATE briskdb_schema_catalog SET identifier_encoding_version = 2 WHERE singleton = 1",
             "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 2, NULL, NULL)",
             "INSERT INTO briskdb_generated_ids VALUES (1, 0, NULL, NULL, 0)",
+            "INSERT INTO briskdb_hilo_leases VALUES (1, 4096, 1, 0, NULL, NULL, NULL)",
             "UPDATE briskdb_shard_layout SET layout_id = randomblob(16) WHERE singleton = 1",
             "INSERT INTO briskdb_schema_migrations VALUES (1, 0, randomblob(32), 1, 'SELECT 1', 4, 2, 4)",
             "INSERT INTO briskdb_table_provisioning VALUES (1, zeroblob(32), 1, 1, zeroblob(32), 4, 1, 0)",
@@ -8773,7 +9933,7 @@ mod tests {
         for (mutation, expected_diagnostic) in [
             (
                 "UPDATE briskdb_generated_ids
-                 SET policy = 2, generated_column = 'tenant_id', encoding_version = 1
+                 SET policy = 3, generated_column = 'tenant_id', encoding_version = 1
                  WHERE table_id = 3",
                 "table 3 uses a newer generated-ID policy",
             ),
@@ -8884,7 +10044,7 @@ mod tests {
     #[test]
     fn integrity_versions_lengths_and_forged_state_invariants_fail_closed() {
         for (version_column, unsupported_version) in
-            [("manifest_digest_version", 4), ("schema_digest_version", 2)]
+            [("manifest_digest_version", 5), ("schema_digest_version", 2)]
         {
             let mut unsupported = Connection::open_in_memory().unwrap();
             create_ready_current_manifest(&mut unsupported, 4);
@@ -9112,7 +10272,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v10_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
         assert_eq!(
             shard_layout_row(&connection).3,
             ShardLayoutState::Adopting.code()
@@ -9136,7 +10296,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v10_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
         assert_eq!(layout.state(), ShardLayoutState::Ready);
         assert_eq!(shard_layout_row(&connection), layout_before);
         assert_eq!(catalog.logical().schema_generation(), 0);
@@ -9228,7 +10388,7 @@ mod tests {
                 identity(&connection),
                 (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
             );
-            assert_eq!(schema_objects(&connection).unwrap(), v10_objects());
+            assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
         }
 
         let mut connection = Connection::open_in_memory().unwrap();
