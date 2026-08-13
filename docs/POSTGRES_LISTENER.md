@@ -1,11 +1,10 @@
 # PostgreSQL startup and listener contract
 
-BriskDB can serve PostgreSQL protocol 3.0 startup on a disabled-by-default,
-separately configured loopback TCP listener. A successful startup selects one
-logical database, creates one protocol-neutral core session, publishes
-BriskDB-owned parameter status, and keeps the socket alive until `Terminate`,
-EOF, server shutdown, or a protocol failure. SQL query execution begins in
-roadmap issue #31.
+BriskDB serves PostgreSQL protocol 3.0 startup and bounded simple queries on a
+disabled-by-default, separately configured loopback TCP listener. A successful
+startup selects one logical database, creates one protocol-neutral core
+session, publishes BriskDB-owned parameter status, and keeps the socket alive
+until `Terminate`, EOF, server shutdown, or a protocol failure.
 
 ## Process configuration
 
@@ -132,15 +131,30 @@ can instead close without a response.
 A failed startup creates no retained core session, statement, portal, route, or
 SQLite operation. A later connection can start normally.
 
-## Query boundary before issue #31
+## Simple-query boundary
 
-Startup support does not claim SQL execution. Every simple-query message,
-including an empty query, receives BriskDB's fixed `ERROR` / `0A000` mapping
-followed by `ReadyForQuery(I)`; the same connection remains reusable. An
-extended `Parse` receives the same fixed error before a dependency-owned
-statement is stored, and `Sync` restores `ReadyForQuery(I)`. Query text is
-never included in the response. Issue #31 replaces this deliberate boundary
-with the complete simple and extended query state machine.
+The `Query` message executes exactly one non-empty PostgreSQL-dialect statement
+through the protocol-neutral prepare, describe, bind, route, and logical
+execute lifecycle. Registered-table `SELECT`, `INSERT`, `UPDATE`, and `DELETE`
+are supported. Temporary statements and portals are closed after success or
+failure. Empty input returns `EmptyQueryResponse`; a statement failure uses the
+fixed Engine-to-SQLSTATE mapping, appends `ReadyForQuery(I)`, never includes
+query text, and leaves the connection reusable.
+
+Rows are bounded and materialized by the Engine, then returned in PostgreSQL
+text format. Known protocol-neutral metadata has stable boolean, signed integer,
+numeric, double precision, text, and bytea OIDs; SQLite's unknown compile
+metadata is reported conservatively as text. Invalid UTF-8 text is rejected
+instead of replaced. Write responses use ordinary
+`INSERT 0 n`, `UPDATE n`, and `DELETE n` command tags. Sharded writes must infer
+one exact owner from their literal shard-key values. Reads retain the Engine's
+existing point/scatter limits and semantics.
+
+Extended `Parse` remains a fixed `0A000` error before a dependency-owned
+statement is stored, and `Sync` restores `ReadyForQuery(I)`. Bind parameters,
+DDL, transactions, `COPY`, and binary results are not supported. The offline
+importer is the supported way to establish registered tables. See the
+[copy/paste query quickstart](POSTGRES_QUICKSTART.md).
 
 ## Connection ownership and shutdown
 
@@ -200,8 +214,9 @@ Automated coverage includes:
 - fixed failures for protocol, user, database, encoding, application-name,
   unknown-key, replication, and truncated-message cases before and after
   session creation, followed by successful recovery;
-- simple-query recovery and extended-query `Sync` recovery without retaining a
-  dependency statement;
+- end-to-end simple-query insert, select, update, delete, row/type encoding,
+  empty-query handling, fixed-error recovery, and extended-query `Sync`
+  recovery;
 - immediate `Terminate`, client EOF, partial startup, normal shutdown, forced
   server-task cancellation, and core-session cleanup;
 - the 256-task admission boundary, deterministic overflow close, and slot reuse

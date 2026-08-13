@@ -1,6 +1,6 @@
 //! Safe protocol representations of protocol-neutral engine errors.
 //!
-//! PostgreSQL startup and deferred-query responses use these fixed mappings.
+//! PostgreSQL startup and simple-query responses use these fixed mappings.
 //! No MySQL listener exists yet; its mapping remains the tested contract for
 //! that later wire adapter.
 

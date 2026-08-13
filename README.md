@@ -24,11 +24,13 @@ protocol-neutral and HTTP results, and the two execution gates.
 
 The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
 unregistered legacy SQLite pass-through from the authoritative-catalog HTTP
-path, PostgreSQL startup support, and planned PostgreSQL/MySQL query
-compatibility.
+path, bounded PostgreSQL simple-query support, and planned PostgreSQL extended
+query/MySQL compatibility.
 The [PostgreSQL listener contract](docs/POSTGRES_LISTENER.md) defines its
-address configuration, startup/session behavior, parameter status, deferred
-query boundary, and shared shutdown lifecycle.
+address configuration, startup/session behavior, simple-query boundary,
+parameter status, and shared shutdown lifecycle. The
+[PostgreSQL quickstart](docs/POSTGRES_QUICKSTART.md) provides a copy/paste
+SQLite import, server startup, and `psql` write/read workflow.
 The [PostgreSQL adapter decision record](docs/POSTGRES_ADAPTER.md) selects the
 exact wire-library version and features, defines the BriskDB-owned connection
 boundary, and records the work that remains for query execution.
@@ -54,7 +56,7 @@ protocol-neutral prepare/bind/describe/execute lifecycle, session-scoped
 statement and portal caches, exact resource limits, metadata refresh, and
 supported physical-target execution boundary shared by future adapters.
 The [error contract](docs/ERRORS.md) defines stable engine error kinds, safe
-HTTP problem details, the mapping consumed by PostgreSQL startup/query deferral
+HTTP problem details, the mapping consumed by PostgreSQL startup/query execution
 and the private adapter probe, and the mapping reserved for a future MySQL wire
 adapter.
 The [request-control contract](docs/REQUEST_CONTROLS.md) defines cancellation,
@@ -209,9 +211,9 @@ cargo run --bin briskdb-import -- \
 See the [import contract](docs/SQLITE_IMPORT.md) for schema support,
 verification, cancellation, and publication behavior.
 
-The initial alpha is HTTP-first: HTTP is the only query-capable network
-interface, and the startup/session-only PostgreSQL listener is disabled by
-default. The unauthenticated HTTP listener defaults to `127.0.0.1:7654` and
+The initial alpha keeps PostgreSQL disabled by default, but its loopback
+listener can execute bounded simple queries against imported/registered
+tables. The unauthenticated HTTP listener defaults to `127.0.0.1:7654` and
 currently requires an IPv4 or IPv6 loopback address. A non-loopback value is
 rejected before the engine opens or either listener binds. Enable the separate
 PostgreSQL TCP listener with an explicit loopback socket address, or use the
@@ -225,18 +227,19 @@ An enabled PostgreSQL address must also be IPv4 or IPv6 loopback in the current
 phase.
 
 ```bash
-# Explicitly enable the startup/session-only PostgreSQL endpoint.
+# Explicitly enable the simple-query PostgreSQL endpoint.
 cargo run -- --postgres-listen 127.0.0.1:5433
 
 # The environment has the same value grammar.
 BRISKDB_POSTGRES_LISTEN=127.0.0.1:5433 cargo run
 ```
 
-The disabled-by-default PostgreSQL listener accepts only loopback addresses. It
-supports protocol 3.0 startup and session selection, then reports fixed
-`0A000` errors for SQL until issue #31 adds simple and extended query execution.
-It is not yet a query-capable PostgreSQL interface. See the
-[listener contract](docs/POSTGRES_LISTENER.md) and
+The listener supports protocol 3.0 startup plus exactly one simple-query
+statement per message. Registered-table `SELECT`, `INSERT`, `UPDATE`, and
+`DELETE` run through the shared Engine. Extended queries, parameters,
+transactions, and DDL remain unsupported. See the copy/paste
+[PostgreSQL quickstart](docs/POSTGRES_QUICKSTART.md), the
+[listener contract](docs/POSTGRES_LISTENER.md), and the
 [adapter decision record](docs/POSTGRES_ADAPTER.md).
 
 The HTTP listener also serves the embedded data explorer at

@@ -76,14 +76,14 @@ production-hardening work.
 With the write opt-in enabled, HTTP rejects transactions, savepoints,
 attachments, and caller-authored DML `RETURNING` as `Unsupported` before pool
 admission; tests also verify every shard remains unchanged. The PostgreSQL
-listener currently rejects both simple Query and extended Parse through its
-fixed deferred-query boundary as SQLSTATE `0A000`, returns to idle, and never
-reaches storage.
+listener now permits simple Query to enter the shared Engine lifecycle, while
+extended Parse remains at the fixed SQLSTATE `0A000` boundary. Unsupported
+session statements return to idle without reaching storage.
 
 There is not yet a MySQL listener or command state machine. The shared mapping
 already freezes `Unsupported` as MySQL error 1235 / SQLSTATE `42000`, but a
-mapping function is not a live wire conformance test. PostgreSQL query execution
-and transactions remain tracked by #31 and #34. MySQL listener/query,
+mapping function is not a live wire conformance test. PostgreSQL extended query
+execution and transactions remain tracked by #31 and #34. MySQL listener/query,
 result/error, and transaction work remains tracked by #40-#44 and #47.
 
 ## Benchmark evidence
