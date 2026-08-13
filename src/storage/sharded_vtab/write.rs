@@ -23,15 +23,15 @@ use super::{
 use super::{TestChildScanControl, TestChildScanGate};
 use crate::{
     core::{
-        EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy, GeneratedKey,
-        OperationControl, Value,
+        CanonicalShardKeyRef, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
+        GeneratedKey, OperationControl, TableId, Value, canonical_shard_key_bytes,
         generated_id::{
             AllocationOwnerSlot, GeneratedIdClassification, classify_generated_id,
             native_range_v1_sequence_ceiling, native_range_v1_sequence_floor,
         },
     },
     sqlite_error,
-    storage::{CONNECTION_BUSY_TIMEOUT, SchemaOperationGuard, Storage},
+    storage::{CONNECTION_BUSY_TIMEOUT, SchemaOperationGuard, Storage, hilo::HiloAllocation},
 };
 
 const CANCELLABLE_BUSY_SLICE: Duration = Duration::from_millis(25);
@@ -1046,6 +1046,7 @@ impl WriteState {
         registry: &Registry,
         spec: &TableSpec,
         shard_key: ValueRef<'_>,
+        child_is_pinned: bool,
     ) -> EngineResult<Option<GeneratedInsertTargets>> {
         let mut generated = self
             .generated_insert
@@ -1079,9 +1080,46 @@ impl WriteState {
             ));
         }
         intent.consumed = true;
-        let targets = match intent.request.expected_shard {
-            Some(shard) => GeneratedInsertTargets::Exact(shard),
-            None => GeneratedInsertTargets::Auto(registry.generated_insert_targets(spec)?),
+        let targets = match &spec.generated_id_policy {
+            GeneratedIdPolicy::NativeRangeV1 { .. } => match intent.request.expected_shard {
+                Some(shard) => GeneratedInsertTargets::NativeExact(shard),
+                None => {
+                    GeneratedInsertTargets::NativeAuto(registry.generated_insert_targets(spec)?)
+                }
+            },
+            GeneratedIdPolicy::HiloV1 { .. } => {
+                if child_is_pinned {
+                    return Err(EngineError::new(
+                        EngineErrorKind::FailedPrecondition,
+                        "hilo_v1 cannot refill or select a new shard after a transaction has pinned a physical writer",
+                    ));
+                }
+                let table_id = TableId::new(spec.id)?;
+                let allocation = registry.storage.allocate_hilo_v1(table_id)?;
+                let shard = registry.storage.shard_for_key(&canonical_shard_key_bytes(
+                    CanonicalShardKeyRef::Int64(allocation.id()),
+                ));
+                if intent
+                    .request
+                    .expected_shard
+                    .is_some_and(|expected| expected != shard)
+                {
+                    return Err(EngineError::new(
+                        EngineErrorKind::FailedPrecondition,
+                        format!(
+                            "hilo_v1 allocated ID {} to shard {shard}, which does not match the preflighted target",
+                            allocation.id()
+                        ),
+                    ));
+                }
+                GeneratedInsertTargets::Hilo { shard, allocation }
+            }
+            GeneratedIdPolicy::None => {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!("registered table {} has no generated-ID policy", spec.name),
+                ));
+            }
         };
         registry.wait_after_generated_target_selection_for_test()?;
         Ok(Some(targets))
@@ -1417,7 +1455,12 @@ impl WriteState {
     ) -> EngineResult<i64> {
         self.with_active(registry, |transaction| {
             let shard_key = spec.write_shard_key(values)?;
-            let generated_shard = self.generated_insert_target(registry, spec, shard_key)?;
+            let generated_shard = self.generated_insert_target(
+                registry,
+                spec,
+                shard_key,
+                transaction.child.is_some(),
+            )?;
             transaction.insert(
                 registry,
                 spec,
@@ -1668,20 +1711,25 @@ struct GeneratedInsertRequest {
 
 #[derive(Debug)]
 enum GeneratedInsertTargets {
-    Exact(u16),
-    Auto(Box<[u16]>),
+    NativeExact(u16),
+    NativeAuto(Box<[u16]>),
+    Hilo {
+        shard: u16,
+        allocation: HiloAllocation,
+    },
 }
 
 impl GeneratedInsertTargets {
     fn candidates(&self) -> &[u16] {
         match self {
-            Self::Exact(shard) => std::slice::from_ref(shard),
-            Self::Auto(shards) => shards,
+            Self::NativeExact(shard) => std::slice::from_ref(shard),
+            Self::NativeAuto(shards) => shards,
+            Self::Hilo { .. } => &[],
         }
     }
 
     const fn permits_capacity_fallback(&self) -> bool {
-        matches!(self, Self::Auto(_))
+        matches!(self, Self::NativeAuto(_))
     }
 }
 
@@ -1747,29 +1795,31 @@ impl Registry {
             )
         })?;
         spec.ensure_writable()?;
-        if !spec.native_id_policy_active {
+        if !spec.generated_id_policy_active {
             return Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
                 format!(
-                    "native generated INSERT for {} is unavailable until its allocation policy is activated",
+                    "generated INSERT for {} is unavailable until its allocation policy is activated",
                     spec.name
                 ),
             ));
         }
-        let GeneratedIdPolicy::NativeRangeV1 { column } = &spec.generated_id_policy else {
-            return Err(EngineError::new(
-                EngineErrorKind::FailedPrecondition,
-                format!(
-                    "registered table {} does not use native_range_v1 generation",
-                    spec.name
-                ),
-            ));
+        let column = match &spec.generated_id_policy {
+            GeneratedIdPolicy::NativeRangeV1 { column } | GeneratedIdPolicy::HiloV1 { column } => {
+                column
+            }
+            GeneratedIdPolicy::None => {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!("registered table {} has no generated-ID policy", spec.name),
+                ));
+            }
         };
         let shard_key = spec.shard_key.as_ref().ok_or_else(|| {
             EngineError::new(
                 EngineErrorKind::DataCorruption,
                 format!(
-                    "registered native-ID table {} has no shard-key descriptor",
+                    "registered generated-ID table {} has no shard-key descriptor",
                     spec.name
                 ),
             )
@@ -1778,7 +1828,7 @@ impl Registry {
             EngineError::new(
                 EngineErrorKind::DataCorruption,
                 format!(
-                    "registered native-ID table {} has an invalid key index",
+                    "registered generated-ID table {} has an invalid key index",
                     spec.name
                 ),
             )
@@ -1793,10 +1843,24 @@ impl Registry {
             return Err(EngineError::new(
                 EngineErrorKind::DataCorruption,
                 format!(
-                    "registered native-ID policy for {} does not match its Int64 shard key",
+                    "registered generated-ID policy for {} does not match its Int64 shard key",
                     spec.name
                 ),
             ));
+        }
+        if let Some(expected_shard) = request.expected_shard {
+            if !spec.targets.contains(&expected_shard) {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "generated INSERT target shard {expected_shard} is not eligible for {}",
+                        spec.name
+                    ),
+                ));
+            }
+        }
+        if matches!(spec.generated_id_policy, GeneratedIdPolicy::HiloV1 { .. }) {
+            return Ok(());
         }
         let owners = spec.allocation_owners.as_ref().ok_or_else(|| {
             EngineError::new(
@@ -1808,15 +1872,6 @@ impl Registry {
             )
         })?;
         if let Some(expected_shard) = request.expected_shard {
-            if !spec.targets.contains(&expected_shard) {
-                return Err(EngineError::new(
-                    EngineErrorKind::FailedPrecondition,
-                    format!(
-                        "native generated INSERT target shard {expected_shard} is not eligible for {}",
-                        spec.name
-                    ),
-                ));
-            }
             if owners.owner_for_physical_shard(expected_shard).is_none() {
                 return Err(EngineError::new(
                     EngineErrorKind::FailedPrecondition,
@@ -2276,7 +2331,7 @@ impl WriteTransaction {
                 active_interrupt,
             );
         }
-        let shard = registry.insert_target(spec, shard_key)?;
+        let shard = registry.caller_new_key_target(spec, shard_key)?;
         let sql = spec.insert_sql(conflict)?;
         let parameters = values
             .iter()
@@ -2323,6 +2378,20 @@ impl WriteTransaction {
         targets: GeneratedInsertTargets,
         active_interrupt: &Mutex<Option<Arc<InterruptHandle>>>,
     ) -> EngineResult<i64> {
+        let targets = match targets {
+            GeneratedInsertTargets::Hilo { shard, allocation } => {
+                return self.insert_hilo_generated(
+                    registry,
+                    spec,
+                    values,
+                    conflict,
+                    shard,
+                    allocation,
+                    active_interrupt,
+                );
+            }
+            targets => targets,
+        };
         let owners = spec.allocation_owners.as_ref().ok_or_else(|| {
             EngineError::new(
                 EngineErrorKind::DataCorruption,
@@ -2451,6 +2520,16 @@ impl WriteTransaction {
                     ),
                 ));
             }
+            GeneratedIdClassification::HiloV1(_) => {
+                self.poison("SQLite allocated a hilo ID through the native allocator");
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!(
+                        "SQLite allocated a hilo ID for native generated table {}",
+                        spec.name
+                    ),
+                ));
+            }
         };
         if decoded.owner() != owner || owners.physical_shard(decoded.owner()) != Some(shard) {
             self.poison("SQLite allocated a generated ID outside its shard owner range");
@@ -2466,6 +2545,110 @@ impl WriteTransaction {
             return Err(EngineError::new(
                 EngineErrorKind::Internal,
                 "brisk_shard physical generated INSERT did not change exactly one row",
+            ));
+        }
+        self.record_physical_changes(changed)?;
+        self.record_write_shard(shard)?;
+        self.generated_key = Some(GeneratedKey::new(generated_column, Value::Int64(generated)));
+        self.ensure_healthy(registry)?;
+        Ok(generated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_hilo_generated(
+        &mut self,
+        registry: &Registry,
+        spec: &TableSpec,
+        values: &[ValueRef<'_>],
+        conflict: ConflictMode,
+        shard: u16,
+        allocation: HiloAllocation,
+        active_interrupt: &Mutex<Option<Arc<InterruptHandle>>>,
+    ) -> EngineResult<i64> {
+        if allocation.table_id().get() != spec.id
+            || allocation.owner_id() != registry.storage.hilo_owner_id()
+            || allocation.fence() == 0
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "hilo_v1 INSERT received an invalid in-process lease credential",
+            ));
+        }
+        let generated = allocation.id();
+        if !matches!(
+            classify_generated_id(&spec.generated_id_policy, generated)?,
+            GeneratedIdClassification::HiloV1(_)
+        ) {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "hilo_v1 allocator returned an ID outside its policy namespace",
+            ));
+        }
+        let routed = registry.write_target(spec, ValueRef::Integer(generated))?;
+        if routed != shard {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                format!(
+                    "hilo_v1 allocated ID {generated} routes to shard {routed}, not prepared shard {shard}"
+                ),
+            ));
+        }
+        let (sql, parameters, generated_column) =
+            spec.hilo_insert_sql_and_values(values, conflict, generated)?;
+        let insertion = (|| {
+            let child = self.pin(registry, shard, active_interrupt)?;
+            let mut statement = child
+                .connection
+                .prepare(&sql)
+                .map_err(sqlite_error::statement)?;
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(&parameters))
+                .map_err(sqlite_error::statement)?;
+            let returned = match rows.next().map_err(sqlite_error::statement)? {
+                Some(row) => row.get::<_, i64>(0).map_err(sqlite_error::statement)?,
+                None => return Ok(None),
+            };
+            if rows.next().map_err(sqlite_error::statement)?.is_some() {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "hilo_v1 INSERT returned more than one generated key",
+                ));
+            }
+            drop(rows);
+            drop(statement);
+            if returned != generated {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!(
+                        "hilo_v1 INSERT returned ID {returned}, expected allocated ID {generated}"
+                    ),
+                ));
+            }
+            let changed = usize::try_from(child.connection.changes()).map_err(|error| {
+                EngineError::from_source(
+                    EngineErrorKind::LimitExceeded,
+                    "SQLite hilo_v1 INSERT change count does not fit usize",
+                    error,
+                )
+            })?;
+            Ok(Some(changed))
+        })();
+        let changed = match insertion {
+            Ok(Some(changed)) => changed,
+            Ok(None) => {
+                self.ensure_healthy(registry)?;
+                return Ok(0);
+            }
+            Err(error) => {
+                self.poison_if_uncertain(&error);
+                return Err(error);
+            }
+        };
+        if changed != 1 {
+            self.poison("physical hilo_v1 INSERT did not report exactly one changed row");
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "brisk_shard physical hilo_v1 INSERT did not change exactly one row",
             ));
         }
         self.record_physical_changes(changed)?;
@@ -2554,7 +2737,7 @@ impl WriteTransaction {
         let new_shard = if no_change.get(shard_key_index).copied().unwrap_or(false) {
             decoded.shard
         } else {
-            registry.write_target(spec, spec.write_shard_key(values)?)?
+            registry.caller_new_key_target(spec, spec.write_shard_key(values)?)?
         };
         if decoded.shard != new_shard {
             self.poison("a shard-key update attempted to move a row to another file");

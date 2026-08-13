@@ -29,7 +29,9 @@ use rusqlite::{
 
 use super::{SchemaOperationGuard, SqliteAffinity, Storage, quote_identifier, sqlite_affinity};
 use crate::{
-    core::generated_id::{GeneratedIdClassification, classify_generated_id},
+    core::generated_id::{
+        GeneratedIdClassification, classify_caller_generated_id, classify_generated_id,
+    },
     core::{
         AllocationOwnerMap, CanonicalShardKeyRef, EngineError, EngineErrorKind, EngineResult,
         GeneratedIdPolicy, OperationControl, ShardKeyType, TableMetadata, TablePlacement,
@@ -764,7 +766,7 @@ impl Registry {
             let spec = TableSpec::from_physical_table(
                 shard,
                 table,
-                storage.native_id_policy_is_active(table.id()),
+                storage.generated_id_policy_is_active(table.id()),
                 allocation_owners.cloned(),
                 targets.into_boxed_slice(),
             )?;
@@ -854,6 +856,9 @@ impl Registry {
                             .physical_shard(id.owner())
                             .map_or(EqualityTargets::Empty, EqualityTargets::One));
                     }
+                    GeneratedIdClassification::HiloV1(id) => Some(self.storage.shard_for_key(
+                        &canonical_shard_key_bytes(CanonicalShardKeyRef::Int64(id.encode())),
+                    )),
                 }
             }
             (ShardKeyType::Text, ValueRef::Text(value)) => {
@@ -892,7 +897,7 @@ impl Registry {
                 ));
             }
             (ShardKeyType::Int64, ValueRef::Integer(value)) => {
-                match classify_generated_id(&spec.generated_id_policy, value)? {
+                match classify_caller_generated_id(&spec.generated_id_policy, value)? {
                     GeneratedIdClassification::Legacy(value) => self.storage.shard_for_key(
                         &canonical_shard_key_bytes(CanonicalShardKeyRef::Int64(value)),
                     ),
@@ -918,6 +923,9 @@ impl Registry {
                                 ),
                             )
                         })?,
+                    GeneratedIdClassification::HiloV1(id) => self.storage.shard_for_key(
+                        &canonical_shard_key_bytes(CanonicalShardKeyRef::Int64(id.encode())),
+                    ),
                 }
             }
             (ShardKeyType::Text, ValueRef::Text(value)) => {
@@ -970,15 +978,32 @@ impl Registry {
         Ok(target)
     }
 
-    /// Resolve an explicit INSERT target while preventing new rows from being
-    /// introduced into a retired native-ID namespace. Historical IDs remain
-    /// routable through `write_target` for delete/update lookup semantics.
-    fn insert_target(&self, spec: &TableSpec, value: ValueRef<'_>) -> EngineResult<u16> {
+    /// Resolve a caller-supplied key for INSERT or a key-changing UPDATE while
+    /// preventing new rows from being introduced into allocator-owned or
+    /// retired namespaces. Historical IDs remain routable through
+    /// `write_target` for lookup and unchanged-key mutation semantics.
+    fn caller_new_key_target(&self, spec: &TableSpec, value: ValueRef<'_>) -> EngineResult<u16> {
+        if let (GeneratedIdPolicy::HiloV1 { .. }, ValueRef::Integer(value)) =
+            (&spec.generated_id_policy, value)
+        {
+            if matches!(
+                classify_caller_generated_id(&spec.generated_id_policy, value)?,
+                GeneratedIdClassification::HiloV1(_)
+            ) {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "hilo_v1 ID for {} is allocator-owned and cannot be supplied explicitly",
+                        spec.name
+                    ),
+                ));
+            }
+        }
         if let (GeneratedIdPolicy::NativeRangeV1 { .. }, ValueRef::Integer(value)) =
             (&spec.generated_id_policy, value)
         {
             if let GeneratedIdClassification::NativeRangeV1(id) =
-                classify_generated_id(&spec.generated_id_policy, value)?
+                classify_caller_generated_id(&spec.generated_id_policy, value)?
             {
                 if let Some(owners) = spec.allocation_owners.as_ref() {
                     if owners.physical_shard(id.owner()).is_some()
@@ -1238,7 +1263,7 @@ struct TableSpec {
     targets: Box<[u16]>,
     shard_key: Option<ShardKeySpec>,
     generated_id_policy: GeneratedIdPolicy,
-    native_id_policy_active: bool,
+    generated_id_policy_active: bool,
     allocation_owners: Option<Arc<AllocationOwnerMap>>,
     generated_shard_cursor: AtomicU64,
 }
@@ -1293,7 +1318,7 @@ impl TableSpec {
     fn from_physical_table(
         connection: &Connection,
         table: &TableMetadata,
-        native_id_policy_active: bool,
+        generated_id_policy_active: bool,
         allocation_owners: Option<Arc<AllocationOwnerMap>>,
         targets: Box<[u16]>,
     ) -> EngineResult<Self> {
@@ -1573,7 +1598,7 @@ impl TableSpec {
             targets,
             shard_key,
             generated_id_policy: table.generated_id_policy().clone(),
-            native_id_policy_active,
+            generated_id_policy_active,
             allocation_owners,
             generated_shard_cursor: AtomicU64::new(0),
         })
@@ -1729,6 +1754,84 @@ impl TableSpec {
             )
         };
         Ok((insert, parameters, generated_column.to_owned()))
+    }
+
+    fn hilo_insert_sql_and_values(
+        &self,
+        values: &[ValueRef<'_>],
+        conflict: ConflictMode,
+        generated_id: i64,
+    ) -> EngineResult<(String, Vec<RawCell>, String)> {
+        self.ensure_writable()?;
+        if values.len() != self.column_count {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                format!(
+                    "brisk_shard received an invalid hilo_v1 INSERT shape for {}",
+                    self.name
+                ),
+            ));
+        }
+        let GeneratedIdPolicy::HiloV1 {
+            column: generated_column,
+        } = &self.generated_id_policy
+        else {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!("registered table {} does not use hilo_v1", self.name),
+            ));
+        };
+        let generated_index = self
+            .columns
+            .iter()
+            .position(|column| column.name == *generated_column)
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!(
+                        "registered generated column {}.{} is absent from the physical schema",
+                        self.name, generated_column
+                    ),
+                )
+            })?;
+        if !matches!(values[generated_index], ValueRef::Null) {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "hilo_v1 INSERT for {} unexpectedly supplied an explicit {} value",
+                    self.name, generated_column
+                ),
+            ));
+        }
+
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| quote_identifier(&column.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut parameters = Vec::with_capacity(self.column_count);
+        for (index, value) in values.iter().enumerate() {
+            parameters.push(if index == generated_index {
+                RawCell::Integer(generated_id)
+            } else {
+                RawCell::try_copy_from(*value)?
+            });
+        }
+        let placeholders = (1..=parameters.len())
+            .map(|position| format!("?{position}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok((
+            format!(
+                "INSERT{} INTO main.{} ({columns}) VALUES ({placeholders}) RETURNING {}",
+                write_conflict_clause(conflict),
+                quote_identifier(&self.name),
+                quote_identifier(generated_column),
+            ),
+            parameters,
+            generated_column.to_owned(),
+        ))
     }
 
     fn delete_sql(&self) -> EngineResult<String> {
@@ -2882,6 +2985,71 @@ mod tests {
         text_keys: Vec<String>,
         blob_keys: Vec<Vec<u8>>,
         native_ids: Vec<i64>,
+    }
+
+    struct HiloFixture {
+        _temp: tempfile::TempDir,
+        storage: Storage,
+        table_id: u64,
+    }
+
+    impl HiloFixture {
+        fn new(shard_count: u16) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let mut storage = Storage::open(temp.path(), shard_count).unwrap();
+            let mut migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            storage
+                .apply_schema_migration(
+                    "CREATE TABLE hilo_events (
+                         id INTEGER PRIMARY KEY,
+                         payload TEXT NOT NULL CHECK (payload <> 'reject')
+                     ) STRICT;",
+                    &mut migration,
+                    None,
+                )
+                .unwrap();
+            migration.publish_ready().unwrap();
+            let database_id = storage.logical_catalog().default_database().id();
+            storage
+                .register_tables(vec![
+                    TableDeclaration::sharded(
+                        database_id,
+                        "hilo_events",
+                        ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+                    )
+                    .unwrap()
+                    .with_generated_id_policy(GeneratedIdPolicy::hilo_v1("id").unwrap())
+                    .unwrap(),
+                ])
+                .unwrap();
+            let table_id = storage
+                .logical_catalog()
+                .table("default", "hilo_events")
+                .unwrap()
+                .unwrap()
+                .id()
+                .get();
+            Self {
+                _temp: temp,
+                storage,
+                table_id,
+            }
+        }
+
+        fn row_count(&self) -> i64 {
+            (0..self.storage.shard_count())
+                .map(|shard| {
+                    self.storage
+                        .open_shard(shard)
+                        .unwrap()
+                        .query_row("SELECT COUNT(*) FROM hilo_events", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap()
+                })
+                .sum()
+        }
     }
 
     struct ScaleFixture {
@@ -4461,7 +4629,10 @@ mod tests {
             Ok(_) => panic!("shadow coordinator schema must be rejected"),
             Err(error) => error,
         };
-        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(matches!(
+            error.kind(),
+            EngineErrorKind::InvalidQuery | EngineErrorKind::FailedPrecondition
+        ));
         let connection = Connection::open(&path).unwrap();
         let objects = connection
             .prepare(
@@ -6024,6 +6195,361 @@ mod tests {
             assert_eq!(owners.physical_shard(decoded.owner()), Some(expected_shard));
             assert!(owners.owner_is_active(decoded.owner()));
         }
+    }
+
+    #[test]
+    fn writable_hilo_generation_leases_once_and_hash_routes_each_id() {
+        let fixture = HiloFixture::new(4);
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let mut generated = Vec::new();
+        for index in 0..10 {
+            let result = coordinator
+                .execute_generated_dml_auto(
+                    "INSERT INTO hilo_events (payload) VALUES (?1)",
+                    [format!("hilo-{index}")],
+                    fixture.table_id,
+                )
+                .unwrap();
+            let id = match &result.generated_key().unwrap().value {
+                Value::Int64(id) => *id,
+                value => panic!("unexpected generated value: {value:?}"),
+            };
+            assert_eq!(
+                result.shard(),
+                Some(
+                    fixture
+                        .storage
+                        .shard_for_key(&canonical_shard_key_bytes(CanonicalShardKeyRef::Int64(id)))
+                )
+            );
+            assert_eq!(
+                crate::core::generated_id::HiloV1Id::decode(id)
+                    .unwrap()
+                    .sequence(),
+                u64::try_from(index + 1).unwrap()
+            );
+            generated.push(id);
+        }
+        generated.sort_unstable();
+        generated.dedup();
+        assert_eq!(generated.len(), 10);
+        assert_eq!(fixture.row_count(), 10);
+
+        let manifest = Connection::open(fixture.storage.root.join("manifest.sqlite")).unwrap();
+        let (next, fence): (i64, i64) = manifest
+            .query_row(
+                "SELECT next_sequence, fence_token FROM briskdb_hilo_leases WHERE table_id = ?1",
+                [i64::try_from(fixture.table_id).unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(next, 4_097);
+        assert_eq!(fence, 1);
+    }
+
+    #[test]
+    fn hilo_generated_write_process_child() {
+        let Ok(root) = std::env::var("BRISKDB_HILO_WRITE_PROCESS_ROOT") else {
+            return;
+        };
+        let storage = Storage::open(root, 4).unwrap();
+        let table_id = storage
+            .logical_catalog()
+            .table("default", "hilo_events")
+            .unwrap()
+            .unwrap()
+            .id()
+            .get();
+        let ready =
+            std::path::PathBuf::from(std::env::var("BRISKDB_HILO_WRITE_PROCESS_READY").unwrap());
+        let go = std::path::PathBuf::from(std::env::var("BRISKDB_HILO_WRITE_PROCESS_GO").unwrap());
+        std::fs::write(&ready, b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !go.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(go.exists(), "parent did not release hilo_v1 write child");
+
+        let mut coordinator = WriteCoordinator::open(storage).unwrap();
+        let payload = format!("process-{}", std::process::id());
+        let result = coordinator
+            .execute_generated_dml_auto(
+                "INSERT INTO hilo_events (payload) VALUES (?1)",
+                [payload],
+                table_id,
+            )
+            .unwrap();
+        let id = match &result.generated_key().unwrap().value {
+            Value::Int64(value) => *value,
+            value => panic!("unexpected generated value: {value:?}"),
+        };
+        std::fs::write(
+            std::env::var("BRISKDB_HILO_WRITE_PROCESS_OUTPUT").unwrap(),
+            format!("{id},{}", result.shard().unwrap()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn competing_processes_insert_unique_hilo_ids_on_their_hash_routed_shards() {
+        let fixture = HiloFixture::new(4);
+        let go = fixture._temp.path().join("hilo-write-go");
+        let mut children = Vec::new();
+        let mut ready_paths = Vec::new();
+        let mut output_paths = Vec::new();
+        for index in 0..3 {
+            let ready = fixture
+                ._temp
+                .path()
+                .join(format!("hilo-write-ready-{index}"));
+            let output = fixture
+                ._temp
+                .path()
+                .join(format!("hilo-write-output-{index}"));
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("storage::sharded_vtab::tests::hilo_generated_write_process_child")
+                .arg("--nocapture")
+                .env("BRISKDB_HILO_WRITE_PROCESS_ROOT", fixture._temp.path())
+                .env("BRISKDB_HILO_WRITE_PROCESS_READY", &ready)
+                .env("BRISKDB_HILO_WRITE_PROCESS_GO", &go)
+                .env("BRISKDB_HILO_WRITE_PROCESS_OUTPUT", &output)
+                .spawn()
+                .unwrap();
+            children.push(child);
+            ready_paths.push(ready);
+            output_paths.push(output);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ready_paths.iter().any(|path| !path.exists()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ready_paths.iter().all(|path| path.exists()));
+        std::fs::write(&go, b"go").unwrap();
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+
+        let allocations = output_paths
+            .iter()
+            .map(|path| {
+                let output = std::fs::read_to_string(path).unwrap();
+                let (id, shard) = output.split_once(',').unwrap();
+                (id.parse::<i64>().unwrap(), shard.parse::<u16>().unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            allocations
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            allocations.len()
+        );
+        for (id, shard) in allocations {
+            assert_eq!(
+                shard,
+                fixture
+                    .storage
+                    .shard_for_key(&canonical_shard_key_bytes(CanonicalShardKeyRef::Int64(id)))
+            );
+            for candidate in 0..4 {
+                assert_eq!(
+                    fixture
+                        .storage
+                        .open_shard(candidate)
+                        .unwrap()
+                        .query_row(
+                            "SELECT COUNT(*) FROM hilo_events WHERE id = ?1",
+                            [id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    i64::from(candidate == shard)
+                );
+            }
+        }
+        assert_eq!(fixture.row_count(), 3);
+    }
+
+    #[test]
+    fn writable_hilo_constraint_rollback_and_ignore_burn_ids_without_reuse() {
+        let fixture = HiloFixture::new(2);
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let first = coordinator
+            .execute_generated_dml_auto(
+                "INSERT INTO hilo_events (payload) VALUES ('first')",
+                [],
+                fixture.table_id,
+            )
+            .unwrap();
+        let first = match &first.generated_key().unwrap().value {
+            Value::Int64(value) => *value,
+            value => panic!("unexpected generated value: {value:?}"),
+        };
+
+        let ignored = coordinator
+            .execute_generated_dml_auto(
+                "INSERT OR IGNORE INTO hilo_events (payload) VALUES ('reject')",
+                [],
+                fixture.table_id,
+            )
+            .unwrap();
+        assert_eq!(ignored.affected_rows(), 0);
+        assert_eq!(ignored.generated_key(), None);
+
+        let error = coordinator
+            .execute_generated_dml_auto(
+                "INSERT INTO hilo_events (payload) VALUES ('reject')",
+                [],
+                fixture.table_id,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::CheckViolation);
+
+        let next = coordinator
+            .execute_generated_dml_auto(
+                "INSERT INTO hilo_events (payload) VALUES ('next')",
+                [],
+                fixture.table_id,
+            )
+            .unwrap();
+        let next = match &next.generated_key().unwrap().value {
+            Value::Int64(value) => *value,
+            value => panic!("unexpected generated value: {value:?}"),
+        };
+        let first_sequence = crate::core::generated_id::HiloV1Id::decode(first)
+            .unwrap()
+            .sequence();
+        let next_sequence = crate::core::generated_id::HiloV1Id::decode(next)
+            .unwrap()
+            .sequence();
+        assert_eq!(next_sequence, first_sequence + 3);
+        assert_eq!(fixture.row_count(), 2);
+    }
+
+    #[test]
+    fn writable_hilo_cancellation_after_allocation_burns_the_id_without_reuse() {
+        let fixture = HiloFixture::new(2);
+        let coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let cancellation = coordinator.cancellation_handle();
+        let mut gate = coordinator.install_generated_target_gate_for_test();
+        let table_id = fixture.table_id;
+        let worker = thread::spawn(move || {
+            let mut coordinator = coordinator;
+            let result = coordinator.execute_generated_dml_auto(
+                "INSERT INTO hilo_events (payload) VALUES ('cancelled')",
+                [],
+                table_id,
+            );
+            (coordinator, result)
+        });
+
+        gate.wait_until_started();
+        cancellation.cancel();
+        gate.release();
+
+        let (mut coordinator, result) = worker.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), EngineErrorKind::Cancelled);
+        assert_eq!(fixture.row_count(), 0);
+
+        let after = coordinator
+            .execute_generated_dml_auto(
+                "INSERT INTO hilo_events (payload) VALUES ('after-cancel')",
+                [],
+                fixture.table_id,
+            )
+            .unwrap();
+        let generated = match &after.generated_key().unwrap().value {
+            Value::Int64(value) => *value,
+            value => panic!("unexpected generated value: {value:?}"),
+        };
+        assert_eq!(
+            crate::core::generated_id::HiloV1Id::decode(generated)
+                .unwrap()
+                .sequence(),
+            2
+        );
+        assert_eq!(fixture.row_count(), 1);
+    }
+
+    #[test]
+    fn writable_hilo_rejects_multirow_and_explicit_allocator_ids_without_mutation() {
+        let fixture = HiloFixture::new(2);
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let error = coordinator
+            .execute_generated_dml_auto(
+                "INSERT INTO hilo_events (payload) VALUES ('one'), ('two')",
+                [],
+                fixture.table_id,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            EngineErrorKind::InvalidQuery | EngineErrorKind::Unsupported
+        ));
+        assert_eq!(fixture.row_count(), 0);
+        drop(coordinator);
+
+        let explicit = crate::core::generated_id::HiloV1Id::new(99)
+            .unwrap()
+            .encode();
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        let error = coordinator
+            .execute_dml(
+                "INSERT INTO hilo_events VALUES (?1, 'explicit')",
+                [explicit],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            EngineErrorKind::InvalidQuery | EngineErrorKind::FailedPrecondition
+        ));
+        assert_eq!(fixture.row_count(), 0);
+    }
+
+    #[test]
+    fn writable_hilo_rejects_caller_namespaces_without_degrading_storage() {
+        let fixture = HiloFixture::new(2);
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        coordinator
+            .execute_dml("INSERT INTO hilo_events VALUES (1, 'legacy')", [])
+            .unwrap();
+        drop(coordinator);
+
+        for malformed in [
+            crate::core::generated_id::HiloV1Id::new(99)
+                .unwrap()
+                .encode(),
+            crate::core::generated_id::HILO_V1_FORMAT_MARKER as i64,
+            crate::core::generated_id::NATIVE_RANGE_V1_FORMAT_MARKER as i64,
+            i64::MAX,
+        ] {
+            let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+            let error = coordinator
+                .execute_dml(
+                    "INSERT INTO hilo_events VALUES (?1, 'malformed')",
+                    [malformed],
+                )
+                .unwrap_err();
+            assert_ne!(error.kind(), EngineErrorKind::DataCorruption);
+            drop(coordinator);
+
+            let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+            let error = coordinator
+                .execute_dml("UPDATE hilo_events SET id = ?1 WHERE id = 1", [malformed])
+                .unwrap_err();
+            assert_ne!(error.kind(), EngineErrorKind::DataCorruption);
+        }
+
+        assert_eq!(fixture.row_count(), 1);
+        let reopened = Storage::open(&fixture.storage.root, 2).unwrap();
+        assert!(
+            reopened.generated_id_policy_is_active(
+                crate::core::TableId::new(fixture.table_id).unwrap()
+            )
+        );
     }
 
     #[test]

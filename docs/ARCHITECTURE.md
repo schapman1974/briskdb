@@ -30,7 +30,7 @@ server ---------> protocol::http
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
 | `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, generated-ID policy and codec types, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, logical Sharded read target selection and scatter/gather, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
-| `storage` | Versioned routing and authoritative logical manifest, persisted generated-ID policy/activation and stable active/retired allocation-owner slots, recoverable one-time table provisioning, shard layout, migration journals and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
+| `storage` | Versioned routing and authoritative logical manifest, persisted generated-ID policy/activation, stable active/retired allocation-owner slots, durable per-table hi/lo block leases, recoverable one-time table provisioning, shard layout, migration journals and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `import` | Offline source-schema preflight, explicit placement and generated-ID plan validation, exact-value row routing into private staging, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, generated-ID inference, implicit Global placement, or protocol-specific behavior |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
@@ -477,6 +477,19 @@ AUTOINCREMENT` storage and installs disjoint owner-local `sqlite_sequence`
 floors on every shard before catalog authority is published. Omitted-key
 dialect parsing and DDL rewriting remain later work.
 
+Version 11 adds the `briskdb_hilo_leases` allocation head and manifest digest
+version 4. An active `hilo_v1` table has exactly one row with fixed block size
+4,096, the first sequence not yet leased, a monotonic fence token, and the most
+recent committed range plus its random 32-byte process-incarnation owner. One
+`BEGIN IMMEDIATE` manifest transaction advances that row and reseals the
+semantic root before an ID can reach a shard writer. The process-local cache
+then consumes the committed block without another central write. It never
+restores a range after exit or returns an issued ID after rollback,
+cancellation, constraint failure, or an ambiguous commit. No timestamp, lease
+expiry, or wall clock participates. The v10-to-v11 migration creates an empty
+lease table, raises the downgrade fence, and changes no policy, shard, or
+application row.
+
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4
 migration remains manifest-atomic. The v4-to-v5 step first validates the v4
@@ -500,6 +513,8 @@ The v9-to-v10 step remains manifest-only: it preserves every policy but marks it
 inactive, marks existing owner rows active, creates empty provisioning tables,
 raises the fence, and installs checksum version 3. A migrated native policy must
 therefore be explicitly reprovisioned before it may generate a new key.
+The v10-to-v11 step is likewise manifest-only: it creates the empty durable
+hi/lo allocation table, raises the fence, and installs checksum version 4.
 There is no automatic downgrade; an older binary requires a backup from before
 the newer format.
 
@@ -525,14 +540,15 @@ lock through independently durable per-shard work and `Ready` publication. A
 lagging opener re-reads `Ready` and strictly validates instead of provisioning
 from a stale `Creating` observation. Only a locked, durable `Creating` state
 permits missing canonical shard files to be created and WAL to be enabled. The
-validated v10 manifest may also contain one active table-provisioning record.
+validated v11 manifest may also contain one active table-provisioning record.
 Startup then keeps admission `Pending`, revalidates the complete declarations
 and committed schema digest, and resumes the ascending `next_shard` prefix. A
 shard-local sequence seed commits before its separate manifest acknowledgement;
 if process loss lands between those boundaries, startup repeats that same seed
 idempotently rather than skipping it. Only after all shards are durable does one
-manifest transaction activate native policies, clear the transient journal,
-reseal digest version 3, and publish the replacement catalog. A conflict never
+manifest transaction activate generated policies, create the initial hi/lo
+allocation row where required, clear the transient journal, reseal digest
+version 4, and publish the replacement catalog. A conflict never
 causes BriskDB to infer a new request from partial shard state.
 
 The final strict shard opens and catalog reconciliation complete before the
@@ -680,6 +696,10 @@ AUTOINCREMENT` storage on every physical shard. Import defaults every table to
 legacy key domain. Every pre-v9 manifest upgrade selects `None`; v9-to-v10
 preserves any native policy but marks it inactive. An old `AUTOINCREMENT` clause
 or marker-looking imported value therefore cannot silently enable generation.
+`HiloV1` has the same Sharded/visible-`Int64` catalog constraint but requires
+exact `INTEGER PRIMARY KEY` storage without `AUTOINCREMENT`. Its policy also
+remains inactive until empty-table provisioning has validated every shard and
+atomically installed an initial manifest allocation head.
 
 The version-1 native value is a positive signed 64-bit integer with bit 62 set,
 an immutable 10-bit allocation-owner slot in bits 61 through 52, and a 52-bit
@@ -725,6 +745,49 @@ publication activates policy and clears the journal. Every later shard
 admission rejects missing, duplicate, malformed, out-of-owner, or row-lagging
 allocator state. Omitted-key SQL translation belongs to issue #130.
 
+The version-1 hi/lo value sets bit 61 and stores one global per-table sequence
+in bits 60 through 0:
+
+```text
+0 | 0 | 1 | global table sequence (61 bits)
+63  62  61               60..0
+```
+
+Sequence zero is reserved. Valid hi/lo IDs are therefore
+`0x2000_0000_0000_0001..=0x3fff_ffff_ffff_ffff`, disjoint from the native
+range beginning at bit 62. Each complete encoded `Int64` value is routed
+through the frozen canonical hash and persisted virtual-bucket map; it does
+not embed or pin a physical shard. Negative and positive pre-marker values
+remain explicit legacy IDs with that same hash route. For a `hilo_v1` table,
+every caller-supplied value at or above the hi/lo marker is reserved to
+allocator namespaces and is rejected before mutation.
+
+The manifest owns one durable global sequence head per active hi/lo table. A
+lease transaction reserves up to 4,096 consecutive values, increments a
+monotonic fence, records the random 32-byte incarnation of the requesting
+process, reseals the semantic root, and commits before the allocator can expose
+the first value. Independent BriskDB processes that reach this narrow allocator
+path serialize only that refill transaction through SQLite and receive
+non-overlapping ranges. The fence distinguishes successive durable reservations;
+it is not an expiry time and does not revoke earlier IDs. There are no clocks,
+heartbeats, or reclaim decisions. This cross-process uniqueness property does
+not by itself broaden the rest of BriskDB's single-process-per-root deployment
+boundary. Independently started processes, including processes after `exec`,
+are the tested allocator model. Continuing to use an inherited live handle or
+lease cache after `fork()` is unsupported.
+
+Committed leases are irrevocable. The process cache advances before the target
+shard insert, never returns an ID after rollback, cancellation, constraint
+failure, or an ignored insertion, and never reloads its unused tail after
+restart. A manifest commit whose outcome cannot safely be acknowledged also
+returns no lease, so a block that may have committed is burned. Gaps and
+abandoned tails are expected. Numeric order reflects allocation order only;
+transactions may commit in another order. `hilo_v1` promises uniqueness and
+non-reuse, not a gapless sequence or global commit ordering. Allocation happens
+before a target shard is selected or write-locked. Consequently, an explicit
+transaction that has already pinned a physical child rejects later hi/lo
+generation rather than trying to lease and move to another shard.
+
 The `experimental-vtab` feature adds separate read-only and narrowly writable
 SQLite coordinators that statically register `brisk_shard`. They prove a
 no-fork logical table boundary while leaving the manifest and physical schemas
@@ -734,7 +797,8 @@ dynamically loads an extension. Trusted metadata supplies each declared
 schema. An exact, storage-class-compatible `Int64`, `Text`, or `Binary`
 shard-key equality can open only its owner and bind the equality on that
 physical child; `native_range_v1` IDs use the stable active/retired owner map
-while legacy integers retain ordinary hash routing. `NULL` is empty and a type
+while `hilo_v1` and policy-accepted legacy integers use ordinary hash routing.
+`NULL` is empty and a type
 mismatch falls back to a full scan so SQLite can retain its comparison semantics.
 Unconstrained scans visit shards in ascending order with `UNION ALL` duplicate
 semantics. Remaining filters, aggregation, ordering, limits, and feature-local
@@ -760,7 +824,12 @@ capacity under the pinned child lock, omits the physical ID column, captures
 `INSERT ... RETURNING id` on that same handle, validates the owner and sequence,
 and publishes a protocol-neutral `GeneratedKey` only after successful
 reconciliation. Generic NULL inserts and a second generated callback remain
-rejected. Engine/HTTP omitted-key planning, Global writes, multi-shard
+rejected. The same one-shot seam accepts `hilo_v1`: it leases and irrevocably
+consumes an ID before any target-shard lock, hashes the encoded value to its
+owner, inserts it explicitly with `RETURNING`, and verifies the returned key.
+Because that allocation may select any shard, a transaction that already
+pinned a child rejects a later hi/lo insert. Engine/HTTP omitted-key planning,
+Global writes, multi-shard
 transactions, caller-authored `RETURNING`, defaults, generated columns, and
 triggers remain later work.
 

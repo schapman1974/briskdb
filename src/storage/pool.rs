@@ -940,6 +940,15 @@ fn configure_connection_controlled(
             barrier.wait(_control);
         }
 
+        // A cancellation that released a blocked setup hook must win before
+        // strict storage validation starts. Otherwise SQLite's interrupted
+        // schema reads can be classified as corruption and unnecessarily
+        // degrade a healthy root before the outer controlled wrapper replaces
+        // the error with the accepted cancellation reason.
+        if let Some(reason) = _control.reason() {
+            return Err(reason.error());
+        }
+
         // Do not call the ordinary configuration wrapper here: its fixed
         // busy timeout would replace the cancellable handler before these
         // pragmas can encounter a SQLite lock.

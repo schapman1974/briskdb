@@ -10,7 +10,9 @@ use crate::sql::{
 use super::{
     AllocationOwnerMap, Catalog, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
     LogicalDatabaseId, TableMetadata, TablePlacement, Value,
-    generated_id::{GeneratedIdClassification, classify_caller_generated_id},
+    generated_id::{
+        GeneratedIdClassification, HILO_V1_FORMAT_MARKER, classify_caller_generated_id,
+    },
 };
 
 /// Borrowed typed shard key encoded identically by every routing entry point.
@@ -267,6 +269,12 @@ where
         .table_id()
         .and_then(|table| catalog.table_by_id(table))
         .filter(|table| table.database_id() == database);
+    let shard_key_column = sharded_key_column(catalog, database, &inference)?;
+    let dml = shard_key_column
+        .map(|column| routed_dml_shape(normalized, statement_index, column))
+        .transpose()?
+        .flatten();
+    reject_hilo_allocator_namespace_insert(dml, inferred_table, inference.values())?;
 
     let mut unique_routes = HashMap::<&ShardKeyValue, PlannedRoute>::new();
     let mut inferred_routes = Vec::with_capacity(inference.values().len());
@@ -306,11 +314,6 @@ where
         }
     });
 
-    let shard_key_column = sharded_key_column(catalog, database, &inference)?;
-    let dml = shard_key_column
-        .map(|column| routed_dml_shape(normalized, statement_index, column))
-        .transpose()?
-        .flatten();
     reject_retired_owner_insert(dml, inferred_table, allocation_owners, inference.values())?;
     let inferred_shards = inferred_shards(&inferred_routes);
 
@@ -352,6 +355,36 @@ where
         explicit_route,
         assigned_shard,
     })
+}
+
+fn reject_hilo_allocator_namespace_insert(
+    dml: Option<RoutedDml>,
+    table: Option<&TableMetadata>,
+    values: &[ShardKeyValue],
+) -> EngineResult<()> {
+    if dml != Some(RoutedDml::Insert)
+        || !table.is_some_and(|table| {
+            matches!(
+                table.generated_id_policy(),
+                GeneratedIdPolicy::HiloV1 { .. }
+            )
+        })
+    {
+        return Ok(());
+    }
+
+    let first_reserved =
+        i64::try_from(HILO_V1_FORMAT_MARKER).expect("hilo_v1 reserves the signed high bit");
+    if values
+        .iter()
+        .any(|value| matches!(value, ShardKeyValue::Int64(value) if *value >= first_reserved))
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "hilo_v1 generated-ID values are allocator-owned and cannot be supplied by an explicit INSERT",
+        ));
+    }
+    Ok(())
 }
 
 fn reject_retired_owner_insert(
@@ -541,18 +574,25 @@ where
     let Some(table) = table else {
         return Ok(shard_for_key(canonical_key));
     };
-    let (GeneratedIdPolicy::NativeRangeV1 { .. }, ShardKeyValue::Int64(value)) =
-        (table.generated_id_policy(), value)
-    else {
+    let ShardKeyValue::Int64(value) = value else {
         return Ok(shard_for_key(canonical_key));
     };
+    if !matches!(
+        table.generated_id_policy(),
+        GeneratedIdPolicy::NativeRangeV1 { .. } | GeneratedIdPolicy::HiloV1 { .. }
+    ) {
+        return Ok(shard_for_key(canonical_key));
+    }
 
     let classification = classify_caller_generated_id(table.generated_id_policy(), *value)?;
-    let GeneratedIdClassification::NativeRangeV1(native) = classification else {
-        // Negative and pre-marker values deliberately retain the frozen legacy
-        // hash route so imported identifiers never move when native allocation
-        // is enabled explicitly for future rows.
-        return Ok(shard_for_key(canonical_key));
+    let native = match classification {
+        GeneratedIdClassification::Legacy(_) | GeneratedIdClassification::HiloV1(_) => {
+            // Native tables keep their pre-native-marker legacy route. Hi/lo
+            // tables hash both their global sequence values and the explicitly
+            // supported negative/pre-hi/lo legacy interval.
+            return Ok(shard_for_key(canonical_key));
+        }
+        GeneratedIdClassification::NativeRangeV1(native) => native,
     };
     let owners = allocation_owners.ok_or_else(|| {
         EngineError::new(
@@ -687,6 +727,30 @@ mod tests {
                     ShardKeyType::Int64,
                 )),
                 GeneratedIdPolicy::native_range_v1("id").unwrap(),
+            )]
+            .into_boxed_slice(),
+        )
+    }
+
+    fn hilo_catalog() -> Catalog {
+        Catalog::from_validated_parts(
+            1,
+            7,
+            DEFAULT_DATABASE,
+            vec![LogicalDatabaseMetadata::from_validated(
+                DEFAULT_DATABASE,
+                "default".to_owned(),
+            )]
+            .into_boxed_slice(),
+            vec![TableMetadata::from_validated_with_generated_id_policy(
+                EVENTS_TABLE,
+                DEFAULT_DATABASE,
+                "hilo_events".to_owned(),
+                TablePlacement::Sharded(ShardKeyMetadata::from_validated(
+                    "id".to_owned(),
+                    ShardKeyType::Int64,
+                )),
+                GeneratedIdPolicy::hilo_v1("id").unwrap(),
             )]
             .into_boxed_slice(),
         )
@@ -1332,6 +1396,178 @@ mod tests {
             )
             .unwrap();
             assert_eq!(plan.inferred_routes()[0].shard(), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn hilo_ids_and_pre_marker_legacy_values_use_the_frozen_hash_route() {
+        let catalog = hilo_catalog();
+        let routing = routing_catalog(4);
+        let generated = [
+            crate::core::generated_id::HiloV1Id::new(1)
+                .unwrap()
+                .encode(),
+            crate::core::generated_id::HiloV1Id::new(41)
+                .unwrap()
+                .encode(),
+            crate::core::generated_id::HiloV1Id::new(
+                crate::core::generated_id::MAX_HILO_V1_SEQUENCE,
+            )
+            .unwrap()
+            .encode(),
+        ];
+        let legacy = [
+            i64::MIN,
+            -1,
+            0,
+            1,
+            (crate::core::generated_id::HILO_V1_FORMAT_MARKER - 1) as i64,
+        ];
+
+        for value in generated.into_iter().chain(legacy) {
+            for source in [
+                "SELECT * FROM hilo_events WHERE id = ?1",
+                "DELETE FROM hilo_events WHERE id = ?1",
+            ] {
+                let normalized = normalize(SqlDialect::Sqlite, source);
+                let expected = routing.shard_for_key(value.to_string().as_bytes());
+                let explicit = value.to_string();
+                let plan = plan_bound_statement(
+                    BoundStatementPlanInput::new(
+                        &catalog,
+                        database_id(DEFAULT_DATABASE),
+                        &normalized,
+                        0,
+                        &[Value::Int64(value)],
+                        Some(explicit.as_bytes()),
+                    ),
+                    RoutingProvenance::new(1, 1, 1, 1),
+                    |key| routing.shard_for_key(key),
+                )
+                .unwrap();
+                assert_eq!(plan.inferred_routes()[0].shard(), expected, "{value}");
+                assert_eq!(plan.explicit_route().unwrap().shard(), expected, "{value}");
+                assert_eq!(plan.assigned_shard(), Some(expected), "{value}");
+            }
+        }
+    }
+
+    #[test]
+    fn hilo_explicit_insert_rejects_the_entire_allocator_namespace_before_routing() {
+        let catalog = hilo_catalog();
+        let normalized = normalize(
+            SqlDialect::Sqlite,
+            "INSERT INTO hilo_events (id) VALUES (?1)",
+        );
+        for value in [
+            crate::core::generated_id::hilo_v1_sequence_floor(),
+            crate::core::generated_id::hilo_v1_first_id(),
+            0x3000_0000_0000_0041,
+            crate::core::generated_id::hilo_v1_sequence_ceiling(),
+            crate::core::generated_id::NATIVE_RANGE_V1_FORMAT_MARKER as i64,
+            0x5000_0000_0000_0041,
+            i64::MAX,
+        ] {
+            let error = plan_bound_statement(
+                BoundStatementPlanInput::new(
+                    &catalog,
+                    database_id(DEFAULT_DATABASE),
+                    &normalized,
+                    0,
+                    &[Value::Int64(value)],
+                    None,
+                ),
+                RoutingProvenance::new(1, 1, 1, 1),
+                |_| panic!("allocator-owned INSERT must fail before routing"),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+            assert!(error.diagnostic().contains("allocator-owned"));
+        }
+
+        let multirow = normalize(
+            SqlDialect::Sqlite,
+            "INSERT INTO hilo_events (id) VALUES (?1), (?2)",
+        );
+        let error = plan_bound_statement(
+            BoundStatementPlanInput::new(
+                &catalog,
+                database_id(DEFAULT_DATABASE),
+                &multirow,
+                0,
+                &[
+                    Value::Int64(41),
+                    Value::Int64(crate::core::generated_id::hilo_v1_first_id()),
+                ],
+                None,
+            ),
+            RoutingProvenance::new(1, 1, 1, 1),
+            |_| panic!("a mixed multi-row INSERT must fail before routing"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(error.diagnostic().contains("allocator-owned"));
+    }
+
+    #[test]
+    fn hilo_explicit_insert_still_accepts_pre_marker_legacy_values() {
+        let catalog = hilo_catalog();
+        let routing = routing_catalog(4);
+        let normalized = normalize(
+            SqlDialect::Sqlite,
+            "INSERT INTO hilo_events (id) VALUES (?1)",
+        );
+        for value in [
+            i64::MIN,
+            -1,
+            0,
+            1,
+            (crate::core::generated_id::HILO_V1_FORMAT_MARKER - 1) as i64,
+        ] {
+            let expected = routing.shard_for_key(value.to_string().as_bytes());
+            let plan = plan_bound_statement(
+                BoundStatementPlanInput::new(
+                    &catalog,
+                    database_id(DEFAULT_DATABASE),
+                    &normalized,
+                    0,
+                    &[Value::Int64(value)],
+                    None,
+                ),
+                RoutingProvenance::new(1, 1, 1, 1),
+                |key| routing.shard_for_key(key),
+            )
+            .unwrap();
+            assert_eq!(plan.assigned_shard(), Some(expected), "{value}");
+        }
+    }
+
+    #[test]
+    fn hilo_reads_fail_closed_on_reserved_or_incompatible_namespaces() {
+        let catalog = hilo_catalog();
+        let normalized = normalize(
+            SqlDialect::Sqlite,
+            "SELECT * FROM hilo_events WHERE id = ?1",
+        );
+        for value in [
+            crate::core::generated_id::hilo_v1_sequence_floor(),
+            crate::core::generated_id::NATIVE_RANGE_V1_FORMAT_MARKER as i64,
+            i64::MAX,
+        ] {
+            let error = plan_bound_statement(
+                BoundStatementPlanInput::new(
+                    &catalog,
+                    database_id(DEFAULT_DATABASE),
+                    &normalized,
+                    0,
+                    &[Value::Int64(value)],
+                    None,
+                ),
+                RoutingProvenance::new(1, 1, 1, 1),
+                |_| 0,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidArgument, "{value}");
         }
     }
 

@@ -675,7 +675,10 @@ pub(super) fn preflight_schema_migration_on_connection_with_digest_and_catalog_s
         sql,
         Some((
             catalog.logical(),
-            Some(catalog.active_native_id_table_ids()),
+            Some((
+                catalog.active_native_id_table_ids(),
+                catalog.active_hilo_id_table_ids(),
+            )),
         )),
     )
 }
@@ -689,7 +692,7 @@ fn preflight_schema_migration_on_connection_with_digest_inner(
     target_generation: u64,
     layout: &ShardLayout,
     sql: &str,
-    catalog: Option<(&Catalog, Option<&[TableId]>)>,
+    catalog: Option<SchemaCatalogValidation<'_>>,
 ) -> EngineResult<(SchemaMigrationShardState, SchemaDigest)> {
     if catalog.is_some_and(|(catalog, _)| !catalog.tables().is_empty()) {
         crate::sql::validate_authoritative_schema_migration(sql)?;
@@ -767,6 +770,9 @@ fn preflight_schema_migration_on_connection_with_digest_inner(
     Ok((state, target_digest))
 }
 
+type ActiveGeneratedIdTableIds<'a> = (&'a [TableId], &'a [TableId]);
+type SchemaCatalogValidation<'a> = (&'a Catalog, Option<ActiveGeneratedIdTableIds<'a>>);
+
 /// Verify that one physical shard still implements the complete authoritative
 /// logical table catalog after a tentative schema migration.
 ///
@@ -784,18 +790,23 @@ pub(super) fn validate_registered_table_schema(
     validate_registered_table_schema_inner(connection, catalog, None)
 }
 
-pub(super) fn validate_registered_table_schema_with_active_native_ids(
+pub(super) fn validate_registered_table_schema_with_active_generated_ids(
     connection: &Connection,
     catalog: &Catalog,
     active_native_id_table_ids: &[TableId],
+    active_hilo_id_table_ids: &[TableId],
 ) -> EngineResult<()> {
-    validate_registered_table_schema_inner(connection, catalog, Some(active_native_id_table_ids))
+    validate_registered_table_schema_inner(
+        connection,
+        catalog,
+        Some((active_native_id_table_ids, active_hilo_id_table_ids)),
+    )
 }
 
 fn validate_registered_table_schema_inner(
     connection: &Connection,
     catalog: &Catalog,
-    active_native_id_table_ids: Option<&[TableId]>,
+    active_generated_id_table_ids: Option<(&[TableId], &[TableId])>,
 ) -> EngineResult<()> {
     if catalog.tables().is_empty() {
         return Ok(());
@@ -963,17 +974,34 @@ fn validate_registered_table_schema_inner(
                 "has an incompatible SQLite declared type",
             ));
         }
-        let native_policy_is_active =
-            active_native_id_table_ids.is_none_or(|ids| ids.binary_search(&table.id()).is_ok());
-        if native_policy_is_active {
-            if let GeneratedIdPolicy::NativeRangeV1 { column } = table.generated_id_policy() {
-                if !native_generated_column_is_exact(connection, table.name(), column)? {
+        let generated_policy_is_active = match table.generated_id_policy() {
+            GeneratedIdPolicy::NativeRangeV1 { .. } => active_generated_id_table_ids
+                .is_none_or(|(ids, _)| ids.binary_search(&table.id()).is_ok()),
+            GeneratedIdPolicy::HiloV1 { .. } => active_generated_id_table_ids
+                .is_none_or(|(_, ids)| ids.binary_search(&table.id()).is_ok()),
+            GeneratedIdPolicy::None => false,
+        };
+        if generated_policy_is_active {
+            match table.generated_id_policy() {
+                GeneratedIdPolicy::NativeRangeV1 { column }
+                    if !native_generated_column_is_exact(connection, table.name(), column)? =>
+                {
                     return Err(registered_shard_key_error(
                         table.name(),
                         column,
                         "must remain exactly INTEGER PRIMARY KEY AUTOINCREMENT",
                     ));
                 }
+                GeneratedIdPolicy::HiloV1 { column }
+                    if !hilo_generated_column_is_exact(connection, table.name(), column)? =>
+                {
+                    return Err(registered_shard_key_error(
+                        table.name(),
+                        column,
+                        "must remain exactly INTEGER PRIMARY KEY without AUTOINCREMENT",
+                    ));
+                }
+                _ => {}
             }
         }
         if matches!(shard_key.key_type(), ShardKeyType::Text)
@@ -1631,6 +1659,12 @@ fn generated_id_routing_domains_match(
     matches!(
         (child, parent),
         (GeneratedIdPolicy::None, GeneratedIdPolicy::None)
+            | (GeneratedIdPolicy::None, GeneratedIdPolicy::HiloV1 { .. })
+            | (GeneratedIdPolicy::HiloV1 { .. }, GeneratedIdPolicy::None)
+            | (
+                GeneratedIdPolicy::HiloV1 { .. },
+                GeneratedIdPolicy::HiloV1 { .. }
+            )
             | (
                 GeneratedIdPolicy::NativeRangeV1 { .. },
                 GeneratedIdPolicy::NativeRangeV1 { .. }
@@ -1853,6 +1887,33 @@ pub(super) fn native_generated_column_is_exact(
             .is_some_and(|declared_type| declared_type.to_bytes().eq_ignore_ascii_case(b"INTEGER"))
         && primary_key
         && auto_increment)
+}
+
+pub(super) fn hilo_generated_column_is_exact(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> EngineResult<bool> {
+    let (declared_type, _, _, primary_key, auto_increment) = connection
+        .column_metadata(Some("main"), table, column)
+        .map_err(sqlite_error::storage)?;
+    let exact_shape = connection
+        .query_row(
+            "SELECT COUNT(*) = 1
+                    AND COALESCE(MAX(dflt_value IS NULL), 0) = 1
+                    AND COALESCE(MAX(pk), 0) = 1
+                    AND COALESCE(MAX(hidden), 1) = 0
+             FROM pragma_table_xinfo(?1)
+             WHERE name = ?2 COLLATE BINARY",
+            (table, column),
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(exact_shape
+        && declared_type
+            .is_some_and(|declared_type| declared_type.to_bytes().eq_ignore_ascii_case(b"INTEGER"))
+        && primary_key
+        && !auto_increment)
 }
 
 fn registered_shard_key_is_non_null(
@@ -4047,6 +4108,83 @@ mod tests {
         let error = validate_registered_table_schema(&unsafe_catalog_parent, &catalog).unwrap_err();
         assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
         assert!(error.diagnostic().contains("catalog-only table"));
+    }
+
+    #[test]
+    fn hilo_and_plain_int64_shard_keys_share_a_foreign_key_routing_domain() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE hilo_parents (
+                     id INTEGER PRIMARY KEY,
+                     payload TEXT NOT NULL
+                 ) STRICT;
+                 CREATE TABLE plain_children (
+                     parent_id INTEGER PRIMARY KEY
+                         REFERENCES hilo_parents(id),
+                     payload TEXT NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        let database = crate::core::LogicalDatabaseId::new(1).unwrap();
+        let parent = TableDeclaration::sharded(
+            database,
+            "hilo_parents",
+            ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+        )
+        .unwrap()
+        .with_generated_id_policy(GeneratedIdPolicy::hilo_v1("id").unwrap())
+        .unwrap();
+        let child = TableDeclaration::sharded(
+            database,
+            "plain_children",
+            ShardKeyMetadata::new("parent_id", ShardKeyType::Int64).unwrap(),
+        )
+        .unwrap();
+        let declarations = [parent.clone(), child.clone()];
+
+        validate_declared_table_constraints(&connection, &parent, &declarations).unwrap();
+        validate_declared_table_constraints(&connection, &child, &declarations).unwrap();
+
+        let generated = crate::core::generated_id::HiloV1Id::new(1)
+            .unwrap()
+            .encode();
+        connection
+            .execute(
+                "INSERT INTO hilo_parents (id, payload) VALUES (?1, 'parent')",
+                [generated],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO plain_children (parent_id, payload) VALUES (?1, 'child')",
+                [generated],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM plain_children AS child
+                     JOIN hilo_parents AS parent ON parent.id = child.parent_id",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        assert!(generated_id_routing_domains_match(
+            &GeneratedIdPolicy::None,
+            parent.generated_id_policy()
+        ));
+        assert!(!generated_id_routing_domains_match(
+            &GeneratedIdPolicy::native_range_v1("parent_id").unwrap(),
+            parent.generated_id_policy()
+        ));
     }
 
     #[test]

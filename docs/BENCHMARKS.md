@@ -218,6 +218,88 @@ an experimental complement and optimization foundation. It must not replace
 the Engine/protocol query path at this stage. Streaming child cursors and pooled
 read handles are the clearest measured follow-up opportunities.
 
+## Hi/lo versus native generated-write workload
+
+Issue #129 adds a separate ignored release harness for the two internal
+generated-ID seams. It is a four-shard, one-row autocommit comparison, not a
+wire-protocol benchmark. Each fresh fixture registers these exact empty table
+shapes on every shard:
+
+```sql
+CREATE TABLE benchmark_generated_native (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payload TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE benchmark_generated_hilo (
+    id INTEGER PRIMARY KEY,
+    payload TEXT NOT NULL
+) STRICT;
+```
+
+The matrix is frozen at exactly 2, 4, 8, and 10 concurrent writers. Each writer
+owns one pre-opened writable coordinator on its own OS thread. A barrier releases
+all writers together, after coordinator construction, and each performs 10,000
+single-row inserts. The native workload uses its automatic active-owner
+selection. The hi/lo workload consumes a globally leased ID and hash-routes the
+complete encoded value. Five samples are taken per policy and writer count;
+which policy runs first alternates by sample. The report uses the median by
+total writes per second. A fresh fixture is used for each writer count, and
+both physical table counts must equal the exact expected cumulative writes
+before that comparison is reported.
+
+Timing includes generated-ID consumption, route selection, virtual-table
+callback and reconciliation, physical SQLite WAL work, `synchronous=FULL`, and
+all 10,000 autocommit inserts per worker. For `hilo_v1`, it therefore includes
+one immediate manifest reservation and semantic-root refresh per 4,096-value
+block. It excludes database and table creation, registration/provisioning,
+coordinator opening, and thread creation. Timing starts immediately before the
+parent joins the start barrier, so it includes the final worker rendezvous and
+barrier release.
+The two policies intentionally retain their production allocation semantics:
+native generation advances shard-local `sqlite_sequence`, whereas hi/lo makes
+one central durable write per block and hash-distributes its encoded IDs.
+
+Run the correctness smoke test first, then the optimized matrix on a quiet local
+filesystem:
+
+```bash
+cargo test --locked --features experimental-vtab --lib \
+  storage::sharded_vtab::benchmarks::generated_write_benchmark_smoke_covers_the_frozen_writer_matrix_and_both_policies \
+  -- --exact
+
+cargo test --release --locked --features experimental-vtab --lib \
+  storage::sharded_vtab::benchmarks::release_benchmark_matrix_reports_issue_129_generated_write_comparison \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+The tab-separated output schema is:
+
+```text
+record  policy  shards  writers  writes_per_worker  samples  median_total_writes  median_elapsed_ms  median_writes_per_sec
+comparison_record  shards  writers  hilo_over_native
+```
+
+The issue #129 matrix was measured on 2026-08-12 from branch
+`agent/129-hilo-v1`, based on `e8a1a05`, with the exact release command above.
+The host was an Apple M1 Pro with 10 cores and 16 GiB RAM, macOS 26.2/Darwin
+25.2.0, Rust 1.94.1 (`aarch64-apple-darwin`), and Cargo 1.94.1. The repository
+and temporary fixtures were on the internal solid-state APFS data volume. The
+machine was on AC power with a charged battery; samples used the operating
+system's normal warm cache and no cache flush. The complete test took 757.34
+seconds and all post-run physical row counts matched.
+
+| Writers | `native_range_v1` writes/s | `hilo_v1` writes/s | Hi/lo ÷ native |
+| ---: | ---: | ---: | ---: |
+| 2 | 1,911.16 | 2,059.28 | 1.078× |
+| 4 | 2,566.69 | 3,021.51 | 1.177× |
+| 8 | 3,683.81 | 3,782.75 | 1.027× |
+| 10 | 3,490.22 | 3,614.71 | 1.036× |
+
+On this host, hi/lo remained ahead at every tested concurrency, with the
+largest measured gain at four writers. These values are one-host engineering
+measurements, not capacity guarantees or CI thresholds.
+
 The decision record must report measurements for both paths, including startup
 where relevant, and explain whether the virtual-table boundary advances,
 remains experimental, or is rejected. The feature remains off the authoritative

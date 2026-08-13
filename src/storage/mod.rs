@@ -1,5 +1,6 @@
 //! SQLite file layout, versioned manifest management, and connection configuration.
 
+mod hilo;
 mod manifest;
 mod migration;
 mod schema_gate;
@@ -60,6 +61,7 @@ struct RootSchemaCoordination {
     gate: schema_gate::SchemaGate,
     catalogs: Mutex<Vec<Weak<CatalogSnapshot>>>,
     schema_digests: Mutex<RuntimeSchemaDigests>,
+    hilo_allocator: hilo::HiloAllocator,
 }
 
 struct CatalogReplacementGuard<'a> {
@@ -95,12 +97,13 @@ struct RuntimeSchemaDigests {
 }
 
 impl RootSchemaCoordination {
-    fn new() -> Self {
-        Self {
+    fn new() -> EngineResult<Self> {
+        Ok(Self {
             gate: schema_gate::SchemaGate::new(),
             catalogs: Mutex::new(Vec::new()),
             schema_digests: Mutex::new(RuntimeSchemaDigests::default()),
-        }
+            hilo_allocator: hilo::HiloAllocator::new()?,
+        })
     }
 
     fn mark_degraded(&self) {
@@ -315,6 +318,7 @@ fn immutable_catalog_metadata_matches(left: &CatalogSnapshot, right: &CatalogSna
     left.routing() == right.routing()
         && left.allocation_owners() == right.allocation_owners()
         && left.active_native_id_table_ids() == right.active_native_id_table_ids()
+        && left.active_hilo_id_table_ids() == right.active_hilo_id_table_ids()
         && left_logical.identifier_encoding_version() == right_logical.identifier_encoding_version()
         && left_logical.default_database().id() == right_logical.default_database().id()
         && left_logical.logical_databases() == right_logical.logical_databases()
@@ -336,7 +340,7 @@ fn root_schema_coordination(root: &Path) -> EngineResult<Arc<RootSchemaCoordinat
     if let Some(coordination) = registry.get(root).and_then(Weak::upgrade) {
         return Ok(coordination);
     }
-    let coordination = Arc::new(RootSchemaCoordination::new());
+    let coordination = Arc::new(RootSchemaCoordination::new()?);
     registry.insert(root.to_path_buf(), Arc::downgrade(&coordination));
     Ok(coordination)
 }
@@ -500,9 +504,11 @@ impl Storage {
             active_migration,
             mut integrity,
             active_native_id_table_ids,
+            active_hilo_id_table_ids,
             active_table_provisioning,
         ) = loaded.into_parts_with_recovery();
         let catalog = catalog.with_active_native_id_table_ids(active_native_id_table_ids);
+        let catalog = catalog.with_active_hilo_id_table_ids(active_hilo_id_table_ids);
         let catalog = schema_coordination.register_catalog(catalog)?;
         schema_coordination.publish_schema_digests(
             integrity.committed_schema_digest(),
@@ -694,6 +700,40 @@ impl Storage {
         self.catalog.native_id_policy_is_active(table_id)
     }
 
+    #[cfg(any(feature = "experimental-vtab", test))]
+    pub(crate) fn generated_id_policy_is_active(&self, table_id: TableId) -> bool {
+        self.catalog.native_id_policy_is_active(table_id)
+            || self.catalog.hilo_id_policy_is_active(table_id)
+    }
+
+    #[cfg(any(feature = "experimental-vtab", test))]
+    pub(crate) fn allocate_hilo_v1(&self, table_id: TableId) -> EngineResult<hilo::HiloAllocation> {
+        if !self.catalog.hilo_id_policy_is_active(table_id) {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!("hilo_v1 generation is not active for table {table_id}"),
+            ));
+        }
+        self.schema_coordination
+            .hilo_allocator
+            .allocate(table_id, |owner_id| {
+                let mut manifest_connection =
+                    open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+                configure_manifest_connection(&manifest_connection)?;
+                manifest::reserve_hilo_v1_block(
+                    &mut manifest_connection,
+                    self.shard_count(),
+                    table_id,
+                    owner_id,
+                )
+            })
+    }
+
+    #[cfg(any(feature = "experimental-vtab", test))]
+    pub(crate) fn hilo_owner_id(&self) -> [u8; 32] {
+        self.schema_coordination.hilo_allocator.owner_id()
+    }
+
     pub(crate) fn register_tables(
         &mut self,
         declarations: Vec<TableDeclaration>,
@@ -712,26 +752,30 @@ impl Storage {
                 "the authoritative table catalog is already registered",
             ));
         }
-        let has_native_policy = declarations.iter().any(|declaration| {
-            matches!(
-                declaration.generated_id_policy(),
-                GeneratedIdPolicy::NativeRangeV1 { .. }
-            )
+        let has_generated_policy = declarations.iter().any(|declaration| {
+            !matches!(declaration.generated_id_policy(), GeneratedIdPolicy::None)
         });
-        let every_native_policy_is_active = !has_native_policy
-            || declarations.iter().all(|declaration| {
-                !matches!(
-                    declaration.generated_id_policy(),
-                    GeneratedIdPolicy::NativeRangeV1 { .. }
-                ) || self
-                    .catalog
-                    .logical()
-                    .table("default", declaration.name())
-                    .ok()
-                    .flatten()
-                    .is_some_and(|table| self.catalog.native_id_policy_is_active(table.id()))
-            });
-        if !catalog_is_empty && every_native_policy_is_active {
+        let every_generated_policy_is_active = !has_generated_policy
+            || declarations
+                .iter()
+                .all(|declaration| match declaration.generated_id_policy() {
+                    GeneratedIdPolicy::None => true,
+                    GeneratedIdPolicy::NativeRangeV1 { .. } => self
+                        .catalog
+                        .logical()
+                        .table("default", declaration.name())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|table| self.catalog.native_id_policy_is_active(table.id())),
+                    GeneratedIdPolicy::HiloV1 { .. } => self
+                        .catalog
+                        .logical()
+                        .table("default", declaration.name())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|table| self.catalog.hilo_id_policy_is_active(table.id())),
+                });
+        if !catalog_is_empty && every_generated_policy_is_active {
             let _operation = self.enter_schema_operation()?;
             return Ok(());
         }
@@ -746,7 +790,7 @@ impl Storage {
             let manifest_path = self.root.join("manifest.sqlite");
             let mut manifest_connection = open_existing_manifest(&manifest_path)?;
             configure_manifest_connection(&manifest_connection)?;
-            let replacement = if has_native_policy {
+            let replacement = if has_generated_policy {
                 let committed_schema_digest = self.schema_coordination.committed_schema_digest()?;
                 let classification = manifest::begin_native_table_provisioning(
                     &mut manifest_connection,
@@ -883,7 +927,7 @@ impl Storage {
                 GeneratedIdPolicy::NativeRangeV1 { column } => {
                     Some((declaration.name(), column.as_str()))
                 }
-                GeneratedIdPolicy::None => None,
+                GeneratedIdPolicy::None | GeneratedIdPolicy::HiloV1 { .. } => None,
             })
             .collect::<Vec<_>>();
         if native_tables.is_empty() {
@@ -1345,10 +1389,11 @@ impl Storage {
         // enforcing compatibility policy. Otherwise a policy error on an early
         // shard could mask later corruption and prevent terminal degradation.
         for (shard_id, connection) in verified_connections.iter().enumerate() {
-            shard::validate_registered_table_schema_with_active_native_ids(
+            shard::validate_registered_table_schema_with_active_generated_ids(
                 connection,
                 self.catalog.logical(),
                 self.catalog.active_native_id_table_ids(),
+                self.catalog.active_hilo_id_table_ids(),
             )?;
             self.validate_native_range_v1_state(
                 connection,
@@ -1666,6 +1711,17 @@ fn validate_empty_table_declaration(
                 EngineErrorKind::FailedPrecondition,
                 format!(
                     "generated column {column} on table {} must be exactly INTEGER PRIMARY KEY AUTOINCREMENT on physical shard {shard_id}",
+                    declaration.name()
+                ),
+            ));
+        }
+    }
+    if let GeneratedIdPolicy::HiloV1 { column } = declaration.generated_id_policy() {
+        if !shard::hilo_generated_column_is_exact(connection, declaration.name(), column)? {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "generated column {column} on table {} must be exactly INTEGER PRIMARY KEY without AUTOINCREMENT on physical shard {shard_id}",
                     declaration.name()
                 ),
             ));
@@ -2524,6 +2580,7 @@ mod tests {
             manifest
                 .execute_batch(
                     "BEGIN IMMEDIATE;
+                     DROP TABLE briskdb_hilo_leases;
                      DROP TABLE briskdb_table_provisioning_declarations;
                      DROP TABLE briskdb_table_provisioning;
                      DROP TABLE briskdb_generated_ids;
@@ -2626,6 +2683,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_hilo_leases;
                  DROP TABLE briskdb_table_provisioning_declarations;
                  DROP TABLE briskdb_table_provisioning;
                  DROP TABLE briskdb_generated_ids;
@@ -2722,6 +2780,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_hilo_leases;
                  DROP TABLE briskdb_table_provisioning_declarations;
                  DROP TABLE briskdb_table_provisioning;
                  DROP TABLE briskdb_generated_ids;
@@ -3569,6 +3628,42 @@ mod tests {
             native_events_declaration(storage.logical_catalog().default_database().id());
         storage.register_tables(vec![declaration]).unwrap();
         storage
+    }
+
+    fn create_registered_hilo_storage(root: &Path, shard_count: u16) -> Storage {
+        let mut storage = Storage::open(root, shard_count).unwrap();
+        let mut migration = storage.begin_schema_migration().unwrap();
+        migration.wait_for_quiescence_blocking();
+        storage
+            .apply_schema_migration(
+                "CREATE TABLE events (
+                     id INTEGER PRIMARY KEY,
+                     payload BLOB
+                 ) STRICT;",
+                &mut migration,
+                None,
+            )
+            .unwrap();
+        migration.publish_ready().unwrap();
+        let declaration = TableDeclaration::sharded(
+            storage.logical_catalog().default_database().id(),
+            "events",
+            crate::core::ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+        )
+        .unwrap()
+        .with_generated_id_policy(crate::core::GeneratedIdPolicy::hilo_v1("id").unwrap())
+        .unwrap();
+        storage.register_tables(vec![declaration]).unwrap();
+        storage
+    }
+
+    fn hilo_events_table_id(storage: &Storage) -> TableId {
+        storage
+            .logical_catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap()
+            .id()
     }
 
     #[test]
@@ -4995,6 +5090,175 @@ mod tests {
             reopened.register_tables(declarations).unwrap();
             assert_eq!(reopened.catalog().tables().len(), 2);
         }
+    }
+
+    #[test]
+    fn hilo_lease_process_child() {
+        let Ok(root) = std::env::var("BRISKDB_HILO_PROCESS_ROOT") else {
+            return;
+        };
+        let storage = Storage::open(root, 2).unwrap();
+        let table_id = hilo_events_table_id(&storage);
+        if let Ok(ready) = std::env::var("BRISKDB_HILO_PROCESS_READY") {
+            fs::write(&ready, b"ready").unwrap();
+            let go = PathBuf::from(std::env::var("BRISKDB_HILO_PROCESS_GO").unwrap());
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while !go.exists() && Instant::now() < deadline {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(go.exists(), "parent did not release hilo_v1 child");
+        }
+        let allocation = storage.allocate_hilo_v1(table_id).unwrap();
+        if let Ok(output) = std::env::var("BRISKDB_HILO_PROCESS_OUTPUT") {
+            fs::write(output, allocation.id().to_string()).unwrap();
+        }
+    }
+
+    #[test]
+    fn hilo_restart_burns_the_unconsumed_tail_of_the_committed_block() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = create_registered_hilo_storage(temp.path(), 2);
+        let table_id = hilo_events_table_id(&storage);
+        let first = storage.allocate_hilo_v1(table_id).unwrap().id();
+        assert_eq!(
+            crate::core::generated_id::HiloV1Id::decode(first)
+                .unwrap()
+                .sequence(),
+            1
+        );
+        drop(storage);
+
+        let reopened = Storage::open(temp.path(), 2).unwrap();
+        let next = reopened.allocate_hilo_v1(table_id).unwrap().id();
+        assert_eq!(
+            crate::core::generated_id::HiloV1Id::decode(next)
+                .unwrap()
+                .sequence(),
+            manifest::HILO_V1_BLOCK_SIZE + 1
+        );
+    }
+
+    #[test]
+    fn hilo_allocator_reserves_manifest_state_once_per_block() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = create_registered_hilo_storage(temp.path(), 4);
+        let table_id = hilo_events_table_id(&storage);
+
+        for expected_sequence in 1..=manifest::HILO_V1_BLOCK_SIZE + 1 {
+            let allocation = storage.allocate_hilo_v1(table_id).unwrap();
+            assert_eq!(
+                crate::core::generated_id::HiloV1Id::decode(allocation.id())
+                    .unwrap()
+                    .sequence(),
+                expected_sequence
+            );
+        }
+
+        let connection = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+        let (next_sequence, fence_token) = connection
+            .query_row(
+                "SELECT next_sequence, fence_token
+                 FROM briskdb_hilo_leases
+                 WHERE table_id = ?1",
+                [i64::try_from(table_id.get()).unwrap()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            next_sequence,
+            i64::try_from(manifest::HILO_V1_BLOCK_SIZE * 2 + 1).unwrap()
+        );
+        assert_eq!(fence_token, 2);
+    }
+
+    #[test]
+    fn real_process_abort_before_or_after_hilo_lease_commit_never_reuses_a_block() {
+        for (boundary, expected_sequence) in [
+            ("before-commit", 1),
+            ("after-commit", manifest::HILO_V1_BLOCK_SIZE + 1),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            drop(create_registered_hilo_storage(temp.path(), 2));
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("storage::tests::hilo_lease_process_child")
+                .arg("--nocapture")
+                .env("BRISKDB_HILO_PROCESS_ROOT", temp.path())
+                .env("BRISKDB_HILO_LEASE_ABORT_POINT", boundary)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "child did not abort at {boundary}");
+
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let allocation = storage
+                .allocate_hilo_v1(hilo_events_table_id(&storage))
+                .unwrap();
+            assert_eq!(
+                crate::core::generated_id::HiloV1Id::decode(allocation.id())
+                    .unwrap()
+                    .sequence(),
+                expected_sequence,
+                "{boundary}"
+            );
+        }
+    }
+
+    #[test]
+    fn competing_processes_receive_disjoint_hilo_blocks() {
+        let temp = tempfile::tempdir().unwrap();
+        drop(create_registered_hilo_storage(temp.path(), 2));
+        let go = temp.path().join("go");
+        let mut children = Vec::new();
+        let mut ready_paths = Vec::new();
+        let mut output_paths = Vec::new();
+        for index in 0..2 {
+            let ready = temp.path().join(format!("ready-{index}"));
+            let output = temp.path().join(format!("allocation-{index}"));
+            let child = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("storage::tests::hilo_lease_process_child")
+                .arg("--nocapture")
+                .env("BRISKDB_HILO_PROCESS_ROOT", temp.path())
+                .env("BRISKDB_HILO_PROCESS_READY", &ready)
+                .env("BRISKDB_HILO_PROCESS_GO", &go)
+                .env("BRISKDB_HILO_PROCESS_OUTPUT", &output)
+                .spawn()
+                .unwrap();
+            children.push(child);
+            ready_paths.push(ready);
+            output_paths.push(output);
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while ready_paths.iter().any(|path| !path.exists()) && Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ready_paths.iter().all(|path| path.exists()));
+        fs::write(&go, b"go").unwrap();
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        let mut sequences = output_paths
+            .iter()
+            .map(|path| {
+                let id = fs::read_to_string(path).unwrap().parse::<i64>().unwrap();
+                crate::core::generated_id::HiloV1Id::decode(id)
+                    .unwrap()
+                    .sequence()
+            })
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, [1, manifest::HILO_V1_BLOCK_SIZE + 1]);
+
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let next = storage
+            .allocate_hilo_v1(hilo_events_table_id(&storage))
+            .unwrap();
+        assert_eq!(
+            crate::core::generated_id::HiloV1Id::decode(next.id())
+                .unwrap()
+                .sequence(),
+            manifest::HILO_V1_BLOCK_SIZE * 2 + 1
+        );
     }
 
     #[test]
