@@ -66,6 +66,8 @@ offline, staged conversion of one ordinary SQLite database into an explicitly
 cataloged BriskDB layout with exactly-once Sharded row placement.
 The [manifest storage-format contract](docs/STORAGE_FORMAT.md) defines versioned
 startup migrations, downgrade behavior, and recovery boundaries.
+The [pre-1.0 compatibility policy](docs/PRE_1_COMPATIBILITY.md) defines upgrade,
+downgrade, rollback, and release-note expectations while the format is unstable.
 The [stopped-server backup contract](docs/OFFLINE_BACKUP.md) defines the
 supported alpha procedure for copying and restoring one complete data directory.
 Contributions follow the repository's [test-first completion policy](CONTRIBUTING.md).

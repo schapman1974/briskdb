@@ -4,6 +4,8 @@
 never exposed through HTTP, PostgreSQL, MySQL, or the SQL execution API. The
 format is pre-1.0, but every format change must still have an ordered migration,
 failure coverage, and an explicit compatibility decision.
+The [pre-1.0 compatibility policy](PRE_1_COMPATIBILITY.md) defines the required
+operator backup, forward-upgrade, downgrade-refusal, and release-note contract.
 
 The final `manifest.sqlite` path component must be a regular file, never a
 symbolic link. Startup may create that exact file when a fresh layout is
