@@ -11,8 +11,8 @@ engine. It keeps the durability, WAL, transactions, tooling, and boring
 reliability developers already trust—then adds routing, parallel writer domains,
 global reads, generated IDs, an HTTP API, and wire-protocol frontends.
 
-**HTTP and bounded PostgreSQL queries work today. Native MongoDB, MySQL,
-embedded Rust, Python, and serverless use are on the roadmap.**
+**HTTP, bounded PostgreSQL queries, and listener-free Rust embedding work today.
+Native MongoDB, MySQL, Python, and serverless use are on the roadmap.**
 
 > [!WARNING]
 > BriskDB is an alpha. It is exciting infrastructure, not yet a production-ready
@@ -109,9 +109,10 @@ experimental and opt-in; the exact contract lives in
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
 | Debian package and hardened systemd service | Published |
+| Listener-free Rust library entrypoint | Working |
 | Native MongoDB wire protocol with TinyMongo parity | [Planned](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
-| Embedded Rust, Python wheels, and serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/189) |
+| Python wheels and serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/197) |
 
 ## Try it in 30 seconds
 
@@ -147,6 +148,10 @@ Have an existing SQLite database? Use the offline
 [GitHub release](https://github.com/schapman1974/briskdb/releases), including
 macOS/Linux ARM64 and x86-64 archives plus Linux `.deb` packages.
 
+Embedding in Rust starts with `BriskDb::open()` or the validated builder. The
+[embedded Rust guide](docs/EMBEDDED_RUST.md) includes a complete listener-free
+example and documents every default.
+
 ## Still just inspectable files
 
 ```text
@@ -168,8 +173,9 @@ and integrity metadata. Application rows stay in ordinary SQLite files.
   indexes, cursors, aggregation, and differential TinyMongo parity.
 - **More wire protocols:** PostgreSQL extended queries and MySQL compatibility,
   all sharing the same engine behavior.
-- **Embedded and serverless:** a clean Rust library, Python/PyO3 wheels, atomic
-  snapshots, ephemeral-runtime helpers, and fenced single-writer operation.
+- **Python and serverless:** Python/PyO3 wheels, atomic snapshots,
+  ephemeral-runtime helpers, and fenced single-writer operation over the
+  embedded Rust API.
 - **Future storage adapters:** SQLite is the first backend, while the engine
   boundaries are being kept reusable for other durable backends.
 
@@ -190,6 +196,7 @@ Follow the [roadmap](ROADMAP.md) or browse the
 ## Go deeper
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Embedded Rust](docs/EMBEDDED_RUST.md)
 - [PostgreSQL quickstart](docs/POSTGRES_QUICKSTART.md)
 - [SQL compatibility](docs/SQL_COMPATIBILITY.md)
 - [Generated keys](docs/GENERATED_KEYS.md)

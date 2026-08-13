@@ -353,6 +353,15 @@ impl EngineOptions {
 
         Ok(total_active_connections)
     }
+
+    /// Validate limits that depend on one embedded database's shard count.
+    ///
+    /// This performs no filesystem access and allows builders and other hosts
+    /// to reject a complete configuration before opening or creating storage.
+    pub fn validate_for_shards(self, shard_count: u16) -> EngineResult<()> {
+        crate::storage::validate_shard_count(shard_count)?;
+        self.worker_limit(shard_count).map(|_| ())
+    }
 }
 
 impl Default for EngineOptions {
