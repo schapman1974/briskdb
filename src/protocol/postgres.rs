@@ -1778,6 +1778,118 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn opted_in_vtab_is_unreachable_from_deferred_postgres_query_flows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = crate::core::Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE records (
+                    tenant_id TEXT NOT NULL PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                crate::core::TableDeclaration::sharded(
+                    logical_database,
+                    "records",
+                    crate::core::ShardKeyMetadata::new(
+                        "tenant_id",
+                        crate::core::ShardKeyType::Text,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let database = Arc::new(database);
+        let options = crate::core::EngineOptions::new(2, 16)
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let engine = Engine::from_database_with_options(Arc::clone(&database), options).unwrap();
+        let before = engine.pool_snapshot_for_test().unwrap();
+        let adapter = Adapter::new(engine.clone());
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        read_until_ready(&mut client).await;
+        let expected = postgres_error(EngineErrorKind::Unsupported);
+
+        for sql in [
+            "BEGIN",
+            "INSERT INTO records (tenant_id, payload) VALUES ('blocked-tenant', 'must-not-be-stored')",
+            "COMMIT",
+            "ROLLBACK",
+        ] {
+            let mut body = sql.as_bytes().to_vec();
+            body.push(0);
+            client.write_all(&typed_packet(b'Q', &body)).await.unwrap();
+            let frames = read_until_ready(&mut client).await;
+            assert_eq!(frames.len(), 2, "simple-query response for {sql}");
+            let fields = message_fields(&frames[0].1);
+            assert_eq!(fields.get(&b'S').map(String::as_str), Some("ERROR"));
+            assert_eq!(
+                fields.get(&b'C').map(String::as_str),
+                Some(expected.sqlstate)
+            );
+            assert_eq!(
+                fields.get(&b'M').map(String::as_str),
+                Some(expected.message)
+            );
+            assert!(!fields.get(&b'M').unwrap().contains(sql));
+            assert_eq!(frames[1], (b'Z', vec![b'I']));
+        }
+
+        let extended_sql = "INSERT INTO records (tenant_id, payload) VALUES ('extended-blocked', 'must-not-be-stored')";
+        let mut parse = Vec::new();
+        parse.push(0);
+        parse.extend_from_slice(extended_sql.as_bytes());
+        parse.push(0);
+        parse.extend_from_slice(&0_u16.to_be_bytes());
+        client.write_all(&typed_packet(b'P', &parse)).await.unwrap();
+        let error = read_frame(&mut client).await;
+        assert_eq!(error.0, b'E');
+        let fields = message_fields(&error.1);
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some(expected.sqlstate)
+        );
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some(expected.message)
+        );
+        assert!(!fields.get(&b'M').unwrap().contains(extended_sql));
+        client.write_all(&typed_packet(b'S', &[])).await.unwrap();
+        assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
+
+        assert_eq!(
+            engine.pool_snapshot_for_test().unwrap(),
+            before,
+            "deferred PostgreSQL query flow must not admit storage work"
+        );
+        for shard in 0..database.shard_count() {
+            let rows =
+                rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM records", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap();
+            assert_eq!(rows, 0, "PostgreSQL query mutated physical shard {shard}");
+        }
+
+        finish_wire_server(&mut client, server).await;
+        assert_eq!(
+            wire.connection().unwrap().state().await,
+            SessionState::Closed
+        );
+        engine.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn extended_query_rejects_before_storage_and_sync_recovers() {
         let (_temp, engine) = engine(2).await;

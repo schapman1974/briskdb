@@ -51,6 +51,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false }
+libc = "0.2"
+proptest = "1.7"
 tempfile = "3.23"
 
 [[bench]]

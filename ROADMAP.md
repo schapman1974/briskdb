@@ -139,6 +139,9 @@ therefore required before calling the driver interfaces production-ready.
   tables may instead opt into a versioned generated-integer policy; the exact
   single-row SQL and non-gapless allocation contract is documented in
   [`docs/GENERATED_KEYS.md`](docs/GENERATED_KEYS.md).
+- The no-fork virtual-table facade remains experimental after its issue #131
+  rollout review. Its frozen pass criteria, evidence, and hold decision are in
+  [`docs/VTAB_ROLLOUT.md`](docs/VTAB_ROLLOUT.md).
 
 ## Milestones
 ### 0. Baseline and compatibility contract

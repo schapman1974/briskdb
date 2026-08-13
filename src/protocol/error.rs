@@ -424,6 +424,22 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_rollout_gate_has_fixed_cross_protocol_encodings() {
+        let http = http_error(EngineErrorKind::Unsupported);
+        let postgres = postgres_error(EngineErrorKind::Unsupported);
+        let mysql = mysql_error(EngineErrorKind::Unsupported);
+
+        assert_eq!(http.status, 501);
+        assert_eq!(http.title, "Unsupported operation");
+        assert_eq!(http.detail, "The requested operation is not supported.");
+        assert_eq!(postgres.sqlstate, "0A000");
+        assert_eq!(mysql.error_number, 1235);
+        assert_eq!(mysql.sqlstate, "42000");
+        assert_eq!(postgres.message, http.detail);
+        assert_eq!(mysql.message, http.detail);
+    }
+
+    #[test]
     fn public_error_documentation_matches_the_executable_mapping_table() {
         let documentation = include_str!("../../docs/ERRORS.md");
 

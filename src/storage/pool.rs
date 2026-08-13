@@ -1008,7 +1008,7 @@ fn configure_connection_controlled(
         // Do not call the ordinary configuration wrapper here: its fixed
         // busy timeout would replace the cancellable handler before these
         // pragmas can encounter a SQLite lock.
-        storage.validate_unconfigured_shard(connection, shard)
+        storage.validate_unconfigured_shard_nonterminal(connection, shard)
     })
 }
 
@@ -1024,7 +1024,7 @@ pub(super) fn with_read_only_connection_controlled<T>(
     inspect: impl FnOnce(&Connection) -> EngineResult<T>,
 ) -> EngineResult<T> {
     run_connection_validation_controlled(connection, control, |connection, _control| {
-        storage.validate_unconfigured_shard_read_only(connection, shard)?;
+        storage.validate_unconfigured_shard_read_only_nonterminal(connection, shard)?;
         inspect(connection)
     })
 }

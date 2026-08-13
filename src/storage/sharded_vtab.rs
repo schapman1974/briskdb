@@ -2695,12 +2695,13 @@ mod benchmarks;
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeSet,
+        collections::{BTreeMap, BTreeSet},
         sync::{Arc, mpsc},
         thread,
         time::Instant,
     };
 
+    use proptest::prelude::*;
     use rusqlite::{ErrorCode, MAIN_DB, params, types::ValueRef};
 
     use super::*;
@@ -2709,6 +2710,52 @@ mod tests {
         TableDeclaration, Value,
         generated_id::{AllocationOwnerSlot, NativeRangeV1Id, native_range_v1_sequence_floor},
     };
+
+    struct ReapedTestChild {
+        child: Option<std::process::Child>,
+    }
+
+    impl ReapedTestChild {
+        const fn new(child: std::process::Child) -> Self {
+            Self { child: Some(child) }
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            self.child
+                .as_mut()
+                .expect("test child was already reaped")
+                .try_wait()
+        }
+
+        fn terminate_with_output(&mut self) -> std::io::Result<std::process::Output> {
+            let mut child = self.child.take().expect("test child was already reaped");
+            let status_error = match child.try_wait() {
+                Ok(Some(_)) => None,
+                Ok(None) => child.kill().err(),
+                Err(error) => {
+                    let _ = child.kill();
+                    Some(error)
+                }
+            };
+            let output = child.wait_with_output();
+            match (output, status_error) {
+                (Err(wait_error), _) => Err(wait_error),
+                (Ok(_), Some(status_error)) => Err(status_error),
+                (Ok(output), None) => Ok(output),
+            }
+        }
+    }
+
+    impl Drop for ReapedTestChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+            }
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum ParityCell {
@@ -3262,6 +3309,238 @@ mod tests {
             }
         }
         keys.into_iter().map(Option::unwrap).collect()
+    }
+
+    fn assert_persistent_sqlite_integrity(root: &std::path::Path, shard_count: u16) {
+        let paths = std::iter::once(root.join("manifest.sqlite"))
+            .chain((0..shard_count).map(|shard| root.join(format!("shards/{shard:04}.sqlite"))));
+        for path in paths {
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok",
+                "{} failed SQLite integrity_check",
+                path.display()
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0,
+                "{} failed SQLite foreign_key_check",
+                path.display()
+            );
+        }
+    }
+
+    fn native_event_rows(storage: &Storage) -> Vec<(u16, i64, String)> {
+        let mut rows = Vec::new();
+        for shard in 0..storage.shard_count() {
+            let connection = storage.open_shard(shard).unwrap();
+            rows.extend(
+                connection
+                    .prepare("SELECT id, payload FROM native_events")
+                    .unwrap()
+                    .query_map([], |row| Ok((shard, row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            );
+        }
+        rows.sort_unstable_by_key(|row| row.1);
+        rows
+    }
+
+    fn assert_native_event_invariants(storage: &Storage) -> Vec<(u16, i64, String)> {
+        let owners = storage.allocation_owner_map().unwrap();
+        let rows = native_event_rows(storage);
+        assert_eq!(
+            rows.iter().map(|row| row.1).collect::<BTreeSet<_>>().len(),
+            rows.len(),
+            "native generated IDs must be globally unique"
+        );
+        for (shard, id, _) in &rows {
+            let decoded = NativeRangeV1Id::decode(*id).unwrap();
+            assert_eq!(owners.physical_shard(decoded.owner()), Some(*shard));
+        }
+        for shard in 0..storage.shard_count() {
+            let maximum = rows
+                .iter()
+                .filter_map(|(row_shard, id, _)| (*row_shard == shard).then_some(*id))
+                .max()
+                .expect("the native generated fixture seeds every physical shard");
+            assert_eq!(
+                storage
+                    .open_shard(shard)
+                    .unwrap()
+                    .query_row(
+                        "SELECT seq FROM sqlite_sequence WHERE name = 'native_events'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                maximum,
+                "shard {shard} SQLite sequence must equal its greatest durable generated ID"
+            );
+        }
+        rows
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 24,
+            max_shrink_iters: 1_024,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn randomized_write_sequences_match_the_model_physical_union_and_facade(
+            operations in proptest::collection::vec(
+                (0_u8..5, any::<bool>(), 2_i64..32, "[a-z0-9]{0,24}"),
+                1..40,
+            ),
+        ) {
+            let fixture = Fixture::new();
+            let mut expected = BTreeMap::from([
+                ((fixture.keys[0], 1_i64), "zero".to_owned()),
+                ((fixture.keys[1], 1_i64), "one".to_owned()),
+            ]);
+            let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+
+            for (operation, second_shard, event_id, payload) in operations {
+                let tenant_id = fixture.keys[usize::from(second_shard)];
+                let identity = (tenant_id, event_id);
+                let existed = expected.contains_key(&identity);
+                match operation {
+                    0 => {
+                        let affected = if existed {
+                            coordinator
+                                .execute_dml(
+                                    "UPDATE events SET payload = ?3
+                                     WHERE tenant_id = ?1 AND event_id = ?2",
+                                    params![tenant_id, event_id, payload],
+                                )
+                                .unwrap()
+                                .affected_rows()
+                        } else {
+                            coordinator
+                                .execute_dml(
+                                    "INSERT INTO events
+                                     (tenant_id, event_id, payload, amount, raw, optional, category)
+                                     VALUES (?1, ?2, ?3, 1.0, x'00', NULL, 'property')",
+                                    params![tenant_id, event_id, payload],
+                                )
+                                .unwrap()
+                                .affected_rows()
+                        };
+                        prop_assert_eq!(affected, 1);
+                        expected.insert(identity, payload);
+                    }
+                    1 => {
+                        let affected = coordinator
+                            .execute_dml(
+                                "UPDATE events SET payload = ?3
+                                 WHERE tenant_id = ?1 AND event_id = ?2",
+                                params![tenant_id, event_id, payload],
+                            )
+                            .unwrap()
+                            .affected_rows();
+                        prop_assert_eq!(affected, usize::from(existed));
+                        if existed {
+                            expected.insert(identity, payload);
+                        }
+                    }
+                    2 => {
+                        let affected = coordinator
+                            .execute_dml(
+                                "DELETE FROM events WHERE tenant_id = ?1 AND event_id = ?2",
+                                params![tenant_id, event_id],
+                            )
+                            .unwrap()
+                            .affected_rows();
+                        prop_assert_eq!(affected, usize::from(existed));
+                        expected.remove(&identity);
+                    }
+                    3 | 4 => {
+                        coordinator.begin().unwrap();
+                        let affected = if existed {
+                            coordinator
+                                .execute_dml(
+                                    "UPDATE events SET payload = ?3
+                                     WHERE tenant_id = ?1 AND event_id = ?2",
+                                    params![tenant_id, event_id, payload],
+                                )
+                                .unwrap()
+                                .affected_rows()
+                        } else {
+                            coordinator
+                                .execute_dml(
+                                    "INSERT INTO events
+                                     (tenant_id, event_id, payload, amount, raw, optional, category)
+                                     VALUES (?1, ?2, ?3, 1.0, x'00', NULL, 'property')",
+                                    params![tenant_id, event_id, payload],
+                                )
+                                .unwrap()
+                                .affected_rows()
+                        };
+                        prop_assert_eq!(affected, 1);
+                        if operation == 3 {
+                            coordinator.rollback().unwrap();
+                        } else {
+                            coordinator.commit().unwrap();
+                            expected.insert(identity, payload);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            drop(coordinator);
+
+            let mut physical = Vec::new();
+            for shard in 0..2_u16 {
+                let connection = fixture.storage.open_shard(shard).unwrap();
+                let shard_rows = connection
+                    .prepare("SELECT tenant_id, event_id, payload FROM events")
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                prop_assert!(
+                    shard_rows.iter().all(|row| row.0 == fixture.keys[usize::from(shard)]),
+                    "physical shard {shard} contains a row owned by another shard: {shard_rows:?}",
+                );
+                physical.extend(shard_rows);
+            }
+            physical.sort_unstable();
+
+            let facade = ReadCoordinator::open(fixture.storage.clone()).unwrap();
+            let mut logical = facade
+                .connection()
+                .prepare("SELECT tenant_id, event_id, payload FROM events")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            logical.sort_unstable();
+            let modeled = expected
+                .into_iter()
+                .map(|((tenant_id, event_id), payload)| (tenant_id, event_id, payload))
+                .collect::<Vec<_>>();
+
+            prop_assert_eq!(&logical, &physical);
+            prop_assert_eq!(logical, modeled);
+            assert_persistent_sqlite_integrity(fixture.temp.path(), 2);
+        }
     }
 
     #[test]
@@ -7636,6 +7915,179 @@ mod tests {
     }
 
     #[test]
+    fn writable_forced_termination_process_child() {
+        let Ok(root) = std::env::var("BRISKDB_VTAB_TERMINATION_ROOT") else {
+            return;
+        };
+        let storage = Storage::open(root, 4).unwrap();
+        let table_id = storage
+            .logical_catalog()
+            .table("default", "native_events")
+            .unwrap()
+            .unwrap()
+            .id()
+            .get();
+        let mut coordinator = WriteCoordinator::open(storage).unwrap();
+
+        let committed = coordinator
+            .execute_generated_dml_auto(
+                "INSERT INTO native_events (payload) VALUES ('committed-before-kill')",
+                [],
+                table_id,
+            )
+            .unwrap();
+        let committed_id = match &committed.generated_key().unwrap().value {
+            Value::Int64(value) => *value,
+            value => panic!("unexpected generated value: {value:?}"),
+        };
+        let committed_shard = committed.shard().unwrap();
+
+        coordinator.begin().unwrap();
+        let pending = coordinator
+            .execute_generated_dml_auto(
+                "INSERT INTO native_events (payload) VALUES ('uncommitted-at-kill')",
+                [],
+                table_id,
+            )
+            .unwrap();
+        let pending_id = match &pending.generated_key().unwrap().value {
+            Value::Int64(value) => *value,
+            value => panic!("unexpected generated value: {value:?}"),
+        };
+        std::fs::write(
+            std::env::var("BRISKDB_VTAB_TERMINATION_OUTPUT").unwrap(),
+            format!(
+                "{committed_id},{committed_shard},{pending_id},{}",
+                pending.shard().unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            std::env::var("BRISKDB_VTAB_TERMINATION_READY").unwrap(),
+            b"ready",
+        )
+        .unwrap();
+
+        thread::sleep(Duration::from_secs(30));
+        panic!("forced-termination child was not terminated by its parent");
+    }
+
+    #[test]
+    fn forced_termination_recovers_wal_without_lost_acknowledged_or_duplicate_generated_rows() {
+        let TypedRoutingFixture {
+            _temp,
+            storage,
+            int_keys: _,
+            text_keys: _,
+            blob_keys: _,
+            native_ids: _,
+        } = TypedRoutingFixture::new(4);
+        let root = _temp.path();
+        let before = assert_native_event_invariants(&storage);
+        drop(storage);
+        let ready = root.join("forced-termination-ready");
+        let output = root.join("forced-termination-output");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("storage::sharded_vtab::tests::writable_forced_termination_process_child")
+            .arg("--nocapture")
+            .env("BRISKDB_VTAB_TERMINATION_ROOT", root)
+            .env("BRISKDB_VTAB_TERMINATION_READY", &ready)
+            .env("BRISKDB_VTAB_TERMINATION_OUTPUT", &output)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ReapedTestChild::new(child);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        if !ready.exists() {
+            let child_output = child.terminate_with_output().unwrap();
+            panic!(
+                "termination child did not reach its write boundary (status {}): stdout={} stderr={}",
+                child_output.status,
+                String::from_utf8_lossy(&child_output.stdout),
+                String::from_utf8_lossy(&child_output.stderr),
+            );
+        }
+        let child_output = child.terminate_with_output().unwrap();
+        assert!(
+            !child_output.status.success(),
+            "termination child unexpectedly succeeded: stdout={} stderr={}",
+            String::from_utf8_lossy(&child_output.stdout),
+            String::from_utf8_lossy(&child_output.stderr),
+        );
+
+        let result = std::fs::read_to_string(output).unwrap();
+        let values = result
+            .split(',')
+            .map(|value| value.parse::<i64>().unwrap())
+            .collect::<Vec<_>>();
+        let [committed_id, committed_shard, pending_id, _pending_shard] = values.as_slice() else {
+            panic!("unexpected forced-termination child output: {result}");
+        };
+
+        let reopened = Storage::open(root, 4).unwrap();
+        let recovered = assert_native_event_invariants(&reopened);
+        assert_eq!(recovered.len(), before.len() + 1);
+        assert_eq!(
+            recovered
+                .iter()
+                .filter(|(shard, id, payload)| {
+                    i64::from(*shard) == *committed_shard
+                        && *id == *committed_id
+                        && payload == "committed-before-kill"
+                })
+                .count(),
+            1,
+            "the acknowledged autocommit row must survive exactly once"
+        );
+        assert!(
+            recovered
+                .iter()
+                .all(|(_, id, payload)| *id != *pending_id && payload != "uncommitted-at-kill"),
+            "the killed outer transaction must leave no row or generated ID"
+        );
+        assert_persistent_sqlite_integrity(root, 4);
+
+        let table_id = reopened
+            .logical_catalog()
+            .table("default", "native_events")
+            .unwrap()
+            .unwrap()
+            .id()
+            .get();
+        let retried = WriteCoordinator::open(reopened.clone())
+            .unwrap()
+            .execute_generated_dml_auto(
+                "INSERT INTO native_events (payload) VALUES ('retry-after-kill')",
+                [],
+                table_id,
+            )
+            .unwrap();
+        let retried_id = match &retried.generated_key().unwrap().value {
+            Value::Int64(value) => *value,
+            value => panic!("unexpected generated value: {value:?}"),
+        };
+        let final_rows = assert_native_event_invariants(&reopened);
+        assert_eq!(final_rows.len(), before.len() + 2);
+        assert_eq!(
+            final_rows
+                .iter()
+                .filter(|(_, id, payload)| *id == retried_id && payload == "retry-after-kill")
+                .count(),
+            1
+        );
+        assert_persistent_sqlite_integrity(root, 4);
+    }
+
+    #[test]
     fn writable_child_commit_failure_is_surfaced_before_acknowledgement_and_recovers_on_reopen() {
         let fixture = Fixture::new();
         let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
@@ -7675,6 +8127,52 @@ mod tests {
             1
         );
         assert_eq!(fixture.physical_row_count(), 3);
+    }
+
+    #[test]
+    fn writable_sqlite_full_rolls_back_and_exact_retry_preserves_invariants() {
+        let fixture = TypedRoutingFixture::new(4);
+        let table_id = fixture.native_table_id();
+        let before = assert_native_event_invariants(&fixture.storage);
+        let mut coordinator = WriteCoordinator::open(fixture.storage.clone()).unwrap();
+        coordinator.force_next_child_sqlite_full_for_test();
+        let oversized_payload = format!("retry-after-full:{}", "x".repeat(256 * 1024));
+
+        let error = coordinator
+            .execute_generated_dml_auto(
+                "INSERT INTO native_events (payload) VALUES (?1)",
+                params![oversized_payload],
+                table_id,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::StorageFull);
+        drop(coordinator);
+        assert_eq!(assert_native_event_invariants(&fixture.storage), before);
+        assert_persistent_sqlite_integrity(fixture._temp.path(), 4);
+
+        let reopened = Storage::open(fixture._temp.path(), 4).unwrap();
+        let retried = WriteCoordinator::open(reopened.clone())
+            .unwrap()
+            .execute_generated_dml_auto(
+                "INSERT INTO native_events (payload) VALUES (?1)",
+                params![oversized_payload],
+                table_id,
+            )
+            .unwrap();
+        let retried_id = match &retried.generated_key().unwrap().value {
+            Value::Int64(value) => *value,
+            value => panic!("unexpected generated value: {value:?}"),
+        };
+        let after = assert_native_event_invariants(&reopened);
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(
+            after
+                .iter()
+                .filter(|(_, id, payload)| { *id == retried_id && payload == &oversized_payload })
+                .count(),
+            1
+        );
+        assert_persistent_sqlite_integrity(fixture._temp.path(), 4);
     }
 
     #[test]

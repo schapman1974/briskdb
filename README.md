@@ -14,6 +14,9 @@ boundaries and dependency direction.
 The [experimental sharded virtual-table contract](docs/SHARDED_VIRTUAL_TABLE.md)
 defines the no-fork coordinator, its opt-in autocommit write path, and the
 features that deliberately remain on the established engine paths.
+The [virtual-table rollout gate](docs/VTAB_ROLLOUT.md) freezes the correctness,
+performance, resource, snapshot, and protocol criteria and records why the
+facade remains experimental after issue #131.
 The [generated-key contract](docs/GENERATED_KEYS.md) defines the exact accepted
 SQLite, MySQL, and PostgreSQL declarations, omitted-key insert semantics,
 protocol-neutral and HTTP results, and the two execution gates.
@@ -172,7 +175,8 @@ established metadata-driven scatter/gather readers. `BEGIN`, `COMMIT`,
 `ROLLBACK`, and transactions spanning HTTP requests are not enabled by this
 flag. Generated-key DDL and insert examples, the additive HTTP response field,
 and deliberate protocol gaps are documented in
-[the generated-key contract](docs/GENERATED_KEYS.md).
+[the generated-key contract](docs/GENERATED_KEYS.md). The feature remains
+explicitly opt-in under [the rollout decision](docs/VTAB_ROLLOUT.md).
 
 To initialize a new data directory from an existing standard SQLite file, use
 the separate offline importer. The destination must not already exist, and the

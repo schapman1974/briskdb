@@ -673,6 +673,11 @@ impl WriteCoordinator {
     }
 
     #[cfg(test)]
+    pub(super) fn force_next_child_sqlite_full_for_test(&self) {
+        self.registry.write_state().force_next_child_sqlite_full();
+    }
+
+    #[cfg(test)]
     pub(super) fn fail_next_write_corruption_for_test(&self) {
         self.registry.write_state().fail_next_write_corruption();
     }
@@ -889,6 +894,8 @@ pub(super) struct WriteState {
     #[cfg(test)]
     fail_next_commit: AtomicBool,
     #[cfg(test)]
+    force_next_child_sqlite_full: AtomicBool,
+    #[cfg(test)]
     fail_next_write_corruption: AtomicBool,
     #[cfg(test)]
     fail_next_commit_corruption: AtomicBool,
@@ -920,6 +927,8 @@ impl WriteState {
             nonblocking_cancel_requested: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_commit: AtomicBool::new(false),
+            #[cfg(test)]
+            force_next_child_sqlite_full: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_write_corruption: AtomicBool::new(false),
             #[cfg(test)]
@@ -1197,6 +1206,12 @@ impl WriteState {
     #[cfg(test)]
     pub(super) fn fail_next_commit(&self) {
         self.fail_next_commit.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_next_child_sqlite_full(&self) {
+        self.force_next_child_sqlite_full
+            .store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -1625,6 +1640,18 @@ impl WriteState {
         #[cfg(test)]
         {
             self.fail_next_commit.swap(false, Ordering::AcqRel)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn take_force_child_sqlite_full_for_test(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.force_next_child_sqlite_full
+                .swap(false, Ordering::AcqRel)
         }
         #[cfg(not(test))]
         {
@@ -2165,6 +2192,34 @@ impl WriteTransaction {
                     Some(move || cancellation_epoch.load(Ordering::Acquire) != epoch),
                 )
                 .map_err(sqlite_error::storage)?;
+            #[cfg(test)]
+            if registry
+                .write_state()
+                .take_force_child_sqlite_full_for_test()
+            {
+                // Exercise SQLite's real SQLITE_FULL path without depending on
+                // the host filesystem being exhausted. Prevent this physical
+                // child from growing past its current final page; a test then
+                // writes a value larger than the existing free space.
+                let page_count = connection
+                    .pragma_query_value(None, "page_count", |row| row.get::<_, i64>(0))
+                    .map_err(sqlite_error::storage)?;
+                let applied = connection
+                    .query_row(
+                        &format!("PRAGMA max_page_count = {page_count}"),
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(sqlite_error::storage)?;
+                if applied != page_count {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        format!(
+                            "SQLite refused the test page limit: requested {page_count}, applied {applied}"
+                        ),
+                    ));
+                }
+            }
             let interrupt = Arc::new(connection.get_interrupt_handle());
             *active_interrupt
                 .lock()

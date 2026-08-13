@@ -1708,7 +1708,11 @@ impl Storage {
         control: Arc<crate::core::OperationControl>,
         inspect: impl FnOnce(&Connection) -> EngineResult<T>,
     ) -> EngineResult<T> {
-        let result = (|| {
+        // This controlled path is non-terminal: its caller still owns the
+        // cancellation linearization point. Let that wrapper distinguish an
+        // interrupted validation from authoritative corruption before the
+        // Engine applies terminal fail-closed policy.
+        (|| {
             self.ensure_shard_in_range(shard)?;
             let mut connection = shard::open_required_file_read_only(&self.shard_path(shard))?;
             pool::with_read_only_connection_controlled(
@@ -1718,8 +1722,7 @@ impl Storage {
                 shard,
                 inspect,
             )
-        })();
-        self.fail_closed_on_corruption(result)
+        })()
     }
 
     fn verify_current_schema_consensus(
@@ -1789,7 +1792,20 @@ impl Storage {
     }
 
     fn validate_unconfigured_shard(&self, connection: &Connection, shard: u16) -> EngineResult<()> {
-        let result = (|| {
+        let result = self.validate_unconfigured_shard_nonterminal(connection, shard);
+        self.fail_closed_on_corruption(result)
+    }
+
+    /// Validate a handle owned by a cancellation-controlled worker without
+    /// changing persistent admission state. Its controlled wrapper resolves an
+    /// interrupted validation to cancellation; the Engine then persists any
+    /// DataCorruption that remains authoritative.
+    fn validate_unconfigured_shard_nonterminal(
+        &self,
+        connection: &Connection,
+        shard: u16,
+    ) -> EngineResult<()> {
+        (|| {
             self.ensure_shard_in_range(shard)?;
             shard::validate_open_connection(
                 connection,
@@ -1805,17 +1821,16 @@ impl Storage {
                 &expected_digest,
             )?;
             self.validate_native_range_v1_state(connection, shard)
-        })();
-        self.fail_closed_on_corruption(result)
+        })()
     }
 
     #[cfg(feature = "experimental-vtab")]
-    fn validate_unconfigured_shard_read_only(
+    fn validate_unconfigured_shard_read_only_nonterminal(
         &self,
         connection: &Connection,
         shard: u16,
     ) -> EngineResult<()> {
-        let result = (|| {
+        (|| {
             self.ensure_shard_in_range(shard)?;
             shard::validate_open_read_only_connection(
                 connection,
@@ -1832,8 +1847,7 @@ impl Storage {
             )?;
             self.validate_native_range_v1_state(connection, shard)?;
             attach_storage_authorizer(connection)
-        })();
-        self.fail_closed_on_corruption(result)
+        })()
     }
 
     fn validate_native_range_v1_state(
@@ -2818,6 +2832,33 @@ mod tests {
                 )
                 .unwrap(),
             4
+        );
+    }
+
+    #[test]
+    fn nonterminal_validation_defers_fail_closed_state_until_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let shard_path = temp.path().join("shards/0000.sqlite");
+        Connection::open(&shard_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE unexpected_drift(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let connection = storage.open_unconfigured_shard(0).unwrap();
+
+        let nonterminal = storage
+            .validate_unconfigured_shard_nonterminal(&connection, 0)
+            .unwrap_err();
+        assert_eq!(nonterminal.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(storage.schema_gate_snapshot().state, SchemaGateState::Ready);
+
+        let terminal = storage
+            .validate_unconfigured_shard(&connection, 0)
+            .unwrap_err();
+        assert_eq!(terminal.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            storage.schema_gate_snapshot().state,
+            SchemaGateState::Degraded
         );
     }
 
