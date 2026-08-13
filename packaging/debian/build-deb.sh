@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+to_debian_version() {
+    local version=$1
+    if [[ "$version" == *-* ]]; then
+        printf '%s~%s-1\n' "${version%%-*}" "${version#*-}"
+    else
+        printf '%s-1\n' "$version"
+    fi
+}
+
+if [[ $# -eq 2 && "$1" == "--print-debian-version" ]]; then
+    to_debian_version "$2"
+    exit 0
+fi
+
 if [[ $# -ne 4 ]]; then
     echo "usage: $0 BINARY_DIRECTORY DEBIAN_ARCHITECTURE CARGO_VERSION OUTPUT_DIRECTORY" >&2
     exit 2
@@ -26,7 +40,7 @@ for binary in briskdb briskdb-import; do
     fi
 done
 
-debian_version=${cargo_version/-/~}-1
+debian_version=$(to_debian_version "$cargo_version")
 package_basename="briskdb_${debian_version}_${architecture}"
 temporary_directory=$(mktemp -d)
 package_root="$temporary_directory/$package_basename"
@@ -56,9 +70,9 @@ printf '%s\n' /etc/default/briskdb > "$package_root/DEBIAN/conffiles"
 
 installed_size=$(du -sk "$package_root" | awk '{print $1}')
 sed \
-    -e "s/@DEBIAN_VERSION@/$debian_version/g" \
-    -e "s/@ARCHITECTURE@/$architecture/g" \
-    -e "s/@INSTALLED_SIZE@/$installed_size/g" \
+    -e "s|@DEBIAN_VERSION@|$debian_version|g" \
+    -e "s|@ARCHITECTURE@|$architecture|g" \
+    -e "s|@INSTALLED_SIZE@|$installed_size|g" \
     packaging/debian/control.in > "$package_root/DEBIAN/control"
 
 mkdir -p "$output_directory"

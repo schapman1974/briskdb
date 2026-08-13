@@ -37,6 +37,23 @@ fn debian_service_uses_fhs_paths_journald_and_a_restricted_account() {
 }
 
 #[test]
+fn cargo_versions_convert_to_debian_versions_without_shell_tilde_expansion() {
+    let builder = format!(
+        "{}/packaging/debian/build-deb.sh",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    for (cargo_version, expected) in [("0.1.0-alpha.2", "0.1.0~alpha.2-1"), ("0.1.0", "0.1.0-1")] {
+        let output = Command::new(&builder)
+            .args(["--print-debian-version", cargo_version])
+            .output()
+            .expect("package builder must run");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+    }
+}
+
+#[test]
 fn debian_package_contract_preserves_configuration_and_database_state() {
     let builder = include_str!("../packaging/debian/build-deb.sh");
     for required in [
@@ -70,3 +87,4 @@ fn debian_package_contract_preserves_configuration_and_database_state() {
         );
     }
 }
+use std::process::Command;
