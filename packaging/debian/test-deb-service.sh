@@ -10,24 +10,27 @@ package=$1
 configuration=/etc/default/briskdb
 state_directory=/var/lib/briskdb
 
+wait_for_service() {
+    for attempt in {1..30}; do
+        if sudo systemctl is-active --quiet briskdb.service \
+            && curl --fail --silent --show-error http://127.0.0.1:7654/admin >/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    sudo systemctl status briskdb.service --no-pager || true
+    sudo journalctl -u briskdb.service --no-pager || true
+    return 1
+}
+
 dpkg-deb --info "$package"
 dpkg-deb --contents "$package" | grep -F ./lib/systemd/system/briskdb.service
 dpkg-deb --contents "$package" | grep -F ./etc/default/briskdb
 
 sudo env DEBIAN_FRONTEND=noninteractive dpkg -i "$package"
 sudo systemd-analyze verify /lib/systemd/system/briskdb.service
-
-for attempt in {1..30}; do
-    if curl --fail --silent --show-error http://127.0.0.1:7654/admin >/dev/null; then
-        break
-    fi
-    if [[ "$attempt" -eq 30 ]]; then
-        sudo systemctl status briskdb.service --no-pager || true
-        sudo journalctl -u briskdb.service --no-pager || true
-        exit 1
-    fi
-    sleep 1
-done
+wait_for_service
 
 sudo systemctl is-enabled --quiet briskdb.service
 sudo systemctl is-active --quiet briskdb.service
@@ -42,7 +45,7 @@ sudo touch "$state_directory/package-smoke-state"
 sudo env DEBIAN_FRONTEND=noninteractive dpkg -i "$package"
 grep -F '# package smoke-test local configuration' "$configuration"
 test -f "$state_directory/package-smoke-state"
-sudo systemctl is-active --quiet briskdb.service
+wait_for_service
 
 sudo env DEBIAN_FRONTEND=noninteractive dpkg -r briskdb
 test -f "$configuration"

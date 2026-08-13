@@ -2,7 +2,7 @@
 Description=BriskDB sharded SQLite server
 Documentation=https://github.com/schapman1974/briskdb
 After=local-fs.target network.target
-ConditionPathIsExecutable=/usr/bin/briskdb
+ConditionFileIsExecutable=/usr/bin/briskdb
 
 [Service]
 Type=simple

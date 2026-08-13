@@ -9,6 +9,7 @@ fn debian_service_uses_fhs_paths_journald_and_a_restricted_account() {
         "StateDirectory=briskdb",
         "StateDirectoryMode=0750",
         "ExecStart=/usr/bin/briskdb",
+        "ConditionFileIsExecutable=/usr/bin/briskdb",
         "StandardOutput=journal",
         "StandardError=journal",
         "ProtectSystem=strict",
@@ -78,6 +79,7 @@ fn debian_package_contract_preserves_configuration_and_database_state() {
         "systemd-analyze verify",
         "BriskDB is ready",
         "package smoke-test local configuration",
+        "wait_for_service",
         "dpkg -r briskdb",
         "package-smoke-state",
     ] {

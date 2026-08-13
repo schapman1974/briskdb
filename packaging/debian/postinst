@@ -31,9 +31,9 @@ fi
 if [ -d /run/systemd/system ]; then
     systemctl --system daemon-reload >/dev/null || true
     if systemctl --system --quiet is-active briskdb.service; then
-        deb-systemd-invoke restart briskdb.service >/dev/null || true
+        deb-systemd-invoke restart briskdb.service >/dev/null
     else
-        deb-systemd-invoke start briskdb.service >/dev/null || true
+        deb-systemd-invoke start briskdb.service >/dev/null
     fi
 fi
 
