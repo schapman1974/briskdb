@@ -21,8 +21,9 @@ use rusqlite::Connection;
 use crate::{
     core::{
         CancellationReason, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult,
-        OperationControl,
+        OperationControl, TableDeclaration,
     },
+    sql::SqlDialect,
     sqlite_error,
 };
 
@@ -119,6 +120,24 @@ struct SchemaMigrationTestBlock {
 #[cfg(test)]
 static SCHEMA_MIGRATION_TEST_BLOCKS: OnceLock<Mutex<HashMap<PathBuf, SchemaMigrationTestBlock>>> =
     OnceLock::new();
+
+#[cfg(test)]
+fn abort_generated_table_ddl_at_migration_boundary(point: SchemaMigrationCoordinatorPoint) {
+    let name = match point {
+        SchemaMigrationCoordinatorPoint::JournalCommitted => "journal",
+        SchemaMigrationCoordinatorPoint::ShardCommitted(0) => "shard-0",
+        SchemaMigrationCoordinatorPoint::ProgressPrepared(0) => "progress-0-prepared",
+        SchemaMigrationCoordinatorPoint::ProgressCommitted(0) => "progress-0",
+        SchemaMigrationCoordinatorPoint::FinalizationPrepared => "physical-finalization-prepared",
+        SchemaMigrationCoordinatorPoint::FinalizationCommitted => "physical-finalization-committed",
+        SchemaMigrationCoordinatorPoint::ShardCommitted(_)
+        | SchemaMigrationCoordinatorPoint::ProgressPrepared(_)
+        | SchemaMigrationCoordinatorPoint::ProgressCommitted(_) => return,
+    };
+    if std::env::var("BRISKDB_GENERATED_DDL_ABORT_POINT").as_deref() == Ok(name) {
+        std::process::abort();
+    }
+}
 
 #[cfg(test)]
 pub(super) fn install_schema_migration_test_block(
@@ -248,6 +267,118 @@ pub(super) fn apply_schema_migration(
     result
 }
 
+/// Begin and complete the physical half of one generated-table DDL bridge.
+///
+/// Unlike an ordinary broadcast, the exact logical request and its canonical
+/// physical migration are inserted by the same manifest transaction. The
+/// caller retains the exclusive schema guard for the later provisioning and
+/// catalog-publication phases.
+pub(super) fn apply_generated_table_ddl_migration(
+    storage: &Storage,
+    source_dialect: SqlDialect,
+    source_sql: &str,
+    physical_sql: &str,
+    declaration: TableDeclaration,
+    guard: &mut SchemaMigrationGuard,
+) -> EngineResult<manifest::GeneratedTableDdl> {
+    #[cfg(test)]
+    let result = apply_generated_table_ddl_migration_with_hook(
+        storage,
+        source_dialect,
+        source_sql,
+        physical_sql,
+        declaration,
+        guard,
+        |point| {
+            run_schema_migration_test_block(&storage.root, point)?;
+            abort_generated_table_ddl_at_migration_boundary(point);
+            Ok(())
+        },
+    );
+    #[cfg(not(test))]
+    let result = apply_generated_table_ddl_migration_with_hook(
+        storage,
+        source_dialect,
+        source_sql,
+        physical_sql,
+        declaration,
+        guard,
+        |_| Ok(()),
+    );
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+    {
+        storage.record_schema_degraded();
+    }
+    result
+}
+
+fn apply_generated_table_ddl_migration_with_hook<F>(
+    storage: &Storage,
+    source_dialect: SqlDialect,
+    source_sql: &str,
+    physical_sql: &str,
+    declaration: TableDeclaration,
+    guard: &mut SchemaMigrationGuard,
+    mut hook: F,
+) -> EngineResult<manifest::GeneratedTableDdl>
+where
+    F: FnMut(SchemaMigrationCoordinatorPoint) -> EngineResult<()>,
+{
+    let _ = manifest::schema_migration_id(physical_sql)?;
+    let (source_generation, source_digest, target_digest) =
+        preflight_new_schema_migration(storage, physical_sql, None)?;
+
+    let manifest_path = storage.root.join("manifest.sqlite");
+    let mut manifest_connection = open_existing_manifest(&manifest_path)?;
+    configure_manifest_connection(&manifest_connection)?;
+    configure_journal_mode(&manifest_connection)?;
+
+    let mut transaction = ManifestTransaction::begin(&mut manifest_connection, None)?;
+    let (ddl, migration) = transaction.run(|connection| {
+        manifest::ensure_schema_migration_layout(
+            connection,
+            storage.shard_count(),
+            &storage.shard_layout,
+        )?;
+        manifest::begin_generated_table_ddl_in_transaction(
+            connection,
+            storage.shard_count(),
+            source_generation,
+            source_dialect,
+            source_sql,
+            physical_sql,
+            declaration,
+            source_digest,
+            target_digest,
+        )
+    })?;
+    transaction.commit_with_durability_boundary(|| guard.mark_pending_on_drop())?;
+    storage
+        .schema_coordination
+        .publish_schema_digests(Some(source_digest), Some(target_digest))?;
+    if migration.is_complete() {
+        finish_completed_schema_migration(storage, &migration, None)?;
+        return Ok(ddl);
+    }
+    hook(SchemaMigrationCoordinatorPoint::JournalCommitted)?;
+    resume_active_schema_migration(
+        SchemaMigrationCoordinator {
+            root: &storage.root,
+            manifest_connection: &mut manifest_connection,
+            requested_shards: storage.shard_count(),
+            catalog: &storage.catalog,
+            schema_coordination: &storage.schema_coordination,
+            layout: &storage.shard_layout,
+            control: None,
+        },
+        migration,
+        &mut hook,
+    )?;
+    Ok(ddl)
+}
+
 fn apply_schema_migration_with_hook<F>(
     storage: &Storage,
     sql: &str,
@@ -330,56 +461,8 @@ where
         SchemaMigrationClassification::Absent => {}
     }
 
-    let source_generation = storage.current_schema_generation();
-    let target_generation = source_generation.checked_add(1).ok_or_else(|| {
-        EngineError::new(
-            EngineErrorKind::FailedPrecondition,
-            "schema migration generation is exhausted",
-        )
-    })?;
-    let shards_dir = storage.root.join("shards");
-    let source_digest = storage.schema_coordination.committed_schema_digest()?;
-    let mut target_digest = None;
-    for shard_id in 0..storage.shard_count() {
-        check_cancelled(control.as_deref())?;
-        let path = shard_path(&shards_dir, shard_id);
-        let (state, observed_target_digest) = preflight_one_shard(
-            ShardMigrationRequest {
-                path: &path,
-                shard_id,
-                source_generation,
-                target_generation,
-                layout: &storage.shard_layout,
-                sql,
-                control: control.as_ref(),
-            },
-            &source_digest,
-            &storage.catalog,
-        )
-        .map_err(|error| sanitized_shard_error(error, "preflight", shard_id))?;
-        if state != shard::SchemaMigrationShardState::Source {
-            return Err(EngineError::new(
-                EngineErrorKind::DataCorruption,
-                format!(
-                    "schema migration preflight found shard {shard_id} at the target generation without an active journal"
-                ),
-            ));
-        }
-        if target_digest.is_some_and(|expected| expected != observed_target_digest) {
-            return Err(EngineError::new(
-                EngineErrorKind::DataCorruption,
-                "schema migration produced inconsistent target fingerprints across shards",
-            ));
-        }
-        target_digest = Some(observed_target_digest);
-    }
-    check_cancelled(control.as_deref())?;
-    let target_digest = target_digest.ok_or_else(|| {
-        EngineError::new(
-            EngineErrorKind::Internal,
-            "schema migration preflight did not inspect any shards",
-        )
-    })?;
+    let (source_generation, source_digest, target_digest) =
+        preflight_new_schema_migration(storage, sql, control.as_ref())?;
 
     let migration = begin_schema_migration(
         &mut manifest_connection,
@@ -416,6 +499,64 @@ where
         &mut hook,
     )?;
     Ok(all_shards(storage.shard_count()))
+}
+
+fn preflight_new_schema_migration(
+    storage: &Storage,
+    sql: &str,
+    control: Option<&Arc<OperationControl>>,
+) -> EngineResult<(u64, [u8; 32], [u8; 32])> {
+    let source_generation = storage.current_schema_generation();
+    let target_generation = source_generation.checked_add(1).ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "schema migration generation is exhausted",
+        )
+    })?;
+    let shards_dir = storage.root.join("shards");
+    let source_digest = storage.schema_coordination.committed_schema_digest()?;
+    let mut target_digest = None;
+    for shard_id in 0..storage.shard_count() {
+        check_cancelled(control.map(Arc::as_ref))?;
+        let path = shard_path(&shards_dir, shard_id);
+        let (state, observed_target_digest) = preflight_one_shard(
+            ShardMigrationRequest {
+                path: &path,
+                shard_id,
+                source_generation,
+                target_generation,
+                layout: &storage.shard_layout,
+                sql,
+                control,
+            },
+            &source_digest,
+            &storage.catalog,
+        )
+        .map_err(|error| sanitized_shard_error(error, "preflight", shard_id))?;
+        if state != shard::SchemaMigrationShardState::Source {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "schema migration preflight found shard {shard_id} at the target generation without an active journal"
+                ),
+            ));
+        }
+        if target_digest.is_some_and(|expected| expected != observed_target_digest) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "schema migration produced inconsistent target fingerprints across shards",
+            ));
+        }
+        target_digest = Some(observed_target_digest);
+    }
+    check_cancelled(control.map(Arc::as_ref))?;
+    let target_digest = target_digest.ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "schema migration preflight did not inspect any shards",
+        )
+    })?;
+    Ok((source_generation, source_digest, target_digest))
 }
 
 fn classify_schema_migration(

@@ -61,6 +61,14 @@ with the same exact-handle interruption and cleanup as raw execution.
 Cancellation before a prepared object is published leaves the session cache
 unchanged; a cancelled or failed execution retains the existing portal.
 
+A native omitted-key portal has no selected shard at bind time. After its
+bounded worker starts, it never waits for candidate capacity: it immediately
+tries one owner from the table's rotating candidate list, skips `Busy`, and
+releases an exhausted unmutated candidate before fallback. Hi/lo takes the
+opposite safe ordering and waits for all possible target capacities before its
+worker consumes an irrevocable allocation. Both remain under the same deadline,
+cancellation, and cleanup contract.
+
 Completion wins a very close race with cancellation. A statement that is known
 to have completed successfully returns success rather than a misleading
 cancellation error. A single SQLite write statement interrupted before

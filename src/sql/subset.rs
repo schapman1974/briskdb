@@ -12,7 +12,7 @@ use sqlparser::ast::{
 };
 use sqlparser::tokenizer::Span;
 
-use super::{ParsedSql, SqlDialect};
+use super::{ParsedSql, SqlDialect, generated};
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
 /// Maximum recursive expression depth accepted by common-subset validation.
@@ -88,22 +88,24 @@ pub fn validate_common_subset(parsed: ParsedSql) -> EngineResult<CommonSql> {
     let mut statement_placeholders = Vec::with_capacity(parsed.statement_count());
     for (index, statement) in parsed.statements().iter().enumerate() {
         let mut validation = ValidationState::default();
-        validate_statement(statement, &mut validation).map_err(|violation| {
-            let diagnostic = if violation.kind == EngineErrorKind::LimitExceeded {
-                format!(
-                    "statement {} exceeds the common SQL expression depth limit of {}",
-                    index + 1,
-                    MAX_COMMON_SQL_EXPRESSION_DEPTH
-                )
-            } else {
-                format!(
-                    "statement {} is outside the common SQL subset: {}",
-                    index + 1,
-                    violation.feature
-                )
-            };
-            EngineError::new(violation.kind, diagnostic)
-        })?;
+        validate_statement(statement, parsed.dialect(), index, &mut validation).map_err(
+            |violation| {
+                let diagnostic = if violation.kind == EngineErrorKind::LimitExceeded {
+                    format!(
+                        "statement {} exceeds the common SQL expression depth limit of {}",
+                        index + 1,
+                        MAX_COMMON_SQL_EXPRESSION_DEPTH
+                    )
+                } else {
+                    format!(
+                        "statement {} is outside the common SQL subset: {}",
+                        index + 1,
+                        violation.feature
+                    )
+                };
+                EngineError::new(violation.kind, diagnostic)
+            },
+        )?;
         statement_placeholders.push(validation.placeholders);
     }
 
@@ -149,9 +151,14 @@ const fn expression_depth_exceeded<T>() -> SubsetResult<T> {
     })
 }
 
-fn validate_statement(statement: &AstStatement, validation: &mut ValidationState) -> SubsetResult {
+fn validate_statement(
+    statement: &AstStatement,
+    dialect: SqlDialect,
+    statement_index: usize,
+    validation: &mut ValidationState,
+) -> SubsetResult {
     match statement {
-        AstStatement::CreateTable(table) => validate_create_table(table),
+        AstStatement::CreateTable(table) => validate_create_table(table, dialect, statement_index),
         AstStatement::CreateIndex(index) => validate_create_index(index),
         AstStatement::Query(query) => validate_query(query, validation),
         AstStatement::Insert(insert) => validate_insert(insert, validation),
@@ -194,7 +201,11 @@ fn validate_statement(statement: &AstStatement, validation: &mut ValidationState
     }
 }
 
-fn validate_create_table(table: &CreateTable) -> SubsetResult {
+fn validate_create_table(
+    table: &CreateTable,
+    dialect: SqlDialect,
+    statement_index: usize,
+) -> SubsetResult {
     let CreateTable {
         or_replace,
         temporary,
@@ -343,11 +354,23 @@ fn validate_create_table(table: &CreateTable) -> SubsetResult {
     if columns.is_empty() {
         return unsupported("CREATE TABLE without columns");
     }
-    for column in columns {
+    let generated =
+        generated::analyze_create_table(dialect, statement_index, table).map_err(|()| {
+            SubsetViolation {
+                kind: EngineErrorKind::Unsupported,
+                feature: "generated-key declaration",
+            }
+        })?;
+    for (column_index, column) in columns.iter().enumerate() {
         if column.data_type == DataType::Unspecified {
             return unsupported("columns without an explicit type");
         }
-        for option in &column.options {
+        for (option_index, option) in column.options.iter().enumerate() {
+            if generated.as_ref().is_some_and(|generated| {
+                generated.owns_generated_option(column_index, option_index)
+            }) {
+                continue;
+            }
             validate_column_option(option.name.is_some(), &option.option)?;
         }
     }
@@ -1299,6 +1322,110 @@ mod tests {
             SqlDialect::Sqlite,
             "CREATE TABLE widgets(id CUSTOM_TYPE DEFAULT -1, label TEXT NULL, CONSTRAINT widgets_id UNIQUE(id), CHECK(id >= 0))",
         );
+    }
+
+    #[test]
+    fn generated_key_declarations_have_one_narrow_dialect_surface() {
+        for (dialect, source) in [
+            (
+                SqlDialect::Sqlite,
+                "CREATE TABLE widgets(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)",
+            ),
+            (
+                SqlDialect::MySql,
+                "CREATE TABLE widgets(id BIGINT PRIMARY KEY AUTO_INCREMENT, payload TEXT)",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE widgets(id BIGSERIAL PRIMARY KEY, payload TEXT)",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE widgets(id BIGINT PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY, payload TEXT)",
+            ),
+        ] {
+            assert_supported(dialect, source);
+        }
+
+        for (dialect, source) in [
+            (
+                SqlDialect::Sqlite,
+                "CREATE TABLE widgets(id INT PRIMARY KEY AUTOINCREMENT)",
+            ),
+            (
+                SqlDialect::Sqlite,
+                "CREATE TABLE widgets(id INTEGER AUTOINCREMENT)",
+            ),
+            (
+                SqlDialect::Sqlite,
+                "CREATE TABLE widgets(id INTEGER AUTOINCREMENT PRIMARY KEY)",
+            ),
+            (
+                SqlDialect::Sqlite,
+                "CREATE TABLE widgets(id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL)",
+            ),
+            (
+                SqlDialect::Sqlite,
+                "CREATE TABLE IF NOT EXISTS widgets(id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            ),
+            (
+                SqlDialect::MySql,
+                "CREATE TABLE widgets(id INT PRIMARY KEY AUTO_INCREMENT)",
+            ),
+            (
+                SqlDialect::MySql,
+                "CREATE TABLE widgets(id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT)",
+            ),
+            (
+                SqlDialect::MySql,
+                "CREATE TABLE widgets(id BIGINT AUTO_INCREMENT)",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE widgets(id SERIAL PRIMARY KEY)",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE widgets(id SMALLSERIAL PRIMARY KEY)",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE widgets(id BIGSERIAL UNIQUE)",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE widgets(id BIGSERIAL, PRIMARY KEY(id))",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE widgets(id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY)",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE widgets(id BIGINT PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY (START WITH 10))",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE widgets(id BIGINT GENERATED BY DEFAULT AS IDENTITY)",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE widgets(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY)",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE widgets(id BIGSERIAL PRIMARY KEY, other BIGSERIAL PRIMARY KEY)",
+            ),
+            (
+                SqlDialect::Sqlite,
+                "CREATE TABLE widgets(id INTEGER PRIMARY KEY AUTOINCREMENT, other TEXT PRIMARY KEY)",
+            ),
+        ] {
+            let error = validate(dialect, source).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Unsupported, "{source}");
+            assert!(error.diagnostic().contains("generated-key declaration"));
+            assert!(!error.diagnostic().contains("widgets"));
+        }
     }
 
     #[test]

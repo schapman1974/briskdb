@@ -3,13 +3,14 @@
 use std::{borrow::Cow, collections::HashMap, fmt, sync::Arc};
 
 use crate::sql::{
-    NormalizedSql, RoutedDml, ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue,
-    StatementBehavior, classify_normalized_statements, infer_shard_keys, routed_dml_shape,
+    GeneratedInsertShape, NormalizedSql, RoutedDml, ShardKeyInference, ShardKeyInferenceKind,
+    ShardKeyValue, StatementBehavior, classify_normalized_statements, generated_insert_shape,
+    infer_shard_keys, routed_dml_shape,
 };
 
 use super::{
     AllocationOwnerMap, Catalog, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
-    LogicalDatabaseId, TableMetadata, TablePlacement, Value,
+    LogicalDatabaseId, TableId, TableMetadata, TablePlacement, Value,
     generated_id::{
         GeneratedIdClassification, HILO_V1_FORMAT_MARKER, classify_caller_generated_id,
     },
@@ -64,6 +65,29 @@ impl fmt::Debug for PlannedRoute {
     }
 }
 
+/// One structurally proven, single-row INSERT whose declared generated key is
+/// absent from the caller's column list.
+///
+/// Target selection and allocation deliberately remain later execution work.
+/// This plan records only immutable catalog intent and never treats an explicit
+/// route or an explicitly supplied `NULL` as permission to generate a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedInsertPlan {
+    table_id: TableId,
+    policy: GeneratedIdPolicy,
+}
+
+impl GeneratedInsertPlan {
+    pub(crate) const fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    #[cfg(any(feature = "experimental-vtab", test))]
+    pub(crate) const fn policy(&self) -> &GeneratedIdPolicy {
+        &self.policy
+    }
+}
+
 /// Owned routing metadata produced from one statement's actual bound values.
 ///
 /// Inferred routes remain aligned one-for-one with
@@ -86,6 +110,7 @@ pub struct BoundStatementPlan {
     inference: ShardKeyInference,
     inferred_routes: Vec<PlannedRoute>,
     explicit_route: Option<PlannedRoute>,
+    generated_insert: Option<GeneratedInsertPlan>,
     assigned_shard: Option<u16>,
 }
 
@@ -145,11 +170,18 @@ impl BoundStatementPlan {
         self.explicit_route.as_ref()
     }
 
+    /// Return a single-row omitted-key intent awaiting allocator target
+    /// selection, if this statement declared one structurally.
+    pub(crate) const fn generated_insert(&self) -> Option<&GeneratedInsertPlan> {
+        self.generated_insert.as_ref()
+    }
+
     /// Return the physical shard assigned by routing policy, if any.
     ///
     /// `None` is retained for non-sharded statements and reads that still need
-    /// later scatter or empty-result planning. Every accepted sharded write has
-    /// an assigned shard.
+    /// later scatter, empty-result planning, or generated-key allocation.
+    /// Explicit-key sharded writes always have an assigned shard; an omitted
+    /// generated key receives its target only during allocator execution.
     pub const fn assigned_shard(&self) -> Option<u16> {
         self.assigned_shard
     }
@@ -170,6 +202,7 @@ impl fmt::Debug for BoundStatementPlan {
             .field("inference", &self.inference)
             .field("inferred_route_count", &self.inferred_routes.len())
             .field("has_explicit_route", &self.explicit_route.is_some())
+            .field("has_generated_insert", &self.generated_insert.is_some())
             .field("assigned_shard", &self.assigned_shard)
             .finish()
     }
@@ -274,6 +307,13 @@ where
         .map(|column| routed_dml_shape(normalized, statement_index, column))
         .transpose()?
         .flatten();
+    let generated_insert = plan_generated_insert(
+        normalized,
+        statement_index,
+        dml,
+        inferred_table,
+        inference.kind(),
+    )?;
     reject_hilo_allocator_namespace_insert(dml, inferred_table, inference.values())?;
 
     let mut unique_routes = HashMap::<&ShardKeyValue, PlannedRoute>::new();
@@ -299,20 +339,22 @@ where
     }
     drop(unique_routes);
 
-    let explicit_route = explicit_routing_key.map(|key| {
-        // A protocol routing key that is byte-for-byte the canonical inferred
-        // key must resolve through the same table policy. In particular, a
-        // native-range integer is owner-routed rather than re-hashed merely
-        // because it arrived through session context as decimal text.
-        let shard = inferred_routes
-            .iter()
-            .find(|route| route.key_bytes() == key)
-            .map_or_else(|| shard_for_key(key), PlannedRoute::shard);
-        PlannedRoute {
-            shard,
-            key_bytes: Arc::from(key),
-        }
-    });
+    let explicit_route = explicit_routing_key
+        .filter(|_| generated_insert.is_none())
+        .map(|key| {
+            // A protocol routing key that is byte-for-byte the canonical inferred
+            // key must resolve through the same table policy. In particular, a
+            // native-range integer is owner-routed rather than re-hashed merely
+            // because it arrived through session context as decimal text.
+            let shard = inferred_routes
+                .iter()
+                .find(|route| route.key_bytes() == key)
+                .map_or_else(|| shard_for_key(key), PlannedRoute::shard);
+            PlannedRoute {
+                shard,
+                key_bytes: Arc::from(key),
+            }
+        });
 
     reject_retired_owner_insert(dml, inferred_table, allocation_owners, inference.values())?;
     let inferred_shards = inferred_shards(&inferred_routes);
@@ -329,7 +371,12 @@ where
         ));
     }
     validate_explicit_route(&inferred_routes, explicit_route.as_ref())?;
-    validate_sharded_write(dml, inferred_shards, explicit_route.as_ref())?;
+    validate_sharded_write(
+        dml,
+        inferred_shards,
+        explicit_route.as_ref(),
+        generated_insert.as_ref(),
+    )?;
 
     let assigned_shard = if shard_key_column.is_some() {
         match inferred_shards {
@@ -353,8 +400,46 @@ where
         inference,
         inferred_routes,
         explicit_route,
+        generated_insert,
         assigned_shard,
     })
+}
+
+fn plan_generated_insert(
+    normalized: &NormalizedSql,
+    statement_index: usize,
+    dml: Option<RoutedDml>,
+    table: Option<&TableMetadata>,
+    inference_kind: ShardKeyInferenceKind,
+) -> EngineResult<Option<GeneratedInsertPlan>> {
+    if dml != Some(RoutedDml::Insert) {
+        return Ok(None);
+    }
+    let Some(table) = table else {
+        return Ok(None);
+    };
+    let policy = table.generated_id_policy();
+    let Some(column) = policy.column() else {
+        return Ok(None);
+    };
+
+    match generated_insert_shape(normalized, statement_index, column)? {
+        Some(GeneratedInsertShape::ExplicitKey) => Ok(None),
+        Some(GeneratedInsertShape::OmittedSingleRow) => {
+            if inference_kind != ShardKeyInferenceKind::Unconstrained {
+                return Err(planning_invariant());
+            }
+            Ok(Some(GeneratedInsertPlan {
+                table_id: table.id(),
+                policy: policy.clone(),
+            }))
+        }
+        Some(GeneratedInsertShape::OmittedMultipleRows) => Err(EngineError::new(
+            EngineErrorKind::Unsupported,
+            "multi-row INSERT with an omitted generated key is not supported",
+        )),
+        None => Err(planning_invariant()),
+    }
 }
 
 fn reject_hilo_allocator_namespace_insert(
@@ -474,10 +559,12 @@ fn validate_sharded_write(
     dml: Option<RoutedDml>,
     inferred_shards: InferredShards,
     explicit_route: Option<&PlannedRoute>,
+    generated_insert: Option<&GeneratedInsertPlan>,
 ) -> EngineResult<()> {
     match dml {
         Some(RoutedDml::Insert) => match inferred_shards {
             InferredShards::One(_) => Ok(()),
+            InferredShards::None if generated_insert.is_some() => Ok(()),
             InferredShards::None | InferredShards::Multiple => Err(EngineError::new(
                 EngineErrorKind::InvalidQuery,
                 "sharded INSERT requires a proven routing key for every row",
@@ -1137,6 +1224,167 @@ mod tests {
             plans[0].assigned_shard(),
             Some(plans[0].inferred_routes()[0].shard())
         );
+    }
+
+    #[test]
+    fn omitted_generated_key_plans_one_row_without_a_caller_selected_route() {
+        let owners = owner_map(4);
+        for dialect in SqlDialect::ALL.iter().copied() {
+            for (catalog, table_name, expected_policy) in [
+                (
+                    native_range_catalog(),
+                    "native_events",
+                    GeneratedIdPolicy::native_range_v1("id").unwrap(),
+                ),
+                (
+                    hilo_catalog(),
+                    "hilo_events",
+                    GeneratedIdPolicy::hilo_v1("id").unwrap(),
+                ),
+            ] {
+                let normalized = normalize(
+                    dialect,
+                    &format!("INSERT INTO {table_name} (payload) VALUES ('one')"),
+                );
+                let plan = plan_bound_statement(
+                    BoundStatementPlanInput::new(
+                        &catalog,
+                        database_id(DEFAULT_DATABASE),
+                        &normalized,
+                        0,
+                        &[],
+                        Some(b"caller-route-must-not-select-generated-owner"),
+                    )
+                    .with_allocation_owners(Some(&owners)),
+                    RoutingProvenance::new(1, 1, 1, 1),
+                    |_| panic!("omitted generated INSERT must not hash a caller route"),
+                )
+                .unwrap();
+
+                assert_eq!(
+                    plan.inference().kind(),
+                    ShardKeyInferenceKind::Unconstrained
+                );
+                assert!(plan.inferred_routes().is_empty());
+                assert_eq!(plan.explicit_route(), None);
+                assert_eq!(plan.assigned_shard(), None);
+                let generated = plan.generated_insert().unwrap();
+                assert_eq!(generated.table_id(), TableId::new(EVENTS_TABLE).unwrap());
+                assert_eq!(generated.policy(), &expected_policy);
+                let debug = format!("{plan:?}");
+                assert!(debug.contains("has_generated_insert: true"));
+                assert!(!debug.contains("caller-route"));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_generated_column_keeps_existing_routing_and_null_validation() {
+        let catalog = native_range_catalog();
+        let owners = owner_map(4);
+        let owner = owners.owner_for_physical_shard(2).unwrap();
+        let explicit_id = crate::core::generated_id::NativeRangeV1Id::new(owner, 41)
+            .unwrap()
+            .encode();
+
+        for dialect in SqlDialect::ALL.iter().copied() {
+            let normalized = normalize(
+                dialect,
+                &format!("INSERT INTO native_events (id, payload) VALUES ({explicit_id}, 'one')"),
+            );
+            let explicit = explicit_id.to_string();
+            let plan = plan_bound_statement(
+                BoundStatementPlanInput::new(
+                    &catalog,
+                    database_id(DEFAULT_DATABASE),
+                    &normalized,
+                    0,
+                    &[],
+                    Some(explicit.as_bytes()),
+                )
+                .with_allocation_owners(Some(&owners)),
+                RoutingProvenance::new(1, 1, 1, 1),
+                |_| 3,
+            )
+            .unwrap();
+            assert_eq!(plan.generated_insert(), None);
+            assert_eq!(plan.assigned_shard(), Some(2));
+            assert_eq!(plan.explicit_route().unwrap().shard(), 2);
+
+            let explicit_null = normalize(
+                dialect,
+                "INSERT INTO native_events (id, payload) VALUES (NULL, 'one')",
+            );
+            let error = plan_bound_statement(
+                BoundStatementPlanInput::new(
+                    &catalog,
+                    database_id(DEFAULT_DATABASE),
+                    &explicit_null,
+                    0,
+                    &[],
+                    None,
+                )
+                .with_allocation_owners(Some(&owners)),
+                RoutingProvenance::new(1, 1, 1, 1),
+                |_| panic!("explicit NULL must fail before routing"),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::NotNullViolation);
+        }
+    }
+
+    #[test]
+    fn multi_row_omitted_generation_is_rejected_before_any_route_is_selected() {
+        let owners = owner_map(4);
+        for dialect in SqlDialect::ALL.iter().copied() {
+            for (catalog, table_name) in [
+                (native_range_catalog(), "native_events"),
+                (hilo_catalog(), "hilo_events"),
+            ] {
+                let normalized = normalize(
+                    dialect,
+                    &format!("INSERT INTO {table_name} (payload) VALUES ('one'), ('two')"),
+                );
+                let error = plan_bound_statement(
+                    BoundStatementPlanInput::new(
+                        &catalog,
+                        database_id(DEFAULT_DATABASE),
+                        &normalized,
+                        0,
+                        &[],
+                        Some(b"must-not-be-routed"),
+                    )
+                    .with_allocation_owners(Some(&owners)),
+                    RoutingProvenance::new(1, 1, 1, 1),
+                    |_| panic!("multi-row omitted generation must fail structurally"),
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), EngineErrorKind::Unsupported);
+                assert!(error.diagnostic().contains("multi-row"));
+                assert!(!error.diagnostic().contains(table_name));
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_shard_key_without_a_generated_policy_remains_rejected() {
+        let catalog = sample_catalog();
+        let normalized = normalize(
+            SqlDialect::Sqlite,
+            "INSERT INTO events (payload) VALUES ('one')",
+        );
+        let error = plan_with_router(
+            &catalog,
+            DEFAULT_DATABASE,
+            &normalized,
+            0,
+            &[],
+            None,
+            |_| panic!("missing ordinary shard key must fail before routing"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+        assert!(error.diagnostic().contains("proven routing key"));
     }
 
     #[test]

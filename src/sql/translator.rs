@@ -6,7 +6,7 @@ use sqlparser::ast::{
     ValueWithSpan, VisitMut, VisitorMut,
 };
 
-use super::{NormalizedSql, SqlDialect, StatementParameters};
+use super::{GeneratedTableIntent, NormalizedSql, SqlDialect, StatementParameters, generated};
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
 /// The SQL compatibility policy applied after structural validation and
@@ -55,6 +55,7 @@ pub struct TranslatedSql {
     normalized: NormalizedSql,
     mode: SqlTranslationMode,
     sqlite_sql: String,
+    generated_table_intents: Box<[GeneratedTableIntent]>,
 }
 
 impl TranslatedSql {
@@ -76,6 +77,16 @@ impl TranslatedSql {
     /// Return the separate SQL text for a later SQLite prepare step.
     pub fn sqlite_sql(&self) -> &str {
         &self.sqlite_sql
+    }
+
+    /// Return every generated-key table declaration retained from the source
+    /// AST, in statement order.
+    ///
+    /// An empty slice means the SQL declared no supported generated-key table.
+    /// These values are syntax intent only; they do not prove that catalog
+    /// metadata has been durably installed.
+    pub fn generated_table_intents(&self) -> &[GeneratedTableIntent] {
+        &self.generated_table_intents
     }
 
     /// Borrow the validated placeholder-normalized request retained for
@@ -109,6 +120,10 @@ impl fmt::Debug for TranslatedSql {
             .field("source_bytes", &self.source().len())
             .field("sqlite_sql_bytes", &self.sqlite_sql.len())
             .field("statement_count", &self.statement_count())
+            .field(
+                "generated_table_intents",
+                &self.generated_table_intents.len(),
+            )
             .finish()
     }
 }
@@ -124,6 +139,12 @@ pub fn translate_sql(
     normalized: NormalizedSql,
     mode: SqlTranslationMode,
 ) -> EngineResult<TranslatedSql> {
+    let generated = generated::analyze_generated_tables(&normalized)?;
+    let generated_table_intents = generated
+        .iter()
+        .map(|generated| generated.intent().clone())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     match mode {
         SqlTranslationMode::StrictSqlite => {
             if normalized.dialect() != SqlDialect::Sqlite {
@@ -137,20 +158,25 @@ pub fn translate_sql(
                 normalized,
                 mode,
                 sqlite_sql,
+                generated_table_intents,
             })
         }
         SqlTranslationMode::Compatibility => {
-            let sqlite_sql = translate_compatibility(&normalized)?;
+            let sqlite_sql = translate_compatibility(&normalized, &generated)?;
             Ok(TranslatedSql {
                 normalized,
                 mode,
                 sqlite_sql,
+                generated_table_intents,
             })
         }
     }
 }
 
-fn translate_compatibility(normalized: &NormalizedSql) -> EngineResult<String> {
+fn translate_compatibility(
+    normalized: &NormalizedSql,
+    generated_tables: &[generated::AnalyzedGeneratedTable],
+) -> EngineResult<String> {
     let mut statements = normalized.common().statements().to_vec();
     if statements.len() != normalized.statement_count()
         || normalized.statement_parameters().len() != normalized.statement_count()
@@ -159,7 +185,13 @@ fn translate_compatibility(normalized: &NormalizedSql) -> EngineResult<String> {
     }
 
     for (statement_index, statement) in statements.iter_mut().enumerate() {
-        translate_column_types(normalized.dialect(), statement_index, statement)?;
+        let generated = generated_tables
+            .iter()
+            .find(|generated| generated.intent().statement_index() == statement_index);
+        translate_column_types(normalized.dialect(), statement_index, statement, generated)?;
+        if let Some(generated) = generated {
+            generated::rewrite_to_native_sqlite(statement, generated)?;
+        }
 
         let expected_placeholders =
             normalized.statement_parameters()[statement_index].occurrence_count();
@@ -193,12 +225,16 @@ fn translate_column_types(
     dialect: SqlDialect,
     statement_index: usize,
     statement: &mut AstStatement,
+    generated: Option<&generated::AnalyzedGeneratedTable>,
 ) -> EngineResult<()> {
     let AstStatement::CreateTable(table) = statement else {
         return Ok(());
     };
 
     for (column_index, column) in table.columns.iter_mut().enumerate() {
+        if generated.is_some_and(|generated| generated.column_index() == column_index) {
+            continue;
+        }
         let Some(translated) = translated_data_type(dialect, &column.data_type) else {
             return Err(EngineError::new(
                 EngineErrorKind::Unsupported,
@@ -426,7 +462,10 @@ mod tests {
     use super::*;
     use crate::{
         core::Value,
-        sql::{execute_batch, normalize_placeholders, parse, query, validate_common_subset},
+        sql::{
+            GeneratedIdPolicyIntent, execute_batch, normalize_placeholders, parse, query,
+            validate_common_subset,
+        },
     };
 
     fn normalize(dialect: SqlDialect, source: &str) -> EngineResult<NormalizedSql> {
@@ -542,6 +581,103 @@ mod tests {
     }
 
     #[test]
+    fn generated_key_ddl_has_one_physical_sql_and_logical_intent() {
+        let sources = [
+            (
+                SqlDialect::Sqlite,
+                "CREATE TABLE \"events\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"payload\" TEXT)",
+            ),
+            (
+                SqlDialect::MySql,
+                "CREATE TABLE `events` (`id` BIGINT PRIMARY KEY AUTO_INCREMENT, `payload` TEXT)",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE \"events\" (\"id\" BIGSERIAL PRIMARY KEY, \"payload\" TEXT)",
+            ),
+            (
+                SqlDialect::PostgreSql,
+                "CREATE TABLE \"events\" (\"id\" BIGINT PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY, \"payload\" TEXT)",
+            ),
+        ];
+        let expected =
+            "CREATE TABLE \"events\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"payload\" TEXT)";
+
+        for (dialect, source) in sources {
+            let translated = compatibility(dialect, source).unwrap();
+            assert_eq!(translated.sqlite_sql(), expected, "{dialect}");
+            let [intent] = translated.generated_table_intents() else {
+                panic!("{dialect} did not retain exactly one generated-table intent");
+            };
+            assert_eq!(intent.statement_index(), 0);
+            assert_eq!(intent.table(), "events");
+            assert_eq!(intent.column(), "id");
+            assert_eq!(intent.policy(), GeneratedIdPolicyIntent::NativeRangeV1);
+
+            let debug = format!("{intent:?}");
+            assert!(debug.contains("NativeRangeV1"));
+            assert!(!debug.contains("events"));
+            assert!(!debug.contains("id"));
+
+            let connection = Connection::open_in_memory().unwrap();
+            execute_batch(&connection, translated.sqlite_sql()).unwrap();
+            execute_batch(
+                &connection,
+                "INSERT INTO events(payload) VALUES ('generated')",
+            )
+            .unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT id FROM events", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn generated_key_rewrite_canonicalizes_option_order_and_retains_batch_position() {
+        let translated = compatibility(
+            SqlDialect::MySql,
+            "CREATE TABLE events(id BIGINT AUTO_INCREMENT PRIMARY KEY)",
+        )
+        .unwrap();
+        assert_eq!(
+            translated.sqlite_sql(),
+            "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT)"
+        );
+
+        let batch = compatibility(
+            SqlDialect::Sqlite,
+            "CREATE TABLE ordinary(value TEXT); CREATE TABLE generated(id INTEGER PRIMARY KEY AUTOINCREMENT)",
+        )
+        .unwrap();
+        let [intent] = batch.generated_table_intents() else {
+            panic!("batch did not retain exactly one generated-table intent");
+        };
+        assert_eq!(intent.statement_index(), 1);
+        assert_eq!(intent.table(), "generated");
+
+        let strict_source =
+            "CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)";
+        let strict = translate(
+            SqlDialect::Sqlite,
+            strict_source,
+            SqlTranslationMode::StrictSqlite,
+        )
+        .unwrap();
+        assert_eq!(strict.sqlite_sql(), strict_source);
+        assert_eq!(strict.generated_table_intents().len(), 1);
+
+        let ordinary = compatibility(
+            SqlDialect::Sqlite,
+            "CREATE TABLE ordinary(id INTEGER PRIMARY KEY)",
+        )
+        .unwrap();
+        assert!(ordinary.generated_table_intents().is_empty());
+    }
+
+    #[test]
     fn finite_type_alias_matrix_is_dialect_specific() {
         let cases: &[(SqlDialect, &[(&str, &str)])] = &[
             (
@@ -641,7 +777,6 @@ mod tests {
             (SqlDialect::PostgreSql, "VARCHAR(MAX)"),
             (SqlDialect::PostgreSql, "VARCHAR(20 CHARACTERS)"),
             (SqlDialect::PostgreSql, "CHARACTER VARYING(20 OCTETS)"),
-            (SqlDialect::PostgreSql, "SERIAL"),
             (SqlDialect::PostgreSql, "CHAR(8)"),
             (SqlDialect::MySql, "INT(11)"),
             (SqlDialect::MySql, "TINYINT(2)"),
@@ -666,6 +801,20 @@ mod tests {
             assert!(!error.diagnostic().contains("private"));
             assert!(!error.diagnostic().contains(source_type));
         }
+
+        let serial_error = compatibility(
+            SqlDialect::PostgreSql,
+            "CREATE TABLE private_name (private_column SERIAL PRIMARY KEY)",
+        )
+        .unwrap_err();
+        assert_eq!(serial_error.kind(), EngineErrorKind::Unsupported);
+        assert!(
+            serial_error
+                .diagnostic()
+                .contains("generated-key declaration")
+        );
+        assert!(!serial_error.diagnostic().contains("private"));
+        assert!(!serial_error.diagnostic().contains("SERIAL"));
 
         let batch = "CREATE TABLE first (ok BIGINT); CREATE TABLE second (ok TEXT, private_column PRIVATE_TYPE); CREATE TABLE third (later PRIVATE_TYPE)";
         let error = compatibility(SqlDialect::Sqlite, batch).unwrap_err();

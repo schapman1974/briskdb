@@ -198,6 +198,19 @@ impl ConnectionPools {
         self.shard(shard)?.acquire(owner).await
     }
 
+    /// Reserve one shard immediately without waiting for an active connection
+    /// slot. This is used only after a blocking worker has started, where
+    /// waiting would invert the normal capacity-before-worker acquisition
+    /// order and could form a resource cycle.
+    #[cfg(feature = "experimental-vtab")]
+    pub(crate) fn try_acquire_for_owner(
+        &self,
+        shard: u16,
+        owner: ConnectionOwner,
+    ) -> EngineResult<PoolPermit> {
+        self.shard(shard)?.try_acquire(owner)
+    }
+
     /// Reserve one slot on every shard in deterministic shard order.
     #[cfg(test)]
     pub(crate) async fn acquire_all_for_owner(
@@ -422,6 +435,49 @@ impl ShardPool {
                 )
             })?;
 
+        Ok(PoolPermit {
+            pool: self.clone(),
+            owner,
+            admission,
+            connection,
+        })
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    fn try_acquire(&self, owner: ConnectionOwner) -> EngineResult<PoolPermit> {
+        let admission = match Arc::clone(&self.inner.admission).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                return Err(EngineError::new(
+                    EngineErrorKind::Busy,
+                    format!("shard {} connection queue is full", self.inner.shard),
+                ));
+            }
+            Err(TryAcquireError::Closed) => {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    format!("shard {} admission semaphore is closed", self.inner.shard),
+                ));
+            }
+        };
+        let connection = match Arc::clone(&self.inner.connections).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                return Err(EngineError::new(
+                    EngineErrorKind::Busy,
+                    format!(
+                        "shard {} has no immediately available connection",
+                        self.inner.shard
+                    ),
+                ));
+            }
+            Err(TryAcquireError::Closed) => {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    format!("shard {} connection semaphore is closed", self.inner.shard),
+                ));
+            }
+        };
         Ok(PoolPermit {
             pool: self.clone(),
             owner,

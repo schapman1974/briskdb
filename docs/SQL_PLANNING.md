@@ -57,8 +57,11 @@ parameter buffers after the call returns.
 
 `assigned_shard()` is an assignment, not permission to execute. `None` is a
 normal successful result for a statement that is not sharded and for a read
-that still needs later scatter or empty-result planning. Every accepted write
-to a cataloged sharded table has `Some(shard)`.
+that still needs later scatter or empty-result planning. Explicit-key accepted
+writes to a cataloged sharded table have `Some(shard)`. The deliberate write
+exception is one single-row insert that omits a catalog-declared generated key:
+the plan records allocator intent and leaves its physical target unassigned
+until execution chooses an eligible allocation owner.
 
 For an `Int64` key on a table with `native_range_v1`, inferred marker-set IDs
 resolve through the persisted allocation-owner map instead of the routing hash.
@@ -100,11 +103,13 @@ limit pushdown remains owned by issues #58 through #61.
 
 Populated-catalog raw execute/query uses the same internal planning result after
 SQLite parsing, common-subset validation, placeholder normalization, and strict
-translation. Execute still requires one assigned Sharded owner. Query uses one
-owner for `Exact`, each distinct inferred owner for finite `Multiple`, every
-shard for `Unconstrained`, and shard 0 once for supported Global or table-free
-reads. Catalog and undeclared placement remain denied. An empty catalog alone
-bypasses this composition and keeps the legacy caller-key route.
+translation. Execute requires one assigned Sharded owner unless the plan
+contains the single-row generated intent; that intent chooses its owner in the
+allocator-backed coordinator. Query uses one owner for `Exact`, each distinct
+inferred owner for finite `Multiple`, every shard for `Unconstrained`, and shard
+0 once for supported Global or table-free reads. Catalog and undeclared
+placement remain denied. An empty catalog alone bypasses this composition and
+keeps the legacy caller-key route.
 
 `Debug` output reports identifiers, versions, shard IDs, and counts where
 useful. It does not render SQL, AST contents, inferred key values, explicit key
@@ -119,7 +124,9 @@ For a cataloged sharded table, planning applies this order:
    rules below permit a fallback.
 3. Leave a read without one physical target unassigned for later scatter or
    empty-result planning.
-4. Reject a write that cannot be assigned to exactly one physical shard.
+4. Defer the target only for one catalog-declared omitted generated key;
+   otherwise reject a write that cannot be assigned to exactly one physical
+   shard.
 
 An explicit route never narrows or overrides finite inference. When inferred
 routes exist, an explicit route is compatible only if it selects the same
@@ -164,7 +171,9 @@ The first sharded DML contract is intentionally single-shard:
 | DML shape | Accepted assignment |
 | --- | --- |
 | `INSERT` with a proven key for every row | Every inferred occurrence must select one physical shard; an explicit route, if present, must select that shard |
-| `INSERT` with an omitted or non-atomic shard-key value | Rejected even when explicit context exists, because the row's actual placement was not proven |
+| Single-row `INSERT` omitting an active catalog-declared generated shard key | Retain generated intent without an assigned shard; native execution tries a per-table round-robin owner list one non-waiting capacity at a time, while hi/lo reserves all possible capacities before allocation; either path reports the actual owner |
+| Multi-row `INSERT` omitting that generated key | Reject as `Unsupported` before mutation |
+| Other `INSERT` with an omitted or non-atomic shard-key value | Rejected even when explicit context exists, because the row's actual placement was not proven |
 | `UPDATE` or `DELETE` with finite inference | Every inferred route must select one physical shard; a compatible explicit route may also be retained |
 | `UPDATE` or `DELETE` with `Unconstrained` or `Contradiction` inference | Requires an explicit fallback and assigns its physical shard |
 | Any finite write spanning physical shards | Rejected before execution; explicit context cannot repair or narrow it |
@@ -172,6 +181,20 @@ The first sharded DML contract is intentionally single-shard:
 Duplicate `INSERT` keys and distinct logical keys that collide on one physical
 shard are valid single-shard writes. Their individual route occurrences remain
 visible in the plan.
+
+The generated case is recognized from the retained AST, not from a `NULL`
+SQLite value. The generated column must be absent from the insert column list
+and the `VALUES` source must contain exactly one row. Listing the column is an
+explicit-key insert even when its value is `NULL`; that shape never enables the
+allocator and ordinarily fails because it cannot prove placement. Explicit
+integer IDs retain the existing owner-aware or legacy routing behavior.
+
+Target selection and mutation remain execution work. With both experimental
+coordinator gates enabled, Engine, prepared-portal, and populated-catalog HTTP
+execution consume the unassigned generated intent, capture the resulting key
+on the writing handle, and report the actual owner. Without either gate the
+statement fails before mutation. The complete DDL, execution, and result
+contract is in [generated keys](GENERATED_KEYS.md).
 
 A cataloged shard-key column is immutable in this first contract. Every
 sharded `UPDATE` assignment targeting it is rejected, including self-assignment,
@@ -279,7 +302,8 @@ return:
 | Explicit physical shard conflicts with any finite inferred route | `InvalidArgument` |
 | `UPDATE` or `DELETE` has no finite route and no explicit fallback | `InvalidArgument` |
 | A sharded `UPDATE` assigns the cataloged shard-key column | `InvalidQuery` |
-| A sharded `INSERT` does not prove every row's key | `InvalidQuery` |
+| A sharded `INSERT` does not prove every row's key and has no supported generated-key intent | `InvalidQuery` |
+| A multi-row `INSERT` omits its catalog-declared generated key | `Unsupported` |
 | A finite sharded write spans physical shards | `InvalidQuery` |
 | Retained inference, catalog, AST, or route metadata is inconsistent | `Internal` |
 
@@ -310,8 +334,9 @@ path. In particular:
 - `Engine::plan_bound_statement` is synchronous and stateless; it neither
   accepts nor mutates a `Session`;
 - `assigned_shard()` is consumed by prepared execution and by raw HTTP
-  execute/query when the authoritative catalog is populated; an empty catalog
-  retains legacy routing without a plan;
+  execute/query when the authoritative catalog is populated; generated-key
+  intent instead receives its owner at allocator execution, while an empty
+  catalog retains legacy routing without a plan;
 - no read scatter, merge, contradiction short circuit, or write executes in
   this synchronous planner method;
 - no transaction pinning or cross-call routing context is applied;

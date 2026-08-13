@@ -6,7 +6,7 @@ use crate::sql::{SqlDialect, SqlTranslationMode, StatementBehavior, TranslatedSq
 
 use super::{
     Column, DataType, EngineError, EngineErrorKind, EngineResult, LogicalDatabaseId,
-    PreparedStatementLimits, ResultSet, SessionId, Value,
+    PreparedStatementLimits, ResultSet, SessionId, Value, WriteResult,
 };
 
 /// A request to prepare exactly one protocol-neutral SQL statement.
@@ -195,6 +195,13 @@ impl fmt::Debug for PreparedStatementDescription {
 pub enum PreparedExecution {
     /// A command completed and changed this many rows.
     AffectedRows(usize),
+    /// A write completed with a generated key captured by the same logical
+    /// operation that committed it.
+    ///
+    /// This variant is emitted only for an INSERT whose catalog-declared
+    /// generated column was omitted. Explicit-key writes retain
+    /// [`Self::AffectedRows`] for compatibility.
+    GeneratedWrite(WriteResult),
     /// A read-only statement returned a bounded materialized result.
     Rows(ResultSet),
 }

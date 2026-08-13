@@ -27,7 +27,9 @@ use rusqlite::{
     },
 };
 
-use super::{SchemaOperationGuard, SqliteAffinity, Storage, quote_identifier, sqlite_affinity};
+use super::{
+    SchemaOperationGuard, SqliteAffinity, Storage, quote_identifier, shard, sqlite_affinity,
+};
 use crate::{
     core::generated_id::{
         GeneratedIdClassification, classify_caller_generated_id, classify_generated_id,
@@ -48,7 +50,7 @@ const ROW_ACCOUNTING_BYTES: usize = size_of::<Vec<RawCell>>() * 4 + ALLOCATION_O
 const VALUE_ACCOUNTING_BYTES: usize = size_of::<RawCell>();
 const SCAN_PLAN: c_int = 0;
 const SHARD_KEY_EQUALITY_PLAN: c_int = 1;
-const LOCATOR_COLUMN_NAME: &str = "__briskdb_locator";
+const LOCATOR_COLUMN_NAME: &str = shard::WRITABLE_LOCATOR_COLUMN_NAME;
 
 mod locator;
 mod module_v2;
@@ -478,6 +480,7 @@ struct Registry {
     cancellation_epoch: Arc<AtomicU64>,
     active_child_scans: Arc<Mutex<usize>>,
     lifecycle: Arc<LifecycleCounters>,
+    generated_shard_admission: Mutex<Option<Arc<GeneratedShardAdmission>>>,
     #[cfg(test)]
     opened_shards: Mutex<Vec<u16>>,
     #[cfg(test)]
@@ -489,6 +492,8 @@ struct Registry {
     #[cfg(test)]
     generated_target_gate: Mutex<Option<TestChildScanGate>>,
 }
+
+type GeneratedShardAdmission = dyn Fn(u16) -> EngineResult<()> + Send + Sync;
 
 #[derive(Debug)]
 struct RegistrySchema {
@@ -679,6 +684,7 @@ impl Registry {
             cancellation_epoch: Arc::new(AtomicU64::new(0)),
             active_child_scans: Arc::new(Mutex::new(0)),
             lifecycle: Arc::new(LifecycleCounters::default()),
+            generated_shard_admission: Mutex::new(None),
             #[cfg(test)]
             opened_shards: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -1271,7 +1277,6 @@ struct TableSpec {
 #[derive(Debug, Clone)]
 struct PhysicalColumnSpec {
     name: String,
-    default_sql: Option<String>,
     generated: bool,
 }
 
@@ -1473,13 +1478,10 @@ impl TableSpec {
 
         let physical_columns = columns
             .iter()
-            .map(
-                |(column, _, _, default_sql, _, hidden)| PhysicalColumnSpec {
-                    name: column.clone(),
-                    default_sql: default_sql.clone(),
-                    generated: matches!(*hidden, 2 | 3),
-                },
-            )
+            .map(|(column, _, _, _, _, hidden)| PhysicalColumnSpec {
+                name: column.clone(),
+                generated: matches!(*hidden, 2 | 3),
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
@@ -1514,49 +1516,12 @@ impl TableSpec {
                 })
         };
 
-        let has_trigger = connection
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1
-                     FROM main.sqlite_schema
-                     WHERE type = 'trigger' AND tbl_name = ?1 COLLATE BINARY
-                 )",
-                [name],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(sqlite_error::storage)?;
         let write_unsupported = if !matches!(table.placement(), TablePlacement::Sharded(_)) {
             Some(format!(
                 "registered table {name} is not Sharded; the writable facade does not mutate replicated or catalog placement"
             ))
-        } else if columns
-            .iter()
-            .any(|(column, _, _, _, _, _)| column.eq_ignore_ascii_case(LOCATOR_COLUMN_NAME))
-        {
-            Some(format!(
-                "registered table {name} conflicts with the reserved writable row locator"
-            ))
-        } else if physical_columns
-            .iter()
-            .any(|column| column.default_sql.is_some())
-        {
-            Some(format!(
-                "registered table {name} has physical defaults; SQLite xUpdate cannot distinguish an omitted value from explicit NULL"
-            ))
-        } else if physical_columns.iter().any(|column| column.generated) {
-            Some(format!(
-                "registered table {name} has generated columns, which are not writable through the explicit-key facade"
-            ))
-        } else if has_trigger {
-            Some(format!(
-                "registered table {name} has physical triggers, which are not supported by the writable facade"
-            ))
-        } else if locator.is_none() {
-            Some(format!(
-                "registered table {name} has no unambiguous physical row identity for writable scans"
-            ))
         } else {
-            None
+            shard::writable_table_unsupported_reason(connection, name)?
         };
 
         let (locator_select_sql, locator_point_select_sql) = locator

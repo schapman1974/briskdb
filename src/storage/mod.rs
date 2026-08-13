@@ -26,7 +26,7 @@ use std::{
 };
 
 use rusqlite::{
-    Connection, OpenFlags, TransactionBehavior,
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior,
     hooks::{AuthAction, AuthContext, Authorization},
 };
 
@@ -42,12 +42,13 @@ use crate::core::TableId;
 use crate::{
     core::{
         Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
-        MAX_TABLES, ShardKeyType, TableDeclaration, TablePlacement,
+        GeneratedTableDdlReceipt, MAX_TABLES, ShardKeyType, TableDeclaration, TablePlacement,
         generated_id::{
             NATIVE_RANGE_V1_FORMAT_MARKER, native_range_v1_sequence_ceiling,
             native_range_v1_sequence_floor,
         },
     },
+    sql::SqlDialect,
     sqlite_error,
 };
 
@@ -209,6 +210,15 @@ impl RootSchemaCoordination {
         Ok(CatalogReplacementGuard { catalogs })
     }
 
+    fn ensure_exclusive_catalog(&self, current: &Arc<CatalogSnapshot>) -> EngineResult<()> {
+        // The schema gate prevents a new handle from completing startup while
+        // the caller's migration guard is live. Dropping this reservation is
+        // therefore safe and avoids holding the catalog mutex while physical
+        // migration generation is published through that same coordinator.
+        drop(self.reserve_catalog_replacement(current)?);
+        Ok(())
+    }
+
     fn publish_schema_generation(
         &self,
         expected_generation: u64,
@@ -363,6 +373,13 @@ fn begin_startup_coordination(
     }
 }
 
+#[cfg(test)]
+fn abort_generated_table_ddl_at_test_boundary(boundary: &str) {
+    if std::env::var("BRISKDB_GENERATED_DDL_ABORT_POINT").as_deref() == Ok(boundary) {
+        std::process::abort();
+    }
+}
+
 fn validate_schema_migration_checksum_prefix(
     shards_dir: &Path,
     shard_count: u16,
@@ -505,7 +522,8 @@ impl Storage {
             mut integrity,
             active_native_id_table_ids,
             active_hilo_id_table_ids,
-            active_table_provisioning,
+            mut active_table_provisioning,
+            generated_table_ddl,
         ) = loaded.into_parts_with_recovery();
         let catalog = catalog.with_active_native_id_table_ids(active_native_id_table_ids);
         let catalog = catalog.with_active_hilo_id_table_ids(active_hilo_id_table_ids);
@@ -584,7 +602,102 @@ impl Storage {
             shard_layout: ready_layout,
             schema_coordination,
         };
-        if let Some(mut provisioning) = active_table_provisioning {
+        if let Some(mut ddl) = generated_table_ddl {
+            startup.mark_pending_on_drop();
+            let recovery: EngineResult<()> = (|| {
+                if ddl.lifecycle() == manifest::GeneratedTableDdlLifecycle::ApplyingPhysical {
+                    ddl = manifest::mark_generated_table_ddl_provisioning(
+                        &mut manifest,
+                        requested_shards,
+                        &ddl,
+                        || {},
+                    )?;
+                }
+                if ddl.lifecycle() == manifest::GeneratedTableDdlLifecycle::Complete {
+                    if active_table_provisioning.is_some() {
+                        return Err(EngineError::new(
+                            EngineErrorKind::DataCorruption,
+                            "complete generated-table DDL retains active table provisioning",
+                        ));
+                    }
+                    return Ok(());
+                }
+                if ddl.lifecycle() != manifest::GeneratedTableDdlLifecycle::Provisioning {
+                    return Err(EngineError::new(
+                        EngineErrorKind::DataCorruption,
+                        "generated-table DDL recovery found an unsupported lifecycle",
+                    ));
+                }
+                let mut provisioning = match active_table_provisioning.take() {
+                    Some(provisioning) => provisioning,
+                    None => {
+                        let committed_schema_digest =
+                            storage.schema_coordination.committed_schema_digest()?;
+                        match manifest::begin_native_table_provisioning(
+                            &mut manifest,
+                            requested_shards,
+                            vec![ddl.declaration().clone()],
+                            committed_schema_digest,
+                            || {},
+                        )? {
+                            manifest::NativeTableProvisioningClassification::Active(
+                                provisioning,
+                            ) => provisioning,
+                            manifest::NativeTableProvisioningClassification::Complete => {
+                                return Err(EngineError::new(
+                                    EngineErrorKind::DataCorruption,
+                                    "generated-table DDL catalog completed outside its atomic bridge finalization",
+                                ));
+                            }
+                            manifest::NativeTableProvisioningClassification::Absent => {
+                                return Err(EngineError::new(
+                                    EngineErrorKind::Internal,
+                                    "generated-table DDL recovery did not create its provisioning journal",
+                                ));
+                            }
+                        }
+                    }
+                };
+                storage.validate_empty_table_declarations(provisioning.declarations())?;
+                while provisioning.next_shard() < provisioning.shard_count() {
+                    let shard_id = provisioning.next_shard();
+                    storage.seed_native_range_v1_sequences_on_shard(
+                        provisioning.declarations(),
+                        shard_id,
+                    )?;
+                    provisioning = manifest::advance_native_table_provisioning(
+                        &mut manifest,
+                        requested_shards,
+                        &provisioning,
+                        shard_id + 1,
+                    )?;
+                }
+                let replacement_guard = storage
+                    .schema_coordination
+                    .reserve_catalog_replacement(&storage.catalog)?;
+                let (replacement, _completed) =
+                    manifest::finalize_generated_table_ddl_provisioning(
+                        &mut manifest,
+                        requested_shards,
+                        &ddl,
+                        &provisioning,
+                        || {},
+                    )?;
+                storage.catalog = replacement_guard.publish(&storage.catalog, replacement)?;
+                Ok::<(), EngineError>(())
+            })();
+            if let Err(error) = recovery {
+                if error.kind() == EngineErrorKind::DataCorruption {
+                    storage.mark_schema_degraded();
+                    let _ = manifest::mark_degraded(
+                        &mut manifest,
+                        requested_shards,
+                        &storage.shard_layout,
+                    );
+                }
+                return Err(error);
+            }
+        } else if let Some(mut provisioning) = active_table_provisioning {
             startup.mark_pending_on_drop();
             let recovery: EngineResult<()> = (|| {
                 storage.validate_empty_table_declarations(provisioning.declarations())?;
@@ -732,6 +845,201 @@ impl Storage {
     #[cfg(any(feature = "experimental-vtab", test))]
     pub(crate) fn hilo_owner_id(&self) -> [u8; 32] {
         self.schema_coordination.hilo_allocator.owner_id()
+    }
+
+    pub(crate) fn apply_generated_table_ddl(
+        &mut self,
+        source_dialect: SqlDialect,
+        source_sql: &str,
+        physical_sql: &str,
+        declaration: TableDeclaration,
+    ) -> EngineResult<GeneratedTableDdlReceipt> {
+        let result = self.apply_generated_table_ddl_inner(
+            source_dialect,
+            source_sql,
+            physical_sql,
+            declaration,
+        );
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn apply_generated_table_ddl_inner(
+        &mut self,
+        source_dialect: SqlDialect,
+        source_sql: &str,
+        physical_sql: &str,
+        declaration: TableDeclaration,
+    ) -> EngineResult<GeneratedTableDdlReceipt> {
+        self.validate_table_declaration_request(std::slice::from_ref(&declaration))?;
+        let mut migration = self.schema_coordination.gate.begin_new_migration()?;
+        migration.wait_for_quiescence_blocking();
+        let operation = (|| {
+            self.schema_coordination
+                .ensure_exclusive_catalog(&self.catalog)?;
+            let manifest_path = self.root.join("manifest.sqlite");
+            let mut manifest_connection = open_existing_manifest(&manifest_path)?;
+            configure_manifest_connection(&manifest_connection)?;
+            configure_journal_mode(&manifest_connection)?;
+
+            let classification = manifest::classify_generated_table_ddl(
+                &mut manifest_connection,
+                self.shard_count(),
+                source_dialect,
+                source_sql,
+                physical_sql,
+                &declaration,
+            )?;
+            let mut ddl = match classification {
+                manifest::GeneratedTableDdlClassification::Existing(existing)
+                    if existing.lifecycle() == manifest::GeneratedTableDdlLifecycle::Complete =>
+                {
+                    let receipt = generated_table_ddl_receipt(&existing)?;
+                    if !declarations_match_catalog(
+                        self.catalog.logical(),
+                        std::slice::from_ref(&declaration),
+                    ) || !self.catalog.native_id_policy_is_active(receipt.table_id())
+                    {
+                        return Err(EngineError::new(
+                            EngineErrorKind::FailedPrecondition,
+                            "generated-table DDL is complete; reopen this stale database handle",
+                        ));
+                    }
+                    return Ok(receipt);
+                }
+                manifest::GeneratedTableDdlClassification::Existing(existing) => {
+                    if existing.lifecycle()
+                        == manifest::GeneratedTableDdlLifecycle::ApplyingPhysical
+                    {
+                        self.apply_schema_migration(existing.physical_sql(), &mut migration, None)?;
+                    }
+                    existing
+                }
+                manifest::GeneratedTableDdlClassification::Absent => {
+                    if !self.catalog.logical().tables().is_empty() {
+                        return Err(EngineError::new(
+                            EngineErrorKind::FailedPrecondition,
+                            "generated-table DDL bridge currently requires an empty authoritative catalog",
+                        ));
+                    }
+                    self.preflight_generated_table_ddl(physical_sql, &declaration)?;
+                    migration::apply_generated_table_ddl_migration(
+                        self,
+                        source_dialect,
+                        source_sql,
+                        physical_sql,
+                        declaration.clone(),
+                        &mut migration,
+                    )
+                    .inspect(|_| {
+                        #[cfg(test)]
+                        abort_generated_table_ddl_at_test_boundary("physical-complete");
+                    })?
+                }
+            };
+
+            if ddl.lifecycle() == manifest::GeneratedTableDdlLifecycle::ApplyingPhysical {
+                ddl = manifest::mark_generated_table_ddl_provisioning(
+                    &mut manifest_connection,
+                    self.shard_count(),
+                    &ddl,
+                    || {
+                        migration.mark_pending_on_drop();
+                        #[cfg(test)]
+                        abort_generated_table_ddl_at_test_boundary("mark-before-commit");
+                    },
+                )?;
+                #[cfg(test)]
+                abort_generated_table_ddl_at_test_boundary("mark-after-commit");
+            }
+            if ddl.lifecycle() != manifest::GeneratedTableDdlLifecycle::Provisioning {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "generated-table DDL did not reach its provisioning phase",
+                ));
+            }
+
+            self.validate_empty_table_declarations(std::slice::from_ref(&declaration))?;
+            let committed_schema_digest = self.schema_coordination.committed_schema_digest()?;
+            let classification = manifest::begin_native_table_provisioning(
+                &mut manifest_connection,
+                self.shard_count(),
+                vec![declaration.clone()],
+                committed_schema_digest,
+                || {
+                    migration.mark_pending_on_drop();
+                    #[cfg(test)]
+                    abort_generated_table_ddl_at_test_boundary("provisioning-before-commit");
+                },
+            )?;
+            #[cfg(test)]
+            abort_generated_table_ddl_at_test_boundary("provisioning-after-commit");
+            let mut provisioning = match classification {
+                manifest::NativeTableProvisioningClassification::Active(provisioning) => {
+                    provisioning
+                }
+                manifest::NativeTableProvisioningClassification::Complete => {
+                    return Err(EngineError::new(
+                        EngineErrorKind::DataCorruption,
+                        "generated-table DDL catalog completed outside its atomic bridge finalization",
+                    ));
+                }
+                manifest::NativeTableProvisioningClassification::Absent => {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "generated-table DDL provisioning did not create its durable journal",
+                    ));
+                }
+            };
+            while provisioning.next_shard() < provisioning.shard_count() {
+                let shard_id = provisioning.next_shard();
+                self.seed_native_range_v1_sequences_on_shard(
+                    provisioning.declarations(),
+                    shard_id,
+                )?;
+                #[cfg(test)]
+                if shard_id == 0 {
+                    abort_generated_table_ddl_at_test_boundary("seed-0-before-progress");
+                }
+                provisioning = manifest::advance_native_table_provisioning(
+                    &mut manifest_connection,
+                    self.shard_count(),
+                    &provisioning,
+                    shard_id + 1,
+                )?;
+                #[cfg(test)]
+                if shard_id == 0 {
+                    abort_generated_table_ddl_at_test_boundary("seed-0-progress");
+                }
+            }
+
+            let replacement_guard = self
+                .schema_coordination
+                .reserve_catalog_replacement(&self.catalog)?;
+            let (replacement, completed) = manifest::finalize_generated_table_ddl_provisioning(
+                &mut manifest_connection,
+                self.shard_count(),
+                &ddl,
+                &provisioning,
+                || {
+                    migration.mark_pending_on_drop();
+                    #[cfg(test)]
+                    abort_generated_table_ddl_at_test_boundary("complete-before-commit");
+                },
+            )?;
+            #[cfg(test)]
+            abort_generated_table_ddl_at_test_boundary("complete-after-commit");
+            self.catalog = replacement_guard.publish(&self.catalog, replacement)?;
+            generated_table_ddl_receipt(&completed)
+        })();
+        if operation
+            .as_ref()
+            .is_err_and(|error: &EngineError| error.kind() == EngineErrorKind::DataCorruption)
+        {
+            self.record_schema_degraded();
+        }
+        let receipt = operation?;
+        migration.publish_ready()?;
+        Ok(receipt)
     }
 
     pub(crate) fn register_tables(
@@ -1128,6 +1436,78 @@ impl Storage {
                     )?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Prove a generated-table candidate can become both authoritative and
+    /// writable while every change still belongs to a rollback-only SQLite
+    /// transaction. This runs before the durable DDL bridge or schema-migration
+    /// journal is created.
+    fn preflight_generated_table_ddl(
+        &self,
+        physical_sql: &str,
+        declaration: &TableDeclaration,
+    ) -> EngineResult<()> {
+        let expected_tables = BTreeSet::from([declaration.name().to_owned()]);
+        for shard_id in 0..self.shard_count() {
+            let mut connection = self.open_shard(shard_id)?;
+            let existing_object = connection
+                .query_row(
+                    "SELECT name
+                     FROM main.sqlite_schema
+                     WHERE name NOT GLOB 'sqlite_*'
+                       AND name <> 'briskdb_shard_metadata'
+                       AND tbl_name <> 'briskdb_shard_metadata'
+                     ORDER BY name COLLATE BINARY
+                     LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(sqlite_error::storage)?;
+            if let Some(existing_object) = existing_object {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "generated-table DDL requires an empty physical application schema; physical shard {shard_id} already contains {existing_object}"
+                    ),
+                ));
+            }
+
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sqlite_error::storage)?;
+            let validation = (|| {
+                shard::execute_schema_migration_batch(&transaction, physical_sql)?;
+                if application_table_names(&transaction)? != expected_tables {
+                    return Err(EngineError::new(
+                        EngineErrorKind::FailedPrecondition,
+                        format!(
+                            "generated-table DDL did not produce exactly its declared table on physical shard {shard_id}"
+                        ),
+                    ));
+                }
+                validate_empty_table_declaration(
+                    &transaction,
+                    shard_id,
+                    declaration,
+                    std::slice::from_ref(declaration),
+                )?;
+                if let Some(reason) =
+                    shard::writable_table_unsupported_reason(&transaction, declaration.name())?
+                {
+                    return Err(EngineError::new(
+                        EngineErrorKind::FailedPrecondition,
+                        format!(
+                            "generated-table DDL cannot publish a writable table on physical shard {shard_id}: {reason}"
+                        ),
+                    ));
+                }
+                Ok(())
+            })();
+            transaction.rollback().map_err(sqlite_error::storage)?;
+            validation?;
         }
         Ok(())
     }
@@ -1562,6 +1942,35 @@ fn declarations_match_catalog(catalog: &Catalog, declarations: &[TableDeclaratio
                 && table.placement() == declaration.placement()
                 && table.generated_id_policy() == declaration.generated_id_policy()
         })
+}
+
+fn generated_table_ddl_receipt(
+    ddl: &manifest::GeneratedTableDdl,
+) -> EngineResult<GeneratedTableDdlReceipt> {
+    if ddl.lifecycle() != manifest::GeneratedTableDdlLifecycle::Complete {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "generated-table DDL receipt requires a complete durable bridge",
+        ));
+    }
+    let provisioning_id = ddl.provisioning_id().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "complete generated-table DDL is missing its provisioning identity",
+        )
+    })?;
+    let table_id = ddl.table_id().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "complete generated-table DDL is missing its catalog table identity",
+        )
+    })?;
+    Ok(GeneratedTableDdlReceipt::from_durable_parts(
+        ddl.logical_id(),
+        ddl.physical_migration_id(),
+        provisioning_id,
+        table_id,
+    ))
 }
 
 fn application_table_names(connection: &Connection) -> EngineResult<BTreeSet<String>> {
@@ -2580,6 +2989,7 @@ mod tests {
             manifest
                 .execute_batch(
                     "BEGIN IMMEDIATE;
+                     DROP TABLE briskdb_generated_table_ddl;
                      DROP TABLE briskdb_hilo_leases;
                      DROP TABLE briskdb_table_provisioning_declarations;
                      DROP TABLE briskdb_table_provisioning;
@@ -2683,6 +3093,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_generated_table_ddl;
                  DROP TABLE briskdb_hilo_leases;
                  DROP TABLE briskdb_table_provisioning_declarations;
                  DROP TABLE briskdb_table_provisioning;
@@ -2780,6 +3191,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_generated_table_ddl;
                  DROP TABLE briskdb_hilo_leases;
                  DROP TABLE briskdb_table_provisioning_declarations;
                  DROP TABLE briskdb_table_provisioning;
@@ -5089,6 +5501,117 @@ mod tests {
             let declarations = registered_table_declarations(&reopened);
             reopened.register_tables(declarations).unwrap();
             assert_eq!(reopened.catalog().tables().len(), 2);
+        }
+    }
+
+    const GENERATED_DDL_CRASH_SOURCE: &str =
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)";
+
+    #[test]
+    fn generated_table_ddl_crash_child() {
+        let Ok(root) = std::env::var("BRISKDB_GENERATED_DDL_ABORT_ROOT") else {
+            return;
+        };
+        let mut database = Database::open(root, 2).unwrap();
+        let result =
+            database.apply_generated_table_ddl(SqlDialect::Sqlite, GENERATED_DDL_CRASH_SOURCE);
+        panic!("child did not reach requested generated-DDL boundary: {result:?}");
+    }
+
+    #[test]
+    fn generated_table_ddl_resumes_after_real_process_abort_at_every_durable_phase() {
+        for boundary in [
+            "journal",
+            "shard-0",
+            "progress-0-prepared",
+            "progress-0",
+            "physical-finalization-prepared",
+            "physical-finalization-committed",
+            "physical-complete",
+            "mark-before-commit",
+            "mark-after-commit",
+            "provisioning-before-commit",
+            "provisioning-after-commit",
+            "seed-0-before-progress",
+            "seed-0-progress",
+            "complete-before-commit",
+            "complete-after-commit",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("storage::tests::generated_table_ddl_crash_child")
+                .arg("--nocapture")
+                .env("BRISKDB_GENERATED_DDL_ABORT_ROOT", temp.path())
+                .env("BRISKDB_GENERATED_DDL_ABORT_POINT", boundary)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "child did not abort at {boundary}");
+
+            let mut reopened = Database::open(temp.path(), 2).unwrap();
+            let receipt = reopened
+                .apply_generated_table_ddl(SqlDialect::Sqlite, GENERATED_DDL_CRASH_SOURCE)
+                .unwrap();
+            let table = reopened
+                .catalog()
+                .table("default", "events")
+                .unwrap()
+                .unwrap();
+            assert_eq!(table.id(), receipt.table_id(), "boundary {boundary}");
+            assert_eq!(
+                table.generated_id_policy(),
+                &GeneratedIdPolicy::native_range_v1("id").unwrap(),
+                "boundary {boundary}"
+            );
+
+            let manifest = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+            assert_eq!(
+                manifest
+                    .query_row(
+                        "SELECT lifecycle_state FROM briskdb_generated_table_ddl",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                3,
+                "boundary {boundary}"
+            );
+            assert_eq!(
+                manifest
+                    .query_row(
+                        "SELECT COUNT(*) FROM briskdb_table_provisioning",
+                        [],
+                        |row| { row.get::<_, i64>(0) }
+                    )
+                    .unwrap(),
+                0,
+                "boundary {boundary}"
+            );
+            drop(manifest);
+
+            for shard_id in 0..2_u16 {
+                let shard = Connection::open(shard_file(temp.path(), shard_id)).unwrap();
+                assert_eq!(
+                    shard
+                        .query_row(
+                            "SELECT seq FROM sqlite_sequence WHERE name = 'events'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    native_range_v1_sequence_floor(
+                        crate::core::generated_id::AllocationOwnerSlot::new(shard_id).unwrap(),
+                    ),
+                    "boundary {boundary}, shard {shard_id}"
+                );
+                assert_eq!(
+                    shard
+                        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    "ok",
+                    "boundary {boundary}, shard {shard_id}"
+                );
+            }
         }
     }
 

@@ -80,6 +80,126 @@ fn explicit_native_range_import_preserves_legacy_rows_and_owner_floors() {
     }
 }
 
+#[cfg(feature = "experimental-vtab")]
+#[tokio::test]
+async fn imported_native_range_table_accepts_public_omitted_key_writes() {
+    use std::sync::Arc;
+
+    use briskdb::core::{Engine, EngineOptions, Statement, Value};
+
+    const IMPORT_SHARDS: u16 = 4;
+    const NATIVE_FORMAT_MARKER: u64 = 0x4000_0000_0000_0000;
+    const OWNER_SHIFT: u32 = 52;
+    const OWNER_MASK: u64 = (1_u64 << 10) - 1;
+    const LOCAL_SEQUENCE_MASK: u64 = (1_u64 << OWNER_SHIFT) - 1;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let source_path = temporary.path().join("generated-source.sqlite");
+    let destination = temporary.path().join("generated-imported");
+    Connection::open(&source_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE records(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 value TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+    let plan = SqliteImportPlan::new(vec![
+        SqliteTableImportPlan::sharded_by_primary_key("records")
+            .with_native_range_v1("id")
+            .unwrap(),
+    ]);
+    import_sqlite_database(
+        &source_path,
+        &destination,
+        &plan,
+        SqliteImportOptions::new(IMPORT_SHARDS).unwrap(),
+    )
+    .unwrap();
+
+    // Opening an Engine after the offline import exercises the same durable
+    // catalog and owner map that a normal process restart observes.
+    let database = Database::open(&destination, IMPORT_SHARDS).unwrap();
+    let options = EngineOptions::new(1, 4)
+        .unwrap()
+        .with_experimental_vtab_writes(true);
+    let engine = Engine::from_database_with_options(Arc::new(database), options).unwrap();
+    let session = engine.session();
+    let inserted = engine
+        .execute_write(
+            &session,
+            Statement::new(
+                "INSERT INTO records (value) VALUES (?1)",
+                vec![Value::from("generated-after-import")],
+            ),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(inserted.value.rows_affected, 1);
+    let generated = inserted.value.generated_key.unwrap();
+    assert_eq!(generated.column, "id");
+    let generated_id = generated
+        .value
+        .as_i64()
+        .expect("native_range_v1 must return a signed integer ID");
+    let encoded = u64::try_from(generated_id).unwrap();
+    assert_eq!(encoded & (3_u64 << 62), NATIVE_FORMAT_MARKER);
+    assert_ne!(encoded & LOCAL_SEQUENCE_MASK, 0);
+    let owner_slot = i64::try_from((encoded >> OWNER_SHIFT) & OWNER_MASK).unwrap();
+
+    let manifest = Connection::open(destination.join("manifest.sqlite")).unwrap();
+    let owner_shard = manifest
+        .query_row(
+            "SELECT physical_shard_id
+             FROM briskdb_allocation_owners
+             WHERE owner_slot = ?1 AND owner_state = 1",
+            [owner_slot],
+            |row| row.get::<_, u16>(0),
+        )
+        .unwrap();
+    assert_eq!(inserted.shard, owner_shard);
+
+    for shard in 0..IMPORT_SHARDS {
+        let connection = Connection::open(shard_path(&destination, shard)).unwrap();
+        let count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE id = ?1",
+                [generated_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(count, i64::from(shard == owner_shard), "shard {shard}");
+        if shard == owner_shard {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT value FROM records WHERE id = ?1",
+                        [generated_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "generated-after-import"
+            );
+        }
+    }
+
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let reopened = Database::open(&destination, IMPORT_SHARDS).unwrap();
+    let metadata = reopened
+        .catalog()
+        .tables()
+        .iter()
+        .find(|table| table.name() == "records")
+        .unwrap();
+    assert_eq!(
+        metadata.generated_id_policy(),
+        &GeneratedIdPolicy::native_range_v1("id").unwrap()
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RawValue {
     Null,

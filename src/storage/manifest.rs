@@ -13,11 +13,12 @@ use crate::{
         AllocationOwnerMap, BUCKET_ALGORITHM_VERSION, Catalog, CatalogSnapshot,
         DEFAULT_LOGICAL_DATABASE_ID, DEFAULT_LOGICAL_DATABASE_NAME, EngineError, EngineErrorKind,
         EngineResult, GeneratedIdPolicy, HASH_VERSION, IDENTIFIER_ENCODING_VERSION,
-        INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION, LogicalDatabaseMetadata,
+        INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION, LogicalDatabaseId, LogicalDatabaseMetadata,
         MAX_LOGICAL_DATABASES, MAX_TABLES, RoutingCatalog, ShardKeyMetadata, ShardKeyType,
         TableDeclaration, TableId, TableMetadata, TablePlacement, VIRTUAL_BUCKET_COUNT,
         initial_physical_shard, validate_catalog_identifier,
     },
+    sql::SqlDialect,
     sqlite_error,
 };
 
@@ -39,7 +40,8 @@ const V8_SCHEMA_VERSION: u32 = 8;
 const V9_SCHEMA_VERSION: u32 = 9;
 const V10_SCHEMA_VERSION: u32 = 10;
 const V11_SCHEMA_VERSION: u32 = 11;
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = V11_SCHEMA_VERSION;
+const V12_SCHEMA_VERSION: u32 = 12;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = V12_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
 
 pub(super) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = 65_536;
@@ -52,12 +54,24 @@ const V1_MANIFEST_DIGEST_VERSION: u32 = 1;
 const V2_MANIFEST_DIGEST_VERSION: u32 = 2;
 const V3_MANIFEST_DIGEST_VERSION: u32 = 3;
 const V4_MANIFEST_DIGEST_VERSION: u32 = 4;
+const V5_MANIFEST_DIGEST_VERSION: u32 = 5;
 pub(super) const SCHEMA_DIGEST_VERSION: u32 = 1;
 const V1_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v1\0";
 const V2_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v2\0";
 const V3_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v3\0";
 const V4_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v4\0";
+const V5_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v5\0";
 const TABLE_PROVISIONING_DIGEST_DOMAIN: &[u8] = b"briskdb.table-provisioning.v1\0";
+const GENERATED_TABLE_DDL_DIGEST_DOMAIN: &[u8] = b"briskdb.generated-table-ddl.v1\0";
+
+const GENERATED_TABLE_DDL_DIGEST_VERSION: u32 = 1;
+pub(super) const GENERATED_TABLE_DDL_TRANSLATION_VERSION: u32 = 1;
+const GENERATED_TABLE_DDL_APPLYING_PHYSICAL: i64 = 1;
+const GENERATED_TABLE_DDL_PROVISIONING: i64 = 2;
+const GENERATED_TABLE_DDL_COMPLETE: i64 = 3;
+const GENERATED_TABLE_DDL_SQLITE: i64 = 1;
+const GENERATED_TABLE_DDL_POSTGRESQL: i64 = 2;
+const GENERATED_TABLE_DDL_MYSQL: i64 = 3;
 
 const DATABASE_STATE_VERIFYING: i64 = 1;
 const DATABASE_STATE_READY: i64 = 2;
@@ -158,6 +172,10 @@ const V10_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
 const V11_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
         CHECK (requires_manifest_version >= 11)
+) STRICT";
+const V12_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 12)
 ) STRICT";
 const V3_ROUTING_TABLE_SQL: &str = "CREATE TABLE briskdb_routing (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -468,6 +486,95 @@ const V11_HILO_LEASES_TABLE_SQL: &str = "CREATE TABLE briskdb_hilo_leases (
         )
     )
 ) STRICT";
+const V12_GENERATED_TABLE_DDL_TABLE_SQL: &str = "CREATE TABLE briskdb_generated_table_ddl (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    logical_id BLOB NOT NULL UNIQUE
+        CHECK (typeof(logical_id) = 'blob' AND length(logical_id) = 32),
+    logical_digest_version INTEGER NOT NULL CHECK (logical_digest_version = 1),
+    source_dialect INTEGER NOT NULL CHECK (source_dialect IN (1, 2, 3)),
+    translation_version INTEGER NOT NULL CHECK (translation_version = 1),
+    source_sql TEXT NOT NULL
+        CHECK (
+            typeof(source_sql) = 'text'
+            AND length(CAST(source_sql AS BLOB)) BETWEEN 1 AND 65536
+            AND instr(source_sql, char(0)) = 0
+        ),
+    physical_migration_id BLOB NOT NULL UNIQUE
+        CHECK (typeof(physical_migration_id) = 'blob' AND length(physical_migration_id) = 32),
+    physical_sql TEXT NOT NULL
+        CHECK (
+            typeof(physical_sql) = 'text'
+            AND length(CAST(physical_sql AS BLOB)) BETWEEN 1 AND 65536
+            AND instr(physical_sql, char(0)) = 0
+        ),
+    database_id INTEGER NOT NULL CHECK (database_id > 0),
+    table_name TEXT NOT NULL COLLATE BINARY
+        CHECK (
+            length(table_name) BETWEEN 1 AND 63
+            AND instr(table_name, char(0)) = 0
+            AND table_name NOT GLOB '*[^a-z0-9_]*'
+            AND substr(table_name, 1, 1) GLOB '[a-z_]'
+            AND table_name <> 'briskdb'
+            AND table_name NOT GLOB 'briskdb_*'
+            AND table_name NOT GLOB 'sqlite_*'
+        ),
+    generated_column TEXT NOT NULL COLLATE BINARY
+        CHECK (
+            length(generated_column) BETWEEN 1 AND 63
+            AND instr(generated_column, char(0)) = 0
+            AND generated_column NOT GLOB '*[^a-z0-9_]*'
+            AND substr(generated_column, 1, 1) GLOB '[a-z_]'
+            AND generated_column <> 'briskdb'
+            AND generated_column NOT GLOB 'briskdb_*'
+            AND generated_column NOT GLOB 'sqlite_*'
+        ),
+    generated_policy INTEGER NOT NULL CHECK (generated_policy = 1),
+    generated_encoding_version INTEGER NOT NULL CHECK (generated_encoding_version = 1),
+    lifecycle_state INTEGER NOT NULL CHECK (lifecycle_state IN (1, 2, 3)),
+    provisioning_id BLOB
+        CHECK (
+            provisioning_id IS NULL
+            OR (typeof(provisioning_id) = 'blob' AND length(provisioning_id) = 32)
+        ),
+    provisioning_schema_digest BLOB
+        CHECK (
+            provisioning_schema_digest IS NULL
+            OR (
+                typeof(provisioning_schema_digest) = 'blob'
+                AND length(provisioning_schema_digest) = 32
+            )
+        ),
+    table_id INTEGER CHECK (table_id IS NULL OR table_id > 0),
+    FOREIGN KEY (physical_migration_id)
+        REFERENCES briskdb_schema_migrations (migration_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (database_id)
+        REFERENCES briskdb_logical_databases (database_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (table_id)
+        REFERENCES briskdb_tables (table_id)
+        ON DELETE RESTRICT,
+    CHECK (
+        (
+            lifecycle_state = 1
+            AND provisioning_id IS NULL
+            AND provisioning_schema_digest IS NULL
+            AND table_id IS NULL
+        )
+        OR (
+            lifecycle_state = 2
+            AND provisioning_id IS NOT NULL
+            AND provisioning_schema_digest IS NOT NULL
+            AND table_id IS NULL
+        )
+        OR (
+            lifecycle_state = 3
+            AND provisioning_id IS NOT NULL
+            AND provisioning_schema_digest IS NOT NULL
+            AND table_id IS NOT NULL
+        )
+    )
+) STRICT";
 const V5_SHARD_LAYOUT_TABLE_SQL: &str = "CREATE TABLE briskdb_shard_layout (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     layout_id BLOB NOT NULL
@@ -691,12 +798,10 @@ pub(super) struct NativeTableProvisioning {
 }
 
 impl NativeTableProvisioning {
-    #[cfg(test)]
     pub(super) const fn provisioning_id(&self) -> [u8; 32] {
         self.provisioning_id
     }
 
-    #[cfg(test)]
     pub(super) const fn committed_schema_digest(&self) -> [u8; 32] {
         self.committed_schema_digest
     }
@@ -722,6 +827,117 @@ pub(super) enum NativeTableProvisioningClassification {
     Complete,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub(super) enum GeneratedTableDdlClassification {
+    Absent,
+    Existing(GeneratedTableDdl),
+}
+
+/// Durable phase of the generated-table DDL bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GeneratedTableDdlLifecycle {
+    /// The canonical SQLite migration is active or durably complete.
+    ApplyingPhysical,
+    /// Physical DDL is complete and the deterministic table provisioning is
+    /// pending or active.
+    Provisioning,
+    /// Physical DDL and authoritative catalog publication are complete.
+    Complete,
+}
+
+impl GeneratedTableDdlLifecycle {
+    const fn code(self) -> i64 {
+        match self {
+            Self::ApplyingPhysical => GENERATED_TABLE_DDL_APPLYING_PHYSICAL,
+            Self::Provisioning => GENERATED_TABLE_DDL_PROVISIONING,
+            Self::Complete => GENERATED_TABLE_DDL_COMPLETE,
+        }
+    }
+
+    fn from_code(code: i64) -> EngineResult<Self> {
+        match code {
+            GENERATED_TABLE_DDL_APPLYING_PHYSICAL => Ok(Self::ApplyingPhysical),
+            GENERATED_TABLE_DDL_PROVISIONING => Ok(Self::Provisioning),
+            GENERATED_TABLE_DDL_COMPLETE => Ok(Self::Complete),
+            _ => Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "generated-table DDL bridge has an unsupported lifecycle state",
+            )),
+        }
+    }
+}
+
+/// One fully validated, checksummed generated-table DDL bridge record.
+///
+/// The exact source bytes and their logical identity remain distinct from the
+/// canonical SQLite migration identity. The derived declaration is retained
+/// so recovery never has to parse or translate untrusted journal text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GeneratedTableDdl {
+    logical_id: [u8; 32],
+    source_dialect: SqlDialect,
+    translation_version: u32,
+    source_sql: String,
+    physical_migration_id: [u8; 32],
+    physical_sql: String,
+    declaration: TableDeclaration,
+    lifecycle: GeneratedTableDdlLifecycle,
+    provisioning_id: Option<[u8; 32]>,
+    provisioning_schema_digest: Option<[u8; 32]>,
+    table_id: Option<TableId>,
+}
+
+impl GeneratedTableDdl {
+    pub(super) const fn logical_id(&self) -> [u8; 32] {
+        self.logical_id
+    }
+
+    #[cfg(test)]
+    pub(super) const fn source_dialect(&self) -> SqlDialect {
+        self.source_dialect
+    }
+
+    #[cfg(test)]
+    pub(super) const fn translation_version(&self) -> u32 {
+        self.translation_version
+    }
+
+    #[cfg(test)]
+    pub(super) fn source_sql(&self) -> &str {
+        &self.source_sql
+    }
+
+    pub(super) const fn physical_migration_id(&self) -> [u8; 32] {
+        self.physical_migration_id
+    }
+
+    pub(super) fn physical_sql(&self) -> &str {
+        &self.physical_sql
+    }
+
+    pub(super) fn declaration(&self) -> &TableDeclaration {
+        &self.declaration
+    }
+
+    pub(super) const fn lifecycle(&self) -> GeneratedTableDdlLifecycle {
+        self.lifecycle
+    }
+
+    pub(super) const fn provisioning_id(&self) -> Option<[u8; 32]> {
+        self.provisioning_id
+    }
+
+    #[cfg(test)]
+    pub(super) const fn provisioning_schema_digest(&self) -> Option<[u8; 32]> {
+        self.provisioning_schema_digest
+    }
+
+    pub(super) const fn table_id(&self) -> Option<TableId> {
+        self.table_id
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Migration {
     from: u32,
@@ -743,6 +959,7 @@ struct ManifestSnapshot {
     active_native_id_table_ids: Box<[TableId]>,
     active_hilo_id_table_ids: Box<[TableId]>,
     active_table_provisioning: Option<NativeTableProvisioning>,
+    generated_table_ddl: Option<GeneratedTableDdl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -754,6 +971,7 @@ pub(super) struct LoadedManifest {
     active_native_id_table_ids: Box<[TableId]>,
     active_hilo_id_table_ids: Box<[TableId]>,
     active_table_provisioning: Option<NativeTableProvisioning>,
+    generated_table_ddl: Option<GeneratedTableDdl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -786,6 +1004,11 @@ impl LoadedManifest {
     }
 
     #[cfg(test)]
+    pub(super) fn generated_table_ddl(&self) -> Option<&GeneratedTableDdl> {
+        self.generated_table_ddl.as_ref()
+    }
+
+    #[cfg(test)]
     pub(super) fn into_parts_with_migration(
         self,
     ) -> (
@@ -813,6 +1036,7 @@ impl LoadedManifest {
         Box<[TableId]>,
         Box<[TableId]>,
         Option<NativeTableProvisioning>,
+        Option<GeneratedTableDdl>,
     ) {
         (
             self.catalog,
@@ -822,6 +1046,7 @@ impl LoadedManifest {
             self.active_native_id_table_ids,
             self.active_hilo_id_table_ids,
             self.active_table_provisioning,
+            self.generated_table_ddl,
         )
     }
 }
@@ -897,6 +1122,13 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v10_to_v11,
         validate: validate_v11,
     },
+    Migration {
+        from: V11_SCHEMA_VERSION,
+        to: V12_SCHEMA_VERSION,
+        name: "durable_generated_table_ddl_bridge",
+        apply: migrate_v11_to_v12,
+        validate: validate_v12,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -910,8 +1142,8 @@ struct MigrationPlan<'a> {
 const CURRENT_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: CURRENT_SCHEMA_VERSION,
     migrations: MIGRATIONS,
-    initialize_current: create_v11_schema,
-    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v11,
+    initialize_current: create_v12_schema,
+    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v12,
 };
 
 // Startup uses this frozen plan only to finish an already-active v6 journal
@@ -1008,6 +1240,7 @@ pub(super) fn load_or_create_manifest_with_fresh_layout(
         active_native_id_table_ids,
         active_hilo_id_table_ids,
         active_table_provisioning: snapshot.active_table_provisioning,
+        generated_table_ddl: snapshot.generated_table_ddl,
     })
 }
 
@@ -1142,6 +1375,167 @@ pub(super) fn ensure_schema_migration_layout(
         ));
     }
     Ok(())
+}
+
+/// Classify the exact generated-table DDL bridge request.
+///
+/// The bridge is a retained singleton. An exact retry returns its validated
+/// record at any lifecycle phase; any different request fails closed.
+pub(super) fn classify_generated_table_ddl(
+    connection: &mut Connection,
+    requested_shards: u16,
+    source_dialect: SqlDialect,
+    source_sql: &str,
+    physical_sql: &str,
+    declaration: &TableDeclaration,
+) -> EngineResult<GeneratedTableDdlClassification> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    let result = classify_generated_table_ddl_snapshot(
+        &snapshot,
+        source_dialect,
+        source_sql,
+        physical_sql,
+        declaration,
+    )?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(result)
+}
+
+/// Atomically begin the canonical physical migration and retain the exact
+/// generated-table logical request in the same caller-owned transaction.
+///
+/// The caller owns the commit durability boundary and must not restore the
+/// schema gate to Ready if COMMIT may have been attempted.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn begin_generated_table_ddl_in_transaction(
+    transaction: &Connection,
+    requested_shards: u16,
+    expected_source_generation: u64,
+    source_dialect: SqlDialect,
+    source_sql: &str,
+    physical_sql: &str,
+    declaration: TableDeclaration,
+    expected_source_digest: [u8; 32],
+    target_digest: [u8; 32],
+) -> EngineResult<(GeneratedTableDdl, SchemaMigration)> {
+    validate_generated_table_ddl_declaration(&declaration)?;
+    validate_schema_migration_sql(source_sql)?;
+    validate_schema_migration_sql(physical_sql)?;
+    let snapshot = current_manifest_snapshot(transaction, requested_shards)?;
+    match classify_generated_table_ddl_snapshot(
+        &snapshot,
+        source_dialect,
+        source_sql,
+        physical_sql,
+        &declaration,
+    )? {
+        GeneratedTableDdlClassification::Existing(existing) => {
+            let migration = find_schema_migration(
+                transaction,
+                requested_shards,
+                &existing.physical_migration_id,
+            )?
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    "generated-table DDL bridge lost its physical migration",
+                )
+            })?;
+            return Ok((existing, migration));
+        }
+        GeneratedTableDdlClassification::Absent => {}
+    }
+    if snapshot.active_table_provisioning.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "generated-table DDL cannot begin during table provisioning",
+        ));
+    }
+    if snapshot
+        .logical_catalog
+        .as_ref()
+        .is_none_or(|catalog| !catalog.tables().is_empty())
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "generated-table DDL bridge currently requires an empty authoritative catalog",
+        ));
+    }
+    let migration = begin_schema_migration_with_digests_in_transaction(
+        transaction,
+        requested_shards,
+        expected_source_generation,
+        physical_sql,
+        expected_source_digest,
+        target_digest,
+    )?;
+    let logical_id = generated_table_ddl_logical_id(source_dialect, source_sql)?;
+    let physical_migration_id = schema_migration_id(physical_sql)?;
+    let generated_column = validate_generated_table_ddl_declaration(&declaration)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_generated_table_ddl (
+                singleton,
+                logical_id,
+                logical_digest_version,
+                source_dialect,
+                translation_version,
+                source_sql,
+                physical_migration_id,
+                physical_sql,
+                database_id,
+                table_name,
+                generated_column,
+                generated_policy,
+                generated_encoding_version,
+                lifecycle_state,
+                provisioning_id,
+                provisioning_schema_digest,
+                table_id
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL, NULL)",
+            rusqlite::params![
+                logical_id.as_slice(),
+                GENERATED_TABLE_DDL_DIGEST_VERSION,
+                encoded_generated_table_ddl_dialect(source_dialect),
+                GENERATED_TABLE_DDL_TRANSLATION_VERSION,
+                source_sql,
+                physical_migration_id.as_slice(),
+                physical_sql,
+                i64::try_from(declaration.database_id().get()).map_err(|error| {
+                    EngineError::from_source(
+                        EngineErrorKind::NumericOutOfRange,
+                        "generated-table DDL database ID does not fit in SQLite",
+                        error,
+                    )
+                })?,
+                declaration.name(),
+                generated_column,
+                GENERATED_ID_POLICY_NATIVE_RANGE_V1,
+                NATIVE_RANGE_V1_ENCODING_VERSION,
+                GeneratedTableDdlLifecycle::ApplyingPhysical.code(),
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    refresh_manifest_digest(transaction)?;
+    let persisted = current_manifest_snapshot(transaction, requested_shards)?
+        .generated_table_ddl
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "generated-table DDL bridge did not persist",
+            )
+        })?;
+    ensure_same_generated_table_ddl_request(
+        &persisted,
+        source_dialect,
+        source_sql,
+        physical_sql,
+        &declaration,
+    )?;
+    Ok((persisted, migration))
 }
 
 pub(super) fn current_integrity(
@@ -2325,6 +2719,7 @@ fn downgrade_v10_manifest_to_v9_for_test(connection: &Connection) -> EngineResul
     connection
         .execute_batch(
             "DROP TABLE IF EXISTS briskdb_hilo_leases;
+             DROP TABLE IF EXISTS briskdb_generated_table_ddl;
              DROP TABLE briskdb_table_provisioning_declarations;
              DROP TABLE briskdb_table_provisioning;
              DROP INDEX briskdb_one_active_owner_per_shard;
@@ -2386,7 +2781,8 @@ fn downgrade_v11_manifest_to_v10_for_test(
 ) -> EngineResult<()> {
     connection
         .execute_batch(
-            "DROP TABLE briskdb_hilo_leases;
+            "DROP TABLE briskdb_generated_table_ddl;
+             DROP TABLE briskdb_hilo_leases;
              DROP TABLE briskdb_metadata;",
         )
         .map_err(sqlite_error::storage)?;
@@ -2411,6 +2807,38 @@ fn downgrade_v11_manifest_to_v10_for_test(
     Ok(())
 }
 
+#[cfg(test)]
+fn downgrade_v12_manifest_to_v11_for_test(
+    connection: &Connection,
+    shard_count: u16,
+) -> EngineResult<()> {
+    connection
+        .execute_batch(
+            "DROP TABLE briskdb_generated_table_ddl;
+             DROP TABLE briskdb_metadata;",
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(V11_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V11_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "UPDATE briskdb_integrity SET manifest_digest_version = ?1 WHERE singleton = 1",
+            [V4_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    set_identity(connection, V11_SCHEMA_VERSION)?;
+    refresh_manifest_digest(connection)?;
+    validate_v11(connection, shard_count, &schema_objects(connection)?)?;
+    Ok(())
+}
+
 /// Atomically publish the authoritative catalog and activate native policies
 /// after every shard-local sequence seed is durable.
 pub(super) fn finalize_native_table_provisioning<F>(
@@ -2425,7 +2853,22 @@ where
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error::storage)?;
-    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    let catalog = finalize_native_table_provisioning_in_transaction(
+        &transaction,
+        requested_shards,
+        expected,
+    )?;
+    on_commit_attempted();
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(catalog)
+}
+
+fn finalize_native_table_provisioning_in_transaction(
+    transaction: &Transaction<'_>,
+    requested_shards: u16,
+    expected: &NativeTableProvisioning,
+) -> EngineResult<CatalogSnapshot> {
+    let snapshot = current_manifest_snapshot(transaction, requested_shards)?;
     let Some(active) = snapshot.active_table_provisioning else {
         let declarations = expected.declarations.to_vec();
         let classification = classify_native_table_provisioning_snapshot(
@@ -2434,9 +2877,7 @@ where
             expected.committed_schema_digest,
         )?;
         if classification == NativeTableProvisioningClassification::Complete {
-            let catalog = catalog_snapshot_from_manifest(snapshot)?;
-            transaction.commit().map_err(sqlite_error::storage)?;
-            return Ok(catalog);
+            return catalog_snapshot_from_manifest(snapshot);
         }
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
@@ -2457,7 +2898,7 @@ where
         )
     })?;
     if catalog.tables().is_empty() {
-        insert_authoritative_table_catalog(&transaction, &active.declarations, true)?;
+        insert_authoritative_table_catalog(transaction, &active.declarations, true)?;
     } else if !declarations_match_catalog_owned(&active.declarations, catalog) {
         return Err(EngineError::new(
             EngineErrorKind::DataCorruption,
@@ -2501,8 +2942,8 @@ where
     transaction
         .execute("DELETE FROM briskdb_table_provisioning", [])
         .map_err(sqlite_error::storage)?;
-    refresh_manifest_digest(&transaction)?;
-    let finalized = current_manifest_snapshot(&transaction, requested_shards)?;
+    refresh_manifest_digest(transaction)?;
+    let finalized = current_manifest_snapshot(transaction, requested_shards)?;
     if finalized.active_table_provisioning.is_some()
         || !native_table_provisioning_complete(&finalized, &active.declarations)
     {
@@ -2512,9 +2953,227 @@ where
         ));
     }
     let catalog = catalog_snapshot_from_manifest(finalized)?;
+    Ok(catalog)
+}
+
+/// Publish the provisioning identity after the canonical physical migration
+/// is durable. An exact repeat is idempotent.
+pub(super) fn mark_generated_table_ddl_provisioning<F>(
+    connection: &mut Connection,
+    requested_shards: u16,
+    expected: &GeneratedTableDdl,
+    on_commit_attempted: F,
+) -> EngineResult<GeneratedTableDdl>
+where
+    F: FnOnce(),
+{
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    let current = snapshot.generated_table_ddl.clone().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "generated-table DDL bridge is not retained",
+        )
+    })?;
+    ensure_same_generated_table_ddl_request(
+        &current,
+        expected.source_dialect,
+        &expected.source_sql,
+        &expected.physical_sql,
+        &expected.declaration,
+    )?;
+    if current.lifecycle == GeneratedTableDdlLifecycle::Complete
+        || current.lifecycle == GeneratedTableDdlLifecycle::Provisioning
+    {
+        transaction.commit().map_err(sqlite_error::storage)?;
+        return Ok(current);
+    }
+    let physical = find_schema_migration(
+        &transaction,
+        requested_shards,
+        &current.physical_migration_id,
+    )?
+    .filter(SchemaMigration::is_complete)
+    .ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "generated-table DDL physical migration is not complete",
+        )
+    })?;
+    if physical.sql_text() != current.physical_sql {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "generated-table DDL physical migration changed before provisioning",
+        ));
+    }
+    let committed_schema_digest = snapshot
+        .integrity
+        .and_then(ManifestIntegrity::committed_schema_digest)
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "generated-table DDL provisioning requires a committed schema checksum",
+            )
+        })?;
+    let provisioning_id = table_provisioning_id(
+        std::slice::from_ref(&current.declaration),
+        requested_shards,
+        committed_schema_digest,
+    );
+    let changed = transaction
+        .execute(
+            "UPDATE briskdb_generated_table_ddl
+             SET lifecycle_state = ?1,
+                 provisioning_id = ?2,
+                 provisioning_schema_digest = ?3
+             WHERE singleton = 1
+               AND logical_id = ?4
+               AND lifecycle_state = ?5
+               AND provisioning_id IS NULL
+               AND provisioning_schema_digest IS NULL
+               AND table_id IS NULL",
+            rusqlite::params![
+                GeneratedTableDdlLifecycle::Provisioning.code(),
+                provisioning_id.as_slice(),
+                committed_schema_digest.as_slice(),
+                current.logical_id.as_slice(),
+                GeneratedTableDdlLifecycle::ApplyingPhysical.code(),
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    if changed != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "generated-table DDL lifecycle changed concurrently",
+        ));
+    }
+    refresh_manifest_digest(&transaction)?;
+    let marked = current_manifest_snapshot(&transaction, requested_shards)?
+        .generated_table_ddl
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "generated-table DDL provisioning transition lost its bridge",
+            )
+        })?;
     on_commit_attempted();
     transaction.commit().map_err(sqlite_error::storage)?;
-    Ok(catalog)
+    Ok(marked)
+}
+
+/// Atomically finalize the authoritative catalog, activate its generated-ID
+/// policy, and seal the retained DDL bridge as complete.
+pub(super) fn finalize_generated_table_ddl_provisioning<F>(
+    connection: &mut Connection,
+    requested_shards: u16,
+    expected_ddl: &GeneratedTableDdl,
+    expected_provisioning: &NativeTableProvisioning,
+    on_commit_attempted: F,
+) -> EngineResult<(CatalogSnapshot, GeneratedTableDdl)>
+where
+    F: FnOnce(),
+{
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let snapshot = current_manifest_snapshot(&transaction, requested_shards)?;
+    let current = snapshot.generated_table_ddl.clone().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "generated-table DDL bridge is not retained",
+        )
+    })?;
+    ensure_same_generated_table_ddl_request(
+        &current,
+        expected_ddl.source_dialect,
+        &expected_ddl.source_sql,
+        &expected_ddl.physical_sql,
+        &expected_ddl.declaration,
+    )?;
+    if current.lifecycle == GeneratedTableDdlLifecycle::Complete {
+        let catalog = catalog_snapshot_from_manifest(snapshot)?;
+        transaction.commit().map_err(sqlite_error::storage)?;
+        return Ok((catalog, current));
+    }
+    if current.lifecycle != GeneratedTableDdlLifecycle::Provisioning
+        || current.provisioning_id != Some(expected_provisioning.provisioning_id())
+        || current.provisioning_schema_digest
+            != Some(expected_provisioning.committed_schema_digest())
+        || expected_provisioning.declarations() != std::slice::from_ref(&current.declaration)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "generated-table DDL bridge does not match the table provisioning being finalized",
+        ));
+    }
+    let catalog = finalize_native_table_provisioning_in_transaction(
+        &transaction,
+        requested_shards,
+        expected_provisioning,
+    )?;
+    let table_id = catalog
+        .logical()
+        .tables()
+        .iter()
+        .find(|table| {
+            table.database_id() == current.declaration.database_id()
+                && table.name() == current.declaration.name()
+        })
+        .map(TableMetadata::id)
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "generated-table DDL finalization did not publish its table",
+            )
+        })?;
+    let changed = transaction
+        .execute(
+            "UPDATE briskdb_generated_table_ddl
+             SET lifecycle_state = ?1, table_id = ?2
+             WHERE singleton = 1
+               AND logical_id = ?3
+               AND lifecycle_state = ?4
+               AND provisioning_id = ?5
+               AND provisioning_schema_digest = ?6
+               AND table_id IS NULL",
+            rusqlite::params![
+                GeneratedTableDdlLifecycle::Complete.code(),
+                i64::try_from(table_id.get()).expect("bounded table ID fits SQLite"),
+                current.logical_id.as_slice(),
+                GeneratedTableDdlLifecycle::Provisioning.code(),
+                expected_provisioning.provisioning_id().as_slice(),
+                expected_provisioning.committed_schema_digest().as_slice(),
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    if changed != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "generated-table DDL lifecycle changed concurrently",
+        ));
+    }
+    refresh_manifest_digest(&transaction)?;
+    let completed = current_manifest_snapshot(&transaction, requested_shards)?
+        .generated_table_ddl
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                "generated-table DDL completion lost its bridge",
+            )
+        })?;
+    if completed.lifecycle != GeneratedTableDdlLifecycle::Complete
+        || completed.table_id != Some(table_id)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "generated-table DDL completion did not persist",
+        ));
+    }
+    on_commit_attempted();
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok((catalog, completed))
 }
 
 fn classify_native_table_provisioning_snapshot(
@@ -2536,6 +3195,54 @@ fn classify_native_table_provisioning_snapshot(
         return Ok(NativeTableProvisioningClassification::Complete);
     }
     Ok(NativeTableProvisioningClassification::Absent)
+}
+
+fn classify_generated_table_ddl_snapshot(
+    snapshot: &ManifestSnapshot,
+    source_dialect: SqlDialect,
+    source_sql: &str,
+    physical_sql: &str,
+    declaration: &TableDeclaration,
+) -> EngineResult<GeneratedTableDdlClassification> {
+    validate_generated_table_ddl_declaration(declaration)?;
+    validate_schema_migration_sql(source_sql)?;
+    validate_schema_migration_sql(physical_sql)?;
+    let Some(existing) = snapshot.generated_table_ddl.as_ref() else {
+        return Ok(GeneratedTableDdlClassification::Absent);
+    };
+    ensure_same_generated_table_ddl_request(
+        existing,
+        source_dialect,
+        source_sql,
+        physical_sql,
+        declaration,
+    )?;
+    Ok(GeneratedTableDdlClassification::Existing(existing.clone()))
+}
+
+fn ensure_same_generated_table_ddl_request(
+    existing: &GeneratedTableDdl,
+    source_dialect: SqlDialect,
+    source_sql: &str,
+    physical_sql: &str,
+    declaration: &TableDeclaration,
+) -> EngineResult<()> {
+    let logical_id = generated_table_ddl_logical_id(source_dialect, source_sql)?;
+    let physical_migration_id = schema_migration_id(physical_sql)?;
+    if existing.logical_id != logical_id
+        || existing.source_dialect != source_dialect
+        || existing.translation_version != GENERATED_TABLE_DDL_TRANSLATION_VERSION
+        || existing.source_sql != source_sql
+        || existing.physical_migration_id != physical_migration_id
+        || existing.physical_sql != physical_sql
+        || existing.declaration != *declaration
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "a different generated-table DDL bridge request is already retained",
+        ));
+    }
+    Ok(())
 }
 
 fn native_table_provisioning_complete(
@@ -3507,6 +4214,11 @@ fn create_v11_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineR
     migrate_v10_to_v11(transaction, shard_count)
 }
 
+fn create_v12_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
+    create_v11_schema(transaction, shard_count)?;
+    migrate_v11_to_v12(transaction, shard_count)
+}
+
 fn migrate_interrupted_legacy_to_v6(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -3563,6 +4275,7 @@ fn migrate_interrupted_legacy_to_v10(
     create_v10_schema(transaction, shard_count)
 }
 
+#[cfg(test)]
 fn migrate_interrupted_legacy_to_v11(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -3571,6 +4284,16 @@ fn migrate_interrupted_legacy_to_v11(
         .execute_batch("DROP TABLE briskdb_metadata;")
         .map_err(sqlite_error::storage)?;
     create_v11_schema(transaction, shard_count)
+}
+
+fn migrate_interrupted_legacy_to_v12(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v12_schema(transaction, shard_count)
 }
 
 #[cfg(test)]
@@ -4022,6 +4745,33 @@ fn migrate_v10_to_v11(transaction: &Transaction<'_>, _shard_count: u16) -> Engin
     Ok(())
 }
 
+fn migrate_v11_to_v12(transaction: &Transaction<'_>, _shard_count: u16) -> EngineResult<()> {
+    transaction
+        .execute_batch(V12_GENERATED_TABLE_DDL_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V12_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V12_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "UPDATE briskdb_integrity
+             SET manifest_digest_version = ?1
+             WHERE singleton = 1",
+            [V5_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
 fn add_v5_schema(transaction: &Transaction<'_>, state: ShardLayoutState) -> EngineResult<()> {
     transaction
         .execute_batch("DROP TABLE briskdb_metadata;")
@@ -4358,6 +5108,18 @@ fn v11_objects() -> Vec<SchemaObject> {
     objects
 }
 
+fn v12_objects() -> Vec<SchemaObject> {
+    let mut objects = v11_objects();
+    objects.push(SchemaObject {
+        object_type: "table".to_owned(),
+        name: "briskdb_generated_table_ddl".to_owned(),
+    });
+    objects.sort_by(|left, right| {
+        (&left.object_type, &left.name).cmp(&(&right.object_type, &right.name))
+    });
+    objects
+}
+
 fn schema_objects(connection: &Connection) -> EngineResult<Vec<SchemaObject>> {
     let mut statement = connection
         .prepare(
@@ -4486,6 +5248,10 @@ fn validate_table(
         "briskdb_hilo_leases" => {
             "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
              FROM pragma_table_xinfo('briskdb_hilo_leases') LIMIT ?1"
+        }
+        "briskdb_generated_table_ddl" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_generated_table_ddl') LIMIT ?1"
         }
         _ => {
             return Err(EngineError::new(
@@ -4680,6 +5446,7 @@ fn validate_v2(
         active_native_id_table_ids: Box::new([]),
         active_hilo_id_table_ids: Box::new([]),
         active_table_provisioning: None,
+        generated_table_ddl: None,
     })
 }
 
@@ -4713,6 +5480,7 @@ fn validate_v3(
         active_native_id_table_ids: Box::new([]),
         active_hilo_id_table_ids: Box::new([]),
         active_table_provisioning: None,
+        generated_table_ddl: None,
     })
 }
 
@@ -5081,6 +5849,352 @@ fn validate_v11(
     Ok(snapshot)
 }
 
+fn validate_v12(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    let mut snapshot = validate_integrity_manifest_with_definition(
+        connection,
+        requested_shards,
+        objects,
+        IntegrityManifestDefinition {
+            version: V12_SCHEMA_VERSION,
+            downgrade_fence_sql: V12_DOWNGRADE_FENCE_SQL,
+            expected_objects: &v12_objects(),
+            expected_manifest_digest_version: V5_MANIFEST_DIGEST_VERSION,
+            generated_ids: true,
+        },
+    )?;
+    snapshot.allocation_owners = Some(validate_allocation_owners(
+        connection,
+        snapshot.shard_count,
+    )?);
+    snapshot.active_native_id_table_ids =
+        validate_active_generated_id_tables(connection, GENERATED_ID_POLICY_NATIVE_RANGE_V1)?;
+    snapshot.active_hilo_id_table_ids =
+        validate_active_generated_id_tables(connection, GENERATED_ID_POLICY_HILO_V1)?;
+    validate_hilo_v1_leases(
+        connection,
+        snapshot.logical_catalog.as_ref(),
+        &snapshot.active_hilo_id_table_ids,
+    )?;
+    snapshot.active_table_provisioning = validate_table_provisioning(
+        connection,
+        V12_SCHEMA_VERSION,
+        snapshot.shard_count,
+        snapshot.logical_catalog.as_ref(),
+        snapshot.active_migration.as_ref(),
+        snapshot.integrity,
+    )?;
+    validate_table(
+        connection,
+        "briskdb_generated_table_ddl",
+        &[
+            TableColumn::expected(0, "singleton", "INTEGER", false, 1),
+            TableColumn::expected(1, "logical_id", "BLOB", true, 0),
+            TableColumn::expected(2, "logical_digest_version", "INTEGER", true, 0),
+            TableColumn::expected(3, "source_dialect", "INTEGER", true, 0),
+            TableColumn::expected(4, "translation_version", "INTEGER", true, 0),
+            TableColumn::expected(5, "source_sql", "TEXT", true, 0),
+            TableColumn::expected(6, "physical_migration_id", "BLOB", true, 0),
+            TableColumn::expected(7, "physical_sql", "TEXT", true, 0),
+            TableColumn::expected(8, "database_id", "INTEGER", true, 0),
+            TableColumn::expected(9, "table_name", "TEXT", true, 0),
+            TableColumn::expected(10, "generated_column", "TEXT", true, 0),
+            TableColumn::expected(11, "generated_policy", "INTEGER", true, 0),
+            TableColumn::expected(12, "generated_encoding_version", "INTEGER", true, 0),
+            TableColumn::expected(13, "lifecycle_state", "INTEGER", true, 0),
+            TableColumn::expected(14, "provisioning_id", "BLOB", false, 0),
+            TableColumn::expected(15, "provisioning_schema_digest", "BLOB", false, 0),
+            TableColumn::expected(16, "table_id", "INTEGER", false, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_generated_table_ddl",
+        V12_GENERATED_TABLE_DDL_TABLE_SQL,
+    )?;
+    snapshot.generated_table_ddl = validate_generated_table_ddl(connection, &snapshot)?;
+    Ok(snapshot)
+}
+
+#[allow(clippy::type_complexity)]
+fn validate_generated_table_ddl(
+    connection: &Connection,
+    snapshot: &ManifestSnapshot,
+) -> EngineResult<Option<GeneratedTableDdl>> {
+    let rows = connection
+        .prepare(
+            "SELECT singleton,
+                    logical_id,
+                    logical_digest_version,
+                    source_dialect,
+                    translation_version,
+                    source_sql,
+                    physical_migration_id,
+                    physical_sql,
+                    database_id,
+                    table_name,
+                    generated_column,
+                    generated_policy,
+                    generated_encoding_version,
+                    lifecycle_state,
+                    provisioning_id,
+                    provisioning_schema_digest,
+                    table_id
+             FROM briskdb_generated_table_ddl
+             ORDER BY singleton
+             LIMIT 3",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, Option<Vec<u8>>>(14)?,
+                        row.get::<_, Option<Vec<u8>>>(15)?,
+                        row.get::<_, Option<i64>>(16)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| manifest_read_error(error, "failed to read generated-table DDL bridge"))?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    if rows.len() != 1 || rows[0].0 != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "generated-table DDL bridge must contain at most its singleton row",
+        ));
+    }
+    let (
+        _,
+        logical_id,
+        logical_digest_version,
+        source_dialect,
+        translation_version,
+        source_sql,
+        physical_migration_id,
+        physical_sql,
+        database_id,
+        table_name,
+        generated_column,
+        generated_policy,
+        generated_encoding_version,
+        lifecycle_state,
+        provisioning_id,
+        provisioning_schema_digest,
+        table_id,
+    ) = rows.into_iter().next().expect("one bridge row exists");
+    if logical_digest_version != i64::from(GENERATED_TABLE_DDL_DIGEST_VERSION)
+        || translation_version != i64::from(GENERATED_TABLE_DDL_TRANSLATION_VERSION)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "generated-table DDL bridge uses a newer identity or translation version",
+        ));
+    }
+    if generated_policy != GENERATED_ID_POLICY_NATIVE_RANGE_V1
+        || generated_encoding_version != i64::from(NATIVE_RANGE_V1_ENCODING_VERSION)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "generated-table DDL bridge uses an unsupported generated-ID policy encoding",
+        ));
+    }
+    let source_dialect = decode_generated_table_ddl_dialect(source_dialect)?;
+    let logical_id = digest_from_blob(&logical_id, "generated-table logical identity")?;
+    let expected_logical_id = generated_table_ddl_logical_id(source_dialect, &source_sql)?;
+    if logical_id != expected_logical_id {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "generated-table DDL logical identity does not match its exact source",
+        ));
+    }
+    let physical_migration_id = digest_from_blob(
+        &physical_migration_id,
+        "generated-table physical migration identity",
+    )?;
+    if schema_migration_id(&physical_sql)? != physical_migration_id {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "generated-table physical identity does not match its canonical SQL",
+        ));
+    }
+    let stored_migration =
+        find_schema_migration(connection, snapshot.shard_count, &physical_migration_id)?
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    "generated-table DDL bridge references a missing physical migration",
+                )
+            })?;
+    if stored_migration.sql_text() != physical_sql {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "generated-table DDL bridge conflicts with its physical migration",
+        ));
+    }
+    let database_id = u64::try_from(database_id).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "generated-table DDL database ID is outside the supported range",
+            error,
+        )
+    })?;
+    if !validate_catalog_identifier(&table_name) || !validate_catalog_identifier(&generated_column)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "generated-table DDL bridge contains an invalid catalog identifier",
+        ));
+    }
+    let declaration = generated_table_ddl_declaration(
+        LogicalDatabaseId::from_validated(database_id),
+        table_name,
+        generated_column,
+    )?;
+    let catalog = snapshot.logical_catalog.as_ref().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "generated-table DDL validation omitted its logical catalog",
+        )
+    })?;
+    if catalog.database_by_id(declaration.database_id()).is_none() {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "generated-table DDL bridge references an unknown logical database",
+        ));
+    }
+    let lifecycle = GeneratedTableDdlLifecycle::from_code(lifecycle_state)?;
+    let provisioning_id = provisioning_id
+        .as_deref()
+        .map(|id| digest_from_blob(id, "generated-table provisioning identity"))
+        .transpose()?;
+    let provisioning_schema_digest = provisioning_schema_digest
+        .as_deref()
+        .map(|digest| digest_from_blob(digest, "generated-table provisioning schema checksum"))
+        .transpose()?;
+    let table_id = table_id
+        .map(|id| {
+            u64::try_from(id)
+                .map(TableId::from_validated)
+                .map_err(|error| {
+                    EngineError::from_source(
+                        EngineErrorKind::DataCorruption,
+                        "generated-table DDL table ID is outside the supported range",
+                        error,
+                    )
+                })
+        })
+        .transpose()?;
+    let expected_provisioning_id = provisioning_schema_digest.map(|digest| {
+        table_provisioning_id(
+            std::slice::from_ref(&declaration),
+            snapshot.shard_count,
+            digest,
+        )
+    });
+    match lifecycle {
+        GeneratedTableDdlLifecycle::ApplyingPhysical => {
+            if provisioning_id.is_some()
+                || provisioning_schema_digest.is_some()
+                || table_id.is_some()
+            {
+                return Err(invalid_generated_table_ddl_lifecycle());
+            }
+        }
+        GeneratedTableDdlLifecycle::Provisioning => {
+            if !stored_migration.is_complete()
+                || provisioning_id.is_none()
+                || provisioning_schema_digest.is_none()
+                || provisioning_id != expected_provisioning_id
+                || snapshot
+                    .integrity
+                    .and_then(ManifestIntegrity::committed_schema_digest)
+                    != provisioning_schema_digest
+                || table_id.is_some()
+            {
+                return Err(invalid_generated_table_ddl_lifecycle());
+            }
+            if let Some(active) = snapshot.active_table_provisioning.as_ref() {
+                if active.provisioning_id() != provisioning_id.expect("checked above")
+                    || Some(active.committed_schema_digest()) != provisioning_schema_digest
+                    || active.declarations() != std::slice::from_ref(&declaration)
+                {
+                    return Err(EngineError::new(
+                        EngineErrorKind::DataCorruption,
+                        "generated-table DDL bridge conflicts with active table provisioning",
+                    ));
+                }
+            }
+        }
+        GeneratedTableDdlLifecycle::Complete => {
+            let Some(table_id) = table_id else {
+                return Err(invalid_generated_table_ddl_lifecycle());
+            };
+            if !stored_migration.is_complete()
+                || provisioning_id.is_none()
+                || provisioning_schema_digest.is_none()
+                || provisioning_id != expected_provisioning_id
+                || snapshot.active_table_provisioning.is_some()
+            {
+                return Err(invalid_generated_table_ddl_lifecycle());
+            }
+            let Some(table) = catalog.table_by_id(table_id) else {
+                return Err(invalid_generated_table_ddl_lifecycle());
+            };
+            if table.database_id() != declaration.database_id()
+                || table.name() != declaration.name()
+                || table.placement() != declaration.placement()
+                || table.generated_id_policy() != declaration.generated_id_policy()
+                || snapshot
+                    .active_native_id_table_ids
+                    .binary_search(&table_id)
+                    .is_err()
+            {
+                return Err(invalid_generated_table_ddl_lifecycle());
+            }
+        }
+    }
+    Ok(Some(GeneratedTableDdl {
+        logical_id,
+        source_dialect,
+        translation_version: GENERATED_TABLE_DDL_TRANSLATION_VERSION,
+        source_sql,
+        physical_migration_id,
+        physical_sql,
+        declaration,
+        lifecycle,
+        provisioning_id,
+        provisioning_schema_digest,
+        table_id,
+    }))
+}
+
+fn invalid_generated_table_ddl_lifecycle() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::DataCorruption,
+        "generated-table DDL lifecycle is inconsistent with durable migration and catalog state",
+    )
+}
+
 fn validate_integrity_manifest(
     connection: &Connection,
     requested_shards: u16,
@@ -5271,7 +6385,7 @@ fn validate_manifest_semantic_root(
             "manifest checksum version must be positive",
         ));
     }
-    if *version > i64::from(V4_MANIFEST_DIGEST_VERSION) {
+    if *version > i64::from(V5_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -5469,6 +6583,29 @@ const V4_HILO_LEASES_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
     ],
     sql: "SELECT table_id, block_size, next_sequence, fence_token, last_owner_id, last_first_sequence, last_last_sequence FROM briskdb_hilo_leases ORDER BY table_id",
 };
+const V5_GENERATED_TABLE_DDL_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
+    table: "briskdb_generated_table_ddl",
+    columns: &[
+        "singleton",
+        "logical_id",
+        "logical_digest_version",
+        "source_dialect",
+        "translation_version",
+        "source_sql",
+        "physical_migration_id",
+        "physical_sql",
+        "database_id",
+        "table_name",
+        "generated_column",
+        "generated_policy",
+        "generated_encoding_version",
+        "lifecycle_state",
+        "provisioning_id",
+        "provisioning_schema_digest",
+        "table_id",
+    ],
+    sql: "SELECT singleton, logical_id, logical_digest_version, source_dialect, translation_version, source_sql, physical_migration_id, physical_sql, database_id, table_name, generated_column, generated_policy, generated_encoding_version, lifecycle_state, provisioning_id, provisioning_schema_digest, table_id FROM briskdb_generated_table_ddl ORDER BY singleton",
+};
 
 fn manifest_semantic_digest_for_version(
     connection: &Connection,
@@ -5522,6 +6659,23 @@ fn manifest_semantic_digest_for_version(
                 }
             }
             (V4_MANIFEST_DIGEST_DOMAIN, queries)
+        }
+        V5_MANIFEST_DIGEST_VERSION => {
+            let mut queries = Vec::with_capacity(V1_MANIFEST_DIGEST_QUERIES.len() + 6);
+            for query in V1_MANIFEST_DIGEST_QUERIES {
+                queries.push(query);
+                if query.table == "briskdb_physical_shards" {
+                    queries.push(&V3_ALLOCATION_OWNERS_DIGEST_QUERY);
+                }
+                if query.table == "briskdb_tables" {
+                    queries.push(&V3_GENERATED_IDS_DIGEST_QUERY);
+                    queries.push(&V5_GENERATED_TABLE_DDL_DIGEST_QUERY);
+                    queries.push(&V4_HILO_LEASES_DIGEST_QUERY);
+                    queries.push(&V3_TABLE_PROVISIONING_DIGEST_QUERY);
+                    queries.push(&V3_TABLE_PROVISIONING_DECLARATIONS_DIGEST_QUERY);
+                }
+            }
+            (V5_MANIFEST_DIGEST_DOMAIN, queries)
         }
         0 => {
             return Err(EngineError::new(
@@ -5661,7 +6815,8 @@ fn refresh_manifest_digest_if_checksummed(connection: &Connection) -> EngineResu
                 | V8_SCHEMA_VERSION
                 | V9_SCHEMA_VERSION
                 | V10_SCHEMA_VERSION
-                | V11_SCHEMA_VERSION)
+                | V11_SCHEMA_VERSION
+                | V12_SCHEMA_VERSION)
         )
     {
         let _ = refresh_manifest_digest(connection)?;
@@ -5725,7 +6880,7 @@ fn validate_manifest_integrity(
             "manifest checksum version must be positive",
         ));
     }
-    if *manifest_version > i64::from(V4_MANIFEST_DIGEST_VERSION) {
+    if *manifest_version > i64::from(V5_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -5959,6 +7114,7 @@ fn validate_catalog_manifest(
         active_native_id_table_ids: Box::new([]),
         active_hilo_id_table_ids: Box::new([]),
         active_table_provisioning: None,
+        generated_table_ddl: None,
     })
 }
 
@@ -6995,6 +8151,77 @@ fn schema_migration_digest(sql: &str) -> [u8; 32] {
 pub(super) fn schema_migration_id(sql: &str) -> EngineResult<[u8; 32]> {
     validate_schema_migration_sql(sql)?;
     Ok(schema_migration_digest(sql))
+}
+
+fn encoded_generated_table_ddl_dialect(dialect: SqlDialect) -> i64 {
+    match dialect {
+        SqlDialect::Sqlite => GENERATED_TABLE_DDL_SQLITE,
+        SqlDialect::PostgreSql => GENERATED_TABLE_DDL_POSTGRESQL,
+        SqlDialect::MySql => GENERATED_TABLE_DDL_MYSQL,
+    }
+}
+
+fn decode_generated_table_ddl_dialect(code: i64) -> EngineResult<SqlDialect> {
+    match code {
+        GENERATED_TABLE_DDL_SQLITE => Ok(SqlDialect::Sqlite),
+        GENERATED_TABLE_DDL_POSTGRESQL => Ok(SqlDialect::PostgreSql),
+        GENERATED_TABLE_DDL_MYSQL => Ok(SqlDialect::MySql),
+        _ => Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "generated-table DDL bridge uses a newer source dialect encoding",
+        )),
+    }
+}
+
+fn generated_table_ddl_logical_id(
+    source_dialect: SqlDialect,
+    source_sql: &str,
+) -> EngineResult<[u8; 32]> {
+    validate_schema_migration_sql(source_sql).map_err(|error| {
+        EngineError::from_source(
+            error.kind(),
+            "generated-table source SQL violates its storage limits",
+            error,
+        )
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(GENERATED_TABLE_DDL_DIGEST_DOMAIN);
+    hasher.update(&GENERATED_TABLE_DDL_DIGEST_VERSION.to_le_bytes());
+    hasher.update(&encoded_generated_table_ddl_dialect(source_dialect).to_le_bytes());
+    hasher.update(&GENERATED_TABLE_DDL_TRANSLATION_VERSION.to_le_bytes());
+    hash_manifest_name(&mut hasher, source_sql.as_bytes());
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn generated_table_ddl_declaration(
+    database_id: LogicalDatabaseId,
+    table_name: String,
+    generated_column: String,
+) -> EngineResult<TableDeclaration> {
+    TableDeclaration::sharded(
+        database_id,
+        table_name,
+        ShardKeyMetadata::new(&generated_column, ShardKeyType::Int64)?,
+    )?
+    .with_generated_id_policy(GeneratedIdPolicy::native_range_v1(generated_column)?)
+}
+
+fn validate_generated_table_ddl_declaration(declaration: &TableDeclaration) -> EngineResult<&str> {
+    let (TablePlacement::Sharded(shard_key), GeneratedIdPolicy::NativeRangeV1 { column }) =
+        (declaration.placement(), declaration.generated_id_policy())
+    else {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "generated-table DDL requires one native_range_v1 Sharded declaration",
+        ));
+    };
+    if shard_key.key_type() != ShardKeyType::Int64 || shard_key.column() != column {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "generated-table DDL generated column must be its Int64 shard key",
+        ));
+    }
+    Ok(column)
 }
 
 fn validate_logical_databases(
@@ -8134,7 +9361,7 @@ mod tests {
             identity(connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(connection).unwrap(), v11_objects());
+        assert_eq!(schema_objects(connection).unwrap(), v12_objects());
         assert_eq!(
             connection
                 .query_row(
@@ -8201,7 +9428,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V4_MANIFEST_DIGEST_VERSION)
+            i64::from(V5_MANIFEST_DIGEST_VERSION)
         );
         let (layout_id, application_id, metadata_version, state) = shard_layout_row(connection);
         assert_eq!(layout_id.len(), 16);
@@ -8319,6 +9546,7 @@ mod tests {
                 (8, 9),
                 (9, 10),
                 (10, 11),
+                (11, 12),
             ]
         );
         assert_generation_one_catalog(&connection, 4);
@@ -8388,8 +9616,8 @@ mod tests {
                 assert_eq!(quick_check(&connection), "ok");
 
                 load_or_create_manifest(&mut connection, 4).unwrap();
-                assert_eq!(identity(&connection).1, i64::from(V11_SCHEMA_VERSION));
-                assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
+                assert_eq!(identity(&connection).1, i64::from(CURRENT_SCHEMA_VERSION));
+                assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
                 assert_eq!(
                     connection
                         .query_row(
@@ -8398,7 +9626,7 @@ mod tests {
                             |row| row.get::<_, i64>(0),
                         )
                         .unwrap(),
-                    i64::from(V4_MANIFEST_DIGEST_VERSION)
+                    i64::from(V5_MANIFEST_DIGEST_VERSION)
                 );
                 assert_eq!(
                     connection
@@ -8771,9 +9999,11 @@ mod tests {
 
         let mut reopened = Connection::open(&path).unwrap();
         let loaded = load_or_create_manifest(&mut reopened, 4).unwrap();
-        let (_, _, _, integrity, _, _, provisioning) = loaded.into_parts_with_recovery();
+        let (_, _, _, integrity, _, _, provisioning, generated_ddl) =
+            loaded.into_parts_with_recovery();
         assert_eq!(integrity.state(), DatabaseIntegrityState::Degraded);
         assert_eq!(provisioning, Some(active));
+        assert_eq!(generated_ddl, None);
         assert_eq!(
             manifest_semantic_digest(&reopened).unwrap(),
             stored_manifest_digest(&reopened)
@@ -8937,7 +10167,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
         assert_eq!(table_metadata_rows(&connection), tables_before);
         assert_eq!(logical_databases(&connection), databases_before);
         assert_eq!(routing_configuration(&connection), routing_before);
@@ -8980,7 +10210,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V4_MANIFEST_DIGEST_VERSION)
+            i64::from(V5_MANIFEST_DIGEST_VERSION)
         );
         assert_eq!(
             manifest_semantic_digest(&connection).unwrap(),
@@ -9042,7 +10272,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE briskdb_hilo_leases;
+                "DROP TABLE briskdb_generated_table_ddl;
+                 DROP TABLE briskdb_hilo_leases;
                  DROP TABLE briskdb_table_provisioning_declarations;
                  DROP TABLE briskdb_table_provisioning;
                  DROP INDEX briskdb_one_active_owner_per_shard;
@@ -9513,7 +10744,7 @@ mod tests {
                     identity(&connection),
                     (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
                 );
-                assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
+                assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
                 assert_eq!(
                     manifest_semantic_digest(&connection).unwrap(),
                     stored_manifest_digest(&connection)
@@ -9861,6 +11092,7 @@ mod tests {
         refresh_manifest_digest(&connection).unwrap();
         let table_id = activate_hilo_table(&mut connection, 4);
         reserve_hilo_v1_block(&mut connection, 4, table_id, [0x6b; 32]).unwrap();
+        downgrade_v12_manifest_to_v11_for_test(&connection, 4).unwrap();
 
         let digest = manifest_semantic_digest(&connection).unwrap();
         assert_eq!(
@@ -9878,7 +11110,7 @@ mod tests {
     fn semantic_root_covers_every_authoritative_manifest_table_and_integrity_state() {
         let mutations = [
             "UPDATE briskdb_manifest SET singleton = 2 WHERE singleton = 1",
-            "UPDATE briskdb_metadata SET requires_manifest_version = 12",
+            "UPDATE briskdb_metadata SET requires_manifest_version = 13",
             "UPDATE briskdb_routing SET hash_version = 2 WHERE singleton = 1",
             "UPDATE briskdb_physical_shards SET lifecycle_state = 'retired' WHERE shard_id = 0",
             "UPDATE briskdb_allocation_owners SET owner_slot = 100 WHERE owner_slot = 0",
@@ -9887,6 +11119,7 @@ mod tests {
             "UPDATE briskdb_schema_catalog SET identifier_encoding_version = 2 WHERE singleton = 1",
             "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 2, NULL, NULL)",
             "INSERT INTO briskdb_generated_ids VALUES (1, 0, NULL, NULL, 0)",
+            "INSERT INTO briskdb_generated_table_ddl VALUES (1, zeroblob(32), 1, 1, 1, 'x', zeroblob(32), 'x', 1, 'events', 'id', 1, 1, 1, NULL, NULL, NULL)",
             "INSERT INTO briskdb_hilo_leases VALUES (1, 4096, 1, 0, NULL, NULL, NULL)",
             "UPDATE briskdb_shard_layout SET layout_id = randomblob(16) WHERE singleton = 1",
             "INSERT INTO briskdb_schema_migrations VALUES (1, 0, randomblob(32), 1, 'SELECT 1', 4, 2, 4)",
@@ -10044,7 +11277,7 @@ mod tests {
     #[test]
     fn integrity_versions_lengths_and_forged_state_invariants_fail_closed() {
         for (version_column, unsupported_version) in
-            [("manifest_digest_version", 5), ("schema_digest_version", 2)]
+            [("manifest_digest_version", 6), ("schema_digest_version", 2)]
         {
             let mut unsupported = Connection::open_in_memory().unwrap();
             create_ready_current_manifest(&mut unsupported, 4);
@@ -10272,7 +11505,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
         assert_eq!(
             shard_layout_row(&connection).3,
             ShardLayoutState::Adopting.code()
@@ -10296,7 +11529,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
         assert_eq!(layout.state(), ShardLayoutState::Ready);
         assert_eq!(shard_layout_row(&connection), layout_before);
         assert_eq!(catalog.logical().schema_generation(), 0);
@@ -10388,7 +11621,7 @@ mod tests {
                 identity(&connection),
                 (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
             );
-            assert_eq!(schema_objects(&connection).unwrap(), v11_objects());
+            assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
         }
 
         let mut connection = Connection::open_in_memory().unwrap();
@@ -12008,7 +13241,7 @@ mod tests {
         for mutation in [
             "DELETE FROM briskdb_metadata",
             "DELETE FROM briskdb_manifest",
-            "INSERT INTO briskdb_metadata VALUES (11)",
+            "INSERT INTO briskdb_metadata VALUES (13)",
             "DELETE FROM briskdb_routing",
             "DELETE FROM briskdb_virtual_buckets WHERE bucket_id = 4095",
             "DELETE FROM briskdb_physical_shards WHERE shard_id = 3",
@@ -12349,5 +13582,268 @@ mod tests {
         assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
         assert_eq!(identity(&connection), (0, 0));
         assert_eq!(schema_objects(&connection).unwrap()[0].name, "unrelated");
+    }
+
+    fn generated_events_declaration() -> TableDeclaration {
+        let database = LogicalDatabaseId::new(DEFAULT_LOGICAL_DATABASE_ID).unwrap();
+        TableDeclaration::sharded(
+            database,
+            "events",
+            ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+        )
+        .unwrap()
+        .with_generated_id_policy(GeneratedIdPolicy::native_range_v1("id").unwrap())
+        .unwrap()
+    }
+
+    fn create_ready_v11_manifest(connection: &mut Connection, shards: u16) {
+        let transaction = connection.transaction().unwrap();
+        create_v11_schema(&transaction, shards).unwrap();
+        transaction
+            .execute(
+                "UPDATE briskdb_shard_layout SET layout_state = ?1 WHERE singleton = 1",
+                [ShardLayoutState::Ready.code()],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE briskdb_integrity
+                 SET database_state = ?1,
+                     committed_schema_digest = ?2,
+                     target_schema_digest = NULL
+                 WHERE singleton = 1",
+                rusqlite::params![DATABASE_STATE_READY, [0x5a_u8; 32].as_slice()],
+            )
+            .unwrap();
+        set_identity(&transaction, V11_SCHEMA_VERSION).unwrap();
+        refresh_manifest_digest(&transaction).unwrap();
+        validate_v11(&transaction, shards, &schema_objects(&transaction).unwrap()).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn v11_to_v12_upgrade_is_atomic_checksummed_and_downgrade_fenced() {
+        const V11_PLAN: MigrationPlan<'static> = MigrationPlan {
+            current_version: V11_SCHEMA_VERSION,
+            migrations: MIGRATIONS,
+            initialize_current: create_v11_schema,
+            initialize_interrupted_legacy: migrate_interrupted_legacy_to_v11,
+        };
+        for phase in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ] {
+            let mut interrupted = Connection::open_in_memory().unwrap();
+            create_ready_v11_manifest(&mut interrupted, 4);
+            let root = stored_manifest_digest(&interrupted);
+            let error = load_or_create_with_hook(&mut interrupted, 4, |point| {
+                if point.from == V11_SCHEMA_VERSION && point.phase == phase {
+                    Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "injected v11 to v12 failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+            assert_eq!(identity(&interrupted).1, i64::from(V11_SCHEMA_VERSION));
+            assert_eq!(schema_objects(&interrupted).unwrap(), v11_objects());
+            assert_eq!(stored_manifest_digest(&interrupted), root);
+        }
+
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_v11_manifest(&mut connection, 4);
+        load_or_create_manifest(&mut connection, 4).unwrap();
+        assert_eq!(identity(&connection).1, i64::from(V12_SCHEMA_VERSION));
+        assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT requires_manifest_version FROM briskdb_metadata",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            i64::from(V12_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT manifest_digest_version FROM briskdb_integrity",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            i64::from(V5_MANIFEST_DIGEST_VERSION)
+        );
+        assert_eq!(
+            manifest_semantic_digest(&connection).unwrap(),
+            stored_manifest_digest(&connection)
+        );
+        assert_eq!(
+            inspect_with_plan(&connection, 4, V11_PLAN)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn generated_table_ddl_bridge_is_exact_checksummed_and_lifecycle_complete() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let source = "CREATE TABLE events (id BIGSERIAL PRIMARY KEY, payload TEXT NOT NULL)";
+        let physical =
+            "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)";
+        let declaration = generated_events_declaration();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let (ddl, mut migration) = begin_generated_table_ddl_in_transaction(
+            &transaction,
+            4,
+            0,
+            SqlDialect::PostgreSql,
+            source,
+            physical,
+            declaration.clone(),
+            [0x5a; 32],
+            [0x6b; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            ddl.lifecycle(),
+            GeneratedTableDdlLifecycle::ApplyingPhysical
+        );
+        assert_ne!(ddl.logical_id(), ddl.physical_migration_id());
+        transaction.commit().unwrap();
+
+        assert!(matches!(
+            classify_generated_table_ddl(
+                &mut connection,
+                4,
+                SqlDialect::PostgreSql,
+                source,
+                physical,
+                &declaration,
+            )
+            .unwrap(),
+            GeneratedTableDdlClassification::Existing(_)
+        ));
+        let conflict = classify_generated_table_ddl(
+            &mut connection,
+            4,
+            SqlDialect::MySql,
+            source,
+            physical,
+            &declaration,
+        )
+        .unwrap_err();
+        assert_eq!(conflict.kind(), EngineErrorKind::FailedPrecondition);
+
+        while migration.next_shard() < migration.shard_count() {
+            let next = migration.next_shard() + 1;
+            migration = advance_schema_migration(&mut connection, 4, &migration, next).unwrap();
+        }
+        migration = finalize_schema_migration(&mut connection, 4, &migration).unwrap();
+        assert!(migration.is_complete());
+        let ddl = mark_generated_table_ddl_provisioning(&mut connection, 4, &ddl, || {}).unwrap();
+        assert_eq!(ddl.lifecycle(), GeneratedTableDdlLifecycle::Provisioning);
+        let provisioning_id = ddl.provisioning_id().unwrap();
+        assert_eq!(ddl.provisioning_schema_digest(), Some([0x6b; 32]));
+
+        let active = match begin_native_table_provisioning(
+            &mut connection,
+            4,
+            vec![declaration.clone()],
+            [0x6b; 32],
+            || {},
+        )
+        .unwrap()
+        {
+            NativeTableProvisioningClassification::Active(active) => active,
+            other => panic!("expected active provisioning, got {other:?}"),
+        };
+        assert_eq!(active.provisioning_id(), provisioning_id);
+        let mut active = active;
+        while active.next_shard() < active.shard_count() {
+            let next = active.next_shard() + 1;
+            active = advance_native_table_provisioning(&mut connection, 4, &active, next).unwrap();
+        }
+        let (catalog, completed) =
+            finalize_generated_table_ddl_provisioning(&mut connection, 4, &ddl, &active, || {})
+                .unwrap();
+        assert_eq!(completed.lifecycle(), GeneratedTableDdlLifecycle::Complete);
+        assert_eq!(completed.provisioning_id(), Some(provisioning_id));
+        assert_eq!(completed.provisioning_schema_digest(), Some([0x6b; 32]));
+        assert_eq!(
+            completed.table_id(),
+            Some(catalog.logical().tables()[0].id())
+        );
+        assert_eq!(completed.source_dialect(), SqlDialect::PostgreSql);
+        assert_eq!(
+            completed.translation_version(),
+            GENERATED_TABLE_DDL_TRANSLATION_VERSION
+        );
+        assert_eq!(completed.source_sql(), source);
+        assert_eq!(completed.physical_sql(), physical);
+        assert_eq!(completed.declaration(), &declaration);
+        assert_eq!(
+            manifest_semantic_digest(&connection).unwrap(),
+            stored_manifest_digest(&connection)
+        );
+
+        let reopened = load_or_create_manifest(&mut connection, 4).unwrap();
+        assert_eq!(reopened.generated_table_ddl(), Some(&completed));
+    }
+
+    #[test]
+    fn generated_table_ddl_bridge_schema_and_checksum_fail_closed() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        let source = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT)";
+        let physical = source;
+        let declaration = generated_events_declaration();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        begin_generated_table_ddl_in_transaction(
+            &transaction,
+            4,
+            0,
+            SqlDialect::Sqlite,
+            source,
+            physical,
+            declaration,
+            [0x5a; 32],
+            [0x6b; 32],
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        connection
+            .execute(
+                "UPDATE briskdb_generated_table_ddl SET source_sql = source_sql || ' '",
+                [],
+            )
+            .unwrap();
+        let error = load_or_create_manifest(&mut connection, 4).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+
+        let mut schema = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut schema, 4);
+        schema.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        schema
+            .execute_batch(
+                "ALTER TABLE briskdb_generated_table_ddl
+                 RENAME TO briskdb_generated_table_ddl_old;
+                 CREATE TABLE briskdb_generated_table_ddl (singleton INTEGER PRIMARY KEY) STRICT;
+                 DROP TABLE briskdb_generated_table_ddl_old;",
+            )
+            .unwrap();
+        let error = load_or_create_manifest(&mut schema, 4).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
     }
 }
