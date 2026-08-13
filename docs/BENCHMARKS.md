@@ -241,8 +241,9 @@ The matrix is frozen at exactly 2, 4, 8, and 10 concurrent writers. Each writer
 owns one pre-opened writable coordinator on its own OS thread. A barrier releases
 all writers together, after coordinator construction, and each performs 10,000
 single-row inserts. The native workload uses its automatic active-owner
-selection. The hi/lo workload consumes a globally leased ID and hash-routes the
-complete encoded value. Five samples are taken per policy and writer count;
+selection with a per-table round-robin start and exhaustion fallback. The hi/lo
+workload consumes a globally leased ID and hash-routes the complete encoded
+value. Five samples are taken per policy and writer count;
 which policy runs first alternates by sample. The report uses the median by
 total writes per second. A fresh fixture is used for each writer count, and
 both physical table counts must equal the exact expected cumulative writes

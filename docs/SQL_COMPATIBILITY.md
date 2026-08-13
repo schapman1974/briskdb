@@ -90,7 +90,7 @@ set, every shard for an unconstrained Sharded read, or shard 0 once for a
 
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
-| HTTP `/v1/execute` | Experimental | Empty catalog: legacy SQLite statement. Populated catalog: exactly one SQLite common-subset write with normalized positional parameters and strict SQLite translation | Required caller `shard_key`; a populated catalog also requires authoritative finite single-shard inference and rejects Global/Catalog writes |
+| HTTP `/v1/execute` | Experimental | Empty catalog: legacy SQLite statement. Populated catalog: exactly one SQLite common-subset write with normalized positional parameters and strict SQLite translation | Empty catalog requires caller `shard_key`; a populated catalog requires authoritative finite single-shard inference except for one active-policy omitted generated key, and rejects Global/Catalog writes |
 | HTTP `/v1/query` | Experimental | Empty catalog: legacy raw SQLite query. Populated catalog: exactly one SQLite common-subset read; no session cache; multi-shard execution is limited to the row-local scatter-safe subset | Empty catalog requires caller `shard_key`; populated catalog derives targets from registered metadata, reads Global data once on shard 0, and denies Catalog/undeclared tables |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch; populated catalogs reject row-moving DML, table drops, and trigger creation | Preflight on every shard, then ascending resumable apply |
 | HTTP `/admin` browser | Experimental, read-only | No caller SQL; metadata-driven logical table discovery, specialized exact logical `COUNT(*)`, and bounded deterministic `SELECT *` page slices | Sharded tables visit all files; Global tables visit shard 0 once; no browser shard selector or arbitrary SQL |
@@ -107,25 +107,30 @@ registration composes the SQLite frontend and planner into the existing HTTP
 execute/query rows as described above; it adds no HTTP field or route.
 
 The `experimental-vtab` Cargo feature also contains internal read-only and
-explicit-key writable `brisk_shard` coordinators for evaluating the no-fork
-virtual-table boundary. They are not HTTP, PostgreSQL, or MySQL query interfaces
-and do not expand the table above. The module is statically registered into
-stock SQLite and opens validated physical children through OS-level SQLite
-handles; it does not use `ATTACH`, runtime extension loading, a SQLite fork, or
-a storage-format change. The writable wrapper accepts explicit-key Sharded
-INSERT and exactly routed UPDATE/DELETE, pins one physical transaction, and
-rejects cross-shard or Global writes. An internal preflighted seam also permits
-one generated NULL callback for a single omitted-key row. `native_range_v1`
-allocates on an already selected shard and captures the ID with child
-`RETURNING` on the same handle. `hilo_v1` durably leases before taking a child
-write lock, consumes one global per-table ID, hash-routes it, inserts it
-explicitly, and verifies the returned value. A transaction that already pinned
-a shard rejects later hi/lo generation. Generic generated/missing-key SQL
-remains rejected until #130 supplies AST intent and protocol rendering. Schema
-operations, attachments, unsafe
+writable `brisk_shard` coordinators for the no-fork virtual-table boundary.
+They are not PostgreSQL or MySQL query interfaces. The module is statically
+registered into stock SQLite and opens validated physical children through
+OS-level SQLite handles; it does not use `ATTACH`, runtime extension loading, a
+SQLite fork, or a storage-format change. The writable wrapper accepts
+explicit-key Sharded INSERT and exactly routed UPDATE/DELETE, pins one physical
+transaction, and rejects cross-shard or Global writes. Shared issue #130 AST
+planning can also arm one generated callback for a single row whose declared
+key is absent from the column list. `native_range_v1` chooses an eligible
+owner from a per-table round-robin candidate list. Engine holds at most one
+non-waiting candidate pool reservation, skips busy candidates, and releases an
+exhausted unmutated candidate before fallback; the chosen child captures the ID
+with `RETURNING` on the same handle. `hilo_v1` first reserves every possible
+target's pool capacity, then durably leases before taking a child write lock,
+consumes one global per-table ID, hash-routes it, inserts it explicitly, and
+verifies the returned value. A
+transaction that already pinned a shard rejects later hi/lo generation. Engine,
+prepared-portal, and HTTP execution expose the protocol-neutral generated
+result when both coordinator gates are enabled. Schema operations, attachments,
+unsafe
 PRAGMAs, extension loading, defaults, generated columns, triggers, and
 caller-authored `RETURNING` remain rejected. This surface is internal and
-cannot be reached by the query app or protocol adapters.
+cannot be reached by the query app or PostgreSQL/MySQL protocol adapters. See
+[generated keys](GENERATED_KEYS.md) for the exact syntax and result contract.
 
 The lower `hilo_v1` seam reserves fixed 4,096-value blocks in the manifest and
 serves them from a fenced process-local cache. A monotonic fence and random
@@ -206,6 +211,13 @@ queue returns the retryable `Busy` error (HTTP 503), while single-shard routed
 work waiting on one shard does not consume another shard's capacity. Schema
 migration drains admitted ordinary work and uses fresh coordinator-owned
 connections instead of reserving every shard pool.
+
+Native omitted-key writes are the target-unknown exception: after acquiring one
+bounded worker they use only non-waiting pool admission, retain at most one
+per-table round-robin candidate, and fall back around `Busy` or exhausted
+owners. Hi/lo instead reserves every possible target pool before its allocation
+can choose a hash route. Neither path grows an unbounded worker or connection
+queue.
 
 SQLite forms that can leave connection-local state remain allowed by the
 empty-catalog one-call pass-through, but they are uncontracted and are outside
@@ -785,7 +797,7 @@ normative in the [adapter decision record](POSTGRES_ADAPTER.md).
 | Identifier quoting | Double quotes | Retained by opt-in compatibility translation; PostgreSQL case folding and catalog equivalence are not claimed |
 | Type system | Static types identified by OIDs | Opt-in Rust translation maps a finite declaration set to `BIGINT`, `BOOLEAN`, `REAL`, `TEXT`, or `BLOB`; OID and value/result adaptation remain planned |
 | Boolean | Dedicated `boolean` type | Opt-in translation maps the declaration to `BOOLEAN` and literals to `1`/`0`; Boolean wire/result metadata remains planned |
-| `serial`, identity, sequences | Sequence-backed generation | Unsupported until explicit sequence/identity semantics are designed |
+| `BIGSERIAL`, identity, sequences | Sequence-backed generation | Compatibility translation accepts exactly inline `BIGSERIAL PRIMARY KEY` or `BIGINT PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY` as `native_range_v1` intent and canonical SQLite `AUTOINCREMENT`; sequence objects/options and PostgreSQL wire result behavior remain unsupported |
 | `bytea` | Binary value | Opt-in declaration translation maps it to SQLite `BLOB`; binary value and wire adaptation remain planned |
 | `json` / `jsonb` | Distinct PostgreSQL types | Planned JSON validation; no promise of PostgreSQL `jsonb` storage or operators |
 | Arrays, ranges, enums, domains | Native PostgreSQL types | Unsupported initially |
@@ -813,7 +825,7 @@ engine used by PostgreSQL and HTTP.
 | Identifier quoting | Backticks by default | Opt-in compatibility translation emits safely escaped double-quoted SQLite identifiers; case and collation equivalence are not claimed |
 | Type system | Static signed/unsigned column types | Opt-in Rust translation maps a finite signed integer, Boolean, 64-bit float, text, and binary declaration set; unsigned declarations are rejected, and translation performs no value or result adaptation. Independently, BriskDB retains `UInt64` values without narrowing, while current SQLite binding rejects values above `i64::MAX` until a storage mapping exists |
 | Boolean | Commonly `TINYINT(1)` | Opt-in translation maps exactly `TINYINT(1)` to `BOOLEAN` and Boolean literals to `1`/`0`; wire/result metadata remains planned |
-| `AUTO_INCREMENT` | Table column attribute | Native shard-range allocation exists below the SQL layer; dialect recognition and omitted-key planning remain #130 |
+| `AUTO_INCREMENT` | Table column attribute | Compatibility translation accepts inline `BIGINT` with `PRIMARY KEY AUTO_INCREMENT` or `AUTO_INCREMENT PRIMARY KEY` as `native_range_v1` intent and canonical SQLite `AUTOINCREMENT`; one omitted-key row can execute through the gated shared engine, while MySQL wire behavior remains issue #44 |
 | `UNSIGNED`, display widths | MySQL column attributes | Rejected by compatibility translation, except that exactly `TINYINT(1)` is the documented Boolean declaration |
 | `DATETIME`, `TIMESTAMP` | Distinct MySQL temporal behavior | No implicit compatibility; canonical timestamp encoding must be defined first |
 | `JSON` | Native MySQL JSON type | Planned JSON validation stored using the canonical BriskDB representation |

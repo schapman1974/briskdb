@@ -14,6 +14,9 @@ boundaries and dependency direction.
 The [experimental sharded virtual-table contract](docs/SHARDED_VIRTUAL_TABLE.md)
 defines the no-fork coordinator, its opt-in autocommit write path, and the
 features that deliberately remain on the established engine paths.
+The [generated-key contract](docs/GENERATED_KEYS.md) defines the exact accepted
+SQLite, MySQL, and PostgreSQL declarations, omitted-key insert semantics,
+protocol-neutral and HTTP results, and the two execution gates.
 
 The [SQL compatibility contract](docs/SQL_COMPATIBILITY.md) distinguishes the
 unregistered legacy SQLite pass-through from the authoritative-catalog HTTP
@@ -110,12 +113,17 @@ minimum supported Rust version (MSRV) and the latest stable toolchain.
   exact-value verification, and atomic no-replace publication
 - Initialization-only registration of a complete, empty physical schema, with
   later schema migrations checked against its table and shard-key declarations
+- An initialization-only `Database::apply_generated_table_ddl` bridge that
+  durably binds one exact SQLite/PostgreSQL/MySQL generated-table declaration
+  to canonical physical SQLite migration, `native_range_v1` provisioning, and
+  stable receipt identities with automatic restart recovery
 - Identity-bound, WAL-enabled SQLite shard files that are never silently
   recreated after initialization
 - Routed writes and catalog-aware logical query execution, with a separately
   compiled and runtime-enabled virtual-table coordinator for explicit-key
-  autocommit writes to registered Sharded tables and internal preflighted
-  generated-key seams for `native_range_v1` and `hilo_v1`
+  autocommit writes to registered Sharded tables and single-row omitted-key
+  writes for active generated-ID policies; generated IDs are captured by the
+  committing operation and returned through protocol-neutral and HTTP results
 - A crash-resumable, journaled schema-migration endpoint for every shard
 - A checksummed manifest, generation-bound shard-schema fingerprints, and
   fail-closed `Verifying`/`Ready`/`Migrating`/`Degraded` storage states
@@ -142,8 +150,9 @@ cargo run -- --data-dir ./briskdb-data --shards 4
 ```
 
 The established physical-shard write path remains the default. To try the
-stock-SQLite virtual-table coordinator for registered, explicit-key autocommit
-writes, enable both its Cargo feature and runtime gate:
+stock-SQLite virtual-table coordinator for registered explicit-key writes or
+single-row omitted-key writes on an active generated-ID table, enable both its
+Cargo feature and runtime gate:
 
 ```bash
 cargo run --features experimental-vtab -- \
@@ -161,7 +170,9 @@ This opt-in changes only validated `Engine::execute` and
 `/v1/execute` adapter. `/v1/query` and the admin browser continue to use the
 established metadata-driven scatter/gather readers. `BEGIN`, `COMMIT`,
 `ROLLBACK`, and transactions spanning HTTP requests are not enabled by this
-flag.
+flag. Generated-key DDL and insert examples, the additive HTTP response field,
+and deliberate protocol gaps are documented in
+[the generated-key contract](docs/GENERATED_KEYS.md).
 
 To initialize a new data directory from an existing standard SQLite file, use
 the separate offline importer. The destination must not already exist, and the
@@ -339,23 +350,28 @@ common-subset write, those ephemeral requests share a stateless physical-handle
 ownership domain. This keeps the logical sessions separate while allowing clean
 autocommit write handles to remain warm. When BriskDB is compiled with
 `experimental-vtab` and `--experimental-vtab-writes` is set, an accepted
-explicit-key write to a registered Sharded table instead executes through one
-ephemeral writable coordinator and commits its one physical child before HTTP
-success is returned. It keeps the same HTTP request, response, planner, shard
-assignment, admission, cancellation, and affected-row contracts. Each request
-is still one autocommit statement; the option does not add session transaction
-state, prepared-portal integration, Global writes, or a virtual-table read
-path. Empty-catalog pass-through SQL and all other session surfaces retain
-their existing behavior. Registration, startup, import, and migration
+explicit-key write, or one single-row insert omitting an active declared
+generated key, executes through one ephemeral writable coordinator and commits
+its one physical child before HTTP success is returned. Explicit writes keep
+their existing HTTP shape; a generated write adds `generated_key` and reports
+the allocator-selected physical owner. The same generated result is available
+through protocol-neutral Engine and prepared-portal execution. Each request is
+still one autocommit statement; the option does not add session transaction
+state, Global writes, or a virtual-table read path. Empty-catalog pass-through
+SQL retains its existing behavior. Registration, startup, import, and migration
 validation also reject `last_insert_rowid()`, `changes()`, and
 `total_changes()` inside persistent table or index expressions, so a stored
 `DEFAULT`, `CHECK`, generated expression, or index cannot bypass that boundary.
 Pool admission happens before blocking SQLite work: once a shard's active slots
 and queue are full, the engine returns retryable `Busy` (HTTP 503) instead of
-growing work without bound. Connections are opened lazily and reused. Broadcast
-is now a journaled schema migration: it excludes new ordinary work, waits for
-previously admitted operations to drain, and uses dedicated migration
-connections rather than reserving every shard pool.
+growing work without bound. The native omitted-key path cannot know one target
+before its bounded worker starts, so it uses a non-waiting reservation for one
+round-robin candidate at a time and falls back around busy or exhausted owners;
+it never queues while retaining that worker. Hi/lo reserves every possible
+target capacity before consuming an ID. Connections are opened lazily and
+reused. Broadcast is now a journaled schema migration: it excludes new ordinary
+work, waits for previously admitted operations to drain, and uses dedicated
+migration connections rather than reserving every shard pool.
 
 Rust callers may explicitly parse SQL and consume the result with
 `validate_common_subset(ParsedSql)`, receiving an owned opaque `CommonSql` on
@@ -560,9 +576,11 @@ the sequence range, owner-local rows, and high-water mark before use. Encoded
 explicit IDs route through active or retired persisted owners; new explicit IDs
 are rejected for retired owners, while marker-clear and negative legacy IDs
 keep their original hash route. An internal coordinator seam can allocate and
-capture one preflighted omitted-key row on an eligible active shard, but no
-public Engine or HTTP SQL path can invoke it yet. SQL declarations, omitted-key
-Engine planning, and response rendering remain issue #130.
+capture one preflighted omitted-key row on an eligible active shard. The shared
+AST and bound planner now authorize that seam for one omitted-key row, and
+public Engine, prepared-portal, and HTTP execution expose the captured result
+when both experimental coordinator gates are enabled. The exact contract is in
+[`docs/GENERATED_KEYS.md`](docs/GENERATED_KEYS.md).
 
 Version 11 adds optional `hilo_v1`, a manifest-leased global sequence for one
 registered Sharded table. The generated column must be the table's exact
@@ -580,8 +598,24 @@ order is allocation order, not commit order. The allocator promises uniqueness
 and non-reuse, not gapless IDs or global commit ordering. Explicit inserts may
 still use negative and positive pre-marker legacy IDs, which hash-route normally;
 the complete hi/lo namespace is allocator-owned and rejected when supplied by
-the caller. This release exposes generation through the lower coordinator seam;
-public DDL/omitted-key SQL and wire-result integration remain issue #130.
+the caller. The lower coordinator seam is also consumed by shared omitted-key
+planning; protocol-neutral results and HTTP rendering are implemented.
+PostgreSQL and MySQL wire mappings remain coordinated with issues #33 and #44
+respectively.
+
+Version 12 adds the retained generated-table DDL bridge used by
+`Database::apply_generated_table_ddl`. One checksummed singleton stores the
+exact source dialect and bytes, canonical physical SQLite SQL, fields that
+reconstruct the derived `native_range_v1` declaration, independent
+logical/physical/provisioning identities, the provisioning-time schema digest,
+lifecycle, and final catalog table ID. The v11-to-v12 migration is
+manifest-only: it creates the empty
+bridge table, raises the downgrade fence, and advances the semantic manifest
+checksum to version 5 without changing any shard schema or application row.
+New bridge work atomically begins its canonical schema-migration row with the
+logical request, resumes physical and provisioning prefixes after restart, and
+retains the completed record for audit and exact retry even after a later
+schema migration. See [the generated-key contract](docs/GENERATED_KEYS.md).
 
 Registration marks schema admission `Pending` before its manifest commit. If
 that commit reports an ambiguous cleanup or I/O failure, close the registering

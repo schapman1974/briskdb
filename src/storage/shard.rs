@@ -9,6 +9,7 @@ use std::{
 use rusqlite::{
     Connection, MAIN_DB, OpenFlags, OptionalExtension, TransactionBehavior,
     hooks::{AuthAction, AuthContext, Authorization},
+    limits::Limit,
 };
 
 use crate::{
@@ -34,6 +35,7 @@ pub(super) const SHARD_METADATA_VERSION: u32 = 1;
 pub(super) const SHARD_SCHEMA_DIGEST_VERSION: u32 = 1;
 
 const SHARD_METADATA_TABLE: &str = "briskdb_shard_metadata";
+pub(super) const WRITABLE_LOCATOR_COLUMN_NAME: &str = "__briskdb_locator";
 const SHARD_SCHEMA_DIGEST_DOMAIN: &[u8] = b"briskdb.shard.application-schema.v1\0";
 const MAX_SHARDS: u16 = 64;
 const MAX_DIRECTORY_ENTRIES: usize = 512;
@@ -1916,6 +1918,138 @@ pub(super) fn hilo_generated_column_is_exact(
         && !auto_increment)
 }
 
+/// Return the same physical-schema reason that prevents the experimental
+/// writable facade from exposing a registered Sharded table.
+///
+/// Generated-table DDL calls this while its candidate schema still lives in a
+/// rollback-only preflight transaction. Keeping this inspection independent
+/// of virtual-table registration prevents a durable DDL bridge from publishing
+/// a table that the writable facade must immediately reject.
+pub(super) fn writable_table_unsupported_reason(
+    connection: &Connection,
+    table: &str,
+) -> EngineResult<Option<String>> {
+    let without_rowid = connection
+        .query_row(
+            "SELECT wr
+             FROM pragma_table_list
+             WHERE schema = 'main' AND name = ?1 COLLATE BINARY AND type = 'table'",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("registered table {table} is absent from the physical schema"),
+            )
+        })?;
+    let mut statement = connection
+        .prepare(
+            "SELECT name, dflt_value, pk, hidden
+             FROM pragma_table_xinfo(?1)
+             ORDER BY cid",
+        )
+        .map_err(sqlite_error::storage)?;
+    let columns = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(sqlite_error::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error::storage)?;
+    if columns.is_empty() {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("registered table {table} has no physical columns"),
+        ));
+    }
+    let sqlite_column_limit = usize::try_from(
+        connection
+            .limit(Limit::SQLITE_LIMIT_COLUMN)
+            .map_err(sqlite_error::storage)?,
+    )
+    .map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::Internal,
+            "SQLite reported a negative column limit",
+            error,
+        )
+    })?;
+    if columns
+        .len()
+        .checked_add(1)
+        .is_none_or(|declared_columns| declared_columns > sqlite_column_limit)
+    {
+        return Ok(Some(format!(
+            "registered table {table} leaves no SQLite column capacity for the writable row locator"
+        )));
+    }
+    if columns
+        .iter()
+        .any(|(column, _, _, _)| column.eq_ignore_ascii_case(WRITABLE_LOCATOR_COLUMN_NAME))
+    {
+        return Ok(Some(format!(
+            "registered table {table} conflicts with the reserved writable row locator"
+        )));
+    }
+    if columns
+        .iter()
+        .any(|(_, default_sql, _, _)| default_sql.is_some())
+    {
+        return Ok(Some(format!(
+            "registered table {table} has physical defaults; SQLite xUpdate cannot distinguish an omitted value from explicit NULL"
+        )));
+    }
+    if columns
+        .iter()
+        .any(|(_, _, _, hidden)| matches!(*hidden, 2 | 3))
+    {
+        return Ok(Some(format!(
+            "registered table {table} has generated columns, which are not writable through the explicit-key facade"
+        )));
+    }
+    let has_trigger = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM main.sqlite_schema
+                 WHERE type = 'trigger' AND tbl_name = ?1 COLLATE BINARY
+             )",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    if has_trigger {
+        return Ok(Some(format!(
+            "registered table {table} has physical triggers, which are not supported by the writable facade"
+        )));
+    }
+
+    let has_locator = if without_rowid {
+        columns
+            .iter()
+            .any(|(_, _, primary_key, _)| *primary_key > 0)
+    } else {
+        ["rowid", "_rowid_", "oid"].into_iter().any(|candidate| {
+            columns
+                .iter()
+                .all(|(column, _, _, _)| !column.eq_ignore_ascii_case(candidate))
+        })
+    };
+    Ok((!has_locator).then(|| {
+        format!(
+            "registered table {table} has no unambiguous physical row identity for writable scans"
+        )
+    }))
+}
+
 fn registered_shard_key_is_non_null(
     connection: &Connection,
     table: &str,
@@ -2334,7 +2468,10 @@ fn classify_schema_migration_shard(
     Ok(state)
 }
 
-fn execute_schema_migration_batch(connection: &Connection, sql: &str) -> EngineResult<()> {
+pub(super) fn execute_schema_migration_batch(
+    connection: &Connection,
+    sql: &str,
+) -> EngineResult<()> {
     connection
         .authorizer(Some(|context: AuthContext<'_>| {
             if denies_schema_migration_action(context) {

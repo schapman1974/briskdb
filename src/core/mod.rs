@@ -77,13 +77,69 @@ pub(crate) enum RawDataOperation {
 
 #[derive(Debug)]
 pub(crate) struct RawDataPlan {
-    pub(crate) shard: u16,
+    pub(crate) target: RawDataTarget,
     pub(crate) sqlite_sql: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawDataTarget {
+    Exact(u16),
+    Generated(TableId),
 }
 
 #[derive(Debug)]
 pub struct Database {
     storage: Storage,
+}
+
+/// Durable identities and catalog result of one generated-table DDL request.
+///
+/// The logical identity names the exact source dialect and source bytes. The
+/// physical identity names the canonical SQLite migration text. They are
+/// intentionally distinct even when two source dialects translate to the same
+/// physical table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedTableDdlReceipt {
+    logical_id: [u8; 32],
+    physical_migration_id: [u8; 32],
+    provisioning_id: [u8; 32],
+    table_id: TableId,
+}
+
+impl GeneratedTableDdlReceipt {
+    /// Return the version-1 exact logical-source identity.
+    pub const fn logical_id(&self) -> [u8; 32] {
+        self.logical_id
+    }
+
+    /// Return the exact canonical-physical-SQL migration identity.
+    pub const fn physical_migration_id(&self) -> [u8; 32] {
+        self.physical_migration_id
+    }
+
+    /// Return the normalized table-policy provisioning identity.
+    pub const fn provisioning_id(&self) -> [u8; 32] {
+        self.provisioning_id
+    }
+
+    /// Return the stable catalog table identity published by the operation.
+    pub const fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    pub(crate) const fn from_durable_parts(
+        logical_id: [u8; 32],
+        physical_migration_id: [u8; 32],
+        provisioning_id: [u8; 32],
+        table_id: TableId,
+    ) -> Self {
+        Self {
+            logical_id,
+            physical_migration_id,
+            provisioning_id,
+            table_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +191,58 @@ impl Database {
         self.storage.register_tables(declarations)
     }
 
+    /// Create and durably register one generated-ID Sharded table from a
+    /// documented SQLite, PostgreSQL, or MySQL declaration.
+    ///
+    /// This initialization-only operation accepts exactly one generated-key
+    /// `CREATE TABLE`, translates it to canonical SQLite, installs the physical
+    /// schema on every shard, and publishes the matching `native_range_v1`
+    /// table policy. Its bridge journal resumes automatically after a process
+    /// exit and retains both logical and physical identities for audit.
+    pub fn apply_generated_table_ddl(
+        &mut self,
+        dialect: sql::SqlDialect,
+        source: &str,
+    ) -> EngineResult<GeneratedTableDdlReceipt> {
+        let parsed = sql::parse(dialect, source)?;
+        if parsed.statement_count() != 1 {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "generated table DDL requires exactly one top-level statement",
+            ));
+        }
+        let common = sql::validate_common_subset(parsed)?;
+        let normalized = sql::normalize_placeholders(common)?;
+        let translated = sql::translate_sql(normalized, sql::SqlTranslationMode::Compatibility)?;
+        let [intent] = translated.generated_table_intents() else {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "generated table DDL requires exactly one generated-key declaration",
+            ));
+        };
+        if intent.statement_index() != 0
+            || !validate_catalog_identifier(intent.table())
+            || !validate_catalog_identifier(intent.column())
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "generated table DDL identifiers must use canonical catalog spelling",
+            ));
+        }
+        let declaration = TableDeclaration::sharded(
+            self.catalog().default_database().id(),
+            intent.table(),
+            ShardKeyMetadata::new(intent.column(), ShardKeyType::Int64)?,
+        )?
+        .with_generated_id_policy(GeneratedIdPolicy::native_range_v1(intent.column())?)?;
+        self.storage.apply_generated_table_ddl(
+            dialect,
+            translated.source(),
+            translated.sqlite_sql(),
+            declaration,
+        )
+    }
+
     /// Return the immutable logical database and table catalog.
     pub fn catalog(&self) -> &Catalog {
         self.storage.logical_catalog()
@@ -156,7 +264,7 @@ impl Database {
     /// SQL frontend, inference, and routing policy as prepared statements.
     pub(crate) fn raw_data_plan(
         &self,
-        shard_key: &str,
+        shard_key: Option<&str>,
         statement: &str,
         params: &[Value],
         operation: RawDataOperation,
@@ -185,7 +293,7 @@ impl Database {
                 translated.normalized_sql(),
                 0,
                 params,
-                Some(shard_key.as_bytes()),
+                shard_key.map(str::as_bytes),
             )
             .with_allocation_owners(self.storage.allocation_owner_map()),
             planner::RoutingProvenance::new(
@@ -196,9 +304,9 @@ impl Database {
             ),
             |key| self.shard_for_key(key),
         )?;
-        let shard = raw_data_execution_shard(&plan, catalog, operation)?;
+        let target = raw_data_execution_target(&plan, catalog, operation)?;
         Ok(Some(RawDataPlan {
-            shard,
+            target,
             sqlite_sql: translated.sqlite_sql().to_owned(),
         }))
     }
@@ -210,11 +318,28 @@ impl Database {
         params: &[Value],
     ) -> EngineResult<Routed<usize>> {
         let _schema_operation = self.storage.enter_schema_operation()?;
-        let plan = self.raw_data_plan(shard_key, statement, params, RawDataOperation::Execute)?;
+        let plan = self.raw_data_plan(
+            Some(shard_key),
+            statement,
+            params,
+            RawDataOperation::Execute,
+        )?;
         let shard = plan.as_ref().map_or_else(
             || self.shard_for_key(shard_key.as_bytes()),
-            |plan| plan.shard,
+            |plan| match plan.target {
+                RawDataTarget::Exact(shard) => shard,
+                RawDataTarget::Generated(_) => self.shard_for_key(shard_key.as_bytes()),
+            },
         );
+        if plan
+            .as_ref()
+            .is_some_and(|plan| matches!(plan.target, RawDataTarget::Generated(_)))
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "generated-key INSERT requires the asynchronous Engine coordinator",
+            ));
+        }
         let statement = plan
             .as_ref()
             .map_or(statement, |plan| plan.sqlite_sql.as_str());
@@ -232,10 +357,14 @@ impl Database {
         params: &[Value],
     ) -> EngineResult<Routed<ResultSet>> {
         let _schema_operation = self.storage.enter_schema_operation()?;
-        let plan = self.raw_data_plan(shard_key, statement, params, RawDataOperation::Query)?;
+        let plan =
+            self.raw_data_plan(Some(shard_key), statement, params, RawDataOperation::Query)?;
         let shard = plan.as_ref().map_or_else(
             || self.shard_for_key(shard_key.as_bytes()),
-            |plan| plan.shard,
+            |plan| match plan.target {
+                RawDataTarget::Exact(shard) => shard,
+                RawDataTarget::Generated(_) => unreachable!("query planning cannot generate IDs"),
+            },
         );
         let statement = plan
             .as_ref()
@@ -276,11 +405,11 @@ impl Database {
     }
 }
 
-fn raw_data_execution_shard(
+fn raw_data_execution_target(
     plan: &BoundStatementPlan,
     catalog: &Catalog,
     operation: RawDataOperation,
-) -> EngineResult<u16> {
+) -> EngineResult<RawDataTarget> {
     let behavior_matches_operation = matches!(
         (operation, plan.behavior()),
         (RawDataOperation::Execute, sql::StatementBehavior::Write(_))
@@ -308,7 +437,7 @@ fn raw_data_execution_shard(
         return if inference.kind() == sql::ShardKeyInferenceKind::NotApplicable
             && plan.behavior() == sql::StatementBehavior::Read
         {
-            Ok(0)
+            Ok(RawDataTarget::Exact(0))
         } else {
             Err(EngineError::new(
                 EngineErrorKind::Internal,
@@ -329,7 +458,7 @@ fn raw_data_execution_shard(
             "catalog-placed tables cannot execute as client SQL",
         )),
         TablePlacement::Global => match plan.behavior() {
-            sql::StatementBehavior::Read => Ok(0),
+            sql::StatementBehavior::Read => Ok(RawDataTarget::Exact(0)),
             sql::StatementBehavior::Write(_) => Err(EngineError::new(
                 EngineErrorKind::Unsupported,
                 "raw writes to global tables require an explicit replication operation",
@@ -342,16 +471,25 @@ fn raw_data_execution_shard(
             }
         },
         TablePlacement::Sharded(_) => match inference.kind() {
-            sql::ShardKeyInferenceKind::Exact | sql::ShardKeyInferenceKind::Multiple => {
-                plan.assigned_shard().ok_or_else(|| {
+            sql::ShardKeyInferenceKind::Exact | sql::ShardKeyInferenceKind::Multiple => plan
+                .assigned_shard()
+                .map(RawDataTarget::Exact)
+                .ok_or_else(|| {
                     EngineError::new(
                         EngineErrorKind::Unsupported,
                         "raw sharded statement does not have one executable physical shard",
                     )
-                })
-            }
-            sql::ShardKeyInferenceKind::Unconstrained
-            | sql::ShardKeyInferenceKind::Contradiction => Err(EngineError::new(
+                }),
+            sql::ShardKeyInferenceKind::Unconstrained => plan
+                .generated_insert()
+                .map(|generated| RawDataTarget::Generated(generated.table_id()))
+                .ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::Unsupported,
+                        "raw sharded statement requires a finite single-shard key constraint",
+                    )
+                }),
+            sql::ShardKeyInferenceKind::Contradiction => Err(EngineError::new(
                 EngineErrorKind::Unsupported,
                 "raw sharded statement requires a finite single-shard key constraint",
             )),

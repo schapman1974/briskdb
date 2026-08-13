@@ -475,7 +475,7 @@ new insert. Manifest digest version 3 covers both lifecycle fields and both
 provisioning tables. Native policy activation proves exact `INTEGER PRIMARY KEY
 AUTOINCREMENT` storage and installs disjoint owner-local `sqlite_sequence`
 floors on every shard before catalog authority is published. Omitted-key
-dialect parsing and DDL rewriting remain later work.
+dialect parsing and DDL rewriting are connected durably by version 12 below.
 
 Version 11 adds the `briskdb_hilo_leases` allocation head and manifest digest
 version 4. An active `hilo_v1` table has exactly one row with fixed block size
@@ -489,6 +489,23 @@ cancellation, constraint failure, or an ambiguous commit. No timestamp, lease
 expiry, or wall clock participates. The v10-to-v11 migration creates an empty
 lease table, raises the downgrade fence, and changes no policy, shard, or
 application row.
+
+Version 12 adds the retained `briskdb_generated_table_ddl` singleton and
+manifest digest version 5. `Database::apply_generated_table_ddl` parses exactly
+one supported SQLite/PostgreSQL/MySQL declaration, emits canonical SQLite, and
+derives one native-range Sharded declaration. The bridge stores the exact
+source dialect/bytes and version-1 logical identity separately from the
+canonical SQL and its ordinary physical migration identity. Lifecycle
+`ApplyingPhysical` begins the bridge and physical migration in one manifest
+transaction; `Provisioning` retains their completed schema digest and links it
+to the table-provisioning identity; `Complete` atomically publishes the active
+policy and stable table ID while clearing transient provisioning rows. The
+retained provisioning-time digest keeps that identity auditable after later
+schema migrations advance the current digest. Startup resumes either durable
+prefix from the reconstructed declaration and never reparses journal text to
+infer authority. The v11-to-v12 migration itself is manifest-only: it adds an
+empty bridge table, raises the downgrade fence, advances the semantic root to
+version 5, and changes no shard or application row.
 
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4
@@ -515,6 +532,8 @@ raises the fence, and installs checksum version 3. A migrated native policy must
 therefore be explicitly reprovisioned before it may generate a new key.
 The v10-to-v11 step is likewise manifest-only: it creates the empty durable
 hi/lo allocation table, raises the fence, and installs checksum version 4.
+The v11-to-v12 step adds the empty durable generated-table DDL bridge, raises
+the fence, and installs checksum version 5 without changing a shard.
 There is no automatic downgrade; an older binary requires a backup from before
 the newer format.
 
@@ -540,16 +559,20 @@ lock through independently durable per-shard work and `Ready` publication. A
 lagging opener re-reads `Ready` and strictly validates instead of provisioning
 from a stale `Creating` observation. Only a locked, durable `Creating` state
 permits missing canonical shard files to be created and WAL to be enabled. The
-validated v11 manifest may also contain one active table-provisioning record.
-Startup then keeps admission `Pending`, revalidates the complete declarations
-and committed schema digest, and resumes the ascending `next_shard` prefix. A
+validated v12 manifest may also retain one generated-table DDL bridge and one
+matching active table-provisioning record. Startup first resumes any
+`Applying` physical migration under its ordinary exact-prefix rules. It then
+keeps admission `Pending`, advances the bridge from `ApplyingPhysical` to
+`Provisioning`, creates or validates provisioning from the bridge's trusted
+derived declaration, and resumes the ascending `next_shard` prefix. A
 shard-local sequence seed commits before its separate manifest acknowledgement;
 if process loss lands between those boundaries, startup repeats that same seed
 idempotently rather than skipping it. Only after all shards are durable does one
-manifest transaction activate generated policies, create the initial hi/lo
-allocation row where required, clear the transient journal, reseal digest
-version 4, and publish the replacement catalog. A conflict never
-causes BriskDB to infer a new request from partial shard state.
+manifest transaction activate generated policy, clear the transient journal,
+record the stable table ID, seal the bridge `Complete`, reseal digest version 5,
+and publish the replacement catalog. A standalone table-provisioning journal
+retains its existing recovery path. A conflict never causes BriskDB to infer a
+new request from partial shard state.
 
 The final strict shard opens and catalog reconciliation complete before the
 startup guard publishes `Ready`; ordinary work is never served against a
@@ -743,7 +766,10 @@ but before acknowledgement repeats that shard; a crash at any other boundary
 resumes the exact identity, never a guessed request. Only final manifest
 publication activates policy and clears the journal. Every later shard
 admission rejects missing, duplicate, malformed, out-of-owner, or row-lagging
-allocator state. Omitted-key SQL translation belongs to issue #130.
+allocator state. Issue #130's structural SQL frontend recognizes the finite
+generated declarations, records `native_range_v1` intent beside canonical
+physical SQLite DDL, and authorizes one omitted-key row only after this
+catalog state is active.
 
 The version-1 hi/lo value sets bit 61 and stores one global per-table sequence
 in bits 60 through 0:
@@ -819,39 +845,49 @@ The wrapper reconciles stock-SQLite transaction and savepoint callbacks, then
 performs the fallible child commit before acknowledging success. Physical
 constraints and conservatively admitted co-located foreign keys remain
 authoritative. A narrow preflighted `native_range_v1` seam can arm one
-single-row omitted-key insert for an already admitted shard. It checks range
-capacity under the pinned child lock, omits the physical ID column, captures
-`INSERT ... RETURNING id` on that same handle, validates the owner and sequence,
-and publishes a protocol-neutral `GeneratedKey` only after successful
-reconciliation. Generic NULL inserts and a second generated callback remain
-rejected. The same one-shot seam accepts `hilo_v1`: it leases and irrevocably
-consumes an ID before any target-shard lock, hashes the encoded value to its
-owner, inserts it explicitly with `RETURNING`, and verifies the returned key.
-Because that allocation may select any shard, a transaction that already
-pinned a child rejects a later hi/lo insert. Engine/HTTP omitted-key planning,
-Global writes, multi-shard
-transactions, caller-authored `RETURNING`, defaults, generated columns, and
-triggers remain later work.
+single-row insert whose generated column is absent from the AST column list.
+Engine leaves native owner selection to the writable registry. A per-table
+atomic cursor rotates the first candidate, and the lower runner attempts one
+active owner's bounded pool capacity at a time without waiting. It skips a busy
+candidate; after pinning a candidate it checks range capacity under the child
+lock, and an exhausted unmutated child is released before fallback. The chosen
+child omits the physical ID column, captures `INSERT ... RETURNING id` on that
+same handle, validates the owner and sequence, and publishes a protocol-neutral
+`GeneratedKey` only after successful reconciliation. An explicit `NULL`,
+omitted-key multi-row insert, and second generated callback remain rejected.
+The same one-shot seam accepts `hilo_v1`: Engine first reserves every possible
+target shard's capacity, then the coordinator leases and irrevocably consumes
+an ID before any target-shard write lock, hashes the encoded value to its owner,
+inserts it explicitly with `RETURNING`, and verifies the returned key. Because
+that allocation may select any shard, a transaction that already pinned a child
+rejects a later hi/lo insert. Engine, prepared-portal, and HTTP omitted-key
+planning consume this seam. Global writes, generated multi-row inserts,
+multi-shard transactions, caller-authored `RETURNING`, defaults, generated
+columns, and triggers remain later work.
 
 Engine integration has two independent opt-ins. The binary must be compiled
 with `experimental-vtab`, and `EngineOptions::with_experimental_vtab_writes(true)`
 must enable the runtime gate; the server exposes that option as
 `--experimental-vtab-writes` and
 `BRISKDB_EXPERIMENTAL_VTAB_WRITES=true`. The gate is false by default even in an
-all-features build. When it is true, only a populated-catalog raw Engine write
-that planning has already proven to be one Sharded owner is dispatched through
-an ephemeral writable coordinator. The engine retains its lifecycle, schema,
-session, per-shard capacity, worker, cancellation, deadline, route-reporting,
-and error boundaries while the coordinator supplies the physical affected-row
-count and acknowledges success only after its child commit. Empty-catalog SQL,
-Global and Catalog placement, prepared portals, and all reads retain their
-established execution paths.
+all-features build. When it is true, a populated-catalog Engine write is
+dispatched through an ephemeral writable coordinator only after planning has
+proven one explicit Sharded owner or one single-row generated allocator intent.
+Prepared portal execution uses that same rule. The engine retains its
+lifecycle, schema, session, capacity, worker, cancellation, deadline,
+route-reporting, and error boundaries while the coordinator supplies the
+physical affected-row count, optional generated key, and acknowledges success
+only after its child commit. Empty-catalog SQL, Global and Catalog placement,
+and all reads retain their established execution paths.
 
 Physical table descriptors discovered from shard 0 are immutable for one schema
 generation and cached per Engine. Cold discovery is serialized, cancellable,
 and charged to shard 0's connection capacity; warm coordinators open no shard-0
-handle and reserve only their target shard, so an occupied shard 0 cannot stall
-writers whose metadata is already warm. A published schema-generation mismatch
+handle. Explicit-key DML reserves only its already planned target. A native
+generated write retains at most one non-waiting candidate reservation and may
+replace it while falling back around busy or exhausted owners. Hi/lo reserves
+capacity on every shard in stable order because it learns its hash-routed owner
+only after consuming a durable lease. A published schema-generation mismatch
 invalidates the cache and forces controlled rediscovery before another write.
 
 This integration is intentionally autocommit-only. Each `Engine::execute`,
@@ -903,8 +939,12 @@ The local engine owns one independent pool per physical shard. `EngineOptions`
 defaults each pool to four active connections and a queue of 32 admitted
 operations. Connections are created lazily, up to the active limit, and are
 reused after successful cleanup. Admission occurs on the asynchronous side
-before work is handed to a Tokio blocking worker, so waiting for a shard slot
-does not occupy an unbounded set of blocking threads.
+before work is handed to a Tokio blocking worker, so waiting for an exact shard
+slot does not occupy an unbounded set of blocking threads. Target-unknown native
+generation is the bounded exception: after taking one worker, it makes only
+non-waiting pool attempts against one rotating candidate at a time and never
+holds the worker while queued for capacity. Hi/lo reserves every possible
+target capacity on the asynchronous side before its worker may consume an ID.
 
 Custom options allow 1–16 active connections and 1–1,024 queued operations per
 shard. Construction also enforces an aggregate limit of 512
@@ -928,6 +968,10 @@ When a shard has no active slot and its admission queue is full, a new operation
 fails immediately with retryable `Busy`, which the HTTP adapter maps to 503.
 Capacity for routed work belongs to its selected shard: saturation on shard A
 neither consumes shard B's slots nor delays work already admitted there.
+For native omitted-key generation, an immediately unavailable candidate is
+skipped. If the scan completes without a selection, any observed busy candidate
+yields `Busy`; `LimitExceeded` requires every active owner to be proven
+exhausted.
 
 A logical multi-shard read admits one outer operation and schedules no more
 than eight shard tasks at once. Each child uses the independent pool for its

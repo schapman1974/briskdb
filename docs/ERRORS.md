@@ -70,8 +70,21 @@ configured connection slots active and its per-shard admission queue is full.
 The HTTP response is therefore the fixed 503 problem detail above. Admission
 accounting is per shard, so one shard returning `Busy` does not by itself imply
 that another shard is saturated. Routed single-shard requests consume only
-their selected pool. Schema migration instead uses an in-process gate shared by
-handles for the same canonical root, plus fresh coordinator-owned connections.
+their selected pool.
+
+Public native omitted-key execution is the bounded exception to queueing. Its
+target is not known before a worker starts, so the lower runner tries an
+immediate active-slot and admission reservation for one per-table round-robin
+candidate at a time. It skips a `Busy` candidate and tries the next without
+holding two candidate reservations or waiting on a queue. If no candidate
+is selected after the candidate scan and at least one was busy, the operation
+returns retryable `Busy`; only if every active owner was successfully pinned
+and proven sequence-exhausted does it return non-retryable `LimitExceeded`.
+Hi/lo instead reserves all possible target pools before it consumes an
+irrevocable allocation.
+
+Schema migration instead uses an in-process gate shared by handles for the same
+canonical root, plus fresh coordinator-owned connections.
 While that gate is `Migrating`, new
 ordinary operations and another migration coordinator receive retryable
 `Busy`. Clients that retry should use the same bounded exponential backoff and

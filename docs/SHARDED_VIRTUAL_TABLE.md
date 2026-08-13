@@ -51,19 +51,30 @@ maps `--experimental-vtab-writes` and
 
 With both gates enabled, `Engine::execute`, `Engine::execute_write`, and HTTP
 `/v1/execute` dispatch a write through the coordinator only after the
-authoritative catalog, common SQL frontend, bound values, caller route, and
-single-owner write policy have accepted one Sharded target. The returned
-`shard` remains the planner's assigned owner. `rows_affected` comes from the
-reconciled physical child, and a successful response is produced only after the
-autocommit child transaction commits under BriskDB's configured SQLite WAL and
-synchronous policy. The endpoint's request and response shapes do not change.
+authoritative catalog, common SQL frontend, bound values, routing policy, and
+generated-key policy have accepted either one explicit Sharded target or one
+omitted-key allocator intent. For an explicit key, returned `shard` remains the
+planner's assigned owner; for an omitted key, it is the allocator's actual
+owner. `rows_affected` comes from the reconciled physical child, and a
+successful response is produced only after the autocommit child transaction
+commits under BriskDB's configured SQLite WAL and synchronous policy. Existing
+HTTP responses retain their shape; only a generated insert adds the optional
+`generated_key` object documented in [generated keys](GENERATED_KEYS.md).
 
 The Engine caches the validated physical table descriptors for the current
 schema generation. One serialized cold bootstrap discovers them through a
 cancellable, shard-0-capacity-accounted read-only handle. Warm coordinator
-opens reuse those immutable descriptors and reserve only the DML target shard,
-preserving independent-shard writer progress. Schema-generation publication
-invalidates the cache and makes the next write rediscover descriptors.
+opens reuse those immutable descriptors. Explicit-key DML reserves only its
+already planned target shard, preserving independent-shard writer progress.
+Public native generated writes do not preselect an exact owner in Engine. The
+writable registry builds a per-table candidate list whose start rotates with a
+round-robin cursor. After its worker starts, Engine attempts a non-waiting
+bounded-pool reservation for one candidate at a time; a busy candidate is
+skipped without queuing, and its permit is never held alongside another
+candidate's. Hi/lo learns its hash-routed owner only after consuming a lease,
+so the runner instead reserves capacity on every shard in stable order before
+entering the coordinator. Schema-generation publication invalidates the cache
+and makes the next write rediscover descriptors.
 
 For a target table declaring `native_range_v1`, an explicit valid native ID is
 routed through its persisted allocation owner at planning, pool admission,
@@ -76,21 +87,25 @@ route. Every value at or above the marker belongs to a generated-ID namespace
 and a caller-authored INSERT is rejected; only the allocator may introduce a
 hi/lo ID.
 
-The coordinator also has a narrow generated-insert seam for issue #130's
-planner. A caller that has already proven one omitted-key row can arm exactly
-one callback. For `native_range_v1`, the caller may select an eligible shard;
-the child uses `INSERT ... RETURNING id`, checks `sqlite_sequence` and decoded
-ownership on the same pinned handle, and retains the generated key only after
-successful reconciliation. For `hilo_v1`, the coordinator first irrevocably
-consumes an ID from a durable manifest-leased block, hashes that encoded value
-to its target shard, inserts it explicitly with `RETURNING`, and verifies the
-returned value. Leasing occurs before any target-shard write lock. A transaction
-that already pinned a child therefore rejects later hi/lo generation instead
-of moving to another shard. `Engine::execute_write` has the protocol-neutral
-result shape needed to carry that data, but every currently accepted Engine
-statement returns `generated_key: None`: Engine and HTTP SQL planning still
-reject omitted shard keys. Dialect translation, Engine invocation, and public
-response rendering belong to #130.
+The coordinator also has the narrow generated-insert seam consumed by issue
+#130's planner. After the shared AST and catalog policy prove exactly one row
+whose generated column is absent from the column list, execution arms exactly
+one callback. For `native_range_v1`, the registry visits active owners from its
+per-table rotating start. Once one candidate has immediate pool capacity, the
+coordinator pins that child and checks its `sqlite_sequence` range under the
+child lock. An exhausted candidate is released without mutation before another
+candidate is admitted. The first active, immediately admitted, non-exhausted
+owner uses `INSERT ... RETURNING id`; ownership and sequence are validated on
+that same handle, and the generated key is retained only after successful
+reconciliation. For `hilo_v1`, the coordinator first irrevocably consumes an
+ID from a durable manifest-leased block, hashes that encoded value to its target
+shard, inserts it explicitly with `RETURNING`, and verifies the returned value.
+Leasing occurs before any target-shard write lock, but only after Engine has
+reserved every possible target's pool capacity. A transaction that already
+pinned a child therefore rejects later hi/lo generation instead of moving to
+another shard. `Engine::execute_write`, prepared portal execution, and HTTP
+`/v1/execute` carry the same protocol-neutral result. The exact syntax, result
+shape, and gates are in [generated keys](GENERATED_KEYS.md).
 
 Each hi/lo manifest write reserves 4,096 global per-table sequence values and
 records a monotonic fence plus a random 32-byte process incarnation. There is no
@@ -105,7 +120,9 @@ The integration opens an ephemeral coordinator for one statement. It does not
 retain a coordinator in `Session`, and it does not add `BEGIN`, `COMMIT`,
 `ROLLBACK`, read-your-writes, or any transaction spanning requests. Those need
 the later protocol-neutral transaction state machine and shard-pinning policy.
-Prepared portals are also unchanged in this step.
+Prepared portals remain logical cached objects rather than coordinator handles;
+a generated portal opens a fresh coordinator for each execution and returns
+`PreparedExecution::GeneratedWrite`.
 
 Reads deliberately stay on the established paths. Engine logical reads and
 HTTP `/v1/query` still select physical targets from catalog metadata and use
@@ -233,18 +250,22 @@ This is why several alternatives are excluded:
 
 ## Current non-goals
 
-The writable coordinator provides explicit-key DML and the preflighted
-single-row native allocation seam on one pinned Sharded child. The opt-in
-Engine/HTTP integration currently exposes only explicit-key one-statement
-autocommit writes. It does not provide general missing-key SQL, replicated
-Global writes, multi-shard or session transactions, caller-authored
+The writable coordinator provides explicit-key DML and a preflighted
+single-row generated allocation seam that mutates exactly one pinned Sharded
+child. Native selection may pin and release earlier unmutated exhausted
+candidates, but never retains or writes two children. Opt-in Engine,
+prepared-portal, and HTTP execution expose that exact omitted-key shape. They do
+not provide arbitrary missing-key/default behavior, generated
+multi-row inserts, replicated Global writes, multi-shard or session
+transactions, caller-authored
 `RETURNING`, physical defaults, generated columns, physical triggers,
 client-created virtual-table indexes or triggers, `ALTER TABLE`,
 aggregate/order/limit/join pushdown, parallel shard scans, or a public
 virtual-table query API. The physical-default restriction is intentional:
 SQLite's `xUpdate` arguments do not distinguish an omitted column from explicit
 `NULL`, so only an AST-preflighted intent may enable allocation. Omitted-key SQL
-integration remains owned by #130, and the broader rollout gate by #131.
+is limited to the issue #130 contract, and the broader rollout gate remains
+#131.
 
 The established protocol planner stays authoritative. The writable coordinator
 is kept behind both `experimental-vtab` and the runtime option and cannot be

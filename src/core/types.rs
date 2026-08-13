@@ -171,9 +171,7 @@ impl GeneratedKey {
 ///
 /// The native-range allocation contract accepts at most one automatically
 /// generated row per statement, so `generated_key` is singular. Statements
-/// with explicit keys, updates, and deletes return `None`. The current public
-/// Engine SQL planner also returns `None` because omitted generated-key
-/// planning remains roadmap issue #130.
+/// with explicit keys, updates, and deletes return `None`.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct WriteResult {

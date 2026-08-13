@@ -1,7 +1,7 @@
 # Prepared statements and bound portals
 
 Status: implemented for roadmap issue #26, with logical read execution from
-issue #57
+issue #57 and generated-write results from issue #130
 
 BriskDB exposes one protocol-neutral lifecycle for SQL submitted by SQLite,
 PostgreSQL, MySQL, and future adapters. A frontend owns a `Session`, explicitly
@@ -50,6 +50,10 @@ async fn example(
         PreparedExecution::AffectedRows(rows) => {
             // Encode the command count for the calling protocol.
             let _ = rows;
+        }
+        PreparedExecution::GeneratedWrite(write) => {
+            // Encode both the command count and captured generated key.
+            let _ = write;
         }
         _ => {}
     }
@@ -329,11 +333,17 @@ These paths remain outside the current lifecycle:
 - persistent DDL outside the journaled schema-migration API;
 - explicit transaction state and shard pinning.
 
-Cataloged sharded DML must already satisfy the single-shard policy in
-[SQL planning](SQL_PLANNING.md). A cataloged read with finite inference, or one
-accepted through the bind-time routing fallback, can execute when it has one
-assigned shard. The shared classifier is authoritative; SQLite's ability to
-compile a statement or report columns never grants execution permission.
+Cataloged sharded DML must already satisfy the policy in
+[SQL planning](SQL_PLANNING.md). Explicit-key DML executes only with one
+assigned shard. A single-row INSERT that omits an active catalog-declared
+generated shard key instead retains allocator intent. Native execution rotates
+a per-table candidate list and admits at most one immediately available,
+non-exhausted owner at a time; hi/lo reserves all possible target capacities
+before allocation. Both report the actual shard. A cataloged read with finite
+inference, or one accepted through the bind-time routing fallback, can execute
+when it has one assigned shard. The shared classifier is authoritative;
+SQLite's ability to compile a statement or report columns never grants
+execution permission.
 
 Persistent `CREATE TABLE` and `CREATE INDEX` are classified as `Schema`, but
 ordinary shard authorizer policy denies them during transient preparation with
@@ -345,7 +355,13 @@ SQLite transiently prepares and executes the retained canonical SQLite SQL on
 the selected target or targets. Classified reads produce either the
 compatibility `Routed<PreparedExecution::Rows(ResultSet)>` or logical
 `Executed<PreparedExecution::Rows(ResultSet)>`; commands remain routed
-`PreparedExecution::AffectedRows(usize)` results. A
+`PreparedExecution::AffectedRows(usize)` results, except that a supported
+omitted-key insert returns `PreparedExecution::GeneratedWrite(WriteResult)`.
+That result contains the affected-row count and the catalog column plus integer
+value captured by the committing child operation. Explicit-key writes retain
+`AffectedRows`. Generated portal execution requires both gates documented in
+[generated keys](GENERATED_KEYS.md), and omitted-key multi-row inserts fail
+before a portal is published or data is mutated. A
 disagreement between classified behavior and SQLite execution metadata is an
 `Internal` invariant failure. Row results preserve ordered
 metadata, duplicate names, positional values, and the normal exact result row
@@ -432,9 +448,9 @@ the same planning and result path:
 
 | Input | Required mode and parameter form | Prepared execution result |
 | --- | --- | --- |
-| SQLite | `StrictSqlite` for exact normalized SQLite, or explicit finite `Compatibility`; `?` / `?N` | Protocol-neutral routed or logical rows, or routed affected-row count |
-| PostgreSQL | `Compatibility`; `$N` identities, including repeats and gaps | Same protocol-neutral routed/logical rows or routed affected-row count |
-| MySQL | `Compatibility`; each `?` numbered left-to-right | Same protocol-neutral routed/logical rows or routed affected-row count |
+| SQLite | `StrictSqlite` for exact normalized SQLite, or explicit finite `Compatibility`; `?` / `?N` | Protocol-neutral routed/logical rows, affected-row count, or generated write |
+| PostgreSQL | `Compatibility`; `$N` identities, including repeats and gaps | Same protocol-neutral result; PostgreSQL OID/wire mapping remains issue #33 |
+| MySQL | `Compatibility`; each `?` numbered left-to-right | Same protocol-neutral result; MySQL generated-key/wire mapping remains issue #44 |
 
 Each protocol adapter owns its message framing, authentication,
 statement/portal naming, wire parameter decoding, result type encoding, close

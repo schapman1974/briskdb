@@ -135,8 +135,10 @@ therefore required before calling the driver interfaces production-ready.
   uniqueness requires a separately designed manifest-owned reservation index.
 - Joins are initially supported only when every participating table is
   co-located on one shard. Distributed joins are a later planner feature.
-- Globally unique identifiers should use application-assigned UUID/ULID-style
-  values. A globally serialized integer sequence is optional future work.
+- Applications may use their own UUID/ULID-style values. Registered Sharded
+  tables may instead opt into a versioned generated-integer policy; the exact
+  single-row SQL and non-gapless allocation contract is documented in
+  [`docs/GENERATED_KEYS.md`](docs/GENERATED_KEYS.md).
 
 ## Milestones
 ### 0. Baseline and compatibility contract
@@ -217,6 +219,16 @@ interrupted schema migration can be diagnosed and resumed.
   bounded per-session prepared-statement cache.
 - [x] Classify statements by read/write/schema/session behavior and block unsafe
   multi-statement combinations.
+- [x] Recognize the documented SQLite `AUTOINCREMENT`, MySQL `AUTO_INCREMENT`,
+  and PostgreSQL `BIGSERIAL`/identity declarations structurally and translate
+  them to one canonical physical SQLite declaration.
+- [x] Plan one omitted generated-key row through the shared engine, capture its
+  ID in the committing operation, expose the protocol-neutral and HTTP result,
+  and reject omitted-key multi-row inserts before mutation.
+- [x] Add one crash-resumable DDL coordinator that durably binds the exact
+  logical generated declaration to its canonical physical migration and
+  catalog-provisioning identity and returns all three identities plus the
+  published table ID through `Database::apply_generated_table_ddl`.
 
 Exit criterion: the same typed request produces the same plan and result through
 the engine regardless of its eventual wire protocol.
@@ -238,7 +250,8 @@ the engine regardless of its eventual wire protocol.
 - [ ] Negotiate explicitly supported newer protocol minor versions from the
   exact 3.0 baseline rather than conflating protocol and server versions.
 - [ ] Map BriskDB types to PostgreSQL OIDs and support text format first, then
-  the binary formats required by tested drivers.
+  the binary formats required by tested drivers (issue #33, including the
+  generated-key result contract).
 - [ ] Implement `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction state, and shard
   pinning. Report PostgreSQL's idle/in-transaction/failed (`I`/`T`/`E`) states
   even where SQLite's native behavior differs.
@@ -271,7 +284,7 @@ inside a single-shard transaction, handle errors, and reconnect cleanly.
 - [ ] Implement `COM_STMT_PREPARE`, parameter metadata,
   `COM_STMT_EXECUTE`, reset, and close.
 - [ ] Map BriskDB types, nulls, status flags, affected rows, generated-key
-  behavior, warnings, MySQL error numbers, and SQLSTATE values.
+  behavior, warnings, MySQL error numbers, and SQLSTATE values (issue #44).
 - [ ] Apply the implemented selected MySQL normalization for backtick
   identifiers, Boolean conventions, `LIMIT offset,count`, and documented type
   aliases to the MySQL wire request lifecycle.

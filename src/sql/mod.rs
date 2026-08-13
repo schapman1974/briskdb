@@ -11,6 +11,7 @@
 
 mod classifier;
 mod dml;
+mod generated;
 mod inference;
 mod normalizer;
 mod parser;
@@ -19,12 +20,13 @@ mod subset;
 mod translator;
 
 pub(crate) use classifier::classify_normalized_statements;
-pub(crate) use dml::{RoutedDml, routed_dml_shape};
+pub(crate) use dml::{GeneratedInsertShape, RoutedDml, generated_insert_shape, routed_dml_shape};
 
 pub use classifier::{
     SchemaBehavior, SessionBehavior, StatementBatchClassification, StatementBehavior,
     WriteBehavior, classify_statements,
 };
+pub use generated::{GeneratedIdPolicyIntent, GeneratedTableIntent};
 pub use inference::{ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue, infer_shard_keys};
 pub use normalizer::{
     MAX_SQL_PARAMETERS, NormalizedSql, StatementParameters, normalize_placeholders,

@@ -16,7 +16,8 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::{
     core::{
-        DataType, Database, Engine, EngineError, Executed, ResultSet, Routed, Statement, Value,
+        DataType, Database, Engine, EngineError, EngineErrorKind, Executed, GeneratedKey,
+        ResultSet, Routed, Statement, Value,
     },
     protocol::error::http_error,
 };
@@ -64,7 +65,8 @@ async fn health(State(state): State<HttpState>) -> Result<Json<JsonValue>, ApiEr
 
 #[derive(Debug, Deserialize)]
 struct RoutedSqlRequest {
-    shard_key: String,
+    #[serde(default)]
+    shard_key: Option<String>,
     sql: String,
     #[serde(default)]
     params: Vec<JsonValue>,
@@ -90,6 +92,15 @@ struct BroadcastRequest {
 struct ExecuteResponse {
     shard: u16,
     rows_affected: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generated_key: Option<ExecuteGeneratedKey>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecuteGeneratedKey {
+    column: String,
+    data_type: &'static str,
+    value: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,18 +130,44 @@ async fn execute(
         .map(json_to_value)
         .collect::<Vec<_>>();
     let session = engine.session();
-    session.set_routing_key(request.shard_key).await?;
+    if let Some(shard_key) = request.shard_key {
+        session.set_routing_key(shard_key).await?;
+    }
     let Routed {
         shard,
-        value: rows_affected,
+        value: write_result,
     } = engine
         .execute_http_request(&session, Statement::new(request.sql, params))
         .await?;
+    let rows_affected = write_result.rows_affected;
+    let generated_key = write_result
+        .generated_key
+        .map(execute_generated_key)
+        .transpose()?;
 
     Ok(Json(ExecuteResponse {
         shard,
         rows_affected,
+        generated_key,
     }))
+}
+
+fn execute_generated_key(generated: GeneratedKey) -> Result<ExecuteGeneratedKey, EngineError> {
+    let (data_type, value) = match generated.value {
+        Value::Int64(value) => ("int64", value.to_string()),
+        Value::UInt64(value) => ("uint64", value.to_string()),
+        _ => {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "the engine returned a non-integer generated key to the HTTP adapter",
+            ));
+        }
+    };
+    Ok(ExecuteGeneratedKey {
+        column: generated.column,
+        data_type,
+        value,
+    })
 }
 
 async fn query(
@@ -802,6 +839,80 @@ mod tests {
                 })
             )
         );
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    #[tokio::test]
+    async fn http_omitted_key_insert_returns_exact_generated_id_and_actual_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 4).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE native_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payload TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "native_events",
+                    ShardKeyMetadata::new("id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap()
+                .with_generated_id_policy(
+                    crate::core::GeneratedIdPolicy::native_range_v1("id").unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let database = Arc::new(database);
+        let options = EngineOptions::new(2, 16)
+            .unwrap()
+            .with_experimental_vtab_writes(true);
+        let engine = Engine::from_database_with_options(Arc::clone(&database), options).unwrap();
+        let application = router_with_engine(engine);
+
+        let (status, body) = request_json(
+            &application,
+            Method::POST,
+            "/v1/execute",
+            Some(json!({
+                "sql": "INSERT INTO native_events (payload) VALUES (?1)",
+                "params": ["from-http"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rows_affected"], json!(1));
+        assert_eq!(body["generated_key"]["column"], json!("id"));
+        assert_eq!(body["generated_key"]["data_type"], json!("int64"));
+        let encoded = body["generated_key"]["value"]
+            .as_str()
+            .expect("generated integer is rendered as an exact decimal string");
+        let id = encoded.parse::<i64>().unwrap();
+        assert_eq!(encoded, id.to_string());
+        let shard = u16::try_from(body["shard"].as_u64().unwrap()).unwrap();
+
+        for candidate in 0..database.shard_count() {
+            assert_eq!(
+                rusqlite::Connection::open(
+                    temp.path().join(format!("shards/{candidate:04}.sqlite"))
+                )
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM native_events WHERE id = ?1 AND payload = 'from-http'",
+                    [id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                i64::from(candidate == shard),
+                "physical shard {candidate}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1658,17 +1769,81 @@ mod tests {
     }
 
     #[test]
-    fn only_reads_may_omit_an_explicit_shard_key() {
-        assert!(
-            serde_json::from_value::<QueryRequest>(json!({"sql": "SELECT payload FROM events"}))
-                .is_ok()
+    fn routed_requests_preserve_or_omit_the_optional_shard_key() {
+        let read = serde_json::from_value::<QueryRequest>(json!({
+            "sql": "SELECT payload FROM events"
+        }))
+        .unwrap();
+        assert_eq!(read.shard_key, None);
+
+        let generated = serde_json::from_value::<RoutedSqlRequest>(json!({
+            "sql": "INSERT INTO events (payload) VALUES (?1)"
+        }))
+        .unwrap();
+        assert_eq!(generated.shard_key, None);
+
+        let explicit = serde_json::from_value::<RoutedSqlRequest>(json!({
+            "shard_key": "tenant-42",
+            "sql": "INSERT INTO events (tenant_key, payload) VALUES (?1, ?2)"
+        }))
+        .unwrap();
+        assert_eq!(explicit.shard_key.as_deref(), Some("tenant-42"));
+    }
+
+    #[test]
+    fn execute_responses_omit_absent_keys_and_encode_generated_integers_exactly() {
+        assert_eq!(
+            serde_json::to_value(ExecuteResponse {
+                shard: 2,
+                rows_affected: 1,
+                generated_key: None,
+            })
+            .unwrap(),
+            json!({"shard": 2, "rows_affected": 1})
         );
-        assert!(
-            serde_json::from_value::<RoutedSqlRequest>(json!({
-                "sql": "INSERT INTO events (tenant_key, payload) VALUES (?1, ?2)"
-            }))
-            .is_err()
-        );
+
+        for (value, data_type, expected) in [
+            (Value::Int64(i64::MAX), "int64", i64::MAX.to_string()),
+            (Value::UInt64(u64::MAX), "uint64", u64::MAX.to_string()),
+        ] {
+            let generated_key =
+                execute_generated_key(GeneratedKey::new("event_id", value)).unwrap();
+            assert_eq!(
+                serde_json::to_value(ExecuteResponse {
+                    shard: 3,
+                    rows_affected: 1,
+                    generated_key: Some(generated_key),
+                })
+                .unwrap(),
+                json!({
+                    "shard": 3,
+                    "rows_affected": 1,
+                    "generated_key": {
+                        "column": "event_id",
+                        "data_type": data_type,
+                        "value": expected,
+                    }
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn execute_response_rejects_impossible_non_integer_generated_values() {
+        for value in [
+            Value::Null,
+            Value::Boolean(true),
+            Value::Float64(1.5),
+            Value::Text("not-an-id".to_owned()),
+            Value::Binary(vec![1, 2, 3]),
+        ] {
+            let error = execute_generated_key(GeneratedKey::new("id", value)).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+            assert_eq!(
+                error.diagnostic(),
+                "the engine returned a non-integer generated key to the HTTP adapter"
+            );
+        }
     }
 
     #[test]

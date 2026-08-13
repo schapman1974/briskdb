@@ -501,6 +501,26 @@ impl WriteCoordinator {
         self.execute_generated_dml_auto(sql, rusqlite::params_from_iter(parameters), table_id)
     }
 
+    /// Execute a native generated write while admitting only the physical
+    /// candidate currently being inspected. The callback's capacity must
+    /// remain retained until it is invoked for another shard or this method
+    /// returns.
+    pub(crate) fn execute_generated_dml_values_auto_admitted<F>(
+        &mut self,
+        sql: &str,
+        parameters: &[Value],
+        table_id: u64,
+        admit: F,
+    ) -> EngineResult<CoordinatorWriteResult>
+    where
+        F: Fn(u16) -> EngineResult<()> + Send + Sync + 'static,
+    {
+        let parameters = crate::sql::sqlite_parameters(parameters)?;
+        let _admission =
+            GeneratedShardAdmissionArm::install(Arc::clone(&self.registry), Arc::new(admit))?;
+        self.execute_generated_dml_auto(sql, rusqlite::params_from_iter(parameters), table_id)
+    }
+
     pub(crate) fn begin(&mut self) -> EngineResult<()> {
         self.ensure_usable()?;
         if !self.connection.is_autocommit() {
@@ -1734,6 +1754,15 @@ impl GeneratedInsertTargets {
 }
 
 impl Registry {
+    fn admit_generated_shard(&self, shard: u16) -> EngineResult<()> {
+        let admission = self
+            .generated_shard_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        admission.map_or(Ok(()), |admit| admit(shard))
+    }
+
     fn generated_insert_targets(&self, spec: &TableSpec) -> EngineResult<Box<[u16]>> {
         if spec.targets.is_empty() {
             return Err(EngineError::new(
@@ -1901,6 +1930,41 @@ impl Registry {
 struct GeneratedInsertIntent {
     request: GeneratedInsertRequest,
     consumed: bool,
+}
+
+struct GeneratedShardAdmissionArm {
+    registry: Arc<Registry>,
+}
+
+impl GeneratedShardAdmissionArm {
+    fn install(
+        registry: Arc<Registry>,
+        admission: Arc<super::GeneratedShardAdmission>,
+    ) -> EngineResult<Self> {
+        let mut slot = registry
+            .generated_shard_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_some() {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "generated-shard admission is already installed",
+            ));
+        }
+        *slot = Some(admission);
+        drop(slot);
+        Ok(Self { registry })
+    }
+}
+
+impl Drop for GeneratedShardAdmissionArm {
+    fn drop(&mut self) {
+        *self
+            .registry
+            .generated_shard_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 struct GeneratedInsertArm {
@@ -2407,10 +2471,19 @@ impl WriteTransaction {
         let pinned_shard = self.child.as_ref().map(|child| child.shard);
         let may_fallback = targets.permits_capacity_fallback() && pinned_shard.is_none();
         let mut selected = None;
+        let mut admission_error = None;
         let candidates = targets.candidates();
         for &shard in candidates {
             if pinned_shard.is_some_and(|pinned| pinned != shard) {
                 continue;
+            }
+            match registry.admit_generated_shard(shard) {
+                Ok(()) => {}
+                Err(error) if may_fallback && error.kind() == EngineErrorKind::Busy => {
+                    admission_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
             let owner = owners.owner_for_physical_shard(shard).ok_or_else(|| {
                 EngineError::new(
@@ -2436,6 +2509,9 @@ impl WriteTransaction {
             }
         }
         let Some((shard, owner)) = selected else {
+            if let Some(error) = admission_error {
+                return Err(error);
+            }
             return Err(EngineError::new(
                 if pinned_shard.is_some() {
                     EngineErrorKind::FailedPrecondition
