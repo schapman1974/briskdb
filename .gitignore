@@ -1,1 +1,7 @@
 /target
+/dist
+/.venv
+/python/python/briskdb/_briskdb*.so
+/python/python/briskdb/_briskdb*.pyd
+__pycache__/
+*.pyc

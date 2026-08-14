@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin==1.14.1"]
+build-backend = "maturin"
+
+[project]
+name = "briskdb"
+dynamic = ["version"]
+description = "In-process sharded SQLite through BriskDB's native Rust engine"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "BriskDB contributors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.urls]
+Repository = "https://github.com/schapman1974/briskdb"
+Issues = "https://github.com/schapman1974/briskdb/issues"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+python-source = "python"
+module-name = "briskdb._briskdb"
+features = ["pyo3/extension-module"]
+strip = true

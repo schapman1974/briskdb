@@ -145,3 +145,65 @@ jobs:
 
       - name: Run documentation tests
         run: cargo test --locked --doc --all-features
+
+  python:
+    name: Python source build (${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+          - "3.9"
+          - "3.14"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal --component clippy
+
+      - name: Select Rust 1.85
+        run: rustup default 1.85.0
+
+      - name: Install Python ${{ matrix.python }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: python/pyproject.toml
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: python-${{ matrix.python }}
+
+      - name: Install pinned build frontend
+        run: python -m pip install maturin==1.14.1
+
+      - name: Build wheel from source
+        run: maturin build --manifest-path python/Cargo.toml --locked --out dist
+
+      - name: Install wheel and run Python tests
+        run: |
+          python -m pip install --force-reinstall dist/*.whl
+          python -m unittest discover -s python/tests -v
+
+      - name: Test and lint the native extension
+        run: |
+          cargo test --locked -p briskdb-python
+          cargo clippy --locked -p briskdb-python --all-targets --no-deps -- -D warnings
+
+      - name: Verify Python dependency boundary
+        run: |
+          forbidden_dependencies="$(
+            cargo tree --locked -p briskdb-python --edges normal --prefix none |
+              awk '$1 ~ /^(anyhow|axum|clap|hyper|hyper-util|pgwire|tokio-util|tower|tracing-subscriber)$/ { print $1 }' |
+              sort -u
+          )"
+          if [ -n "$forbidden_dependencies" ]; then
+            echo "Python extension unexpectedly includes: $forbidden_dependencies"
+            exit 1
+          fi

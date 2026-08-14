@@ -1,0 +1,18 @@
+[package]
+name = "briskdb-python"
+version = "0.1.0-alpha.3"
+edition = "2024"
+rust-version = "1.85"
+description = "Native Python bindings for embedded BriskDB"
+license = "MIT"
+repository = "https://github.com/schapman1974/briskdb"
+publish = false
+
+[lib]
+name = "_briskdb"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+briskdb = { path = "..", default-features = false, features = ["embedded"] }
+pyo3 = { version = "=0.29.2", features = ["abi3-py39"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time"] }
