@@ -564,6 +564,7 @@ fn checkpoint_to_python(py: Python<'_>, report: CheckpointReport) -> PyResult<Py
 
 #[pymodule]
 fn _briskdb(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    error::register(module)?;
     module.add_class::<Config>()?;
     module.add_class::<Database>()?;
     module.add_class::<Session>()?;
