@@ -1,0 +1,207 @@
+name: Python distributions
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/python-wheels.yml"
+      - ".github/workflows/release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "LICENSE"
+      - "python/**"
+      - "src/**"
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+jobs:
+  sdist:
+    name: Python sdist, metadata, and typing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Select Rust 1.85
+        run: rustup default 1.85.0
+
+      - name: Install Python 3.14
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: python/pyproject.toml
+
+      - name: Install pinned packaging tools
+        run: >-
+          python -m pip install
+          maturin==1.14.1
+          mypy==1.19.1
+          packaging==26.3
+          twine==7.0.0
+
+      - name: Check Rust, extension, and build metadata parity
+        run: python python/scripts/check_versions.py
+
+      - name: Type-check the public API at the minimum Python version
+        env:
+          MYPYPATH: python/python
+        run: python -m mypy --strict --python-version 3.9 python/tests/typing_contract.py
+
+      - name: Build and inspect the source distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          maturin sdist --manifest-path python/Cargo.toml --out dist
+          sdists=(dist/*.tar.gz)
+          if [[ ${#sdists[@]} -ne 1 || ! -f "${sdists[0]}" ]]; then
+            echo "expected exactly one source distribution" >&2
+            exit 1
+          fi
+          python python/scripts/check_dist.py --sdist "${sdists[0]}"
+          python -m twine check "${sdists[0]}"
+
+      - name: Install the sdist and run the Python suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/briskdb-sdist"
+          "$RUNNER_TEMP/briskdb-sdist/bin/python" -m pip install dist/*.tar.gz
+          "$RUNNER_TEMP/briskdb-sdist/bin/python" -m unittest discover -s python/tests -v
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: briskdb-python-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  wheels:
+    name: Python wheel (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: manylinux_2_28_x86_64
+            manylinux: "2_28"
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: manylinux_2_28_aarch64
+            manylinux: "2_28"
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macosx_11_0_x86_64
+            manylinux: auto
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            platform: macosx_11_0_arm64
+            manylinux: auto
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Python 3.14 for build inspection
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+
+      - name: Build the abi3 wheel under the fixed platform policy
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.14.1
+          rust-toolchain: 1.85.0
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: >-
+            --release
+            --locked
+            --compatibility pypi
+            --manifest-path python/Cargo.toml
+            --out dist
+
+      - name: Check wheel contents, metadata, and exact tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install check-wheel-contents==0.6.3 packaging==26.3
+          wheels=(dist/*.whl)
+          if [[ ${#wheels[@]} -ne 1 || ! -f "${wheels[0]}" ]]; then
+            echo "expected exactly one wheel" >&2
+            exit 1
+          fi
+          check-wheel-contents "${wheels[0]}"
+          python python/scripts/check_dist.py \
+            --wheel "${wheels[0]}" \
+            --platform "${{ matrix.platform }}"
+
+      - name: Audit manylinux dependencies and symbols
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install auditwheel==6.8.0
+          auditwheel show dist/*.whl | tee "dist/${{ matrix.platform }}-AUDIT.txt"
+
+      - name: Inspect macOS dynamic-library dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install delocate==0.13.0
+          delocate-listdeps --all dist/*.whl | tee "dist/${{ matrix.platform }}-AUDIT.txt"
+
+      - name: Install and test wheel on CPython 3.9
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.9"
+
+      - name: Run minimum-version wheel tests without a source build
+        run: |
+          python -m pip install --no-index --only-binary=:all: --force-reinstall dist/*.whl
+          python -m unittest discover -s python/tests -v
+
+      - name: Install and test wheel on CPython 3.14
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+
+      - name: Run maximum-version wheel tests without a source build
+        run: |
+          python -m pip install --no-index --only-binary=:all: --force-reinstall dist/*.whl
+          python -m unittest discover -s python/tests -v
+          python -m pip install mypy==1.19.1
+          python -m mypy --strict --python-version 3.9 python/tests/typing_contract.py
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: briskdb-python-wheel-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload native dependency audit
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: briskdb-python-audit-${{ matrix.platform }}
+          path: dist/*-AUDIT.txt
+          if-no-files-found: error
+          retention-days: 7

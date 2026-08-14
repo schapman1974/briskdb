@@ -1,5 +1,6 @@
 import datetime
 import decimal
+import importlib.metadata
 import math
 import random
 import subprocess
@@ -9,11 +10,15 @@ import threading
 import time
 import unittest
 import uuid
+from pathlib import Path
 
 import briskdb
 
 
 class EmbeddedBriskDbTests(unittest.TestCase):
+    def test_distribution_and_native_versions_match(self) -> None:
+        self.assertEqual(importlib.metadata.version("briskdb"), briskdb.__version__)
+
     def test_validated_configuration_reaches_the_engine(self) -> None:
         with tempfile.TemporaryDirectory() as data_dir:
             config = briskdb.Config(
@@ -278,6 +283,17 @@ session.query("SELECT 1")
             timeout=20,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_corrupt_manifest_fails_closed_with_a_stable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as data_dir:
+            database = briskdb.open(data_dir, shards=2)
+            database.close()
+
+            manifest = Path(data_dir) / "manifest.sqlite"
+            manifest.write_bytes(b"not a SQLite database")
+            with self.assertRaises(briskdb.DataCorruptionError) as raised:
+                briskdb.open(data_dir, shards=2)
+            self.assertEqual(raised.exception.code, "data_corruption")
 
 
 if __name__ == "__main__":
