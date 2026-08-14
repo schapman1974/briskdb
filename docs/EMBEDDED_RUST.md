@@ -76,6 +76,13 @@ data directories can be opened independently in one process. Create a distinct
 work ends, and explicitly await `BriskDb::close()` before the final handle is
 dropped.
 
+`BriskDb::owned_session()` returns a cloneable `BriskSession` that retains its
+owning database identity and exposes direct/prepared SQL methods without a
+separate database argument. Clones share routing, prepared state, and terminal
+close. Database shutdown is monotonic: a retained session can be closed after
+shutdown, but it cannot submit work or resurrect the stopped engine. This is
+the preferred handle for foreign-language wrappers.
+
 Failures use `EngineError`. Match `EngineError::kind()` or the stable
 machine-readable `EngineError::code()`; diagnostic text is intended for trusted
 logs and is not a compatibility contract.
@@ -95,3 +102,8 @@ typed dedicated-runtime and document-support modes are reserved and fail with
 `unsupported` before storage is touched until their implementations land.
 The host may install any tracing subscriber it wants; the library emits through
 the normal `tracing` facade and never configures global logging itself.
+
+Explicit single-shard transaction handles and streaming cursors are not yet
+part of the embedded contract; they remain tracked by #34 and #39. Autocommit
+commands, prepared portals, cancellation, bounded queueing, and materialized
+result limits use the same engine semantics as protocol adapters.

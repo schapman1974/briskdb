@@ -21,6 +21,7 @@ pub use core::{
     SessionState, ShutdownReport, Statement, Value, WriteResult,
 };
 pub use embedded::{
-    BriskDb, BriskDbBuilder, DEFAULT_EMBEDDED_SHARDS, DocumentSupport, RuntimeBehavior,
+    BriskDb, BriskDbBuilder, BriskSession, DEFAULT_EMBEDDED_SHARDS, DocumentSupport,
+    RuntimeBehavior,
 };
 pub use sql::{SqlDialect, SqlTranslationMode, StatementBehavior};
