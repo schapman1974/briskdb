@@ -4,7 +4,7 @@ use std::{
     fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -30,9 +30,9 @@ struct LeaseFile {
 }
 
 /// One process-local lease shared by every handle for a canonical root.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct RootProcessLease {
-    inner: Mutex<LeaseFile>,
+    inner: Arc<Mutex<LeaseFile>>,
 }
 
 impl RootProcessLease {
@@ -47,11 +47,11 @@ impl RootProcessLease {
             )
         })?;
         Ok(Self {
-            inner: Mutex::new(LeaseFile {
+            inner: Arc::new(Mutex::new(LeaseFile {
                 file,
                 path,
                 mode: LeaseMode::Shared,
-            }),
+            })),
         })
     }
 
@@ -61,7 +61,7 @@ impl RootProcessLease {
     /// upgrade loses a race, restore the lifetime shared lease before
     /// returning the retryable contention error.
     #[allow(dead_code)]
-    pub(super) fn try_acquire_exclusive(&self) -> EngineResult<RootMutationGuard<'_>> {
+    pub(super) fn try_acquire_exclusive(&self) -> EngineResult<RootMutationGuard> {
         let mut lease = self.lock_inner()?;
         if lease.mode == LeaseMode::Exclusive {
             return Err(EngineError::new(
@@ -72,8 +72,9 @@ impl RootProcessLease {
         match lock_nonblocking(&lease.file, LockRequest::Exclusive) {
             Ok(()) => {
                 lease.mode = LeaseMode::Exclusive;
+                drop(lease);
                 Ok(RootMutationGuard {
-                    lease,
+                    lease: Arc::clone(&self.inner),
                     downgraded: false,
                 })
             }
@@ -111,13 +112,12 @@ impl RootProcessLease {
 /// Exclusive root ownership for one schema/catalog/layout mutation.
 #[derive(Debug)]
 #[must_use = "dropping the guard restores the process's shared root lease"]
-pub(super) struct RootMutationGuard<'a> {
-    lease: MutexGuard<'a, LeaseFile>,
+pub(super) struct RootMutationGuard {
+    lease: Arc<Mutex<LeaseFile>>,
     downgraded: bool,
 }
 
-impl RootMutationGuard<'_> {
-    #[allow(dead_code)]
+impl RootMutationGuard {
     pub(super) fn downgrade(mut self) -> EngineResult<()> {
         self.restore_shared()?;
         self.downgraded = true;
@@ -125,21 +125,27 @@ impl RootMutationGuard<'_> {
     }
 
     fn restore_shared(&mut self) -> EngineResult<()> {
-        lock_blocking(&self.lease.file, LockRequest::Shared).map_err(|error| {
+        let mut lease = self.lease.lock().map_err(|error| {
+            EngineError::new(
+                EngineErrorKind::Internal,
+                format!("cross-process root lease is poisoned: {error}"),
+            )
+        })?;
+        lock_blocking(&lease.file, LockRequest::Shared).map_err(|error| {
             sqlite_error::storage_io(
                 error,
                 format!(
                     "failed to restore shared BriskDB process lease {}",
-                    self.lease.path.display()
+                    lease.path.display()
                 ),
             )
         })?;
-        self.lease.mode = LeaseMode::Shared;
+        lease.mode = LeaseMode::Shared;
         Ok(())
     }
 }
 
-impl Drop for RootMutationGuard<'_> {
+impl Drop for RootMutationGuard {
     fn drop(&mut self) {
         if !self.downgraded {
             // If this unexpectedly fails, retain the descriptor. That fails

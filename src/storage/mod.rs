@@ -33,9 +33,10 @@ use rusqlite::{
 
 #[cfg(test)]
 pub(crate) use migration::SchemaMigrationCoordinatorPoint;
+use schema_gate::SchemaMigrationGuard as LocalSchemaMigrationGuard;
+pub(crate) use schema_gate::SchemaOperationGuard;
 #[cfg(test)]
 pub(crate) use schema_gate::{SchemaGateSnapshot, SchemaGateState};
-pub(crate) use schema_gate::{SchemaMigrationGuard, SchemaOperationGuard};
 
 pub use crate::core::Database;
 #[cfg(any(feature = "experimental-vtab", test))]
@@ -62,7 +63,7 @@ pub(crate) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = manifest::MAX_SCHEMA_MI
 #[derive(Debug)]
 struct RootSchemaCoordination {
     gate: schema_gate::SchemaGate,
-    _process_lease: process_lock::RootProcessLease,
+    process_lease: process_lock::RootProcessLease,
     catalogs: Mutex<Vec<Weak<CatalogSnapshot>>>,
     schema_digests: Mutex<RuntimeSchemaDigests>,
     #[cfg_attr(not(feature = "experimental-vtab"), allow(dead_code))]
@@ -105,7 +106,7 @@ impl RootSchemaCoordination {
     fn new(root: &Path) -> EngineResult<Self> {
         Ok(Self {
             gate: schema_gate::SchemaGate::new(),
-            _process_lease: process_lock::RootProcessLease::acquire(root)?,
+            process_lease: process_lock::RootProcessLease::acquire(root)?,
             catalogs: Mutex::new(Vec::new()),
             schema_digests: Mutex::new(RuntimeSchemaDigests::default()),
             hilo_allocator: hilo::HiloAllocator::new()?,
@@ -362,7 +363,7 @@ fn root_schema_coordination(root: &Path) -> EngineResult<Arc<RootSchemaCoordinat
 
 fn begin_startup_coordination(
     coordination: &RootSchemaCoordination,
-) -> EngineResult<SchemaMigrationGuard> {
+) -> EngineResult<LocalSchemaMigrationGuard> {
     let started = Instant::now();
     loop {
         match coordination.gate.begin_migration() {
@@ -375,6 +376,65 @@ fn begin_startup_coordination(
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+/// In-process schema exclusion composed with optional sole-process ownership.
+#[derive(Debug)]
+pub(crate) struct SchemaMigrationGuard {
+    local: LocalSchemaMigrationGuard,
+    process: Option<process_lock::RootMutationGuard>,
+}
+
+impl SchemaMigrationGuard {
+    fn new(local: LocalSchemaMigrationGuard) -> Self {
+        Self {
+            local,
+            process: None,
+        }
+    }
+
+    pub(crate) async fn wait_for_quiescence(&self) {
+        self.local.wait_for_quiescence().await;
+    }
+
+    pub(crate) fn wait_for_quiescence_blocking(&self) {
+        self.local.wait_for_quiescence_blocking();
+    }
+
+    pub(crate) fn mark_pending_on_drop(&mut self) {
+        self.local.mark_pending_on_drop();
+    }
+
+    fn acquire_process_ownership(
+        &mut self,
+        lease: &process_lock::RootProcessLease,
+    ) -> EngineResult<()> {
+        if self.process.is_some() {
+            return Ok(());
+        }
+        // Callers exclude new local operations and drain admitted work first.
+        // The nonblocking process upgrade is last, so competing processes do
+        // not wait on one another while holding another cross-process lock.
+        self.process = Some(lease.try_acquire_exclusive()?);
+        Ok(())
+    }
+
+    pub(crate) fn publish_ready(mut self) -> EngineResult<()> {
+        self.local.publish_ready()?;
+        if let Some(process) = self.process.take() {
+            process.downgrade()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_pending(mut self) -> EngineResult<()> {
+        self.local.publish_pending()?;
+        if let Some(process) = self.process.take() {
+            process.downgrade()?;
+        }
+        Ok(())
     }
 }
 
@@ -464,12 +524,34 @@ impl Storage {
         let root = fs::canonicalize(&root).map_err(|error| {
             sqlite_error::storage_io(error, format!("failed to resolve {}", root.display()))
         })?;
+        // Lock order is startup serialization, process-local schema admission,
+        // then (only for initialization/upgrade/recovery) sole-process root
+        // ownership. A queued opener cannot add a shared lease while recovery
+        // is deciding whether its exclusive upgrade is safe.
+        let _process_startup =
+            process_lock::RootStartupGuard::acquire(&root, CONNECTION_BUSY_TIMEOUT)?;
         let schema_coordination = root_schema_coordination(&root)?;
         let mut startup = begin_startup_coordination(&schema_coordination)?;
         startup.wait_for_quiescence_blocking();
+        let manifest_path = root.join("manifest.sqlite");
+        let requires_exclusive =
+            startup_requires_exclusive_ownership(&manifest_path, requested_shards);
+        let requires_exclusive = match requires_exclusive {
+            Ok(requires_exclusive) => requires_exclusive,
+            Err(error) => {
+                if error.kind() == EngineErrorKind::DataCorruption {
+                    schema_coordination.mark_degraded();
+                }
+                return Err(error);
+            }
+        };
+        let process_mutation = if requires_exclusive {
+            Some(schema_coordination.process_lease.try_acquire_exclusive()?)
+        } else {
+            None
+        };
         let shards_dir = root.join("shards");
         let fresh_layout_allowed = physical_layout_is_empty(&shards_dir)?;
-        let manifest_path = root.join("manifest.sqlite");
         let mut manifest = open_manifest_for_startup(&manifest_path)?;
         if let Err(error) = configure_manifest_connection(&manifest) {
             if error.kind() == EngineErrorKind::DataCorruption {
@@ -784,6 +866,9 @@ impl Storage {
             .schema_coordination
             .reconcile_validated_catalog_generation(&storage.catalog)?;
         startup.publish_ready()?;
+        if let Some(process_mutation) = process_mutation {
+            process_mutation.downgrade()?;
+        }
         Ok(storage)
     }
 
@@ -879,8 +964,10 @@ impl Storage {
         declaration: TableDeclaration,
     ) -> EngineResult<GeneratedTableDdlReceipt> {
         self.validate_table_declaration_request(std::slice::from_ref(&declaration))?;
-        let mut migration = self.schema_coordination.gate.begin_new_migration()?;
+        let mut migration =
+            SchemaMigrationGuard::new(self.schema_coordination.gate.begin_new_migration()?);
         migration.wait_for_quiescence_blocking();
+        migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
         let operation = (|| {
             self.schema_coordination
                 .ensure_exclusive_catalog(&self.catalog)?;
@@ -1095,8 +1182,10 @@ impl Storage {
             let _operation = self.enter_schema_operation()?;
             return Ok(());
         }
-        let mut migration = self.schema_coordination.gate.begin_new_migration()?;
+        let mut migration =
+            SchemaMigrationGuard::new(self.schema_coordination.gate.begin_new_migration()?);
         migration.wait_for_quiescence_blocking();
+        migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
         let registration = (|| {
             self.validate_empty_table_declarations(&declarations)?;
             let replacement_guard = self
@@ -1529,7 +1618,10 @@ impl Storage {
     }
 
     pub(crate) fn begin_schema_migration(&self) -> EngineResult<SchemaMigrationGuard> {
-        self.schema_coordination.gate.begin_migration()
+        self.schema_coordination
+            .gate
+            .begin_migration()
+            .map(SchemaMigrationGuard::new)
     }
 
     pub(crate) fn mark_schema_degraded(&self) {
@@ -1597,6 +1689,7 @@ impl Storage {
         guard: &mut SchemaMigrationGuard,
         control: Option<Arc<crate::core::OperationControl>>,
     ) -> EngineResult<Vec<u16>> {
+        guard.acquire_process_ownership(&self.schema_coordination.process_lease)?;
         migration::apply_schema_migration(self, sql, guard, control)
     }
 
@@ -2425,6 +2518,16 @@ fn open_manifest_for_startup(path: &Path) -> EngineResult<Connection> {
     })?;
     validate_existing_manifest_file(path)?;
     Ok(connection)
+}
+
+fn startup_requires_exclusive_ownership(path: &Path, requested_shards: u16) -> EngineResult<bool> {
+    validate_optional_manifest_file(path)?;
+    if !path.exists() {
+        return Ok(true);
+    }
+    let connection = open_existing_manifest(path)?;
+    configure_manifest_connection(&connection)?;
+    manifest::startup_requires_exclusive_ownership(&connection, requested_shards)
 }
 
 pub(super) fn open_existing_manifest(path: &Path) -> EngineResult<Connection> {
@@ -5662,6 +5765,184 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn shared_root_peer_process_child() {
+        let Ok(root) = std::env::var("BRISKDB_SHARED_ROOT_PEER_ROOT") else {
+            return;
+        };
+        let ready = PathBuf::from(std::env::var("BRISKDB_SHARED_ROOT_PEER_READY").unwrap());
+        let release = PathBuf::from(std::env::var("BRISKDB_SHARED_ROOT_PEER_RELEASE").unwrap());
+        let _database = Database::open(root, 2).unwrap();
+        fs::write(&ready, b"ready").unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !release.exists() && Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(release.exists(), "parent did not release shared-root peer");
+    }
+
+    fn spawn_shared_root_peer(root: &Path, label: &str) -> (std::process::Child, PathBuf) {
+        let ready = root.join(format!("peer-{label}-ready"));
+        let release = root.join(format!("peer-{label}-release"));
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("storage::tests::shared_root_peer_process_child")
+            .arg("--nocapture")
+            .env("BRISKDB_SHARED_ROOT_PEER_ROOT", root)
+            .env("BRISKDB_SHARED_ROOT_PEER_READY", &ready)
+            .env("BRISKDB_SHARED_ROOT_PEER_RELEASE", &release)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ready.exists(), "shared-root peer did not open the database");
+        (child, release)
+    }
+
+    fn release_shared_root_peer(mut child: std::process::Child, release: &Path) {
+        fs::write(release, b"release").unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn peer_fences_schema_migration_and_catalog_registration_before_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let setup = Database::open(temp.path(), 2).unwrap();
+        create_registered_table_schema(&setup);
+        drop(setup);
+
+        let (peer, release) = spawn_shared_root_peer(temp.path(), "catalog");
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        let manifest_path = temp.path().join("manifest.sqlite");
+        let before = Connection::open(&manifest_path)
+            .unwrap()
+            .query_row(
+                "SELECT schema_generation,
+                        (SELECT COUNT(*) FROM briskdb_schema_migrations),
+                        (SELECT COUNT(*) FROM briskdb_tables),
+                        manifest_digest
+                 FROM briskdb_schema_catalog
+                 JOIN briskdb_integrity ON briskdb_integrity.singleton = 1
+                 WHERE briskdb_schema_catalog.singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        let migration = database
+            .broadcast("CREATE INDEX events_payload_idx ON events(payload)")
+            .unwrap_err();
+        assert_eq!(migration.kind(), EngineErrorKind::Busy);
+        assert!(migration.is_retryable());
+        let registration = database
+            .register_tables(registered_table_declarations(&database))
+            .unwrap_err();
+        assert_eq!(registration.kind(), EngineErrorKind::Busy);
+        assert!(registration.is_retryable());
+
+        let after = Connection::open(&manifest_path)
+            .unwrap()
+            .query_row(
+                "SELECT schema_generation,
+                        (SELECT COUNT(*) FROM briskdb_schema_migrations),
+                        (SELECT COUNT(*) FROM briskdb_tables),
+                        manifest_digest
+                 FROM briskdb_schema_catalog
+                 JOIN briskdb_integrity ON briskdb_integrity.singleton = 1
+                 WHERE briskdb_schema_catalog.singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        for shard_id in 0..2 {
+            assert!(
+                !Connection::open(shard_file(temp.path(), shard_id))
+                    .unwrap()
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM sqlite_schema
+                            WHERE name = 'events_payload_idx'
+                         )",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
+
+        release_shared_root_peer(peer, &release);
+        let declarations = registered_table_declarations(&database);
+        database.register_tables(declarations).unwrap();
+        database
+            .broadcast("CREATE INDEX events_payload_idx ON events(payload)")
+            .unwrap();
+    }
+
+    #[test]
+    fn peer_fences_generated_table_ddl_and_guard_downgrades_after_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        drop(Database::open(temp.path(), 2).unwrap());
+        let (peer, release) = spawn_shared_root_peer(temp.path(), "generated");
+        let mut database = Database::open(temp.path(), 2).unwrap();
+
+        let error = database
+            .apply_generated_table_ddl(SqlDialect::Sqlite, GENERATED_DDL_CRASH_SOURCE)
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+        assert!(error.is_retryable());
+        let manifest = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+        assert_eq!(
+            manifest
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_generated_table_ddl",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+        drop(manifest);
+        for shard_id in 0..2 {
+            assert!(
+                !Connection::open(shard_file(temp.path(), shard_id))
+                    .unwrap()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'events')",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
+
+        release_shared_root_peer(peer, &release);
+        database
+            .apply_generated_table_ddl(SqlDialect::Sqlite, GENERATED_DDL_CRASH_SOURCE)
+            .unwrap();
+
+        // The successful exclusive operation must downgrade to the lifetime
+        // shared lease so a fresh independent process can join immediately.
+        let (peer, release) = spawn_shared_root_peer(temp.path(), "after-retry");
+        release_shared_root_peer(peer, &release);
     }
 
     #[test]

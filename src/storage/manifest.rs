@@ -1244,6 +1244,43 @@ pub(super) fn load_or_create_manifest_with_fresh_layout(
     })
 }
 
+/// Return whether startup may need to change durable multi-file state.
+///
+/// A current, steady manifest can be validated while peer processes retain
+/// shared root leases. Every initialization, format upgrade, or recovery shape
+/// requires sole-process ownership before the normal startup path proceeds.
+pub(super) fn startup_requires_exclusive_ownership(
+    connection: &Connection,
+    requested_shards: u16,
+) -> EngineResult<bool> {
+    let state = inspect_with_plan(connection, requested_shards, CURRENT_PLAN)?;
+    let ManifestState::Versioned { version, snapshot } = state else {
+        return Ok(true);
+    };
+    if version != CURRENT_SCHEMA_VERSION {
+        return Ok(true);
+    }
+    let layout_ready = snapshot
+        .shard_layout
+        .as_ref()
+        .is_some_and(|layout| layout.state() == ShardLayoutState::Ready);
+    let integrity_steady = snapshot.integrity.is_some_and(|integrity| {
+        matches!(
+            integrity.state(),
+            DatabaseIntegrityState::Ready | DatabaseIntegrityState::Degraded
+        )
+    });
+    let generated_ddl_steady = snapshot
+        .generated_table_ddl
+        .as_ref()
+        .is_none_or(|ddl| ddl.lifecycle() == GeneratedTableDdlLifecycle::Complete);
+    Ok(!(layout_ready
+        && integrity_steady
+        && snapshot.active_migration.is_none()
+        && snapshot.active_table_provisioning.is_none()
+        && generated_ddl_steady))
+}
+
 /// Return an active v6 journal without upgrading it. Startup completes this
 /// recovery under the v6 rules before establishing v7 checksum authority.
 pub(super) fn load_v6_active_migration(
