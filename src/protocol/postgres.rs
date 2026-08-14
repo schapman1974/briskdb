@@ -4676,6 +4676,40 @@ mod tests {
     }
 
     #[test]
+    fn postgres_text_and_binary_parameters_share_canonical_index_keys() {
+        let text_values = [
+            decode_text_parameter(b"true", &Type::BOOL).unwrap(),
+            decode_text_parameter(b"-42", &Type::INT8).unwrap(),
+            decode_text_parameter(b"1.5", &Type::FLOAT8).unwrap(),
+            decode_text_parameter(b"shared", &Type::TEXT).unwrap(),
+            decode_text_parameter(br"\x00ff", &Type::BYTEA).unwrap(),
+        ];
+        let binary_values = [
+            decode_binary_parameter(&[1], &Type::BOOL).unwrap(),
+            decode_binary_parameter(&(-42_i64).to_be_bytes(), &Type::INT8).unwrap(),
+            decode_binary_parameter(&1.5_f64.to_be_bytes(), &Type::FLOAT8).unwrap(),
+            decode_binary_parameter(b"shared", &Type::TEXT).unwrap(),
+            decode_binary_parameter(&[0, 255], &Type::BYTEA).unwrap(),
+        ];
+        let direct = [
+            Value::Boolean(true),
+            Value::Int64(-42),
+            Value::Float64(1.5),
+            Value::Text("shared".to_owned()),
+            Value::Binary(vec![0, 255]),
+        ];
+        let expected = crate::core::CanonicalIndexKey::encode_values(&direct).unwrap();
+        assert_eq!(
+            crate::core::CanonicalIndexKey::encode_values(&text_values).unwrap(),
+            expected
+        );
+        assert_eq!(
+            crate::core::CanonicalIndexKey::encode_values(&binary_values).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn generated_insert_uses_the_standard_command_tag_without_unsolicited_rows() {
         let execution =
             PreparedExecution::GeneratedWrite(crate::core::WriteResult::with_generated_key(

@@ -405,7 +405,7 @@ requires an earlier dependency:
    Track the rollout in [#225](https://github.com/schapman1974/briskdb/issues/225):
 
    - [x] [#226](https://github.com/schapman1974/briskdb/issues/226) — baseline and regression suite
-   - [ ] [#227](https://github.com/schapman1974/briskdb/issues/227) — canonical key encoding
+   - [x] [#227](https://github.com/schapman1974/briskdb/issues/227) — canonical key encoding
    - [ ] [#228](https://github.com/schapman1974/briskdb/issues/228) — catalog lifecycle and compatibility fencing
    - [ ] [#229](https://github.com/schapman1974/briskdb/issues/229) — storage-topology prototype
    - [ ] [#230](https://github.com/schapman1974/briskdb/issues/230) — offline index construction

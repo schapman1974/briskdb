@@ -29,7 +29,7 @@ server ---------> protocol::http
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, generated-ID policy and codec types, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, logical Sharded read target selection and scatter/gather, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, generated-ID policy and codec types, canonical global-index keys, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, logical Sharded read target selection and scatter/gather, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
 | `storage` | Versioned routing and authoritative logical manifest, persisted generated-ID policy/activation, stable active/retired allocation-owner slots, durable per-table hi/lo block leases, recoverable one-time table provisioning, shard layout, migration journals and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `import` | Offline source-schema preflight, explicit placement and generated-ID plan validation, exact-value row routing into private staging, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, generated-ID inference, implicit Global placement, or protocol-specific behavior |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
@@ -312,6 +312,21 @@ owns bind-time canonical encoding, physical routing, and rejection of
 conflicting or unroutable sharded DML. The normative proof, type, result,
 error, and testing rules are in the [shard-key inference
 contract](SQL_SHARD_KEYS.md).
+
+### Canonical global-index keys
+
+Global-index keys use a dedicated versioned core codec; they do not change or
+reuse the persisted raw-byte shard-routing format. The codec owns type tags,
+compound framing, ascending/descending byte order, explicit NULL placement,
+binary text collation, float canonicalization, dates, and timestamps. HTTP,
+PostgreSQL, Python, the Rust library, and future protocols must enter through
+this core boundary after converting to protocol-neutral values. The exact
+format and compatibility rules are in [canonical global-index
+keys](INDEX_KEY_ENCODING.md).
+
+Issue #227 introduces only this public codec. It adds no manifest record or
+global-index file; the catalog lifecycle in issue #228 is the first consumer
+that may persist its version.
 
 ### Bound statement-planning boundary
 

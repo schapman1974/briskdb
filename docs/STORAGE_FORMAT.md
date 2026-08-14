@@ -1219,6 +1219,12 @@ version, encoding, bucket-map, shard-file, or migration change. The complete
 planning and policy contract is in [bound statement
 planning](SQL_PLANNING.md).
 
+This routing format is intentionally distinct from the tagged, order-preserving
+[canonical global-index key format](INDEX_KEY_ENCODING.md). Issue #227 adds the
+global-index codec without persisting it, changing this manifest schema, or
+changing shard placement. A later manifest version must record the index codec
+version before any global-index bytes become durable.
+
 Bucket algorithm version 1 deliberately preserves legacy placement even when
 `N` does not divide 4,096. Given the version-1 64-bit hash `H`:
 
