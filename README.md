@@ -11,8 +11,8 @@ engine. It keeps the durability, WAL, transactions, tooling, and boring
 reliability developers already trust—then adds routing, parallel writer domains,
 global reads, generated IDs, an HTTP API, and wire-protocol frontends.
 
-**HTTP, bounded PostgreSQL queries, and listener-free Rust embedding work today.
-Native MongoDB, MySQL, Python, and serverless use are on the roadmap.**
+**HTTP, bounded PostgreSQL queries, and listener-free Rust and Python embedding
+work today. Native MongoDB, MySQL, and serverless use are on the roadmap.**
 
 > [!WARNING]
 > BriskDB is an alpha. It is exciting infrastructure, not yet a production-ready
@@ -44,7 +44,7 @@ flowchart LR
         MONGO[MongoDB clients · planned]
         MYSQL[MySQL clients · planned]
         RUST[Rust embedding]
-        PY[Python · planned]
+        PY[Python embedding]
     end
 
     WEB --> ENGINE
@@ -52,7 +52,7 @@ flowchart LR
     MONGO -.-> ENGINE
     MYSQL -.-> ENGINE
     RUST --> ENGINE
-    PY -.-> ENGINE
+    PY --> ENGINE
 
     ENGINE[Protocol-neutral Rust engine] --> ROUTER[4,096 virtual buckets]
     ROUTER --> S0[(SQLite WAL · shard 0)]
@@ -114,7 +114,8 @@ experimental and opt-in; the exact contract lives in
 | Listener-free Rust library entrypoint | Working |
 | Native MongoDB wire protocol with TinyMongo parity | [Planned](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
-| Python wheels and serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/197) |
+| Native Python extension | Source builds working; release wheels [planned](https://github.com/schapman1974/briskdb/issues/200) |
+| Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
 
 ## Try it in 30 seconds
 
@@ -156,6 +157,16 @@ example and documents every default. Use `default-features = false` with the
 `embedded` feature to leave the network and CLI stacks out; see the
 [crate feature map](docs/CRATE_FEATURES.md).
 
+Python can run the same engine directly in-process with no server or listener:
+
+```bash
+python -m pip install ./python
+```
+
+See the [Python quickstart](python/README.md) for a write/read example. A Rust
+toolchain is required for this initial source distribution; prebuilt wheels are
+tracked in [#200](https://github.com/schapman1974/briskdb/issues/200).
+
 ## Still just inspectable files
 
 ```text
@@ -177,9 +188,9 @@ and integrity metadata. Application rows stay in ordinary SQLite files.
   indexes, cursors, aggregation, and differential TinyMongo parity.
 - **More wire protocols:** PostgreSQL extended queries and MySQL compatibility,
   all sharing the same engine behavior.
-- **Python and serverless:** Python/PyO3 wheels, atomic snapshots,
+- **Python and serverless:** prebuilt Python wheels, atomic snapshots,
   ephemeral-runtime helpers, and fenced single-writer operation over the
-  embedded Rust API.
+  embedded Rust API. The initial PyO3 source package already runs in-process.
 - **Future storage adapters:** SQLite is the first backend, while the engine
   boundaries are being kept reusable for other durable backends.
 

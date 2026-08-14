@@ -1,3 +1,8 @@
+[workspace]
+members = ["python"]
+default-members = ["."]
+resolver = "3"
+
 [package]
 name = "briskdb"
 version = "0.1.0-alpha.3"
