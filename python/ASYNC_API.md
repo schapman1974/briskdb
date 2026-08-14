@@ -67,8 +67,10 @@ async with await database.serve(postgres="127.0.0.1:0") as server:
     print(server.http_address, server.postgres_address)
 ```
 
-`AsyncServer.close()` drains its loopback listeners but leaves the database
-running. Closing the database closes every attached server first.
+`AsyncServer.close()` drains its listeners but leaves the database running.
+Closing the database closes every attached server first. Remote PostgreSQL
+uses the same TLS certificate/key/user/password-file keyword arguments as the
+synchronous `Database.serve()` method.
 
 ## Transaction and DB-API boundaries
 

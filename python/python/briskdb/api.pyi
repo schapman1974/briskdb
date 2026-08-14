@@ -132,6 +132,10 @@ class AsyncDatabase:
         *,
         http: str = "127.0.0.1:0",
         postgres: Optional[str] = None,
+        postgres_tls_cert: Optional[Union[str, PathLike[str]]] = None,
+        postgres_tls_key: Optional[Union[str, PathLike[str]]] = None,
+        postgres_user: str = "briskdb",
+        postgres_password_file: Optional[Union[str, PathLike[str]]] = None,
     ) -> AsyncServer: ...
     async def close(self) -> CloseReport: ...
     async def __aenter__(self) -> AsyncDatabase: ...

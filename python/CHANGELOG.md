@@ -6,6 +6,9 @@
   synchronous and asyncio `Database.serve()` APIs.
 - Listener shutdown is deterministic and database shutdown closes every
   attached server before stopping the shared engine.
+- `Database.serve()` can configure PostgreSQL TLS and SCRAM-SHA-256 with
+  certificate, private-key, identity, and password-file arguments; remote
+  PostgreSQL binds require that secure mode.
 
 ## 0.1.0-alpha.5 — 2026-08-14
 

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+from pathlib import Path
+import shutil
 import socket
 import tempfile
 import unittest
@@ -71,6 +74,55 @@ class AttachedServerTests(unittest.TestCase):
             self.assertTrue(restarted.closed)
             self.assertTrue(restarted.close()["already_closed"])
 
+    def test_tls_scram_listener_works_with_real_psycopg(self) -> None:
+        fixture = Path(__file__).resolve().parents[2] / "tests/fixtures/postgres-tls"
+        with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as secrets:
+            secrets_path = Path(secrets)
+            certificate = secrets_path / "server.crt"
+            private_key = secrets_path / "server.key"
+            password_file = secrets_path / "postgres-password"
+            shutil.copyfile(fixture / "server.crt", certificate)
+            shutil.copyfile(fixture / "server.key", private_key)
+            password_file.write_text("python-secret\n", encoding="utf-8")
+            os.chmod(private_key, 0o600)
+            os.chmod(password_file, 0o600)
+
+            with briskdb.open(data_dir, shards=2) as database:
+                with database.serve(
+                    postgres="127.0.0.1:0",
+                    postgres_tls_cert=certificate,
+                    postgres_tls_key=private_key,
+                    postgres_user="briskdb",
+                    postgres_password_file=password_file,
+                ) as server:
+                    _, port = split_address(server.postgres_address or "")
+                    with self.assertRaises(psycopg.OperationalError):
+                        psycopg.connect(
+                            host="localhost",
+                            port=port,
+                            dbname="default",
+                            user="briskdb",
+                            password="wrong",
+                            sslmode="verify-full",
+                            sslrootcert=str(certificate),
+                            connect_timeout=5,
+                        )
+                    with psycopg.connect(
+                        host="localhost",
+                        port=port,
+                        dbname="default",
+                        user="briskdb",
+                        password="python-secret",
+                        sslmode="verify-full",
+                        sslrootcert=str(certificate),
+                        autocommit=True,
+                        cursor_factory=psycopg.ClientCursor,
+                        connect_timeout=5,
+                    ) as connection:
+                        with connection.cursor() as cursor:
+                            cursor.execute("SELECT 84 AS answer")
+                            self.assertEqual(cursor.fetchall(), [("84",)])
+
     def test_address_and_bind_failures_leave_the_database_usable(self) -> None:
         with tempfile.TemporaryDirectory() as data_dir:
             database = briskdb.open(data_dir, shards=2)
@@ -78,6 +130,8 @@ class AttachedServerTests(unittest.TestCase):
                 database.serve(http="0.0.0.0:0")
             with self.assertRaisesRegex(briskdb.InvalidArgumentError, "IP socket address"):
                 database.serve(http="localhost:0")
+            with self.assertRaisesRegex(briskdb.InvalidArgumentError, "must be set together"):
+                database.serve(postgres_tls_cert="missing.crt")
 
             reservation = socket.socket()
             reservation.bind(("127.0.0.1", 0))

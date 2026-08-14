@@ -9,7 +9,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fmt, io,
+    fmt,
+    fs::{self, File},
+    io::{self, BufReader},
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
@@ -23,7 +26,11 @@ use pgwire::{
     api::{
         ClientInfo, ClientPortalStore, DEFAULT_NAME, DefaultClient, ErrorHandler,
         PgWireConnectionState, PgWireServerHandlers, Type,
-        auth::StartupHandler,
+        auth::{
+            AuthSource, LoginInfo, Password, StartupHandler,
+            sasl::SASLState,
+            sasl::scram::{SCRAM_ITERATIONS, ScramAuth, gen_salted_password},
+        },
         cancel::CancelHandler,
         portal::{Portal, PortalExecutionState},
         query::{
@@ -48,14 +55,19 @@ use pgwire::{
         },
         response::{GssEncResponse, ReadyForQuery, SslResponse, TransactionStatus},
         startup::{
-            Authentication, BackendKeyData, NegotiateProtocolVersion, ParameterStatus, SecretKey,
+            Authentication, BackendKeyData, NegotiateProtocolVersion, ParameterStatus,
+            PasswordMessageFamily, SecretKey, Startup,
         },
     },
-    tokio::server::{PgWireMessageServerCodec, process_error, process_message},
+    tokio::{
+        server::{MaybeTls, PgWireMessageServerCodec, process_error, process_message},
+        tokio_rustls::{TlsAcceptor, rustls},
+    },
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
+    sync::Mutex as AsyncMutex,
 };
 use tokio_util::codec::Framed;
 
@@ -77,6 +89,8 @@ const MAX_STARTUP_NAME_BYTES: usize = 63;
 const MAX_EXTENDED_NAME_BYTES: usize = 63;
 const MAX_STARTUP_PACKET_LENGTH: usize = 10_000;
 const MAX_FRONTEND_MESSAGE_LENGTH: usize = MAX_PARSED_SQL_BYTES + 5;
+const MAX_TLS_PEM_BYTES: u64 = 1_048_576;
+const MAX_PASSWORD_FILE_BYTES: u64 = 1_026;
 const CANCEL_REQUEST_CODE: i32 = 80_877_102;
 const SSL_REQUEST_CODE: i32 = 80_877_103;
 const GSSENC_REQUEST_CODE: i32 = 80_877_104;
@@ -88,6 +102,359 @@ const PARAMETER_STATUS: [(&str, &str); 5] = [
     ("standard_conforming_strings", "on"),
     ("integer_datetimes", "on"),
 ];
+
+/// Files and identity used by a TLS-protected PostgreSQL listener.
+///
+/// The password is read from `password_file`, never from a command-line value,
+/// and is converted to a salted SCRAM secret while the listener is prepared.
+/// BriskDB currently supports one authenticated identity; authorization and a
+/// durable role catalog remain separate roadmap work.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecurityConfig {
+    certificate: PathBuf,
+    private_key: PathBuf,
+    user: Box<str>,
+    password_file: PathBuf,
+}
+
+impl SecurityConfig {
+    pub fn new(
+        certificate: impl Into<PathBuf>,
+        private_key: impl Into<PathBuf>,
+        user: impl Into<Box<str>>,
+        password_file: impl Into<PathBuf>,
+    ) -> io::Result<Self> {
+        let user = user.into();
+        if !valid_user_label(&user) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PostgreSQL authentication user must be a valid lowercase user label",
+            ));
+        }
+        Ok(Self {
+            certificate: certificate.into(),
+            private_key: private_key.into(),
+            user,
+            password_file: password_file.into(),
+        })
+    }
+
+    pub fn certificate(&self) -> &Path {
+        &self.certificate
+    }
+
+    pub fn private_key(&self) -> &Path {
+        &self.private_key
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    pub fn password_file(&self) -> &Path {
+        &self.password_file
+    }
+
+    pub(crate) fn load(&self) -> io::Result<LoadedSecurity> {
+        validate_regular_file(
+            &self.certificate,
+            "PostgreSQL TLS certificate",
+            MAX_TLS_PEM_BYTES,
+        )?;
+        validate_regular_file(
+            &self.private_key,
+            "PostgreSQL TLS private key",
+            MAX_TLS_PEM_BYTES,
+        )?;
+        validate_regular_file(
+            &self.password_file,
+            "PostgreSQL password file",
+            MAX_PASSWORD_FILE_BYTES,
+        )?;
+        validate_private_file(&self.private_key, "PostgreSQL TLS private key")?;
+        validate_private_file(&self.password_file, "PostgreSQL password file")?;
+
+        let certificate_pem = fs::read(&self.certificate).map_err(|error| {
+            contextual_io_error(
+                error,
+                format!(
+                    "failed to read PostgreSQL TLS certificate {}",
+                    self.certificate.display()
+                ),
+            )
+        })?;
+        let certificates = rustls_pemfile::certs(&mut certificate_pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                contextual_io_error(
+                    error,
+                    format!(
+                        "failed to parse PostgreSQL TLS certificate {}",
+                        self.certificate.display()
+                    ),
+                )
+            })?;
+        if certificates.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "PostgreSQL TLS certificate {} contains no certificates",
+                    self.certificate.display()
+                ),
+            ));
+        }
+
+        let key_file = File::open(&self.private_key).map_err(|error| {
+            contextual_io_error(
+                error,
+                format!(
+                    "failed to read PostgreSQL TLS private key {}",
+                    self.private_key.display()
+                ),
+            )
+        })?;
+        let private_key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+            .map_err(|error| {
+                contextual_io_error(
+                    error,
+                    format!(
+                        "failed to parse PostgreSQL TLS private key {}",
+                        self.private_key.display()
+                    ),
+                )
+            })?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "PostgreSQL TLS private key {} contains no supported private key",
+                        self.private_key.display()
+                    ),
+                )
+            })?;
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certificates, private_key)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("PostgreSQL TLS certificate and private key are invalid: {error}"),
+                )
+            })?;
+        tls.alpn_protocols = vec![b"postgresql".to_vec()];
+
+        let mut password = fs::read(&self.password_file).map_err(|error| {
+            contextual_io_error(
+                error,
+                format!(
+                    "failed to read PostgreSQL password file {}",
+                    self.password_file.display()
+                ),
+            )
+        })?;
+        if password.last() == Some(&b'\n') {
+            password.pop();
+            if password.last() == Some(&b'\r') {
+                password.pop();
+            }
+        }
+        if password.is_empty()
+            || password.len() > 1_024
+            || password.contains(&0)
+            || password.contains(&b'\n')
+            || password.contains(&b'\r')
+        {
+            password.fill(0);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PostgreSQL password file must contain one non-empty UTF-8 line of at most 1024 bytes",
+            ));
+        }
+        if std::str::from_utf8(&password).is_err() {
+            password.fill(0);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PostgreSQL password file must contain valid UTF-8",
+            ));
+        }
+        let mut salt = vec![0_u8; 16];
+        if let Err(error) = getrandom::fill(&mut salt) {
+            password.fill(0);
+            return Err(io::Error::other(format!(
+                "failed to generate PostgreSQL SCRAM salt: {error}"
+            )));
+        }
+        let salted_password = gen_salted_password(
+            std::str::from_utf8(&password).expect("the password encoding was checked"),
+            &salt,
+            SCRAM_ITERATIONS,
+        );
+        password.fill(0);
+
+        let mut fake_salt = vec![0_u8; 16];
+        getrandom::fill(&mut fake_salt).map_err(|error| {
+            io::Error::other(format!(
+                "failed to generate PostgreSQL SCRAM decoy salt: {error}"
+            ))
+        })?;
+        let fake_password = gen_salted_password(
+            "briskdb-invalid-authentication-secret",
+            &fake_salt,
+            SCRAM_ITERATIONS,
+        );
+
+        let loaded = LoadedSecurity {
+            tls_acceptor: TlsAcceptor::from(Arc::new(tls)),
+            certificate_pem: certificate_pem.into(),
+            credentials: Arc::new(ScramCredentials {
+                user: self.user.clone(),
+                salt,
+                salted_password,
+                fake_salt,
+                fake_password,
+            }),
+        };
+        loaded.scram().map_err(io::Error::other)?;
+        Ok(loaded)
+    }
+}
+
+impl fmt::Debug for SecurityConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecurityConfig")
+            .field("certificate", &self.certificate)
+            .field("private_key", &self.private_key)
+            .field("user", &self.user)
+            .field("password_file", &self.password_file)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LoadedSecurity {
+    tls_acceptor: TlsAcceptor,
+    certificate_pem: Arc<[u8]>,
+    credentials: Arc<ScramCredentials>,
+}
+
+impl LoadedSecurity {
+    fn scram(&self) -> PgWireResult<ScramAuth> {
+        let mut scram = ScramAuth::new(self.credentials.clone());
+        scram.set_iterations(SCRAM_ITERATIONS);
+        scram.configure_certificate(&self.certificate_pem)?;
+        Ok(scram)
+    }
+}
+
+impl fmt::Debug for LoadedSecurity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedSecurity")
+            .field("user", &self.credentials.user)
+            .finish_non_exhaustive()
+    }
+}
+
+struct ScramCredentials {
+    user: Box<str>,
+    salt: Vec<u8>,
+    salted_password: Vec<u8>,
+    fake_salt: Vec<u8>,
+    fake_password: Vec<u8>,
+}
+
+impl fmt::Debug for ScramCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScramCredentials")
+            .field("user", &self.user)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ScramCredentials {
+    fn drop(&mut self) {
+        self.salted_password.fill(0);
+        self.fake_password.fill(0);
+    }
+}
+
+#[async_trait]
+impl AuthSource for ScramCredentials {
+    async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
+        let (salt, password) = if login.user() == Some(self.user.as_ref()) {
+            (&self.salt, &self.salted_password)
+        } else {
+            (&self.fake_salt, &self.fake_password)
+        };
+        Ok(Password::new(Some(salt.clone()), password.clone()))
+    }
+}
+
+fn contextual_io_error(error: io::Error, message: String) -> io::Error {
+    io::Error::new(error.kind(), format!("{message}: {error}"))
+}
+
+fn validate_regular_file(path: &Path, label: &str, maximum_bytes: u64) -> io::Result<()> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        contextual_io_error(
+            error,
+            format!("failed to inspect {label} {}", path.display()),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} {} is not a regular file", path.display()),
+        ));
+    }
+    if metadata.len() > maximum_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{label} {} exceeds the {maximum_bytes}-byte limit",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_file(path: &Path, label: &str) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).map_err(|error| {
+        contextual_io_error(
+            error,
+            format!("failed to inspect {label} {}", path.display()),
+        )
+    })?;
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o037 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{label} {} must not be group-writable or accessible by other users (mode is {mode:03o})",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_file(path: &Path, label: &str) -> io::Result<()> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        contextual_io_error(
+            error,
+            format!("failed to inspect {label} {}", path.display()),
+        )
+    })?;
+    let _ = metadata;
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 enum FrontendFramePhase {
@@ -364,6 +731,10 @@ fn validate_typed_frame(frame: &[u8]) -> io::Result<()> {
         Some(b'B') => validate_bind_frame_body(body),
         Some(b'D') | Some(b'C') => validate_named_target_frame_body(body),
         Some(b'E') => validate_execute_frame_body(body),
+        // SASLInitialResponse and SASLResponse share the PasswordMessage tag.
+        // The selected decoder validates their state-dependent internals; this
+        // gate still bounds the complete frame before admitting it.
+        Some(b'p') if !body.is_empty() => Ok(()),
         Some(b'H') | Some(b'S') | Some(b'X') if body.is_empty() => Ok(()),
         _ => Err(invalid_frontend_frame()),
     }
@@ -698,6 +1069,7 @@ pub struct Adapter {
     default_database: LogicalDatabaseId,
     default_database_name: Box<str>,
     cancellations: Arc<CancellationRegistry>,
+    security: Option<Arc<LoadedSecurity>>,
 }
 
 impl Adapter {
@@ -711,7 +1083,14 @@ impl Adapter {
             default_database,
             default_database_name,
             cancellations: Arc::new(CancellationRegistry::default()),
+            security: None,
         }
+    }
+
+    pub(crate) fn with_loaded_security(engine: Engine, security: LoadedSecurity) -> Self {
+        let mut adapter = Self::new(engine);
+        adapter.security = Some(Arc::new(security));
+        adapter
     }
 
     /// Allocate independent protocol state for a direct adapter probe.
@@ -763,10 +1142,16 @@ impl Adapter {
     }
 
     pub(crate) fn wire_connection(&self) -> WireConnection {
+        let scram = self.security.as_ref().map(|security| {
+            security
+                .scram()
+                .expect("loaded PostgreSQL security was validated")
+        });
         WireConnection {
             state: Arc::new(WireConnectionState {
                 adapter: self.clone(),
                 installed: OnceLock::new(),
+                authentication: AsyncMutex::new(AuthenticationState::new(scram)),
             }),
         }
     }
@@ -778,6 +1163,7 @@ impl fmt::Debug for Adapter {
             .debug_struct("Adapter")
             .field("default_database", &self.default_database)
             .field("shard_count", &self.engine.shard_count())
+            .field("secure", &self.security.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -953,6 +1339,32 @@ pub(crate) struct WireConnection {
 struct WireConnectionState {
     adapter: Adapter,
     installed: OnceLock<InstalledWireConnection>,
+    authentication: AsyncMutex<AuthenticationState>,
+}
+
+struct AuthenticationState {
+    scram: Option<ScramAuth>,
+    sasl: SASLState,
+    pending: Option<PendingStartup>,
+}
+
+impl AuthenticationState {
+    fn new(scram: Option<ScramAuth>) -> Self {
+        Self {
+            scram,
+            sasl: SASLState::Initial,
+            pending: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PendingStartup {
+    user: Box<str>,
+    database: Box<str>,
+    application_name: Option<Box<str>>,
+    protocol_minor: u16,
+    unsupported_options: Vec<String>,
 }
 
 struct InstalledWireConnection {
@@ -1189,6 +1601,158 @@ impl WireHandlers {
     }
 }
 
+fn validate_startup(startup: &Startup) -> PgWireResult<PendingStartup> {
+    if startup.protocol_number_major != POSTGRES_PROTOCOL_MAJOR {
+        return Err(fatal_wire_error(
+            "08P01",
+            "the PostgreSQL protocol version is unsupported",
+        ));
+    }
+
+    let mut unsupported_options = startup
+        .parameters
+        .keys()
+        .filter(|key| key.starts_with("_pq_."))
+        .cloned()
+        .collect::<Vec<_>>();
+    unsupported_options.sort_unstable();
+    for key in startup.parameters.keys() {
+        if !matches!(
+            key.as_str(),
+            "user" | "database" | "client_encoding" | "application_name" | "replication"
+        ) && !key.starts_with("_pq_.")
+        {
+            return Err(fatal_wire_error(
+                "0A000",
+                "the PostgreSQL startup parameter is unsupported",
+            ));
+        }
+    }
+
+    let user = startup
+        .parameters
+        .get("user")
+        .ok_or_else(|| fatal_wire_error("28000", "a valid PostgreSQL user label is required"))?;
+    if !valid_user_label(user) {
+        return Err(fatal_wire_error(
+            "28000",
+            "a valid PostgreSQL user label is required",
+        ));
+    }
+    let database = startup
+        .parameters
+        .get("database")
+        .map(String::as_str)
+        .unwrap_or(user);
+
+    if startup
+        .parameters
+        .get("client_encoding")
+        .is_some_and(|encoding| !matches!(encoding.as_str(), "UTF8" | "UTF-8"))
+    {
+        return Err(fatal_wire_error(
+            "22023",
+            "PostgreSQL client encoding must be UTF8",
+        ));
+    }
+    let application_name = startup.parameters.get("application_name");
+    if application_name.is_some_and(|name| !valid_application_name(name)) {
+        return Err(fatal_wire_error(
+            "22023",
+            "the PostgreSQL application name is invalid",
+        ));
+    }
+    if startup
+        .parameters
+        .get("replication")
+        .is_some_and(|value| value != "false")
+    {
+        return Err(fatal_wire_error(
+            "0A000",
+            "PostgreSQL replication startup is unsupported",
+        ));
+    }
+
+    Ok(PendingStartup {
+        user: user.as_str().into(),
+        database: database.into(),
+        application_name: application_name.map(|name| name.as_str().into()),
+        protocol_minor: startup.protocol_number_minor,
+        unsupported_options,
+    })
+}
+
+fn set_startup_metadata<C>(client: &mut C, pending: &PendingStartup)
+where
+    C: ClientInfo,
+{
+    client.set_protocol_version(ProtocolVersion::PROTOCOL3_0);
+    let metadata = client.metadata_mut();
+    metadata.insert("user".to_owned(), pending.user.to_string());
+    metadata.insert("database".to_owned(), pending.database.to_string());
+    metadata.insert("client_encoding".to_owned(), "UTF8".to_owned());
+    if let Some(application_name) = &pending.application_name {
+        metadata.insert("application_name".to_owned(), application_name.to_string());
+    }
+}
+
+async fn finish_startup<C>(
+    connection: &WireConnection,
+    client: &mut C,
+    pending: PendingStartup,
+) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: fmt::Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    connection.install(&pending.user, &pending.database).await?;
+    let backend_key = connection.backend_key()?;
+    client.set_pid_and_secret_key(backend_key.pid, SecretKey::I32(backend_key.secret));
+    if pending.protocol_minor > POSTGRES_PROTOCOL_MINOR || !pending.unsupported_options.is_empty() {
+        client
+            .send(PgWireBackendMessage::NegotiateProtocolVersion(
+                NegotiateProtocolVersion::new(
+                    i32::from(POSTGRES_PROTOCOL_MINOR),
+                    pending.unsupported_options,
+                ),
+            ))
+            .await?;
+    }
+    client
+        .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
+        .await?;
+    for (name, value) in PARAMETER_STATUS {
+        client
+            .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                name.to_owned(),
+                value.to_owned(),
+            )))
+            .await?;
+    }
+    if let Some(application_name) = pending.application_name {
+        client
+            .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                "application_name".to_owned(),
+                application_name.to_string(),
+            )))
+            .await?;
+    }
+    client
+        .feed(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
+            backend_key.pid,
+            SecretKey::I32(backend_key.secret),
+        )))
+        .await?;
+    client
+        .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+            TransactionStatus::Idle,
+        )))
+        .await?;
+    client.set_state(PgWireConnectionState::ReadyForQuery);
+    Ok(())
+}
+
 #[async_trait]
 impl StartupHandler for WireHandlers {
     async fn on_startup<C>(
@@ -1201,138 +1765,104 @@ impl StartupHandler for WireHandlers {
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let PgWireFrontendMessage::Startup(startup) = message else {
-            return Err(fatal_wire_error(
-                "08P01",
-                "a PostgreSQL startup message is required",
-            ));
-        };
-        if startup.protocol_number_major != POSTGRES_PROTOCOL_MAJOR {
-            return Err(fatal_wire_error(
-                "08P01",
-                "the PostgreSQL protocol version is unsupported",
-            ));
-        }
-
-        let mut unsupported_options = startup
-            .parameters
-            .keys()
-            .filter(|key| key.starts_with("_pq_."))
-            .cloned()
-            .collect::<Vec<_>>();
-        unsupported_options.sort_unstable();
-        for key in startup.parameters.keys() {
-            if !matches!(
-                key.as_str(),
-                "user" | "database" | "client_encoding" | "application_name" | "replication"
-            ) && !key.starts_with("_pq_.")
-            {
-                return Err(fatal_wire_error(
-                    "0A000",
-                    "the PostgreSQL startup parameter is unsupported",
-                ));
+        match message {
+            PgWireFrontendMessage::Startup(startup) => {
+                let pending = validate_startup(&startup)?;
+                set_startup_metadata(client, &pending);
+                if self.connection.state.adapter.security.is_none() {
+                    return finish_startup(&self.connection, client, pending).await;
+                }
+                if !client.is_secure() {
+                    return Err(fatal_wire_error(
+                        "08004",
+                        "TLS is required for PostgreSQL authentication",
+                    ));
+                }
+                let mut authentication = self.connection.state.authentication.lock().await;
+                if authentication.pending.is_some() {
+                    return Err(fatal_wire_error(
+                        "08P01",
+                        "PostgreSQL startup was already received",
+                    ));
+                }
+                authentication.pending = Some(pending);
+                client.set_state(PgWireConnectionState::AuthenticationInProgress);
+                client
+                    .send(PgWireBackendMessage::Authentication(Authentication::SASL(
+                        vec!["SCRAM-SHA-256-PLUS".to_owned(), "SCRAM-SHA-256".to_owned()],
+                    )))
+                    .await
+                    .map_err(Into::into)
             }
-        }
+            PgWireFrontendMessage::PasswordMessageFamily(mut message) => {
+                let mut authentication = self.connection.state.authentication.lock().await;
+                if authentication.pending.is_none() || authentication.scram.is_none() {
+                    return Err(fatal_wire_error(
+                        "08P01",
+                        "PostgreSQL SCRAM authentication was not started",
+                    ));
+                }
+                if matches!(authentication.sasl, SASLState::Initial) {
+                    let initial = message.into_sasl_initial_response()?;
+                    if !matches!(
+                        initial.auth_method.as_str(),
+                        "SCRAM-SHA-256" | "SCRAM-SHA-256-PLUS"
+                    ) {
+                        return Err(fatal_wire_error(
+                            "0A000",
+                            "the PostgreSQL SASL mechanism is unsupported",
+                        ));
+                    }
+                    authentication.sasl = SASLState::ScramClientFirstReceived;
+                    message = PasswordMessageFamily::SASLInitialResponse(initial);
+                } else {
+                    message = PasswordMessageFamily::SASLResponse(message.into_sasl_response()?);
+                }
 
-        let user = startup.parameters.get("user").ok_or_else(|| {
-            fatal_wire_error("28000", "a valid PostgreSQL user label is required")
-        })?;
-        if !valid_user_label(user) {
-            return Err(fatal_wire_error(
-                "28000",
-                "a valid PostgreSQL user label is required",
-            ));
+                let (response, state) = authentication
+                    .scram
+                    .as_ref()
+                    .expect("the SCRAM configuration was checked")
+                    .process_scram_message(client, message, &authentication.sasl)
+                    .await?;
+                if matches!(state, SASLState::Finished) {
+                    let pending = authentication
+                        .pending
+                        .as_ref()
+                        .expect("finished SCRAM has validated startup metadata");
+                    let configured_user = self
+                        .connection
+                        .state
+                        .adapter
+                        .security
+                        .as_ref()
+                        .expect("SCRAM is present only for secure adapters")
+                        .credentials
+                        .user
+                        .as_ref();
+                    if pending.user.as_ref() != configured_user {
+                        return Err(PgWireError::InvalidPassword(String::new()));
+                    }
+                }
+                client
+                    .send(PgWireBackendMessage::Authentication(response))
+                    .await?;
+                authentication.sasl = state;
+                if !matches!(authentication.sasl, SASLState::Finished) {
+                    return Ok(());
+                }
+                let pending = authentication
+                    .pending
+                    .take()
+                    .expect("finished SCRAM has validated startup metadata");
+                drop(authentication);
+                finish_startup(&self.connection, client, pending).await
+            }
+            _ => Err(fatal_wire_error(
+                "08P01",
+                "a PostgreSQL startup or SCRAM message is required",
+            )),
         }
-        let database = startup
-            .parameters
-            .get("database")
-            .map(String::as_str)
-            .unwrap_or(user);
-
-        if startup
-            .parameters
-            .get("client_encoding")
-            .is_some_and(|encoding| !matches!(encoding.as_str(), "UTF8" | "UTF-8"))
-        {
-            return Err(fatal_wire_error(
-                "22023",
-                "PostgreSQL client encoding must be UTF8",
-            ));
-        }
-        let application_name = startup.parameters.get("application_name");
-        if application_name.is_some_and(|name| !valid_application_name(name)) {
-            return Err(fatal_wire_error(
-                "22023",
-                "the PostgreSQL application name is invalid",
-            ));
-        }
-        if startup
-            .parameters
-            .get("replication")
-            .is_some_and(|value| value != "false")
-        {
-            return Err(fatal_wire_error(
-                "0A000",
-                "PostgreSQL replication startup is unsupported",
-            ));
-        }
-
-        self.connection.install(user, database).await?;
-        let backend_key = self.connection.backend_key()?;
-        client.set_protocol_version(ProtocolVersion::PROTOCOL3_0);
-        client.set_pid_and_secret_key(backend_key.pid, SecretKey::I32(backend_key.secret));
-        let metadata = client.metadata_mut();
-        metadata.insert("user".to_owned(), user.to_owned());
-        metadata.insert("database".to_owned(), database.to_owned());
-        metadata.insert("client_encoding".to_owned(), "UTF8".to_owned());
-        if let Some(application_name) = application_name {
-            metadata.insert("application_name".to_owned(), application_name.to_owned());
-        }
-
-        if startup.protocol_number_minor > POSTGRES_PROTOCOL_MINOR
-            || !unsupported_options.is_empty()
-        {
-            client
-                .send(PgWireBackendMessage::NegotiateProtocolVersion(
-                    NegotiateProtocolVersion::new(
-                        i32::from(POSTGRES_PROTOCOL_MINOR),
-                        unsupported_options,
-                    ),
-                ))
-                .await?;
-        }
-        client
-            .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
-            .await?;
-        for (name, value) in PARAMETER_STATUS {
-            client
-                .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
-                    name.to_owned(),
-                    value.to_owned(),
-                )))
-                .await?;
-        }
-        if let Some(application_name) = application_name {
-            client
-                .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
-                    "application_name".to_owned(),
-                    application_name.to_owned(),
-                )))
-                .await?;
-        }
-        client
-            .feed(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
-                backend_key.pid,
-                SecretKey::I32(backend_key.secret),
-            )))
-            .await?;
-        client
-            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                TransactionStatus::Idle,
-            )))
-            .await?;
-        client.set_state(PgWireConnectionState::ReadyForQuery);
-        Ok(())
     }
 }
 
@@ -2474,6 +3004,10 @@ impl ErrorHandler for WireHandlers {
             *error = query_wire_error("26000", "the PostgreSQL prepared statement does not exist");
             return;
         }
+        if matches!(error, PgWireError::InvalidPassword(_)) {
+            *error = fatal_wire_error("28P01", "PostgreSQL password authentication failed");
+            return;
+        }
         *error = if matches!(
             client.state(),
             PgWireConnectionState::AwaitingStartup
@@ -2531,34 +3065,68 @@ impl PgWireServerHandlers for WireHandlers {
     }
 }
 
-type GuardedSocket = Framed<GuardedPgStream<TcpStream>, PgWireMessageServerCodec<PgWirePrepared>>;
+type GuardedSocket = Framed<GuardedPgStream<MaybeTls>, PgWireMessageServerCodec<PgWirePrepared>>;
 
-async fn negotiate_plaintext(
+fn guarded_socket(stream: MaybeTls, peer: std::net::SocketAddr, secure: bool) -> GuardedSocket {
+    let client = DefaultClient::<PgWirePrepared>::new(peer, secure);
+    Framed::new(
+        GuardedPgStream::new(stream, Vec::new()),
+        PgWireMessageServerCodec::new(client),
+    )
+}
+
+async fn negotiate_transport(
     stream: TcpStream,
+    security: Option<&LoadedSecurity>,
 ) -> io::Result<Option<(GuardedSocket, Option<PgWireFrontendMessage>)>> {
     let peer = stream.peer_addr()?;
     stream.set_nodelay(true)?;
 
-    // Direct TLS is not enabled for the loopback-only listener. Match the
-    // dependency's existing behavior by closing without interpreting a TLS
-    // ClientHello as PostgreSQL framing.
     let mut first = [0_u8; 1];
     if stream.peek(&mut first).await? > 0 && first[0] == 0x16 {
-        return Ok(None);
+        let Some(security) = security else {
+            return Ok(None);
+        };
+        let tls = security.tls_acceptor.accept(stream).await?;
+        let (_, session) = tls.get_ref();
+        if session.alpn_protocol() != Some(b"postgresql") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "direct PostgreSQL TLS requires the postgresql ALPN protocol",
+            ));
+        }
+        let mut socket = guarded_socket(MaybeTls::Tls(Box::new(tls)), peer, true);
+        socket.set_state(PgWireConnectionState::AwaitingStartup);
+        return Ok(Some((socket, None)));
     }
 
-    let client = DefaultClient::<PgWirePrepared>::new(peer, false);
-    let codec = PgWireMessageServerCodec::new(client);
-    let mut socket = Framed::new(GuardedPgStream::new(stream, Vec::new()), codec);
+    let mut socket = guarded_socket(MaybeTls::Plain(stream), peer, false);
 
     loop {
         match socket.next().await {
             Some(Ok(PgWireFrontendMessage::SslNegotiation(
                 SslNegotiationMetaMessage::PostgresSsl(_),
             ))) => {
+                let Some(security) = security else {
+                    socket
+                        .send(PgWireBackendMessage::SslResponse(SslResponse::Refuse))
+                        .await?;
+                    continue;
+                };
                 socket
-                    .send(PgWireBackendMessage::SslResponse(SslResponse::Refuse))
+                    .send(PgWireBackendMessage::SslResponse(SslResponse::Accept))
                     .await?;
+                let guarded = socket.into_inner();
+                let MaybeTls::Plain(stream) = guarded.inner else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "PostgreSQL TLS negotiation was repeated",
+                    ));
+                };
+                let tls = security.tls_acceptor.accept(stream).await?;
+                let mut socket = guarded_socket(MaybeTls::Tls(Box::new(tls)), peer, true);
+                socket.set_state(PgWireConnectionState::AwaitingStartup);
+                return Ok(Some((socket, None)));
             }
             Some(Ok(PgWireFrontendMessage::SslNegotiation(
                 SslNegotiationMetaMessage::PostgresGss(_),
@@ -2596,7 +3164,7 @@ async fn run_socket(
     tokio::pin!(startup_timeout);
     let socket = tokio::select! {
         _ = &mut startup_timeout => return Ok(()),
-        socket = negotiate_plaintext(stream) => socket?,
+        socket = negotiate_transport(stream, handlers.connection.state.adapter.security.as_deref()) => socket?,
     };
     let Some((mut socket, initial_message)) = socket else {
         return Ok(());
@@ -2936,7 +3504,7 @@ fn engine_error_to_pgwire_with_severity(error: EngineError, severity: &str) -> P
 
 #[cfg(test)]
 mod tests {
-    use std::{fmt::Debug, net::SocketAddr, sync::Arc, time::Duration};
+    use std::{fmt::Debug, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
     use futures::Sink;
@@ -2952,8 +3520,9 @@ mod tests {
         messages::{PgWireBackendMessage, PgWireFrontendMessage},
         tokio::process_socket,
     };
+    use postgres_protocol::authentication::sasl::{ChannelBinding, SCRAM_SHA_256, ScramSha256};
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
     };
 
@@ -3054,6 +3623,134 @@ mod tests {
         startup_packet_with(196_608, &[("user", "briskdb"), ("database", "default")])
     }
 
+    fn test_security_config(directory: &Path) -> SecurityConfig {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/postgres-tls");
+        let certificate = directory.join("server.crt");
+        let private_key = directory.join("server.key");
+        let password_file = directory.join("postgres-password");
+        std::fs::copy(fixtures.join("server.crt"), &certificate).unwrap();
+        std::fs::copy(fixtures.join("server.key"), &private_key).unwrap();
+        std::fs::write(&password_file, b"correct horse battery staple\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&private_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&password_file, std::fs::Permissions::from_mode(0o640))
+                .unwrap();
+        }
+        SecurityConfig::new(certificate, private_key, "briskdb", password_file).unwrap()
+    }
+
+    fn test_tls_connector() -> pgwire::tokio::tokio_rustls::TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        let certificate = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/postgres-tls/server.crt"
+        ));
+        for certificate in rustls_pemfile::certs(&mut certificate.as_slice()) {
+            roots.add(certificate.unwrap()).unwrap();
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        pgwire::tokio::tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    type TestTlsStream = pgwire::tokio::tokio_rustls::client::TlsStream<TcpStream>;
+
+    async fn secure_startup(
+        address: SocketAddr,
+        user: &str,
+        password: &str,
+    ) -> Result<TestTlsStream, std::collections::BTreeMap<u8, String>> {
+        let mut tcp = TcpStream::connect(address).await.unwrap();
+        tcp.write_all(&[0, 0, 0, 8, 4, 210, 22, 47]).await.unwrap();
+        let mut response = [0_u8; 1];
+        tcp.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, *b"S");
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+            .unwrap()
+            .to_owned();
+        let mut tls = test_tls_connector()
+            .connect(server_name, tcp)
+            .await
+            .unwrap();
+        tls.write_all(&startup_packet_with(
+            196_608,
+            &[("user", user), ("database", "default")],
+        ))
+        .await
+        .unwrap();
+
+        let (message_type, mechanisms) = read_frame(&mut tls).await;
+        assert_eq!(message_type, b'R');
+        assert_eq!(i32::from_be_bytes(mechanisms[..4].try_into().unwrap()), 10);
+        assert!(
+            mechanisms[4..]
+                .windows(SCRAM_SHA_256.len())
+                .any(|window| window == SCRAM_SHA_256.as_bytes())
+        );
+
+        let mut scram = ScramSha256::new(password.as_bytes(), ChannelBinding::unsupported());
+        let mut initial = Vec::new();
+        push_cstring(&mut initial, SCRAM_SHA_256);
+        initial.extend_from_slice(&i32::try_from(scram.message().len()).unwrap().to_be_bytes());
+        initial.extend_from_slice(scram.message());
+        tls.write_all(&typed_packet(b'p', &initial)).await.unwrap();
+
+        let (message_type, challenge) = read_frame(&mut tls).await;
+        assert_eq!(message_type, b'R');
+        assert_eq!(i32::from_be_bytes(challenge[..4].try_into().unwrap()), 11);
+        scram.update(&challenge[4..]).unwrap();
+        tls.write_all(&typed_packet(b'p', scram.message()))
+            .await
+            .unwrap();
+
+        let (message_type, final_message) = read_frame(&mut tls).await;
+        if message_type == b'E' {
+            return Err(message_fields(&final_message));
+        }
+        assert_eq!(message_type, b'R');
+        assert_eq!(
+            i32::from_be_bytes(final_message[..4].try_into().unwrap()),
+            12
+        );
+        scram.finish(&final_message[4..]).unwrap();
+        let startup = read_until_ready(&mut tls).await;
+        assert!(startup.iter().any(|(kind, body)| {
+            *kind == b'R' && i32::from_be_bytes(body[..4].try_into().unwrap()) == 0
+        }));
+        Ok(tls)
+    }
+
+    async fn secure_server(
+        engine: Engine,
+        security: LoadedSecurity,
+        connection_count: usize,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let adapter = Adapter::with_loaded_security(engine, security);
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            for _ in 0..connection_count {
+                let (stream, _) = listener.accept().await.unwrap();
+                let connection = adapter.wire_connection();
+                connections.spawn(async move {
+                    connection
+                        .serve(stream, std::future::pending())
+                        .await
+                        .unwrap();
+                });
+            }
+            while let Some(result) = connections.join_next().await {
+                result.unwrap();
+            }
+        });
+        (address, task)
+    }
+
     fn cancel_packet(pid: i32, secret: i32) -> Vec<u8> {
         let mut packet = Vec::with_capacity(16);
         packet.extend_from_slice(&16_u32.to_be_bytes());
@@ -3150,7 +3847,10 @@ mod tests {
         typed_packet(b'C', &body)
     }
 
-    async fn read_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+    async fn read_frame<S>(stream: &mut S) -> (u8, Vec<u8>)
+    where
+        S: AsyncRead + Unpin,
+    {
         tokio::time::timeout(Duration::from_secs(2), async {
             let mut header = [0_u8; 5];
             stream.read_exact(&mut header).await.unwrap();
@@ -3164,7 +3864,10 @@ mod tests {
         .expect("the pgwire compatibility probe returned a frame")
     }
 
-    async fn read_until_ready(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+    async fn read_until_ready<S>(stream: &mut S) -> Vec<(u8, Vec<u8>)>
+    where
+        S: AsyncRead + Unpin,
+    {
         let mut frames = Vec::new();
         loop {
             let frame = read_frame(stream).await;
@@ -3637,6 +4340,121 @@ mod tests {
         assert!(second.cancellation.is_cancelled());
         assert_eq!(registry.len(), 0);
         drop(second);
+    }
+
+    #[test]
+    fn security_configuration_validates_identity_secrets_and_tls_material() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_security_config(temp.path());
+        let loaded = config.load().unwrap();
+        assert_eq!(loaded.credentials.user.as_ref(), "briskdb");
+        assert!(!format!("{loaded:?}").contains("correct horse"));
+        assert!(
+            SecurityConfig::new(
+                config.certificate(),
+                config.private_key(),
+                "Invalid-User",
+                config.password_file(),
+            )
+            .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(
+                config.password_file(),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            let error = config.load().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(!error.to_string().contains("correct horse"));
+        }
+    }
+
+    #[tokio::test]
+    async fn secure_listener_requires_tls_and_returns_a_fixed_startup_error() {
+        let (temp, engine) = engine(2).await;
+        let security = test_security_config(temp.path()).load().unwrap();
+        let (address, server) = secure_server(engine.clone(), security, 1).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        let (kind, body) = read_frame(&mut client).await;
+        assert_eq!(kind, b'E');
+        let fields = message_fields(&body);
+        assert_eq!(fields.get(&b'C').map(String::as_str), Some("08004"));
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some("TLS is required for PostgreSQL authentication")
+        );
+        assert_eof(&mut client).await;
+        server.await.unwrap();
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_scram_supports_queries_concurrency_and_recovery_after_bad_password() {
+        let (temp, engine) = engine(2).await;
+        let security = test_security_config(temp.path()).load().unwrap();
+        let (address, server) = secure_server(engine.clone(), security, 5).await;
+
+        let error = secure_startup(address, "briskdb", "wrong password")
+            .await
+            .unwrap_err();
+        assert_eq!(error.get(&b'C').map(String::as_str), Some("28P01"));
+        assert_eq!(
+            error.get(&b'M').map(String::as_str),
+            Some("PostgreSQL password authentication failed")
+        );
+
+        // The decoy credential keeps unknown-user proof work comparable, but
+        // must never become a usable account even if its source value is known.
+        let error = secure_startup(
+            address,
+            "unknown_user",
+            "briskdb-invalid-authentication-secret",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.get(&b'C').map(String::as_str), Some("28P01"));
+
+        let (first, second) = tokio::join!(
+            secure_startup(address, "briskdb", "correct horse battery staple"),
+            secure_startup(address, "briskdb", "correct horse battery staple"),
+        );
+        let mut first = first.unwrap();
+        let mut second = second.unwrap();
+        for client in [&mut first, &mut second] {
+            client
+                .write_all(&typed_packet(b'Q', b"SELECT 1\0"))
+                .await
+                .unwrap();
+            let frames = read_until_ready(client).await;
+            assert!(frames.iter().any(|(kind, _)| *kind == b'D'));
+            client.write_all(&typed_packet(b'X', &[])).await.unwrap();
+        }
+        drop(first);
+        drop(second);
+
+        let mut recovered = secure_startup(address, "briskdb", "correct horse battery staple")
+            .await
+            .unwrap();
+        recovered
+            .write_all(&typed_packet(b'Q', b"SELECT 2\0"))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut recovered).await;
+        assert!(frames.iter().any(|(kind, _)| *kind == b'D'));
+        recovered.write_all(&typed_packet(b'X', &[])).await.unwrap();
+        drop(recovered);
+
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("all secure PostgreSQL connections should finish")
+            .unwrap();
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]

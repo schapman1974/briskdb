@@ -6,8 +6,10 @@ use briskdb::{
         DEFAULT_MAX_PREPARED_STATEMENTS_PER_SESSION, DEFAULT_MAX_RESULT_BYTES,
         DEFAULT_MAX_RESULT_ROWS, DEFAULT_MAX_RETAINED_BOUND_VALUE_BYTES,
         DEFAULT_QUEUE_CAPACITY_PER_SHARD, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_SHUTDOWN_GRACE_MS,
-        EngineOptions, EngineResult, PreparedStatementLimits, ResultLimits,
+        EngineError, EngineErrorKind, EngineOptions, EngineResult, PreparedStatementLimits,
+        ResultLimits,
     },
+    protocol::postgres::SecurityConfig as PostgresSecurityConfig,
     server::{self, Config},
 };
 use clap::Parser;
@@ -64,6 +66,27 @@ struct Args {
         value_name = "SOCKET_ADDR|disabled"
     )]
     postgres_listen: ListenerSetting,
+
+    /// PEM certificate chain for TLS on the PostgreSQL listener.
+    #[arg(long, env = "BRISKDB_POSTGRES_TLS_CERT", value_name = "PATH")]
+    postgres_tls_cert: Option<PathBuf>,
+
+    /// PEM private key for TLS on the PostgreSQL listener.
+    #[arg(long, env = "BRISKDB_POSTGRES_TLS_KEY", value_name = "PATH")]
+    postgres_tls_key: Option<PathBuf>,
+
+    /// PostgreSQL identity accepted by SCRAM-SHA-256 authentication.
+    #[arg(
+        long,
+        env = "BRISKDB_POSTGRES_USER",
+        default_value = "briskdb",
+        value_name = "USER"
+    )]
+    postgres_user: String,
+
+    /// File containing the PostgreSQL SCRAM password; never pass the password itself.
+    #[arg(long, env = "BRISKDB_POSTGRES_PASSWORD_FILE", value_name = "PATH")]
+    postgres_password_file: Option<PathBuf>,
 
     /// Directory containing the manifest and shard files.
     #[arg(long, env = "BRISKDB_DATA_DIR", default_value = "./briskdb-data")]
@@ -161,6 +184,33 @@ impl Args {
     /// Keeping this conversion ahead of `server::run_with_engine_options`
     /// ensures invalid limits cannot bind a listener or create database files.
     fn into_server_parts(self) -> EngineResult<(Config, EngineOptions)> {
+        let postgres_security = match (
+            self.postgres_tls_cert,
+            self.postgres_tls_key,
+            self.postgres_password_file,
+        ) {
+            (None, None, None) => None,
+            (Some(certificate), Some(private_key), Some(password_file)) => Some(
+                PostgresSecurityConfig::new(
+                    certificate,
+                    private_key,
+                    self.postgres_user,
+                    password_file,
+                )
+                .map_err(|error| {
+                    EngineError::new(
+                        EngineErrorKind::InvalidArgument,
+                        format!("PostgreSQL TLS and SCRAM configuration is invalid: {error}"),
+                    )
+                })?,
+            ),
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    "--postgres-tls-cert, --postgres-tls-key, and --postgres-password-file must be set together",
+                ));
+            }
+        };
         let result_limits = ResultLimits::new(self.max_result_rows, self.max_result_bytes)?;
         let prepared_statement_limits = PreparedStatementLimits::new(
             self.max_prepared_statements_per_session,
@@ -180,6 +230,7 @@ impl Args {
         let config = Config {
             listen: self.listen,
             postgres_listen: self.postgres_listen.into_option(),
+            postgres_security,
             data_dir: self.data_dir,
             shards: self.shards,
         };
@@ -213,6 +264,10 @@ mod tests {
 
         assert_eq!(args.listen, "127.0.0.1:7654".parse().unwrap());
         assert_eq!(args.postgres_listen, ListenerSetting::Disabled);
+        assert_eq!(args.postgres_tls_cert, None);
+        assert_eq!(args.postgres_tls_key, None);
+        assert_eq!(args.postgres_user, "briskdb");
+        assert_eq!(args.postgres_password_file, None);
         assert_eq!(args.data_dir, PathBuf::from("./briskdb-data"));
         assert_eq!(args.shards, 4);
         assert_eq!(args.connections_per_shard, DEFAULT_CONNECTIONS_PER_SHARD);
@@ -248,6 +303,14 @@ mod tests {
             "127.0.0.1:9000",
             "--postgres-listen",
             "127.0.0.1:9543",
+            "--postgres-tls-cert",
+            "/tmp/server.crt",
+            "--postgres-tls-key",
+            "/tmp/server.key",
+            "--postgres-user",
+            "app_user",
+            "--postgres-password-file",
+            "/tmp/postgres-password",
             "--data-dir",
             "/tmp/briskdb-test-data",
             "--shards",
@@ -277,6 +340,19 @@ mod tests {
         assert_eq!(
             args.postgres_listen,
             ListenerSetting::Address("127.0.0.1:9543".parse().unwrap())
+        );
+        assert_eq!(
+            args.postgres_tls_cert,
+            Some(PathBuf::from("/tmp/server.crt"))
+        );
+        assert_eq!(
+            args.postgres_tls_key,
+            Some(PathBuf::from("/tmp/server.key"))
+        );
+        assert_eq!(args.postgres_user, "app_user");
+        assert_eq!(
+            args.postgres_password_file,
+            Some(PathBuf::from("/tmp/postgres-password"))
         );
         assert_eq!(args.data_dir, PathBuf::from("/tmp/briskdb-test-data"));
         assert_eq!(args.shards, 8);
@@ -330,6 +406,7 @@ mod tests {
             Config {
                 listen: "127.0.0.1:9000".parse().unwrap(),
                 postgres_listen: Some("127.0.0.1:9543".parse().unwrap()),
+                postgres_security: None,
                 data_dir: PathBuf::from("/tmp/briskdb-test-data"),
                 shards: 8,
             }
@@ -439,6 +516,60 @@ mod tests {
         let (config, _) = args.into_server_parts().unwrap();
 
         assert_eq!(config.postgres_listen, None);
+        assert_eq!(config.postgres_security, None);
+    }
+
+    #[test]
+    fn postgres_security_requires_complete_file_configuration() {
+        for arguments in [
+            vec!["briskdb", "--postgres-tls-cert", "/tmp/server.crt"],
+            vec![
+                "briskdb",
+                "--postgres-tls-cert",
+                "/tmp/server.crt",
+                "--postgres-tls-key",
+                "/tmp/server.key",
+            ],
+            vec![
+                "briskdb",
+                "--postgres-password-file",
+                "/tmp/postgres-password",
+            ],
+        ] {
+            let error = Args::try_parse_from(arguments)
+                .unwrap()
+                .into_server_parts()
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+            assert!(error.diagnostic().contains("must be set together"));
+        }
+    }
+
+    #[test]
+    fn postgres_security_files_and_identity_reach_server_config() {
+        let args = Args::try_parse_from([
+            "briskdb",
+            "--postgres-listen",
+            "0.0.0.0:5433",
+            "--postgres-tls-cert",
+            "/tmp/server.crt",
+            "--postgres-tls-key",
+            "/tmp/server.key",
+            "--postgres-user",
+            "app_user",
+            "--postgres-password-file",
+            "/tmp/postgres-password",
+        ])
+        .unwrap();
+        let (config, _) = args.into_server_parts().unwrap();
+        let security = config.postgres_security.unwrap();
+        assert_eq!(security.certificate(), PathBuf::from("/tmp/server.crt"));
+        assert_eq!(security.private_key(), PathBuf::from("/tmp/server.key"));
+        assert_eq!(security.user(), "app_user");
+        assert_eq!(
+            security.password_file(),
+            PathBuf::from("/tmp/postgres-password")
+        );
     }
 
     #[test]
@@ -479,6 +610,22 @@ mod tests {
         let postgres_listener = command
             .get_arguments()
             .find(|argument| argument.get_id() == "postgres_listen")
+            .unwrap();
+        let postgres_tls_cert = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "postgres_tls_cert")
+            .unwrap();
+        let postgres_tls_key = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "postgres_tls_key")
+            .unwrap();
+        let postgres_user = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "postgres_user")
+            .unwrap();
+        let postgres_password_file = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "postgres_password_file")
             .unwrap();
         let connections = command
             .get_arguments()
@@ -525,6 +672,22 @@ mod tests {
         assert_eq!(
             postgres_listener.get_env(),
             Some(OsStr::new("BRISKDB_POSTGRES_LISTEN"))
+        );
+        assert_eq!(
+            postgres_tls_cert.get_env(),
+            Some(OsStr::new("BRISKDB_POSTGRES_TLS_CERT"))
+        );
+        assert_eq!(
+            postgres_tls_key.get_env(),
+            Some(OsStr::new("BRISKDB_POSTGRES_TLS_KEY"))
+        );
+        assert_eq!(
+            postgres_user.get_env(),
+            Some(OsStr::new("BRISKDB_POSTGRES_USER"))
+        );
+        assert_eq!(
+            postgres_password_file.get_env(),
+            Some(OsStr::new("BRISKDB_POSTGRES_PASSWORD_FILE"))
         );
         assert_eq!(
             connections.get_env(),
@@ -668,6 +831,47 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "environment case failed: {expected}");
         }
+    }
+
+    #[test]
+    fn postgres_security_settings_parse_from_environment() {
+        const CHILD_MARKER: &str = "BRISKDB_POSTGRES_SECURITY_ENV_TEST_CHILD";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let args = Args::try_parse_from(["briskdb"]).unwrap();
+            assert_eq!(
+                args.postgres_tls_cert,
+                Some(PathBuf::from("/tmp/env-server.crt"))
+            );
+            assert_eq!(
+                args.postgres_tls_key,
+                Some(PathBuf::from("/tmp/env-server.key"))
+            );
+            assert_eq!(args.postgres_user, "env_user");
+            assert_eq!(
+                args.postgres_password_file,
+                Some(PathBuf::from("/tmp/env-postgres-password"))
+            );
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::postgres_security_settings_parse_from_environment",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("BRISKDB_POSTGRES_TLS_CERT", "/tmp/env-server.crt")
+            .env("BRISKDB_POSTGRES_TLS_KEY", "/tmp/env-server.key")
+            .env("BRISKDB_POSTGRES_USER", "env_user")
+            .env(
+                "BRISKDB_POSTGRES_PASSWORD_FILE",
+                "/tmp/env-postgres-password",
+            )
+            .status()
+            .unwrap();
+
+        assert!(status.success());
     }
 
     #[test]

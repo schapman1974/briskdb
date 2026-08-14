@@ -35,16 +35,24 @@ postgres = [
     "dep:bytes",
     "dep:futures",
     "dep:pgwire",
+    "dep:rustls-pemfile",
+    "pgwire/server-api-ring",
     "dep:tokio-util",
     "tokio/io-util",
     "tokio/net",
+]
+# Compatibility alias for the PostgreSQL transport-security surface. The
+# adapter always includes TLS and SCRAM so a downstream listener cannot compile
+# an accidentally insecure non-loopback configuration.
+tls = [
+    "postgres",
 ]
 # Host-controlled HTTP/PostgreSQL listener assembly. It does not install
 # signal handlers, logging subscribers, or own an engine lifecycle.
 listeners = [
     "embedded",
     "http",
-    "postgres",
+    "tls",
     "dep:anyhow",
     "dep:hyper",
     "dep:hyper-util",
@@ -68,7 +76,6 @@ sqlite-import-cli = ["sqlite-import", "dep:anyhow", "dep:clap"]
 # claiming that these roadmap surfaces are implemented.
 documents = ["embedded"]
 mysql = []
-tls = []
 # Statically compile rusqlite's virtual-table API for the no-fork sharded-table
 # prototype. This does not enable SQLite's runtime extension loader.
 experimental-vtab = ["rusqlite/vtab"]
@@ -86,9 +93,11 @@ hyper = { version = "1.11", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1.20", features = ["service", "tokio"], optional = true }
 libc = "0.2"
 # 0.36.3 is the newest pgwire release that supports BriskDB's Rust 1.85
-# baseline. Keep the pre-1.0 dependency exact and enable only the plaintext
-# server surface; later roadmap work owns TLS and extended type adapters.
+# baseline. Keep the pre-1.0 dependency exact. The `postgres` feature selects
+# the server API and its ring provider for TLS and SCRAM-SHA-256 without
+# pulling in the dependency's defaults.
 pgwire = { version = "=0.36.3", default-features = false, features = ["server-api"], optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
 rusqlite = { version = "0.39.0", features = ["bundled", "column_decltype", "column_metadata", "hooks", "limits"] }
 same-file = "1.0"
 serde = { version = "1.0.229", features = ["derive"], optional = true }
@@ -106,6 +115,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional =
 
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false }
+postgres-protocol = "=0.6.12"
 proptest = "1.7"
 tempfile = "3.23"
 

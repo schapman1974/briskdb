@@ -31,15 +31,17 @@ propagates a native `CancellationToken` into the exact Rust request.
 
 ## Attached listeners
 
-- `db.serve(*, http="127.0.0.1:0", postgres=None) -> Server`
+- `db.serve(*, http="127.0.0.1:0", postgres=None, postgres_tls_cert=None, postgres_tls_key=None, postgres_user="briskdb", postgres_password_file=None) -> Server`
 - `await async_db.serve(...) -> AsyncServer`
 - `Server.http_address` and `.postgres_address` report actual bound addresses.
 - `Server.close()` is idempotent; server context exit closes only listeners.
 - Database close first drains every attached server, then stops the engine.
 
-Only numeric loopback socket addresses are accepted. These alpha listeners
-have no authentication or TLS. The PostgreSQL endpoint supports BriskDB's
-documented bounded SQL subset.
+HTTP and unauthenticated PostgreSQL accept only numeric loopback addresses.
+Certificate, key, and password-file arguments enable TLS/SCRAM PostgreSQL and
+permit a non-loopback PostgreSQL address. This is single-identity
+authentication, not roles or authorization. The PostgreSQL endpoint supports
+BriskDB's documented bounded SQL subset.
 
 ## Results and errors
 

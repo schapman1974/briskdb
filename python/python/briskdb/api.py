@@ -297,11 +297,21 @@ class AsyncDatabase:
         *,
         http: str = "127.0.0.1:0",
         postgres: Optional[str] = None,
+        postgres_tls_cert: Optional[Union[str, PathLike[str]]] = None,
+        postgres_tls_key: Optional[Union[str, PathLike[str]]] = None,
+        postgres_user: str = "briskdb",
+        postgres_password_file: Optional[Union[str, PathLike[str]]] = None,
     ) -> AsyncServer:
-        """Start loopback listeners against this database's existing engine."""
+        """Start listeners against this database's existing engine."""
 
         server = await asyncio.to_thread(
-            self._database.serve, http=http, postgres=postgres
+            self._database.serve,
+            http=http,
+            postgres=postgres,
+            postgres_tls_cert=postgres_tls_cert,
+            postgres_tls_key=postgres_tls_key,
+            postgres_user=postgres_user,
+            postgres_password_file=postgres_password_file,
         )
         return AsyncServer(server)
 
