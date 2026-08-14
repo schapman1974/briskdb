@@ -154,7 +154,8 @@ macOS/Linux ARM64 and x86-64 archives plus Linux `.deb` packages.
 
 Embedding in Rust starts with `BriskDb::open()` or the validated builder. The
 [embedded Rust guide](docs/EMBEDDED_RUST.md) includes a complete listener-free
-example and documents every default. Use `default-features = false` with the
+example. Choose a shard count when creating data; later opens detect it from
+the manifest and reject explicit mismatches. Use `default-features = false` with the
 `embedded` feature to leave the network and CLI stacks out; see the
 [crate feature map](docs/CRATE_FEATURES.md).
 

@@ -2041,6 +2041,62 @@ impl Storage {
     }
 }
 
+/// Detect the immutable physical shard count without creating or upgrading
+/// any database files.
+pub(crate) fn detect_shard_count(root: impl AsRef<Path>) -> EngineResult<u16> {
+    let root = root.as_ref();
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            EngineError::from_source(
+                EngineErrorKind::FailedPrecondition,
+                "data directory has no initialized BriskDB manifest; set a shard count to create it",
+                error,
+            )
+        } else {
+            sqlite_error::storage_io(error, format!("failed to inspect {}", root.display()))
+        }
+    })?;
+    if !metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("data path {} is not a directory", root.display()),
+        ));
+    }
+    let root = fs::canonicalize(root).map_err(|error| {
+        sqlite_error::storage_io(error, format!("failed to resolve {}", root.display()))
+    })?;
+    if !fs::metadata(&root)
+        .map_err(|error| {
+            sqlite_error::storage_io(error, format!("failed to inspect {}", root.display()))
+        })?
+        .is_dir()
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("data path {} is not a directory", root.display()),
+        ));
+    }
+    let manifest_path = root.join("manifest.sqlite");
+    match fs::symlink_metadata(&manifest_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "data directory has no initialized BriskDB manifest; set a shard count to create it",
+            ));
+        }
+        Err(error) => {
+            return Err(sqlite_error::storage_io(
+                error,
+                format!("failed to inspect {}", manifest_path.display()),
+            ));
+        }
+    }
+    let connection = open_existing_manifest_read_only(&manifest_path)?;
+    configure_manifest_connection(&connection)?;
+    manifest::detect_shard_count(&connection)
+}
+
 fn declarations_match_catalog(catalog: &Catalog, declarations: &[TableDeclaration]) -> bool {
     if catalog.tables().len() != declarations.len() {
         return false;
@@ -2539,6 +2595,20 @@ pub(super) fn open_existing_manifest(path: &Path) -> EngineResult<Connection> {
     let open_path = canonical_manifest_open_path(path)?;
     let connection = Connection::open_with_flags(open_path, flags).map_err(|error| {
         sqlite_error::storage(error).context(format!("failed to open {}", path.display()))
+    })?;
+    validate_existing_manifest_file(path)?;
+    Ok(connection)
+}
+
+fn open_existing_manifest_read_only(path: &Path) -> EngineResult<Connection> {
+    validate_existing_manifest_file(path)?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+        | OpenFlags::SQLITE_OPEN_EXRESCODE;
+    let open_path = canonical_manifest_open_path(path)?;
+    let connection = Connection::open_with_flags(open_path, flags).map_err(|error| {
+        sqlite_error::storage(error).context(format!("failed to open {} read-only", path.display()))
     })?;
     validate_existing_manifest_file(path)?;
     Ok(connection)

@@ -19,7 +19,10 @@ use crate::core::{
 };
 use crate::{EngineError, EngineErrorKind};
 
-/// Default number of physical shards created by the embedded convenience API.
+/// Recommended number of physical shards for small embedded deployments.
+///
+/// New databases still require callers to select a count explicitly; this
+/// constant is retained as a convenient documented choice.
 pub const DEFAULT_EMBEDDED_SHARDS: u16 = 4;
 
 /// Tokio runtime ownership selected for an embedded database.
@@ -57,18 +60,19 @@ pub enum DocumentSupport {
 #[must_use = "a builder must be opened to create a BriskDB instance"]
 pub struct BriskDbBuilder {
     root: PathBuf,
-    shard_count: u16,
+    shard_count: Option<u16>,
     engine_options: EngineOptions,
     runtime_behavior: RuntimeBehavior,
     document_support: DocumentSupport,
 }
 
 impl BriskDbBuilder {
-    /// Create a builder with documented embedded defaults.
+    /// Create a builder that detects existing storage and uses documented
+    /// resource defaults.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            shard_count: DEFAULT_EMBEDDED_SHARDS,
+            shard_count: None,
             engine_options: EngineOptions::default(),
             runtime_behavior: RuntimeBehavior::default(),
             document_support: DocumentSupport::default(),
@@ -80,14 +84,14 @@ impl BriskDbBuilder {
         &self.root
     }
 
-    /// Return the configured physical shard count.
-    pub const fn shard_count(&self) -> u16 {
+    /// Return the requested count, or `None` when existing data will decide.
+    pub const fn shard_count(&self) -> Option<u16> {
         self.shard_count
     }
 
     /// Set the fixed physical shard count used for a new database.
     pub const fn with_shard_count(mut self, shard_count: u16) -> Self {
-        self.shard_count = shard_count;
+        self.shard_count = Some(shard_count);
         self
     }
 
@@ -132,7 +136,9 @@ impl BriskDbBuilder {
                 "the embedded data-directory path must not be empty",
             ));
         }
-        self.engine_options.validate_for_shards(self.shard_count)?;
+        if let Some(shard_count) = self.shard_count {
+            self.engine_options.validate_for_shards(shard_count)?;
+        }
         if self.runtime_behavior != RuntimeBehavior::CallerManaged {
             return Err(EngineError::new(
                 EngineErrorKind::Unsupported,
@@ -151,8 +157,12 @@ impl BriskDbBuilder {
     /// Validate and open one embedded database on the caller's Tokio runtime.
     pub async fn open(self) -> EngineResult<BriskDb> {
         self.validate()?;
-        let engine =
-            Engine::open_with_options(&self.root, self.shard_count, self.engine_options).await?;
+        let engine = match self.shard_count {
+            Some(shard_count) => {
+                Engine::open_with_options(&self.root, shard_count, self.engine_options).await?
+            }
+            None => Engine::open_detected_with_options(&self.root, self.engine_options).await?,
+        };
         Ok(BriskDb {
             engine,
             root: self.root,
@@ -203,7 +213,7 @@ impl BriskDb {
         BriskDbBuilder::new(root)
     }
 
-    /// Open one database with the documented embedded defaults.
+    /// Open an initialized database by detecting its physical shard count.
     pub async fn open(root: impl Into<PathBuf>) -> EngineResult<Self> {
         Self::builder(root).open().await
     }

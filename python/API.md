@@ -13,6 +13,11 @@ files; the signatures below are the compact API map.
 - `Config(...)` validates shard, pool, queue, result, prepared-object,
   deadline, and shutdown limits before opening storage.
 
+`shards` is required to create storage and optional when reopening it. An
+omitted count is read from the validated manifest; an explicit mismatch raises
+`FailedPreconditionError`. `Database.shard_count` and `Database.config.shards`
+always report the resolved count.
+
 ## Database and session
 
 `Database` exposes `session()`, `checkpoint()`, `close()`, state/config

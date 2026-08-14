@@ -28,6 +28,11 @@ session.close()
 db.close()
 ```
 
+Pass `shards` when creating a data directory. Later calls may omit it and use
+the count stored in the manifest. Passing the wrong count raises
+`FailedPreconditionError`; omitting it for new/empty storage asks you to choose
+one without creating files.
+
 Resource limits can be validated before the database opens:
 
 ```python
@@ -50,7 +55,7 @@ Synchronous handles support `with`; the asyncio facade keeps engine work off
 the event loop and propagates task cancellation into Rust:
 
 ```python
-async with await briskdb.open_async("./data", shards=4) as db:
+async with await briskdb.open_async("./data") as db:
     async with await db.session(routing_key="account-1") as session:
         rows = await session.query("SELECT body FROM notes WHERE id = ?1", [1])
 ```

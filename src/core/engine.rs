@@ -394,6 +394,30 @@ impl Engine {
         Self::from_parts(Arc::new(database), options, workers)
     }
 
+    /// Detect an initialized database's immutable shard count and open it.
+    ///
+    /// Detection runs on a blocking worker and does not create a missing data
+    /// directory or manifest. The normal open validates the same count again
+    /// before establishing pools, closing replacement races safely.
+    pub async fn open_detected_with_options(
+        root: impl AsRef<Path>,
+        options: EngineOptions,
+    ) -> EngineResult<Self> {
+        let root = PathBuf::from(root.as_ref());
+        let detect_root = root.clone();
+        let requested_shards =
+            tokio::task::spawn_blocking(move || Database::detect_shard_count(detect_root))
+                .await
+                .map_err(|error| {
+                    EngineError::from_source(
+                        EngineErrorKind::Internal,
+                        "shard-count discovery worker failed",
+                        error,
+                    )
+                })??;
+        Self::open_with_options(root, requested_shards, options).await
+    }
+
     /// Wrap the synchronous compatibility API in the shared async boundary.
     pub fn from_database(database: Arc<Database>) -> Self {
         Self::from_database_with_options(database, EngineOptions::default())

@@ -84,7 +84,7 @@ class DataCorruptionError(OperationalError): ...
 class InternalError(OperationalError): ...
 
 class Config:
-    shards: int
+    shards: Optional[int]
     connections_per_shard: int
     queue_capacity_per_shard: int
     max_result_rows: int
@@ -97,7 +97,7 @@ class Config:
     def __init__(
         self,
         *,
-        shards: int = ...,
+        shards: Optional[int] = ...,
         connections_per_shard: int = ...,
         queue_capacity_per_shard: int = ...,
         max_result_rows: int = ...,

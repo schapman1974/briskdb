@@ -109,6 +109,8 @@ class AsyncApiTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertTrue(session.closed)
             self.assertTrue(database.closed)
+            async with await briskdb.open_async(data_dir) as reopened:
+                self.assertEqual(reopened.shard_count, 2)
 
     async def test_async_queries_do_not_block_the_event_loop(self) -> None:
         with tempfile.TemporaryDirectory() as data_dir:
