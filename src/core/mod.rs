@@ -15,6 +15,7 @@ mod prepared;
 mod routing;
 mod scatter;
 mod session;
+mod stream;
 mod types;
 pub(crate) mod worker;
 
@@ -58,6 +59,8 @@ pub(crate) use routing::{
 };
 pub(crate) use scatter::merge_scatter_results;
 pub use session::{Session, SessionId, SessionState};
+pub(crate) use stream::RowProducer;
+pub use stream::{DEFAULT_STREAM_BUFFER_ROWS, RowStream};
 pub use types::{
     Column, DataType, Decimal, GeneratedKey, ParseDecimalError, ResultSet, ResultSetShapeError,
     Row, Value, WriteResult,

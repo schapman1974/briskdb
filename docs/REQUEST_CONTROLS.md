@@ -90,13 +90,14 @@ request deadlines wins. Deadline failures use the distinct
 `DeadlineExceeded` kind. The server flag `--request-timeout-ms 0` disables the
 engine default.
 
-## Materialized result budgets
+## Query result budgets
 
 Every query has a finite row and logical-byte budget. Defaults are 10,000 rows
 and 16 MiB; the configurable hard caps are 1,000,000 rows and 1 GiB. A request
 context may narrow but never widen its engine's configured budget. Equality at
-the limit succeeds. Exceeding either limit returns `LimitExceeded` without a
-partial `ResultSet`.
+the limit succeeds. Exceeding either limit returns `LimitExceeded`. Materialized
+Engine APIs return no partial `ResultSet`; a streaming frontend may already
+have delivered the bounded prefix that preceded a later limit failure.
 
 Logical bytes use a stable protocol-neutral model rather than JSON or future
 wire-protocol encoding:
@@ -123,6 +124,14 @@ results, and schema migration do not materialize a `ResultSet` and are
 unaffected by query result budgets. A logical scatter applies one budget to the
 combined result, including one result envelope and one set of column metadata;
 it does not grant every shard a fresh row or byte allowance.
+
+PostgreSQL reads use a protocol-neutral stream with a 16-row handoff. SQLite
+stops stepping when that handoff is full and resumes only as the client drains
+rows. Scatter streams visit physical shards in ascending order to retain the
+same deterministic concatenation while holding one shard connection at a time.
+Dropping or closing a stream cancels its operation; request cancellation,
+deadline expiry, and shutdown interrupt the currently leased SQLite handle and
+discard already-buffered rows.
 
 Logical scatter/gather schedules at most eight shard tasks concurrently. All
 children inherit the operation's one absolute deadline and sticky cancellation

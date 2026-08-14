@@ -265,7 +265,7 @@ the engine regardless of its eventual wire protocol.
   and only the catalog queries needed by explicitly tested clients.
 - [x] Test with `psql`, `tokio-postgres`, `psycopg`, and SQLAlchemy ORM through
   a live, release-gating client matrix.
-- [ ] Stream rows with backpressure while preserving the PostgreSQL
+- [x] Stream rows with backpressure while preserving the PostgreSQL
   `CancelRequest` to SQLite interrupt path.
 
 Deferred: `COPY`, replication, `LISTEN/NOTIFY`, large objects, PostgreSQL
@@ -396,7 +396,7 @@ requires an earlier dependency:
    SQLite WAL files, version the allocation policies, support native shard
    ranges and durable hi/lo leases, and retain the general virtual-table path
    behind its measured rollout gate.
-2. [ ] **Complete PostgreSQL support.** Finish the simple and extended query
+2. [x] **Complete PostgreSQL support.** Finish the simple and extended query
    lifecycle, type mapping, transactions, cancellation, compatibility shims,
    and real-client conformance tests.
 3. [ ] **Implement global indexes, uniqueness, and value allocation.** Add the

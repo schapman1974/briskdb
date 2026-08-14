@@ -10,7 +10,7 @@ use std::{
 };
 
 use tokio::{
-    sync::OwnedMutexGuard,
+    sync::{OwnedMutexGuard, oneshot},
     task::{JoinHandle, JoinSet},
 };
 
@@ -21,8 +21,9 @@ use super::{
     EngineState, Executed, Lifecycle, LogicalDatabaseId, OperationControl, OperationLease,
     PortalId, PrepareRequest, PreparedExecution, PreparedStatementDescription, PreparedStatementId,
     PreparedStatementLimits, RawDataOperation, RawDataTarget, RequestContext, ResultLimits,
-    ResultSet, Routed, Session, SessionInner, ShutdownReport, TablePlacement, TransactionExecution,
-    Value, merge_scatter_results, wait_for_cancellation, wait_pending,
+    ResultSet, Routed, RowProducer, RowStream, Session, SessionInner, ShutdownReport,
+    TablePlacement, TransactionExecution, Value, merge_scatter_results, wait_for_cancellation,
+    wait_pending,
 };
 use crate::{
     sql,
@@ -292,6 +293,55 @@ struct Operation {
     deadline: Option<Instant>,
     result_limits: ResultLimits,
     cancel_on_drop: CancelOnDrop,
+}
+
+struct StreamReadiness {
+    sender: std::sync::Mutex<Option<oneshot::Sender<EngineResult<Vec<super::Column>>>>>,
+}
+
+impl StreamReadiness {
+    fn new(sender: oneshot::Sender<EngineResult<Vec<super::Column>>>) -> Arc<Self> {
+        Arc::new(Self {
+            sender: std::sync::Mutex::new(Some(sender)),
+        })
+    }
+
+    fn publish(&self, columns: &[super::Column]) -> EngineResult<()> {
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(sender) = sender {
+            sender.send(Ok(columns.to_vec())).map_err(|_| {
+                EngineError::new(
+                    EngineErrorKind::Cancelled,
+                    "the streamed query caller stopped before receiving metadata",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn finish(&self, result: EngineResult<()>, producer: &RowProducer) {
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        match (sender, result) {
+            (Some(sender), Err(error)) => {
+                let _ = sender.send(Err(error));
+            }
+            (Some(sender), Ok(())) => {
+                let _ = sender.send(Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "a streamed query completed without publishing column metadata",
+                )));
+            }
+            (None, result) => producer.finish(result),
+        }
+    }
 }
 
 impl Operation {
@@ -1554,6 +1604,322 @@ impl Engine {
             .await;
         let value = operation.finish_started(result)?;
         Ok(Executed { shards, value })
+    }
+
+    /// Execute one immutable read portal as a bounded protocol-neutral row
+    /// stream with default request controls.
+    pub async fn stream_portal_logical(
+        &self,
+        session: &Session,
+        portal: PortalId,
+    ) -> EngineResult<Executed<RowStream>> {
+        self.stream_portal_logical_with_context(session, portal, RequestContext::new())
+            .await
+    }
+
+    /// Execute one immutable read portal as a bounded protocol-neutral row
+    /// stream across every metadata-selected physical shard.
+    ///
+    /// Column metadata is available before this method returns. SQLite steps at
+    /// most [`super::DEFAULT_STREAM_BUFFER_ROWS`] rows ahead of the consumer,
+    /// and dropping the returned stream cancels the complete logical query.
+    pub async fn stream_portal_logical_with_context(
+        &self,
+        session: &Session,
+        portal: PortalId,
+        context: RequestContext,
+    ) -> EngineResult<Executed<RowStream>> {
+        let mut operation = self.operation(context)?;
+        let (schema_operation, mut guard) =
+            match self.session_with_schema(&operation, session).await {
+                Ok(admission) => admission,
+                Err(error) => return operation.finish(Err(error)),
+            };
+        let portal_snapshot = match guard.prepared().portal(portal) {
+            Ok(portal) => portal.clone(),
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
+        };
+        let template = match guard.prepared().statement(portal_snapshot.statement()) {
+            Ok(template) => template,
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
+        };
+        if !matches!(
+            template.description().behavior(),
+            sql::StatementBehavior::Read
+        ) {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "only read portals can produce a row stream",
+            )));
+        }
+        if guard.state() == super::SessionState::FailedTransaction {
+            return operation.finish(Err(transaction_aborted()));
+        }
+        let plan = match self.plan_bound_statement_admitted(
+            template.database(),
+            template.translated().normalized_sql(),
+            0,
+            portal_snapshot.parameters(),
+            None,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
+        };
+        let shards = match prepared_execution_shards(&plan, self.catalog(), self.shard_count()) {
+            Ok(shards) => shards,
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
+        };
+        if shards.len() > 1 {
+            if let Err(error) = sql::validate_scatter_safe(template.translated()) {
+                return operation.finish(Err(error));
+            }
+        }
+        if guard.state() == super::SessionState::InTransaction
+            && (shards.len() != 1
+                || guard
+                    .transaction_shard()
+                    .is_some_and(|pinned| pinned != shards[0]))
+        {
+            guard.fail_transaction();
+            return operation.finish(Err(cross_shard_transaction()));
+        }
+
+        let owner = ConnectionOwner::new(session.id().get());
+        let sqlite_sql: Arc<str> = Arc::from(template.translated().sqlite_sql());
+        let parameters: Arc<[Value]> = Arc::from(portal_snapshot.parameters().to_vec());
+        let result_limits = operation.result_limits;
+        let control = Arc::clone(&operation.control);
+        let (mut stream, producer) = RowStream::channel(
+            control,
+            operation.cancellation.clone(),
+            operation.shutdown_cancel.clone(),
+            operation.deadline,
+        );
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let readiness = StreamReadiness::new(ready_tx);
+        let engine = self.clone();
+        let task_shards = shards.clone();
+        tokio::spawn(async move {
+            let result = if guard.state() == super::SessionState::InTransaction {
+                engine
+                    .produce_transaction_stream(
+                        &mut operation,
+                        task_shards[0],
+                        owner,
+                        schema_operation,
+                        guard,
+                        sqlite_sql,
+                        parameters,
+                        result_limits,
+                        Arc::clone(&readiness),
+                        producer.clone(),
+                    )
+                    .await
+            } else {
+                engine
+                    .produce_stream(
+                        &mut operation,
+                        owner,
+                        schema_operation,
+                        guard,
+                        task_shards,
+                        sqlite_sql,
+                        parameters,
+                        result_limits,
+                        Arc::clone(&readiness),
+                        producer.clone(),
+                    )
+                    .await
+            };
+            let result = operation.finish(result);
+            readiness.finish(result, &producer);
+        });
+
+        let columns = ready_rx.await.map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::Internal,
+                "the streamed query worker stopped before publishing metadata",
+                error,
+            )
+        })??;
+        stream.set_columns(columns);
+        Ok(Executed {
+            shards,
+            value: stream,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn produce_stream(
+        &self,
+        operation: &mut Operation,
+        owner: ConnectionOwner,
+        _schema_operation: SchemaOperationGuard,
+        _session: OwnedMutexGuard<SessionInner>,
+        shards: Vec<u16>,
+        sqlite_sql: Arc<str>,
+        parameters: Arc<[Value]>,
+        result_limits: ResultLimits,
+        readiness: Arc<StreamReadiness>,
+        producer: RowProducer,
+    ) -> EngineResult<()> {
+        let budget = sql::ScatterResultBudget::new(result_limits);
+        for shard in shards {
+            let permit = operation
+                .wait_pending(self.inner.connections.acquire_for_owner(shard, owner))
+                .await?;
+            let worker = operation.wait_pending(self.inner.workers.acquire()).await?;
+            operation.check_before_start()?;
+            let control = Arc::clone(&operation.control);
+            let worker_control = Arc::clone(&control);
+            let storage = self.inner.database.storage.clone();
+            let sqlite_sql = Arc::clone(&sqlite_sql);
+            let parameters = Arc::clone(&parameters);
+            let readiness = Arc::clone(&readiness);
+            let producer = producer.clone();
+            let budget = budget.clone();
+            let join = worker.spawn(move || {
+                let result = permit
+                    .checkout_controlled(Arc::clone(&worker_control))
+                    .and_then(|mut connection| {
+                        let result = connection
+                            .isolate_foreign_sql_controlled(
+                                Arc::clone(&worker_control),
+                                &sqlite_sql,
+                            )
+                            .and_then(|_| {
+                                connection.run_controlled(worker_control, |connection| {
+                                    sql::stream_query_with_budget(
+                                        connection,
+                                        &sqlite_sql,
+                                        &parameters,
+                                        &budget,
+                                        |columns| readiness.publish(columns),
+                                        |row| producer.send(row),
+                                    )
+                                })
+                            });
+                        retire_if_broken(&mut connection, &result);
+                        result
+                    });
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+                {
+                    storage.record_schema_degraded();
+                }
+                result
+            });
+            operation.wait_started(join).await?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn produce_transaction_stream(
+        &self,
+        operation: &mut Operation,
+        shard: u16,
+        owner: ConnectionOwner,
+        schema_operation: SchemaOperationGuard,
+        mut session: OwnedMutexGuard<SessionInner>,
+        sqlite_sql: Arc<str>,
+        parameters: Arc<[Value]>,
+        result_limits: ResultLimits,
+        readiness: Arc<StreamReadiness>,
+        producer: RowProducer,
+    ) -> EngineResult<()> {
+        let needs_connection = session
+            .transaction_mut()
+            .is_some_and(|transaction| transaction.connection.is_none());
+        let permit = if needs_connection {
+            Some(
+                operation
+                    .wait_pending(self.inner.connections.acquire_for_owner(shard, owner))
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let worker = operation.wait_pending(self.inner.workers.acquire()).await?;
+        operation.check_before_start()?;
+        let worker_control = Arc::clone(&operation.control);
+        let storage = self.inner.database.storage.clone();
+        let budget = sql::ScatterResultBudget::new(result_limits);
+        let join = worker.spawn(move || {
+            let _schema_operation = schema_operation;
+            let result = (|| {
+                let transaction = session.transaction_mut().ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "active session transaction state is missing",
+                    )
+                })?;
+                let first_statement = transaction.pinned_shard.is_none();
+                let mut connection = match transaction.connection.take() {
+                    Some(connection) => connection,
+                    None => permit
+                        .ok_or_else(|| {
+                            EngineError::new(
+                                EngineErrorKind::Internal,
+                                "a pinned transaction lost its SQLite connection",
+                            )
+                        })?
+                        .checkout_controlled(Arc::clone(&worker_control))?,
+                };
+                let result = (|| {
+                    if first_statement {
+                        connection.isolate_foreign_sql_controlled(
+                            Arc::clone(&worker_control),
+                            &sqlite_sql,
+                        )?;
+                        connection.run_controlled(Arc::clone(&worker_control), |connection| {
+                            connection.execute_batch("BEGIN DEFERRED").map_err(|error| {
+                                crate::sqlite_error::storage(error)
+                                    .context("failed to begin the pinned SQLite transaction")
+                            })
+                        })?;
+                        transaction.pinned_shard = Some(shard);
+                    }
+                    connection.run_controlled(Arc::clone(&worker_control), |connection| {
+                        sql::stream_query_with_budget(
+                            connection,
+                            &sqlite_sql,
+                            &parameters,
+                            &budget,
+                            |columns| readiness.publish(columns),
+                            |row| producer.send(row),
+                        )
+                    })
+                })();
+                retire_if_broken(&mut connection, &result);
+                transaction.connection = Some(connection);
+                result
+            })();
+            if result.is_err() {
+                session.fail_transaction();
+            }
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                storage.record_schema_degraded();
+            }
+            result
+        });
+        operation.wait_started(join).await
     }
 
     /// Close a prepared statement and every portal bound from it.
@@ -5298,6 +5664,236 @@ mod tests {
                     && result.rows()[0].get(0) == Some(&Value::from(1_i64))
                     && result.rows()[1].get(0) == Some(&Value::from(2_i64))
         ));
+    }
+
+    #[tokio::test]
+    async fn portal_row_stream_applies_backpressure_and_drop_releases_engine_ownership() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (temp, engine, database) = engine_with_prepared_catalog(options);
+        let connection =
+            rusqlite::Connection::open(temp.path().join("shards/0000.sqlite")).unwrap();
+        let mut insert = connection
+            .prepare("INSERT INTO global_events (code) VALUES (?1)")
+            .unwrap();
+        for value in 0..(super::super::DEFAULT_STREAM_BUFFER_ROWS + 8) {
+            insert.execute([value as i64]).unwrap();
+        }
+        drop(insert);
+        drop(connection);
+
+        let session = engine.session();
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT code FROM global_events ORDER BY code",
+                ),
+            )
+            .await
+            .unwrap();
+        let portal = engine
+            .bind_statement(&session, statement, vec![])
+            .await
+            .unwrap();
+        let available_workers = engine.inner.workers.available_permits();
+        let mut stream = engine
+            .stream_portal_logical_with_context(&session, portal, RequestContext::new())
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(stream.columns().len(), 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(engine.inner.lifecycle.active(), 1);
+        assert_eq!(
+            engine.inner.workers.available_permits(),
+            available_workers - 1
+        );
+        assert_eq!(
+            stream.next_row().await.unwrap().unwrap().get(0),
+            Some(&Value::Int64(0))
+        );
+
+        drop(stream);
+        timeout(Duration::from_secs(2), async {
+            while engine.inner.lifecycle.active() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(engine.inner.workers.available_permits(), available_workers);
+        assert_eq!(engine.status(&session).await.unwrap().shard_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_portal_row_stream_discards_buffered_rows_and_recovers() {
+        let (temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let connection =
+            rusqlite::Connection::open(temp.path().join("shards/0000.sqlite")).unwrap();
+        for value in 0..64_i64 {
+            connection
+                .execute("INSERT INTO global_events (code) VALUES (?1)", [value])
+                .unwrap();
+        }
+        drop(connection);
+        let session = engine.session();
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT code FROM global_events",
+                ),
+            )
+            .await
+            .unwrap();
+        let portal = engine
+            .bind_statement(&session, statement, vec![])
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut stream = engine
+            .stream_portal_logical_with_context(
+                &session,
+                portal,
+                RequestContext::new().with_cancellation_token(cancellation.clone()),
+            )
+            .await
+            .unwrap()
+            .value;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancellation.cancel();
+        let error = stream.next_row().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        drop(stream);
+        timeout(Duration::from_secs(2), async {
+            while engine.inner.lifecycle.active() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let rows = engine.execute_portal(&session, portal).await.unwrap();
+        assert!(matches!(
+            rows.value,
+            PreparedExecution::Rows(result) if result.rows().len() == 64
+        ));
+    }
+
+    #[tokio::test]
+    async fn portal_row_stream_reports_a_late_result_limit_and_remains_retryable() {
+        let (temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let connection =
+            rusqlite::Connection::open(temp.path().join("shards/0000.sqlite")).unwrap();
+        connection
+            .execute_batch("INSERT INTO global_events (code) VALUES (1), (2), (3)")
+            .unwrap();
+        drop(connection);
+        let session = engine.session();
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT code FROM global_events ORDER BY code",
+                ),
+            )
+            .await
+            .unwrap();
+        let portal = engine
+            .bind_statement(&session, statement, vec![])
+            .await
+            .unwrap();
+        let limits = ResultLimits::new(1, 1_024).unwrap();
+        let mut stream = engine
+            .stream_portal_logical_with_context(
+                &session,
+                portal,
+                RequestContext::new().with_result_limits(limits),
+            )
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(
+            stream.next_row().await.unwrap().unwrap().get(0),
+            Some(&Value::Int64(1))
+        );
+        assert_eq!(
+            stream.next_row().await.unwrap().unwrap_err().kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        assert!(stream.next_row().await.is_none());
+
+        let retried = engine.execute_portal(&session, portal).await.unwrap();
+        assert!(matches!(
+            retried.value,
+            PreparedExecution::Rows(result) if result.rows().len() == 3
+        ));
+    }
+
+    #[tokio::test]
+    async fn portal_row_stream_reuses_and_releases_a_pinned_transaction_connection() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+        let key = integer_key_for_shard(&engine, 0, None);
+        execute_prepared_sql(
+            &engine,
+            &session,
+            database,
+            "INSERT INTO events (tenant_id, payload) VALUES (?, ?)",
+            vec![Value::from(key), Value::from("streamed")],
+        )
+        .await
+        .unwrap();
+        execute_prepared_sql(&engine, &session, database, "BEGIN", vec![])
+            .await
+            .unwrap();
+        let statement = engine
+            .prepare_statement(
+                &session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    "SELECT payload FROM events WHERE tenant_id = ?",
+                ),
+            )
+            .await
+            .unwrap();
+        let portal = engine
+            .bind_statement(&session, statement, vec![Value::from(key)])
+            .await
+            .unwrap();
+        let mut stream = engine
+            .stream_portal_logical(&session, portal)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(
+            stream.next_row().await.unwrap().unwrap().get(0),
+            Some(&Value::from("streamed"))
+        );
+        assert!(stream.next_row().await.is_none());
+        assert_eq!(session.state().await, SessionState::InTransaction);
+        assert_eq!(
+            execute_prepared_sql(&engine, &session, database, "COMMIT", vec![])
+                .await
+                .unwrap()
+                .value,
+            PreparedExecution::Transaction(TransactionExecution::Committed)
+        );
+        assert_eq!(session.state().await, SessionState::Ready);
     }
 
     #[tokio::test]
