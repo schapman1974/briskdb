@@ -443,19 +443,20 @@ The lifecycle is implemented as a Rust engine API. Production PostgreSQL
 startup validates identity and creates one selected core session. Each
 simple-query statement enters this lifecycle with no parameters, then closes
 its temporary statement and portal after execution or failure. Extended
-`Parse` still stops at fixed `0A000`. There is no MySQL listener. All three
-typed Rust input paths share the same planning and result path:
+Parse/Bind decodes supported PostgreSQL OIDs and text/binary values into this
+lifecycle. There is no MySQL listener. All three typed Rust input paths share
+the same planning and result path:
 
 | Input | Required mode and parameter form | Prepared execution result |
 | --- | --- | --- |
 | SQLite | `StrictSqlite` for exact normalized SQLite, or explicit finite `Compatibility`; `?` / `?N` | Protocol-neutral routed/logical rows, affected-row count, or generated write |
-| PostgreSQL | `Compatibility`; `$N` identities, including repeats and gaps | Same protocol-neutral result; PostgreSQL OID/wire mapping remains issue #33 |
+| PostgreSQL | `Compatibility`; `$N` identities, including repeats and gaps | Same protocol-neutral result with adapter-owned basic OID and text/binary mapping |
 | MySQL | `Compatibility`; each `?` numbered left-to-right | Same protocol-neutral result; MySQL generated-key/wire mapping remains issue #44 |
 
 Each protocol adapter owns its message framing, authentication,
 statement/portal naming, wire parameter decoding, result type encoding, close
 acknowledgement, and protocol resynchronization. PostgreSQL startup framing,
-session ownership, parameter-free simple queries, and zero-parameter extended
+session ownership, parameter-free simple queries, and parameterized extended
 queries map into this lifecycle without retaining a SQLite handle, implementing
 a second authoritative cache, interpolating values into SQL, or choosing a
 physical shard in the adapter.

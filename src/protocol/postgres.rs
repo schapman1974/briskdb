@@ -17,6 +17,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bytes::{BufMut, BytesMut};
 use futures::{Sink, SinkExt, StreamExt, stream};
 use pgwire::{
     api::{
@@ -29,8 +30,8 @@ use pgwire::{
             send_partial_query_response, send_query_response,
         },
         results::{
-            DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
-            FieldInfo, QueryResponse, Response, Tag,
+            DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
+            QueryResponse, Response, Tag,
         },
         stmt::{QueryParser, StoredStatement},
         store::PortalStore,
@@ -38,7 +39,7 @@ use pgwire::{
     error::{ErrorInfo, PgWireError, PgWireResult},
     messages::{
         PgWireBackendMessage, PgWireFrontendMessage, ProtocolVersion, SslNegotiationMetaMessage,
-        data::NoData,
+        data::{DataRow, NoData},
         extendedquery::{
             Bind, BindComplete, Close, CloseComplete, Execute, Parse, ParseComplete,
             TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
@@ -601,10 +602,11 @@ struct PgWireExtendedState {
     portals: BTreeMap<String, PgWireBoundPortal>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PgWireBoundPortal {
     id: PortalId,
     statement: PreparedStatementId,
+    fields: Arc<Vec<FieldInfo>>,
 }
 
 /// Protocol-owned state for one PostgreSQL connection.
@@ -1048,9 +1050,20 @@ fn simple_query_response(
     behavior: StatementBehavior,
     execution: PreparedExecution,
 ) -> PgWireResult<Response> {
+    execution_response(behavior, execution, None)
+}
+
+fn execution_response(
+    behavior: StatementBehavior,
+    execution: PreparedExecution,
+    fields: Option<Arc<Vec<FieldInfo>>>,
+) -> PgWireResult<Response> {
     match execution {
         PreparedExecution::Rows(result) if matches!(behavior, StatementBehavior::Read) => {
-            result_set_response(result)
+            match fields {
+                Some(fields) => result_set_response_with_fields(result, fields),
+                None => result_set_response(result),
+            }
         }
         PreparedExecution::AffectedRows(rows) => {
             Ok(Response::Execution(write_tag(behavior, rows)?))
@@ -1091,30 +1104,53 @@ fn result_set_response(result: ResultSet) -> PgWireResult<Response> {
             })
             .collect::<Vec<_>>(),
     );
+    encode_query_response(rows, fields)
+}
+
+fn result_set_response_with_fields(
+    result: ResultSet,
+    fields: Arc<Vec<FieldInfo>>,
+) -> PgWireResult<Response> {
+    let (columns, rows) = result.into_parts();
+    if columns.len() != fields.len() {
+        return Err(internal_query_error());
+    }
+    encode_query_response(rows, fields)
+}
+
+fn encode_query_response(
+    rows: Vec<crate::core::Row>,
+    fields: Arc<Vec<FieldInfo>>,
+) -> PgWireResult<Response> {
     let encoded = rows
         .into_iter()
         .map(|row| encode_data_row(Arc::clone(&fields), row.into_values()))
-        .collect::<Vec<_>>();
-    if encoded.iter().any(Result::is_err) {
-        return Err(internal_query_error());
-    }
+        .collect::<PgWireResult<Vec<_>>>()?;
     Ok(Response::Query(QueryResponse::new(
         fields,
-        stream::iter(encoded),
+        stream::iter(encoded.into_iter().map(Ok)),
     )))
 }
 
 fn description_fields(description: &PreparedStatementDescription) -> Vec<FieldInfo> {
+    description_fields_with(description, |_| FieldFormat::Text)
+}
+
+fn description_fields_with(
+    description: &PreparedStatementDescription,
+    format_for: impl Fn(usize) -> FieldFormat,
+) -> Vec<FieldInfo> {
     description
         .columns()
         .iter()
-        .map(|column| {
+        .enumerate()
+        .map(|(index, column)| {
             FieldInfo::new(
                 column.name.clone(),
                 None,
                 None,
                 postgres_type(column.data_type),
-                FieldFormat::Text,
+                format_for(index),
             )
         })
         .collect()
@@ -1131,25 +1167,632 @@ fn postgres_type(data_type: DataType) -> Type {
     }
 }
 
-fn encode_data_row(
-    fields: Arc<Vec<FieldInfo>>,
-    values: Vec<Value>,
-) -> PgWireResult<pgwire::messages::data::DataRow> {
-    let mut encoder = DataRowEncoder::new(fields);
-    for value in values {
-        match value {
-            Value::Null => encoder.encode_field(&None::<String>)?,
-            Value::Boolean(value) => encoder.encode_field(&value)?,
-            Value::Int64(value) => encoder.encode_field(&value)?,
-            Value::UInt64(value) => encoder.encode_field(&value.to_string())?,
-            Value::Float64(value) => encoder.encode_field(&value)?,
-            Value::Decimal(value) => encoder.encode_field(&value.into_string())?,
-            Value::Text(value) => encoder.encode_field(&value)?,
-            Value::InvalidText(_) => return Err(invalid_text_query_error()),
-            Value::Binary(value) => encoder.encode_field(&value)?,
+fn supported_parameter_type(data_type: &Type) -> bool {
+    matches!(
+        data_type,
+        &Type::BOOL
+            | &Type::INT2
+            | &Type::INT4
+            | &Type::INT8
+            | &Type::OID
+            | &Type::FLOAT4
+            | &Type::FLOAT8
+            | &Type::NUMERIC
+            | &Type::BYTEA
+            | &Type::TEXT
+            | &Type::VARCHAR
+            | &Type::BPCHAR
+            | &Type::NAME
+            | &Type::UNKNOWN
+            | &Type::JSON
+            | &Type::JSONB
+    )
+}
+
+fn decode_bound_parameters(
+    portal: &Portal<PgWirePrepared>,
+    parameter_types: &[Type],
+) -> PgWireResult<Vec<Value>> {
+    if portal.parameters.len() != parameter_types.len() {
+        return Err(query_wire_error(
+            "08P01",
+            "the PostgreSQL bound parameter count does not match the statement",
+        ));
+    }
+    portal
+        .parameters
+        .iter()
+        .zip(parameter_types)
+        .enumerate()
+        .map(|(index, (parameter, data_type))| match parameter {
+            None => Ok(Value::Null),
+            Some(parameter) => match portal.parameter_format.format_for(index) {
+                FieldFormat::Text => decode_text_parameter(parameter, data_type),
+                FieldFormat::Binary => decode_binary_parameter(parameter, data_type),
+            },
+        })
+        .collect()
+}
+
+fn decode_text_parameter(parameter: &[u8], data_type: &Type) -> PgWireResult<Value> {
+    if data_type == &Type::BYTEA {
+        return decode_bytea_text(parameter).map(Value::Binary);
+    }
+    let parameter = std::str::from_utf8(parameter).map_err(|_| invalid_parameter_utf8_error())?;
+    if data_type == &Type::BOOL {
+        if ["t", "true", "y", "yes", "on", "1"]
+            .iter()
+            .any(|accepted| parameter.eq_ignore_ascii_case(accepted))
+        {
+            Ok(Value::Boolean(true))
+        } else if ["f", "false", "n", "no", "off", "0"]
+            .iter()
+            .any(|accepted| parameter.eq_ignore_ascii_case(accepted))
+        {
+            Ok(Value::Boolean(false))
+        } else {
+            Err(invalid_parameter_value_error())
+        }
+    } else if data_type == &Type::INT2 {
+        parameter
+            .parse::<i16>()
+            .map(|value| Value::Int64(i64::from(value)))
+            .map_err(|_| invalid_parameter_value_error())
+    } else if data_type == &Type::INT4 {
+        parameter
+            .parse::<i32>()
+            .map(|value| Value::Int64(i64::from(value)))
+            .map_err(|_| invalid_parameter_value_error())
+    } else if data_type == &Type::INT8 {
+        parameter
+            .parse::<i64>()
+            .map(Value::Int64)
+            .map_err(|_| invalid_parameter_value_error())
+    } else if data_type == &Type::OID {
+        parameter
+            .parse::<u32>()
+            .map(|value| Value::UInt64(u64::from(value)))
+            .map_err(|_| invalid_parameter_value_error())
+    } else if data_type == &Type::FLOAT4 {
+        parse_postgres_float(parameter)
+            .and_then(|value| {
+                let narrowed = value as f32;
+                if narrowed.is_finite() || value.is_nan() || value.is_infinite() {
+                    Some(Value::Float64(f64::from(narrowed)))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(invalid_parameter_value_error)
+    } else if data_type == &Type::FLOAT8 {
+        parse_postgres_float(parameter)
+            .map(Value::Float64)
+            .ok_or_else(invalid_parameter_value_error)
+    } else if data_type == &Type::NUMERIC {
+        Value::decimal(parameter).map_err(|_| invalid_parameter_value_error())
+    } else if is_postgres_text_type(data_type) || matches!(data_type, &Type::JSON | &Type::JSONB) {
+        Ok(Value::Text(parameter.to_owned()))
+    } else {
+        Err(unsupported_parameter_type_error())
+    }
+}
+
+fn decode_binary_parameter(parameter: &[u8], data_type: &Type) -> PgWireResult<Value> {
+    if data_type == &Type::BOOL {
+        return match parameter {
+            [0] => Ok(Value::Boolean(false)),
+            [1] => Ok(Value::Boolean(true)),
+            _ => Err(invalid_parameter_value_error()),
+        };
+    }
+    if data_type == &Type::INT2 {
+        return parameter
+            .try_into()
+            .map(i16::from_be_bytes)
+            .map(|value| Value::Int64(i64::from(value)))
+            .map_err(|_| invalid_parameter_value_error());
+    }
+    if data_type == &Type::INT4 {
+        return parameter
+            .try_into()
+            .map(i32::from_be_bytes)
+            .map(|value| Value::Int64(i64::from(value)))
+            .map_err(|_| invalid_parameter_value_error());
+    }
+    if data_type == &Type::INT8 {
+        return parameter
+            .try_into()
+            .map(i64::from_be_bytes)
+            .map(Value::Int64)
+            .map_err(|_| invalid_parameter_value_error());
+    }
+    if data_type == &Type::OID {
+        return parameter
+            .try_into()
+            .map(u32::from_be_bytes)
+            .map(|value| Value::UInt64(u64::from(value)))
+            .map_err(|_| invalid_parameter_value_error());
+    }
+    if data_type == &Type::FLOAT4 {
+        return parameter
+            .try_into()
+            .map(f32::from_be_bytes)
+            .map(|value| Value::Float64(f64::from(value)))
+            .map_err(|_| invalid_parameter_value_error());
+    }
+    if data_type == &Type::FLOAT8 {
+        return parameter
+            .try_into()
+            .map(f64::from_be_bytes)
+            .map(Value::Float64)
+            .map_err(|_| invalid_parameter_value_error());
+    }
+    if data_type == &Type::NUMERIC {
+        return decode_numeric_binary(parameter);
+    }
+    if data_type == &Type::BYTEA {
+        return Ok(Value::Binary(parameter.to_vec()));
+    }
+    if data_type == &Type::JSONB {
+        let Some((1, json)) = parameter.split_first() else {
+            return Err(invalid_parameter_value_error());
+        };
+        return std::str::from_utf8(json)
+            .map(|json| Value::Text(json.to_owned()))
+            .map_err(|_| invalid_parameter_utf8_error());
+    }
+    if is_postgres_text_type(data_type) || data_type == &Type::JSON {
+        return std::str::from_utf8(parameter)
+            .map(|value| Value::Text(value.to_owned()))
+            .map_err(|_| invalid_parameter_utf8_error());
+    }
+    Err(unsupported_parameter_type_error())
+}
+
+fn parse_postgres_float(value: &str) -> Option<f64> {
+    if value.eq_ignore_ascii_case("nan") {
+        Some(f64::NAN)
+    } else if value.eq_ignore_ascii_case("infinity") || value.eq_ignore_ascii_case("inf") {
+        Some(f64::INFINITY)
+    } else if value.eq_ignore_ascii_case("-infinity") || value.eq_ignore_ascii_case("-inf") {
+        Some(f64::NEG_INFINITY)
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn decode_bytea_text(value: &[u8]) -> PgWireResult<Vec<u8>> {
+    if let Some(hex) = value.strip_prefix(br"\x") {
+        if hex.len() % 2 != 0 {
+            return Err(invalid_parameter_value_error());
+        }
+        return hex
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = decode_hex(pair[0]).ok_or_else(invalid_parameter_value_error)?;
+                let low = decode_hex(pair[1]).ok_or_else(invalid_parameter_value_error)?;
+                Ok((high << 4) | low)
+            })
+            .collect();
+    }
+
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        if value[index] != b'\\' {
+            decoded.push(value[index]);
+            index += 1;
+        } else if value.get(index + 1) == Some(&b'\\') {
+            decoded.push(b'\\');
+            index += 2;
+        } else {
+            let octal = value
+                .get(index + 1..index + 4)
+                .filter(|digits| digits.iter().all(|digit| matches!(digit, b'0'..=b'7')))
+                .ok_or_else(invalid_parameter_value_error)?;
+            let value = u16::from(octal[0] - b'0') * 64
+                + u16::from(octal[1] - b'0') * 8
+                + u16::from(octal[2] - b'0');
+            decoded.push(u8::try_from(value).map_err(|_| invalid_parameter_value_error())?);
+            index += 4;
         }
     }
-    encoder.finish()
+    Ok(decoded)
+}
+
+fn decode_hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_numeric_binary(value: &[u8]) -> PgWireResult<Value> {
+    if value.len() < 8 || (value.len() - 8) % 2 != 0 {
+        return Err(invalid_parameter_value_error());
+    }
+    let ndigits = i16::from_be_bytes(value[0..2].try_into().unwrap());
+    let weight = i16::from_be_bytes(value[2..4].try_into().unwrap());
+    let sign = u16::from_be_bytes(value[4..6].try_into().unwrap());
+    let dscale = i16::from_be_bytes(value[6..8].try_into().unwrap());
+    if ndigits < 0
+        || !(0..=16_383).contains(&dscale)
+        || usize::try_from(ndigits).ok() != Some((value.len() - 8) / 2)
+        || !matches!(sign, 0x0000 | 0x4000)
+    {
+        return Err(invalid_parameter_value_error());
+    }
+    let groups = value[8..]
+        .chunks_exact(2)
+        .map(|bytes| i16::from_be_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    if groups.iter().any(|group| !(0..=9999).contains(group)) {
+        return Err(invalid_parameter_value_error());
+    }
+
+    let mut integer = String::new();
+    if weight >= 0 {
+        for position in (0..=weight).rev() {
+            let index = i32::from(weight) - i32::from(position);
+            let group = usize::try_from(index)
+                .ok()
+                .and_then(|index| groups.get(index))
+                .copied()
+                .unwrap_or(0);
+            if integer.is_empty() {
+                integer.push_str(&group.to_string());
+            } else {
+                integer.push_str(&format!("{group:04}"));
+            }
+        }
+    } else {
+        integer.push('0');
+    }
+    if integer.is_empty() {
+        integer.push('0');
+    }
+
+    let mut fraction = String::new();
+    let fraction_groups = usize::from(u16::try_from(dscale).unwrap()).div_ceil(4);
+    for offset in 0..fraction_groups {
+        let position =
+            -1_i32 - i32::try_from(offset).map_err(|_| invalid_parameter_value_error())?;
+        let index = i32::from(weight) - position;
+        let group = usize::try_from(index)
+            .ok()
+            .and_then(|index| groups.get(index))
+            .copied()
+            .unwrap_or(0);
+        fraction.push_str(&format!("{group:04}"));
+    }
+    fraction.truncate(usize::from(u16::try_from(dscale).unwrap()));
+
+    let mut decoded = String::new();
+    if sign == 0x4000 {
+        decoded.push('-');
+    }
+    decoded.push_str(&integer);
+    if dscale > 0 {
+        decoded.push('.');
+        decoded.push_str(&fraction);
+    }
+    Value::decimal(decoded).map_err(|_| invalid_parameter_value_error())
+}
+
+fn unsupported_parameter_type_error() -> PgWireError {
+    query_wire_error("0A000", "the PostgreSQL parameter type is unsupported")
+}
+
+fn invalid_parameter_value_error() -> PgWireError {
+    query_wire_error("22P02", "the PostgreSQL parameter value is invalid")
+}
+
+fn invalid_parameter_utf8_error() -> PgWireError {
+    query_wire_error("22021", "the PostgreSQL text parameter is not valid UTF8")
+}
+
+fn encode_data_row(fields: Arc<Vec<FieldInfo>>, values: Vec<Value>) -> PgWireResult<DataRow> {
+    if fields.len() != values.len() {
+        return Err(internal_query_error());
+    }
+    let field_count = i16::try_from(fields.len()).map_err(|_| internal_query_error())?;
+    let mut data = BytesMut::new();
+    for (field, value) in fields.iter().zip(values) {
+        let Some(encoded) = encode_postgres_value(value, field.datatype(), field.format())? else {
+            data.put_i32(-1);
+            continue;
+        };
+        data.put_i32(i32::try_from(encoded.len()).map_err(|_| internal_query_error())?);
+        data.extend_from_slice(&encoded);
+    }
+    Ok(DataRow::new(data, field_count))
+}
+
+fn encode_postgres_value(
+    value: Value,
+    data_type: &Type,
+    format: FieldFormat,
+) -> PgWireResult<Option<Vec<u8>>> {
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+
+    let text = || postgres_scalar_text(&value);
+    let encoded = if data_type == &Type::BOOL {
+        let value = postgres_bool(&value)?;
+        match format {
+            FieldFormat::Text => vec![if value { b't' } else { b'f' }],
+            FieldFormat::Binary => vec![u8::from(value)],
+        }
+    } else if data_type == &Type::INT8 {
+        let value = postgres_i64(&value)?;
+        match format {
+            FieldFormat::Text => value.to_string().into_bytes(),
+            FieldFormat::Binary => value.to_be_bytes().to_vec(),
+        }
+    } else if data_type == &Type::FLOAT8 {
+        let Value::Float64(value) = value else {
+            return Err(result_type_mismatch_error());
+        };
+        match format {
+            FieldFormat::Text => postgres_float_text(value).into_bytes(),
+            FieldFormat::Binary => value.to_be_bytes().to_vec(),
+        }
+    } else if data_type == &Type::NUMERIC {
+        let text = postgres_numeric_text(&value)?;
+        match format {
+            FieldFormat::Text => text.into_bytes(),
+            FieldFormat::Binary => encode_numeric_binary(&text)?,
+        }
+    } else if data_type == &Type::BYTEA {
+        let Value::Binary(value) = value else {
+            return Err(result_type_mismatch_error());
+        };
+        match format {
+            FieldFormat::Text => postgres_bytea_text(&value),
+            FieldFormat::Binary => value,
+        }
+    } else if is_postgres_text_type(data_type) {
+        text()?.into_bytes()
+    } else {
+        return Err(result_type_mismatch_error());
+    };
+    Ok(Some(encoded))
+}
+
+fn postgres_bool(value: &Value) -> PgWireResult<bool> {
+    match value {
+        Value::Boolean(value) => Ok(*value),
+        Value::Int64(0) => Ok(false),
+        Value::Int64(1) => Ok(true),
+        _ => Err(result_type_mismatch_error()),
+    }
+}
+
+fn postgres_i64(value: &Value) -> PgWireResult<i64> {
+    match value {
+        Value::Int64(value) => Ok(*value),
+        Value::UInt64(value) => i64::try_from(*value).map_err(|_| result_type_mismatch_error()),
+        _ => Err(result_type_mismatch_error()),
+    }
+}
+
+fn postgres_numeric_text(value: &Value) -> PgWireResult<String> {
+    match value {
+        Value::Int64(value) => Ok(value.to_string()),
+        Value::UInt64(value) => Ok(value.to_string()),
+        Value::Float64(value) => Ok(postgres_float_text(*value)),
+        Value::Decimal(value) => Ok(value.as_str().to_owned()),
+        _ => Err(result_type_mismatch_error()),
+    }
+}
+
+fn postgres_scalar_text(value: &Value) -> PgWireResult<String> {
+    match value {
+        Value::Null => unreachable!("NULL is handled before scalar encoding"),
+        Value::Boolean(value) => Ok(if *value { "t" } else { "f" }.to_owned()),
+        Value::Int64(value) => Ok(value.to_string()),
+        Value::UInt64(value) => Ok(value.to_string()),
+        Value::Float64(value) => Ok(postgres_float_text(*value)),
+        Value::Decimal(value) => Ok(value.as_str().to_owned()),
+        Value::Text(value) => Ok(value.clone()),
+        Value::InvalidText(_) => Err(invalid_text_query_error()),
+        Value::Binary(value) => {
+            String::from_utf8(postgres_bytea_text(value)).map_err(|_| internal_query_error())
+        }
+    }
+}
+
+fn postgres_float_text(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "Infinity".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+fn postgres_bytea_text(value: &[u8]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = Vec::with_capacity(2 + value.len().saturating_mul(2));
+    encoded.extend_from_slice(br"\x");
+    for byte in value {
+        encoded.push(HEX[usize::from(byte >> 4)]);
+        encoded.push(HEX[usize::from(byte & 0x0f)]);
+    }
+    encoded
+}
+
+fn is_postgres_text_type(data_type: &Type) -> bool {
+    matches!(
+        data_type,
+        &Type::TEXT | &Type::VARCHAR | &Type::BPCHAR | &Type::NAME | &Type::UNKNOWN
+    )
+}
+
+fn encode_numeric_binary(value: &str) -> PgWireResult<Vec<u8>> {
+    let special_sign = match value {
+        "NaN" => Some(0xc000_u16),
+        "Infinity" => Some(0xd000),
+        "-Infinity" => Some(0xf000),
+        _ => None,
+    };
+    if let Some(sign) = special_sign {
+        let mut encoded = Vec::with_capacity(8);
+        encoded.extend_from_slice(&0_i16.to_be_bytes());
+        encoded.extend_from_slice(&0_i16.to_be_bytes());
+        encoded.extend_from_slice(&sign.to_be_bytes());
+        encoded.extend_from_slice(&0_i16.to_be_bytes());
+        return Ok(encoded);
+    }
+
+    let (negative, unsigned) = value
+        .strip_prefix('-')
+        .map(|value| (true, value))
+        .or_else(|| value.strip_prefix('+').map(|value| (false, value)))
+        .unwrap_or((false, value));
+    let (mantissa, exponent) = unsigned
+        .split_once(['e', 'E'])
+        .map(|(mantissa, exponent)| {
+            exponent
+                .parse::<i32>()
+                .map(|exponent| (mantissa, exponent))
+                .map_err(|_| result_type_mismatch_error())
+        })
+        .transpose()?
+        .unwrap_or((unsigned, 0));
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if integer.is_empty() && fraction.is_empty() {
+        return Err(result_type_mismatch_error());
+    }
+    if !integer
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(result_type_mismatch_error());
+    }
+
+    let mut digits = String::with_capacity(integer.len() + fraction.len());
+    digits.push_str(integer);
+    digits.push_str(fraction);
+    let decimal_index = i64::try_from(integer.len())
+        .ok()
+        .and_then(|length| length.checked_add(i64::from(exponent)))
+        .ok_or_else(numeric_out_of_range_error)?;
+    let digit_count = i64::try_from(digits.len()).map_err(|_| numeric_out_of_range_error())?;
+    let dscale = digit_count.checked_sub(decimal_index).unwrap_or(0).max(0);
+    if dscale > 16_383 {
+        return Err(numeric_out_of_range_error());
+    }
+    let dscale = i16::try_from(dscale).map_err(|_| numeric_out_of_range_error())?;
+
+    let mut whole = String::new();
+    if decimal_index <= 0 {
+        whole.push('0');
+    } else {
+        let integer_digits =
+            usize::try_from(decimal_index).map_err(|_| numeric_out_of_range_error())?;
+        let available = integer_digits.min(digits.len());
+        whole.push_str(&digits[..available]);
+        whole.extend(std::iter::repeat_n('0', integer_digits - available));
+        if whole.is_empty() {
+            whole.push('0');
+        }
+    }
+
+    let mut fractional = String::new();
+    if dscale > 0 {
+        if decimal_index < 0 {
+            fractional.extend(std::iter::repeat_n(
+                '0',
+                usize::try_from(-decimal_index).map_err(|_| numeric_out_of_range_error())?,
+            ));
+            fractional.push_str(&digits);
+        } else {
+            let start = usize::try_from(decimal_index)
+                .map_err(|_| numeric_out_of_range_error())?
+                .min(digits.len());
+            fractional.push_str(&digits[start..]);
+        }
+        fractional.truncate(usize::try_from(dscale).expect("positive i16 fits usize"));
+        fractional.extend(std::iter::repeat_n(
+            '0',
+            usize::try_from(dscale).expect("positive i16 fits usize") - fractional.len(),
+        ));
+    }
+
+    let integer_groups = whole.len().div_ceil(4);
+    let left_padding = integer_groups * 4 - whole.len();
+    let fractional_groups = fractional.len().div_ceil(4);
+    let mut grouped = String::with_capacity((integer_groups + fractional_groups) * 4);
+    grouped.extend(std::iter::repeat_n('0', left_padding));
+    grouped.push_str(&whole);
+    grouped.push_str(&fractional);
+    grouped.extend(std::iter::repeat_n(
+        '0',
+        fractional_groups * 4 - fractional.len(),
+    ));
+    let groups = grouped
+        .as_bytes()
+        .chunks_exact(4)
+        .map(|chunk| {
+            std::str::from_utf8(chunk)
+                .ok()
+                .and_then(|chunk| chunk.parse::<i16>().ok())
+                .ok_or_else(result_type_mismatch_error)
+        })
+        .collect::<PgWireResult<Vec<_>>>()?;
+    let leading_zeroes = groups.iter().take_while(|group| **group == 0).count();
+    let trailing_zeroes = groups.iter().rev().take_while(|group| **group == 0).count();
+    let retained_end = groups
+        .len()
+        .saturating_sub(trailing_zeroes)
+        .max(leading_zeroes);
+    let groups = &groups[leading_zeroes..retained_end];
+    let mut weight = i32::try_from(integer_groups).map_err(|_| numeric_out_of_range_error())?
+        - 1
+        - i32::try_from(leading_zeroes).map_err(|_| numeric_out_of_range_error())?;
+    if groups.is_empty() {
+        weight = 0;
+    }
+
+    let mut encoded = Vec::with_capacity(8 + groups.len() * 2);
+    encoded.extend_from_slice(
+        &i16::try_from(groups.len())
+            .map_err(|_| numeric_out_of_range_error())?
+            .to_be_bytes(),
+    );
+    encoded.extend_from_slice(
+        &i16::try_from(weight)
+            .map_err(|_| numeric_out_of_range_error())?
+            .to_be_bytes(),
+    );
+    encoded.extend_from_slice(&(if negative { 0x4000_u16 } else { 0 }).to_be_bytes());
+    encoded.extend_from_slice(&dscale.to_be_bytes());
+    for group in groups {
+        encoded.extend_from_slice(&group.to_be_bytes());
+    }
+    Ok(encoded)
+}
+
+fn result_type_mismatch_error() -> PgWireError {
+    engine_error_to_pgwire(EngineError::new(
+        crate::core::EngineErrorKind::TypeMismatch,
+        "a PostgreSQL result value does not match its advertised type",
+    ))
+}
+
+fn numeric_out_of_range_error() -> PgWireError {
+    engine_error_to_pgwire(EngineError::new(
+        crate::core::EngineErrorKind::NumericOutOfRange,
+        "a PostgreSQL numeric value exceeds the supported wire range",
+    ))
 }
 
 fn internal_query_error() -> PgWireError {
@@ -1200,29 +1843,31 @@ impl ExtendedQueryHandler for WireHandlers {
             self.remove_statement(client, name).await?;
         }
 
-        if !message.type_oids.is_empty() {
-            return Err(query_wire_error(
-                "0A000",
-                "PostgreSQL parameter OID lists are deferred to type mapping",
-            ));
+        for oid in &message.type_oids {
+            if *oid != 0
+                && !Type::from_oid(*oid)
+                    .as_ref()
+                    .is_some_and(supported_parameter_type)
+            {
+                return Err(unsupported_parameter_type_error());
+            }
         }
+        let parameter_types = message
+            .type_oids
+            .iter()
+            .map(|oid| Type::from_oid(*oid))
+            .collect::<Vec<_>>();
         let statement = self
             .query_parser()
-            .parse_sql(client, &message.query, &[])
+            .parse_sql(client, &message.query, &parameter_types)
             .await?;
-        if !statement.description.parameter_types().is_empty() {
-            let connection = self.connection.installed()?;
-            let _ = connection
-                .state
-                .engine
-                .close_prepared_statement(&connection.state.session, statement.id)
-                .await;
-            return Err(query_wire_error(
-                "0A000",
-                "PostgreSQL bound parameters are deferred to type mapping",
-            ));
-        }
-        let statement = StoredStatement::new(name.to_owned(), statement, Vec::new());
+        let stored_parameter_types = statement
+            .parameter_types
+            .iter()
+            .cloned()
+            .map(Some)
+            .collect();
+        let statement = StoredStatement::new(name.to_owned(), statement, stored_parameter_types);
         client.portal_store().put_statement(Arc::new(statement));
         client
             .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
@@ -1244,21 +1889,22 @@ impl ExtendedQueryHandler for WireHandlers {
             .get_statement(statement_name)
             .ok_or_else(|| PgWireError::StatementNotFound(statement_name.to_owned()))?;
 
-        if !message.parameters.is_empty()
-            || !matches!(message.parameter_format_codes.as_slice(), [] | [0])
+        let parameter_count = statement.statement.parameter_types.len();
+        if message.parameters.len() != parameter_count {
+            return Err(query_wire_error(
+                "08P01",
+                "the PostgreSQL bound parameter count does not match the statement",
+            ));
+        }
+        if !matches!(message.parameter_format_codes.len(), 0 | 1)
+            && message.parameter_format_codes.len() != parameter_count
         {
             return Err(query_wire_error(
-                "0A000",
-                "PostgreSQL bound parameters are deferred to type mapping",
+                "08P01",
+                "the PostgreSQL parameter format count does not match the parameters",
             ));
         }
         let result_formats = message.result_column_format_codes.as_slice();
-        if !result_formats.iter().all(|format| *format == 0) {
-            return Err(query_wire_error(
-                "0A000",
-                "PostgreSQL binary result formats are deferred to type mapping",
-            ));
-        }
         if portal_name != DEFAULT_NAME && client.portal_store().get_portal(portal_name).is_some() {
             return Err(query_wire_error(
                 "42P03",
@@ -1288,33 +1934,29 @@ impl ExtendedQueryHandler for WireHandlers {
             self.remove_portal(client, portal_name).await?;
         }
 
+        let portal = Portal::try_new(&message, Arc::clone(&statement))?;
+        let parameters = decode_bound_parameters(&portal, &statement.statement.parameter_types)?;
+        let fields = Arc::new(description_fields_with(&description, |index| {
+            portal.result_column_format.format_for(index)
+        }));
+
         let portal_id = connection
             .state
             .engine
             .bind_statement(
                 &connection.state.session,
                 statement.statement.id,
-                Vec::new(),
+                parameters,
             )
             .await
             .map_err(engine_error_to_pgwire)?;
-        let portal = match Portal::try_new(&message, Arc::clone(&statement)) {
-            Ok(portal) => portal,
-            Err(error) => {
-                let _ = connection
-                    .state
-                    .engine
-                    .close_portal(&connection.state.session, portal_id)
-                    .await;
-                return Err(error);
-            }
-        };
         if let Err(error) = insert_bound_portal(
             &connection.state,
             portal_name,
             PgWireBoundPortal {
                 id: portal_id,
                 statement: statement.statement.id,
+                fields,
             },
         ) {
             let _ = connection
@@ -1431,12 +2073,7 @@ impl ExtendedQueryHandler for WireHandlers {
             .await
             .map_err(engine_error_to_pgwire)?;
         Ok(DescribeStatementResponse::new(
-            description
-                .parameter_types()
-                .iter()
-                .copied()
-                .map(postgres_type)
-                .collect(),
+            target.statement.parameter_types.iter().cloned().collect(),
             description_fields(&description),
         ))
     }
@@ -1454,16 +2091,7 @@ impl ExtendedQueryHandler for WireHandlers {
     {
         let portal = bound_portal(&self.connection.installed()?.state, target.name.as_str())?
             .ok_or_else(|| PgWireError::PortalNotFound(target.name.clone()))?;
-        let connection = self.connection.installed()?;
-        let description = connection
-            .state
-            .engine
-            .describe_prepared(&connection.state.session, DescribeTarget::Portal(portal.id))
-            .await
-            .map_err(engine_error_to_pgwire)?;
-        Ok(DescribePortalResponse::new(description_fields(
-            &description,
-        )))
+        Ok(DescribePortalResponse::new(portal.fields.as_ref().clone()))
     }
 
     async fn do_query<C>(
@@ -1494,7 +2122,7 @@ impl ExtendedQueryHandler for WireHandlers {
             .execute_portal_logical(&connection.state.session, bound.id)
             .await
             .map_err(engine_error_to_pgwire)?;
-        simple_query_response(behavior, execution.value)
+        execution_response(behavior, execution.value, Some(Arc::clone(&bound.fields)))
     }
 }
 
@@ -1739,7 +2367,7 @@ fn lock_extended_state(
 }
 
 fn bound_portal(state: &ConnectionState, name: &str) -> PgWireResult<Option<PgWireBoundPortal>> {
-    Ok(lock_extended_state(state)?.portals.get(name).copied())
+    Ok(lock_extended_state(state)?.portals.get(name).cloned())
 }
 
 fn insert_bound_portal(
@@ -1802,6 +2430,7 @@ fn valid_application_name(name: &str) -> bool {
 struct PgWirePrepared {
     id: PreparedStatementId,
     description: PreparedStatementDescription,
+    parameter_types: Arc<Vec<Type>>,
 }
 
 impl fmt::Debug for PgWirePrepared {
@@ -1810,6 +2439,7 @@ impl fmt::Debug for PgWirePrepared {
             .debug_struct("PgWirePrepared")
             .field("id", &self.id)
             .field("description", &self.description)
+            .field("parameter_types", &self.parameter_types)
             .finish()
     }
 }
@@ -1840,16 +2470,14 @@ impl QueryParser for PgWireQueryParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        // pgwire has already converted raw OIDs by this point. Both the
-        // inference marker (OID 0) and an unknown/custom OID arrive as `None`,
-        // so this boundary cannot safely distinguish them. Reject every
-        // nonempty type list until BriskDB owns raw Parse-message validation.
-        if !types.is_empty() {
-            return Err(engine_error_to_pgwire(EngineError::new(
-                crate::core::EngineErrorKind::Unsupported,
-                "PostgreSQL parameter OID lists are deferred to type mapping",
-            )));
-        }
+        let supplied_types = types
+            .iter()
+            .map(|data_type| match data_type {
+                Some(data_type) if supported_parameter_type(data_type) => Ok(data_type.clone()),
+                Some(_) => Err(unsupported_parameter_type_error()),
+                None => Ok(Type::TEXT),
+            })
+            .collect::<PgWireResult<Vec<_>>>()?;
 
         let request = PrepareRequest::new(
             self.state.database,
@@ -1880,7 +2508,25 @@ impl QueryParser for PgWireQueryParser {
             }
         };
 
-        Ok(PgWirePrepared { id, description })
+        if supplied_types.len() > description.parameter_types().len() {
+            let _ = self
+                .state
+                .engine
+                .close_prepared_statement(&self.state.session, id)
+                .await;
+            return Err(query_wire_error(
+                "08P01",
+                "the PostgreSQL parameter type count exceeds the statement parameters",
+            ));
+        }
+        let mut parameter_types = supplied_types;
+        parameter_types.resize(description.parameter_types().len(), Type::TEXT);
+
+        Ok(PgWirePrepared {
+            id,
+            description,
+            parameter_types: Arc::new(parameter_types),
+        })
     }
 }
 
@@ -2032,20 +2678,56 @@ mod tests {
     }
 
     fn parse_packet(name: &str, query: &str) -> Vec<u8> {
+        parse_packet_with_oids(name, query, &[])
+    }
+
+    fn parse_packet_with_oids(name: &str, query: &str, type_oids: &[u32]) -> Vec<u8> {
         let mut body = Vec::new();
         push_cstring(&mut body, name);
         push_cstring(&mut body, query);
-        body.extend_from_slice(&0_u16.to_be_bytes());
+        body.extend_from_slice(&u16::try_from(type_oids.len()).unwrap().to_be_bytes());
+        for oid in type_oids {
+            body.extend_from_slice(&oid.to_be_bytes());
+        }
         typed_packet(b'P', &body)
     }
 
     fn bind_packet(portal: &str, statement: &str) -> Vec<u8> {
+        bind_packet_with(portal, statement, &[], &[], &[])
+    }
+
+    fn bind_packet_with(
+        portal: &str,
+        statement: &str,
+        parameter_formats: &[i16],
+        parameters: &[Option<&[u8]>],
+        result_formats: &[i16],
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         push_cstring(&mut body, portal);
         push_cstring(&mut body, statement);
-        body.extend_from_slice(&0_u16.to_be_bytes());
-        body.extend_from_slice(&0_u16.to_be_bytes());
-        body.extend_from_slice(&0_i16.to_be_bytes());
+        body.extend_from_slice(
+            &u16::try_from(parameter_formats.len())
+                .unwrap()
+                .to_be_bytes(),
+        );
+        for format in parameter_formats {
+            body.extend_from_slice(&format.to_be_bytes());
+        }
+        body.extend_from_slice(&u16::try_from(parameters.len()).unwrap().to_be_bytes());
+        for parameter in parameters {
+            match parameter {
+                Some(parameter) => {
+                    body.extend_from_slice(&i32::try_from(parameter.len()).unwrap().to_be_bytes());
+                    body.extend_from_slice(parameter);
+                }
+                None => body.extend_from_slice(&(-1_i32).to_be_bytes()),
+            }
+        }
+        body.extend_from_slice(&i16::try_from(result_formats.len()).unwrap().to_be_bytes());
+        for format in result_formats {
+            body.extend_from_slice(&format.to_be_bytes());
+        }
         typed_packet(b'B', &body)
     }
 
@@ -2172,6 +2854,13 @@ mod tests {
     }
 
     fn row_description(body: &[u8]) -> Vec<(String, u32)> {
+        row_description_fields(body)
+            .into_iter()
+            .map(|(name, oid, _)| (name, oid))
+            .collect()
+    }
+
+    fn row_description_fields(body: &[u8]) -> Vec<(String, u32, i16)> {
         let count = usize::from(u16::from_be_bytes(body[..2].try_into().unwrap()));
         let mut fields = Vec::with_capacity(count);
         let mut offset = 2;
@@ -2185,11 +2874,22 @@ mod tests {
             offset = end + 1;
             offset += 4 + 2;
             let oid = u32::from_be_bytes(body[offset..offset + 4].try_into().unwrap());
-            offset += 4 + 2 + 4 + 2;
-            fields.push((name, oid));
+            offset += 4 + 2 + 4;
+            let format = i16::from_be_bytes(body[offset..offset + 2].try_into().unwrap());
+            offset += 2;
+            fields.push((name, oid, format));
         }
         assert_eq!(offset, body.len());
         fields
+    }
+
+    fn parameter_description(body: &[u8]) -> Vec<u32> {
+        let count = usize::from(u16::from_be_bytes(body[..2].try_into().unwrap()));
+        assert_eq!(body.len(), 2 + count * 4);
+        body[2..]
+            .chunks_exact(4)
+            .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
+            .collect()
     }
 
     #[test]
@@ -2283,6 +2983,152 @@ mod tests {
             info.message,
             postgres_error(EngineErrorKind::InvalidTextEncoding).message
         );
+
+        let invalid_result = ResultSet::new(
+            vec![crate::core::Column::new("invalid", DataType::Text)],
+            vec![crate::core::Row::new(vec![Value::InvalidText(vec![0x80])])],
+        )
+        .unwrap();
+        let Err(PgWireError::UserError(info)) = result_set_response(invalid_result) else {
+            panic!("result response encoding must preserve the fixed invalid-text error")
+        };
+        assert_eq!(info.code, "22021");
+
+        let mismatched_result = ResultSet::new(
+            vec![crate::core::Column::new("count", DataType::Int64)],
+            vec![crate::core::Row::new(vec![Value::Text(
+                "not an integer".to_owned(),
+            )])],
+        )
+        .unwrap();
+        let Err(PgWireError::UserError(info)) = result_set_response(mismatched_result) else {
+            panic!("result response encoding must preserve the fixed type-mismatch error")
+        };
+        assert_eq!(info.code, "42804");
+    }
+
+    #[test]
+    fn postgres_binary_values_and_numeric_groups_are_exact() {
+        let fields = Arc::new(vec![
+            FieldInfo::new(
+                "bool".to_owned(),
+                None,
+                None,
+                Type::BOOL,
+                FieldFormat::Binary,
+            ),
+            FieldInfo::new(
+                "int".to_owned(),
+                None,
+                None,
+                Type::INT8,
+                FieldFormat::Binary,
+            ),
+            FieldInfo::new(
+                "numeric".to_owned(),
+                None,
+                None,
+                Type::NUMERIC,
+                FieldFormat::Binary,
+            ),
+            FieldInfo::new(
+                "float".to_owned(),
+                None,
+                None,
+                Type::FLOAT8,
+                FieldFormat::Binary,
+            ),
+            FieldInfo::new(
+                "text".to_owned(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Binary,
+            ),
+            FieldInfo::new(
+                "bytea".to_owned(),
+                None,
+                None,
+                Type::BYTEA,
+                FieldFormat::Binary,
+            ),
+        ]);
+        let row = encode_data_row(
+            fields,
+            vec![
+                Value::Int64(1),
+                Value::Int64(-42),
+                Value::decimal("12.3400").unwrap(),
+                Value::Float64(1.5),
+                Value::Text("hello".to_owned()),
+                Value::Binary(vec![0, 255]),
+            ],
+        )
+        .unwrap();
+        let mut body = row.field_count.to_be_bytes().to_vec();
+        body.extend_from_slice(&row.data);
+        let numeric = [
+            0, 2, // two base-10000 digits
+            0, 0, // weight zero
+            0, 0, // positive
+            0, 4, // four decimal places
+            0, 12, // 12
+            13, 72, // 3400
+        ];
+        assert_eq!(
+            data_row(&body),
+            [
+                Some(vec![1]),
+                Some((-42_i64).to_be_bytes().to_vec()),
+                Some(numeric.to_vec()),
+                Some(1.5_f64.to_be_bytes().to_vec()),
+                Some(b"hello".to_vec()),
+                Some(vec![0, 255]),
+            ]
+        );
+        assert_eq!(
+            decode_numeric_binary(&numeric).unwrap(),
+            Value::decimal("12.3400").unwrap()
+        );
+        for value in ["0", "-0.0012", "10000", ".5", "1e3", "1e-3"] {
+            let encoded = encode_numeric_binary(value).unwrap();
+            let Value::Decimal(decoded) = decode_numeric_binary(&encoded).unwrap() else {
+                panic!("finite PostgreSQL numeric decoded as another BriskDB type")
+            };
+            let expected = match value {
+                ".5" => "0.5",
+                "1e3" => "1000",
+                "1e-3" => "0.001",
+                value => value,
+            };
+            assert_eq!(decoded.as_str(), expected);
+        }
+        let invalid_bytea = decode_bytea_text(br"\777").unwrap_err();
+        let PgWireError::UserError(info) = invalid_bytea else {
+            panic!("invalid bytea must use the fixed parameter error")
+        };
+        assert_eq!(info.code, "22P02");
+    }
+
+    #[test]
+    fn generated_insert_uses_the_standard_command_tag_without_unsolicited_rows() {
+        let execution =
+            PreparedExecution::GeneratedWrite(crate::core::WriteResult::with_generated_key(
+                1,
+                crate::core::GeneratedKey::new("id", Value::Int64(4_620_693_217_682_128_897)),
+            ));
+        let response = execution_response(
+            StatementBehavior::Write(WriteBehavior::Insert),
+            execution,
+            None,
+        )
+        .unwrap();
+        let Response::Execution(tag) = response else {
+            panic!("PostgreSQL must not invent a result row without RETURNING")
+        };
+        let complete: pgwire::messages::response::CommandComplete = tag.into();
+        assert_eq!(complete.tag, "INSERT 0 1");
+        assert!(!complete.tag.contains("4620693217682128897"));
     }
 
     async fn assert_eof(stream: &mut TcpStream) {
@@ -3018,6 +3864,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extended_parameters_and_binary_results_use_declared_postgres_types() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = crate::core::Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE typed_records (
+                    tenant_id TEXT NOT NULL PRIMARY KEY,
+                    enabled BOOLEAN NOT NULL,
+                    count_value INTEGER NOT NULL,
+                    ratio REAL NOT NULL,
+                    payload BLOB NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                crate::core::TableDeclaration::sharded(
+                    logical_database,
+                    "typed_records",
+                    crate::core::ShardKeyMetadata::new(
+                        "tenant_id",
+                        crate::core::ShardKeyType::Text,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let engine = Engine::from_database(Arc::new(database));
+        let adapter = Adapter::new(engine.clone());
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        read_until_ready(&mut client).await;
+
+        let insert_types = [
+            Type::TEXT.oid(),
+            Type::BOOL.oid(),
+            Type::INT8.oid(),
+            Type::FLOAT8.oid(),
+            Type::BYTEA.oid(),
+        ];
+        let ratio = 1.5_f64.to_be_bytes();
+        let insert = [
+            parse_packet_with_oids(
+                "insert_typed",
+                "INSERT INTO typed_records
+                 (tenant_id, enabled, count_value, ratio, payload)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &insert_types,
+            ),
+            bind_packet_with(
+                "insert_portal",
+                "insert_typed",
+                &[0, 1, 0, 1, 1],
+                &[
+                    Some(b"tenant-b"),
+                    Some(&[1]),
+                    Some(b"42"),
+                    Some(&ratio),
+                    Some(&[0, 255]),
+                ],
+                &[],
+            ),
+            execute_packet("insert_portal", 0),
+            typed_packet(b'S', &[]),
+        ]
+        .concat();
+        client.write_all(&insert).await.unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'1', b'2', b'C', b'Z']
+        );
+        assert_eq!(command_tag(&frames[2].1), "INSERT 0 1");
+
+        client
+            .write_all(
+                &[
+                    parse_packet_with_oids(
+                        "select_typed",
+                        "SELECT tenant_id, enabled, count_value, ratio, payload
+                         FROM typed_records WHERE tenant_id = $1",
+                        &[Type::TEXT.oid()],
+                    ),
+                    describe_packet(TARGET_TYPE_BYTE_STATEMENT, "select_typed"),
+                ]
+                .concat(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut client).await, (b'1', vec![]));
+        let parameter_frame = read_frame(&mut client).await;
+        assert_eq!(parameter_frame.0, b't');
+        assert_eq!(
+            parameter_description(&parameter_frame.1),
+            [Type::TEXT.oid()]
+        );
+        let statement_fields = read_frame(&mut client).await;
+        assert_eq!(statement_fields.0, b'T');
+        assert_eq!(
+            row_description_fields(&statement_fields.1),
+            [
+                ("tenant_id".to_owned(), Type::TEXT.oid(), 0),
+                ("enabled".to_owned(), Type::BOOL.oid(), 0),
+                ("count_value".to_owned(), Type::INT8.oid(), 0),
+                ("ratio".to_owned(), Type::FLOAT8.oid(), 0),
+                ("payload".to_owned(), Type::BYTEA.oid(), 0),
+            ]
+        );
+
+        let read = [
+            bind_packet_with(
+                "select_portal",
+                "select_typed",
+                &[1],
+                &[Some(b"tenant-b")],
+                &[1],
+            ),
+            describe_packet(TARGET_TYPE_BYTE_PORTAL, "select_portal"),
+            execute_packet("select_portal", 0),
+            typed_packet(b'S', &[]),
+        ]
+        .concat();
+        client.write_all(&read).await.unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'2', b'T', b'D', b'C', b'Z']
+        );
+        assert_eq!(
+            row_description_fields(&frames[1].1),
+            [
+                ("tenant_id".to_owned(), Type::TEXT.oid(), 1),
+                ("enabled".to_owned(), Type::BOOL.oid(), 1),
+                ("count_value".to_owned(), Type::INT8.oid(), 1),
+                ("ratio".to_owned(), Type::FLOAT8.oid(), 1),
+                ("payload".to_owned(), Type::BYTEA.oid(), 1),
+            ]
+        );
+        assert_eq!(
+            data_row(&frames[2].1),
+            [
+                Some(b"tenant-b".to_vec()),
+                Some(vec![1]),
+                Some(42_i64.to_be_bytes().to_vec()),
+                Some(1.5_f64.to_be_bytes().to_vec()),
+                Some(vec![0, 255]),
+            ]
+        );
+        assert_eq!(command_tag(&frames[3].1), "SELECT 1");
+
+        let core = Arc::clone(wire.connection().unwrap());
+        finish_wire_server(&mut client, server).await;
+        assert_eq!(core.state().await, SessionState::Closed);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn extended_query_errors_resync_and_unnamed_replacement_cleans_up_portals() {
         let (_temp, engine) = engine(2).await;
         let adapter = Adapter::new(engine.clone());
@@ -3027,19 +4033,21 @@ mod tests {
         read_until_ready(&mut client).await;
         let core = Arc::clone(wire.connection().unwrap());
 
-        let mut parse = Vec::new();
-        push_cstring(&mut parse, "private_statement");
-        push_cstring(&mut parse, "SELECT 'private extended text'");
-        parse.extend_from_slice(&1_u16.to_be_bytes());
-        parse.extend_from_slice(&Type::INT4.oid().to_be_bytes());
-        client.write_all(&typed_packet(b'P', &parse)).await.unwrap();
+        client
+            .write_all(&parse_packet_with_oids(
+                "private_statement",
+                "SELECT $1 || 'private extended text'",
+                &[Type::DATE.oid()],
+            ))
+            .await
+            .unwrap();
         let error = read_frame(&mut client).await;
         assert_eq!(error.0, b'E');
         let fields = message_fields(&error.1);
         assert_eq!(fields.get(&b'C').map(String::as_str), Some("0A000"));
         assert_eq!(
             fields.get(&b'M').map(String::as_str),
-            Some("PostgreSQL parameter OID lists are deferred to type mapping")
+            Some("the PostgreSQL parameter type is unsupported")
         );
         assert!(!fields.get(&b'M').unwrap().contains("private extended text"));
 
@@ -3047,15 +4055,52 @@ mod tests {
         assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
 
         client
-            .write_all(&parse_packet("parameterized", "SELECT $1"))
+            .write_all(&parse_packet_with_oids(
+                "too_many_types",
+                "SELECT $1",
+                &[Type::INT8.oid(), Type::BOOL.oid()],
+            ))
+            .await
+            .unwrap();
+        let error = read_frame(&mut client).await;
+        assert_eq!(error.0, b'E');
+        assert_eq!(
+            message_fields(&error.1).get(&b'C').map(String::as_str),
+            Some("08P01")
+        );
+        client.write_all(&typed_packet(b'S', &[])).await.unwrap();
+        assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
+
+        client
+            .write_all(&parse_packet_with_oids(
+                "parameterized",
+                "SELECT $1",
+                &[Type::INT8.oid()],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut client).await, (b'1', vec![]));
+        client
+            .write_all(&bind_packet_with(
+                "invalid_parameter_portal",
+                "parameterized",
+                &[1],
+                &[Some(&1_i32.to_be_bytes())],
+                &[],
+            ))
             .await
             .unwrap();
         let error = read_frame(&mut client).await;
         assert_eq!(error.0, b'E');
         let fields = message_fields(&error.1);
-        assert_eq!(fields.get(&b'C').map(String::as_str), Some("0A000"));
+        assert_eq!(fields.get(&b'C').map(String::as_str), Some("22P02"));
         client.write_all(&typed_packet(b'S', &[])).await.unwrap();
         assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
+        assert!(
+            bound_portal(&core.state, "invalid_parameter_portal")
+                .unwrap()
+                .is_none()
+        );
 
         client
             .write_all(&parse_packet(
@@ -3573,7 +4618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_query_parser_prepares_through_core_and_rejects_all_oid_lists() {
+    async fn selected_query_parser_prepares_through_core_and_owns_parameter_types() {
         let (_temp, engine) = engine(2).await;
         let adapter = Adapter::new(engine.clone());
         let connection = adapter.open_connection();
@@ -3599,29 +4644,52 @@ mod tests {
             .wire_parser
             .parse_sql(&client, "SELECT $1", &[None])
             .await
-            .unwrap_err();
-        let PgWireError::UserError(info) = inferred_or_unknown else {
-            panic!("expected a BriskDB-owned PostgreSQL error")
-        };
-        assert_eq!(info.code, "0A000");
-        assert_eq!(
-            info.message,
-            postgres_error(EngineErrorKind::Unsupported).message
+            .unwrap();
+        assert_eq!(inferred_or_unknown.parameter_types.as_ref(), &[Type::TEXT]);
+        assert!(
+            connection
+                .state
+                .engine
+                .close_prepared_statement(&connection.state.session, inferred_or_unknown.id)
+                .await
+                .unwrap()
         );
 
         let recognized = connection
             .wire_parser
             .parse_sql(&client, "SELECT $1", &[Some(Type::INT8)])
             .await
+            .unwrap();
+        assert_eq!(recognized.parameter_types.as_ref(), &[Type::INT8]);
+        assert!(
+            connection
+                .state
+                .engine
+                .close_prepared_statement(&connection.state.session, recognized.id)
+                .await
+                .unwrap()
+        );
+
+        let unsupported = connection
+            .wire_parser
+            .parse_sql(&client, "SELECT $1", &[Some(Type::DATE)])
+            .await
             .unwrap_err();
-        let PgWireError::UserError(info) = recognized else {
+        let PgWireError::UserError(info) = unsupported else {
             panic!("expected a BriskDB-owned PostgreSQL error")
         };
         assert_eq!(info.code, "0A000");
-        assert_eq!(
-            info.message,
-            postgres_error(EngineErrorKind::Unsupported).message
-        );
+        assert_eq!(info.message, "the PostgreSQL parameter type is unsupported");
+
+        let too_many = connection
+            .wire_parser
+            .parse_sql(&client, "SELECT $1", &[Some(Type::INT8), Some(Type::BOOL)])
+            .await
+            .unwrap_err();
+        let PgWireError::UserError(info) = too_many else {
+            panic!("expected a BriskDB-owned PostgreSQL error")
+        };
+        assert_eq!(info.code, "08P01");
 
         let invalid = connection
             .wire_parser

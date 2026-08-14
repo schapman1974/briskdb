@@ -1280,8 +1280,8 @@ async fn prepared_lifecycle_is_public_owned_and_protocol_neutral() {
     assert_eq!(
         description.columns(),
         [
-            core::Column::new("tenant_id", core::DataType::Unknown),
-            core::Column::new("payload", core::DataType::Unknown),
+            core::Column::new("tenant_id", core::DataType::Int64),
+            core::Column::new("payload", core::DataType::Text),
         ]
     );
     assert!(description.returns_rows());

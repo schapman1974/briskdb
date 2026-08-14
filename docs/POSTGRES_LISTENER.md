@@ -1,7 +1,7 @@
 # PostgreSQL startup and listener contract
 
 BriskDB serves a PostgreSQL protocol 3.0 baseline plus bounded simple and
-zero-parameter extended queries on a disabled-by-default, separately configured
+parameterized extended queries on a disabled-by-default, separately configured
 loopback TCP listener. A successful startup selects one logical database,
 creates one protocol-neutral core session, publishes BriskDB-owned parameter
 status, and keeps the socket alive until `Terminate`, EOF, server shutdown, or
@@ -151,24 +151,33 @@ fixed Engine-to-SQLSTATE mapping, appends `ReadyForQuery(I)`, never includes
 query text, and leaves the connection reusable.
 
 Rows are bounded and materialized by the Engine, then returned in PostgreSQL
-text format. Known protocol-neutral metadata has stable boolean, signed integer,
-numeric, double precision, text, and bytea OIDs; SQLite's unknown compile
-metadata is reported conservatively as text. Invalid UTF-8 text is rejected
-instead of replaced. Write responses use ordinary
+text format. Declared SQLite columns map `BOOL`/`BOOLEAN` to `bool`, names
+containing `INT` to `int8`, `REAL`/`FLOA`/`DOUB` to `float8`,
+`DECIMAL`/`NUMERIC` to `numeric`, `CHAR`/`CLOB`/`TEXT` to `text`, and `BLOB` to
+`bytea`. Unknown declarations and expressions remain conservative `text`.
+Invalid UTF-8 text is rejected instead of replaced. Write responses use ordinary
 `INSERT 0 n`, `UPDATE n`, and `DELETE n` command tags. Sharded writes must infer
 one exact owner from their literal shard-key values. Reads retain the Engine's
 existing point/scatter limits and semantics.
 
 ## Extended-query boundary
 
-The text-format, zero-parameter extended flow uses the same Engine lifecycle:
+The parameterized text/binary extended flow uses the same Engine lifecycle:
 
 - `Parse` prepares exactly one statement. Named statements must be unique;
   replacing the unnamed statement closes it and every portal bound from it.
-- `Bind` accepts no values or parameter formats yet. Named portals must be
-  unique; replacing the unnamed portal closes its core handle.
-- `Describe` returns zero parameter OIDs plus statement fields, or portal
-  fields, without execution.
+  Explicit OIDs are accepted for `bool`, `int2`/`int4`/`int8`, `oid`,
+  `float4`/`float8`, `numeric`, `bytea`, PostgreSQL text families, and
+  `json`/`jsonb`. OID zero, omitted OIDs, and trailing uninferred parameters
+  conservatively become `text`; unsupported OIDs fail before a core prepared
+  handle is retained.
+- `Bind` requires the exact value count and accepts PostgreSQL's zero, unified,
+  or per-parameter text/binary format list. Values are decoded into
+  protocol-neutral `Value`s before Engine bind, planning, or routing. Named
+  portals must be unique; replacing the unnamed portal closes its core handle.
+- `Describe` returns the resolved parameter OIDs and text-format statement
+  fields, or the bound portal's immutable requested result formats, without
+  execution.
 - `Execute` returns rows or a command tag. A positive row limit suspends and
   resumes the already materialized bounded response without rerunning the core
   portal; a completed portal cannot replay a write.
@@ -176,12 +185,19 @@ The text-format, zero-parameter extended flow uses the same Engine lifecycle:
   `Flush` flushes pending output; `Sync` restores `ReadyForQuery(I)` after an
   error and causes skipped extended messages to be accepted again.
 
+Result format lists may be empty, unified, or match the result-column count.
+Binary results use PostgreSQL's native encodings for `bool`, `int8`, `float8`,
+and `numeric`, raw bytes for `bytea`, and UTF-8 bytes for text. Text results use
+canonical PostgreSQL spellings, including hex `bytea`. A dynamically stored
+SQLite value that cannot satisfy its declared static type fails as `42804`
+instead of emitting corrupt bytes. Decimal parameters decode correctly but the
+current Engine still rejects them before mutation because SQLite has no
+lossless decimal binding.
+
 Statement and portal names are at most 63 UTF-8 bytes. Engine limits remain
 authoritative for per-session prepared statements, portals, retained values,
-rows, and bytes. Explicit parameter OIDs, bound values, parameter formats, and
-binary results remain issue #33. DDL, transactions, and `COPY` are not
-supported. The offline importer is the supported way to establish registered
-tables. See the
+rows, and bytes. DDL, transactions, and `COPY` are not supported. The offline
+importer is the supported way to establish registered tables. See the
 [copy/paste query quickstart](POSTGRES_QUICKSTART.md).
 
 ## Connection ownership and shutdown
@@ -217,10 +233,11 @@ only `server-api` enabled. Production framing is contained in
 not accept or return dependency types. The adapter uses BriskDB's catalog,
 session lifecycle, fixed SQLSTATE table, and safe messages.
 
-This startup work changes no HTTP route, JSON body, SQL subset, planner rule,
-typed result, manifest table, shard header, migration journal, stored row, or
-storage-format version. Startup identity, parameter metadata, and connection
-tasks exist only in process memory.
+This work changes no HTTP route, JSON body, SQL subset, planner rule, manifest
+table, shard header, migration journal, stored row, or storage-format version.
+Declared SQLite type metadata is now retained in protocol-neutral statement
+descriptions; PostgreSQL OIDs, formats, and raw parameter bytes remain confined
+to the adapter and connection memory.
 
 Library selection details and upgrade constraints are normative in the
 [PostgreSQL adapter decision record](POSTGRES_ADAPTER.md).
@@ -249,6 +266,9 @@ Automated coverage includes:
 - named and unnamed extended write/read/describe/execute, suspension without
   replay, cascading close, flush, fixed-error `Sync` recovery, and raw frame
   validation;
+- explicit and inferred parameter OIDs, mixed text/binary values, declared
+  result OIDs, statement-versus-portal format descriptions, native binary
+  rows, numeric base-10,000 framing, fixed decode errors, and recovery;
 - immediate `Terminate`, client EOF, partial startup, normal shutdown, forced
   server-task cancellation, and core-session cleanup;
 - the 256-task admission boundary, deterministic overflow close, and slot reuse

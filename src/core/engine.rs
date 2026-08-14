@@ -3631,8 +3631,8 @@ mod tests {
         ];
         let expected = ResultSet::new(
             vec![
-                Column::new("tenant_id", DataType::Unknown),
-                Column::new("payload", DataType::Unknown),
+                Column::new("tenant_id", DataType::Int64),
+                Column::new("payload", DataType::Text),
             ],
             vec![Row::new(vec![Value::from(7_i64), Value::from("seven")])],
         )
@@ -4957,8 +4957,8 @@ mod tests {
             read.value,
             ResultSet::new(
                 vec![
-                    Column::new("id", DataType::Unknown),
-                    Column::new("name", DataType::Unknown),
+                    Column::new("id", DataType::Text),
+                    Column::new("name", DataType::Text),
                 ],
                 vec![Row::new(vec![
                     Value::from("widget-1"),
@@ -5166,8 +5166,8 @@ mod tests {
                 result,
                 ResultSet::new(
                     vec![
-                        Column::new("id", DataType::Unknown),
-                        Column::new("label", DataType::Unknown),
+                        Column::new("id", DataType::Int64),
+                        Column::new("label", DataType::Text),
                     ],
                     vec![Row::new(vec![
                         Value::from(i64::from(shard)),

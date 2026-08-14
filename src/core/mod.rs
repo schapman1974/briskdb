@@ -717,8 +717,8 @@ mod tests {
             read.value,
             ResultSet::new(
                 vec![
-                    Column::new("id", DataType::Unknown),
-                    Column::new("name", DataType::Unknown),
+                    Column::new("id", DataType::Text),
+                    Column::new("name", DataType::Text),
                 ],
                 vec![Row::new(vec![
                     Value::from("widget-1"),
@@ -760,8 +760,8 @@ mod tests {
                 .unwrap(),
             ResultSet::new(
                 vec![
-                    Column::new("id", DataType::Unknown),
-                    Column::new("name", DataType::Unknown),
+                    Column::new("id", DataType::Text),
+                    Column::new("name", DataType::Text),
                 ],
                 vec![Row::new(vec![
                     Value::from("widget-1"),

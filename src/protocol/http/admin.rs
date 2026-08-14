@@ -1698,10 +1698,10 @@ mod tests {
         assert_eq!(
             first_page["columns"],
             json!([
-                {"name":"id","data_type":"unknown"},
-                {"name":"label","data_type":"unknown"},
-                {"name":"payload","data_type":"unknown"},
-                {"name":"note","data_type":"unknown"}
+                {"name":"id","data_type":"int64"},
+                {"name":"label","data_type":"text"},
+                {"name":"payload","data_type":"binary"},
+                {"name":"note","data_type":"text"}
             ])
         );
         assert_eq!(
@@ -1735,10 +1735,10 @@ mod tests {
                     "offset": 2,
                     "has_more": true,
                     "columns": [
-                        {"name":"id","data_type":"unknown"},
-                        {"name":"label","data_type":"unknown"},
-                        {"name":"payload","data_type":"unknown"},
-                        {"name":"note","data_type":"unknown"}
+                        {"name":"id","data_type":"int64"},
+                        {"name":"label","data_type":"text"},
+                        {"name":"payload","data_type":"binary"},
+                        {"name":"note","data_type":"text"}
                     ],
                     "rows": [
                         [1, "shard-1-row-1", [1, 1], null],

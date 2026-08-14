@@ -107,7 +107,7 @@ experimental and opt-in; the exact contract lives in
 | Durable virtual-bucket routing over independent SQLite WAL files | Working |
 | Exact-key routing and bounded scatter/gather reads | Working |
 | HTTP query/write API and admin data browser | Working, loopback-only |
-| PostgreSQL wire protocol | Simple and zero-parameter prepared `SELECT`/`INSERT`/`UPDATE`/`DELETE` |
+| PostgreSQL wire protocol | Simple and parameterized text/binary prepared `SELECT`/`INSERT`/`UPDATE`/`DELETE` |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
@@ -133,8 +133,8 @@ Then open the [data browser](http://127.0.0.1:7654/admin) or check the server:
 curl http://127.0.0.1:7654/health
 ```
 
-Enable the PostgreSQL listener explicitly. Simple queries and zero-parameter
-text-format prepared queries share the same bounded engine path:
+Enable the PostgreSQL listener explicitly. Simple and parameterized
+text/binary prepared queries share the same bounded engine path:
 
 ```bash
 cargo run --release -- --postgres-listen 127.0.0.1:5433

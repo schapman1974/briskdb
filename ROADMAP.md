@@ -252,7 +252,7 @@ the engine regardless of its eventual wire protocol.
   resynchronization, and portal suspension.
 - [x] Negotiate explicitly supported newer protocol minor versions from the
   exact 3.0 baseline rather than conflating protocol and server versions.
-- [ ] Map BriskDB types to PostgreSQL OIDs and support text format first, then
+- [x] Map BriskDB types to PostgreSQL OIDs and support text format first, then
   the binary formats required by tested drivers (issue #33, including the
   generated-key result contract).
 - [ ] Implement `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction state, and shard

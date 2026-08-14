@@ -233,6 +233,7 @@ dependencies = [
  "async-trait",
  "axum",
  "blake3",
+ "bytes",
  "clap",
  "criterion",
  "futures",

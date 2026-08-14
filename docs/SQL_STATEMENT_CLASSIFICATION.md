@@ -224,8 +224,8 @@ classifier rejects, subject to the populated-catalog ban on row-moving DML,
 table drops, and trigger creation.
 At the issue-28 milestone, the PostgreSQL endpoint was only an accept/close
 scaffold. Issue #30 connected startup, catalog selection, status, and session
-cleanup; issue #31 connects simple and zero-parameter extended SQL messages to
-the shared classification and Engine lifecycle.
+cleanup; issues #31 and #33 connect simple and parameterized text/binary
+extended SQL messages to the shared classification and Engine lifecycle.
 
 ## Storage-format and configuration boundary
 

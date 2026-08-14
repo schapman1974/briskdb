@@ -474,8 +474,8 @@ mod tests {
                 json!({
                     "shard": expected_shard,
                     "columns": [
-                        {"name": "id", "data_type": "unknown"},
-                        {"name": "name", "data_type": "unknown"}
+                        {"name": "id", "data_type": "text"},
+                        {"name": "name", "data_type": "text"}
                     ],
                     "rows": [["widget-1", "First widget"]]
                 }),
@@ -827,9 +827,9 @@ mod tests {
                 json!({
                     "shards": [0, 1, 2, 3],
                     "columns": [
-                        {"name": "tenant_id", "data_type": "unknown"},
-                        {"name": "record_id", "data_type": "unknown"},
-                        {"name": "payload", "data_type": "unknown"}
+                        {"name": "tenant_id", "data_type": "text"},
+                        {"name": "record_id", "data_type": "int64"},
+                        {"name": "payload", "data_type": "text"}
                     ],
                     "rows": [
                         [tenant_keys[0], 1, "updated-0"],
@@ -1142,8 +1142,8 @@ mod tests {
                 json!({
                     "shards": [0, 1],
                     "columns": [
-                        {"name": "tenant_key", "data_type": "unknown"},
-                        {"name": "payload", "data_type": "unknown"}
+                        {"name": "tenant_key", "data_type": "text"},
+                        {"name": "payload", "data_type": "text"}
                     ],
                     "rows": [
                         [tenant_keys[0], "zero payload"],
@@ -1168,8 +1168,8 @@ mod tests {
                 json!({
                     "shards": [0, 1],
                     "columns": [
-                        {"name": "tenant_key", "data_type": "unknown"},
-                        {"name": "payload", "data_type": "unknown"}
+                        {"name": "tenant_key", "data_type": "text"},
+                        {"name": "payload", "data_type": "text"}
                     ],
                     "rows": [
                         [tenant_keys[0], "zero payload"],
