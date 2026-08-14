@@ -114,7 +114,7 @@ experimental and opt-in; the exact contract lives in
 | Listener-free Rust library entrypoint | Working |
 | Native MongoDB wire protocol with TinyMongo parity | [Planned](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
-| Native Python extension | Source builds working; release wheels [planned](https://github.com/schapman1974/briskdb/issues/200) |
+| Native Python extension | Sync/async API working; tagged releases build audited macOS/Linux ARM/x86 wheels |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
 
 ## Try it in 30 seconds
@@ -164,9 +164,9 @@ python -m pip install ./python
 ```
 
 See the [Python quickstart](python/README.md) for sync and asyncio write/read
-examples. A Rust toolchain is required for this initial source distribution;
-prebuilt wheels are tracked in
-[#200](https://github.com/schapman1974/briskdb/issues/200).
+examples. Tagged releases publish compiler-free `cp39-abi3` wheels for the
+[supported platform matrix](python/COMPATIBILITY.md); repository checkouts can
+still be installed from source with Rust 1.85+.
 
 ## Still just inspectable files
 
@@ -189,9 +189,8 @@ and integrity metadata. Application rows stay in ordinary SQLite files.
   indexes, cursors, aggregation, and differential TinyMongo parity.
 - **More wire protocols:** PostgreSQL extended queries and MySQL compatibility,
   all sharing the same engine behavior.
-- **Python and serverless:** prebuilt Python wheels, atomic snapshots,
-  ephemeral-runtime helpers, and fenced single-writer operation over the
-  embedded Rust API. The initial PyO3 source package already runs in-process.
+- **Serverless storage:** atomic snapshots, object-store adapters, and fenced
+  single-writer operation beyond today's embedded warm-handler pattern.
 - **Future storage adapters:** SQLite is the first backend, while the engine
   boundaries are being kept reusable for other durable backends.
 
@@ -206,8 +205,9 @@ Follow the [roadmap](ROADMAP.md) or browse the
 - The supported backup today is a stopped-server copy of the complete data
   directory; online/serverless snapshots are planned.
 - Pre-1.0 storage and public-library compatibility can change between releases.
-- Ubuntu 24.04 x86-64 receives the full required CI suite; other release
-  platforms are preview artifacts with native startup smoke tests.
+- Ubuntu 24.04 x86-64 receives the full required Rust CI suite. Python wheels
+  receive native build, audit, install, restart, corruption, and concurrency
+  checks on Linux/macOS x86-64 and ARM64.
 
 ## Go deeper
 

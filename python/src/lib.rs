@@ -890,6 +890,15 @@ fn checkpoint_to_python(py: Python<'_>, report: CheckpointReport) -> PyResult<Py
     Ok(output.into_any().unbind())
 }
 
+fn python_distribution_version(version: &str) -> String {
+    for (semver, pep440) in [("-alpha.", "a"), ("-beta.", "b"), ("-rc.", "rc")] {
+        if let Some((release, prerelease)) = version.split_once(semver) {
+            return format!("{release}{pep440}{prerelease}");
+        }
+    }
+    version.to_owned()
+}
+
 #[pymodule]
 fn _briskdb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register(module)?;
@@ -899,6 +908,22 @@ fn _briskdb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Database>()?;
     module.add_class::<Session>()?;
     module.add_function(wrap_pyfunction!(open_database, module)?)?;
-    module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    module.add(
+        "__version__",
+        python_distribution_version(env!("CARGO_PKG_VERSION")),
+    )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::python_distribution_version;
+
+    #[test]
+    fn cargo_prereleases_match_python_distribution_versions() {
+        assert_eq!(python_distribution_version("1.2.3"), "1.2.3");
+        assert_eq!(python_distribution_version("1.2.3-alpha.4"), "1.2.3a4");
+        assert_eq!(python_distribution_version("1.2.3-beta.5"), "1.2.3b5");
+        assert_eq!(python_distribution_version("1.2.3-rc.6"), "1.2.3rc6");
+    }
 }

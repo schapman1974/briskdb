@@ -1,0 +1,12 @@
+BriskDB native wheel notices
+============================
+
+BriskDB wheels contain a native Rust extension and a statically bundled copy
+of SQLite supplied through rusqlite/libsqlite3-sys. SQLite is dedicated to the
+public domain; see https://sqlite.org/copyright.html.
+
+The BriskDB Python and Rust sources are MIT licensed. Their source manifests
+record the licenses of Rust dependencies. Platform audit reports attached to
+each GitHub release list any dynamic libraries used by the final wheel. The
+supported wheels are designed to depend only on operating-system libraries;
+they do not load a separately installed SQLite library.

@@ -3,7 +3,14 @@
 This package runs BriskDB's sharded SQLite engine in the Python process. It
 starts no listener, subprocess, signal handler, or global logger.
 
-Build and install it from the repository with Python 3.9+ and Rust 1.85+:
+Tagged releases publish compiler-free wheels for CPython 3.9–3.14 on supported
+macOS and Linux targets:
+
+```bash
+python -m pip install --only-binary=:all: briskdb
+```
+
+To build the current checkout from source, use Python 3.9+ and Rust 1.85+:
 
 ```bash
 python -m pip install ./python
@@ -43,6 +50,9 @@ async with await briskdb.open_async("./data", shards=4) as db:
 
 See [sync and asyncio usage](ASYNC_API.md) for cursors, deadlines, cancellation,
 thread/task safety, and the intentionally unclaimed DB-API transaction surface.
+The [API reference](API.md), [platform matrix](COMPATIBILITY.md), and
+[serverless-shaped warm-handler example](SERVERLESS.md) define the supported
+package surface and its current boundaries.
 
 This is an alpha API. SQL supports `None`, `bool`, bounded integers, `float`,
 `str`, bytes-like values, and exact `decimal.Decimal` conversion with explicit
