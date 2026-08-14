@@ -4,9 +4,11 @@ from ._briskdb import (
     BriskDBError,
     BusyError,
     CancelledError,
+    CancellationToken,
     CheckViolationError,
     Config,
     ConstraintViolationError,
+    Cursor,
     DataCorruptionError,
     DataError,
     Database,
@@ -36,14 +38,17 @@ from ._briskdb import (
     __version__,
     open,
 )
+from .api import AsyncCursor, AsyncDatabase, AsyncSession, connect, connect_async, open_async
 
 __all__ = [
     "BriskDBError",
     "BusyError",
     "CancelledError",
+    "CancellationToken",
     "CheckViolationError",
     "Config",
     "ConstraintViolationError",
+    "Cursor",
     "DataCorruptionError",
     "DataError",
     "Database",
@@ -70,6 +75,12 @@ __all__ = [
     "TypeMismatchError",
     "UniqueViolationError",
     "UnsupportedError",
+    "AsyncCursor",
+    "AsyncDatabase",
+    "AsyncSession",
     "__version__",
+    "connect",
+    "connect_async",
+    "open_async",
     "open",
 ]

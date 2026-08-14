@@ -81,7 +81,7 @@ fn extract_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     )))
 }
 
-fn value_to_python(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
+pub(crate) fn value_to_python(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
     match value {
         Value::Null => Ok(py.None()),
         Value::Boolean(value) => value.into_py_any(py),
@@ -100,7 +100,7 @@ fn value_to_python(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
     }
 }
 
-fn data_type_name(data_type: DataType) -> &'static str {
+pub(crate) fn data_type_name(data_type: DataType) -> &'static str {
     match data_type {
         DataType::Unknown => "unknown",
         DataType::Null => "null",
