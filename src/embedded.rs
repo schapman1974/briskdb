@@ -5,13 +5,17 @@
 //! Tokio runtime and should explicitly call [`BriskDb::close`] before dropping
 //! its last database handle.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::core::{
     CancellationToken, Catalog, CheckpointReport, DescribeTarget, Engine, EngineOptions,
     EngineResult, EngineState, EngineStatus, Executed, PortalId, PrepareRequest, PreparedExecution,
     PreparedStatementDescription, PreparedStatementId, RequestContext, ResultSet, Routed, Session,
-    ShutdownReport, Statement, Value, WriteResult,
+    SessionId, SessionState, ShutdownReport, Statement, Value, WriteResult,
 };
 use crate::{EngineError, EngineErrorKind};
 
@@ -171,6 +175,28 @@ pub struct BriskDb {
     document_support: DocumentSupport,
 }
 
+/// Cloneable, database-owning session handle for embedded applications.
+///
+/// Every clone shares one serialized session state, including routing context,
+/// prepared statements, and terminal close. The retained [`BriskDb`] handle
+/// keeps the owning engine identity available, but cannot resurrect it after
+/// database shutdown.
+#[derive(Clone)]
+pub struct BriskSession {
+    database: BriskDb,
+    session: Arc<Session>,
+}
+
+impl fmt::Debug for BriskSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BriskSession")
+            .field("id", &self.id())
+            .field("database_state", &self.database.state())
+            .finish_non_exhaustive()
+    }
+}
+
 impl BriskDb {
     /// Start a builder for one data directory.
     pub fn builder(root: impl Into<PathBuf>) -> BriskDbBuilder {
@@ -210,6 +236,17 @@ impl BriskDb {
     /// Create an independent frontend session owned by this database.
     pub fn session(&self) -> Session {
         self.engine.session()
+    }
+
+    /// Create a cloneable session that retains its owning database handle.
+    ///
+    /// This is the preferred session form for foreign-language wrappers and
+    /// application components that need to move or clone owned handles.
+    pub fn owned_session(&self) -> BriskSession {
+        BriskSession {
+            database: self.clone(),
+            session: Arc::new(self.session()),
+        }
     }
 
     /// Return immutable engine and resource-limit status.
@@ -507,5 +544,203 @@ impl BriskDb {
     ) -> EngineResult<ShutdownReport> {
         cancellation.cancelled().await;
         self.close().await
+    }
+}
+
+impl BriskSession {
+    /// Return the process-unique session identity.
+    pub fn id(&self) -> SessionId {
+        self.session.id()
+    }
+
+    /// Return the lifecycle state shared by every clone of this handle.
+    pub async fn state(&self) -> SessionState {
+        self.session.state().await
+    }
+
+    /// Return the owning database lifecycle state.
+    pub fn database_state(&self) -> EngineState {
+        self.database.state()
+    }
+
+    /// Return a copy of the current explicit route, if one is set.
+    pub async fn routing_key(&self) -> Option<String> {
+        self.session.routing_key().await
+    }
+
+    /// Replace the explicit route used by subsequent operations.
+    pub async fn set_routing_key(&self, routing_key: impl Into<String>) -> EngineResult<()> {
+        self.session.set_routing_key(routing_key).await
+    }
+
+    /// Clear the explicit route used by subsequent operations.
+    pub async fn clear_routing_key(&self) -> EngineResult<()> {
+        self.session.clear_routing_key().await
+    }
+
+    /// Return immutable engine and resource-limit status.
+    pub async fn status(&self) -> EngineResult<EngineStatus> {
+        self.database.status(self.session.as_ref()).await
+    }
+
+    /// Execute one routed write and return only its affected-row count.
+    pub async fn execute(&self, statement: Statement) -> EngineResult<Routed<usize>> {
+        self.database
+            .execute(self.session.as_ref(), statement)
+            .await
+    }
+
+    /// Execute one routed write with host-supplied request controls.
+    pub async fn execute_with_context(
+        &self,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<usize>> {
+        self.database
+            .execute_with_context(self.session.as_ref(), statement, context)
+            .await
+    }
+
+    /// Execute one routed write with complete generated-key data.
+    pub async fn execute_write(&self, statement: Statement) -> EngineResult<Routed<WriteResult>> {
+        self.database
+            .execute_write(self.session.as_ref(), statement)
+            .await
+    }
+
+    /// Execute one routed write with request controls and generated-key data.
+    pub async fn execute_write_with_context(
+        &self,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<WriteResult>> {
+        self.database
+            .execute_write_with_context(self.session.as_ref(), statement, context)
+            .await
+    }
+
+    /// Query one routed physical owner.
+    pub async fn query(&self, statement: Statement) -> EngineResult<Routed<ResultSet>> {
+        self.database.query(self.session.as_ref(), statement).await
+    }
+
+    /// Query one routed owner with host-supplied request controls.
+    pub async fn query_with_context(
+        &self,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<ResultSet>> {
+        self.database
+            .query_with_context(self.session.as_ref(), statement, context)
+            .await
+    }
+
+    /// Query the logical table view through point/scatter planning.
+    pub async fn query_logical(&self, statement: Statement) -> EngineResult<Executed<ResultSet>> {
+        self.database
+            .query_logical(self.session.as_ref(), statement)
+            .await
+    }
+
+    /// Query the logical table view with host-supplied request controls.
+    pub async fn query_logical_with_context(
+        &self,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Executed<ResultSet>> {
+        self.database
+            .query_logical_with_context(self.session.as_ref(), statement, context)
+            .await
+    }
+
+    /// Compile one protocol-neutral prepared SQL statement.
+    pub async fn prepare(&self, request: PrepareRequest) -> EngineResult<PreparedStatementId> {
+        self.database.prepare(self.session.as_ref(), request).await
+    }
+
+    /// Prepare one statement with host-supplied request controls.
+    pub async fn prepare_with_context(
+        &self,
+        request: PrepareRequest,
+        context: RequestContext,
+    ) -> EngineResult<PreparedStatementId> {
+        self.database
+            .prepare_with_context(self.session.as_ref(), request, context)
+            .await
+    }
+
+    /// Bind typed values and the current route into an immutable portal.
+    pub async fn bind(
+        &self,
+        statement: PreparedStatementId,
+        parameters: Vec<Value>,
+    ) -> EngineResult<PortalId> {
+        self.database
+            .bind(self.session.as_ref(), statement, parameters)
+            .await
+    }
+
+    /// Bind a prepared statement with host-supplied request controls.
+    pub async fn bind_with_context(
+        &self,
+        statement: PreparedStatementId,
+        parameters: Vec<Value>,
+        context: RequestContext,
+    ) -> EngineResult<PortalId> {
+        self.database
+            .bind_with_context(self.session.as_ref(), statement, parameters, context)
+            .await
+    }
+
+    /// Describe a prepared statement or bound portal.
+    pub async fn describe(
+        &self,
+        target: DescribeTarget,
+    ) -> EngineResult<PreparedStatementDescription> {
+        self.database.describe(self.session.as_ref(), target).await
+    }
+
+    /// Execute one immutable bound portal on its selected owner.
+    pub async fn execute_bound(&self, portal: PortalId) -> EngineResult<Routed<PreparedExecution>> {
+        self.database
+            .execute_bound(self.session.as_ref(), portal)
+            .await
+    }
+
+    /// Execute a bound portal through logical point/scatter planning.
+    pub async fn execute_bound_logical(
+        &self,
+        portal: PortalId,
+    ) -> EngineResult<Executed<PreparedExecution>> {
+        self.database
+            .execute_bound_logical(self.session.as_ref(), portal)
+            .await
+    }
+
+    /// Close a prepared statement and every bound portal derived from it.
+    pub async fn close_prepared(&self, statement: PreparedStatementId) -> EngineResult<bool> {
+        self.database
+            .close_prepared(self.session.as_ref(), statement)
+            .await
+    }
+
+    /// Close one bound portal while retaining its prepared statement.
+    pub async fn close_bound(&self, portal: PortalId) -> EngineResult<bool> {
+        self.database
+            .close_bound(self.session.as_ref(), portal)
+            .await
+    }
+
+    /// Apply one durable parameterless schema batch to every shard.
+    pub async fn migrate(&self, sql: impl Into<String>) -> EngineResult<Vec<u16>> {
+        self.database.migrate(self.session.as_ref(), sql).await
+    }
+
+    /// Close this session terminally and clear all retained session state.
+    ///
+    /// Closing one clone closes every clone. It remains available while the
+    /// database is draining and is deterministic and idempotent.
+    pub async fn close(&self) -> EngineResult<()> {
+        self.session.close().await
     }
 }
