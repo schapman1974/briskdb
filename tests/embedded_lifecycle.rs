@@ -95,6 +95,7 @@ async fn passive_checkpoint_is_ordered_bounded_and_host_cancellable() {
         vec![0, 1]
     );
     for shard in report.shards() {
+        assert!(shard.counts_available());
         assert!(shard.checkpointed_frames() <= shard.wal_frames());
         assert_eq!(
             shard.complete(),
