@@ -9,7 +9,7 @@ handling dependencies:
 
 ```toml
 [dependencies]
-briskdb = { version = "0.1.0-alpha.3", default-features = false, features = ["embedded"] }
+briskdb = { version = "0.1.0-alpha.4", default-features = false, features = ["embedded"] }
 ```
 
 ## Feature map
@@ -48,7 +48,7 @@ See [Pre-1.0 compatibility](PRE_1_COMPATIBILITY.md) for the versioning policy.
 
 ## Packaging baseline
 
-Measured from the alpha.3 lockfile on macOS ARM64 with Cargo's normal-edge
+Measured from the alpha.4 lockfile on macOS ARM64 with Cargo's normal-edge
 dependency graph:
 
 | Build | Unique packages |
