@@ -1,0 +1,84 @@
+metadata	captured_at	2026-08-14
+metadata	engine_revision	51c84212839632ecbf27fddb56d5c792cf56207f
+metadata	rustc	rustc 1.94.1 (e408947bf 2026-03-25); binary: rustc; commit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1; commit-date: 2026-03-25; host: aarch64-apple-darwin; release: 1.94.1; LLVM version: 21.1.8
+metadata	uname	Darwin MacBook-Pro-2.local 25.2.0 Darwin Kernel Version 25.2.0: Tue Nov 18 21:09:40 PST 2025; root:xnu-12377.61.12~1/RELEASE_ARM64_T6000 arm64
+metadata	cpu	Apple M1 Pro
+metadata	memory_bytes	17179869184
+metadata	filesystem	APFS; internal Apple Fabric storage
+metadata	power_cache_policy	AC power; normal warm operating-system cache
+metadata	command	cargo test --release --locked --test global_index_baseline release_global_index_baseline -- --ignored --exact --nocapture --test-threads=1
+metadata	os	macos
+metadata	arch	aarch64
+control	rows_per_shard	16
+control	operations_per_worker	256
+control	warmup_operations	16
+control	process_workers	4
+control	cache_policy	warm
+control	sqlite_journal_mode	WAL
+control	sqlite_synchronous	FULL
+control	fsync_observation	SQLite FULL durability policy; syscall counts are not portable and are not inferred
+record	mode	shards	workload	workers	operations_per_worker	attempts	successes	constraints	returned_rows	visited_shards	elapsed_us	throughput_ops_s	p50_us	p95_us	p99_us	cpu_us	peak_rss_bytes	physical_write_bytes	peak_wal_growth_bytes	expected_shards_per_operation	sqlite_synchronous
+result	single_process	2	point_read	1	256	256	256	0	256	256	6799	37652.60	24	32	68	7420	14057472	0	0	1	FULL
+result	single_process	2	scatter_read	1	256	256	256	0	2048	512	14866	17220.50	53	88	106	25454	14286848	0	0	2	FULL
+result	single_process	2	indexed_hit	1	256	256	256	0	256	512	10965	23347.01	39	69	89	17331	14385152	0	0	2	FULL
+result	single_process	2	indexed_miss	1	256	256	256	0	0	512	11126	23009.17	38	71	93	17588	14401536	0	0	2	FULL
+result	single_process	2	insert	1	256	256	256	0	256	256	32465	7885.42	124	164	235	29162	14401536	0	4128272	1	FULL
+result	single_process	2	update	1	256	256	256	0	256	256	22093	11587.38	83	109	143	20090	14450688	0	1120672	1	FULL
+result	single_process	2	delete	1	256	256	256	0	256	256	40988	6245.73	159	234	307	37771	14467072	0	4128272	1	FULL
+result	single_process	2	contended_unique_insert	1	256	256	256	0	256	256	39595	6465.46	156	224	294	35203	14467072	0	4132392	1	FULL
+result	multi_process	2	point_read	4	256	1024	1024	0	1024	1024	12327	83069.68	47	61	75	49809	54542336	0	0	1	FULL
+result	multi_process	2	scatter_read	4	256	1024	1024	0	8192	2048	32608	31403.34	121	170	209	202798	54935552	0	0	2	FULL
+result	multi_process	2	indexed_hit	4	256	1024	1024	0	1024	2048	53403	19174.95	141	558	1079	153142	54919168	0	0	2	FULL
+result	multi_process	2	indexed_miss	4	256	1024	1024	0	0	2048	26166	39134.76	97	134	166	156189	55001088	0	0	2	FULL
+result	multi_process	2	insert	4	256	1024	1024	0	1024	1024	83717	12231.69	104	336	2672	132149	54951936	0	7057560	1	FULL
+result	multi_process	2	update	4	256	1024	1024	0	1024	1024	57808	17713.81	100	182	4007	96875	54411264	0	4124120	1	FULL
+result	multi_process	2	delete	4	256	1024	1024	0	1024	1024	60180	17015.62	96	260	2988	97938	54214656	0	7172920	1	FULL
+result	multi_process	2	contended_unique_insert	4	256	1024	256	768	256	1024	49382	20736.30	31	153	2828	52803	54755328	0	3872800	1	FULL
+result	single_process	4	point_read	1	256	256	256	0	256	256	6719	38100.91	24	37	47	7244	14696448	0	0	1	FULL
+result	single_process	4	scatter_read	1	256	256	256	0	4096	1024	23078	11092.82	88	123	136	50165	14860288	0	0	4	FULL
+result	single_process	4	indexed_hit	1	256	256	256	0	256	1024	16599	15422.62	61	101	119	35834	14860288	0	0	4	FULL
+result	single_process	4	indexed_miss	1	256	256	256	0	0	1024	17709	14455.93	65	104	119	36643	14860288	0	0	4	FULL
+result	single_process	4	insert	1	256	256	256	0	256	256	32790	7807.26	133	161	221	31077	14860288	0	4132392	1	FULL
+result	single_process	4	update	1	256	256	256	0	256	256	21879	11700.72	74	141	215	20505	14860288	0	1120672	1	FULL
+result	single_process	4	delete	1	256	256	256	0	256	256	36759	6964.28	148	184	224	34278	14860288	0	4132392	1	FULL
+result	single_process	4	contended_unique_insert	1	256	256	256	0	256	256	36292	7053.90	153	197	225	33749	14860288	0	4128272	1	FULL
+result	multi_process	4	point_read	4	256	1024	1024	0	1024	1024	11706	87476.51	45	56	74	48224	55328768	0	0	1	FULL
+result	multi_process	4	scatter_read	4	256	1024	1024	0	16384	4096	43107	23754.84	161	220	257	323524	56115200	0	0	4	FULL
+result	multi_process	4	indexed_hit	4	256	1024	1024	0	1024	4096	37039	27646.53	139	196	219	274208	56459264	0	0	4	FULL
+result	multi_process	4	indexed_miss	4	256	1024	1024	0	0	4096	37207	27521.70	138	194	230	269329	56147968	0	0	4	FULL
+result	multi_process	4	insert	4	256	1024	1024	0	1024	1024	73680	13897.94	272	470	633	222694	55427072	0	15322280	1	FULL
+result	multi_process	4	update	4	256	1024	1024	0	1024	1024	44914	22799.13	165	232	269	146793	55230464	0	4078824	1	FULL
+result	multi_process	4	delete	4	256	1024	1024	0	1024	1024	112853	9073.75	436	729	864	266313	54935552	0	15474720	1	FULL
+result	multi_process	4	contended_unique_insert	4	256	1024	256	768	256	1024	66207	15466.64	29	255	2915	68121	55508992	0	3835720	1	FULL
+result	single_process	10	point_read	1	256	256	256	0	256	256	6769	37819.47	23	39	73	7490	15368192	0	0	1	FULL
+result	single_process	10	scatter_read	1	256	256	256	0	10240	2560	36183	7075.15	139	172	194	129582	15712256	0	0	10	FULL
+result	single_process	10	indexed_hit	1	256	256	256	0	256	2560	32843	7794.66	126	160	190	107011	15728640	0	0	10	FULL
+result	single_process	10	indexed_miss	1	256	256	256	0	0	2560	32222	7944.88	123	157	170	104662	15810560	0	0	10	FULL
+result	single_process	10	insert	1	256	256	256	0	256	256	31941	8014.78	113	183	225	30652	15810560	0	4132392	1	FULL
+result	single_process	10	update	1	256	256	256	0	256	256	21999	11636.89	81	122	145	20671	15810560	0	1116552	1	FULL
+result	single_process	10	delete	1	256	256	256	0	256	256	32493	7878.62	130	154	205	30982	15810560	0	4132392	1	FULL
+result	single_process	10	contended_unique_insert	1	256	256	256	0	256	256	32351	7913.20	119	181	219	30786	15810560	0	4128272	1	FULL
+result	multi_process	10	point_read	4	256	1024	1024	0	1024	1024	12362	82834.49	47	60	77	50390	56885248	0	0	1	FULL
+result	multi_process	10	scatter_read	4	256	1024	1024	0	40960	10240	72951	14036.82	275	361	418	556314	59244544	0	0	10	FULL
+result	multi_process	10	indexed_hit	4	256	1024	1024	0	1024	10240	67119	15256.48	255	357	414	528198	59080704	0	0	10	FULL
+result	multi_process	10	indexed_miss	4	256	1024	1024	0	0	10240	67437	15184.54	255	340	381	526996	59785216	0	0	10	FULL
+result	multi_process	10	insert	4	256	1024	1024	0	1024	1024	106505	9614.57	424	645	778	271368	57573376	0	15309920	1	FULL
+result	multi_process	10	update	4	256	1024	1024	0	1024	1024	45122	22694.03	175	233	255	156031	56901632	0	4161200	1	FULL
+result	multi_process	10	delete	4	256	1024	1024	0	1024	1024	83209	12306.36	316	491	613	236083	56590336	0	15474720	1	FULL
+result	multi_process	10	contended_unique_insert	4	256	1024	256	768	256	1024	62417	16405.79	33	238	4380	63853	57196544	0	3839840	1	FULL
+result	single_process	64	point_read	1	256	256	256	0	256	256	6681	38317.62	24	33	47	8896	21217280	0	0	1	FULL
+result	single_process	64	scatter_read	1	256	256	256	0	65536	16384	164935	1552.13	642	730	776	821480	23232512	0	0	64	FULL
+result	single_process	64	indexed_hit	1	256	256	256	0	256	16384	155651	1644.71	603	697	729	759559	23396352	0	0	64	FULL
+result	single_process	64	indexed_miss	1	256	256	256	0	0	16384	157247	1628.01	614	702	737	763407	23592960	0	0	64	FULL
+result	single_process	64	insert	1	256	256	256	0	256	256	55813	4586.75	244	301	334	66460	23592960	0	4132392	1	FULL
+result	single_process	64	update	1	256	256	256	0	256	256	20755	12334.38	77	118	128	24348	23740416	0	1120672	1	FULL
+result	single_process	64	delete	1	256	256	256	0	256	256	28716	8914.89	108	159	230	33065	23756800	0	4132392	1	FULL
+result	single_process	64	contended_unique_insert	1	256	256	256	0	256	256	41618	6151.18	163	257	379	49681	23756800	0	4128272	1	FULL
+result	multi_process	64	point_read	4	256	1024	1024	0	1024	1024	12164	84182.83	46	61	78	49559	76890112	0	0	1	FULL
+result	multi_process	64	scatter_read	4	256	1024	1024	0	262144	65536	346070	2958.94	1188	2103	3210	2900320	84656128	0	0	64	FULL
+result	multi_process	64	indexed_hit	4	256	1024	1024	0	1024	65536	295886	3460.79	1126	1457	1777	2451473	84410368	0	0	64	FULL
+result	multi_process	64	indexed_miss	4	256	1024	1024	0	0	65536	359844	2845.68	1179	1772	7820	2381590	84000768	0	0	64	FULL
+result	multi_process	64	insert	4	256	1024	1024	0	1024	1024	128498	7969.00	495	797	947	311009	76906496	0	15309920	1	FULL
+result	multi_process	64	update	4	256	1024	1024	0	1024	1024	43372	23609.70	164	228	253	149456	77152256	0	4041720	1	FULL
+result	multi_process	64	delete	4	256	1024	1024	0	1024	1024	129909	7882.44	515	812	1009	295327	77070336	0	15474720	1	FULL
+result	multi_process	64	contended_unique_insert	4	256	1024	256	768	256	1024	64352	15912.48	27	216	1564	62097	76742656	0	3839840	1	FULL

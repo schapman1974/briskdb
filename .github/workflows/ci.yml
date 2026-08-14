@@ -147,6 +147,13 @@ jobs:
       - name: Run documentation tests
         run: cargo test --locked --doc --all-features
 
+      - name: Run global-index benchmark correctness smoke
+        if: matrix.rust == 'stable'
+        run: >-
+          cargo test --locked --test global_index_baseline
+          global_index_baseline_smoke --
+          --ignored --exact --test-threads=1
+
   python:
     name: Python source build (${{ matrix.python }})
     runs-on: ubuntu-24.04

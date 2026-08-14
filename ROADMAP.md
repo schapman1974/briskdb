@@ -402,6 +402,22 @@ requires an earlier dependency:
 3. [ ] **Implement global indexes, uniqueness, and value allocation.** Add the
    protocol-neutral authority and routing metadata needed for cross-shard
    constraints, collision-free allocation, and exact indexed shard targeting.
+   Track the rollout in [#225](https://github.com/schapman1974/briskdb/issues/225):
+
+   - [x] [#226](https://github.com/schapman1974/briskdb/issues/226) — baseline and regression suite
+   - [ ] [#227](https://github.com/schapman1974/briskdb/issues/227) — canonical key encoding
+   - [ ] [#228](https://github.com/schapman1974/briskdb/issues/228) — catalog lifecycle and compatibility fencing
+   - [ ] [#229](https://github.com/schapman1974/briskdb/issues/229) — storage-topology prototype
+   - [ ] [#230](https://github.com/schapman1974/briskdb/issues/230) — offline index construction
+   - [ ] [#231](https://github.com/schapman1974/briskdb/issues/231) — validation, repair, and rebuild
+   - [ ] [#232](https://github.com/schapman1974/briskdb/issues/232) — unique reservations and global allocation
+   - [ ] [#233](https://github.com/schapman1974/briskdb/issues/233) — authoritative write maintenance
+   - [ ] [#234](https://github.com/schapman1974/briskdb/issues/234) — exact indexed routing
+   - [ ] [#235](https://github.com/schapman1974/briskdb/issues/235) — candidate verification and repair
+   - [ ] [#236](https://github.com/schapman1974/briskdb/issues/236) — transactional shard outboxes
+   - [ ] [#237](https://github.com/schapman1974/briskdb/issues/237) — asynchronous indexing and watermarks
+   - [ ] [#238](https://github.com/schapman1974/briskdb/issues/238) — Bloom/min-max shard summaries
+   - [ ] [#239](https://github.com/schapman1974/briskdb/issues/239) — production/release gates
 4. [ ] **Finish the embedded Rust API.** Make sessions, transactions,
    cancellation, concurrency, document commands, and shutdown safe for a host
    process.
