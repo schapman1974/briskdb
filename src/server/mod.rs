@@ -885,19 +885,31 @@ mod tests {
             .write_all(&postgres_startup_packet(user))
             .await
             .unwrap();
-        let mut kinds = Vec::new();
+        let mut frames = Vec::new();
         loop {
             let frame = read_postgres_frame(&mut stream).await;
-            kinds.push(frame.0);
             if frame.0 == b'Z' {
                 assert_eq!(frame.1, vec![b'I']);
+                frames.push(frame);
                 break;
             }
-            assert!(kinds.len() < 16);
+            frames.push(frame);
+            assert!(frames.len() < 16);
         }
+        let kinds = frames.iter().map(|frame| frame.0).collect::<Vec<_>>();
         assert_eq!(kinds.first(), Some(&b'R'));
         assert_eq!(kinds.iter().filter(|kind| **kind == b'S').count(), 5);
-        assert!(!kinds.contains(&b'K'));
+        let backend_keys = frames
+            .iter()
+            .filter(|frame| frame.0 == b'K')
+            .collect::<Vec<_>>();
+        assert_eq!(backend_keys.len(), 1);
+        assert_eq!(backend_keys[0].1.len(), 8);
+        assert_ne!(
+            i32::from_be_bytes(backend_keys[0].1[..4].try_into().unwrap()),
+            0
+        );
+        assert_eq!(kinds.last(), Some(&b'Z'));
         stream
     }
 

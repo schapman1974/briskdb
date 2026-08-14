@@ -3,8 +3,9 @@
 BriskDB applies cancellation, deadlines, result budgets, and shutdown at the
 protocol-neutral `Engine` boundary. HTTP, PostgreSQL sessions, and a future
 MySQL adapter therefore share the same resource and cleanup semantics. Current
-PostgreSQL startup performs one bounded status operation; SQL request flow is
-deferred to issue #31.
+PostgreSQL assigns every command a fresh request context. Its advertised backend
+key lets a driver's separate `CancelRequest` connection cancel that command
+through the same core boundary.
 
 ## Per-request context
 
@@ -35,6 +36,13 @@ let context = RequestContext::new()
 future waiters observe cancellation after `cancel()` is called. Tokens belong
 to request contexts, not sessions, so cancelling request A cannot accidentally
 cancel a later request B on the same session.
+
+The PostgreSQL adapter keeps an in-memory registry of random backend PID/secret
+pairs. It installs the current request token only while a command is active,
+requires both values to match, and silently ignores unknown, stale, or inactive
+keys. Closing a PostgreSQL connection unregisters its key and cancels active
+work. A cancelled command returns SQLSTATE `57014`; an explicit transaction
+enters failed state until rollback.
 
 An operation still waiting for its session, shard connection, or blocking
 worker leaves the queue immediately when cancelled. It never starts SQL. Once

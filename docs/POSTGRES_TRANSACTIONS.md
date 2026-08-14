@@ -19,6 +19,9 @@ status `I` (idle), `T` (in transaction), or `E` (failed transaction).
 - Any execution failure enters failed state. Later work returns PostgreSQL
   SQLSTATE `25P02` until `ROLLBACK`; `COMMIT` in failed state rolls back and
   returns a `ROLLBACK` command tag, matching PostgreSQL behavior.
+- A matching PostgreSQL `CancelRequest` interrupts the active core request and
+  returns SQLSTATE `57014`. The transaction becomes failed, preserves its pinned
+  connection until cleanup, and can be recovered with `ROLLBACK`.
 
 An open transaction occupies one connection from its pinned shard and blocks
 application-schema migration until it ends. Pool queue limits, cancellation,

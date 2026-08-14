@@ -902,6 +902,13 @@ therefore reject generated-key writes before allocation. HTTP still creates a
 fresh Session per request; PostgreSQL sessions support retained single-shard
 transactions through the ordinary prepared execution path.
 
+Each PostgreSQL connection also owns a random, in-memory backend PID/secret pair.
+The adapter registers a fresh core cancellation token only for the command that
+is currently running. A separate exact-key `CancelRequest` cancels that token;
+command completion, disconnect, and shutdown clear the registration so stale
+tokens cannot target later work. These wire identifiers never enter the catalog
+or persistent session state.
+
 ## Session and asynchronous engine boundary
 
 `Session` is protocol-neutral mutable state owned by one frontend connection or

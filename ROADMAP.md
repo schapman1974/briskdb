@@ -258,14 +258,14 @@ the engine regardless of its eventual wire protocol.
 - [x] Implement `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction state, and shard
   pinning. Report PostgreSQL's idle/in-transaction/failed (`I`/`T`/`E`) states
   even where SQLite's native behavior differs.
-- [ ] Support `CancelRequest`/backend keys and wire cancellation to the core.
+- [x] Support `CancelRequest`/backend keys and wire cancellation to the core.
 - [ ] Add TLS and SCRAM-SHA-256 before non-loopback use; never ship cleartext
   password authentication on an unencrypted listener.
 - [ ] Add compatibility shims for `SELECT version()`, common `SHOW` commands,
   and only the catalog queries needed by explicitly tested clients.
 - [ ] Test with `psql`, `tokio-postgres`, `psycopg`, and one migration/ORM tool.
-- [ ] Stream rows with backpressure and wire PostgreSQL `CancelRequest` to an
-  actual SQLite interrupt/cancellation path.
+- [ ] Stream rows with backpressure while preserving the PostgreSQL
+  `CancelRequest` to SQLite interrupt path.
 
 Deferred: `COPY`, replication, `LISTEN/NOTIFY`, large objects, PostgreSQL
 extensions, and full `pg_catalog` emulation.
