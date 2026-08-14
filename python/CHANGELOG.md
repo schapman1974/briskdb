@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.0-alpha.5 — 2026-08-14
+
 - Added installed-wheel `spawn` multiprocessing coverage for concurrent
   same-root writes, checkpoints, abrupt child exit, reopen, and retryable schema
   ownership contention.

@@ -44,7 +44,7 @@ fn cargo_versions_convert_to_debian_versions_without_shell_tilde_expansion() {
         env!("CARGO_MANIFEST_DIR")
     );
 
-    for (cargo_version, expected) in [("0.1.0-alpha.4", "0.1.0~alpha.4-1"), ("0.1.0", "0.1.0-1")] {
+    for (cargo_version, expected) in [("0.1.0-alpha.5", "0.1.0~alpha.5-1"), ("0.1.0", "0.1.0-1")] {
         let output = Command::new(&builder)
             .args(["--print-debian-version", cargo_version])
             .output()
@@ -54,13 +54,13 @@ fn cargo_versions_convert_to_debian_versions_without_shell_tilde_expansion() {
     }
 
     let output = Command::new(&builder)
-        .args(["--print-package-filename", "0.1.0-alpha.4"])
+        .args(["--print-package-filename", "0.1.0-alpha.5"])
         .output()
         .expect("package builder must print its external filename");
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "briskdb_0.1.0.alpha.4-1_ARCH.deb"
+        "briskdb_0.1.0.alpha.5-1_ARCH.deb"
     );
 }
 

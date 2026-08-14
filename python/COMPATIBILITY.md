@@ -17,7 +17,7 @@ separately and requires Rust 1.85 or newer.
 
 The `briskdb-python` crate version must exactly equal the root `briskdb` Rust
 crate version. Python metadata and `briskdb.__version__` use the equivalent PEP
-440 spelling (`0.1.0-alpha.4` becomes `0.1.0a4`). Release automation rejects a
+440 spelling (`0.1.0-alpha.5` becomes `0.1.0a5`). Release automation rejects a
 tag or artifact when those versions are not equivalent. A Python alpha package
 supports only its exact bundled Rust engine; mixing an extension and core from
 different releases is unsupported.

@@ -1,20 +1,32 @@
-# Changes after 0.1.0-alpha.4
+# BriskDB 0.1.0-alpha.5
 
-- Independent server, Rust, and Python processes may concurrently open one
-  ready data root on the same Linux or macOS host and local filesystem.
-- Schema, catalog, initialization, upgrade, and recovery work requires
-  sole-process ownership and returns retryable `Busy` while a peer is open.
-- Each process must open its own handle. Inherited live handles after `fork()`,
-  network filesystems, multi-host volumes, and online backup remain unsupported.
-- Installed-wheel and Rust subprocess tests cover overlapping writes,
-  checkpoints, generated IDs, abrupt exit, recovery, and service-plus-embedded
-  operation. See `docs/MULTIPROCESS.md`.
+Alpha 5 lets independently started BriskDB server, Rust, and Python processes
+safely share one ready data root on the same machine. It keeps the embedded
+library, Python wheels, HTTP/PostgreSQL server, and Debian service from alpha 4.
+This remains an evaluation and development release, not a production claim.
 
-# BriskDB 0.1.0-alpha.4
+## Multiple processes, one data root
 
-Alpha 4 makes BriskDB usable as an in-process Rust or Python database, while
-keeping the standalone HTTP/PostgreSQL server and Debian service from alpha 3.
-It is intended for local evaluation and development, not production deployment.
+- Reads and autocommit writes may overlap through SQLite WAL, including traffic
+  to the same shard. Normal writer contention can return retryable `Busy`.
+- Native and manifest-leased hi/lo generated IDs remain unique across
+  independently started processes.
+- Passive checkpoints may overlap. A competing checkpoint can report `busy`
+  with unavailable frame counts through the new `counts_available` field.
+- Schema, catalog, generated-table DDL, initialization, upgrade, and recovery
+  require sole-process ownership and return retryable `Busy` before mutation
+  while another process has the root open.
+
+The supported boundary is one Linux or macOS host and one local filesystem.
+Every process must open its own handle after it starts. Inherited live handles
+after `fork()`, NFS/SMB, cloud-synchronized folders, multi-host volumes, object
+storage, and online backup remain unsupported. The exact contract is in
+`docs/MULTIPROCESS.md`.
+
+Rust subprocess tests cover same- and cross-shard traffic, checkpoints,
+generated IDs, forced contention and retry, abrupt writer exit, final SQLite
+integrity, and a service sharing its root with an embedder. Installed-wheel
+tests repeat the public Python contract with spawned interpreters.
 
 ## Install from PyPI
 
@@ -22,7 +34,7 @@ Compiler-free `cp39-abi3` wheels support CPython 3.9 through 3.14 on Linux
 x86-64/ARM64 (`manylinux_2_28`) and macOS Intel/Apple Silicon (macOS 11+):
 
 ```bash
-python -m pip install briskdb==0.1.0a4
+python -m pip install briskdb==0.1.0a5
 ```
 
 ```python
@@ -44,13 +56,13 @@ the engine's native cancellation token.
 
 ## Embedded Rust library
 
-The root crate now separates its listener-free engine from optional HTTP,
+The root crate separates its listener-free engine from optional HTTP,
 PostgreSQL, importer, and CLI layers. Downstream Rust applications can select
 only the embedded API:
 
 ```toml
 [dependencies]
-briskdb = { git = "https://github.com/schapman1974/briskdb", tag = "v0.1.0-alpha.4", default-features = false, features = ["embedded"] }
+briskdb = { git = "https://github.com/schapman1974/briskdb", tag = "v0.1.0-alpha.5", default-features = false, features = ["embedded"] }
 ```
 
 `BriskDb` and owned `BriskSession` handles expose initialization, migrations,
@@ -90,8 +102,9 @@ GitHub build-provenance attestation.
 - General cross-shard transactions are unsupported. Global ordering,
   pagination, and aggregation pushdown are incomplete, and BriskDB does not
   claim full SQL compatibility.
-- Backups require a stopped server and a complete data-directory copy. Online
-  backup/restore, resharding, and online rebalance are unsupported.
+- Backups require every server and embedder to stop first. The supported
+  procedure is a complete data-directory copy. Online backup/restore,
+  resharding, and online rebalance are unsupported.
 - There is no production metrics or observability suite.
 - The Python package does not claim DB-API 2.0 compatibility, transaction
   methods, retained SQLite streaming cursors, or native document operations.
@@ -107,4 +120,4 @@ Before opening existing data, stop every process and make a complete backup as
 described in `docs/OFFLINE_BACKUP.md`. Startup may migrate the data.
 In-place downgrade is unsupported; rollback requires restoring the complete
 pre-upgrade backup. This release has no on-disk format change from alpha 1,
-alpha 2, or alpha 3.
+alpha 2, alpha 3, or alpha 4.
