@@ -81,7 +81,11 @@ class EmbeddedBriskDbTests(unittest.TestCase):
             )
             self.assertEqual(result["rows"], [(1, "hello")])
             self.assertEqual(session.status()["shards"], 2)
-            self.assertEqual(len(database.checkpoint()["shards"]), 2)
+            checkpoint = database.checkpoint()
+            self.assertEqual(len(checkpoint["shards"]), 2)
+            self.assertTrue(
+                all(shard["counts_available"] for shard in checkpoint["shards"])
+            )
 
             session.close()
             self.assertTrue(session.closed)

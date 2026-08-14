@@ -880,6 +880,7 @@ fn checkpoint_to_python(py: Python<'_>, report: CheckpointReport) -> PyResult<Py
             let item = PyDict::new(py);
             item.set_item("shard", shard.shard())?;
             item.set_item("busy", shard.busy())?;
+            item.set_item("counts_available", shard.counts_available())?;
             item.set_item("wal_frames", shard.wal_frames())?;
             item.set_item("checkpointed_frames", shard.checkpointed_frames())?;
             item.set_item("complete", shard.complete())?;

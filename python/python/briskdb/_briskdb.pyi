@@ -30,6 +30,7 @@ class CloseReport(TypedDict):
 class CheckpointShard(TypedDict):
     shard: int
     busy: bool
+    counts_available: bool
     wal_frames: int
     checkpointed_frames: int
     complete: bool
