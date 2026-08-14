@@ -954,7 +954,7 @@ mod tests {
         }
         let kinds = frames.iter().map(|frame| frame.0).collect::<Vec<_>>();
         assert_eq!(kinds.first(), Some(&b'R'));
-        assert_eq!(kinds.iter().filter(|kind| **kind == b'S').count(), 5);
+        assert_eq!(kinds.iter().filter(|kind| **kind == b'S').count(), 6);
         let backend_keys = frames
             .iter()
             .filter(|frame| frame.0 == b'K')

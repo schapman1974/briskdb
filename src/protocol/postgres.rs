@@ -8,6 +8,7 @@
 //! not accept or return `pgwire` types.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     fs::{self, File},
@@ -64,6 +65,7 @@ use pgwire::{
         tokio_rustls::{TlsAcceptor, rustls},
     },
 };
+use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
@@ -94,9 +96,17 @@ const MAX_PASSWORD_FILE_BYTES: u64 = 1_026;
 const CANCEL_REQUEST_CODE: i32 = 80_877_102;
 const SSL_REQUEST_CODE: i32 = 80_877_103;
 const GSSENC_REQUEST_CODE: i32 = 80_877_104;
-const SERVER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-briskdb");
-const PARAMETER_STATUS: [(&str, &str); 5] = [
+const POSTGRES_COMPATIBILITY_VERSION_NUM: &str = "140000";
+const SERVER_VERSION: &str = "14.0-briskdb";
+const BRISKDB_VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION_BANNER: &str = concat!(
+    "PostgreSQL 14.0 (BriskDB ",
+    env!("CARGO_PKG_VERSION"),
+    " compatibility layer)"
+);
+const PARAMETER_STATUS: [(&str, &str); 6] = [
     ("server_version", SERVER_VERSION),
+    ("briskdb_version", BRISKDB_VERSION),
     ("server_encoding", "UTF8"),
     ("client_encoding", "UTF8"),
     ("standard_conforming_strings", "on"),
@@ -1189,6 +1199,160 @@ struct PgWireBoundPortal {
     fields: Arc<Vec<FieldInfo>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompatibilityShim {
+    Static {
+        column: &'static str,
+        value: &'static str,
+    },
+    CurrentDatabase,
+    CurrentSchema,
+    CurrentUser {
+        column: &'static str,
+    },
+    PsycopgTypeInfo,
+}
+
+impl CompatibilityShim {
+    fn sqlite_sql(self, connection: &ConnectionState) -> String {
+        if matches!(self, Self::PsycopgTypeInfo) {
+            return "SELECT NULL AS \"name\", NULL AS \"oid\", NULL AS \"array_oid\", \
+                    NULL AS \"regtype\", NULL AS \"delimiter\" \
+                    WHERE $1 IS NULL AND 0"
+                .to_owned();
+        }
+        let (column, value) = match self {
+            Self::Static { column, value } => (column, value),
+            Self::CurrentDatabase => ("current_database", connection.database_name.as_ref()),
+            Self::CurrentSchema => ("current_schema", "public"),
+            Self::CurrentUser { column } => (column, connection.user.as_deref().unwrap_or("")),
+            Self::PsycopgTypeInfo => unreachable!("the catalog probe returned above"),
+        };
+        format!("SELECT {} AS \"{column}\"", sqlite_text_literal(value))
+    }
+}
+
+fn postgres_compatibility_shim(sql: &str) -> Option<CompatibilityShim> {
+    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).ok()?;
+    let [statement] = statements.as_slice() else {
+        return None;
+    };
+    let canonical = statement.to_string().to_ascii_lowercase();
+    match canonical.as_str() {
+        "select version()" | "select pg_catalog.version()" => Some(CompatibilityShim::Static {
+            column: "version",
+            value: VERSION_BANNER,
+        }),
+        "select current_database()" | "select pg_catalog.current_database()" => {
+            Some(CompatibilityShim::CurrentDatabase)
+        }
+        "select current_schema()" | "select pg_catalog.current_schema()" => {
+            Some(CompatibilityShim::CurrentSchema)
+        }
+        "select current_user" => Some(CompatibilityShim::CurrentUser {
+            column: "current_user",
+        }),
+        "select session_user" => Some(CompatibilityShim::CurrentUser {
+            column: "session_user",
+        }),
+        "show server_version" => Some(CompatibilityShim::Static {
+            column: "server_version",
+            value: SERVER_VERSION,
+        }),
+        "show server_version_num" => Some(CompatibilityShim::Static {
+            column: "server_version_num",
+            value: POSTGRES_COMPATIBILITY_VERSION_NUM,
+        }),
+        "show server_encoding" => Some(CompatibilityShim::Static {
+            column: "server_encoding",
+            value: "UTF8",
+        }),
+        "show client_encoding" => Some(CompatibilityShim::Static {
+            column: "client_encoding",
+            value: "UTF8",
+        }),
+        "show standard_conforming_strings" => Some(CompatibilityShim::Static {
+            column: "standard_conforming_strings",
+            value: "on",
+        }),
+        "show integer_datetimes" => Some(CompatibilityShim::Static {
+            column: "integer_datetimes",
+            value: "on",
+        }),
+        "show timezone" => Some(CompatibilityShim::Static {
+            column: "TimeZone",
+            value: "UTC",
+        }),
+        "show transaction isolation level" => Some(CompatibilityShim::Static {
+            column: "transaction_isolation",
+            value: "serializable",
+        }),
+        "show transaction_read_only" => Some(CompatibilityShim::Static {
+            column: "transaction_read_only",
+            value: "off",
+        }),
+        "show search_path" => Some(CompatibilityShim::Static {
+            column: "search_path",
+            value: "public",
+        }),
+        "show datestyle" => Some(CompatibilityShim::Static {
+            column: "DateStyle",
+            value: "ISO, MDY",
+        }),
+        "show intervalstyle" => Some(CompatibilityShim::Static {
+            column: "IntervalStyle",
+            value: "postgres",
+        }),
+        "show extra_float_digits" => Some(CompatibilityShim::Static {
+            column: "extra_float_digits",
+            value: "1",
+        }),
+        "show default_transaction_isolation" => Some(CompatibilityShim::Static {
+            column: "default_transaction_isolation",
+            value: "serializable",
+        }),
+        "show default_transaction_read_only" => Some(CompatibilityShim::Static {
+            column: "default_transaction_read_only",
+            value: "off",
+        }),
+        "show session_authorization" => Some(CompatibilityShim::CurrentUser {
+            column: "session_authorization",
+        }),
+        "select current_setting('server_version')" => Some(CompatibilityShim::Static {
+            column: "current_setting",
+            value: SERVER_VERSION,
+        }),
+        "select current_setting('server_version_num')" => Some(CompatibilityShim::Static {
+            column: "current_setting",
+            value: POSTGRES_COMPATIBILITY_VERSION_NUM,
+        }),
+        "select current_setting('standard_conforming_strings')" => {
+            Some(CompatibilityShim::Static {
+                column: "current_setting",
+                value: "on",
+            })
+        }
+        "select current_setting('timezone')" => Some(CompatibilityShim::Static {
+            column: "current_setting",
+            value: "UTC",
+        }),
+        "select typname as name, oid, typarray as array_oid, oid::regtype::text as regtype, typdelim as delimiter from pg_type t where t.oid = to_regtype($1) order by t.oid" => {
+            Some(CompatibilityShim::PsycopgTypeInfo)
+        }
+        _ => None,
+    }
+}
+
+fn sqlite_text_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn postgres_compatibility_sql<'a>(connection: &ConnectionState, sql: &'a str) -> Cow<'a, str> {
+    postgres_compatibility_shim(sql).map_or(Cow::Borrowed(sql), |shim| {
+        Cow::Owned(shim.sqlite_sql(connection))
+    })
+}
+
 /// Protocol-owned state for one PostgreSQL connection.
 ///
 /// This type exposes only BriskDB values. The selected wire crate remains an
@@ -1235,6 +1399,7 @@ impl Connection {
         sql: &str,
         context: RequestContext,
     ) -> EngineResult<(StatementBehavior, PreparedExecution)> {
+        let sql = postgres_compatibility_sql(&self.state, sql);
         let statement = self
             .state
             .engine
@@ -1244,7 +1409,7 @@ impl Connection {
                     self.state.database,
                     SqlDialect::PostgreSql,
                     SqlTranslationMode::Compatibility,
-                    sql,
+                    sql.as_ref(),
                 ),
                 context.clone(),
             )
@@ -3416,11 +3581,12 @@ impl PgWireQueryParser {
             })
             .collect::<PgWireResult<Vec<_>>>()?;
 
+        let sql = postgres_compatibility_sql(&self.state, sql);
         let request = PrepareRequest::new(
             self.state.database,
             SqlDialect::PostgreSql,
             SqlTranslationMode::Compatibility,
-            sql,
+            sql.as_ref(),
         );
         let id = self
             .state
@@ -4374,6 +4540,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compatibility_shims_are_parser_bounded_and_finite() {
+        for query in [
+            "SELECT version()",
+            " select pg_catalog.version() ; ",
+            "SELECT current_database()",
+            "SELECT pg_catalog.current_database()",
+            "SELECT current_schema()",
+            "SELECT pg_catalog.current_schema()",
+            "SELECT current_user",
+            "SELECT session_user",
+            "SHOW server_version",
+            "-- client probe\nSHOW server_version_num",
+            "SHOW server_encoding",
+            "SHOW client_encoding",
+            "SHOW standard_conforming_strings",
+            "SHOW integer_datetimes",
+            "SHOW TRANSACTION ISOLATION LEVEL",
+            "SHOW transaction_read_only",
+            "SHOW search_path",
+            "SHOW TimeZone",
+            "SHOW DateStyle",
+            "SHOW IntervalStyle",
+            "SHOW extra_float_digits",
+            "SHOW default_transaction_isolation",
+            "SHOW default_transaction_read_only",
+            "SHOW session_authorization",
+            "SELECT current_setting('server_version')",
+            "SELECT current_setting('server_version_num')",
+            "SELECT current_setting('standard_conforming_strings')",
+            "SELECT current_setting('TimeZone')",
+            "SELECT typname AS name, oid, typarray AS array_oid, \
+             oid::regtype::text AS regtype, typdelim AS delimiter \
+             FROM pg_type t WHERE t.oid = to_regtype($1) ORDER BY t.oid",
+        ] {
+            assert!(
+                postgres_compatibility_shim(query).is_some(),
+                "expected a compatibility shim for {query:?}"
+            );
+        }
+
+        for query in [
+            "SELECT version() AS invented_alias",
+            "SELECT version() FROM application_table",
+            "SELECT version(); SELECT 1",
+            "SHOW work_mem",
+            "SELECT current_setting('work_mem')",
+            "SELECT * FROM pg_catalog.pg_class",
+        ] {
+            assert!(
+                postgres_compatibility_shim(query).is_none(),
+                "unexpected compatibility shim for {query:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn secure_listener_requires_tls_and_returns_a_fixed_startup_error() {
         let (temp, engine) = engine(2).await;
@@ -4497,7 +4719,7 @@ mod tests {
         assert_ne!(keys[0].pid, 0);
         assert_eq!(
             frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
-            vec![b'R', b'S', b'S', b'S', b'S', b'S', b'S', b'K', b'Z']
+            vec![b'R', b'S', b'S', b'S', b'S', b'S', b'S', b'S', b'K', b'Z']
         );
         let statuses = frames
             .iter()
@@ -4508,6 +4730,7 @@ mod tests {
             statuses,
             vec![
                 ("server_version".to_owned(), SERVER_VERSION.to_owned()),
+                ("briskdb_version".to_owned(), BRISKDB_VERSION.to_owned()),
                 ("server_encoding".to_owned(), "UTF8".to_owned()),
                 ("client_encoding".to_owned(), "UTF8".to_owned()),
                 ("standard_conforming_strings".to_owned(), "on".to_owned(),),
@@ -4527,6 +4750,179 @@ mod tests {
         finish_wire_server(&mut client, server).await;
         assert_eq!(core.state().await, SessionState::Closed);
         assert_eq!(adapter.cancellations.len(), 0);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn simple_compatibility_probes_return_exact_bounded_text_rows() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        read_until_ready(&mut client).await;
+
+        for (query, column, value) in [
+            ("SELECT version()", "version", VERSION_BANNER),
+            ("SELECT pg_catalog.version()", "version", VERSION_BANNER),
+            ("SHOW server_version", "server_version", SERVER_VERSION),
+            (
+                "SHOW server_version_num",
+                "server_version_num",
+                POSTGRES_COMPATIBILITY_VERSION_NUM,
+            ),
+            (
+                "SHOW transaction isolation level",
+                "transaction_isolation",
+                "serializable",
+            ),
+            (
+                "SHOW standard_conforming_strings",
+                "standard_conforming_strings",
+                "on",
+            ),
+            ("SHOW TimeZone", "TimeZone", "UTC"),
+            ("SHOW search_path", "search_path", "public"),
+            ("SELECT current_database()", "current_database", "default"),
+            ("SELECT current_schema()", "current_schema", "public"),
+            ("SELECT current_user", "current_user", "briskdb"),
+            (
+                "SHOW session_authorization",
+                "session_authorization",
+                "briskdb",
+            ),
+        ] {
+            let mut packet = query.as_bytes().to_vec();
+            packet.push(0);
+            client
+                .write_all(&typed_packet(b'Q', &packet))
+                .await
+                .unwrap();
+            let frames = read_until_ready(&mut client).await;
+            assert_eq!(
+                frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+                [b'T', b'D', b'C', b'Z'],
+                "unexpected response shape for {query:?}"
+            );
+            assert_eq!(
+                row_description(&frames[0].1),
+                [(column.to_owned(), Type::TEXT.oid())]
+            );
+            assert_eq!(data_row(&frames[1].1), [Some(value.as_bytes().to_vec())]);
+            assert_eq!(command_tag(&frames[2].1), "SELECT 1");
+        }
+
+        client
+            .write_all(&typed_packet(b'Q', b"SHOW work_mem\0"))
+            .await
+            .unwrap();
+        let rejected = read_until_ready(&mut client).await;
+        assert_eq!(
+            rejected.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'E', b'Z']
+        );
+        let fields = message_fields(&rejected[0].1);
+        assert_eq!(fields.get(&b'C').map(String::as_str), Some("0A000"));
+
+        client
+            .write_all(&typed_packet(b'Q', b"SELECT version()\0"))
+            .await
+            .unwrap();
+        let recovery = read_until_ready(&mut client).await;
+        assert_eq!(
+            data_row(&recovery[1].1),
+            [Some(VERSION_BANNER.as_bytes().to_vec())]
+        );
+
+        finish_wire_server(&mut client, server).await;
+        assert_eq!(
+            wire.connection().unwrap().state().await,
+            SessionState::Closed
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn extended_compatibility_probe_describes_binds_executes_and_recovers() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        read_until_ready(&mut client).await;
+
+        let flow = [
+            parse_packet("orm_version", "SELECT pg_catalog.version()"),
+            bind_packet("orm_portal", "orm_version"),
+            describe_packet(TARGET_TYPE_BYTE_STATEMENT, "orm_version"),
+            describe_packet(TARGET_TYPE_BYTE_PORTAL, "orm_portal"),
+            execute_packet("orm_portal", 0),
+            typed_packet(b'S', &[]),
+        ]
+        .concat();
+        client.write_all(&flow).await.unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'1', b'2', b't', b'T', b'T', b'D', b'C', b'Z']
+        );
+        assert_eq!(
+            row_description(&frames[3].1),
+            [("version".to_owned(), Type::TEXT.oid())]
+        );
+        assert_eq!(row_description(&frames[3].1), row_description(&frames[4].1));
+        assert_eq!(
+            data_row(&frames[5].1),
+            [Some(VERSION_BANNER.as_bytes().to_vec())]
+        );
+
+        let type_probe = [
+            parse_packet(
+                "psycopg_type",
+                "SELECT typname AS name, oid, typarray AS array_oid, \
+                 oid::regtype::text AS regtype, typdelim AS delimiter \
+                 FROM pg_type t WHERE t.oid = to_regtype($1) ORDER BY t.oid",
+            ),
+            bind_packet_with(
+                "psycopg_type_portal",
+                "psycopg_type",
+                &[],
+                &[Some(b"hstore")],
+                &[],
+            ),
+            describe_packet(TARGET_TYPE_BYTE_STATEMENT, "psycopg_type"),
+            describe_packet(TARGET_TYPE_BYTE_PORTAL, "psycopg_type_portal"),
+            execute_packet("psycopg_type_portal", 0),
+            typed_packet(b'S', &[]),
+        ]
+        .concat();
+        client.write_all(&type_probe).await.unwrap();
+        let type_frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            type_frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'1', b'2', b't', b'T', b'T', b'C', b'Z']
+        );
+        assert_eq!(
+            row_description(&type_frames[3].1)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            ["name", "oid", "array_oid", "regtype", "delimiter"]
+        );
+        assert_eq!(command_tag(&type_frames[5].1), "SELECT 0");
+
+        client
+            .write_all(&typed_packet(b'Q', b"SHOW client_encoding\0"))
+            .await
+            .unwrap();
+        let recovery = read_until_ready(&mut client).await;
+        assert_eq!(data_row(&recovery[1].1), [Some(b"UTF8".to_vec())]);
+
+        finish_wire_server(&mut client, server).await;
+        assert_eq!(
+            wire.connection().unwrap().state().await,
+            SessionState::Closed
+        );
         engine.shutdown().await.unwrap();
     }
 

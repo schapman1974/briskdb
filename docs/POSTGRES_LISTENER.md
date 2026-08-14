@@ -121,16 +121,20 @@ Secure startup first exchanges `AuthenticationSASL`, `SASLContinue`, and
 
 1. optional `NegotiateProtocolVersion(0, unsupported _pq_ options)`;
 2. `AuthenticationOk`;
-3. `ParameterStatus(server_version, <BriskDB package version>-briskdb)`;
-4. `ParameterStatus(server_encoding, UTF8)`;
-5. `ParameterStatus(client_encoding, UTF8)`;
-6. `ParameterStatus(standard_conforming_strings, on)`;
-7. `ParameterStatus(integer_datetimes, on)`;
-8. optional validated `ParameterStatus(application_name, ...)`;
-9. `BackendKeyData` containing a random backend PID and secret; and
-10. `ReadyForQuery(I)`.
+3. `ParameterStatus(server_version, 14.0-briskdb)`;
+4. `ParameterStatus(briskdb_version, <BriskDB package version>)`;
+5. `ParameterStatus(server_encoding, UTF8)`;
+6. `ParameterStatus(client_encoding, UTF8)`;
+7. `ParameterStatus(standard_conforming_strings, on)`;
+8. `ParameterStatus(integer_datetimes, on)`;
+9. optional validated `ParameterStatus(application_name, ...)`;
+10. `BackendKeyData` containing a random backend PID and secret; and
+11. `ReadyForQuery(I)`.
 
 The values and ordering are BriskDB-owned rather than dependency defaults.
+The leading `14.0` is a client-parser compatibility marker, not a claim that
+BriskDB implements PostgreSQL 14 SQL or server behavior. The separately
+advertised `briskdb_version` is the running package version.
 The backend PID is an opaque positive identifier, not an operating-system PID.
 The matching secret is never logged or reused as a session identifier.
 
@@ -169,6 +173,39 @@ can instead close without a response.
 
 A failed startup creates no retained core session, statement, portal, route, or
 SQLite operation. A later connection can start normally.
+
+## Compatibility probes
+
+BriskDB recognizes a deliberately finite set of PostgreSQL client-discovery
+statements. Each input must parse as exactly one statement and match a listed
+shape after parser normalization. Comments, whitespace, case, and one trailing
+semicolon are harmless; aliases, added clauses, batches, arbitrary settings,
+and broad catalog reads are not emulated. An unmatched statement continues
+through the ordinary SQL validator and normally receives the fixed unsupported
+error.
+
+| Probe | Returned value |
+| --- | --- |
+| `SELECT [pg_catalog.]version()` | `PostgreSQL 14.0 (BriskDB <package-version> compatibility layer)` |
+| `SELECT [pg_catalog.]current_database()` | Selected logical-database name |
+| `SELECT [pg_catalog.]current_schema()` | `public` compatibility label |
+| `SELECT current_user`, `SELECT session_user` | Selected startup user |
+| `SHOW server_version`, `SHOW server_version_num` | `14.0-briskdb`, `140000` |
+| `SHOW server_encoding`, `SHOW client_encoding` | `UTF8` |
+| `SHOW standard_conforming_strings`, `SHOW integer_datetimes` | `on` |
+| `SHOW timezone`, `SHOW datestyle`, `SHOW intervalstyle` | `UTC`, `ISO, MDY`, `postgres` |
+| `SHOW transaction isolation level`, `SHOW default_transaction_isolation` | `serializable` |
+| `SHOW transaction_read_only`, `SHOW default_transaction_read_only` | `off` |
+| `SHOW search_path`, `SHOW extra_float_digits` | `public`, `1` |
+| `SHOW session_authorization` | Selected startup user |
+| `SELECT current_setting(...)` | Only `server_version`, `server_version_num`, `standard_conforming_strings`, and `TimeZone`, with the values above |
+| psycopg `TypeInfo.fetch()` query for `pg_type`/`to_regtype($1)` | The expected five-column shape with zero rows, declaring that an extension type such as `hstore` is unavailable |
+
+These are response adapters only. BriskDB does not create PostgreSQL schemas,
+settings, extension types, or a general `pg_catalog`. Rewritten statements
+still use the selected core session and the normal Engine
+prepare/describe/bind/execute path, including its limits, cancellation, and
+transaction state. The shim layer does not open SQLite or route work itself.
 
 ## Simple-query boundary
 
@@ -302,6 +339,9 @@ Automated coverage includes:
 - fixed failures for protocol, user, database, encoding, application-name,
   unknown-key, replication, and truncated-message cases before and after
   session creation, followed by successful recovery;
+- parser-bounded compatibility probes through simple and extended query flows,
+  exact returned columns/values, psycopg's absent-extension type lookup, and
+  same-connection recovery after those probes;
 - end-to-end simple-query insert, select, update, delete, row/type encoding,
   and empty-query handling;
 - named and unnamed extended write/read/describe/execute, suspension without

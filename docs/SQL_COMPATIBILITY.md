@@ -807,11 +807,11 @@ normative in the [adapter decision record](POSTGRES_ADAPTER.md).
 | `bytea` | Binary value | Translation maps it to SQLite `BLOB`; parameters accept hex/escape text or raw binary and results use hex text or raw binary |
 | `json` / `jsonb` | Distinct PostgreSQL types | Parameters decode to protocol-neutral text (including the JSONB binary version byte); JSON validation, storage semantics, and operators are not claimed |
 | Arrays, ranges, enums, domains | Native PostgreSQL types | Unsupported initially |
-| Schemas and `search_path` | Multiple schemas per database | Unsupported initially; compatibility shims may expose one logical schema |
+| Schemas and `search_path` | Multiple schemas per database | No schema implementation; exact discovery probes expose the `public` compatibility label |
 | `RETURNING` | Common DML feature | Not in the initial common subset |
 | `ON CONFLICT` | PostgreSQL upsert syntax | Outside the initial common subset and unsupported |
-| Functions/operators | PostgreSQL catalog | SQLite functions/operators unless an explicit shim is documented |
-| System catalogs | `pg_catalog`, `information_schema` | Only queries required by named, tested clients will be emulated |
+| Functions/operators | PostgreSQL catalog | SQLite functions/operators except the exact discovery shims documented in the listener contract |
+| System catalogs | `pg_catalog`, `information_schema` | No general catalog; the exact psycopg extension-type lookup returns the expected columns with zero rows |
 | Error behavior | SQLSTATE and failed transaction state | Startup and execution errors are encoded; extended flow resynchronizes at `Sync`; explicit single-shard transactions report `I`/`T`/`E` and require rollback after failure |
 | `COPY`, replication, `LISTEN/NOTIFY` | PostgreSQL subprotocols/features | Deferred and unsupported initially |
 

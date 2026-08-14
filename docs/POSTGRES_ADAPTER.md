@@ -1,7 +1,7 @@
 # PostgreSQL adapter decision record
 
-Status: accepted for roadmap issue #29; amended through issue #36 TLS and
-SCRAM-SHA-256 authentication
+Status: accepted for roadmap issue #29; amended through issue #37 bounded
+client compatibility probes
 
 BriskDB needs a PostgreSQL frontend library that can own protocol framing and
 message dispatch without becoming the database engine, routing policy,
@@ -86,6 +86,13 @@ or type objects through a BriskDB signature. Production Parse/Bind name
 management mirrors the wire store into bounded core handles. Statement closure
 cascades to dependent portals, and unnamed replacement performs the same
 cleanup before installing its successor.
+
+Issue #37 adds a private, parser-bounded discovery shim at this same adapter
+edge. It accepts exactly one statement, recognizes only the documented finite
+client probes, and rewrites a match to a bounded SQLite `SELECT`. The rewritten
+statement still enters the protocol-neutral Engine prepare/describe/bind and
+execute lifecycle. Near-matches and all application SQL remain untouched; the
+adapter neither reads SQLite directly nor implements a general system catalog.
 
 ## Compatibility probe
 
@@ -202,6 +209,11 @@ only the command currently running on that backend. Disconnect and shutdown
 unregister the key and cancel active work. Issue #36 adds TLS plus
 single-identity SCRAM-SHA-256, requires secure mode before non-loopback binding,
 and delays database lookup/session creation until authentication succeeds.
+Issue #37 adds exact version, identity, common setting, and psycopg absent-type
+discovery responses. The advertised PostgreSQL 14 version is explicitly a
+client-parser compatibility marker; the separate `briskdb_version` status
+retains product identity, and no general PostgreSQL 14 compatibility is
+claimed.
 Later roadmap issues retain client-matrix and row-streaming scopes. The exact
 live contract and user workflow are in the
 [PostgreSQL listener document](POSTGRES_LISTENER.md) and
