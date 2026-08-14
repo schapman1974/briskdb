@@ -3,8 +3,9 @@ mod value;
 
 use std::{
     collections::VecDeque,
+    net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -12,6 +13,7 @@ use briskdb::{
     BriskDb, BriskSession, CancellationToken as EngineCancellationToken, CheckpointReport, Column,
     EngineOptions, EngineState, EngineStatus, Executed, PreparedStatementLimits, RequestContext,
     ResultLimits, ResultSet, Routed, SessionState, Statement, Value,
+    server::{AttachedServer, ListenerAddresses, ListenerConfig},
 };
 use pyo3::{
     prelude::*,
@@ -20,7 +22,7 @@ use pyo3::{
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use crate::{
-    error::{NativeError, NativeResult, run_native},
+    error::{NativeError, NativeResult, listener_error, run_native},
     value::{
         data_type_name, extract_params, logical_result_to_python, routed_result_to_python,
         value_to_python, write_result_to_python,
@@ -31,8 +33,53 @@ struct RuntimeOwner {
     runtime: Runtime,
 }
 
+struct ServerShared {
+    server: Mutex<Option<AttachedServer>>,
+    runtime: Arc<RuntimeOwner>,
+    addresses: ListenerAddresses,
+}
+
+impl ServerShared {
+    fn begin_close(&self) -> NativeResult<()> {
+        if let Some(server) = self.server.lock()?.as_mut() {
+            server.begin_close();
+        }
+        Ok(())
+    }
+
+    fn close_native(&self) -> NativeResult<bool> {
+        let server = self.server.lock()?.take();
+        let Some(mut server) = server else {
+            return Ok(true);
+        };
+        self.runtime
+            .runtime
+            .block_on(server.close())
+            .map_err(listener_error)
+    }
+
+    fn is_closed(&self) -> NativeResult<bool> {
+        Ok(self
+            .server
+            .lock()?
+            .as_ref()
+            .is_none_or(AttachedServer::is_closed))
+    }
+}
+
+impl Drop for ServerShared {
+    fn drop(&mut self) {
+        if let Ok(slot) = self.server.get_mut() {
+            if let Some(server) = slot.as_mut() {
+                server.begin_close();
+            }
+        }
+    }
+}
+
 struct DatabaseShared {
     database: Mutex<Option<BriskDb>>,
+    servers: Mutex<Vec<Weak<ServerShared>>>,
     runtime: Arc<RuntimeOwner>,
     root: PathBuf,
     config: Config,
@@ -49,6 +96,11 @@ impl DatabaseShared {
 
 impl Drop for DatabaseShared {
     fn drop(&mut self) {
+        if let Ok(servers) = self.servers.get_mut() {
+            for server in servers.iter().filter_map(Weak::upgrade) {
+                let _ = server.begin_close();
+            }
+        }
         if let Ok(slot) = self.database.get_mut() {
             if let Some(database) = slot.take() {
                 database.begin_close();
@@ -389,6 +441,7 @@ impl Database {
             Ok(Self {
                 shared: Arc::new(DatabaseShared {
                     database: Mutex::new(Some(database)),
+                    servers: Mutex::new(Vec::new()),
                     runtime,
                     root,
                     config,
@@ -491,14 +544,77 @@ impl Database {
         checkpoint_to_python(py, report)
     }
 
+    #[pyo3(signature = (*, http = "127.0.0.1:0", postgres = None))]
+    fn serve(&self, py: Python<'_>, http: &str, postgres: Option<&str>) -> PyResult<Server> {
+        let http_listen = parse_listener_address(http, "HTTP")?;
+        let postgres_listen = postgres
+            .map(|address| parse_listener_address(address, "PostgreSQL"))
+            .transpose()?;
+        validate_python_listener_address(http_listen, "HTTP")?;
+        if let Some(address) = postgres_listen {
+            validate_python_listener_address(address, "PostgreSQL")?;
+        }
+        let shared = Arc::clone(&self.shared);
+        run_native(py, move || {
+            // Holding the database slot across bind and registration makes
+            // listener start atomic with respect to Database.close().
+            let database_slot = shared.database.lock()?;
+            let database = database_slot
+                .as_ref()
+                .cloned()
+                .ok_or(NativeError::Closed("database"))?;
+            let attached = shared
+                .runtime
+                .runtime
+                .block_on(AttachedServer::start(
+                    &database,
+                    ListenerConfig {
+                        http_listen,
+                        postgres_listen,
+                    },
+                ))
+                .map_err(listener_error)?;
+            let server = Arc::new(ServerShared {
+                addresses: attached.addresses(),
+                server: Mutex::new(Some(attached)),
+                runtime: Arc::clone(&shared.runtime),
+            });
+            let mut servers = shared.servers.lock()?;
+            servers.retain(|server| server.strong_count() > 0);
+            servers.push(Arc::downgrade(&server));
+            drop(servers);
+            drop(database_slot);
+            Ok(Server { shared: server })
+        })
+    }
+
     fn close(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let shared = Arc::clone(&self.shared);
         let report = run_native(py, move || {
-            let database = shared.database.lock()?.take();
-            match database {
-                Some(database) => Ok(Some(shared.runtime.runtime.block_on(database.close())?)),
-                None => Ok(None),
+            let (database, servers) = {
+                let mut database_slot = shared.database.lock()?;
+                let Some(database) = database_slot.take() else {
+                    return Ok(None);
+                };
+                let mut registry = shared.servers.lock()?;
+                let servers = registry
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .collect::<Vec<_>>();
+                registry.clear();
+                (database, servers)
+            };
+            let mut listener_failure = None;
+            for server in servers {
+                if let Err(error) = server.close_native() {
+                    listener_failure.get_or_insert(error);
+                }
             }
+            let report = shared.runtime.runtime.block_on(database.close())?;
+            if let Some(error) = listener_failure {
+                return Err(error);
+            }
+            Ok(Some(report))
         })?;
         let output = PyDict::new(py);
         output.set_item("already_closed", report.is_none())?;
@@ -512,6 +628,64 @@ impl Database {
             self.shared.root,
             self.shard_count(),
             self.state()?
+        ))
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exception_type: Option<&Bound<'_, PyAny>>,
+        _exception: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
+    }
+}
+
+#[pyclass(module = "briskdb._briskdb", frozen)]
+struct Server {
+    shared: Arc<ServerShared>,
+}
+
+#[pymethods]
+impl Server {
+    #[getter]
+    fn http_address(&self) -> String {
+        self.shared.addresses.http().to_string()
+    }
+
+    #[getter]
+    fn postgres_address(&self) -> Option<String> {
+        self.shared
+            .addresses
+            .postgres()
+            .map(|address| address.to_string())
+    }
+
+    #[getter]
+    fn closed(&self) -> PyResult<bool> {
+        self.shared.is_closed().map_err(PyErr::from)
+    }
+
+    fn close(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let shared = Arc::clone(&self.shared);
+        let already_closed = run_native(py, move || shared.close_native())?;
+        let output = PyDict::new(py);
+        output.set_item("already_closed", already_closed)?;
+        Ok(output.into_any().unbind())
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        Ok(format!(
+            "Server(http_address={:?}, postgres_address={:?}, closed={})",
+            self.http_address(),
+            self.postgres_address(),
+            self.closed()?
         ))
     }
 
@@ -798,6 +972,24 @@ fn resolve_config(shards: Option<u16>, config: Option<&Config>) -> PyResult<Conf
     }
 }
 
+fn parse_listener_address(value: &str, label: &str) -> PyResult<SocketAddr> {
+    value.parse().map_err(|_| {
+        crate::error::invalid_value(format!(
+            "{label} listener must be an IP socket address such as 127.0.0.1:0"
+        ))
+    })
+}
+
+fn validate_python_listener_address(address: SocketAddr, label: &str) -> PyResult<()> {
+    if address.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(crate::error::invalid_value(format!(
+            "{label} listener must use a loopback address; received {address}"
+        )))
+    }
+}
+
 fn request_context(
     timeout_ms: Option<u64>,
     cancellation: Option<&CancellationToken>,
@@ -917,6 +1109,7 @@ fn _briskdb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Config>()?;
     module.add_class::<Cursor>()?;
     module.add_class::<Database>()?;
+    module.add_class::<Server>()?;
     module.add_class::<Session>()?;
     module.add_function(wrap_pyfunction!(open_database, module)?)?;
     module.add(

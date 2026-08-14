@@ -11,8 +11,9 @@ engine. It keeps the durability, WAL, transactions, tooling, and boring
 reliability developers already trust—then adds routing, parallel writer domains,
 global reads, generated IDs, an HTTP API, and wire-protocol frontends.
 
-**HTTP, bounded PostgreSQL queries, and listener-free Rust and Python embedding
-work today. Native MongoDB, MySQL, and serverless use are on the roadmap.**
+**HTTP, bounded PostgreSQL queries, and in-process Rust and Python embedding
+work today. Embedded hosts can optionally expose the same engine over loopback
+HTTP and PostgreSQL. Native MongoDB, MySQL, and serverless use are on the roadmap.**
 
 > [!WARNING]
 > BriskDB is an alpha. It is exciting infrastructure, not yet a production-ready
@@ -111,7 +112,7 @@ experimental and opt-in; the exact contract lives in
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
 | Debian package and hardened systemd service | Published |
-| Listener-free Rust library entrypoint | Working |
+| Rust library entrypoint with optional attached listeners | Working |
 | Same-host service and embedded processes sharing one ready root | Working on local filesystems |
 | Native MongoDB wire protocol with TinyMongo parity | [Planned](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
@@ -159,10 +160,17 @@ the manifest and reject explicit mismatches. Use `default-features = false` with
 `embedded` feature to leave the network and CLI stacks out; see the
 [crate feature map](docs/CRATE_FEATURES.md).
 
-Python can run the same engine directly in-process with no server or listener:
+Python can run the same engine directly in-process. It starts no listener by
+default, but `Database.serve()` can attach loopback HTTP/PostgreSQL listeners:
 
 ```bash
 python -m pip install ./python
+```
+
+```python
+with briskdb.open("./data", shards=4) as db:
+    with db.serve(postgres="127.0.0.1:0") as server:
+        print(server.http_address, server.postgres_address)
 ```
 
 See the [Python quickstart](python/README.md) for sync and asyncio write/read

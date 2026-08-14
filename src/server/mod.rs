@@ -1,35 +1,63 @@
 //! Server process assembly and listener lifecycle.
 
-use std::{
-    collections::HashMap, future::Future, net::SocketAddr, path::PathBuf, pin::Pin, sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, future::Future, net::SocketAddr, sync::Arc, time::Duration};
+
+#[cfg(feature = "server")]
+use std::{path::PathBuf, pin::Pin};
 
 use anyhow::Context;
 use axum::body::Body;
 use hyper::{Request, body::Incoming, server::conn::http1};
 use hyper_util::{rt::TokioIo, service::TowerToHyperService};
 use tokio::{
-    sync::{Notify, watch},
-    task::{Id, JoinSet},
+    sync::{Notify, oneshot, watch},
+    task::{Id, JoinHandle, JoinSet},
 };
 use tower::ServiceExt;
 use tracing::{debug, info, warn};
 
 use crate::{
-    core::{Engine, EngineOptions},
+    core::Engine,
     embedded::BriskDb,
     protocol::{http, postgres},
 };
 
+#[cfg(feature = "server")]
+use crate::core::EngineOptions;
+
 const MAX_POSTGRES_CONNECTIONS: usize = 256;
 
+#[cfg(feature = "server")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub listen: SocketAddr,
     pub postgres_listen: Option<SocketAddr>,
     pub data_dir: PathBuf,
     pub shards: u16,
+}
+
+/// Loopback listener addresses for a host-controlled attached server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListenerConfig {
+    pub http_listen: SocketAddr,
+    pub postgres_listen: Option<SocketAddr>,
+}
+
+/// Actual addresses selected after binding, including operating-system ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListenerAddresses {
+    http: SocketAddr,
+    postgres: Option<SocketAddr>,
+}
+
+impl ListenerAddresses {
+    pub const fn http(self) -> SocketAddr {
+        self.http
+    }
+
+    pub const fn postgres(self) -> Option<SocketAddr> {
+        self.postgres
+    }
 }
 
 #[derive(Debug)]
@@ -39,10 +67,10 @@ struct BoundListeners {
 }
 
 impl BoundListeners {
-    async fn bind(config: &Config) -> anyhow::Result<Self> {
-        let http = tokio::net::TcpListener::bind(config.listen)
+    async fn bind(config: &ListenerConfig) -> anyhow::Result<Self> {
+        let http = tokio::net::TcpListener::bind(config.http_listen)
             .await
-            .with_context(|| format!("failed to bind {}", config.listen))?;
+            .with_context(|| format!("failed to bind {}", config.http_listen))?;
         let postgres = match config.postgres_listen {
             Some(address) => Some(
                 tokio::net::TcpListener::bind(address)
@@ -54,6 +82,21 @@ impl BoundListeners {
         Ok(Self { http, postgres })
     }
 
+    fn addresses(&self) -> anyhow::Result<ListenerAddresses> {
+        Ok(ListenerAddresses {
+            http: self
+                .http
+                .local_addr()
+                .context("failed to read the bound HTTP listener address")?,
+            postgres: self
+                .postgres
+                .as_ref()
+                .map(tokio::net::TcpListener::local_addr)
+                .transpose()
+                .context("failed to read the bound PostgreSQL listener address")?,
+        })
+    }
+
     #[cfg(test)]
     fn http_only(http: tokio::net::TcpListener) -> Self {
         Self {
@@ -63,6 +106,7 @@ impl BoundListeners {
     }
 }
 
+#[cfg(feature = "server")]
 pub async fn run(config: Config) -> anyhow::Result<()> {
     run_with_engine_options(config, EngineOptions::default()).await
 }
@@ -72,14 +116,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// `options` is validated before any database files or listener are created.
 /// [`run`] remains the compatibility entry point and delegates here with
 /// [`EngineOptions::default`].
+#[cfg(feature = "server")]
 pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> anyhow::Result<()> {
-    validate_listener_addresses(&config)?;
+    let listener_config = ListenerConfig {
+        http_listen: config.listen,
+        postgres_listen: config.postgres_listen,
+    };
+    validate_listener_addresses(&listener_config)?;
     let database = BriskDb::builder(&config.data_dir)
         .with_shard_count(config.shards)
         .with_engine_options(options)
         .open()
         .await?;
-    let listeners = match BoundListeners::bind(&config).await {
+    let listeners = match BoundListeners::bind(&listener_config).await {
         Ok(listeners) => listeners,
         Err(error) => {
             database.begin_close();
@@ -147,11 +196,11 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
     result
 }
 
-fn validate_listener_addresses(config: &Config) -> anyhow::Result<()> {
-    if !config.listen.ip().is_loopback() {
+fn validate_listener_addresses(config: &ListenerConfig) -> anyhow::Result<()> {
+    if !config.http_listen.ip().is_loopback() {
         anyhow::bail!(
             "unauthenticated HTTP startup requires a loopback listen address; received {}",
-            config.listen
+            config.http_listen
         );
     }
     if let Some(address) = config
@@ -165,6 +214,82 @@ fn validate_listener_addresses(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A caller-owned listener task attached to an already-open database.
+///
+/// Closing or dropping this handle stops only its listeners and connections;
+/// it never begins database shutdown or installs process signal handlers.
+#[derive(Debug)]
+pub struct AttachedServer {
+    addresses: ListenerAddresses,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<anyhow::Result<()>>>,
+}
+
+impl AttachedServer {
+    /// Bind and start listeners against the exact engine behind `database`.
+    pub async fn start(database: &BriskDb, config: ListenerConfig) -> anyhow::Result<Self> {
+        validate_listener_addresses(&config)?;
+        let listeners = BoundListeners::bind(&config).await?;
+        let addresses = listeners.addresses()?;
+        let engine = database.engine().clone();
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            serve_listeners_with_shutdown_mode(
+                listeners,
+                engine,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+                None,
+                EngineShutdown::Borrowed,
+            )
+            .await
+        });
+        Ok(Self {
+            addresses,
+            shutdown: Some(shutdown),
+            task: Some(task),
+        })
+    }
+
+    pub const fn addresses(&self) -> ListenerAddresses {
+        self.addresses
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Request listener shutdown. Returns whether shutdown was already begun.
+    pub fn begin_close(&mut self) -> bool {
+        match self.shutdown.take() {
+            Some(shutdown) => {
+                let _ = shutdown.send(());
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Drain listener connections and join the task exactly once.
+    pub async fn close(&mut self) -> anyhow::Result<bool> {
+        let already_closed = self.task.is_none();
+        self.begin_close();
+        let Some(task) = self.task.take() else {
+            return Ok(already_closed);
+        };
+        task.await.context("attached listener task failed")??;
+        Ok(already_closed)
+    }
+}
+
+impl Drop for AttachedServer {
+    fn drop(&mut self) {
+        self.begin_close();
+    }
+}
+
+#[cfg(feature = "server")]
 async fn serve_listeners_with_shutdown<F>(
     listeners: BoundListeners,
     engine: Engine,
@@ -173,7 +298,7 @@ async fn serve_listeners_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send,
 {
-    serve_listeners_with_shutdown_observed(listeners, engine, signal, None).await
+    serve_listeners_with_shutdown_mode(listeners, engine, signal, None, EngineShutdown::Owned).await
 }
 
 #[cfg(test)]
@@ -186,15 +311,17 @@ async fn serve_with_shutdown_observed<F>(
 where
     F: Future<Output = ()> + Send,
 {
-    serve_listeners_with_shutdown_observed(
+    serve_listeners_with_shutdown_mode(
         BoundListeners::http_only(listener),
         engine,
         signal,
         accepted,
+        EngineShutdown::Owned,
     )
     .await
 }
 
+#[cfg(test)]
 async fn serve_listeners_with_shutdown_observed<F>(
     listeners: BoundListeners,
     engine: Engine,
@@ -204,7 +331,28 @@ async fn serve_listeners_with_shutdown_observed<F>(
 where
     F: Future<Output = ()> + Send,
 {
-    let mut shutdown_guard = ShutdownOnDrop::new(engine.clone());
+    serve_listeners_with_shutdown_mode(listeners, engine, signal, accepted, EngineShutdown::Owned)
+        .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineShutdown {
+    Owned,
+    Borrowed,
+}
+
+async fn serve_listeners_with_shutdown_mode<F>(
+    listeners: BoundListeners,
+    engine: Engine,
+    signal: F,
+    accepted: Option<Arc<Notify>>,
+    engine_shutdown: EngineShutdown,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    let mut shutdown_guard =
+        (engine_shutdown == EngineShutdown::Owned).then(|| ShutdownOnDrop::new(engine.clone()));
     let router = http::router_with_engine(engine.clone());
     let postgres_adapter = listeners
         .postgres
@@ -280,23 +428,34 @@ where
         }
     }
 
-    // Admission must close before the listeners and connection signals so an
-    // already-accepted request cannot enter the core after draining starts.
-    engine.begin_shutdown();
     drop(listeners);
     let http_grace = engine.options().shutdown_grace();
-    let core_shutdown = engine.shutdown();
-    let connection_shutdown = drain_connections(
-        graceful_tx,
-        &mut http_connections,
-        &mut postgres_connections,
-        http_grace,
-    );
-    let (core_result, _) = tokio::join!(core_shutdown, connection_shutdown);
-    let report = core_result?;
-    info!(forced = report.forced(), "BriskDB core shutdown completed");
-
-    shutdown_guard.disarm();
+    if engine_shutdown == EngineShutdown::Owned {
+        // Admission must close before connection signals so an
+        // already-accepted request cannot enter the core after draining starts.
+        engine.begin_shutdown();
+        let core_shutdown = engine.shutdown();
+        let connection_shutdown = drain_connections(
+            graceful_tx,
+            &mut http_connections,
+            &mut postgres_connections,
+            http_grace,
+        );
+        let (core_result, _) = tokio::join!(core_shutdown, connection_shutdown);
+        let report = core_result?;
+        info!(forced = report.forced(), "BriskDB core shutdown completed");
+        if let Some(shutdown_guard) = &mut shutdown_guard {
+            shutdown_guard.disarm();
+        }
+    } else {
+        drain_connections(
+            graceful_tx,
+            &mut http_connections,
+            &mut postgres_connections,
+            http_grace,
+        )
+        .await;
+    }
     if let Some(server_error) = server_error {
         return Err(server_error);
     }
@@ -608,9 +767,10 @@ impl Drop for ShutdownOnDrop {
     }
 }
 
+#[cfg(feature = "server")]
 type PreparedShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-#[cfg(unix)]
+#[cfg(all(feature = "server", unix))]
 fn shutdown_signal() -> anyhow::Result<PreparedShutdownSignal> {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -626,7 +786,7 @@ fn shutdown_signal() -> anyhow::Result<PreparedShutdownSignal> {
     }))
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "server", windows))]
 fn shutdown_signal() -> anyhow::Result<PreparedShutdownSignal> {
     let mut ctrl_c =
         tokio::signal::windows::ctrl_c().context("failed to install Ctrl-C shutdown handler")?;
@@ -635,7 +795,7 @@ fn shutdown_signal() -> anyhow::Result<PreparedShutdownSignal> {
     }))
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(feature = "server", not(any(unix, windows))))]
 fn shutdown_signal() -> anyhow::Result<PreparedShutdownSignal> {
     anyhow::bail!("process shutdown signals are unsupported on this target")
 }
@@ -704,6 +864,19 @@ mod tests {
         })
         .await
         .expect("the PostgreSQL server returned a frame")
+    }
+
+    async fn read_until_ready(stream: &mut tokio::net::TcpStream) -> Vec<(u8, Vec<u8>)> {
+        let mut frames = Vec::new();
+        loop {
+            let frame = read_postgres_frame(stream).await;
+            let ready = frame.0 == b'Z';
+            frames.push(frame);
+            if ready {
+                return frames;
+            }
+            assert!(frames.len() < 32, "PostgreSQL response was not bounded");
+        }
     }
 
     async fn start_postgres_session(address: SocketAddr, user: &str) -> tokio::net::TcpStream {
@@ -820,11 +993,9 @@ mod tests {
     fn listener_validation_accepts_ipv4_and_ipv6_loopback_addresses() {
         for listen in ["127.0.0.1:7654", "[::1]:7654"] {
             for postgres_listen in [None, Some("127.0.0.1:5433"), Some("[::1]:5433")] {
-                validate_listener_addresses(&Config {
-                    listen: listen.parse().unwrap(),
+                validate_listener_addresses(&ListenerConfig {
+                    http_listen: listen.parse().unwrap(),
                     postgres_listen: postgres_listen.map(|address| address.parse().unwrap()),
-                    data_dir: PathBuf::from("unused"),
-                    shards: 2,
                 })
                 .unwrap();
             }
@@ -859,12 +1030,9 @@ mod tests {
 
     #[tokio::test]
     async fn configured_listeners_bind_enabled_and_disabled_postgres_modes() {
-        let temp = tempfile::tempdir().unwrap();
-        let enabled = BoundListeners::bind(&Config {
-            listen: "127.0.0.1:0".parse().unwrap(),
+        let enabled = BoundListeners::bind(&ListenerConfig {
+            http_listen: "127.0.0.1:0".parse().unwrap(),
             postgres_listen: Some("127.0.0.1:0".parse().unwrap()),
-            data_dir: temp.path().to_path_buf(),
-            shards: 2,
         })
         .await
         .unwrap();
@@ -873,15 +1041,126 @@ mod tests {
         assert_ne!(http_address, postgres_address);
         drop(enabled);
 
-        let disabled = BoundListeners::bind(&Config {
-            listen: "127.0.0.1:0".parse().unwrap(),
+        let disabled = BoundListeners::bind(&ListenerConfig {
+            http_listen: "127.0.0.1:0".parse().unwrap(),
             postgres_listen: None,
-            data_dir: temp.path().to_path_buf(),
-            shards: 2,
         })
         .await
         .unwrap();
         assert!(disabled.postgres.is_none());
+    }
+
+    #[tokio::test]
+    async fn attached_server_reports_ports_stops_listeners_and_leaves_database_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = BriskDb::builder(temp.path())
+            .with_shard_count(2)
+            .open()
+            .await
+            .unwrap();
+        let mut server = AttachedServer::start(
+            &database,
+            ListenerConfig {
+                http_listen: "127.0.0.1:0".parse().unwrap(),
+                postgres_listen: Some("127.0.0.1:0".parse().unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+        let addresses = server.addresses();
+        assert_ne!(addresses.http().port(), 0);
+        let postgres_address = addresses.postgres().unwrap();
+        assert_ne!(postgres_address.port(), 0);
+        assert!(
+            read_http_health(addresses.http())
+                .await
+                .starts_with(b"HTTP/1.1 200 OK\r\n")
+        );
+        let mut postgres = start_postgres_session(postgres_address, "attached").await;
+        postgres
+            .write_all(&postgres_typed_packet(b'Q', b"SELECT 42\0"))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut postgres).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'T', b'D', b'C', b'Z']
+        );
+        terminate_postgres_session(&mut postgres).await;
+
+        assert!(!server.close().await.unwrap());
+        assert!(server.close().await.unwrap());
+        assert_eq!(database.state(), crate::core::EngineState::Running);
+        assert!(
+            tokio::net::TcpStream::connect(addresses.http())
+                .await
+                .is_err()
+        );
+
+        let session = database.owned_session();
+        session.set_routing_key("still-running").await.unwrap();
+        assert_eq!(
+            session
+                .query(crate::core::Statement::new("SELECT 1", Vec::new()))
+                .await
+                .unwrap()
+                .value
+                .rows()
+                .len(),
+            1
+        );
+        session.close().await.unwrap();
+
+        let mut restarted = AttachedServer::start(
+            &database,
+            ListenerConfig {
+                http_listen: "127.0.0.1:0".parse().unwrap(),
+                postgres_listen: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            read_http_health(restarted.addresses().http())
+                .await
+                .starts_with(b"HTTP/1.1 200 OK\r\n")
+        );
+        restarted.close().await.unwrap();
+        database.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attached_server_rejects_unsafe_or_unavailable_addresses_without_stopping_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = BriskDb::builder(temp.path())
+            .with_shard_count(2)
+            .open()
+            .await
+            .unwrap();
+        let error = AttachedServer::start(
+            &database,
+            ListenerConfig {
+                http_listen: "0.0.0.0:0".parse().unwrap(),
+                postgres_listen: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("requires a loopback"));
+
+        let (_reservation, unavailable) = unavailable_address();
+        let error = AttachedServer::start(
+            &database,
+            ListenerConfig {
+                http_listen: unavailable,
+                postgres_listen: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), format!("failed to bind {unavailable}"));
+        assert_eq!(database.state(), crate::core::EngineState::Running);
+        database.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -993,9 +1272,12 @@ mod tests {
             .await
             .expect("the startup engine should complete cleanup after the bind failure");
         drop(postgres_reservation);
-        let rebound = BoundListeners::bind(&config)
-            .await
-            .expect("both listeners should bind on a clean retry");
+        let rebound = BoundListeners::bind(&ListenerConfig {
+            http_listen: config.listen,
+            postgres_listen: config.postgres_listen,
+        })
+        .await
+        .expect("both listeners should bind on a clean retry");
         drop(rebound);
         reopened.shutdown().await.unwrap();
     }

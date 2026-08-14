@@ -1,7 +1,7 @@
 # Sync and asyncio API
 
 BriskDB offers synchronous native handles and an asyncio facade over the same
-listener-free engine. Both use the engine's existing queue limits, deadlines,
+in-process engine. Both use the engine's existing queue limits, deadlines,
 cancellation, and owned session lifecycle.
 
 ## Synchronous use
@@ -58,7 +58,17 @@ task.cancel()                 # also calls token.cancel()
 `AsyncDatabase` is safe to retain in a FastAPI-style application lifespan or
 a warm function instance. Create an `AsyncSession` per request/task when their
 routing keys differ. BriskDB does not install an event-loop policy, signal
-handler, logger, listener, or framework dependency.
+handler, logger, listener, or framework dependency when opening a database.
+
+Listeners can be started explicitly without reopening storage:
+
+```python
+async with await database.serve(postgres="127.0.0.1:0") as server:
+    print(server.http_address, server.postgres_address)
+```
+
+`AsyncServer.close()` drains its loopback listeners but leaves the database
+running. Closing the database closes every attached server first.
 
 ## Transaction and DB-API boundaries
 

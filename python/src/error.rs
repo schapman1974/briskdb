@@ -56,6 +56,7 @@ pub(crate) type NativeResult<T> = Result<T, NativeError>;
 pub(crate) enum NativeError {
     Engine(EngineError),
     Closed(&'static str),
+    Listener(String),
     Runtime(String),
     Panic,
 }
@@ -79,10 +80,15 @@ impl NativeError {
             Self::Closed(handle) => {
                 FailedPreconditionError::new_err(format!("BriskDB {handle} is closed"))
             }
+            Self::Listener(message) => OperationalError::new_err(message),
             Self::Runtime(message) => InternalError::new_err(message),
             Self::Panic => InternalError::new_err("BriskDB native operation panicked"),
         }
     }
+}
+
+pub(crate) fn listener_error(error: impl std::fmt::Display) -> NativeError {
+    NativeError::Listener(error.to_string())
 }
 
 impl From<NativeError> for PyErr {

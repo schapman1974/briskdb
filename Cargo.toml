@@ -18,8 +18,8 @@ categories = ["database-implementations"]
 
 [features]
 default = ["server-cli", "sqlite-import-cli"]
-# Host-controlled, listener-free Rust API. SQL execution, routing, and the
-# bundled SQLite storage engine are the stable embedded surface.
+# Host-controlled Rust API with no networking by default. SQL execution,
+# routing, and the bundled SQLite storage engine are the embedded surface.
 embedded = []
 # Network adapters can be selected independently by downstream applications.
 http = [
@@ -38,14 +38,19 @@ postgres = [
     "tokio/io-util",
     "tokio/net",
 ]
-# Process assembly used by the shipped daemon.
-server = [
+# Host-controlled HTTP/PostgreSQL listener assembly. It does not install
+# signal handlers, logging subscribers, or own an engine lifecycle.
+listeners = [
     "embedded",
     "http",
     "postgres",
     "dep:anyhow",
     "dep:hyper",
     "dep:hyper-util",
+]
+# Process assembly used by the shipped daemon.
+server = [
+    "listeners",
     "tokio/signal",
 ]
 server-cli = [

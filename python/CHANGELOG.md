@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added host-controlled loopback HTTP and PostgreSQL listeners through
+  synchronous and asyncio `Database.serve()` APIs.
+- Listener shutdown is deterministic and database shutdown closes every
+  attached server before stopping the shared engine.
+
 ## 0.1.0-alpha.5 — 2026-08-14
 
 - Added installed-wheel `spawn` multiprocessing coverage for concurrent

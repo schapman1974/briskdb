@@ -19,7 +19,8 @@ briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["em
 | `embedded` | Listener-free `BriskDb` and `BriskSession` APIs | Alpha-supported |
 | `http` | Axum HTTP API and admin browser | Alpha-supported |
 | `postgres` | PostgreSQL wire adapter | Alpha-supported, bounded SQL subset |
-| `server` | HTTP/PostgreSQL listener assembly and shutdown handling | Process integration |
+| `listeners` | Host-controlled HTTP/PostgreSQL listeners without signals or engine ownership | Alpha-supported |
+| `server` | Daemon listener assembly, signal handling, and engine ownership | Process integration |
 | `server-cli` | `briskdb` binary, Clap, logging subscriber, multithread runtime | Process integration |
 | `sqlite-import` | Offline SQLite import library | Alpha-supported |
 | `sqlite-import-cli` | `briskdb-import` binary | Process integration |
@@ -28,9 +29,10 @@ briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["em
 | `mysql` | Reserved MySQL boundary | Reserved; no listener yet |
 | `tls` | Reserved transport-security boundary | Reserved; no TLS yet |
 
-`default = ["server-cli", "sqlite-import-cli"]`. `server` selects
-`embedded`, `http`, and `postgres`; applications using adapters directly may
-select `http` or `postgres` without process assembly.
+`default = ["server-cli", "sqlite-import-cli"]`. `listeners` selects
+`embedded`, `http`, and `postgres`; `server` adds process signal handling.
+Applications using adapters directly may select `http` or `postgres` without
+listener assembly.
 
 ## Public API tiers
 

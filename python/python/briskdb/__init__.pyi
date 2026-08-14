@@ -26,6 +26,7 @@ from ._briskdb import (
     PermissionDeniedError as PermissionDeniedError,
     ProgrammingError as ProgrammingError,
     ReadOnlyError as ReadOnlyError,
+    Server as Server,
     Session as Session,
     ShuttingDownError as ShuttingDownError,
     StorageFullError as StorageFullError,
@@ -39,6 +40,7 @@ from ._briskdb import (
 from .api import (
     AsyncCursor as AsyncCursor,
     AsyncDatabase as AsyncDatabase,
+    AsyncServer as AsyncServer,
     AsyncSession as AsyncSession,
     connect as connect,
     connect_async as connect_async,
