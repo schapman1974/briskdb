@@ -50,9 +50,11 @@ PostgreSQL startup also has a finite protocol-specific table: invalid user
 labels use `28000`, unknown logical databases use `3D000`, invalid startup
 values use `22023`, unsupported startup features use `0A000`, and malformed or
 unsupported protocol versions use `08P01`. These are fixed `FATAL` responses
-followed by socket close, without `ReadyForQuery`. Simple-query Engine failures
-use their mapped SQLSTATE; extended `Parse` remains `Unsupported` (`0A000`).
-Neither path includes query text. The complete sequencing is in
+followed by socket close, without `ReadyForQuery`. Simple and extended-query
+Engine failures use their mapped SQLSTATE. Extended-flow name conflicts use
+fixed `42P03`/`42P05`, missing handles use fixed `34000`/`26000`, and unsupported
+OID, parameter, or binary-format requests use `0A000`. Neither path includes
+query text. The complete sequencing is in
 [PostgreSQL startup and listener](POSTGRES_LISTENER.md).
 
 ### Experimental virtual-table rollout boundary
@@ -64,7 +66,7 @@ is intentionally asymmetric:
 | Surface | Reachability and tested unsupported behavior | Remaining dependency |
 | --- | --- | --- |
 | HTTP | A populated catalog with `experimental-vtab` and the write opt-in can reach the coordinator. The execute endpoint maps `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints, and attachments to the fixed `Unsupported` 501 problem; caller-authored DML `RETURNING` has that result through both data endpoints. All fail before pool admission, and protocol tests verify that the shard files are unchanged. | Transaction support still requires a protocol-neutral pinned transaction state machine. |
-| PostgreSQL | Production simple `Query` executes registered-table reads and explicit-key writes through the Engine. Unsupported session/schema statements fail before mutation and return idle recovery state. Extended `Parse` remains fixed `Unsupported` / `0A000`. | Extended query execution remains issue #31/#33; transaction state and shard pinning are issue #34. |
+| PostgreSQL | Production simple `Query` and zero-parameter text-format extended queries execute registered-table reads and explicit-key writes through the Engine. Unsupported session/schema statements fail before mutation and extended errors discard input through `Sync`. | Parameter/OID/binary mapping remains issue #33; transaction state and shard pinning are issue #34. |
 | MySQL | There is no listener or command state machine. `mysql_error(Unsupported)` is only the deterministic future-adapter contract: error 1235, SQLSTATE `42000`, and the same safe message. | Listener and query flow are issues #40–#43; result/error encoding is issue #44; transactions are issue #47. |
 
 Consequently, issue #131 cannot declare cross-wire facade rollout complete

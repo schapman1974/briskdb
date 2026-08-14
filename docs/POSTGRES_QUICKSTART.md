@@ -89,9 +89,10 @@ and inspect it with `systemctl status briskdb` and
   or bytea OIDs. Stored non-UTF-8 text is rejected instead of being replaced.
 - Sharded writes must contain enough literal shard-key information to select
   exactly one owner. Reads use the engine's bounded logical read path.
-- Parameters and the extended Parse/Bind/Describe/Execute protocol are not yet
-  supported. Drivers that default to prepared or extended queries must select
-  their simple-query API for now.
+- Zero-parameter text-format prepared queries support named and unnamed
+  `Parse`/`Bind`/`Describe`/`Execute`, portal suspension, `Flush`, `Sync`, and
+  cascading `Close`. Bind parameters, explicit parameter OIDs, and binary
+  formats remain deferred to type mapping in issue #33.
 - DDL, transactions, `COPY`, authentication, authorization, TLS, and full
   PostgreSQL compatibility are not supported. Initialize the catalog offline
   with `briskdb-import` before starting the server.

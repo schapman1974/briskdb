@@ -48,13 +48,12 @@ claiming to be a drop-in PostgreSQL or MySQL replacement.
 
 ## Current implementation
 
-The initial alpha is HTTP-first: only the experimental HTTP network interface
-can execute SQL network requests today. The disabled-by-default, separately
-configured loopback PostgreSQL listener implements exact
+The initial alpha exposes experimental HTTP plus a disabled-by-default,
+separately configured loopback PostgreSQL listener. PostgreSQL implements exact
 protocol-3.0 startup, logical database/user selection, BriskDB parameter
-status, and tracked session termination through a pinned `pgwire` 0.36.3
-boundary. It rejects SQL with fixed `0A000` responses until issue #31. There is
-no MySQL listener. The public Rust SQL facade
+status, tracked session termination, simple queries, and zero-parameter
+text-format extended queries through a pinned `pgwire` 0.36.3 boundary. There
+is no MySQL listener. The public Rust SQL facade
 can parse an explicitly selected SQLite, PostgreSQL, or MySQL dialect, consume
 that result with
 `validate_common_subset(ParsedSql)`, borrow the result with
@@ -95,7 +94,7 @@ set, every shard for an unconstrained Sharded read, or shard 0 once for a
 | HTTP `/v1/query` | Experimental | Empty catalog: legacy raw SQLite query. Populated catalog: exactly one SQLite common-subset read; no session cache; multi-shard execution is limited to the row-local scatter-safe subset | Empty catalog requires caller `shard_key`; populated catalog derives targets from registered metadata, reads Global data once on shard 0, and denies Catalog/undeclared tables |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch; populated catalogs reject row-moving DML, table drops, and trigger creation | Preflight on every shard, then ascending resumable apply |
 | HTTP `/admin` browser | Experimental, read-only | No caller SQL; metadata-driven logical table discovery, specialized exact logical `COUNT(*)`, and bounded deterministic `SELECT *` page slices | Sharded tables visit all files; Global tables visit shard 0 once; no browser shard selector or arbitrary SQL |
-| PostgreSQL wire protocol | Protocol-3.0 startup plus one statement per simple `Query` on loopback | Registered-table `SELECT`, `INSERT`, `UPDATE`, and `DELETE`; extended `Parse`, parameters, DDL, and transactions remain unsupported | Startup selects an exact logical database; simple queries use Engine prepare/bind/logical execution and fixed SQLSTATE mapping |
+| PostgreSQL wire protocol | Protocol-3.0 startup plus simple `Query` and zero-parameter text-format extended flow on loopback | Registered-table `SELECT`, `INSERT`, `UPDATE`, and `DELETE`; parameters, binary formats, DDL, and transactions remain unsupported | Startup selects an exact logical database; both flows use Engine prepare/bind/logical execution and fixed SQLSTATE mapping |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
 The parser, subset validator, statement classifier, placeholder normalizer, SQL
@@ -785,16 +784,17 @@ boundary are normative in
 The PostgreSQL TCP listener hosts the selected `pgwire` 0.36.3 boundary for
 exact protocol-3.0 startup on loopback. It validates a finite parameter set,
 selects one logical database and user label, advertises BriskDB-owned status,
-and tracks the selected core session through termination. SQL messages remain
-at a fixed error/resynchronization boundary until issue #31. PostgreSQL-specific
-behavior is not implemented unless listed as implemented in this document.
+and tracks the selected core session through termination. Simple and
+zero-parameter extended SQL messages use the bounded Engine lifecycle;
+extended errors discard messages until `Sync`. PostgreSQL-specific behavior is
+not implemented unless listed as implemented in this document.
 Configuration and lifecycle semantics are normative in the [PostgreSQL listener
 contract](POSTGRES_LISTENER.md); dependency and adapter constraints are
 normative in the [adapter decision record](POSTGRES_ADAPTER.md).
 
 | Area | PostgreSQL | BriskDB contract |
 | --- | --- | --- |
-| Parameters | `$1`, `$2`, ... | Rust normalization and session-scoped prepare/bind/describe/execute are implemented; PostgreSQL message/name/type mapping remains planned |
+| Parameters | `$1`, `$2`, ... | Named/unnamed wire prepare/bind/describe/execute works for zero parameters; OID/value mapping remains issue #33 |
 | Identifier quoting | Double quotes | Retained by opt-in compatibility translation; PostgreSQL case folding and catalog equivalence are not claimed |
 | Type system | Static types identified by OIDs | Opt-in Rust translation maps a finite declaration set to `BIGINT`, `BOOLEAN`, `REAL`, `TEXT`, or `BLOB`; OID and value/result adaptation remain planned |
 | Boolean | Dedicated `boolean` type | Opt-in translation maps the declaration to `BOOLEAN` and literals to `1`/`0`; Boolean wire/result metadata remains planned |
@@ -807,7 +807,7 @@ normative in the [adapter decision record](POSTGRES_ADAPTER.md).
 | `ON CONFLICT` | PostgreSQL upsert syntax | Outside the initial common subset and unsupported |
 | Functions/operators | PostgreSQL catalog | SQLite functions/operators unless an explicit shim is documented |
 | System catalogs | `pg_catalog`, `information_schema` | Only queries required by named, tested clients will be emulated |
-| Error behavior | SQLSTATE and failed transaction state | Startup and query-deferral errors are encoded now; the complete execution mapping and `I`/`T`/`E` transaction states remain planned |
+| Error behavior | SQLSTATE and failed transaction state | Startup and execution errors are encoded; extended flow resynchronizes at `Sync`, while complete `I`/`T`/`E` transaction states remain planned |
 | `COPY`, replication, `LISTEN/NOTIFY` | PostgreSQL subprotocols/features | Deferred and unsupported initially |
 
 PostgreSQL's static result metadata does not always have an exact equivalent in

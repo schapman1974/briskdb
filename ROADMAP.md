@@ -247,7 +247,7 @@ the engine regardless of its eventual wire protocol.
 - [x] Support protocol 3.0 startup, exact logical database/user selection,
   BriskDB-owned parameter status, clean termination and session cleanup, and
   useful `<package-version>-briskdb` server identification on loopback.
-- [ ] Support simple query flow and extended Parse/Bind/Describe/Execute/Sync,
+- [x] Support simple query flow and extended Parse/Bind/Describe/Execute/Sync,
   including named and unnamed statements/portals, Flush/Close, protocol error
   resynchronization, and portal suspension.
 - [ ] Negotiate explicitly supported newer protocol minor versions from the

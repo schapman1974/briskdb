@@ -1,10 +1,11 @@
 # PostgreSQL startup and listener contract
 
-BriskDB serves PostgreSQL protocol 3.0 startup and bounded simple queries on a
-disabled-by-default, separately configured loopback TCP listener. A successful
-startup selects one logical database, creates one protocol-neutral core
-session, publishes BriskDB-owned parameter status, and keeps the socket alive
-until `Terminate`, EOF, server shutdown, or a protocol failure.
+BriskDB serves PostgreSQL protocol 3.0 startup plus bounded simple and
+zero-parameter extended queries on a disabled-by-default, separately configured
+loopback TCP listener. A successful startup selects one logical database,
+creates one protocol-neutral core session, publishes BriskDB-owned parameter
+status, and keeps the socket alive until `Terminate`, EOF, server shutdown, or
+a protocol failure.
 
 ## Process configuration
 
@@ -72,14 +73,15 @@ creating a core session.
 For the startup packet and subsequent typed messages, a BriskDB-owned raw-frame
 gate runs before general dependency decoding and releases exactly one complete
 frame at a time. A startup packet's declared length may not exceed 10,000
-bytes. After successful startup, only `Query`, `Parse`, `Sync`, and `Terminate`
-frontend messages are admitted, and their declared length may not exceed 65,541
-bytes (the one-byte message type is outside that declared length). Query and
-Parse strings must be valid UTF-8, all four message types must match their exact
-structural boundaries, and startup key/value pairs must be structurally
-complete valid UTF-8 with no duplicate key. Other frontend message types are
-rejected until their owning roadmap issues. Malformed and oversized frames
-follow the fixed `08P01` protocol-failure path when a response can be sent.
+bytes. After successful startup, `Query`, `Parse`, `Bind`, `Describe`,
+`Execute`, `Close`, `Flush`, `Sync`, and `Terminate` frontend messages are
+admitted, and their declared length may not exceed 65,541 bytes (the one-byte
+message type is outside that declared length). Query, statement, and portal
+strings must be valid UTF-8. Format codes, counts, lengths, target bytes, and
+every message boundary are validated before dependency decoding. Other
+frontend message types are rejected until their owning roadmap issues.
+Malformed and oversized frames follow the fixed `08P01` protocol-failure path
+when a response can be sent.
 
 The accepted startup keys are finite:
 
@@ -150,10 +152,29 @@ instead of replaced. Write responses use ordinary
 one exact owner from their literal shard-key values. Reads retain the Engine's
 existing point/scatter limits and semantics.
 
-Extended `Parse` remains a fixed `0A000` error before a dependency-owned
-statement is stored, and `Sync` restores `ReadyForQuery(I)`. Bind parameters,
-DDL, transactions, `COPY`, and binary results are not supported. The offline
-importer is the supported way to establish registered tables. See the
+## Extended-query boundary
+
+The text-format, zero-parameter extended flow uses the same Engine lifecycle:
+
+- `Parse` prepares exactly one statement. Named statements must be unique;
+  replacing the unnamed statement closes it and every portal bound from it.
+- `Bind` accepts no values or parameter formats yet. Named portals must be
+  unique; replacing the unnamed portal closes its core handle.
+- `Describe` returns zero parameter OIDs plus statement fields, or portal
+  fields, without execution.
+- `Execute` returns rows or a command tag. A positive row limit suspends and
+  resumes the already materialized bounded response without rerunning the core
+  portal; a completed portal cannot replay a write.
+- `Close` releases a portal or cascades statement closure to its portals;
+  `Flush` flushes pending output; `Sync` restores `ReadyForQuery(I)` after an
+  error and causes skipped extended messages to be accepted again.
+
+Statement and portal names are at most 63 UTF-8 bytes. Engine limits remain
+authoritative for per-session prepared statements, portals, retained values,
+rows, and bytes. Explicit parameter OIDs, bound values, parameter formats, and
+binary results remain issue #33. DDL, transactions, and `COPY` are not
+supported. The offline importer is the supported way to establish registered
+tables. See the
 [copy/paste query quickstart](POSTGRES_QUICKSTART.md).
 
 ## Connection ownership and shutdown
@@ -215,8 +236,10 @@ Automated coverage includes:
   unknown-key, replication, and truncated-message cases before and after
   session creation, followed by successful recovery;
 - end-to-end simple-query insert, select, update, delete, row/type encoding,
-  empty-query handling, fixed-error recovery, and extended-query `Sync`
-  recovery;
+  and empty-query handling;
+- named and unnamed extended write/read/describe/execute, suspension without
+  replay, cascading close, flush, fixed-error `Sync` recovery, and raw frame
+  validation;
 - immediate `Terminate`, client EOF, partial startup, normal shutdown, forced
   server-task cancellation, and core-session cleanup;
 - the 256-task admission boundary, deterministic overflow close, and slot reuse

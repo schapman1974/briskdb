@@ -455,10 +455,10 @@ typed Rust input paths share the same planning and result path:
 Each protocol adapter owns its message framing, authentication,
 statement/portal naming, wire parameter decoding, result type encoding, close
 acknowledgement, and protocol resynchronization. PostgreSQL startup framing,
-session ownership, and parameter-free simple queries are implemented; issue
-#31 must map extended query messages into this lifecycle rather than retain a
-SQLite handle, implement a second cache, interpolate values into SQL, or choose
-a physical shard itself.
+session ownership, parameter-free simple queries, and zero-parameter extended
+queries map into this lifecycle without retaining a SQLite handle, implementing
+a second authoritative cache, interpolating values into SQL, or choosing a
+physical shard in the adapter.
 
 ## Storage-format boundary
 
