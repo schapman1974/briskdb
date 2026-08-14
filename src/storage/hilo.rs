@@ -5,6 +5,8 @@
 //! rollback, cancellation, constraint failures, and crashes can create gaps
 //! but cannot cause reuse.
 
+#![cfg_attr(not(feature = "experimental-vtab"), allow(dead_code))]
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},

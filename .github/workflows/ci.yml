@@ -21,6 +21,61 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  features:
+    name: Features (${{ matrix.surface }}, Rust ${{ matrix.rust }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+          - "1.85.0"
+          - stable
+        surface:
+          - core
+          - embedded
+          - http
+          - postgres
+          - sqlite-import
+          - default
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ matrix.rust }}
+        run: rustup toolchain install "${{ matrix.rust }}" --profile minimal
+
+      - name: Select Rust ${{ matrix.rust }}
+        run: rustup default "${{ matrix.rust }}"
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: features-${{ matrix.rust }}-${{ matrix.surface }}
+
+      - name: Check feature surface
+        run: |
+          case "${{ matrix.surface }}" in
+            core) cargo check --locked --lib --no-default-features ;;
+            default) cargo check --locked --lib ;;
+            *) cargo check --locked --lib --no-default-features --features "${{ matrix.surface }}" ;;
+          esac
+
+      - name: Verify embedded dependency boundary
+        if: matrix.surface == 'embedded'
+        run: |
+          forbidden_dependencies="$(
+            cargo tree --locked --no-default-features --features embedded --edges normal --prefix none |
+              awk '$1 ~ /^(anyhow|axum|clap|hyper|hyper-util|pgwire|tokio-util|tower|tracing-subscriber)$/ { print $1 }' |
+              sort -u
+          )"
+          if [ -n "$forbidden_dependencies" ]; then
+            echo "embedded feature unexpectedly includes: $forbidden_dependencies"
+            exit 1
+          fi
+
   quality:
     name: Format and Clippy (stable)
     runs-on: ubuntu-24.04
@@ -47,6 +102,16 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Verify publishable crate package
+        run: cargo package --locked --allow-dirty
+
+      - name: Reject Git-sourced dependencies
+        run: |
+          if awk '/source = "git\+/{ found = 1 } END { exit !found }' Cargo.lock; then
+            echo "Cargo.lock contains a Git-sourced dependency"
+            exit 1
+          fi
 
   test:
     name: Tests (${{ matrix.rust }})

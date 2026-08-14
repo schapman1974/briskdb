@@ -55,6 +55,7 @@ use crate::{
 use crate::core::AllocationOwnerMap;
 
 pub(crate) const CONNECTION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(feature = "sqlite-import")]
 pub(crate) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = manifest::MAX_SCHEMA_MIGRATION_SQL_BYTES;
 
 #[derive(Debug)]
@@ -62,6 +63,7 @@ struct RootSchemaCoordination {
     gate: schema_gate::SchemaGate,
     catalogs: Mutex<Vec<Weak<CatalogSnapshot>>>,
     schema_digests: Mutex<RuntimeSchemaDigests>,
+    #[cfg_attr(not(feature = "experimental-vtab"), allow(dead_code))]
     hilo_allocator: hilo::HiloAllocator,
 }
 
@@ -814,12 +816,14 @@ impl Storage {
     }
 
     #[cfg(any(feature = "experimental-vtab", test))]
+    #[cfg_attr(not(feature = "experimental-vtab"), allow(dead_code))]
     pub(crate) fn generated_id_policy_is_active(&self, table_id: TableId) -> bool {
         self.catalog.native_id_policy_is_active(table_id)
             || self.catalog.hilo_id_policy_is_active(table_id)
     }
 
     #[cfg(any(feature = "experimental-vtab", test))]
+    #[cfg_attr(not(feature = "experimental-vtab"), allow(dead_code))]
     pub(crate) fn allocate_hilo_v1(&self, table_id: TableId) -> EngineResult<hilo::HiloAllocation> {
         if !self.catalog.hilo_id_policy_is_active(table_id) {
             return Err(EngineError::new(
@@ -843,6 +847,7 @@ impl Storage {
     }
 
     #[cfg(any(feature = "experimental-vtab", test))]
+    #[cfg_attr(not(feature = "experimental-vtab"), allow(dead_code))]
     pub(crate) fn hilo_owner_id(&self) -> [u8; 32] {
         self.schema_coordination.hilo_allocator.owner_id()
     }

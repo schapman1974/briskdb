@@ -2143,6 +2143,7 @@ fn current_manifest_snapshot(
 /// lock is acquired. A commit failure is deliberately not reconciled into a
 /// returned lease: if SQLite committed despite the error, that block remains
 /// burned and the next reservation advances beyond it.
+#[cfg_attr(not(feature = "experimental-vtab"), allow(dead_code))]
 pub(super) fn reserve_hilo_v1_block(
     connection: &mut Connection,
     requested_shards: u16,

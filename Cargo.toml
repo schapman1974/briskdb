@@ -7,47 +7,89 @@ default-run = "briskdb"
 description = "Sharded SQLite with HTTP/PostgreSQL today and MongoDB/MySQL frontends planned"
 license = "MIT"
 repository = "https://github.com/schapman1974/briskdb"
-# Cargo packaging removes Git source pins from dependencies. Keep registry
-# publishing disabled while the exact post-0.62 parser snapshot is required.
-publish = false
+readme = "README.md"
+keywords = ["database", "sqlite", "sharding", "embedded"]
+categories = ["database-implementations"]
 
 [features]
-default = []
+default = ["server-cli", "sqlite-import-cli"]
+# Host-controlled, listener-free Rust API. SQL execution, routing, and the
+# bundled SQLite storage engine are the stable embedded surface.
+embedded = []
+# Network adapters can be selected independently by downstream applications.
+http = [
+    "dep:axum",
+    "dep:futures",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tower",
+    "dep:tracing",
+]
+postgres = [
+    "dep:async-trait",
+    "dep:futures",
+    "dep:pgwire",
+    "dep:tokio-util",
+    "tokio/io-util",
+    "tokio/net",
+]
+# Process assembly used by the shipped daemon.
+server = [
+    "embedded",
+    "http",
+    "postgres",
+    "dep:anyhow",
+    "dep:hyper",
+    "dep:hyper-util",
+    "tokio/signal",
+]
+server-cli = [
+    "server",
+    "dep:clap",
+    "dep:tracing-subscriber",
+    "tokio/macros",
+    "tokio/rt-multi-thread",
+]
+# The offline SQLite importer is separate from the embedded query surface.
+sqlite-import = ["dep:serde", "dep:serde_json", "dep:tracing"]
+sqlite-import-cli = ["sqlite-import", "dep:anyhow", "dep:clap"]
+# Reserved feature names establish the intended package boundaries without
+# claiming that these roadmap surfaces are implemented.
+documents = ["embedded"]
+mysql = []
+tls = []
 # Statically compile rusqlite's virtual-table API for the no-fork sharded-table
 # prototype. This does not enable SQLite's runtime extension loader.
 experimental-vtab = ["rusqlite/vtab"]
 
 [dependencies]
-anyhow = "1.0"
-async-trait = "0.1"
-axum = "0.8.9"
+anyhow = { version = "1.0", optional = true }
+async-trait = { version = "0.1", optional = true }
+axum = { version = "0.8.9", optional = true }
 blake3 = "1.8"
-clap = { version = "4.6.6", features = ["derive", "env"] }
+clap = { version = "4.6.6", features = ["derive", "env"], optional = true }
 getrandom = "=0.4.3"
-futures = "0.3"
-hyper = { version = "1.11", features = ["http1", "server"] }
-hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
+futures = { version = "0.3", optional = true }
+hyper = { version = "1.11", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1.20", features = ["service", "tokio"], optional = true }
 # 0.36.3 is the newest pgwire release that supports BriskDB's Rust 1.85
 # baseline. Keep the pre-1.0 dependency exact and enable only the plaintext
 # server surface; later roadmap work owns TLS and extended type adapters.
-pgwire = { version = "=0.36.3", default-features = false, features = ["server-api"] }
+pgwire = { version = "=0.36.3", default-features = false, features = ["server-api"], optional = true }
 rusqlite = { version = "0.39.0", features = ["bundled", "column_metadata", "hooks", "limits"] }
 same-file = "1.0"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0"
-# The exact upstream revision contains the post-0.62.0 `parse_interval`
-# recursion fix. This must remain a direct source pin so downstream BriskDB
-# consumers inherit it; a root-only `[patch]` would not propagate.
-sqlparser = { version = "=0.62.0", git = "https://github.com/apache/datafusion-sqlparser-rs", rev = "33521a534eae72188e06ce0ce4836d19c7f3458a", default-features = false, features = ["std", "recursive-protection", "visitor"] }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+sqlparser = { version = "=0.62.0", default-features = false, features = ["std", "recursive-protection", "visitor"] }
 # `recursive` admits newer `psm` releases whose build dependencies require
 # Rust 1.88. The direct exact constraint preserves BriskDB's Rust 1.85 MSRV for
 # both this repository and downstream consumers until that graph is corrected.
 psm = "=0.1.28"
-tokio = { version = "1.53.1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec"] }
-tower = { version = "0.5", features = ["util"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false }
@@ -58,3 +100,17 @@ tempfile = "3.23"
 [[bench]]
 name = "storage"
 harness = false
+
+[[bin]]
+name = "briskdb"
+path = "src/main.rs"
+required-features = ["server-cli"]
+
+[[bin]]
+name = "briskdb-import"
+path = "src/bin/briskdb-import.rs"
+required-features = ["sqlite-import-cli"]
+
+[[example]]
+name = "embedded"
+required-features = ["embedded"]
