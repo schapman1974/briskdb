@@ -115,12 +115,29 @@ Successful startup emits these frames in order:
 5. `ParameterStatus(client_encoding, UTF8)`;
 6. `ParameterStatus(standard_conforming_strings, on)`;
 7. `ParameterStatus(integer_datetimes, on)`;
-8. optional validated `ParameterStatus(application_name, ...)`; and
-9. `ReadyForQuery(I)`.
+8. optional validated `ParameterStatus(application_name, ...)`;
+9. `BackendKeyData` containing a random backend PID and secret; and
+10. `ReadyForQuery(I)`.
 
 The values and ordering are BriskDB-owned rather than dependency defaults.
-`BackendKeyData` is omitted until cancellation identifiers are implemented in
-issue #35.
+The backend PID is an opaque positive identifier, not an operating-system PID.
+The matching secret is never logged or reused as a session identifier.
+
+## Query cancellation
+
+A PostgreSQL client can send the emitted backend PID and secret in an exact
+16-byte `CancelRequest` on a separate connection. BriskDB silently closes that
+connection, as PostgreSQL clients expect. A matching key cancels only the
+request currently running on that backend; an unknown, stale, or mismatched key
+does nothing. Each command receives a fresh core cancellation token so a token
+for completed command A cannot interrupt later command B.
+
+Cancellation can interrupt a SQLite lock wait or active SQLite statement. It
+returns SQLSTATE `57014`. Inside an explicit transaction, the transaction then
+reports failed status (`E`) until `ROLLBACK`; the same connection can continue
+after rollback. Clients must wait for the cancelled command's response before
+starting another command on that connection. Disconnect and server shutdown
+unregister the key and cancel any active work.
 
 ## Startup errors
 

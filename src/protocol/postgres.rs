@@ -8,7 +8,7 @@
 //! not accept or return `pgwire` types.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt, io,
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
@@ -24,6 +24,7 @@ use pgwire::{
         ClientInfo, ClientPortalStore, DEFAULT_NAME, DefaultClient, ErrorHandler,
         PgWireConnectionState, PgWireServerHandlers, Type,
         auth::StartupHandler,
+        cancel::CancelHandler,
         portal::{Portal, PortalExecutionState},
         query::{
             ExtendedQueryHandler, SimpleQueryHandler, send_execution_response,
@@ -39,13 +40,16 @@ use pgwire::{
     error::{ErrorInfo, PgWireError, PgWireResult},
     messages::{
         PgWireBackendMessage, PgWireFrontendMessage, ProtocolVersion, SslNegotiationMetaMessage,
+        cancel::CancelRequest,
         data::{DataRow, NoData},
         extendedquery::{
             Bind, BindComplete, Close, CloseComplete, Execute, Parse, ParseComplete,
             TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
         },
         response::{GssEncResponse, ReadyForQuery, SslResponse, TransactionStatus},
-        startup::{Authentication, NegotiateProtocolVersion, ParameterStatus},
+        startup::{
+            Authentication, BackendKeyData, NegotiateProtocolVersion, ParameterStatus, SecretKey,
+        },
     },
     tokio::server::{PgWireMessageServerCodec, process_error, process_message},
 };
@@ -57,10 +61,10 @@ use tokio_util::codec::Framed;
 
 use crate::{
     core::{
-        DataType, DescribeTarget, Engine, EngineError, EngineResult, EngineStatus,
-        LogicalDatabaseId, PortalId, PrepareRequest, PreparedExecution,
-        PreparedStatementDescription, PreparedStatementId, ResultSet, Session, SessionId,
-        TransactionExecution, Value,
+        CancellationToken, DataType, DescribeTarget, Engine, EngineError, EngineResult,
+        EngineStatus, LogicalDatabaseId, PortalId, PrepareRequest, PreparedExecution,
+        PreparedStatementDescription, PreparedStatementId, RequestContext, ResultSet, Session,
+        SessionId, TransactionExecution, Value,
     },
     protocol::error::postgres_error,
     sql::{MAX_PARSED_SQL_BYTES, SqlDialect, SqlTranslationMode, StatementBehavior, WriteBehavior},
@@ -94,6 +98,7 @@ enum FrontendFramePhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartupFrameKind {
     Negotiation,
+    Cancellation,
     Startup,
 }
 
@@ -143,7 +148,7 @@ impl<S> GuardedPgStream<S> {
                     .try_into()
                     .expect("the guarded startup preamble length was checked"),
             );
-            if code == CANCEL_REQUEST_CODE
+            if (code == CANCEL_REQUEST_CODE && declared != 16)
                 || (matches!(code, SSL_REQUEST_CODE | GSSENC_REQUEST_CODE) && declared != 8)
             {
                 return Err(invalid_frontend_frame());
@@ -282,10 +287,11 @@ fn validate_startup_frame(frame: &[u8]) -> io::Result<StartupFrameKind> {
         };
     }
     if code == CANCEL_REQUEST_CODE {
-        // Backend cancellation identifiers are introduced by roadmap issue
-        // #35. Until then, a CancelRequest is a well-framed but unsupported
-        // startup packet and must not reach the dependency's no-op handler.
-        return Err(invalid_frontend_frame());
+        return if frame.len() == 16 {
+            Ok(StartupFrameKind::Cancellation)
+        } else {
+            Err(invalid_frontend_frame())
+        };
     }
     if frame.len() < 9 {
         return Err(invalid_frontend_frame());
@@ -496,6 +502,191 @@ fn invalid_frontend_frame() -> io::Error {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackendKey {
+    pid: i32,
+    secret: i32,
+}
+
+#[derive(Debug, Default)]
+struct CancellationRegistry {
+    inner: Mutex<HashMap<i32, BackendCancellation>>,
+}
+
+#[derive(Debug)]
+struct BackendCancellation {
+    secret: i32,
+    next_generation: u64,
+    active: Option<(u64, CancellationToken)>,
+}
+
+impl CancellationRegistry {
+    fn issue(self: &Arc<Self>) -> EngineResult<BackendKey> {
+        for _ in 0..32 {
+            let mut random = [0_u8; 8];
+            getrandom::fill(&mut random).map_err(|error| {
+                EngineError::from_source(
+                    crate::core::EngineErrorKind::Internal,
+                    "failed to generate a PostgreSQL backend cancellation key",
+                    error,
+                )
+            })?;
+            let pid = i32::from_be_bytes(random[..4].try_into().expect("four random PID bytes"))
+                & i32::MAX;
+            if pid == 0 {
+                continue;
+            }
+            let secret = i32::from_be_bytes(
+                random[4..]
+                    .try_into()
+                    .expect("four random cancellation-secret bytes"),
+            );
+            let mut inner = self.inner.lock().map_err(|_| {
+                EngineError::new(
+                    crate::core::EngineErrorKind::Internal,
+                    "PostgreSQL cancellation registry lock was poisoned",
+                )
+            })?;
+            if inner.contains_key(&pid) {
+                continue;
+            }
+            inner.insert(
+                pid,
+                BackendCancellation {
+                    secret,
+                    next_generation: 1,
+                    active: None,
+                },
+            );
+            return Ok(BackendKey { pid, secret });
+        }
+        Err(EngineError::new(
+            crate::core::EngineErrorKind::Internal,
+            "failed to allocate a unique PostgreSQL backend identifier",
+        ))
+    }
+
+    fn begin(self: &Arc<Self>, key: BackendKey) -> EngineResult<ActiveRequest> {
+        let cancellation = CancellationToken::new();
+        let generation = {
+            let mut inner = self.inner.lock().map_err(|_| {
+                EngineError::new(
+                    crate::core::EngineErrorKind::Internal,
+                    "PostgreSQL cancellation registry lock was poisoned",
+                )
+            })?;
+            let backend = inner.get_mut(&key.pid).ok_or_else(|| {
+                EngineError::new(
+                    crate::core::EngineErrorKind::FailedPrecondition,
+                    "the PostgreSQL backend cancellation key is no longer registered",
+                )
+            })?;
+            if backend.secret != key.secret {
+                return Err(EngineError::new(
+                    crate::core::EngineErrorKind::FailedPrecondition,
+                    "the PostgreSQL backend cancellation key does not match",
+                ));
+            }
+            if backend.active.is_some() {
+                return Err(EngineError::new(
+                    crate::core::EngineErrorKind::Internal,
+                    "the PostgreSQL backend already has an active request",
+                ));
+            }
+            let generation = backend.next_generation;
+            backend.next_generation = backend.next_generation.wrapping_add(1).max(1);
+            backend.active = Some((generation, cancellation.clone()));
+            generation
+        };
+        Ok(ActiveRequest {
+            registry: Arc::clone(self),
+            key,
+            generation,
+            cancellation,
+        })
+    }
+
+    fn cancel(&self, pid: i32, secret: i32) -> bool {
+        let cancellation = self.inner.lock().ok().and_then(|inner| {
+            inner.get(&pid).and_then(|backend| {
+                (backend.secret == secret)
+                    .then(|| backend.active.as_ref().map(|(_, token)| token.clone()))
+                    .flatten()
+            })
+        });
+        cancellation.is_some_and(|token| token.cancel())
+    }
+
+    fn unregister(&self, key: BackendKey) {
+        let cancellation = self.inner.lock().ok().and_then(|mut inner| {
+            if inner
+                .get(&key.pid)
+                .is_some_and(|backend| backend.secret == key.secret)
+            {
+                inner
+                    .remove(&key.pid)
+                    .and_then(|backend| backend.active.map(|(_, token)| token))
+            } else {
+                None
+            }
+        });
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+        }
+    }
+
+    fn finish(&self, key: BackendKey, generation: u64) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let Some(backend) = inner.get_mut(&key.pid) else {
+            return;
+        };
+        if backend.secret == key.secret
+            && backend
+                .active
+                .as_ref()
+                .is_some_and(|(active, _)| *active == generation)
+        {
+            backend.active = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    fn active_len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|backend| backend.active.is_some())
+            .count()
+    }
+}
+
+struct ActiveRequest {
+    registry: Arc<CancellationRegistry>,
+    key: BackendKey,
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
+impl ActiveRequest {
+    fn context(&self) -> RequestContext {
+        RequestContext::new().with_cancellation_token(self.cancellation.clone())
+    }
+}
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.registry.finish(self.key, self.generation);
+    }
+}
+
 /// A PostgreSQL protocol adapter backed only by BriskDB's public engine API.
 ///
 /// Constructing an adapter does not bind a socket, accept a connection, or
@@ -506,6 +697,7 @@ pub struct Adapter {
     engine: Engine,
     default_database: LogicalDatabaseId,
     default_database_name: Box<str>,
+    cancellations: Arc<CancellationRegistry>,
 }
 
 impl Adapter {
@@ -518,6 +710,7 @@ impl Adapter {
             engine,
             default_database,
             default_database_name,
+            cancellations: Arc::new(CancellationRegistry::default()),
         }
     }
 
@@ -573,7 +766,7 @@ impl Adapter {
         WireConnection {
             state: Arc::new(WireConnectionState {
                 adapter: self.clone(),
-                connection: OnceLock::new(),
+                installed: OnceLock::new(),
             }),
         }
     }
@@ -654,11 +847,12 @@ impl Connection {
     async fn execute_simple_query(
         &self,
         sql: &str,
+        context: RequestContext,
     ) -> EngineResult<(StatementBehavior, PreparedExecution)> {
         let statement = self
             .state
             .engine
-            .prepare_statement(
+            .prepare_statement_with_context(
                 &self.state.session,
                 PrepareRequest::new(
                     self.state.database,
@@ -666,10 +860,11 @@ impl Connection {
                     SqlTranslationMode::Compatibility,
                     sql,
                 ),
+                context.clone(),
             )
             .await?;
 
-        let result = self.execute_prepared_simple_query(statement).await;
+        let result = self.execute_prepared_simple_query(statement, context).await;
         let cleanup = self
             .state
             .engine
@@ -685,22 +880,32 @@ impl Connection {
     async fn execute_prepared_simple_query(
         &self,
         statement: PreparedStatementId,
+        context: RequestContext,
     ) -> EngineResult<(StatementBehavior, PreparedExecution)> {
         let description = self
             .state
             .engine
-            .describe_prepared(&self.state.session, DescribeTarget::Statement(statement))
+            .describe_prepared_with_context(
+                &self.state.session,
+                DescribeTarget::Statement(statement),
+                context.clone(),
+            )
             .await?;
         let behavior = description.behavior();
         let portal = self
             .state
             .engine
-            .bind_statement(&self.state.session, statement, Vec::new())
+            .bind_statement_with_context(
+                &self.state.session,
+                statement,
+                Vec::new(),
+                context.clone(),
+            )
             .await?;
         let result = self
             .state
             .engine
-            .execute_portal_logical(&self.state.session, portal)
+            .execute_portal_logical_with_context(&self.state.session, portal, context)
             .await
             .map(|executed| (behavior, executed.value));
         let cleanup = self
@@ -747,19 +952,41 @@ pub(crate) struct WireConnection {
 
 struct WireConnectionState {
     adapter: Adapter,
-    connection: OnceLock<Arc<Connection>>,
+    installed: OnceLock<InstalledWireConnection>,
+}
+
+struct InstalledWireConnection {
+    connection: Arc<Connection>,
+    backend_key: BackendKey,
 }
 
 impl WireConnection {
     fn installed(&self) -> PgWireResult<&Arc<Connection>> {
         self.state
-            .connection
+            .installed
             .get()
+            .map(|installed| &installed.connection)
             .ok_or_else(|| fatal_wire_error("08P01", "PostgreSQL startup has not completed"))
     }
 
+    fn backend_key(&self) -> PgWireResult<BackendKey> {
+        self.state
+            .installed
+            .get()
+            .map(|installed| installed.backend_key)
+            .ok_or_else(|| fatal_wire_error("08P01", "PostgreSQL startup has not completed"))
+    }
+
+    fn begin_request(&self) -> PgWireResult<ActiveRequest> {
+        self.state
+            .adapter
+            .cancellations
+            .begin(self.backend_key()?)
+            .map_err(engine_error_to_pgwire)
+    }
+
     async fn install(&self, user: &str, database: &str) -> PgWireResult<()> {
-        if self.state.connection.get().is_some() {
+        if self.state.installed.get().is_some() {
             return Err(fatal_wire_error(
                 "08P01",
                 "PostgreSQL startup was already completed",
@@ -774,8 +1001,22 @@ impl WireConnection {
                     fatal_wire_error("3D000", "PostgreSQL database selection is unavailable")
                 })?,
         );
-        if let Err(connection) = self.state.connection.set(connection) {
-            let _ = connection.close().await;
+        let backend_key = self
+            .state
+            .adapter
+            .cancellations
+            .issue()
+            .map_err(|error| engine_error_to_pgwire_with_severity(error, "FATAL"))?;
+        let installed = InstalledWireConnection {
+            connection,
+            backend_key,
+        };
+        if let Err(installed) = self.state.installed.set(installed) {
+            self.state
+                .adapter
+                .cancellations
+                .unregister(installed.backend_key);
+            let _ = installed.connection.close().await;
             return Err(fatal_wire_error(
                 "08P01",
                 "PostgreSQL startup was already completed",
@@ -783,11 +1024,12 @@ impl WireConnection {
         }
         let connection = self
             .state
-            .connection
+            .installed
             .get()
+            .map(|installed| &installed.connection)
             .expect("the validated PostgreSQL connection was just installed");
         if let Err(error) = connection.status().await {
-            let _ = connection.close().await;
+            let _ = self.close().await;
             return Err(engine_error_to_pgwire_with_severity(error, "FATAL"));
         }
         Ok(())
@@ -824,8 +1066,12 @@ impl WireConnection {
     }
 
     pub(crate) async fn close(&self) -> EngineResult<()> {
-        if let Some(connection) = self.state.connection.get() {
-            connection.close().await
+        if let Some(installed) = self.state.installed.get() {
+            self.state
+                .adapter
+                .cancellations
+                .unregister(installed.backend_key);
+            installed.connection.close().await
         } else {
             Ok(())
         }
@@ -833,7 +1079,10 @@ impl WireConnection {
 
     #[cfg(test)]
     fn connection(&self) -> Option<&Arc<Connection>> {
-        self.state.connection.get()
+        self.state
+            .installed
+            .get()
+            .map(|installed| &installed.connection)
     }
 }
 
@@ -902,6 +1151,41 @@ impl WireHandlers {
         }
         client.portal_store().rm_portal(name);
         Ok(())
+    }
+
+    async fn execute_bound_portal<C>(
+        &self,
+        _client: &mut C,
+        portal: &Portal<PgWirePrepared>,
+        context: RequestContext,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = PgWirePrepared>,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let connection = self.connection.installed()?;
+        let bound = bound_portal(&connection.state, portal.name.as_str())?
+            .ok_or_else(|| PgWireError::PortalNotFound(portal.name.clone()))?;
+        let behavior = connection
+            .state
+            .engine
+            .describe_prepared_with_context(
+                &connection.state.session,
+                DescribeTarget::Portal(bound.id),
+                context.clone(),
+            )
+            .await
+            .map_err(engine_error_to_pgwire)?
+            .behavior();
+        let execution = connection
+            .state
+            .engine
+            .execute_portal_logical_with_context(&connection.state.session, bound.id, context)
+            .await
+            .map_err(engine_error_to_pgwire)?;
+        execution_response(behavior, execution.value, Some(Arc::clone(&bound.fields)))
     }
 }
 
@@ -994,7 +1278,9 @@ impl StartupHandler for WireHandlers {
         }
 
         self.connection.install(user, database).await?;
+        let backend_key = self.connection.backend_key()?;
         client.set_protocol_version(ProtocolVersion::PROTOCOL3_0);
+        client.set_pid_and_secret_key(backend_key.pid, SecretKey::I32(backend_key.secret));
         let metadata = client.metadata_mut();
         metadata.insert("user".to_owned(), user.to_owned());
         metadata.insert("database".to_owned(), database.to_owned());
@@ -1035,6 +1321,12 @@ impl StartupHandler for WireHandlers {
                 .await?;
         }
         client
+            .feed(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
+                backend_key.pid,
+                SecretKey::I32(backend_key.secret),
+            )))
+            .await?;
+        client
             .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                 TransactionStatus::Idle,
             )))
@@ -1053,10 +1345,11 @@ impl SimpleQueryHandler for WireHandlers {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.sync_failed_transaction(client).await?;
+        let request = self.connection.begin_request()?;
         let (behavior, execution) = self
             .connection
             .installed()?
-            .execute_simple_query(query)
+            .execute_simple_query(query, request.context())
             .await
             .map_err(engine_error_to_pgwire)?;
         Ok(vec![simple_query_response(behavior, execution)?])
@@ -1858,6 +2151,7 @@ impl ExtendedQueryHandler for WireHandlers {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.sync_failed_transaction(client).await?;
+        let request = self.connection.begin_request()?;
         let name = valid_extended_name(message.name.as_deref())?;
         if name != DEFAULT_NAME && client.portal_store().get_statement(name).is_some() {
             return Err(query_wire_error(
@@ -1886,7 +2180,7 @@ impl ExtendedQueryHandler for WireHandlers {
             .collect::<Vec<_>>();
         let statement = self
             .query_parser()
-            .parse_sql(client, &message.query, &parameter_types)
+            .parse_sql_with_context(client, &message.query, &parameter_types, request.context())
             .await?;
         let stored_parameter_types = statement
             .parameter_types
@@ -1910,6 +2204,7 @@ impl ExtendedQueryHandler for WireHandlers {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.sync_failed_transaction(client).await?;
+        let request = self.connection.begin_request()?;
         let portal_name = valid_extended_name(message.portal_name.as_deref())?;
         let statement_name = valid_extended_name(message.statement_name.as_deref())?;
         let statement = client
@@ -1943,9 +2238,10 @@ impl ExtendedQueryHandler for WireHandlers {
         let description = connection
             .state
             .engine
-            .describe_prepared(
+            .describe_prepared_with_context(
                 &connection.state.session,
                 DescribeTarget::Statement(statement.statement.id),
+                request.context(),
             )
             .await
             .map_err(engine_error_to_pgwire)?;
@@ -1971,10 +2267,11 @@ impl ExtendedQueryHandler for WireHandlers {
         let portal_id = connection
             .state
             .engine
-            .bind_statement(
+            .bind_statement_with_context(
                 &connection.state.session,
                 statement.statement.id,
                 parameters,
+                request.context(),
             )
             .await
             .map_err(engine_error_to_pgwire)?;
@@ -2009,6 +2306,7 @@ impl ExtendedQueryHandler for WireHandlers {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.sync_failed_transaction(client).await?;
+        let request = self.connection.begin_request()?;
         if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
             return Err(PgWireError::NotReadyForQuery);
         }
@@ -2026,7 +2324,10 @@ impl ExtendedQueryHandler for WireHandlers {
         let mut portal_state = portal_state_lock.lock().await;
         match &mut *portal_state {
             PortalExecutionState::Initial => {
-                match ExtendedQueryHandler::do_query(self, client, &portal, max_rows).await? {
+                match self
+                    .execute_bound_portal(client, &portal, request.context())
+                    .await?
+                {
                     Response::Query(mut response) if max_rows > 0 => {
                         if send_partial_query_response(client, &mut response, max_rows).await? {
                             *portal_state = PortalExecutionState::Suspended(response);
@@ -2101,14 +2402,16 @@ impl ExtendedQueryHandler for WireHandlers {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.sync_failed_transaction(client).await?;
+        let request = self.connection.begin_request()?;
         let description = self
             .connection
             .installed()?
             .state
             .engine
-            .describe_prepared(
+            .describe_prepared_with_context(
                 &self.connection.installed()?.state.session,
                 DescribeTarget::Statement(target.statement.id),
+                request.context(),
             )
             .await
             .map_err(engine_error_to_pgwire)?;
@@ -2130,6 +2433,7 @@ impl ExtendedQueryHandler for WireHandlers {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.sync_failed_transaction(client).await?;
+        let _request = self.connection.begin_request()?;
         let portal = bound_portal(&self.connection.installed()?.state, target.name.as_str())?
             .ok_or_else(|| PgWireError::PortalNotFound(target.name.clone()))?;
         Ok(DescribePortalResponse::new(portal.fields.as_ref().clone()))
@@ -2148,23 +2452,9 @@ impl ExtendedQueryHandler for WireHandlers {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.sync_failed_transaction(client).await?;
-        let connection = self.connection.installed()?;
-        let bound = bound_portal(&connection.state, portal.name.as_str())?
-            .ok_or_else(|| PgWireError::PortalNotFound(portal.name.clone()))?;
-        let behavior = connection
-            .state
-            .engine
-            .describe_prepared(&connection.state.session, DescribeTarget::Portal(bound.id))
+        let request = self.connection.begin_request()?;
+        self.execute_bound_portal(client, portal, request.context())
             .await
-            .map_err(engine_error_to_pgwire)?
-            .behavior();
-        let execution = connection
-            .state
-            .engine
-            .execute_portal_logical(&connection.state.session, bound.id)
-            .await
-            .map_err(engine_error_to_pgwire)?;
-        execution_response(behavior, execution.value, Some(Arc::clone(&bound.fields)))
     }
 }
 
@@ -2196,6 +2486,19 @@ impl ErrorHandler for WireHandlers {
     }
 }
 
+#[async_trait]
+impl CancelHandler for WireHandlers {
+    async fn on_cancel_request(&self, request: CancelRequest) {
+        if let Some(secret) = request.secret_key.as_i32() {
+            self.connection
+                .state
+                .adapter
+                .cancellations
+                .cancel(request.pid, secret);
+        }
+    }
+}
+
 impl PgWireServerHandlers for WireHandlers {
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
         Arc::new(Self {
@@ -2220,11 +2523,19 @@ impl PgWireServerHandlers for WireHandlers {
             connection: self.connection.clone(),
         })
     }
+
+    fn cancel_handler(&self) -> Arc<impl CancelHandler> {
+        Arc::new(Self {
+            connection: self.connection.clone(),
+        })
+    }
 }
 
 type GuardedSocket = Framed<GuardedPgStream<TcpStream>, PgWireMessageServerCodec<PgWirePrepared>>;
 
-async fn negotiate_plaintext(stream: TcpStream) -> io::Result<Option<GuardedSocket>> {
+async fn negotiate_plaintext(
+    stream: TcpStream,
+) -> io::Result<Option<(GuardedSocket, Option<PgWireFrontendMessage>)>> {
     let peer = stream.peer_addr()?;
     stream.set_nodelay(true)?;
 
@@ -2258,7 +2569,10 @@ async fn negotiate_plaintext(stream: TcpStream) -> io::Result<Option<GuardedSock
             }
             Some(Ok(PgWireFrontendMessage::SslNegotiation(SslNegotiationMetaMessage::None))) => {
                 socket.set_state(PgWireConnectionState::AwaitingStartup);
-                return Ok(Some(socket));
+                return Ok(Some((socket, None)));
+            }
+            Some(Ok(message @ PgWireFrontendMessage::CancelRequest(_))) => {
+                return Ok(Some((socket, Some(message))));
             }
             Some(Ok(_)) | Some(Err(_)) => {
                 send_connection_error(
@@ -2284,7 +2598,7 @@ async fn run_socket(
         _ = &mut startup_timeout => return Ok(()),
         socket = negotiate_plaintext(stream) => socket?,
     };
-    let Some(mut socket) = socket else {
+    let Some((mut socket, initial_message)) = socket else {
         return Ok(());
     };
 
@@ -2300,6 +2614,21 @@ async fn run_socket(
     let copy_handler = handlers.copy_handler();
     let cancel_handler = handlers.cancel_handler();
     let error_handler = handlers.error_handler();
+
+    if let Some(message) = initial_message {
+        process_message(
+            message,
+            &mut socket,
+            startup_handler,
+            simple_query_handler,
+            extended_query_handler,
+            copy_handler,
+            cancel_handler,
+        )
+        .await
+        .map_err(io::Error::other)?;
+        return Ok(());
+    }
 
     loop {
         let startup_phase = matches!(
@@ -2499,16 +2828,14 @@ impl fmt::Debug for PgWireQueryParser {
     }
 }
 
-#[async_trait]
-impl QueryParser for PgWireQueryParser {
-    type Statement = PgWirePrepared;
-
-    async fn parse_sql<C>(
+impl PgWireQueryParser {
+    async fn parse_sql_with_context<C>(
         &self,
         _client: &C,
         sql: &str,
         types: &[Option<Type>],
-    ) -> PgWireResult<Self::Statement>
+        context: RequestContext,
+    ) -> PgWireResult<PgWirePrepared>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
@@ -2530,13 +2857,17 @@ impl QueryParser for PgWireQueryParser {
         let id = self
             .state
             .engine
-            .prepare_statement(&self.state.session, request)
+            .prepare_statement_with_context(&self.state.session, request, context.clone())
             .await
             .map_err(engine_error_to_pgwire)?;
         let description = match self
             .state
             .engine
-            .describe_prepared(&self.state.session, DescribeTarget::Statement(id))
+            .describe_prepared_with_context(
+                &self.state.session,
+                DescribeTarget::Statement(id),
+                context,
+            )
             .await
         {
             Ok(description) => description,
@@ -2569,6 +2900,24 @@ impl QueryParser for PgWireQueryParser {
             description,
             parameter_types: Arc::new(parameter_types),
         })
+    }
+}
+
+#[async_trait]
+impl QueryParser for PgWireQueryParser {
+    type Statement = PgWirePrepared;
+
+    async fn parse_sql<C>(
+        &self,
+        client: &C,
+        sql: &str,
+        types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        self.parse_sql_with_context(client, sql, types, RequestContext::new())
+            .await
     }
 }
 
@@ -2703,6 +3052,15 @@ mod tests {
 
     fn startup_packet() -> Vec<u8> {
         startup_packet_with(196_608, &[("user", "briskdb"), ("database", "default")])
+    }
+
+    fn cancel_packet(pid: i32, secret: i32) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(16);
+        packet.extend_from_slice(&16_u32.to_be_bytes());
+        packet.extend_from_slice(&(CANCEL_REQUEST_CODE as u32).to_be_bytes());
+        packet.extend_from_slice(&pid.to_be_bytes());
+        packet.extend_from_slice(&secret.to_be_bytes());
+        packet
     }
 
     fn typed_packet(message_type: u8, body: &[u8]) -> Vec<u8> {
@@ -2849,6 +3207,14 @@ mod tests {
             .to_owned();
         assert_eq!(fields.next(), Some([].as_slice()));
         (name, value)
+    }
+
+    fn backend_key(body: &[u8]) -> BackendKey {
+        assert_eq!(body.len(), 8);
+        BackendKey {
+            pid: i32::from_be_bytes(body[..4].try_into().unwrap()),
+            secret: i32::from_be_bytes(body[4..].try_into().unwrap()),
+        }
     }
 
     fn negotiated_protocol(body: &[u8]) -> (i32, Vec<String>) {
@@ -3242,6 +3608,37 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn cancellation_registry_requires_the_exact_key_and_scopes_each_request_token() {
+        let registry = Arc::new(CancellationRegistry::default());
+        let key = registry.issue().unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.active_len(), 0);
+
+        let first = registry.begin(key).unwrap();
+        let first_generation = first.generation;
+        assert_eq!(registry.active_len(), 1);
+        assert!(!registry.cancel(key.pid.wrapping_add(1), key.secret));
+        assert!(!registry.cancel(key.pid, key.secret ^ 1));
+        assert!(!first.cancellation.is_cancelled());
+        assert!(registry.cancel(key.pid, key.secret));
+        assert!(first.cancellation.is_cancelled());
+        drop(first);
+        assert_eq!(registry.active_len(), 0);
+        assert!(!registry.cancel(key.pid, key.secret));
+
+        let second = registry.begin(key).unwrap();
+        assert!(!second.cancellation.is_cancelled());
+        registry.finish(key, first_generation);
+        assert_eq!(registry.active_len(), 1);
+        assert!(registry.cancel(key.pid, key.secret));
+        assert!(second.cancellation.is_cancelled());
+        registry.unregister(key);
+        assert!(second.cancellation.is_cancelled());
+        assert_eq!(registry.len(), 0);
+        drop(second);
+    }
+
     #[tokio::test]
     async fn production_startup_selects_identity_emits_owned_status_and_terminates() {
         let (_temp, engine) = engine(3).await;
@@ -3273,10 +3670,16 @@ mod tests {
         let frames = read_until_ready(&mut client).await;
         assert_eq!(frames.first().unwrap(), &(b'R', vec![0, 0, 0, 0]));
         assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'I']));
-        assert!(!frames.iter().any(|frame| frame.0 == b'K'));
+        let keys = frames
+            .iter()
+            .filter(|frame| frame.0 == b'K')
+            .map(|frame| backend_key(&frame.1))
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 1);
+        assert_ne!(keys[0].pid, 0);
         assert_eq!(
             frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
-            vec![b'R', b'S', b'S', b'S', b'S', b'S', b'S', b'Z']
+            vec![b'R', b'S', b'S', b'S', b'S', b'S', b'S', b'K', b'Z']
         );
         let statuses = frames
             .iter()
@@ -3301,9 +3704,148 @@ mod tests {
         assert_eq!(core.database(), "default");
         assert_eq!(core.database_id(), engine.catalog().default_database().id());
         assert_eq!(core.state().await, SessionState::Ready);
+        assert_eq!(adapter.cancellations.len(), 1);
 
         finish_wire_server(&mut client, server).await;
         assert_eq!(core.state().await, SessionState::Closed);
+        assert_eq!(adapter.cancellations.len(), 0);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_request_interrupts_the_active_transaction_and_rollback_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = crate::core::Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE records (
+                    tenant_id TEXT NOT NULL PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                crate::core::TableDeclaration::sharded(
+                    logical_database,
+                    "records",
+                    crate::core::ShardKeyMetadata::new(
+                        "tenant_id",
+                        crate::core::ShardKeyType::Text,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let shard = database.shard_for_key(b"tenant-cancel");
+        let engine = Engine::from_database(Arc::new(database));
+        let adapter = Adapter::new(engine.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let wire = adapter.wire_connection();
+        let served = wire.clone();
+        let cancellation_adapter = adapter.clone();
+        let (main_tx, main_rx) = tokio::sync::oneshot::channel();
+        let cancellation_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let main =
+                tokio::spawn(async move { served.serve(stream, std::future::pending()).await });
+            main_tx.send(main).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            cancellation_adapter
+                .wire_connection()
+                .serve(stream, std::future::pending())
+                .await
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let main_server = main_rx.await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        let startup = read_until_ready(&mut client).await;
+        let key = startup
+            .iter()
+            .find(|frame| frame.0 == b'K')
+            .map(|frame| backend_key(&frame.1))
+            .expect("production startup emits one backend cancellation key");
+        client
+            .write_all(&typed_packet(b'Q', b"BEGIN\0"))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'T']));
+        let lock = rusqlite::Connection::open(
+            temp.path()
+                .join("shards")
+                .join(format!("{shard:04}.sqlite")),
+        )
+        .unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        client
+            .write_all(&typed_packet(
+                b'Q',
+                b"INSERT INTO records (tenant_id, payload) VALUES ('tenant-cancel', 'blocked')\0",
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adapter.cancellations.active_len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the blocked request entered cancellation admission");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut cancellation = TcpStream::connect(address).await.unwrap();
+        cancellation
+            .write_all(&cancel_packet(key.pid, key.secret))
+            .await
+            .unwrap();
+        assert_eof(&mut cancellation).await;
+        drop(cancellation);
+        tokio::time::timeout(Duration::from_secs(2), cancellation_server)
+            .await
+            .expect("the CancelRequest connection returned")
+            .unwrap()
+            .unwrap();
+
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(frames[0].0, b'E');
+        assert_eq!(
+            message_fields(&frames[0].1).get(&b'C').map(String::as_str),
+            Some("57014")
+        );
+        assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'E']));
+        assert_eq!(adapter.cancellations.active_len(), 0);
+        lock.execute_batch("ROLLBACK").unwrap();
+
+        client
+            .write_all(&typed_packet(b'Q', b"ROLLBACK\0"))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'I']));
+
+        client
+            .write_all(&typed_packet(
+                b'Q',
+                b"SELECT tenant_id FROM records WHERE tenant_id = 'tenant-cancel'\0",
+            ))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'I']));
+
+        client.write_all(&typed_packet(b'X', &[])).await.unwrap();
+        assert_eof(&mut client).await;
+        tokio::time::timeout(Duration::from_secs(2), main_server)
+            .await
+            .expect("the cancelled PostgreSQL backend connection returned")
+            .unwrap()
+            .unwrap();
+        assert_eq!(adapter.cancellations.len(), 0);
         engine.shutdown().await.unwrap();
     }
 
@@ -3624,6 +4166,7 @@ mod tests {
             wire.connection().unwrap().state().await,
             SessionState::Closed
         );
+        assert_eq!(adapter.cancellations.len(), 0);
         engine.shutdown().await.unwrap();
     }
 
@@ -3679,12 +4222,15 @@ mod tests {
         let duplicate = core
             .execute_simple_query(
                 "INSERT INTO records (tenant_id, payload) VALUES ('tenant-a', 'duplicate')",
+                RequestContext::new(),
             )
             .await
             .unwrap_err();
         assert_eq!(duplicate.kind(), EngineErrorKind::UniqueViolation);
         for _ in 0..130 {
-            core.execute_simple_query("SELECT 1").await.unwrap();
+            core.execute_simple_query("SELECT 1", RequestContext::new())
+                .await
+                .unwrap();
         }
 
         client
@@ -4489,6 +5035,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(eof_core.state().await, SessionState::Closed);
+        assert_eq!(adapter.cancellations.len(), 0);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -4515,6 +5062,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(shutdown_core.state().await, SessionState::Closed);
+        assert_eq!(adapter.cancellations.len(), 0);
 
         engine.shutdown().await.unwrap();
     }
@@ -4612,11 +5160,16 @@ mod tests {
         invalid_utf8[user_value] = 0xff;
         let mut wrong_declared_length = startup.clone();
         wrong_declared_length[..4].copy_from_slice(&8_u32.to_be_bytes());
-        let mut cancel = Vec::new();
-        cancel.extend_from_slice(&16_u32.to_be_bytes());
-        cancel.extend_from_slice(&(CANCEL_REQUEST_CODE as u32).to_be_bytes());
-        cancel.extend_from_slice(&1_u32.to_be_bytes());
-        cancel.extend_from_slice(&2_u32.to_be_bytes());
+        let cancel = cancel_packet(1, 2);
+        assert_eq!(
+            validate_startup_frame(&cancel).unwrap(),
+            StartupFrameKind::Cancellation
+        );
+        let mut short_cancel = cancel.clone();
+        short_cancel.pop();
+        short_cancel[..4].copy_from_slice(&15_u32.to_be_bytes());
+        let mut wrong_cancel_length = cancel.clone();
+        wrong_cancel_length[..4].copy_from_slice(&8_u32.to_be_bytes());
 
         for rejected in [
             missing_terminal,
@@ -4625,7 +5178,8 @@ mod tests {
             missing_value,
             invalid_utf8,
             wrong_declared_length,
-            cancel,
+            short_cancel,
+            wrong_cancel_length,
         ] {
             assert!(
                 validate_startup_frame(&rejected).is_err(),

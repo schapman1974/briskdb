@@ -165,7 +165,9 @@ particular:
   client state to 3.2. BriskDB overrides that state with its exact 3.0 baseline.
   Any newer 3.x request receives a BriskDB-owned downgrade message naming minor
   zero; unsupported `_pq_.` options are sorted and reported in the same frame.
-  The adapter never advertises 3.2 cancellation-key semantics before issue #35.
+  Protocol 3.0 startup returns a random backend PID and secret used only for
+  PostgreSQL `CancelRequest`; neither value is a process identifier or a core
+  session identifier.
 - The raw-frame caps are transport-retention boundaries, not budgets for SQL,
   names, raw parameters, prepared objects, or rows. Those values and connection
   tasks still require their BriskDB-owned finite limits.
@@ -195,7 +197,10 @@ parameter OIDs, and basic text/binary value codecs while keeping PostgreSQL
 types and raw bytes at this adapter edge. Both paths execute registered table
 reads and writes through the Engine. Issue #34 adds protocol-neutral
 single-shard transactions, retained connection ownership, failed state, and
-exact `I`/`T`/`E` wire status. Later roadmap issues retain cancellation,
+exact `I`/`T`/`E` wire status. Issue #35 gives each connected backend a random
+key and maps an exact-key `CancelRequest` to a fresh core cancellation token for
+only the command currently running on that backend. Disconnect and shutdown
+unregister the key and cancel active work. Later roadmap issues retain
 TLS/SCRAM, client-matrix, and row-streaming scopes. The exact
 live contract and user workflow are in the
 [PostgreSQL listener document](POSTGRES_LISTENER.md) and
