@@ -32,6 +32,7 @@ const MAX_POSTGRES_CONNECTIONS: usize = 256;
 pub struct Config {
     pub listen: SocketAddr,
     pub postgres_listen: Option<SocketAddr>,
+    pub postgres_security: Option<postgres::SecurityConfig>,
     pub data_dir: PathBuf,
     pub shards: u16,
 }
@@ -122,7 +123,13 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
         http_listen: config.listen,
         postgres_listen: config.postgres_listen,
     };
-    validate_listener_addresses(&listener_config)?;
+    validate_listener_addresses(&listener_config, config.postgres_security.is_some())?;
+    let postgres_security = config
+        .postgres_security
+        .as_ref()
+        .map(postgres::SecurityConfig::load)
+        .transpose()
+        .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?;
     let database = BriskDb::builder(&config.data_dir)
         .with_shard_count(config.shards)
         .with_engine_options(options)
@@ -161,6 +168,7 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
     info!(
         listen = %config.listen,
         postgres_listen = ?config.postgres_listen,
+        postgres_secure = postgres_security.is_some(),
         data_dir = %config.data_dir.display(),
         shards = engine.shard_count(),
         engine_blocking_task_admission_limit = engine.blocking_task_admission_limit(),
@@ -191,24 +199,30 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
         "BriskDB is ready"
     );
 
-    let result = serve_listeners_with_shutdown(listeners, engine, signal).await;
+    let result = serve_listeners_with_shutdown(listeners, engine, signal, postgres_security).await;
     drop(database);
     result
 }
 
-fn validate_listener_addresses(config: &ListenerConfig) -> anyhow::Result<()> {
+fn validate_listener_addresses(
+    config: &ListenerConfig,
+    postgres_secure: bool,
+) -> anyhow::Result<()> {
     if !config.http_listen.ip().is_loopback() {
         anyhow::bail!(
             "unauthenticated HTTP startup requires a loopback listen address; received {}",
             config.http_listen
         );
     }
+    if postgres_secure && config.postgres_listen.is_none() {
+        anyhow::bail!("PostgreSQL security is configured but the PostgreSQL listener is disabled");
+    }
     if let Some(address) = config
         .postgres_listen
-        .filter(|address| !address.ip().is_loopback())
+        .filter(|address| !address.ip().is_loopback() && !postgres_secure)
     {
         anyhow::bail!(
-            "PostgreSQL wire startup currently requires a loopback listen address; received {address}"
+            "PostgreSQL non-loopback startup requires TLS and SCRAM configuration; received {address}"
         );
     }
     Ok(())
@@ -228,7 +242,28 @@ pub struct AttachedServer {
 impl AttachedServer {
     /// Bind and start listeners against the exact engine behind `database`.
     pub async fn start(database: &BriskDb, config: ListenerConfig) -> anyhow::Result<Self> {
-        validate_listener_addresses(&config)?;
+        Self::start_with_security(database, config, None).await
+    }
+
+    /// Bind listeners with TLS and SCRAM enabled for PostgreSQL.
+    pub async fn start_secure(
+        database: &BriskDb,
+        config: ListenerConfig,
+        security: postgres::SecurityConfig,
+    ) -> anyhow::Result<Self> {
+        validate_listener_addresses(&config, true)?;
+        let security = security
+            .load()
+            .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?;
+        Self::start_with_security(database, config, Some(security)).await
+    }
+
+    async fn start_with_security(
+        database: &BriskDb,
+        config: ListenerConfig,
+        security: Option<postgres::LoadedSecurity>,
+    ) -> anyhow::Result<Self> {
+        validate_listener_addresses(&config, security.is_some())?;
         let listeners = BoundListeners::bind(&config).await?;
         let addresses = listeners.addresses()?;
         let engine = database.engine().clone();
@@ -242,6 +277,7 @@ impl AttachedServer {
                 },
                 None,
                 EngineShutdown::Borrowed,
+                security,
             )
             .await
         });
@@ -294,11 +330,20 @@ async fn serve_listeners_with_shutdown<F>(
     listeners: BoundListeners,
     engine: Engine,
     signal: F,
+    postgres_security: Option<postgres::LoadedSecurity>,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send,
 {
-    serve_listeners_with_shutdown_mode(listeners, engine, signal, None, EngineShutdown::Owned).await
+    serve_listeners_with_shutdown_mode(
+        listeners,
+        engine,
+        signal,
+        None,
+        EngineShutdown::Owned,
+        postgres_security,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -317,6 +362,7 @@ where
         signal,
         accepted,
         EngineShutdown::Owned,
+        None,
     )
     .await
 }
@@ -331,8 +377,15 @@ async fn serve_listeners_with_shutdown_observed<F>(
 where
     F: Future<Output = ()> + Send,
 {
-    serve_listeners_with_shutdown_mode(listeners, engine, signal, accepted, EngineShutdown::Owned)
-        .await
+    serve_listeners_with_shutdown_mode(
+        listeners,
+        engine,
+        signal,
+        accepted,
+        EngineShutdown::Owned,
+        None,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +400,7 @@ async fn serve_listeners_with_shutdown_mode<F>(
     signal: F,
     accepted: Option<Arc<Notify>>,
     engine_shutdown: EngineShutdown,
+    postgres_security: Option<postgres::LoadedSecurity>,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send,
@@ -354,10 +408,12 @@ where
     let mut shutdown_guard =
         (engine_shutdown == EngineShutdown::Owned).then(|| ShutdownOnDrop::new(engine.clone()));
     let router = http::router_with_engine(engine.clone());
-    let postgres_adapter = listeners
-        .postgres
-        .as_ref()
-        .map(|_| postgres::Adapter::new(engine.clone()));
+    let postgres_adapter = listeners.postgres.as_ref().map(|_| {
+        postgres_security.map_or_else(
+            || postgres::Adapter::new(engine.clone()),
+            |security| postgres::Adapter::with_loaded_security(engine.clone(), security),
+        )
+    });
     let (graceful_tx, _graceful_rx) = watch::channel(false);
     let mut http_connections = JoinSet::new();
     let mut postgres_connections = PostgresConnections::default();
@@ -951,6 +1007,7 @@ mod tests {
         let error = run(Config {
             listen,
             postgres_listen: None,
+            postgres_security: None,
             data_dir: data_dir.clone(),
             shards: 1,
         })
@@ -968,6 +1025,7 @@ mod tests {
         let error = run(Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             postgres_listen: Some("0.0.0.0:0".parse().unwrap()),
+            postgres_security: None,
             data_dir: data_dir.clone(),
             shards: 2,
         })
@@ -976,7 +1034,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "PostgreSQL wire startup currently requires a loopback listen address; received 0.0.0.0:0"
+            "PostgreSQL non-loopback startup requires TLS and SCRAM configuration; received 0.0.0.0:0"
         );
         assert!(!data_dir.exists());
     }
@@ -988,6 +1046,7 @@ mod tests {
         let error = run(Config {
             listen: "0.0.0.0:0".parse().unwrap(),
             postgres_listen: Some("127.0.0.1:0".parse().unwrap()),
+            postgres_security: None,
             data_dir: data_dir.clone(),
             shards: 2,
         })
@@ -1005,13 +1064,36 @@ mod tests {
     fn listener_validation_accepts_ipv4_and_ipv6_loopback_addresses() {
         for listen in ["127.0.0.1:7654", "[::1]:7654"] {
             for postgres_listen in [None, Some("127.0.0.1:5433"), Some("[::1]:5433")] {
-                validate_listener_addresses(&ListenerConfig {
-                    http_listen: listen.parse().unwrap(),
-                    postgres_listen: postgres_listen.map(|address| address.parse().unwrap()),
-                })
+                validate_listener_addresses(
+                    &ListenerConfig {
+                        http_listen: listen.parse().unwrap(),
+                        postgres_listen: postgres_listen.map(|address| address.parse().unwrap()),
+                    },
+                    false,
+                )
                 .unwrap();
             }
         }
+    }
+
+    #[test]
+    fn listener_validation_requires_security_only_for_remote_postgres() {
+        let remote = ListenerConfig {
+            http_listen: "127.0.0.1:7654".parse().unwrap(),
+            postgres_listen: Some("0.0.0.0:5433".parse().unwrap()),
+        };
+        assert!(validate_listener_addresses(&remote, false).is_err());
+        validate_listener_addresses(&remote, true).unwrap();
+
+        let disabled = ListenerConfig {
+            http_listen: "127.0.0.1:7654".parse().unwrap(),
+            postgres_listen: None,
+        };
+        let error = validate_listener_addresses(&disabled, true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "PostgreSQL security is configured but the PostgreSQL listener is disabled"
+        );
     }
 
     #[tokio::test]
@@ -1024,6 +1106,7 @@ mod tests {
             Config {
                 listen,
                 postgres_listen: None,
+                postgres_security: None,
                 data_dir: data_dir.clone(),
                 shards: 64,
             },
@@ -1245,6 +1328,7 @@ mod tests {
         let error = run(Config {
             listen: http_address,
             postgres_listen: Some(postgres_address),
+            postgres_security: None,
             data_dir: temp.path().to_path_buf(),
             shards: 2,
         })
@@ -1267,6 +1351,7 @@ mod tests {
         let config = Config {
             listen: http_address,
             postgres_listen: Some(postgres_address),
+            postgres_security: None,
             data_dir: temp.path().to_path_buf(),
             shards: 2,
         };
@@ -1326,6 +1411,7 @@ mod tests {
                 async move {
                     let _ = signal_rx.await;
                 },
+                None,
             ),
         )
         .await
@@ -1371,6 +1457,7 @@ mod tests {
             async move {
                 let _ = signal_rx.await;
             },
+            None,
         ));
 
         let clients = (0..32)
@@ -1431,6 +1518,7 @@ mod tests {
             async move {
                 let _ = signal_rx.await;
             },
+            None,
         ));
 
         let mut idle = start_postgres_session(postgres_address, "idle_client").await;
@@ -1481,6 +1569,7 @@ mod tests {
                 },
                 engine,
                 async {},
+                None,
             ),
         )
         .await

@@ -55,8 +55,8 @@ sudo systemctl status briskdb --no-pager
 ```
 
 The default database location is `/var/lib/briskdb/data`. The HTTP listener is
-`127.0.0.1:7654`, and PostgreSQL is disabled. The server rejects non-loopback
-listeners while authentication and TLS are absent.
+`127.0.0.1:7654`, and PostgreSQL is disabled. PostgreSQL rejects non-loopback
+activation unless TLS and SCRAM-SHA-256 are fully configured.
 
 ## Enable PostgreSQL queries
 
@@ -73,7 +73,8 @@ sudo -u briskdb /usr/bin/briskdb-import \
   --shards 4
 ```
 
-Set these values in `/etc/default/briskdb`, keeping the listener on loopback:
+For local development, set these values in `/etc/default/briskdb` and keep the
+listener on loopback:
 
 ```text
 BRISKDB_POSTGRES_LISTEN=127.0.0.1:5433
@@ -81,10 +82,28 @@ BRISKDB_DATA_DIR=/var/lib/briskdb/imported-data
 BRISKDB_SHARDS=4
 ```
 
-Restart the service, then use the `psql` commands in the
-[PostgreSQL query quickstart](POSTGRES_QUICKSTART.md). The initial interface
-supports one simple-query statement at a time; it has no authentication, TLS,
-DDL, savepoints, cross-shard transactions, or full PostgreSQL compatibility yet.
+For a remote listener, first install the TLS and password files with restricted
+permissions, then configure all secure settings:
+
+```bash
+sudo install -d -o root -g briskdb -m 0750 /etc/briskdb
+sudo install -o root -g root -m 0644 server.crt /etc/briskdb/postgres.crt
+sudo install -o root -g briskdb -m 0640 server.key /etc/briskdb/postgres.key
+sudo install -o root -g briskdb -m 0640 postgres-password /etc/briskdb/postgres-password
+```
+
+```text
+BRISKDB_POSTGRES_LISTEN=0.0.0.0:5433
+BRISKDB_POSTGRES_TLS_CERT=/etc/briskdb/postgres.crt
+BRISKDB_POSTGRES_TLS_KEY=/etc/briskdb/postgres.key
+BRISKDB_POSTGRES_USER=briskdb
+BRISKDB_POSTGRES_PASSWORD_FILE=/etc/briskdb/postgres-password
+```
+
+Restart the service, then use the verified-TLS `psql` example in the
+[PostgreSQL query quickstart](POSTGRES_QUICKSTART.md). The alpha has one
+authenticated identity but no roles/authorization, DDL, savepoints,
+cross-shard transactions, or full PostgreSQL compatibility yet.
 
 ## Logging
 

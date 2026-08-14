@@ -1,20 +1,26 @@
 # PostgreSQL startup and listener contract
 
 BriskDB serves a PostgreSQL protocol 3.0 baseline plus bounded simple and
-parameterized extended queries on a disabled-by-default, separately configured
-loopback TCP listener. A successful startup selects one logical database,
-creates one protocol-neutral core session, publishes BriskDB-owned parameter
-status, and keeps the socket alive until `Terminate`, EOF, server shutdown, or
-a protocol failure.
+parameterized extended queries on a disabled-by-default listener. It can run
+unauthenticated on loopback for development, or with TLS and SCRAM-SHA-256 on
+loopback or remote addresses. A successful startup selects one logical
+database, creates one protocol-neutral core session, publishes BriskDB-owned
+parameter status, and keeps the socket alive until termination.
 
 ## Process configuration
 
-The binary exposes one value with one grammar:
+The binary exposes the listener plus an all-or-nothing security group:
 
 | Source | Default | Enabled value | Disabled value |
 | --- | --- | --- | --- |
-| CLI | `--postgres-listen disabled` | `--postgres-listen 127.0.0.1:5433`, or another numeric loopback `SocketAddr` such as `[::1]:5433` | `--postgres-listen disabled` |
-| Environment | `BRISKDB_POSTGRES_LISTEN=disabled` | `BRISKDB_POSTGRES_LISTEN=127.0.0.1:5433`, or the same numeric loopback grammar | `BRISKDB_POSTGRES_LISTEN=disabled` |
+| CLI | `--postgres-listen disabled` | `--postgres-listen SOCKET_ADDR` | `--postgres-listen disabled` |
+| Environment | `BRISKDB_POSTGRES_LISTEN=disabled` | `BRISKDB_POSTGRES_LISTEN=SOCKET_ADDR` | `BRISKDB_POSTGRES_LISTEN=disabled` |
+
+Secure mode requires `--postgres-tls-cert`, `--postgres-tls-key`, and
+`--postgres-password-file` together. `--postgres-user` defaults to `briskdb`.
+The equivalent environment names are `BRISKDB_POSTGRES_TLS_CERT`,
+`BRISKDB_POSTGRES_TLS_KEY`, `BRISKDB_POSTGRES_PASSWORD_FILE`, and
+`BRISKDB_POSTGRES_USER`.
 
 An explicit command-line value wins over the environment; the environment wins
 over the default. `disabled` is the exact lowercase sentinel. Empty values,
@@ -22,10 +28,11 @@ hostnames, values without a port, and aliases such as `off` or `none` are
 rejected during command-line parsing. Port zero retains the standard
 `SocketAddr` meaning of asking the operating system to select a port.
 
-Only IPv4 or IPv6 loopback addresses may activate the PostgreSQL wire endpoint
-until the TLS and SCRAM work in issue #36. `server::Config` applies that rule
-before opening the data directory or binding either listener. The existing
-HTTP listener remains independently configured and always enabled.
+IPv4 or IPv6 loopback addresses may use the compatibility mode without
+credentials. A non-loopback address is rejected unless the complete TLS/SCRAM
+group is configured. Security with a disabled listener is also rejected.
+These rules are applied before opening the data directory or binding either
+listener. HTTP remains independently configured and loopback-only.
 
 `server::Config::postgres_listen` is `Option<SocketAddr>`:
 
@@ -41,12 +48,13 @@ before entering the server library. `server::run` and
 Startup has one deterministic order:
 
 1. clap parses CLI/environment values and resource options are validated;
-2. a configured PostgreSQL address is required to be loopback;
-3. the engine opens the data directory and completes startup recovery;
-4. the HTTP listener binds;
-5. the PostgreSQL listener binds when configured;
-6. process signal receivers are installed; and
-7. readiness is logged and the shared accept loop starts.
+2. listener/security combinations are validated;
+3. certificate, private key, and password file are read and validated;
+4. the engine opens the data directory and completes startup recovery;
+5. the HTTP listener binds;
+6. the PostgreSQL listener binds when configured;
+7. process signal receivers are installed; and
+8. readiness is logged and the shared accept loop starts.
 
 The server never logs readiness after only one configured listener has bound.
 An HTTP bind failure precedes a PostgreSQL bind attempt. If the PostgreSQL bind
@@ -69,12 +77,14 @@ downgraded just like 3.2 or a future minor. Unsupported `_pq_.` protocol options
 are sorted, listed in the same negotiation message, ignored, and do not become
 session metadata. Other unknown startup keys remain errors.
 
-`SSLRequest` and `GSSENCRequest` must each be an exact eight-byte frame and
-receive `N`, after which the client may send a plaintext startup packet on the
-loopback socket. Malformed negotiation lengths cannot consume bytes from a
-following startup packet. No TLS or GSS session is accepted in the current
-phase. The listener waits at most 60 seconds for negotiation and a startup
-packet; that timeout closes the socket without creating a core session.
+`SSLRequest` and `GSSENCRequest` must each be exact eight-byte frames. GSS is
+always refused. In development mode SSL is refused and plaintext startup is
+accepted only because the listener is loopback. In secure mode SSLRequest is
+accepted; direct TLS is also accepted when the client negotiates `postgresql`
+ALPN. Plaintext startup then fails with `08004`. Malformed negotiation lengths
+cannot consume a following startup packet. The complete negotiation,
+authentication, and startup flow has a 60-second timeout and creates no core
+session until authentication succeeds.
 
 For the startup packet and subsequent typed messages, a BriskDB-owned raw-frame
 gate runs before general dependency decoding and releases exactly one complete
@@ -99,14 +109,15 @@ The accepted startup keys are finite:
 | `application_name` | Optional, at most 63 UTF-8 bytes, with no control or replacement character |
 | `replication` | Optional literal `false`; other values are unsupported |
 
-Every other key is rejected. The `user` value is a bounded connection label,
-not a role lookup or credential check. Authentication and role catalogs are
-separate later work; it is also unrelated to the HTTP browser's temporary
-login. Database selection is an exact lookup through the protocol-neutral
-catalog. Startup creates a core session only after every parameter and the
-database selection have passed validation.
+Every other key is rejected. In development mode `user` is only a bounded
+connection label. In secure mode it must match the single configured identity
+and complete SCRAM-SHA-256 (or SCRAM-SHA-256-PLUS channel binding). This is
+authentication, not authorization: no roles or per-user permissions exist,
+and it is unrelated to the HTTP browser login. Database selection is an exact
+protocol-neutral catalog lookup performed after secure authentication.
 
-Successful startup emits these frames in order:
+Secure startup first exchanges `AuthenticationSASL`, `SASLContinue`, and
+`SASLFinal`. Both modes then emit these frames in order:
 
 1. optional `NegotiateProtocolVersion(0, unsupported _pq_ options)`;
 2. `AuthenticationOk`;
@@ -153,6 +164,8 @@ can instead close without a response.
 | Invalid client encoding or application name | `22023` |
 | Unknown startup key or unsupported replication value | `0A000` |
 | Unsupported protocol major version or malformed startup message | `08P01` |
+| Plaintext startup while security is configured | `08004` |
+| Wrong SCRAM user or password | `28P01` |
 
 A failed startup creates no retained core session, statement, portal, route, or
 SQLite operation. A later connection can start normally.
@@ -247,14 +260,20 @@ shared server and enters the same cleanup path.
 
 ## Compatibility and storage boundary
 
-`pgwire` remains pinned exactly at 0.36.3 with default features disabled and
-only `server-api` enabled. Production framing is contained in
+`pgwire` remains pinned exactly at 0.36.3 with default features disabled.
+BriskDB selects `server-api` plus its ring-backed TLS/SCRAM feature, without
+AWS-LC or dependency-owned extended type adapters. Production framing is contained in
 `protocol::postgres`; `core`, `storage`, `sql`, `server`, and the public API do
 not accept or return dependency types. The adapter uses BriskDB's catalog,
 session lifecycle, fixed SQLSTATE table, and safe messages.
 
-This work changes no HTTP route, JSON body, SQL subset, planner rule, manifest
-table, shard header, migration journal, stored row, or storage-format version.
+TLS keys, certificates, plaintext passwords, and derived SCRAM material are
+process configuration only; none is written to the BriskDB data root. The
+password file is read into bounded memory, converted to a random-salted SCRAM
+secret, and cleared. On Unix, private key/password files may be group-readable
+but cannot be group-writable or accessible by other users. This work changes no
+HTTP route, JSON body, SQL subset, planner rule, manifest table, shard header,
+migration journal, stored row, or storage-format version.
 Declared SQLite type metadata is now retained in protocol-neutral statement
 descriptions; PostgreSQL OIDs, formats, and raw parameter bytes remain confined
 to the adapter and connection memory.
@@ -268,7 +287,9 @@ Automated coverage includes:
 
 - disabled-by-default, explicit IPv4/IPv6, environment, CLI-over-environment, and
   malformed configuration values;
-- loopback validation before database or listener creation;
+- rejection of insecure non-loopback activation before database/listener creation;
+- TLS certificate/key/password validation, fixed plaintext rejection, successful
+  SCRAM queries, wrong-password SQLSTATE, concurrent authentication, and recovery;
 - dual-listener binding, bind-failure cleanup, and clean retry;
 - exact `SSLRequest`/`GSSENCRequest` refusal and boundary handling, startup frame
   order, selected identity, omitted-database behavior, and useful BriskDB server

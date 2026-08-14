@@ -259,7 +259,7 @@ the engine regardless of its eventual wire protocol.
   pinning. Report PostgreSQL's idle/in-transaction/failed (`I`/`T`/`E`) states
   even where SQLite's native behavior differs.
 - [x] Support `CancelRequest`/backend keys and wire cancellation to the core.
-- [ ] Add TLS and SCRAM-SHA-256 before non-loopback use; never ship cleartext
+- [x] Add TLS and SCRAM-SHA-256 before non-loopback use; never ship cleartext
   password authentication on an unencrypted listener.
 - [ ] Add compatibility shims for `SELECT version()`, common `SHOW` commands,
   and only the catalog queries needed by explicitly tested clients.

@@ -1,15 +1,14 @@
 # PostgreSQL adapter decision record
 
-Status: accepted for roadmap issue #29; amended by issue #30 production startup
-activation, issue #31 extended-query execution, issue #32 protocol
-negotiation, and issue #33 type/format mapping
+Status: accepted for roadmap issue #29; amended through issue #36 TLS and
+SCRAM-SHA-256 authentication
 
 BriskDB needs a PostgreSQL frontend library that can own protocol framing and
 message dispatch without becoming the database engine, routing policy,
 prepared-object store, or public error taxonomy. This record selects that
 library, fixes its dependency boundary, documents the compatibility probe, and
-records the BriskDB-owned startup constraints applied when issue #30 activated
-the configured loopback listener.
+records the BriskDB-owned startup and security constraints applied to the
+configured listener.
 
 ## Decision
 
@@ -33,27 +32,27 @@ behavior, and MSRV decision followed by the complete verification matrix.
 
 ## Selected feature surface
 
-Only `server-api` is enabled. That supplies the Tokio socket entrypoint,
+Default features remain disabled. `server-api` supplies the Tokio socket entrypoint,
 frontend/backend messages, handler traits, PostgreSQL type descriptors, and
-row messages used by startup and the query adapter.
+row messages used by startup and the query adapter. BriskDB's `tls` feature
+adds `server-api-ring` for rustls transport and SCRAM-SHA-256.
 
-The dependency's defaults are disabled because they additionally select an
-AWS-LC TLS backend and extended chrono, decimal, and JSON adapters. BriskDB does
-not need those dependencies for the issue-29 fit check:
+The dependency's defaults are disabled because they select AWS-LC and extended
+chrono, decimal, and JSON adapters. BriskDB selects ring deliberately:
 
 | `pgwire` feature area | Issue #29 decision | Owning follow-up |
 | --- | --- | --- |
-| Plain server API | Enabled | Foundation for issues #30 and #31 |
-| AWS-LC or ring TLS provider | Not enabled | TLS and SCRAM issue #36 |
+| Plain server API | Enabled | Foundation for the wire adapter |
+| ring TLS provider | Enabled by BriskDB `tls`/`listeners` | TLS and SCRAM issue #36 |
+| AWS-LC TLS provider | Not enabled | Avoid a second provider and dependency defaults |
 | Chrono type adapter | Not enabled | No BriskDB date/time value type yet |
 | Rust-decimal adapter | Not enabled | BriskDB-owned arbitrary decimal wire codec |
 | Serde-JSON adapter | Not enabled | JSON parameters remain protocol-neutral text |
 | Client API | Not enabled | Named external-client matrix issue #38 |
 
 The resolved graph uses the repository's existing Tokio 1.53.1 rather than a
-second Tokio version. `cargo tree -e features -i pgwire` reports only the
-`server-api` feature. The selected graph contains no `aws-lc`, `ring`,
-`tokio-rustls`, `chrono`, or `rust_decimal` package through `pgwire`.
+second Tokio version. It contains ring, rustls, and tokio-rustls, but no AWS-LC,
+chrono, or rust-decimal adapter through `pgwire`.
 
 ## BriskDB-owned boundary
 
@@ -181,8 +180,8 @@ tests remain authoritative.
 
 ## Current listener behavior
 
-Issue #30 activates production protocol 3.0 startup on configured loopback
-addresses. The listener validates a finite startup parameter set, resolves an
+Issue #30 activates production protocol 3.0 startup. The listener validates a
+finite startup parameter set, resolves an
 exact logical database through the core catalog, creates one session only after
 validation, emits BriskDB-owned status, and tracks that session through
 termination and server shutdown. It does not use the dependency's default
@@ -200,8 +199,10 @@ single-shard transactions, retained connection ownership, failed state, and
 exact `I`/`T`/`E` wire status. Issue #35 gives each connected backend a random
 key and maps an exact-key `CancelRequest` to a fresh core cancellation token for
 only the command currently running on that backend. Disconnect and shutdown
-unregister the key and cancel active work. Later roadmap issues retain
-TLS/SCRAM, client-matrix, and row-streaming scopes. The exact
+unregister the key and cancel active work. Issue #36 adds TLS plus
+single-identity SCRAM-SHA-256, requires secure mode before non-loopback binding,
+and delays database lookup/session creation until authentication succeeds.
+Later roadmap issues retain client-matrix and row-streaming scopes. The exact
 live contract and user workflow are in the
 [PostgreSQL listener document](POSTGRES_LISTENER.md) and
 [query quickstart](POSTGRES_QUICKSTART.md).
@@ -217,11 +218,12 @@ errors use fixed ordinary severity. An error in an active transaction changes
 the core session and PostgreSQL status to failed; later statements receive
 `25P02` until rollback.
 
-This decision adds no CLI or environment setting and does not change listener
-defaults, HTTP routes, JSON, SQL support, routing, engine limits, manifest or
-shard schemas, storage versions, migration journals, file headers, checksums,
-or recovery behavior. Adapter and connection state exist only in process
-memory and disappear on close or restart.
+Issue #36 adds certificate, key, user, and password-file process settings while
+leaving the listener disabled by default. It changes no HTTP route, JSON, SQL
+support, routing, engine limit, manifest/shard schema, storage version,
+migration journal, file header, checksum, or recovery behavior. Authentication
+and connection state exist only in process memory and disappear on close or
+restart.
 
 ## Upgrade and verification policy
 

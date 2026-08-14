@@ -1,10 +1,9 @@
 # PostgreSQL query quickstart
 
-BriskDB's disabled-by-default loopback PostgreSQL listener can execute one
-simple-query protocol statement at a time against tables registered in its
-logical catalog. This walkthrough creates a standard SQLite source, imports it
-as a four-shard BriskDB data directory, starts the listener, and writes and
-reads data with `psql`.
+BriskDB's disabled-by-default PostgreSQL listener executes simple and
+parameterized queries against tables registered in its logical catalog. This
+walkthrough creates a standard SQLite source, imports it as a four-shard
+BriskDB data directory, starts the local listener, and uses `psql`.
 
 Install `sqlite3` and the PostgreSQL client, then use either the release
 `briskdb` and `briskdb-import` binaries or prefix those commands with
@@ -49,8 +48,8 @@ briskdb \
   --postgres-listen 127.0.0.1:5433
 ```
 
-Leave the server running and connect from another terminal. There is currently
-no credential verification or TLS, so the listener accepts only a numeric
+Leave the server running and connect from another terminal. This development
+form has no credential verification, so BriskDB permits it only on a numeric
 loopback address. The `user` value is a bounded session label and `default` is
 the imported logical database.
 
@@ -67,6 +66,38 @@ psql "host=127.0.0.1 port=5433 user=briskdb dbname=default sslmode=disable" \
 psql "host=127.0.0.1 port=5433 user=briskdb dbname=default sslmode=disable" \
   -c "DELETE FROM records WHERE tenant_id = 'tenant-a'"
 ```
+
+## TLS and SCRAM-SHA-256
+
+Secure mode needs a PEM certificate chain, matching PEM private key, one user,
+and a password file. The password is never accepted as a CLI value. A single
+trailing line ending in the file is removed; the remaining UTF-8 password must
+be one non-empty line of at most 1,024 bytes.
+
+```bash
+chmod 600 ./server.key ./postgres-password
+
+briskdb \
+  --data-dir "$demo_dir/briskdb-data" \
+  --shards 4 \
+  --postgres-listen 0.0.0.0:5433 \
+  --postgres-tls-cert ./server.crt \
+  --postgres-tls-key ./server.key \
+  --postgres-user briskdb \
+  --postgres-password-file ./postgres-password
+
+psql "host=HOST port=5433 user=briskdb dbname=default sslmode=verify-full sslrootcert=./ca.crt"
+```
+
+`BRISKDB_POSTGRES_TLS_CERT`, `BRISKDB_POSTGRES_TLS_KEY`,
+`BRISKDB_POSTGRES_USER`, and `BRISKDB_POSTGRES_PASSWORD_FILE` are the equivalent
+environment settings. Certificate, key, and password file must be configured
+together. On Unix, the key and password file may be group-readable, but cannot
+be group-writable or accessible by other users. BriskDB supports PostgreSQL's
+normal SSLRequest flow and direct TLS with `postgresql` ALPN.
+
+This authenticates one configured identity; every authenticated connection has
+the same database capabilities. Roles and authorization are not implemented.
 
 Interactive sessions can group operations on one shard:
 
@@ -108,9 +139,9 @@ and inspect it with `systemctl status briskdb` and
 - `BEGIN`/`COMMIT`/`ROLLBACK` provide a real single-shard SQLite transaction,
   including read-your-writes and PostgreSQL `I`/`T`/`E` status. Cross-shard
   access is rejected before mutation.
-- DDL, savepoints, `COPY`, authentication, authorization, TLS, and full
-  PostgreSQL compatibility are not supported. Initialize the catalog offline
-  with `briskdb-import` before starting the server.
+- DDL, savepoints, `COPY`, roles/authorization, and full PostgreSQL
+  compatibility are not supported. Initialize the catalog offline with
+  `briskdb-import` before starting the server.
 
 The detailed wire and lifecycle contract is in
 [`POSTGRES_LISTENER.md`](POSTGRES_LISTENER.md). The import's validation and

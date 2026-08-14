@@ -165,6 +165,7 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let server_config = server::Config {
         listen: "127.0.0.1:7654".parse().unwrap(),
         postgres_listen: Some("127.0.0.1:5433".parse().unwrap()),
+        postgres_security: None,
         data_dir: std::path::PathBuf::from("./briskdb-data"),
         shards: 4,
     };
@@ -172,6 +173,11 @@ fn legacy_and_explicit_module_paths_are_both_available() {
         server_config.postgres_listen,
         Some("127.0.0.1:5433".parse().unwrap())
     );
+    let postgres_security =
+        postgres::SecurityConfig::new("server.crt", "server.key", "briskdb", "postgres-password")
+            .unwrap();
+    assert_eq!(postgres_security.user(), "briskdb");
+    let _secure_attached_server_entry_point = server::AttachedServer::start_secure;
 
     let result = core::ResultSet::new(
         vec![core::Column::new("value", core::DataType::Int64)],

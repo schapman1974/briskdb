@@ -104,17 +104,19 @@ The HTTP address remains `Config::listen`. The independent
 `Config::postgres_listen` is either a numeric socket address or disabled with
 `None`; the binary maps the exact `disabled` CLI/environment sentinel to that
 option. The process default disables PostgreSQL; callers may explicitly enable
-loopback `127.0.0.1:5433`. See the
+loopback `127.0.0.1:5433`, while non-loopback binds require the complete
+`Config::postgres_security` TLS/SCRAM value. See the
 [PostgreSQL listener contract](POSTGRES_LISTENER.md) for the full grammar and
 startup order.
 
-Issue #29 selects exact `pgwire` 0.36.3 with only `server-api` and adds the
+Issue #29 selects exact `pgwire` 0.36.3 with `server-api` and adds the
 BriskDB-owned `protocol::postgres::{Adapter, Connection}` seam. Issue #30
-connects the production loopback listener to that adapter for exact protocol
+connects the production listener to that adapter for exact protocol
 3.0 startup. Issue #31 adds bounded named and unnamed prepared statements and
 portals, Describe/Execute, suspension without re-execution, cascading Close,
 Flush, and Sync recovery. Issue #33 adds declared protocol-neutral result types
-and adapter-owned PostgreSQL OID plus text/binary codecs. Parameter validation,
+and adapter-owned PostgreSQL OID plus text/binary codecs. Issue #36 adds the
+ring/rustls transport and single-identity SCRAM-SHA-256. Parameter validation,
 logical database/user selection, fixed status/error frames, and terminal
 session cleanup stay in `protocol::postgres`; socket binding, the 256-task cap,
 and task draining stay in `server`. A successful startup creates one core `Session` only after

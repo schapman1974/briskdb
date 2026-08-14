@@ -31,20 +31,22 @@ service-manager integration beyond those signals is not yet part of the support
 contract.
 
 The supported runner tests separate Tokio TCP listeners on numeric IPv4
-loopback addresses, concurrent HTTP and PostgreSQL startup sessions, disabled
-PostgreSQL binding, bind-failure cleanup, and shutdown of both listeners.
+secure/non-secure address validation, concurrent HTTP and PostgreSQL sessions,
+disabled PostgreSQL binding, bind-failure cleanup, TLS/SCRAM exchange, and
+shutdown of both listeners.
 Numeric IPv6 `SocketAddr` parsing is part of the CLI contract; an individual
 host must still provide the requested address family. The PostgreSQL endpoint
-currently supports startup and session lifecycle but not SQL execution. Its
-exact process behavior is documented in
+supports bounded SQL execution, cancellation, and single-shard transactions.
+Its exact process behavior is documented in
 [PostgreSQL listener lifecycle](POSTGRES_LISTENER.md).
 
-The selected PostgreSQL library is pinned to `pgwire` 0.36.3 with only its
-`server-api` feature. It is the newest release declaring compatibility with the
-project's Rust 1.85 minimum; 0.37 and newer require Rust 1.89. CI compiles the
+The selected PostgreSQL library is pinned to `pgwire` 0.36.3 with its server API
+and ring-backed TLS/SCRAM surface. It declares compatibility with the project's
+Rust 1.85 minimum; 0.37 and newer require Rust 1.89. CI compiles the
 locked adapter/core compatibility probe on Rust 1.85 and stable. This library
-selection is active only behind BriskDB-owned startup, status, error, and
-session-lifecycle policy; see the [adapter decision record](POSTGRES_ADAPTER.md).
+selection is active only behind BriskDB-owned framing, authentication, startup,
+status, error, and session policy; see the
+[adapter decision record](POSTGRES_ADAPTER.md).
 
 The same runner exercises the embedded `/admin` shell and assets, temporary
 login/session lifecycle, physical-shard table discovery, and bounded row-page

@@ -11,13 +11,14 @@ engine. It keeps the durability, WAL, transactions, tooling, and boring
 reliability developers already trust—then adds routing, parallel writer domains,
 global reads, generated IDs, an HTTP API, and wire-protocol frontends.
 
-**HTTP, bounded PostgreSQL queries, and in-process Rust and Python embedding
-work today. Embedded hosts can optionally expose the same engine over loopback
+**HTTP, TLS/SCRAM-protected PostgreSQL queries, and in-process Rust and Python
+embedding work today. Embedded hosts can optionally expose the same engine over
 HTTP and PostgreSQL. Native MongoDB, MySQL, and serverless use are on the roadmap.**
 
 > [!WARNING]
 > BriskDB is an alpha. It is exciting infrastructure, not yet a production-ready
-> database service. The current unauthenticated listeners are loopback-only.
+> database service. HTTP and unauthenticated PostgreSQL remain loopback-only;
+> PostgreSQL may bind remotely only with TLS and SCRAM-SHA-256 configured.
 
 ## Why developers might care
 
@@ -107,7 +108,7 @@ experimental and opt-in; the exact contract lives in
 | Durable virtual-bucket routing over independent SQLite WAL files | Working |
 | Exact-key routing and bounded scatter/gather reads | Working |
 | HTTP query/write API and admin data browser | Working, loopback-only |
-| PostgreSQL wire protocol | Text/binary CRUD, cancellable requests, and real single-shard `BEGIN`/`COMMIT`/`ROLLBACK` |
+| PostgreSQL wire protocol | TLS/SCRAM, text/binary CRUD, cancellation, and real single-shard transactions |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
@@ -141,6 +142,10 @@ cargo run --release -- --postgres-listen 127.0.0.1:5433
 psql -h 127.0.0.1 -p 5433 -d default
 ```
 
+That local development form is unauthenticated and therefore loopback-only.
+The [PostgreSQL quickstart](docs/POSTGRES_QUICKSTART.md) shows the four settings
+for TLS plus SCRAM-SHA-256; secure mode is required for any remote bind.
+
 Registered tables can also be queried over HTTP:
 
 ```bash
@@ -162,7 +167,8 @@ the manifest and reject explicit mismatches. Use `default-features = false` with
 [crate feature map](docs/CRATE_FEATURES.md).
 
 Python can run the same engine directly in-process. It starts no listener by
-default, but `Database.serve()` can attach loopback HTTP/PostgreSQL listeners:
+default, but `Database.serve()` can attach HTTP/PostgreSQL listeners (remote
+PostgreSQL requires its TLS/SCRAM arguments):
 
 ```bash
 python -m pip install ./python
@@ -214,7 +220,8 @@ Follow the [roadmap](ROADMAP.md) or browse the
 
 ## Honest alpha boundaries
 
-- No authentication, authorization, or TLS yet; listeners are loopback-only.
+- PostgreSQL has TLS and single-identity SCRAM-SHA-256 authentication, but no
+  roles or authorization yet. HTTP remains a loopback-only development surface.
 - No general atomic transaction across multiple shard files.
 - Global ordering/pagination and general aggregate pushdown are still limited.
 - The supported backup today is a stopped-server copy of the complete data

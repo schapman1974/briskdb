@@ -13,6 +13,7 @@ use briskdb::{
     BriskDb, BriskSession, CancellationToken as EngineCancellationToken, CheckpointReport, Column,
     EngineOptions, EngineState, EngineStatus, Executed, PreparedStatementLimits, RequestContext,
     ResultLimits, ResultSet, Routed, SessionState, Statement, Value,
+    protocol::postgres::SecurityConfig as PostgresSecurityConfig,
     server::{AttachedServer, ListenerAddresses, ListenerConfig},
 };
 use pyo3::{
@@ -544,15 +545,49 @@ impl Database {
         checkpoint_to_python(py, report)
     }
 
-    #[pyo3(signature = (*, http = "127.0.0.1:0", postgres = None))]
-    fn serve(&self, py: Python<'_>, http: &str, postgres: Option<&str>) -> PyResult<Server> {
+    #[pyo3(signature = (
+        *,
+        http = "127.0.0.1:0",
+        postgres = None,
+        postgres_tls_cert = None,
+        postgres_tls_key = None,
+        postgres_user = "briskdb",
+        postgres_password_file = None,
+    ))]
+    // These are separate keyword-only arguments in the stable Python API.
+    #[allow(clippy::too_many_arguments)]
+    fn serve(
+        &self,
+        py: Python<'_>,
+        http: &str,
+        postgres: Option<&str>,
+        postgres_tls_cert: Option<PathBuf>,
+        postgres_tls_key: Option<PathBuf>,
+        postgres_user: &str,
+        postgres_password_file: Option<PathBuf>,
+    ) -> PyResult<Server> {
         let http_listen = parse_listener_address(http, "HTTP")?;
         let postgres_listen = postgres
             .map(|address| parse_listener_address(address, "PostgreSQL"))
             .transpose()?;
         validate_python_listener_address(http_listen, "HTTP")?;
-        if let Some(address) = postgres_listen {
-            validate_python_listener_address(address, "PostgreSQL")?;
+        let postgres_security = match (postgres_tls_cert, postgres_tls_key, postgres_password_file)
+        {
+            (None, None, None) => None,
+            (Some(certificate), Some(private_key), Some(password_file)) => Some(
+                PostgresSecurityConfig::new(certificate, private_key, postgres_user, password_file)
+                    .map_err(listener_error)?,
+            ),
+            _ => {
+                return Err(crate::error::invalid_value(
+                    "postgres_tls_cert, postgres_tls_key, and postgres_password_file must be set together",
+                ));
+            }
+        };
+        if postgres_security.is_none() {
+            if let Some(address) = postgres_listen {
+                validate_python_listener_address(address, "PostgreSQL")?;
+            }
         }
         let shared = Arc::clone(&self.shared);
         run_native(py, move || {
@@ -563,17 +598,25 @@ impl Database {
                 .as_ref()
                 .cloned()
                 .ok_or(NativeError::Closed("database"))?;
-            let attached = shared
-                .runtime
-                .runtime
-                .block_on(AttachedServer::start(
-                    &database,
-                    ListenerConfig {
-                        http_listen,
-                        postgres_listen,
-                    },
-                ))
-                .map_err(listener_error)?;
+            let listener_config = ListenerConfig {
+                http_listen,
+                postgres_listen,
+            };
+            let attached = match postgres_security {
+                Some(security) => shared
+                    .runtime
+                    .runtime
+                    .block_on(AttachedServer::start_secure(
+                        &database,
+                        listener_config,
+                        security,
+                    )),
+                None => shared
+                    .runtime
+                    .runtime
+                    .block_on(AttachedServer::start(&database, listener_config)),
+            }
+            .map_err(listener_error)?;
             let server = Arc::new(ServerShared {
                 addresses: attached.addresses(),
                 server: Mutex::new(Some(attached)),

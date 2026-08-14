@@ -4,8 +4,14 @@
 # The alpha HTTP endpoint has no authentication or TLS and must remain loopback.
 BRISKDB_LISTEN=127.0.0.1:7654
 
-# PostgreSQL simple queries are available on loopback but have no auth or TLS.
+# PostgreSQL may run unauthenticated only on loopback. To bind remotely, set
+# all three commented file paths below; the key/password may be mode 0640 with
+# group briskdb but must not be group-writable or accessible by other users.
 BRISKDB_POSTGRES_LISTEN=disabled
+BRISKDB_POSTGRES_USER=briskdb
+# BRISKDB_POSTGRES_TLS_CERT=/etc/briskdb/postgres.crt
+# BRISKDB_POSTGRES_TLS_KEY=/etc/briskdb/postgres.key
+# BRISKDB_POSTGRES_PASSWORD_FILE=/etc/briskdb/postgres-password
 
 # Persistent package-managed state location. Back up this complete directory
 # only while the service is stopped.

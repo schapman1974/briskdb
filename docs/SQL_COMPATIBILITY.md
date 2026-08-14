@@ -49,11 +49,12 @@ claiming to be a drop-in PostgreSQL or MySQL replacement.
 ## Current implementation
 
 The initial alpha exposes experimental HTTP plus a disabled-by-default,
-separately configured loopback PostgreSQL listener. PostgreSQL implements exact
+separately configured PostgreSQL listener. PostgreSQL implements exact
 protocol-3.0 baseline and newer-minor downgrade, logical database/user
 selection, BriskDB parameter status, tracked session termination, simple
-queries, and parameterized text/binary extended queries through a pinned
-`pgwire` 0.36.3 boundary. There is no MySQL listener. The public Rust SQL facade
+queries, parameterized text/binary extended queries, single-shard transactions,
+cancellation, and optional TLS/SCRAM through a pinned `pgwire` 0.36.3 boundary.
+Unauthenticated mode is loopback-only. There is no MySQL listener. The public Rust SQL facade
 can parse an explicitly selected SQLite, PostgreSQL, or MySQL dialect, consume
 that result with
 `validate_common_subset(ParsedSql)`, borrow the result with
@@ -94,17 +95,17 @@ set, every shard for an unconstrained Sharded read, or shard 0 once for a
 | HTTP `/v1/query` | Experimental | Empty catalog: legacy raw SQLite query. Populated catalog: exactly one SQLite common-subset read; no session cache; multi-shard execution is limited to the row-local scatter-safe subset | Empty catalog requires caller `shard_key`; populated catalog derives targets from registered metadata, reads Global data once on shard 0, and denies Catalog/undeclared tables |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch; populated catalogs reject row-moving DML, table drops, and trigger creation | Preflight on every shard, then ascending resumable apply |
 | HTTP `/admin` browser | Experimental, read-only | No caller SQL; metadata-driven logical table discovery, specialized exact logical `COUNT(*)`, and bounded deterministic `SELECT *` page slices | Sharded tables visit all files; Global tables visit shard 0 once; no browser shard selector or arbitrary SQL |
-| PostgreSQL wire protocol | Protocol-3.0 baseline with newer 3.x minor downgrade, plus simple `Query` and parameterized text/binary extended flow on loopback | Registered-table `SELECT`, `INSERT`, `UPDATE`, and `DELETE`; basic OIDs and value formats are implemented, while DDL and transactions remain unsupported | Startup selects an exact logical database; both flows use Engine prepare/bind/logical execution and fixed SQLSTATE mapping |
+| PostgreSQL wire protocol | Protocol 3.0, newer-minor downgrade, TLS/SCRAM, cancellation, simple and extended flow | Registered-table CRUD, basic OIDs/formats, and single-shard transactions; DDL remains unsupported | Secure startup authenticates before database/session creation; queries use Engine prepare/bind/logical execution and fixed SQLSTATE mapping |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
 The parser, subset validator, statement classifier, placeholder normalizer, SQL
 translator, shard-key inference function, engine planner, and prepared
 lifecycle are implemented Rust APIs, not PostgreSQL or MySQL query interfaces.
-PostgreSQL production startup connects only identity, catalog selection,
-status, and session cleanup; the historical private issue-29 parser probe does
-not make that prepared pipeline public wire behavior. Authoritative table
-registration composes the SQLite frontend and planner into the existing HTTP
-execute/query rows as described above; it adds no HTTP field or route.
+PostgreSQL production startup, authentication, simple/extended queries,
+transactions, cancellation, catalog selection, status, and cleanup all stay
+behind the adapter boundary. Authoritative table registration composes the
+SQLite frontend and planner into both PostgreSQL and HTTP execution without
+adding an HTTP field or route.
 
 The `experimental-vtab` Cargo feature also contains internal read-only and
 writable `brisk_shard` coordinators for the no-fork virtual-table boundary.
