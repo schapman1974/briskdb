@@ -212,7 +212,6 @@ impl ConnectionPools {
     }
 
     /// Reserve one slot on every shard in deterministic shard order.
-    #[cfg(test)]
     pub(crate) async fn acquire_all_for_owner(
         &self,
         owner: ConnectionOwner,

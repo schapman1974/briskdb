@@ -108,6 +108,65 @@ pub struct EngineStatus {
     shutdown_grace: Duration,
 }
 
+/// Result of one passive WAL checkpoint on a physical shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointShardReport {
+    shard: u16,
+    busy: bool,
+    wal_frames: u64,
+    checkpointed_frames: u64,
+}
+
+impl CheckpointShardReport {
+    /// Return the physical shard that was checkpointed.
+    pub const fn shard(self) -> u16 {
+        self.shard
+    }
+
+    /// Return whether SQLite reported a competing checkpoint operation.
+    pub const fn busy(self) -> bool {
+        self.busy
+    }
+
+    /// Return the number of frames SQLite observed in the WAL.
+    pub const fn wal_frames(self) -> u64 {
+        self.wal_frames
+    }
+
+    /// Return the number of frames SQLite copied into the database file.
+    pub const fn checkpointed_frames(self) -> u64 {
+        self.checkpointed_frames
+    }
+
+    /// Return whether every WAL frame observed by this attempt was copied.
+    pub const fn complete(self) -> bool {
+        self.checkpointed_frames >= self.wal_frames
+    }
+}
+
+/// Ordered result of a passive checkpoint across every physical shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointReport {
+    shards: Vec<CheckpointShardReport>,
+}
+
+impl CheckpointReport {
+    /// Return one report for every physical shard, ordered by shard ID.
+    pub fn shards(&self) -> &[CheckpointShardReport] {
+        &self.shards
+    }
+
+    /// Return whether any shard reported incomplete checkpoint progress.
+    pub fn busy(&self) -> bool {
+        self.shards.iter().any(|shard| shard.busy())
+    }
+
+    /// Return whether every shard checkpoint copied all frames it observed.
+    pub fn complete(&self) -> bool {
+        self.shards.iter().all(|shard| shard.complete())
+    }
+}
+
 impl EngineStatus {
     /// Return the number of physical shards opened by the engine.
     pub const fn shard_count(&self) -> u16 {
@@ -665,6 +724,106 @@ impl Engine {
         }
         .await;
         operation.finish(result)
+    }
+
+    /// Ask SQLite to passively checkpoint every shard without blocking writers.
+    ///
+    /// The operation participates in ordinary engine admission, cancellation,
+    /// deadlines, schema coordination, pool limits, and graceful shutdown. A
+    /// successful report can still be `busy` when active readers prevent every
+    /// eligible WAL frame from being copied; callers may retry later.
+    pub async fn checkpoint(&self) -> EngineResult<CheckpointReport> {
+        self.checkpoint_with_context(RequestContext::new()).await
+    }
+
+    /// Passively checkpoint every shard with host-supplied request controls.
+    pub async fn checkpoint_with_context(
+        &self,
+        context: RequestContext,
+    ) -> EngineResult<CheckpointReport> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let permits = match operation
+            .wait_pending(
+                self.inner
+                    .connections
+                    .acquire_all_for_owner(ConnectionOwner::stateless_catalog_write()),
+            )
+            .await
+        {
+            Ok(permits) => permits,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if let Err(error) = operation.check_before_start() {
+            return operation.finish(Err(error));
+        }
+
+        let lease = operation.take_lease();
+        let control = Arc::clone(&operation.control);
+        let worker_control = Arc::clone(&control);
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _schema_operation = schema_operation;
+            let result = permits
+                .into_iter()
+                .map(|(shard, permit)| {
+                    permit
+                        .checkout_controlled(Arc::clone(&worker_control))
+                        .and_then(|mut connection| {
+                            let result = connection.run_controlled(
+                                Arc::clone(&worker_control),
+                                |connection| {
+                                    let (busy, wal_frames, checkpointed_frames) = connection
+                                        .query_row(
+                                            "PRAGMA main.wal_checkpoint(PASSIVE)",
+                                            [],
+                                            |row| {
+                                                Ok((
+                                                    row.get::<_, i64>(0)?,
+                                                    row.get::<_, i64>(1)?,
+                                                    row.get::<_, i64>(2)?,
+                                                ))
+                                            },
+                                        )
+                                        .map_err(crate::sqlite_error::storage)?;
+                                    let wal_frames = u64::try_from(wal_frames).map_err(|_| {
+                                        EngineError::new(
+                                            EngineErrorKind::DataCorruption,
+                                            "SQLite returned a negative WAL frame count",
+                                        )
+                                    })?;
+                                    let checkpointed_frames =
+                                        u64::try_from(checkpointed_frames).map_err(|_| {
+                                            EngineError::new(
+                                                EngineErrorKind::DataCorruption,
+                                                "SQLite returned a negative checkpointed frame count",
+                                            )
+                                        })?;
+                                    Ok(CheckpointShardReport {
+                                        shard,
+                                        busy: busy != 0,
+                                        wal_frames,
+                                        checkpointed_frames,
+                                    })
+                                },
+                            );
+                            retire_if_broken(&mut connection, &result);
+                            result
+                        })
+                })
+                .collect::<EngineResult<Vec<_>>>()
+                .map(|shards| CheckpointReport { shards });
+            worker_control.complete(result)
+        });
+        let result = operation.wait_started(join).await;
+        operation.finish_started(result)
     }
 
     /// Parse, validate, translate, and transiently compile one prepared statement.

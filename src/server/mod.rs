@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     core::{Engine, EngineOptions},
+    embedded::BriskDb,
     protocol::{http, postgres},
 };
 
@@ -73,12 +74,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// [`EngineOptions::default`].
 pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> anyhow::Result<()> {
     validate_listener_addresses(&config)?;
-    let engine = Engine::open_with_options(&config.data_dir, config.shards, options).await?;
+    let database = BriskDb::builder(&config.data_dir)
+        .with_shard_count(config.shards)
+        .with_engine_options(options)
+        .open()
+        .await?;
     let listeners = match BoundListeners::bind(&config).await {
         Ok(listeners) => listeners,
         Err(error) => {
-            engine.begin_shutdown();
-            if let Err(shutdown_error) = engine.shutdown().await {
+            database.begin_close();
+            if let Err(shutdown_error) = database.close().await {
                 warn!(error = %shutdown_error, "failed to clean up after listener startup error");
             }
             return Err(error);
@@ -90,13 +95,14 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
     let signal = match shutdown_signal() {
         Ok(signal) => signal,
         Err(error) => {
-            engine.begin_shutdown();
-            if let Err(shutdown_error) = engine.shutdown().await {
+            database.begin_close();
+            if let Err(shutdown_error) = database.close().await {
                 warn!(error = %shutdown_error, "failed to clean up after signal startup error");
             }
             return Err(error);
         }
     };
+    let engine = database.engine().clone();
 
     #[cfg(feature = "experimental-vtab")]
     let experimental_vtab_writes = engine.options().experimental_vtab_writes();
@@ -136,7 +142,9 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
         "BriskDB is ready"
     );
 
-    serve_listeners_with_shutdown(listeners, engine, signal).await
+    let result = serve_listeners_with_shutdown(listeners, engine, signal).await;
+    drop(database);
+    result
 }
 
 fn validate_listener_addresses(config: &Config) -> anyhow::Result<()> {
