@@ -329,9 +329,9 @@ CTEs, set operations, and windows until their global semantics are planned.
 These paths remain outside the current lifecycle:
 
 - contradictory reads that might later become an empty result without SQLite;
-- global writes, schema and session-statement execution paths;
+- global writes and schema-statement execution paths;
 - persistent DDL outside the journaled schema-migration API;
-- explicit transaction state and shard pinning.
+- cross-shard transactions, savepoints, and transaction modes.
 
 Cataloged sharded DML must already satisfy the policy in
 [SQL planning](SQL_PLANNING.md). Explicit-key DML executes only with one
@@ -348,8 +348,10 @@ execution permission.
 Persistent `CREATE TABLE` and `CREATE INDEX` are classified as `Schema`, but
 ordinary shard authorizer policy denies them during transient preparation with
 `PermissionDenied`, so no prepared handle or description is published. A
-session-control singleton can be prepared and described, but portal execution
-returns `Unsupported` before SQLite is stepped and leaves the session usable.
+`BEGIN`, `COMMIT`, or `ROLLBACK` singleton can be prepared, described, bound,
+and executed. The first one-shard data statement pins a retained SQLite
+connection; later preparation and execution reuse that connection until commit
+or rollback. See [PostgreSQL transactions](POSTGRES_TRANSACTIONS.md).
 
 SQLite transiently prepares and executes the retained canonical SQLite SQL on
 the selected target or targets. Classified reads produce either the
@@ -376,8 +378,9 @@ the sorted, unique set visited by a logical operation.
 Prepare, bind, describe, and execute are ordinary engine operations. Their
 `*_with_context` methods apply the caller's sticky cancellation token and
 deadline; the engine default deadline is still an upper bound. Prepare and a
-schema-refreshing describe apply those controls while waiting for shard 0 and
-while SQLite compiles metadata. Execute also applies per-request result limits,
+schema-refreshing describe apply those controls while waiting for shard 0 (or
+the transaction's retained shard connection) and while SQLite compiles
+metadata. Execute also applies per-request result limits,
 SQLite interruption, rollback, pool cleanup, and exact-handle retirement. A
 logical scatter shares one absolute deadline, cancellation source, and result
 budget across all targets, and drains child cleanup before returning an error.
@@ -405,13 +408,15 @@ The lifecycle preserves the existing stable `EngineErrorKind` taxonomy:
 | --- | --- |
 | Unknown logical database, empty/multi-statement prepare, wrong bind arity, or conflicting explicit/inferred route | `InvalidArgument` |
 | SQL parse/SQLite compile failure or planner write-policy rejection where documented | `InvalidQuery` |
-| Unsupported subset/translation form, session execution, unsupported physical target, or row-producing write | `Unsupported` or the narrower documented SQL-path kind |
+| Unsupported subset/translation form, generated work in an explicit transaction, unsupported physical target, or row-producing write | `Unsupported` or the narrower documented SQL-path kind |
 | Persistent schema prepare, or execution with `Catalog` placement | `PermissionDenied` |
 | Incompatible key/value type | `TypeMismatch` |
 | Out-of-range unsigned integer or inferred integer | `NumericOutOfRange` |
 | Invalid text value | `InvalidTextEncoding` |
 | Full cache, full portal set, retained-value/planning limit, or sequence/accounting exhaustion | `LimitExceeded` |
 | Closed session, foreign engine/session handle, absent statement/portal, or pending schema migration | `FailedPrecondition` |
+| Cross-shard or multi-shard work in an explicit transaction | `FailedPrecondition` |
+| Work attempted after an explicit transaction has failed | `TransactionAborted` |
 | Pool/schema admission contention | `Busy` |
 | Request cancellation or deadline | `Cancelled` / `DeadlineExceeded` |
 | Degraded storage state | `DataCorruption` |

@@ -50,7 +50,7 @@ pub(crate) use planner::{CanonicalShardKeyRef, canonical_shard_key_bytes};
 pub(crate) use prepared::PreparedState;
 pub use prepared::{
     DescribeTarget, PortalId, PrepareRequest, PreparedExecution, PreparedStatementDescription,
-    PreparedStatementId,
+    PreparedStatementId, TransactionExecution,
 };
 pub(crate) use routing::{
     BUCKET_ALGORITHM_VERSION, HASH_VERSION, INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION,

@@ -527,19 +527,21 @@ KEY` alias remains an ordinary declared key and follows the catalog's normal
 locality rules.
 
 Other SQLite syntax may happen to pass through only on the empty-catalog legacy
-path and is not a stable BriskDB contract. In
-particular, multi-request transactions, multi-shard writes, multiple statements
-outside the migration endpoint, and attached-database operations are
-uncontracted public API behavior today. Persistent DDL outside the migration
+path and is not a stable BriskDB contract. In particular, multi-shard
+transactions, multiple statements outside the migration endpoint, and
+attached-database operations are uncontracted public API behavior today. A
+`Session` supports one single-shard transaction at a time, while the stateless
+HTTP endpoints remain autocommit-only. Persistent DDL outside the migration
 endpoint is explicitly denied. DML `RETURNING` is explicitly rejected from the
 query surface, and the execute surface exposes only a rows-affected count,
 never a returned rowset. Both empty- and populated-catalog HTTP modes use those
 same engine boundaries.
 
-The current `Session` `Ready`/`Closed` lifecycle is not a transaction state
-machine. Real `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction behavior, and
-single-shard pinning remain planned for the PostgreSQL and MySQL transaction
-work in issues #34 and #47.
+The current `Session` lifecycle implements `Ready`, `InTransaction`,
+`FailedTransaction`, and `Closed`. `BEGIN` pins the first exact one-shard
+statement, `COMMIT` and `ROLLBACK` release it, and failed transactions reject
+work until rollback. General cross-shard transactions remain unsupported;
+MySQL transaction work remains tracked by issue #47.
 
 The synchronous public Rust `Database` methods remain available for source
 compatibility. Network frontends use `Engine`; retaining `Database` does not
@@ -809,7 +811,7 @@ normative in the [adapter decision record](POSTGRES_ADAPTER.md).
 | `ON CONFLICT` | PostgreSQL upsert syntax | Outside the initial common subset and unsupported |
 | Functions/operators | PostgreSQL catalog | SQLite functions/operators unless an explicit shim is documented |
 | System catalogs | `pg_catalog`, `information_schema` | Only queries required by named, tested clients will be emulated |
-| Error behavior | SQLSTATE and failed transaction state | Startup and execution errors are encoded; extended flow resynchronizes at `Sync`, while complete `I`/`T`/`E` transaction states remain planned |
+| Error behavior | SQLSTATE and failed transaction state | Startup and execution errors are encoded; extended flow resynchronizes at `Sync`; explicit single-shard transactions report `I`/`T`/`E` and require rollback after failure |
 | `COPY`, replication, `LISTEN/NOTIFY` | PostgreSQL subprotocols/features | Deferred and unsupported initially |
 
 PostgreSQL's static result metadata does not always have an exact equivalent in
@@ -944,7 +946,7 @@ underlying execution semantics.
   creates a trigger; introduces an unsafe or malformed foreign key, trigger, or
   virtual table; or breaks one-owner unique-key locality.
 
-### Planned stable contract
+### Current transaction contract
 
 - Canonical key encoding, hash version, virtual bucket count, and bucket map are
   persisted in the manifest.
@@ -960,10 +962,12 @@ underlying execution semantics.
 
 ## Transactions and concurrency
 
-SQLite provides atomic transactions within one database file. BriskDB will not
-describe sequential commits to several shard files as atomic. The initial SQL
-session contract will therefore pin explicit transactions to one shard and
-reject cross-shard access.
+SQLite provides atomic transactions within one database file. BriskDB does not
+describe sequential commits to several shard files as atomic. The SQL session
+contract pins explicit transactions to one shard, retains that SQLite
+connection through commit or rollback, and rejects cross-shard access before
+mutation. Full details are in
+[PostgreSQL transactions](POSTGRES_TRANSACTIONS.md).
 
 Manifest-format migrations are separate from application SQL migrations. They
 run internally during storage open, are transactional only within

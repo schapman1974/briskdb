@@ -14,14 +14,15 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+use super::session::TransactionState;
 use super::{
     BlockingPool, BoundStatementPlan, CancelOnDrop, CancellationReason, CancellationToken,
     Database, DescribeTarget, EngineError, EngineErrorKind, EngineOptions, EngineResult,
     EngineState, Executed, Lifecycle, LogicalDatabaseId, OperationControl, OperationLease,
     PortalId, PrepareRequest, PreparedExecution, PreparedStatementDescription, PreparedStatementId,
     PreparedStatementLimits, RawDataOperation, RawDataTarget, RequestContext, ResultLimits,
-    ResultSet, Routed, Session, SessionInner, ShutdownReport, TablePlacement, Value,
-    merge_scatter_results, wait_for_cancellation, wait_pending,
+    ResultSet, Routed, Session, SessionInner, ShutdownReport, TablePlacement, TransactionExecution,
+    Value, merge_scatter_results, wait_for_cancellation, wait_pending,
 };
 use crate::{
     sql,
@@ -907,15 +908,13 @@ impl Engine {
         context: RequestContext,
     ) -> EngineResult<PreparedStatementId> {
         let mut operation = self.operation(context)?;
-        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
-            Ok(guard) => guard,
-            Err(error) => return operation.finish(Err(error)),
-        };
-        let guard = match operation.wait_pending(self.ready_session(session)).await {
-            Ok(guard) => guard,
-            Err(error) => return operation.finish(Err(error)),
-        };
+        let (schema_operation, mut guard) =
+            match self.session_with_schema(&operation, session).await {
+                Ok(admission) => admission,
+                Err(error) => return operation.finish(Err(error)),
+            };
         if self.catalog().database_by_id(request.database()).is_none() {
+            guard.fail_transaction();
             return operation.finish(Err(EngineError::new(
                 EngineErrorKind::InvalidArgument,
                 "selected logical database does not exist",
@@ -923,7 +922,10 @@ impl Engine {
         }
         let (database, behavior, translated) = match prepare_translated_request(request) {
             Ok(prepared) => prepared,
-            Err(error) => return operation.finish(Err(error)),
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
         };
         if let Err(error) = reject_catalog_prepared_target(
             self.catalog(),
@@ -931,15 +933,54 @@ impl Engine {
             translated.normalized_sql(),
             translated.statement_parameters()[0].parameter_count(),
         ) {
+            guard.fail_transaction();
             return operation.finish(Err(error));
         }
         if let Err(error) = guard.prepared().ensure_statement_capacity() {
+            guard.fail_transaction();
             return operation.finish(Err(error));
         }
         let parameter_count = translated.statement_parameters()[0].parameter_count();
         let sqlite_sql = translated.sqlite_sql().to_owned();
         let schema_generation = self.catalog().schema_generation();
         let owner = ConnectionOwner::new(session.id().get());
+
+        if matches!(behavior, sql::StatementBehavior::Session(_)) {
+            let result = operation.check_before_start().and_then(|()| {
+                let description = PreparedStatementDescription::new(
+                    behavior,
+                    parameter_count,
+                    Vec::new(),
+                    schema_generation,
+                );
+                let mut guard = guard;
+                guard
+                    .prepared_mut()
+                    .insert_statement(database, translated, description)
+            });
+            drop(schema_operation);
+            return operation.finish(result);
+        }
+
+        if guard
+            .transaction_mut()
+            .is_some_and(|transaction| transaction.connection.is_some())
+        {
+            let result = self
+                .run_transaction_prepare(
+                    &mut operation,
+                    schema_operation,
+                    guard,
+                    database,
+                    translated,
+                    behavior,
+                    parameter_count,
+                    sqlite_sql,
+                    schema_generation,
+                )
+                .await;
+            return operation.finish_started(result);
+        }
 
         let result = self
             .run_on_shard(
@@ -949,20 +990,27 @@ impl Engine {
                 schema_operation,
                 guard,
                 move |connection, session, control| {
-                    connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sqlite_sql)?;
-                    let metadata = connection.run_controlled(control, |connection| {
-                        sql::describe_statement(connection, &sqlite_sql)
-                    })?;
-                    ensure_parameter_metadata(parameter_count, metadata.parameter_count())?;
-                    let description = PreparedStatementDescription::new(
-                        behavior,
-                        parameter_count,
-                        metadata.columns().to_vec(),
-                        schema_generation,
-                    );
-                    session
-                        .prepared_mut()
-                        .insert_statement(database, translated, description)
+                    let result = (|| {
+                        connection
+                            .isolate_foreign_sql_controlled(Arc::clone(&control), &sqlite_sql)?;
+                        let metadata = connection.run_controlled(control, |connection| {
+                            sql::describe_statement(connection, &sqlite_sql)
+                        })?;
+                        ensure_parameter_metadata(parameter_count, metadata.parameter_count())?;
+                        let description = PreparedStatementDescription::new(
+                            behavior,
+                            parameter_count,
+                            metadata.columns().to_vec(),
+                            schema_generation,
+                        );
+                        session
+                            .prepared_mut()
+                            .insert_statement(database, translated, description)
+                    })();
+                    if result.is_err() {
+                        session.fail_transaction();
+                    }
+                    result
                 },
             )
             .await;
@@ -989,14 +1037,11 @@ impl Engine {
         context: RequestContext,
     ) -> EngineResult<PortalId> {
         let mut operation = self.operation(context)?;
-        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
-            Ok(guard) => guard,
-            Err(error) => return operation.finish(Err(error)),
-        };
-        let mut guard = match operation.wait_pending(self.ready_session(session)).await {
-            Ok(guard) => guard,
-            Err(error) => return operation.finish(Err(error)),
-        };
+        let (schema_operation, mut guard) =
+            match self.session_with_schema(&operation, session).await {
+                Ok(admission) => admission,
+                Err(error) => return operation.finish(Err(error)),
+            };
         let result = (|| {
             let routing_key = guard.routing_key().map(str::as_bytes);
             let template = guard.prepared().statement(statement)?;
@@ -1032,6 +1077,9 @@ impl Engine {
                 .prepared_mut()
                 .insert_portal(statement, parameters, routing_key)
         })();
+        if result.is_err() {
+            guard.fail_transaction();
+        }
         drop(schema_operation);
         operation.finish(result)
     }
@@ -1054,12 +1102,8 @@ impl Engine {
         context: RequestContext,
     ) -> EngineResult<PreparedStatementDescription> {
         let mut operation = self.operation(context)?;
-        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
-            Ok(guard) => guard,
-            Err(error) => return operation.finish(Err(error)),
-        };
-        let guard = match operation.wait_pending(self.ready_session(session)).await {
-            Ok(guard) => guard,
+        let (schema_operation, guard) = match self.session_with_schema(&operation, session).await {
+            Ok(admission) => admission,
             Err(error) => return operation.finish(Err(error)),
         };
         let statement = match target {
@@ -1135,22 +1179,36 @@ impl Engine {
         context: RequestContext,
     ) -> EngineResult<Routed<PreparedExecution>> {
         let mut operation = self.operation(context)?;
-        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
-            Ok(guard) => guard,
-            Err(error) => return operation.finish(Err(error)),
-        };
-        let guard = match operation.wait_pending(self.ready_session(session)).await {
-            Ok(guard) => guard,
-            Err(error) => return operation.finish(Err(error)),
-        };
+        let (schema_operation, mut guard) =
+            match self.session_with_schema(&operation, session).await {
+                Ok(admission) => admission,
+                Err(error) => return operation.finish(Err(error)),
+            };
         let portal_snapshot = match guard.prepared().portal(portal) {
             Ok(portal) => portal.clone(),
-            Err(error) => return operation.finish(Err(error)),
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
         };
         let template = match guard.prepared().statement(portal_snapshot.statement()) {
             Ok(template) => template,
-            Err(error) => return operation.finish(Err(error)),
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
         };
+        let behavior = template.description().behavior();
+        if let sql::StatementBehavior::Session(session_behavior) = behavior {
+            let _ = session_behavior;
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "transaction control has no Routed physical shard; use logical portal execution",
+            )));
+        }
+        if guard.state() == super::SessionState::FailedTransaction {
+            return operation.finish(Err(transaction_aborted()));
+        }
         let plan = match self.plan_bound_statement_admitted(
             template.database(),
             template.translated().normalized_sql(),
@@ -1159,10 +1217,19 @@ impl Engine {
             portal_snapshot.routing_key(),
         ) {
             Ok(plan) => plan,
-            Err(error) => return operation.finish(Err(error)),
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
         };
         let sqlite_sql = template.translated().sqlite_sql().to_owned();
         let owner = ConnectionOwner::new(session.id().get());
+        if guard.state() == super::SessionState::InTransaction && plan.generated_insert().is_some()
+        {
+            let mut guard = guard;
+            guard.fail_transaction();
+            return operation.finish(Err(explicit_generated_write_unsupported()));
+        }
         if let Some(generated) = plan.generated_insert() {
             #[cfg(feature = "experimental-vtab")]
             {
@@ -1207,10 +1274,30 @@ impl Engine {
         }
         let shard = match prepared_execution_shard(&plan, self.catalog()) {
             Ok(shard) => shard,
-            Err(error) => return operation.finish(Err(error)),
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
         };
         let behavior = plan.behavior();
         let result_limits = operation.result_limits;
+        if guard.state() == super::SessionState::InTransaction {
+            let result = self
+                .run_transaction_statement(
+                    &mut operation,
+                    shard,
+                    owner,
+                    schema_operation,
+                    guard,
+                    sqlite_sql,
+                    portal_snapshot.parameters().to_vec(),
+                    behavior,
+                    result_limits,
+                )
+                .await;
+            let value = operation.finish_started(result)?;
+            return Ok(Routed { shard, value });
+        }
         let result = self
             .run_on_shard(
                 &mut operation,
@@ -1256,22 +1343,50 @@ impl Engine {
         context: RequestContext,
     ) -> EngineResult<Executed<PreparedExecution>> {
         let mut operation = self.operation(context)?;
-        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
-            Ok(guard) => guard,
-            Err(error) => return operation.finish(Err(error)),
-        };
-        let guard = match operation.wait_pending(self.ready_session(session)).await {
-            Ok(guard) => guard,
-            Err(error) => return operation.finish(Err(error)),
-        };
+        let (schema_operation, mut guard) =
+            match self.session_with_schema(&operation, session).await {
+                Ok(admission) => admission,
+                Err(error) => return operation.finish(Err(error)),
+            };
         let portal_snapshot = match guard.prepared().portal(portal) {
             Ok(portal) => portal.clone(),
-            Err(error) => return operation.finish(Err(error)),
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
         };
         let template = match guard.prepared().statement(portal_snapshot.statement()) {
             Ok(template) => template,
-            Err(error) => return operation.finish(Err(error)),
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
         };
+        let behavior = template.description().behavior();
+        if let sql::StatementBehavior::Session(session_behavior) = behavior {
+            if !portal_snapshot.parameters().is_empty() {
+                return operation.finish(Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    "transaction control statements do not accept parameters",
+                )));
+            }
+            return self
+                .execute_transaction_control(
+                    &mut operation,
+                    session,
+                    schema_operation,
+                    guard,
+                    session_behavior,
+                )
+                .await
+                .map(|value| Executed {
+                    shards: Vec::new(),
+                    value,
+                });
+        }
+        if guard.state() == super::SessionState::FailedTransaction {
+            return operation.finish(Err(transaction_aborted()));
+        }
         let explicit_routing_key = if matches!(
             template.description().behavior(),
             sql::StatementBehavior::Read
@@ -1288,10 +1403,19 @@ impl Engine {
             explicit_routing_key,
         ) {
             Ok(plan) => plan,
-            Err(error) => return operation.finish(Err(error)),
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
         };
         let sqlite_sql = template.translated().sqlite_sql().to_owned();
         let owner = ConnectionOwner::new(session.id().get());
+        if guard.state() == super::SessionState::InTransaction && plan.generated_insert().is_some()
+        {
+            let mut guard = guard;
+            guard.fail_transaction();
+            return operation.finish(Err(explicit_generated_write_unsupported()));
+        }
         if let Some(generated) = plan.generated_insert() {
             #[cfg(feature = "experimental-vtab")]
             {
@@ -1336,16 +1460,52 @@ impl Engine {
         }
         let shards = match prepared_execution_shards(&plan, self.catalog(), self.shard_count()) {
             Ok(shards) => shards,
-            Err(error) => return operation.finish(Err(error)),
+            Err(error) => {
+                guard.fail_transaction();
+                return operation.finish(Err(error));
+            }
         };
+        let behavior = plan.behavior();
+        let result_limits = operation.result_limits;
+        if guard.state() == super::SessionState::InTransaction {
+            if shards.len() != 1 {
+                let mut guard = guard;
+                guard.fail_transaction();
+                return operation.finish(Err(cross_shard_transaction()));
+            }
+            let shard = shards[0];
+            if guard
+                .transaction_shard()
+                .is_some_and(|pinned| pinned != shard)
+            {
+                let mut guard = guard;
+                guard.fail_transaction();
+                return operation.finish(Err(cross_shard_transaction()));
+            }
+            let result = self
+                .run_transaction_statement(
+                    &mut operation,
+                    shard,
+                    owner,
+                    schema_operation,
+                    guard,
+                    sqlite_sql,
+                    portal_snapshot.parameters().to_vec(),
+                    behavior,
+                    result_limits,
+                )
+                .await;
+            let value = operation.finish_started(result)?;
+            return Ok(Executed {
+                shards: vec![shard],
+                value,
+            });
+        }
         if shards.len() > 1 {
             if let Err(error) = sql::validate_scatter_safe(template.translated()) {
                 return operation.finish(Err(error));
             }
         }
-
-        let behavior = plan.behavior();
-        let result_limits = operation.result_limits;
         if shards.len() > 1 {
             if !matches!(behavior, sql::StatementBehavior::Read) {
                 return operation.finish(Err(EngineError::new(
@@ -2551,6 +2711,331 @@ impl Engine {
         result
     }
 
+    async fn execute_transaction_control(
+        &self,
+        operation: &mut Operation,
+        session: &Session,
+        schema_operation: SchemaOperationGuard,
+        mut guard: OwnedMutexGuard<SessionInner>,
+        behavior: sql::SessionBehavior,
+    ) -> EngineResult<PreparedExecution> {
+        match behavior {
+            sql::SessionBehavior::Begin => match guard.state() {
+                super::SessionState::Ready => {
+                    let lifecycle = match self.inner.lifecycle.try_acquire() {
+                        Ok(lifecycle) => lifecycle,
+                        Err(error) => return operation.finish(Err(error)),
+                    };
+                    let transaction = TransactionState::new(lifecycle, schema_operation);
+                    let completion = transaction.completion_token();
+                    guard.begin_transaction(transaction);
+                    drop(guard);
+                    self.watch_transaction_shutdown(session, completion);
+                    operation.finish(Ok(PreparedExecution::Transaction(
+                        TransactionExecution::Started,
+                    )))
+                }
+                super::SessionState::InTransaction => operation.finish(Ok(
+                    PreparedExecution::Transaction(TransactionExecution::Started),
+                )),
+                super::SessionState::FailedTransaction => {
+                    operation.finish(Err(transaction_aborted()))
+                }
+                super::SessionState::Closed => operation.finish(Err(closed_transaction_session())),
+            },
+            sql::SessionBehavior::Commit | sql::SessionBehavior::Rollback => {
+                let state = guard.state();
+                if state == super::SessionState::Ready {
+                    let outcome = if behavior == sql::SessionBehavior::Commit {
+                        TransactionExecution::Committed
+                    } else {
+                        TransactionExecution::RolledBack
+                    };
+                    return operation.finish(Ok(PreparedExecution::Transaction(outcome)));
+                }
+                if state == super::SessionState::Closed {
+                    return operation.finish(Err(closed_transaction_session()));
+                }
+
+                let commit = behavior == sql::SessionBehavior::Commit
+                    && state == super::SessionState::InTransaction;
+                let outcome = if commit {
+                    TransactionExecution::Committed
+                } else {
+                    TransactionExecution::RolledBack
+                };
+                let has_connection = guard
+                    .transaction_mut()
+                    .is_some_and(|transaction| transaction.connection.is_some());
+                if !has_connection {
+                    let transaction = guard.finish_transaction().ok_or_else(|| {
+                        EngineError::new(
+                            EngineErrorKind::Internal,
+                            "active session transaction state is missing",
+                        )
+                    });
+                    drop(guard);
+                    drop(schema_operation);
+                    return operation.finish(transaction.and_then(|transaction| {
+                        transaction.finish(commit, None)?;
+                        Ok(PreparedExecution::Transaction(outcome))
+                    }));
+                }
+
+                let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+                    Ok(worker) => worker,
+                    Err(error) => return operation.finish(Err(error)),
+                };
+                if let Err(error) = operation.check_before_start() {
+                    return operation.finish(Err(error));
+                }
+                let lease = operation.take_lease();
+                let control = Arc::clone(&operation.control);
+                let worker_control = Arc::clone(&control);
+                let join = worker.spawn(move || {
+                    let _lease = lease;
+                    let _schema_operation = schema_operation;
+                    let transaction = guard.finish_transaction().ok_or_else(|| {
+                        EngineError::new(
+                            EngineErrorKind::Internal,
+                            "active session transaction state is missing",
+                        )
+                    });
+                    worker_control.complete(transaction.and_then(|transaction| {
+                        transaction.finish(commit, Some(Arc::clone(&worker_control)))?;
+                        Ok(PreparedExecution::Transaction(outcome))
+                    }))
+                });
+                let result = operation.wait_started(join).await;
+                operation.finish_started(result)
+            }
+        }
+    }
+
+    fn watch_transaction_shutdown(&self, session: &Session, completion: CancellationToken) {
+        let shutdown = self.inner.shutdown_cancel.clone();
+        let inner = Arc::downgrade(&session.inner);
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = completion.cancelled() => return,
+                _ = shutdown.cancelled() => {}
+            }
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            let transaction = {
+                let mut guard = inner.lock().await;
+                guard.finish_transaction()
+            };
+            if let Some(transaction) = transaction {
+                let _ = tokio::task::spawn_blocking(move || transaction.finish(false, None)).await;
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_transaction_prepare(
+        &self,
+        operation: &mut Operation,
+        schema_operation: SchemaOperationGuard,
+        mut session: OwnedMutexGuard<SessionInner>,
+        database: LogicalDatabaseId,
+        translated: sql::TranslatedSql,
+        behavior: sql::StatementBehavior,
+        parameter_count: usize,
+        sqlite_sql: String,
+        schema_generation: u64,
+    ) -> EngineResult<PreparedStatementId> {
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => {
+                session.fail_transaction();
+                return operation.control.complete(Err(error));
+            }
+        };
+        if let Err(error) = operation.check_before_start() {
+            session.fail_transaction();
+            return operation.control.complete(Err(error));
+        }
+
+        let lease = operation.take_lease();
+        let worker_control = Arc::clone(&operation.control);
+        let storage = self.inner.database.storage.clone();
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _schema_operation = schema_operation;
+            let result = (|| {
+                let mut connection = session
+                    .transaction_mut()
+                    .ok_or_else(|| {
+                        EngineError::new(
+                            EngineErrorKind::Internal,
+                            "active session transaction state is missing",
+                        )
+                    })?
+                    .connection
+                    .take()
+                    .ok_or_else(|| {
+                        EngineError::new(
+                            EngineErrorKind::Internal,
+                            "a pinned transaction lost its SQLite connection",
+                        )
+                    })?;
+                let result = connection
+                    .run_controlled(Arc::clone(&worker_control), |connection| {
+                        sql::describe_statement(connection, &sqlite_sql)
+                    })
+                    .and_then(|metadata| {
+                        ensure_parameter_metadata(parameter_count, metadata.parameter_count())?;
+                        let description = PreparedStatementDescription::new(
+                            behavior,
+                            parameter_count,
+                            metadata.columns().to_vec(),
+                            schema_generation,
+                        );
+                        session
+                            .prepared_mut()
+                            .insert_statement(database, translated, description)
+                    });
+                retire_if_broken(&mut connection, &result);
+                if let Some(transaction) = session.transaction_mut() {
+                    transaction.connection = Some(connection);
+                }
+                result
+            })();
+            if result.is_err() {
+                session.fail_transaction();
+            }
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                storage.record_schema_degraded();
+            }
+            worker_control.complete(result)
+        });
+        operation.wait_started(join).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_transaction_statement(
+        &self,
+        operation: &mut Operation,
+        shard: u16,
+        owner: ConnectionOwner,
+        schema_operation: SchemaOperationGuard,
+        mut session: OwnedMutexGuard<SessionInner>,
+        sqlite_sql: String,
+        parameters: Vec<Value>,
+        behavior: sql::StatementBehavior,
+        result_limits: ResultLimits,
+    ) -> EngineResult<PreparedExecution> {
+        if session
+            .transaction_shard()
+            .is_some_and(|pinned| pinned != shard)
+        {
+            session.fail_transaction();
+            return operation.control.complete(Err(cross_shard_transaction()));
+        }
+        let needs_connection = session
+            .transaction_mut()
+            .is_some_and(|transaction| transaction.connection.is_none());
+        let permit = if needs_connection {
+            match operation
+                .wait_pending(self.inner.connections.acquire_for_owner(shard, owner))
+                .await
+            {
+                Ok(permit) => Some(permit),
+                Err(error) => {
+                    session.fail_transaction();
+                    return operation.control.complete(Err(error));
+                }
+            }
+        } else {
+            None
+        };
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => {
+                session.fail_transaction();
+                return operation.control.complete(Err(error));
+            }
+        };
+        if let Err(error) = operation.check_before_start() {
+            session.fail_transaction();
+            return operation.control.complete(Err(error));
+        }
+
+        let lease = operation.take_lease();
+        let control = Arc::clone(&operation.control);
+        let worker_control = Arc::clone(&control);
+        let storage = self.inner.database.storage.clone();
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _schema_operation = schema_operation;
+            let result = (|| {
+                let transaction = session.transaction_mut().ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "active session transaction state is missing",
+                    )
+                })?;
+                let first_statement = transaction.pinned_shard.is_none();
+                let mut connection = match transaction.connection.take() {
+                    Some(connection) => connection,
+                    None => permit
+                        .ok_or_else(|| {
+                            EngineError::new(
+                                EngineErrorKind::Internal,
+                                "a pinned transaction lost its SQLite connection",
+                            )
+                        })?
+                        .checkout_controlled(Arc::clone(&worker_control))?,
+                };
+
+                let result = (|| {
+                    if first_statement {
+                        connection.isolate_foreign_sql_controlled(
+                            Arc::clone(&worker_control),
+                            &sqlite_sql,
+                        )?;
+                        connection.run_controlled(Arc::clone(&worker_control), |connection| {
+                            connection.execute_batch("BEGIN DEFERRED").map_err(|error| {
+                                crate::sqlite_error::storage(error)
+                                    .context("failed to begin the pinned SQLite transaction")
+                            })
+                        })?;
+                        transaction.pinned_shard = Some(shard);
+                    }
+                    connection.run_controlled(Arc::clone(&worker_control), |connection| {
+                        sql::execute_statement_with_limits(
+                            connection,
+                            &sqlite_sql,
+                            &parameters,
+                            result_limits,
+                        )
+                        .and_then(|execution| prepared_execution(behavior, execution))
+                    })
+                })();
+                retire_if_broken(&mut connection, &result);
+                transaction.connection = Some(connection);
+                result
+            })();
+            if result.is_err() {
+                session.fail_transaction();
+            }
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                storage.record_schema_degraded();
+            }
+            worker_control.complete(result)
+        });
+        operation.wait_started(join).await
+    }
+
     async fn run_on_shard<T, F>(
         &self,
         operation: &mut Operation,
@@ -2624,8 +3109,33 @@ impl Engine {
         }
 
         let guard = Arc::clone(&session.inner).lock_owned().await;
-        guard.ensure_ready()?;
+        guard.ensure_open()?;
         Ok(guard)
+    }
+
+    async fn session_with_schema(
+        &self,
+        operation: &Operation,
+        session: &Session,
+    ) -> EngineResult<(SchemaOperationGuard, OwnedMutexGuard<SessionInner>)> {
+        match self.inner.database.storage.enter_schema_operation() {
+            Ok(schema_operation) => operation
+                .wait_pending(self.ready_session(session))
+                .await
+                .map(|guard| (schema_operation, guard)),
+            Err(error)
+                if error.kind() == EngineErrorKind::Busy && session.owner == self.inner.id =>
+            {
+                let guard = operation
+                    .wait_pending(async { Ok(Arc::clone(&session.inner).lock_owned().await) })
+                    .await?;
+                match guard.transaction_schema_operation() {
+                    Some(schema_operation) => Ok((schema_operation, guard)),
+                    None => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(test)]
@@ -3020,6 +3530,31 @@ fn unsupported_prepared_behavior() -> EngineError {
     )
 }
 
+fn transaction_aborted() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::TransactionAborted,
+        "the transaction is aborted; roll it back before continuing",
+    )
+}
+
+fn cross_shard_transaction() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::FailedPrecondition,
+        "the statement cannot run because the transaction is pinned to one physical shard",
+    )
+}
+
+fn explicit_generated_write_unsupported() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::Unsupported,
+        "generated-key writes are not supported inside an explicit transaction",
+    )
+}
+
+fn closed_transaction_session() -> EngineError {
+    EngineError::new(EngineErrorKind::FailedPrecondition, "the session is closed")
+}
+
 fn unassigned_prepared_statement() -> EngineError {
     EngineError::new(
         EngineErrorKind::Unsupported,
@@ -3347,6 +3882,37 @@ mod tests {
                         == expected
             })
             .expect("the finite shard layout has an integer routing key")
+    }
+
+    async fn execute_prepared_sql(
+        engine: &Engine,
+        session: &Session,
+        database: LogicalDatabaseId,
+        source: &str,
+        parameters: Vec<Value>,
+    ) -> EngineResult<Executed<PreparedExecution>> {
+        let statement = engine
+            .prepare_statement(
+                session,
+                PrepareRequest::new(
+                    database,
+                    sql::SqlDialect::Sqlite,
+                    sql::SqlTranslationMode::StrictSqlite,
+                    source,
+                ),
+            )
+            .await?;
+        let portal = match engine.bind_statement(session, statement, parameters).await {
+            Ok(portal) => portal,
+            Err(error) => {
+                let _ = engine.close_prepared_statement(session, statement).await;
+                return Err(error);
+            }
+        };
+        let result = engine.execute_portal_logical(session, portal).await;
+        let _ = engine.close_portal(session, portal).await;
+        let _ = engine.close_prepared_statement(session, statement).await;
+        result
     }
 
     #[test]
@@ -3679,8 +4245,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_schema_and_session_statements_are_blocked_without_state_changes_and_recover()
-    {
+    async fn prepared_schema_is_blocked_while_transactions_commit_rollback_and_recover() {
         let (temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
         let session = engine.session();
 
@@ -3745,75 +4310,336 @@ mod tests {
             }
         }
 
-        for (source, expected) in [
-            ("BEGIN", sql::SessionBehavior::Begin),
-            ("COMMIT", sql::SessionBehavior::Commit),
-            ("ROLLBACK", sql::SessionBehavior::Rollback),
-        ] {
-            let statement = engine
-                .prepare_statement(
-                    &session,
-                    PrepareRequest::new(
-                        database,
-                        sql::SqlDialect::Sqlite,
-                        sql::SqlTranslationMode::StrictSqlite,
-                        source,
-                    ),
-                )
-                .await
-                .unwrap();
-            let description = engine
-                .describe_prepared(&session, DescribeTarget::Statement(statement))
-                .await
-                .unwrap();
-            assert_eq!(
-                description.behavior(),
-                sql::StatementBehavior::Session(expected)
-            );
-            assert!(description.columns().is_empty());
-
-            let portal = engine
-                .bind_statement(&session, statement, vec![])
-                .await
-                .unwrap();
-            let error = engine.execute_portal(&session, portal).await.unwrap_err();
-            assert_eq!(error.kind(), EngineErrorKind::Unsupported);
-            assert_eq!(session.state().await, SessionState::Ready);
-            assert_eq!(session.routing_key().await, None);
-            assert!(engine.close_portal(&session, portal).await.unwrap());
-            assert!(
-                engine
-                    .close_prepared_statement(&session, statement)
-                    .await
-                    .unwrap()
-            );
-        }
-
-        let recovered = engine
-            .prepare_statement(
-                &session,
-                PrepareRequest::new(
-                    database,
-                    sql::SqlDialect::Sqlite,
-                    sql::SqlTranslationMode::StrictSqlite,
-                    "SELECT 1",
-                ),
-            )
-            .await
-            .unwrap();
-        let recovered_portal = engine
-            .bind_statement(&session, recovered, vec![])
-            .await
-            .unwrap();
-        assert!(matches!(
-            engine
-                .execute_portal(&session, recovered_portal)
+        let first_key = integer_key_for_shard(&engine, 0, None);
+        assert_eq!(
+            execute_prepared_sql(&engine, &session, database, "BEGIN", vec![])
                 .await
                 .unwrap()
                 .value,
+            PreparedExecution::Transaction(TransactionExecution::Started)
+        );
+        assert_eq!(session.state().await, SessionState::InTransaction);
+        assert_eq!(engine.active_operations_for_test(), 1);
+
+        execute_prepared_sql(
+            &engine,
+            &session,
+            database,
+            "INSERT INTO events (tenant_id, payload) VALUES (?, ?)",
+            vec![Value::from(first_key), Value::from("uncommitted")],
+        )
+        .await
+        .unwrap();
+        let visible = execute_prepared_sql(
+            &engine,
+            &session,
+            database,
+            "SELECT payload FROM events WHERE tenant_id = ?",
+            vec![Value::from(first_key)],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            visible.value,
             PreparedExecution::Rows(rows)
-                if rows.rows()[0].get(0) == Some(&Value::from(1_i64))
+                if rows.rows()[0].get(0) == Some(&Value::from("uncommitted"))
         ));
+        assert_eq!(
+            execute_prepared_sql(&engine, &session, database, "COMMIT", vec![])
+                .await
+                .unwrap()
+                .value,
+            PreparedExecution::Transaction(TransactionExecution::Committed)
+        );
+        assert_eq!(session.state().await, SessionState::Ready);
+        assert_eq!(engine.active_operations_for_test(), 0);
+
+        execute_prepared_sql(&engine, &session, database, "BEGIN", vec![])
+            .await
+            .unwrap();
+        execute_prepared_sql(
+            &engine,
+            &session,
+            database,
+            "UPDATE events SET payload = ? WHERE tenant_id = ?",
+            vec![Value::from("rolled-back"), Value::from(first_key)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            execute_prepared_sql(&engine, &session, database, "ROLLBACK", vec![])
+                .await
+                .unwrap()
+                .value,
+            PreparedExecution::Transaction(TransactionExecution::RolledBack)
+        );
+        let recovered = execute_prepared_sql(
+            &engine,
+            &session,
+            database,
+            "SELECT payload FROM events WHERE tenant_id = ?",
+            vec![Value::from(first_key)],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recovered.value,
+            PreparedExecution::Rows(rows)
+                if rows.rows()[0].get(0) == Some(&Value::from("uncommitted"))
+        ));
+        assert_eq!(session.routing_key().await, None);
+    }
+
+    #[tokio::test]
+    async fn transaction_pins_one_shard_enters_failed_state_and_commit_rolls_back() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+        let first_key = integer_key_for_shard(&engine, 0, None);
+        let other_key = integer_key_for_shard(&engine, 1, None);
+
+        execute_prepared_sql(&engine, &session, database, "BEGIN", vec![])
+            .await
+            .unwrap();
+        execute_prepared_sql(
+            &engine,
+            &session,
+            database,
+            "INSERT INTO events (tenant_id, payload) VALUES (?, ?)",
+            vec![Value::from(first_key), Value::from("first")],
+        )
+        .await
+        .unwrap();
+        let cross_shard = execute_prepared_sql(
+            &engine,
+            &session,
+            database,
+            "INSERT INTO events (tenant_id, payload) VALUES (?, ?)",
+            vec![Value::from(other_key), Value::from("other")],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cross_shard.kind(), EngineErrorKind::FailedPrecondition);
+        assert_eq!(session.state().await, SessionState::FailedTransaction);
+
+        let rejected = execute_prepared_sql(
+            &engine,
+            &session,
+            database,
+            "SELECT payload FROM events WHERE tenant_id = ?",
+            vec![Value::from(first_key)],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.kind(), EngineErrorKind::TransactionAborted);
+        assert_eq!(
+            execute_prepared_sql(&engine, &session, database, "COMMIT", vec![])
+                .await
+                .unwrap()
+                .value,
+            PreparedExecution::Transaction(TransactionExecution::RolledBack)
+        );
+        assert_eq!(session.state().await, SessionState::Ready);
+
+        for key in [first_key, other_key] {
+            let rows = execute_prepared_sql(
+                &engine,
+                &session,
+                database,
+                "SELECT payload FROM events WHERE tenant_id = ?",
+                vec![Value::from(key)],
+            )
+            .await
+            .unwrap();
+            assert!(matches!(rows.value, PreparedExecution::Rows(rows) if rows.rows().is_empty()));
+        }
+
+        execute_prepared_sql(&engine, &session, database, "BEGIN", vec![])
+            .await
+            .unwrap();
+        let parse_error = execute_prepared_sql(
+            &engine,
+            &session,
+            database,
+            "SELECT FROM private_transaction_text",
+            vec![],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(parse_error.kind(), EngineErrorKind::InvalidQuery);
+        assert_eq!(session.state().await, SessionState::FailedTransaction);
+        execute_prepared_sql(&engine, &session, database, "ROLLBACK", vec![])
+            .await
+            .unwrap();
+        assert_eq!(session.state().await, SessionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_rolls_back_and_releases_its_pinned_connection() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(
+            EngineOptions::new(1, 1).expect("one connection and one waiter are valid"),
+        );
+        let session = engine.session();
+        let key = integer_key_for_shard(&engine, 0, None);
+
+        execute_prepared_sql(&engine, &session, database, "BEGIN", vec![])
+            .await
+            .unwrap();
+        execute_prepared_sql(
+            &engine,
+            &session,
+            database,
+            "INSERT INTO events (tenant_id, payload) VALUES (?, ?)",
+            vec![Value::from(key), Value::from("discarded")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(engine.active_operations_for_test(), 1);
+        session.close().await.unwrap();
+        assert_eq!(session.state().await, SessionState::Closed);
+        assert_eq!(engine.active_operations_for_test(), 0);
+
+        let observer = engine.session();
+        let rows = execute_prepared_sql(
+            &engine,
+            &observer,
+            database,
+            "SELECT payload FROM events WHERE tenant_id = ?",
+            vec![Value::from(key)],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rows.value, PreparedExecution::Rows(rows) if rows.rows().is_empty()));
+    }
+
+    #[tokio::test]
+    async fn pinned_transaction_holds_pool_capacity_until_rollback_then_waiter_runs() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(
+            EngineOptions::new(1, 1).expect("one connection and one waiter are valid"),
+        );
+        let transaction = engine.session();
+        let waiter = engine.session();
+        let first_key = integer_key_for_shard(&engine, 0, None);
+        let second_key = integer_key_for_shard(&engine, 0, Some(first_key));
+
+        execute_prepared_sql(&engine, &transaction, database, "BEGIN", vec![])
+            .await
+            .unwrap();
+        execute_prepared_sql(
+            &engine,
+            &transaction,
+            database,
+            "INSERT INTO events (tenant_id, payload) VALUES (?, ?)",
+            vec![Value::from(first_key), Value::from("transaction")],
+        )
+        .await
+        .unwrap();
+
+        let waiting = execute_prepared_sql(
+            &engine,
+            &waiter,
+            database,
+            "INSERT INTO events (tenant_id, payload) VALUES (?, ?)",
+            vec![Value::from(second_key), Value::from("waiter")],
+        );
+        tokio::pin!(waiting);
+        assert!(
+            timeout(Duration::from_millis(25), &mut waiting)
+                .await
+                .is_err()
+        );
+        execute_prepared_sql(&engine, &transaction, database, "ROLLBACK", vec![])
+            .await
+            .unwrap();
+        waiting.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_rolls_back_an_idle_pinned_transaction_before_stopping() {
+        let (temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let session = engine.session();
+        let key = integer_key_for_shard(&engine, 0, None);
+
+        execute_prepared_sql(&engine, &session, database, "BEGIN", vec![])
+            .await
+            .unwrap();
+        execute_prepared_sql(
+            &engine,
+            &session,
+            database,
+            "INSERT INTO events (tenant_id, payload) VALUES (?, ?)",
+            vec![Value::from(key), Value::from("shutdown")],
+        )
+        .await
+        .unwrap();
+
+        let report = engine
+            .shutdown_with_grace(Duration::from_millis(20))
+            .await
+            .unwrap();
+        assert!(report.forced());
+        assert_eq!(engine.state(), EngineState::Stopped);
+        assert_eq!(engine.active_operations_for_test(), 0);
+        assert_eq!(session.state().await, SessionState::Ready);
+
+        let connection =
+            rusqlite::Connection::open(temp.path().join("shards/0000.sqlite")).unwrap();
+        let count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE tenant_id = ?1",
+                [key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn transaction_can_commit_while_a_schema_migration_waits_for_its_admission() {
+        let (_temp, engine, database) = engine_with_prepared_catalog(EngineOptions::default());
+        let transaction = engine.session();
+        let key = integer_key_for_shard(&engine, 0, None);
+
+        execute_prepared_sql(&engine, &transaction, database, "BEGIN", vec![])
+            .await
+            .unwrap();
+        execute_prepared_sql(
+            &engine,
+            &transaction,
+            database,
+            "INSERT INTO events (tenant_id, payload) VALUES (?, ?)",
+            vec![Value::from(key), Value::from("committed")],
+        )
+        .await
+        .unwrap();
+
+        let migration_engine = engine.clone();
+        let migration_session = migration_engine.session();
+        let migration = tokio::spawn(async move {
+            migration_engine
+                .broadcast(
+                    &migration_session,
+                    "CREATE INDEX after_transaction ON events(payload)".to_owned(),
+                )
+                .await
+        });
+        while engine.inner.database.storage.schema_gate_snapshot().state
+            != crate::storage::SchemaGateState::Migrating
+        {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            execute_prepared_sql(&engine, &transaction, database, "COMMIT", vec![])
+                .await
+                .unwrap()
+                .value,
+            PreparedExecution::Transaction(TransactionExecution::Committed)
+        );
+        assert_eq!(migration.await.unwrap().unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            engine.inner.database.storage.schema_gate_snapshot().state,
+            crate::storage::SchemaGateState::Ready
+        );
     }
 
     #[tokio::test]

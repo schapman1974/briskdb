@@ -6,9 +6,12 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use super::{
+    CancellationToken, EngineError, EngineErrorKind, EngineResult, OperationControl,
+    OperationLease, PreparedState, PreparedStatementLimits,
+};
+use crate::storage::{PooledConnection, SchemaOperationGuard};
 use tokio::sync::Mutex;
-
-use super::{EngineError, EngineErrorKind, EngineResult, PreparedState, PreparedStatementLimits};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -36,14 +39,16 @@ impl fmt::Display for SessionId {
 
 /// The lifecycle state of a protocol-neutral session.
 ///
-/// Transaction state will be added with the wire-protocol transaction work;
-/// these variants currently describe only whether the session can accept
-/// requests.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionState {
     /// The session can accept requests.
     Ready,
+    /// The session owns an explicit transaction that can still execute work.
+    InTransaction,
+    /// The session transaction rejected or failed a statement; subsequent SQL
+    /// execution accepts only transaction termination.
+    FailedTransaction,
     /// The session was closed and cannot be reopened.
     Closed,
 }
@@ -52,15 +57,118 @@ pub(crate) struct SessionInner {
     state: SessionState,
     routing_key: Option<String>,
     prepared: PreparedState,
+    transaction: Option<TransactionState>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TransactionState {
+    pub(crate) pinned_shard: Option<u16>,
+    pub(crate) connection: Option<PooledConnection>,
+    done: CancellationToken,
+    _lifecycle: OperationLease,
+    schema_operation: SchemaOperationGuard,
+}
+
+impl TransactionState {
+    pub(crate) fn new(lifecycle: OperationLease, schema: SchemaOperationGuard) -> Self {
+        Self {
+            pinned_shard: None,
+            connection: None,
+            done: CancellationToken::new(),
+            _lifecycle: lifecycle,
+            schema_operation: schema,
+        }
+    }
+
+    pub(crate) fn completion_token(&self) -> CancellationToken {
+        self.done.clone()
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        commit: bool,
+        control: Option<Arc<OperationControl>>,
+    ) -> EngineResult<()> {
+        self.done.cancel();
+        let Some(mut connection) = self.connection.take() else {
+            return Ok(());
+        };
+        let sql = if commit { "COMMIT" } else { "ROLLBACK" };
+        let execute = |connection: &mut PooledConnection| {
+            connection.execute_batch(sql).map_err(|error| {
+                crate::sqlite_error::storage(error)
+                    .context(format!("failed to {sql} the pinned SQLite transaction"))
+            })
+        };
+        let result = match control {
+            Some(control) => connection.run_controlled(control, execute),
+            None => execute(&mut connection),
+        };
+        if result.is_err() {
+            connection.mark_broken();
+        }
+        result
+    }
+}
+
+impl Drop for TransactionState {
+    fn drop(&mut self) {
+        self.done.cancel();
+    }
 }
 
 impl SessionInner {
-    pub(crate) fn ensure_ready(&self) -> EngineResult<()> {
-        if self.state == SessionState::Ready {
+    pub(crate) fn ensure_open(&self) -> EngineResult<()> {
+        if self.state != SessionState::Closed {
             Ok(())
         } else {
             Err(closed_session_error())
         }
+    }
+
+    pub(crate) const fn state(&self) -> SessionState {
+        self.state
+    }
+
+    pub(crate) fn begin_transaction(&mut self, transaction: TransactionState) {
+        debug_assert_eq!(self.state, SessionState::Ready);
+        debug_assert!(self.transaction.is_none());
+        self.transaction = Some(transaction);
+        self.state = SessionState::InTransaction;
+    }
+
+    pub(crate) fn fail_transaction(&mut self) {
+        if self.state == SessionState::InTransaction {
+            self.state = SessionState::FailedTransaction;
+        }
+    }
+
+    pub(crate) fn transaction_mut(&mut self) -> Option<&mut TransactionState> {
+        self.transaction.as_mut()
+    }
+
+    pub(crate) fn transaction_shard(&self) -> Option<u16> {
+        self.transaction
+            .as_ref()
+            .and_then(|transaction| transaction.pinned_shard)
+    }
+
+    pub(crate) fn transaction_schema_operation(&self) -> Option<SchemaOperationGuard> {
+        self.transaction
+            .as_ref()
+            .map(|transaction| transaction.schema_operation.clone())
+    }
+
+    pub(crate) fn take_transaction(&mut self) -> Option<TransactionState> {
+        self.transaction.take()
+    }
+
+    pub(crate) fn finish_transaction(&mut self) -> Option<TransactionState> {
+        let transaction = self.transaction.take();
+        if self.state != SessionState::Closed {
+            self.state = SessionState::Ready;
+        }
+        transaction
     }
 
     pub(crate) fn routing_key(&self) -> Option<&str> {
@@ -83,6 +191,13 @@ impl fmt::Debug for SessionInner {
             .field("state", &self.state)
             .field("has_routing_key", &self.routing_key.is_some())
             .field("prepared", &self.prepared)
+            .field(
+                "transaction_shard",
+                &self
+                    .transaction
+                    .as_ref()
+                    .and_then(|transaction| transaction.pinned_shard),
+            )
             .finish()
     }
 }
@@ -108,6 +223,7 @@ impl Session {
                 state: SessionState::Ready,
                 routing_key: None,
                 prepared: PreparedState::new(id, prepared_limits),
+                transaction: None,
             })),
         }
     }
@@ -131,7 +247,7 @@ impl Session {
     pub async fn set_routing_key(&self, routing_key: impl Into<String>) -> EngineResult<()> {
         let routing_key = routing_key.into();
         let mut inner = self.inner.lock().await;
-        inner.ensure_ready()?;
+        inner.ensure_open()?;
         inner.routing_key = Some(routing_key);
         Ok(())
     }
@@ -139,7 +255,7 @@ impl Session {
     /// Clear the explicit routing key used by routed operations.
     pub async fn clear_routing_key(&self) -> EngineResult<()> {
         let mut inner = self.inner.lock().await;
-        inner.ensure_ready()?;
+        inner.ensure_open()?;
         inner.routing_key = None;
         Ok(())
     }
@@ -149,11 +265,30 @@ impl Session {
     /// Closing is terminal and idempotent. It also clears routing context,
     /// prepared statements, and bound portals.
     pub async fn close(&self) -> EngineResult<()> {
-        let mut inner = self.inner.lock().await;
-        inner.state = SessionState::Closed;
-        inner.routing_key = None;
-        inner.prepared.clear();
+        let transaction = {
+            let mut inner = self.inner.lock().await;
+            inner.state = SessionState::Closed;
+            inner.routing_key = None;
+            inner.prepared.clear();
+            inner.take_transaction()
+        };
+        if let Some(transaction) = transaction {
+            tokio::task::spawn_blocking(move || transaction.finish(false, None))
+                .await
+                .map_err(|error| {
+                    EngineError::from_source(
+                        EngineErrorKind::Internal,
+                        "transaction cleanup task failed",
+                        error,
+                    )
+                })??;
+        }
         Ok(())
+    }
+
+    /// Mark an active transaction failed after a protocol-layer error.
+    pub async fn fail_transaction(&self) {
+        self.inner.lock().await.fail_transaction();
     }
 }
 

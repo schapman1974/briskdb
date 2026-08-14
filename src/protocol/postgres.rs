@@ -59,7 +59,8 @@ use crate::{
     core::{
         DataType, DescribeTarget, Engine, EngineError, EngineResult, EngineStatus,
         LogicalDatabaseId, PortalId, PrepareRequest, PreparedExecution,
-        PreparedStatementDescription, PreparedStatementId, ResultSet, Session, SessionId, Value,
+        PreparedStatementDescription, PreparedStatementId, ResultSet, Session, SessionId,
+        TransactionExecution, Value,
     },
     protocol::error::postgres_error,
     sql::{MAX_PARSED_SQL_BYTES, SqlDialect, SqlTranslationMode, StatementBehavior, WriteBehavior},
@@ -841,6 +842,21 @@ struct WireHandlers {
 }
 
 impl WireHandlers {
+    async fn sync_failed_transaction<C>(&self, client: &C) -> PgWireResult<()>
+    where
+        C: ClientInfo,
+    {
+        if client.transaction_status() == TransactionStatus::Error {
+            self.connection
+                .installed()?
+                .state
+                .session
+                .fail_transaction()
+                .await;
+        }
+        Ok(())
+    }
+
     async fn remove_statement<C>(&self, client: &mut C, name: &str) -> PgWireResult<()>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -1030,12 +1046,13 @@ impl StartupHandler for WireHandlers {
 
 #[async_trait]
 impl SimpleQueryHandler for WireHandlers {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.sync_failed_transaction(client).await?;
         let (behavior, execution) = self
             .connection
             .installed()?
@@ -1072,6 +1089,15 @@ fn execution_response(
             behavior,
             result.rows_affected,
         )?)),
+        PreparedExecution::Transaction(TransactionExecution::Started) => {
+            Ok(Response::TransactionStart(Tag::new("BEGIN")))
+        }
+        PreparedExecution::Transaction(TransactionExecution::Committed) => {
+            Ok(Response::TransactionEnd(Tag::new("COMMIT")))
+        }
+        PreparedExecution::Transaction(TransactionExecution::RolledBack) => {
+            Ok(Response::TransactionEnd(Tag::new("ROLLBACK")))
+        }
         _ => Err(internal_query_error()),
     }
 }
@@ -1831,6 +1857,7 @@ impl ExtendedQueryHandler for WireHandlers {
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.sync_failed_transaction(client).await?;
         let name = valid_extended_name(message.name.as_deref())?;
         if name != DEFAULT_NAME && client.portal_store().get_statement(name).is_some() {
             return Err(query_wire_error(
@@ -1882,6 +1909,7 @@ impl ExtendedQueryHandler for WireHandlers {
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.sync_failed_transaction(client).await?;
         let portal_name = valid_extended_name(message.portal_name.as_deref())?;
         let statement_name = valid_extended_name(message.statement_name.as_deref())?;
         let statement = client
@@ -1980,6 +2008,7 @@ impl ExtendedQueryHandler for WireHandlers {
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.sync_failed_transaction(client).await?;
         if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
             return Err(PgWireError::NotReadyForQuery);
         }
@@ -2011,6 +2040,16 @@ impl ExtendedQueryHandler for WireHandlers {
                     }
                     Response::Execution(tag) => {
                         send_execution_response(client, tag).await?;
+                        *portal_state = PortalExecutionState::Finished;
+                    }
+                    Response::TransactionStart(tag) => {
+                        send_execution_response(client, tag).await?;
+                        client.set_transaction_status(TransactionStatus::Transaction);
+                        *portal_state = PortalExecutionState::Finished;
+                    }
+                    Response::TransactionEnd(tag) => {
+                        send_execution_response(client, tag).await?;
+                        client.set_transaction_status(TransactionStatus::Idle);
                         *portal_state = PortalExecutionState::Finished;
                     }
                     _ => return Err(internal_query_error()),
@@ -2052,7 +2091,7 @@ impl ExtendedQueryHandler for WireHandlers {
 
     async fn do_describe_statement<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         target: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
@@ -2061,6 +2100,7 @@ impl ExtendedQueryHandler for WireHandlers {
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.sync_failed_transaction(client).await?;
         let description = self
             .connection
             .installed()?
@@ -2080,7 +2120,7 @@ impl ExtendedQueryHandler for WireHandlers {
 
     async fn do_describe_portal<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         target: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
@@ -2089,6 +2129,7 @@ impl ExtendedQueryHandler for WireHandlers {
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.sync_failed_transaction(client).await?;
         let portal = bound_portal(&self.connection.installed()?.state, target.name.as_str())?
             .ok_or_else(|| PgWireError::PortalNotFound(target.name.clone()))?;
         Ok(DescribePortalResponse::new(portal.fields.as_ref().clone()))
@@ -2096,7 +2137,7 @@ impl ExtendedQueryHandler for WireHandlers {
 
     async fn do_query<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
@@ -2106,6 +2147,7 @@ impl ExtendedQueryHandler for WireHandlers {
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.sync_failed_transaction(client).await?;
         let connection = self.connection.installed()?;
         let bound = bound_portal(&connection.state, portal.name.as_str())?
             .ok_or_else(|| PgWireError::PortalNotFound(portal.name.clone()))?;
@@ -3724,6 +3766,150 @@ mod tests {
 
         finish_wire_server(&mut client, server).await;
         assert_eq!(core.state().await, SessionState::Closed);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn simple_query_reports_real_transaction_status_and_requires_rollback_after_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = crate::core::Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE records (
+                    tenant_id TEXT NOT NULL PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                crate::core::TableDeclaration::sharded(
+                    logical_database,
+                    "records",
+                    crate::core::ShardKeyMetadata::new(
+                        "tenant_id",
+                        crate::core::ShardKeyType::Text,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let engine = Engine::from_database(Arc::new(database));
+        let adapter = Adapter::new(engine.clone());
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        assert_eq!(
+            read_until_ready(&mut client).await.last().unwrap().1,
+            [b'I']
+        );
+        let core = Arc::clone(wire.connection().unwrap());
+
+        client
+            .write_all(&typed_packet(b'Q', b"BEGIN\0"))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(command_tag(&frames[0].1), "BEGIN");
+        assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'T']));
+        assert_eq!(core.state().await, SessionState::InTransaction);
+
+        for payload in ["first", "duplicate"] {
+            client
+                .write_all(&typed_packet(
+                    b'Q',
+                    format!(
+                        "INSERT INTO records (tenant_id, payload) VALUES ('tenant-tx', '{payload}')\0"
+                    )
+                    .as_bytes(),
+                ))
+                .await
+                .unwrap();
+            let frames = read_until_ready(&mut client).await;
+            if payload == "first" {
+                assert_eq!(command_tag(&frames[0].1), "INSERT 0 1");
+                assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'T']));
+            } else {
+                assert_eq!(frames[0].0, b'E');
+                assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'E']));
+            }
+        }
+        assert_eq!(core.state().await, SessionState::FailedTransaction);
+
+        client
+            .write_all(&typed_packet(
+                b'Q',
+                b"SELECT payload FROM records WHERE tenant_id = 'tenant-tx'\0",
+            ))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            message_fields(&frames[0].1).get(&b'C').map(String::as_str),
+            Some("25P02")
+        );
+        assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'E']));
+
+        client
+            .write_all(&typed_packet(b'Q', b"ROLLBACK\0"))
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(command_tag(&frames[0].1), "ROLLBACK");
+        assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'I']));
+        assert_eq!(core.state().await, SessionState::Ready);
+
+        finish_wire_server(&mut client, server).await;
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn extended_sync_reports_transaction_and_idle_status() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+        let (address, wire, server) = spawn_wire_server(&adapter).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        read_until_ready(&mut client).await;
+        let core = Arc::clone(wire.connection().unwrap());
+
+        let begin = [
+            parse_packet("begin", "BEGIN"),
+            bind_packet("begin_portal", "begin"),
+            execute_packet("begin_portal", 0),
+            typed_packet(b'S', &[]),
+        ]
+        .concat();
+        client.write_all(&begin).await.unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'1', b'2', b'C', b'Z']
+        );
+        assert_eq!(command_tag(&frames[2].1), "BEGIN");
+        assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'T']));
+        assert_eq!(core.state().await, SessionState::InTransaction);
+
+        let rollback = [
+            parse_packet("rollback", "ROLLBACK"),
+            bind_packet("rollback_portal", "rollback"),
+            execute_packet("rollback_portal", 0),
+            typed_packet(b'S', &[]),
+        ]
+        .concat();
+        client.write_all(&rollback).await.unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'1', b'2', b'C', b'Z']
+        );
+        assert_eq!(command_tag(&frames[2].1), "ROLLBACK");
+        assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'I']));
+        assert_eq!(core.state().await, SessionState::Ready);
+
+        finish_wire_server(&mut client, server).await;
         engine.shutdown().await.unwrap();
     }
 

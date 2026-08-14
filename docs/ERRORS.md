@@ -27,6 +27,7 @@ the human-readable text to identify an error.
 | <a id="invalid-query"></a>`InvalidQuery` | `invalid_query` | 422 | Invalid query | The query could not be processed. | `42000` | 1105 | `HY000` | No |
 | <a id="unsupported"></a>`Unsupported` | `unsupported` | 501 | Unsupported operation | The requested operation is not supported. | `0A000` | 1235 | `42000` | No |
 | <a id="failed-precondition"></a>`FailedPrecondition` | `failed_precondition` | 409 | Failed precondition | The operation cannot run in the current state. | `55000` | 1105 | `HY000` | No |
+| <a id="transaction-aborted"></a>`TransactionAborted` | `transaction_aborted` | 409 | Transaction aborted | The transaction is aborted; roll it back before continuing. | `25P02` | 1105 | `HY000` | No |
 | <a id="type-mismatch"></a>`TypeMismatch` | `type_mismatch` | 422 | Type mismatch | A value has an incompatible type. | `42804` | 1366 | `HY000` | No |
 | <a id="constraint-violation"></a>`ConstraintViolation` | `constraint_violation` | 409 | Constraint violation | A database constraint was violated. | `23000` | 1105 | `HY000` | No |
 | <a id="unique-violation"></a>`UniqueViolation` | `unique_violation` | 409 | Unique constraint violation | A unique constraint was violated. | `23505` | 1062 | `23000` | No |
@@ -68,8 +69,8 @@ is intentionally asymmetric:
 
 | Surface | Reachability and tested unsupported behavior | Remaining dependency |
 | --- | --- | --- |
-| HTTP | A populated catalog with `experimental-vtab` and the write opt-in can reach the coordinator. The execute endpoint maps `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints, and attachments to the fixed `Unsupported` 501 problem; caller-authored DML `RETURNING` has that result through both data endpoints. All fail before pool admission, and protocol tests verify that the shard files are unchanged. | Transaction support still requires a protocol-neutral pinned transaction state machine. |
-| PostgreSQL | Production simple `Query` and parameterized text/binary extended queries execute registered-table reads and writes through the Engine. Unsupported session/schema statements fail before mutation and extended errors discard input through `Sync`. | Transaction state and shard pinning are issue #34. |
+| HTTP | A populated catalog with `experimental-vtab` and the write opt-in can reach the coordinator. The execute endpoint maps `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints, and attachments to the fixed `Unsupported` 501 problem; caller-authored DML `RETURNING` has that result through both data endpoints. All fail before pool admission, and protocol tests verify that the shard files are unchanged. | The stateless HTTP surface remains autocommit-only even though engine sessions can retain a transaction. |
+| PostgreSQL | Production simple `Query` and parameterized text/binary extended queries execute registered-table reads and writes through the Engine. Single-shard transactions pin one connection, expose exact `I`/`T`/`E` status, and recover through rollback; unsupported session/schema statements fail before mutation. | General cross-shard transactions remain unsupported. |
 | MySQL | There is no listener or command state machine. `mysql_error(Unsupported)` is only the deterministic future-adapter contract: error 1235, SQLSTATE `42000`, and the same safe message. | Listener and query flow are issues #40–#43; result/error encoding is issue #44; transactions are issue #47. |
 
 Consequently, issue #131 cannot declare cross-wire facade rollout complete

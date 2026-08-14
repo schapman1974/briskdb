@@ -147,8 +147,9 @@ through the protocol-neutral prepare, describe, bind, route, and logical
 execute lifecycle. Registered-table `SELECT`, `INSERT`, `UPDATE`, and `DELETE`
 are supported. Temporary statements and portals are closed after success or
 failure. Empty input returns `EmptyQueryResponse`; a statement failure uses the
-fixed Engine-to-SQLSTATE mapping, appends `ReadyForQuery(I)`, never includes
-query text, and leaves the connection reusable.
+fixed Engine-to-SQLSTATE mapping, appends the session's exact `ReadyForQuery`
+status, never includes query text, and leaves an idle connection reusable. An
+error in a transaction reports `E` and requires rollback.
 
 Rows are bounded and materialized by the Engine, then returned in PostgreSQL
 text format. Declared SQLite columns map `BOOL`/`BOOLEAN` to `bool`, names
@@ -182,8 +183,8 @@ The parameterized text/binary extended flow uses the same Engine lifecycle:
   resumes the already materialized bounded response without rerunning the core
   portal; a completed portal cannot replay a write.
 - `Close` releases a portal or cascades statement closure to its portals;
-  `Flush` flushes pending output; `Sync` restores `ReadyForQuery(I)` after an
-  error and causes skipped extended messages to be accepted again.
+  `Flush` flushes pending output; `Sync` reports the current `I`, `T`, or `E`
+  status and causes skipped extended messages to be accepted again.
 
 Result format lists may be empty, unified, or match the result-column count.
 Binary results use PostgreSQL's native encodings for `bool`, `int8`, `float8`,
@@ -196,9 +197,11 @@ lossless decimal binding.
 
 Statement and portal names are at most 63 UTF-8 bytes. Engine limits remain
 authoritative for per-session prepared statements, portals, retained values,
-rows, and bytes. DDL, transactions, and `COPY` are not supported. The offline
-importer is the supported way to establish registered tables. See the
-[copy/paste query quickstart](POSTGRES_QUICKSTART.md).
+rows, and bytes. Real single-shard `BEGIN`/`COMMIT`/`ROLLBACK` is supported;
+cross-shard work, DDL, savepoints, and `COPY` are not. The offline importer is
+the supported way to establish registered tables. See the
+[copy/paste query quickstart](POSTGRES_QUICKSTART.md) and the
+[transaction contract](POSTGRES_TRANSACTIONS.md).
 
 ## Connection ownership and shutdown
 

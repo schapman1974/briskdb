@@ -82,9 +82,10 @@ return to idle without reaching storage.
 
 There is not yet a MySQL listener or command state machine. The shared mapping
 already freezes `Unsupported` as MySQL error 1235 / SQLSTATE `42000`, but a
-mapping function is not a live wire conformance test. PostgreSQL parameter/type
-transactions remain tracked by #34. MySQL listener/query,
-result/error, and transaction work remains tracked by #40-#44 and #47.
+mapping function is not a live wire conformance test. PostgreSQL now supports
+pinned single-shard transactions with exact `I`/`T`/`E` status. MySQL
+listener/query, result/error, and transaction work remains tracked by #40-#44
+and #47.
 
 ## Benchmark evidence
 

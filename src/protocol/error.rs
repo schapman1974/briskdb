@@ -40,6 +40,7 @@ pub const fn http_error(kind: EngineErrorKind) -> HttpErrorMapping {
         | EngineErrorKind::TypeMismatch => 422,
         EngineErrorKind::Unsupported => 501,
         EngineErrorKind::FailedPrecondition
+        | EngineErrorKind::TransactionAborted
         | EngineErrorKind::ConstraintViolation
         | EngineErrorKind::UniqueViolation
         | EngineErrorKind::NotNullViolation
@@ -74,6 +75,7 @@ pub const fn postgres_error(kind: EngineErrorKind) -> PostgresErrorMapping {
         EngineErrorKind::InvalidQuery => "42000",
         EngineErrorKind::Unsupported => "0A000",
         EngineErrorKind::FailedPrecondition => "55000",
+        EngineErrorKind::TransactionAborted => "25P02",
         EngineErrorKind::TypeMismatch => "42804",
         EngineErrorKind::ConstraintViolation => "23000",
         EngineErrorKind::UniqueViolation => "23505",
@@ -109,6 +111,7 @@ pub const fn mysql_error(kind: EngineErrorKind) -> MysqlErrorMapping {
         EngineErrorKind::InvalidQuery => (1105, "HY000"),
         EngineErrorKind::Unsupported => (1235, "42000"),
         EngineErrorKind::FailedPrecondition => (1105, "HY000"),
+        EngineErrorKind::TransactionAborted => (1105, "HY000"),
         EngineErrorKind::TypeMismatch => (1366, "HY000"),
         EngineErrorKind::ConstraintViolation => (1105, "HY000"),
         EngineErrorKind::UniqueViolation => (1062, "23000"),
@@ -157,6 +160,9 @@ const fn problem_type(kind: EngineErrorKind) -> &'static str {
         }
         EngineErrorKind::FailedPrecondition => {
             "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#failed-precondition"
+        }
+        EngineErrorKind::TransactionAborted => {
+            "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#transaction-aborted"
         }
         EngineErrorKind::TypeMismatch => {
             "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#type-mismatch"
@@ -223,6 +229,7 @@ const fn title(kind: EngineErrorKind) -> &'static str {
         EngineErrorKind::InvalidQuery => "Invalid query",
         EngineErrorKind::Unsupported => "Unsupported operation",
         EngineErrorKind::FailedPrecondition => "Failed precondition",
+        EngineErrorKind::TransactionAborted => "Transaction aborted",
         EngineErrorKind::TypeMismatch => "Type mismatch",
         EngineErrorKind::ConstraintViolation => "Constraint violation",
         EngineErrorKind::UniqueViolation => "Unique constraint violation",
@@ -252,6 +259,9 @@ const fn detail(kind: EngineErrorKind) -> &'static str {
         EngineErrorKind::InvalidQuery => "The query could not be processed.",
         EngineErrorKind::Unsupported => "The requested operation is not supported.",
         EngineErrorKind::FailedPrecondition => "The operation cannot run in the current state.",
+        EngineErrorKind::TransactionAborted => {
+            "The transaction is aborted; roll it back before continuing."
+        }
         EngineErrorKind::TypeMismatch => "A value has an incompatible type.",
         EngineErrorKind::ConstraintViolation => "A database constraint was violated.",
         EngineErrorKind::UniqueViolation => "A unique constraint was violated.",
@@ -311,6 +321,13 @@ mod tests {
                 EngineErrorKind::FailedPrecondition,
                 409,
                 "55000",
+                1105,
+                "HY000",
+            ),
+            (
+                EngineErrorKind::TransactionAborted,
+                409,
+                "25P02",
                 1105,
                 "HY000",
             ),

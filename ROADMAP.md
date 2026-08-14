@@ -255,7 +255,7 @@ the engine regardless of its eventual wire protocol.
 - [x] Map BriskDB types to PostgreSQL OIDs and support text format first, then
   the binary formats required by tested drivers (issue #33, including the
   generated-key result contract).
-- [ ] Implement `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction state, and shard
+- [x] Implement `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction state, and shard
   pinning. Report PostgreSQL's idle/in-transaction/failed (`I`/`T`/`E`) states
   even where SQLite's native behavior differs.
 - [ ] Support `CancelRequest`/backend keys and wire cancellation to the core.

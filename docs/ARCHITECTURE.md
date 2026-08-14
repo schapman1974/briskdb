@@ -895,20 +895,21 @@ capacity on every shard in stable order because it learns its hash-routed owner
 only after consuming a durable lease. A published schema-generation mismatch
 invalidates the cache and forces controlled rediscovery before another write.
 
-This integration is intentionally autocommit-only. Each `Engine::execute`,
+The generated-write coordinator is intentionally autocommit-only. Each `Engine::execute`,
 `Engine::execute_write`, or HTTP `/v1/execute` request owns one statement and
-drops its coordinator after that statement reconciles. `Session` still has no
-transaction state, HTTP still creates a fresh Session per request, and `BEGIN`,
-`COMMIT`, `ROLLBACK`, read-your-writes, and transaction shard pinning are
-deferred to the later session-transaction work.
+drops its coordinator after that statement reconciles. Explicit transactions
+therefore reject generated-key writes before allocation. HTTP still creates a
+fresh Session per request; PostgreSQL sessions support retained single-shard
+transactions through the ordinary prepared execution path.
 
 ## Session and asynchronous engine boundary
 
 `Session` is protocol-neutral mutable state owned by one frontend connection or
 request. A new session is `Ready`; closing it is a terminal transition to
 `Closed`, and engine operations reject a closed session with
-`FailedPrecondition`. Ordinary statement failures do not close or poison a
-session, so a frontend may correct a request and continue. Sessions are not
+`FailedPrecondition`. Ordinary statement failures outside a transaction do not
+close or poison a session. A failure inside a transaction changes it to
+`FailedTransaction` until rollback. Sessions are not
 clonable. Frontends may issue concurrent calls against one borrowed session,
 but the engine serializes them; the HTTP adapter instead creates an independent
 session for every request.
@@ -1070,7 +1071,8 @@ replaces a stateless write handle before SQL runs, and handles used only for
 reads remain reusable across sessions. This ownership is a leakage-prevention
 rule, not connection pinning: a competing ordinary session can replace an idle
 write-bearing handle, so write-counter functions remain uncontracted across
-calls until transaction/session pinning is added.
+autocommit calls. An explicit transaction instead retains its exact pinned
+connection until commit or rollback.
 
 Every operation acquires a lifecycle lease before its first await. Dropping a
 queued future removes the operation before SQLite starts. Once work is running,
@@ -1122,10 +1124,10 @@ sets, synchronously enters `Draining`, and schedules best-effort terminal
 PostgreSQL session cleanup; a surviving embedder-owned `Engine` clone can
 resume asynchronous cleanup with `shutdown()`.
 
-Real multi-call `BEGIN`/`COMMIT`/`ROLLBACK`, failed-transaction state, and
-single-shard pinning remain deferred to the PostgreSQL and MySQL transaction
-work in issues #34 and #47. `Ready` and `Closed` therefore describe session
-lifecycle, not SQL transaction state.
+PostgreSQL `BEGIN`/`COMMIT`/`ROLLBACK` uses the protocol-neutral `Ready`,
+`InTransaction`, and `FailedTransaction` state machine. The first executable
+statement pins one SQLite shard and connection; cross-shard work fails before
+mutation, and close or shutdown rolls back. MySQL exposure remains issue #47.
 
 The pool/request-control and prepared-cache boundaries changed Rust
 orchestration and added opt-in `EngineOptions` plus CLI/environment
