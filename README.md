@@ -163,9 +163,10 @@ Python can run the same engine directly in-process with no server or listener:
 python -m pip install ./python
 ```
 
-See the [Python quickstart](python/README.md) for a write/read example. A Rust
-toolchain is required for this initial source distribution; prebuilt wheels are
-tracked in [#200](https://github.com/schapman1974/briskdb/issues/200).
+See the [Python quickstart](python/README.md) for sync and asyncio write/read
+examples. A Rust toolchain is required for this initial source distribution;
+prebuilt wheels are tracked in
+[#200](https://github.com/schapman1974/briskdb/issues/200).
 
 ## Still just inspectable files
 

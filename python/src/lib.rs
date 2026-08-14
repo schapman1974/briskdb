@@ -2,25 +2,28 @@ mod error;
 mod value;
 
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use briskdb::{
-    BriskDb, BriskSession, CheckpointReport, EngineOptions, EngineState, EngineStatus,
-    PreparedStatementLimits, ResultLimits, SessionState, Statement,
+    BriskDb, BriskSession, CancellationToken as EngineCancellationToken, CheckpointReport, Column,
+    EngineOptions, EngineState, EngineStatus, Executed, PreparedStatementLimits, RequestContext,
+    ResultLimits, ResultSet, Routed, SessionState, Statement, Value,
 };
 use pyo3::{
     prelude::*,
-    types::{PyDict, PyModule},
+    types::{PyAny, PyDict, PyList, PyModule, PyTuple},
 };
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use crate::{
     error::{NativeError, NativeResult, run_native},
     value::{
-        extract_params, logical_result_to_python, routed_result_to_python, write_result_to_python,
+        data_type_name, extract_params, logical_result_to_python, routed_result_to_python,
+        value_to_python, write_result_to_python,
     },
 };
 
@@ -161,6 +164,186 @@ impl Config {
     }
 }
 
+#[pyclass(module = "briskdb._briskdb", frozen, skip_from_py_object)]
+#[derive(Clone, Debug)]
+struct CancellationToken {
+    inner: EngineCancellationToken,
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self {
+            inner: EngineCancellationToken::new(),
+        }
+    }
+}
+
+#[pymethods]
+impl CancellationToken {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn cancel(&self) -> bool {
+        self.inner.cancel()
+    }
+
+    #[getter]
+    fn cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("CancellationToken(cancelled={})", self.cancelled())
+    }
+}
+
+struct CursorState {
+    rows: VecDeque<Vec<Value>>,
+    closed: bool,
+}
+
+#[pyclass(module = "briskdb._briskdb", frozen)]
+struct Cursor {
+    shards: Vec<u16>,
+    columns: Vec<(String, &'static str)>,
+    batch_size: usize,
+    state: Mutex<CursorState>,
+}
+
+impl Cursor {
+    fn from_routed(result: Routed<ResultSet>, batch_size: usize) -> PyResult<Self> {
+        Self::from_parts(vec![result.shard], result.value, batch_size)
+    }
+
+    fn from_logical(result: Executed<ResultSet>, batch_size: usize) -> PyResult<Self> {
+        Self::from_parts(result.shards, result.value, batch_size)
+    }
+
+    fn from_parts(shards: Vec<u16>, result: ResultSet, batch_size: usize) -> PyResult<Self> {
+        if batch_size == 0 {
+            return Err(crate::error::invalid_value(
+                "cursor batch_size must be at least 1",
+            ));
+        }
+        let (columns, rows) = result.into_parts();
+        Ok(Self {
+            shards,
+            columns: cursor_columns(columns),
+            batch_size,
+            state: Mutex::new(CursorState {
+                rows: rows.into_iter().map(briskdb::Row::into_values).collect(),
+                closed: false,
+            }),
+        })
+    }
+
+    fn take_rows(&self, count: usize) -> PyResult<Vec<Vec<Value>>> {
+        let mut state = self.state.lock().map_err(NativeError::from)?;
+        if state.closed {
+            return Err(NativeError::Closed("cursor").into());
+        }
+        let count = count.min(state.rows.len());
+        Ok(state.rows.drain(..count).collect())
+    }
+}
+
+#[pymethods]
+impl Cursor {
+    #[getter]
+    fn shards(&self) -> Vec<u16> {
+        self.shards.clone()
+    }
+
+    #[getter]
+    fn columns(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let output = PyList::empty(py);
+        for (name, data_type) in &self.columns {
+            let column = PyDict::new(py);
+            column.set_item("name", name)?;
+            column.set_item("type", data_type)?;
+            output.append(column)?;
+        }
+        Ok(output.into_any().unbind())
+    }
+
+    #[getter]
+    fn closed(&self) -> PyResult<bool> {
+        Ok(self.state.lock().map_err(NativeError::from)?.closed)
+    }
+
+    #[getter]
+    fn remaining(&self) -> PyResult<usize> {
+        let state = self.state.lock().map_err(NativeError::from)?;
+        if state.closed {
+            return Err(NativeError::Closed("cursor").into());
+        }
+        Ok(state.rows.len())
+    }
+
+    fn fetchone(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.take_rows(1)?
+            .pop()
+            .map(|row| cursor_row_to_python(py, row))
+            .transpose()
+    }
+
+    #[pyo3(signature = (size = None))]
+    fn fetchmany(&self, py: Python<'_>, size: Option<usize>) -> PyResult<Py<PyAny>> {
+        let size = size.unwrap_or(self.batch_size);
+        if size == 0 {
+            return Err(crate::error::invalid_value(
+                "cursor fetch size must be at least 1",
+            ));
+        }
+        cursor_rows_to_python(py, self.take_rows(size)?)
+    }
+
+    fn fetchall(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        cursor_rows_to_python(py, self.take_rows(usize::MAX)?)
+    }
+
+    fn close(&self) -> PyResult<()> {
+        let mut state = self.state.lock().map_err(NativeError::from)?;
+        state.rows.clear();
+        state.closed = true;
+        Ok(())
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.fetchone(py)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        _exception_type: Option<&Bound<'_, PyAny>>,
+        _exception: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        self.close()?;
+        Ok(false)
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        let state = self.state.lock().map_err(NativeError::from)?;
+        Ok(format!(
+            "Cursor(columns={}, remaining={}, closed={})",
+            self.columns.len(),
+            state.rows.len(),
+            state.closed
+        ))
+    }
+}
+
 struct SessionShared {
     session: Mutex<Option<BriskSession>>,
     runtime: Arc<RuntimeOwner>,
@@ -279,11 +462,21 @@ impl Database {
         })
     }
 
-    fn checkpoint(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (*, timeout_ms = None, cancellation = None))]
+    fn checkpoint(
+        &self,
+        py: Python<'_>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+    ) -> PyResult<Py<PyAny>> {
+        let context = request_context(timeout_ms, cancellation.as_deref())?;
         let shared = Arc::clone(&self.shared);
         let report = run_native(py, move || {
             let database = shared.database()?;
-            Ok(shared.runtime.runtime.block_on(database.checkpoint())?)
+            Ok(shared
+                .runtime
+                .runtime
+                .block_on(database.checkpoint_with_context(context))?)
         })?;
         checkpoint_to_python(py, report)
     }
@@ -310,6 +503,21 @@ impl Database {
             self.shared.config.shards,
             self.state()?
         ))
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exception_type: Option<&Bound<'_, PyAny>>,
+        _exception: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
     }
 }
 
@@ -380,69 +588,134 @@ impl Session {
         })
     }
 
-    fn migrate(&self, py: Python<'_>, sql: String) -> PyResult<Vec<u16>> {
+    #[pyo3(signature = (sql, *, timeout_ms = None, cancellation = None))]
+    fn migrate(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+    ) -> PyResult<Vec<u16>> {
+        let context = request_context(timeout_ms, cancellation.as_deref())?;
         let shared = Arc::clone(&self.shared);
         run_native(py, move || {
             let session = shared.session()?;
-            Ok(shared.runtime.runtime.block_on(session.migrate(sql))?)
+            Ok(shared
+                .runtime
+                .runtime
+                .block_on(session.migrate_with_context(sql, context))?)
         })
     }
 
-    #[pyo3(signature = (sql, params = None))]
+    #[pyo3(signature = (sql, params = None, *, timeout_ms = None, cancellation = None))]
     fn execute(
         &self,
         py: Python<'_>,
         sql: String,
         params: Option<Vec<Py<PyAny>>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
     ) -> PyResult<Py<PyAny>> {
         let params = extract_params(py, params)?;
+        let context = request_context(timeout_ms, cancellation.as_deref())?;
         let shared = Arc::clone(&self.shared);
         let result = run_native(py, move || {
             let session = shared.session()?;
-            Ok(shared
-                .runtime
-                .runtime
-                .block_on(session.execute_write(Statement::new(sql, params)))?)
+            Ok(shared.runtime.runtime.block_on(
+                session.execute_write_with_context(Statement::new(sql, params), context),
+            )?)
         })?;
         write_result_to_python(py, result)
     }
 
-    #[pyo3(signature = (sql, params = None))]
+    #[pyo3(signature = (sql, params = None, *, timeout_ms = None, cancellation = None))]
     fn query(
         &self,
         py: Python<'_>,
         sql: String,
         params: Option<Vec<Py<PyAny>>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
     ) -> PyResult<Py<PyAny>> {
         let params = extract_params(py, params)?;
+        let context = request_context(timeout_ms, cancellation.as_deref())?;
         let shared = Arc::clone(&self.shared);
         let result = run_native(py, move || {
             let session = shared.session()?;
             Ok(shared
                 .runtime
                 .runtime
-                .block_on(session.query(Statement::new(sql, params)))?)
+                .block_on(session.query_with_context(Statement::new(sql, params), context))?)
         })?;
         routed_result_to_python(py, result)
     }
 
-    #[pyo3(signature = (sql, params = None))]
+    #[pyo3(signature = (sql, params = None, *, timeout_ms = None, cancellation = None))]
     fn query_logical(
         &self,
         py: Python<'_>,
         sql: String,
         params: Option<Vec<Py<PyAny>>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
     ) -> PyResult<Py<PyAny>> {
         let params = extract_params(py, params)?;
+        let context = request_context(timeout_ms, cancellation.as_deref())?;
+        let shared = Arc::clone(&self.shared);
+        let result = run_native(py, move || {
+            let session = shared.session()?;
+            Ok(shared.runtime.runtime.block_on(
+                session.query_logical_with_context(Statement::new(sql, params), context),
+            )?)
+        })?;
+        logical_result_to_python(py, result)
+    }
+
+    #[pyo3(signature = (sql, params = None, *, batch_size = 1_000, timeout_ms = None, cancellation = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn cursor(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        params: Option<Vec<Py<PyAny>>>,
+        batch_size: usize,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+    ) -> PyResult<Cursor> {
+        let params = extract_params(py, params)?;
+        let context = request_context(timeout_ms, cancellation.as_deref())?;
         let shared = Arc::clone(&self.shared);
         let result = run_native(py, move || {
             let session = shared.session()?;
             Ok(shared
                 .runtime
                 .runtime
-                .block_on(session.query_logical(Statement::new(sql, params)))?)
+                .block_on(session.query_with_context(Statement::new(sql, params), context))?)
         })?;
-        logical_result_to_python(py, result)
+        Cursor::from_routed(result, batch_size)
+    }
+
+    #[pyo3(signature = (sql, params = None, *, batch_size = 1_000, timeout_ms = None, cancellation = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn logical_cursor(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        params: Option<Vec<Py<PyAny>>>,
+        batch_size: usize,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+    ) -> PyResult<Cursor> {
+        let params = extract_params(py, params)?;
+        let context = request_context(timeout_ms, cancellation.as_deref())?;
+        let shared = Arc::clone(&self.shared);
+        let result = run_native(py, move || {
+            let session = shared.session()?;
+            Ok(shared.runtime.runtime.block_on(
+                session.query_logical_with_context(Statement::new(sql, params), context),
+            )?)
+        })?;
+        Cursor::from_logical(result, batch_size)
     }
 
     fn status(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -468,6 +741,21 @@ impl Session {
     fn __repr__(&self) -> PyResult<String> {
         let state = if self.closed()? { "closed" } else { "ready" };
         Ok(format!("Session(state={state:?})"))
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exception_type: Option<&Bound<'_, PyAny>>,
+        _exception: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
     }
 }
 
@@ -498,6 +786,46 @@ fn resolve_config(shards: Option<u16>, config: Option<&Config>) -> PyResult<Conf
         (None, Some(config)) => Ok(config.clone()),
         (None, None) => Ok(Config::default()),
     }
+}
+
+fn request_context(
+    timeout_ms: Option<u64>,
+    cancellation: Option<&CancellationToken>,
+) -> PyResult<RequestContext> {
+    let cancellation = cancellation
+        .map(|cancellation| cancellation.inner.clone())
+        .unwrap_or_default();
+    let context = RequestContext::new().with_cancellation_token(cancellation);
+    match timeout_ms {
+        Some(timeout_ms) => context
+            .with_timeout(Duration::from_millis(timeout_ms))
+            .map_err(NativeError::from)
+            .map_err(PyErr::from),
+        None => Ok(context),
+    }
+}
+
+fn cursor_columns(columns: Vec<Column>) -> Vec<(String, &'static str)> {
+    columns
+        .into_iter()
+        .map(|column| (column.name, data_type_name(column.data_type)))
+        .collect()
+}
+
+fn cursor_row_to_python(py: Python<'_>, row: Vec<Value>) -> PyResult<Py<PyAny>> {
+    let values = row
+        .into_iter()
+        .map(|value| value_to_python(py, value))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(PyTuple::new(py, values)?.into_any().unbind())
+}
+
+fn cursor_rows_to_python(py: Python<'_>, rows: Vec<Vec<Value>>) -> PyResult<Py<PyAny>> {
+    let output = PyList::empty(py);
+    for row in rows {
+        output.append(cursor_row_to_python(py, row)?)?;
+    }
+    Ok(output.into_any().unbind())
 }
 
 fn engine_state_name(state: EngineState) -> &'static str {
@@ -565,7 +893,9 @@ fn checkpoint_to_python(py: Python<'_>, report: CheckpointReport) -> PyResult<Py
 #[pymodule]
 fn _briskdb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register(module)?;
+    module.add_class::<CancellationToken>()?;
     module.add_class::<Config>()?;
+    module.add_class::<Cursor>()?;
     module.add_class::<Database>()?;
     module.add_class::<Session>()?;
     module.add_function(wrap_pyfunction!(open_database, module)?)?;

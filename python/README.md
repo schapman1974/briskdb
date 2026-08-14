@@ -32,6 +32,18 @@ Database and session handles own their native resources, `close()` is
 idempotent, and blocking engine work releases Python's GIL. Dropping live
 handles during interpreter shutdown is also safe.
 
+Synchronous handles support `with`; the asyncio facade keeps engine work off
+the event loop and propagates task cancellation into Rust:
+
+```python
+async with await briskdb.open_async("./data", shards=4) as db:
+    async with await db.session(routing_key="account-1") as session:
+        rows = await session.query("SELECT body FROM notes WHERE id = ?1", [1])
+```
+
+See [sync and asyncio usage](ASYNC_API.md) for cursors, deadlines, cancellation,
+thread/task safety, and the intentionally unclaimed DB-API transaction surface.
+
 This is an alpha API. SQL supports `None`, `bool`, bounded integers, `float`,
 `str`, bytes-like values, and exact `decimal.Decimal` conversion with explicit
 errors when SQLite cannot store a value losslessly. See the executable

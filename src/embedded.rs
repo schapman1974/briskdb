@@ -736,6 +736,17 @@ impl BriskSession {
         self.database.migrate(self.session.as_ref(), sql).await
     }
 
+    /// Apply one durable schema batch with host-supplied request controls.
+    pub async fn migrate_with_context(
+        &self,
+        sql: impl Into<String>,
+        context: RequestContext,
+    ) -> EngineResult<Vec<u16>> {
+        self.database
+            .migrate_with_context(self.session.as_ref(), sql, context)
+            .await
+    }
+
     /// Close this session terminally and clear all retained session state.
     ///
     /// Closing one clone closes every clone. It remains available while the
