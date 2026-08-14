@@ -12,13 +12,13 @@ the checksum before installation, then install the local package:
 
 ```bash
 sha256sum --check SHA256SUMS --ignore-missing
-sudo apt install ./briskdb_0.1.0.alpha.4-1_amd64.deb
+sudo apt install ./briskdb_0.1.0.alpha.5-1_amd64.deb
 ```
 
 Use the `_arm64.deb` package on 64-bit ARM. `apt` resolves the package's runtime
 dependencies and enables and starts `briskdb.service` during installation.
 The filename uses a GitHub-safe dot, while package metadata uses the Debian
-prerelease version `0.1.0~alpha.4-1` so it sorts before the final release.
+prerelease version `0.1.0~alpha.5-1` so it sorts before the final release.
 
 ## Filesystem contract
 
