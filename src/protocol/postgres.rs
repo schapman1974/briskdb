@@ -44,7 +44,7 @@ use pgwire::{
             TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
         },
         response::{GssEncResponse, ReadyForQuery, SslResponse, TransactionStatus},
-        startup::{Authentication, ParameterStatus},
+        startup::{Authentication, NegotiateProtocolVersion, ParameterStatus},
     },
     tokio::server::{PgWireMessageServerCodec, process_error, process_message},
 };
@@ -905,20 +905,26 @@ impl StartupHandler for WireHandlers {
                 "a PostgreSQL startup message is required",
             ));
         };
-        if (startup.protocol_number_major, startup.protocol_number_minor)
-            != (POSTGRES_PROTOCOL_MAJOR, POSTGRES_PROTOCOL_MINOR)
-        {
+        if startup.protocol_number_major != POSTGRES_PROTOCOL_MAJOR {
             return Err(fatal_wire_error(
                 "08P01",
                 "the PostgreSQL protocol version is unsupported",
             ));
         }
 
+        let mut unsupported_options = startup
+            .parameters
+            .keys()
+            .filter(|key| key.starts_with("_pq_."))
+            .cloned()
+            .collect::<Vec<_>>();
+        unsupported_options.sort_unstable();
         for key in startup.parameters.keys() {
             if !matches!(
                 key.as_str(),
                 "user" | "database" | "client_encoding" | "application_name" | "replication"
-            ) {
+            ) && !key.starts_with("_pq_.")
+            {
                 return Err(fatal_wire_error(
                     "0A000",
                     "the PostgreSQL startup parameter is unsupported",
@@ -979,6 +985,18 @@ impl StartupHandler for WireHandlers {
             metadata.insert("application_name".to_owned(), application_name.to_owned());
         }
 
+        if startup.protocol_number_minor > POSTGRES_PROTOCOL_MINOR
+            || !unsupported_options.is_empty()
+        {
+            client
+                .send(PgWireBackendMessage::NegotiateProtocolVersion(
+                    NegotiateProtocolVersion::new(
+                        i32::from(POSTGRES_PROTOCOL_MINOR),
+                        unsupported_options,
+                    ),
+                ))
+                .await?;
+        }
         client
             .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
             .await?;
@@ -2109,6 +2127,25 @@ mod tests {
         (name, value)
     }
 
+    fn negotiated_protocol(body: &[u8]) -> (i32, Vec<String>) {
+        let newest_minor = i32::from_be_bytes(body[..4].try_into().unwrap());
+        let option_count =
+            usize::try_from(i32::from_be_bytes(body[4..8].try_into().unwrap())).unwrap();
+        let mut options = Vec::with_capacity(option_count);
+        let mut offset = 8;
+        for _ in 0..option_count {
+            let end = body[offset..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|length| offset + length)
+                .unwrap();
+            options.push(std::str::from_utf8(&body[offset..end]).unwrap().to_owned());
+            offset = end + 1;
+        }
+        assert_eq!(offset, body.len());
+        (newest_minor, options)
+    }
+
     fn command_tag(body: &[u8]) -> &str {
         let (terminator, tag) = body.split_last().unwrap();
         assert_eq!(*terminator, 0);
@@ -2426,6 +2463,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn newer_minor_versions_and_protocol_options_negotiate_to_the_exact_baseline() {
+        let (_temp, engine) = engine(2).await;
+        let adapter = Adapter::new(engine.clone());
+        let cases = [
+            (1_u16, Vec::new()),
+            (2, Vec::new()),
+            (
+                u16::MAX,
+                vec![("_pq_.feature_z", "enabled"), ("_pq_.feature_a", "enabled")],
+            ),
+            (0, vec![("_pq_.feature_only", "enabled")]),
+        ];
+
+        for (minor, options) in cases {
+            let (address, wire, server) = spawn_wire_server(&adapter).await;
+            let mut client = TcpStream::connect(address).await.unwrap();
+            let mut parameters = vec![("user", "client_user"), ("database", "default")];
+            parameters.extend(options.iter().copied());
+            let protocol = (u32::from(POSTGRES_PROTOCOL_MAJOR) << 16) | u32::from(minor);
+            client
+                .write_all(&startup_packet_with(protocol, &parameters))
+                .await
+                .unwrap();
+
+            let frames = read_until_ready(&mut client).await;
+            assert_eq!(frames.first().unwrap().0, b'v');
+            assert_eq!(frames.get(1).unwrap(), &(b'R', vec![0, 0, 0, 0]));
+            assert_eq!(frames.last().unwrap(), &(b'Z', vec![b'I']));
+            assert!(frames.iter().filter(|frame| frame.0 == b'S').any(|frame| {
+                parameter_status(&frame.1)
+                    == ("server_version".to_owned(), SERVER_VERSION.to_owned())
+            }));
+            let expected_options = options
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                negotiated_protocol(&frames[0].1),
+                (i32::from(POSTGRES_PROTOCOL_MINOR), expected_options)
+            );
+
+            client.write_all(&typed_packet(b'Q', &[0])).await.unwrap();
+            assert_eq!(
+                read_until_ready(&mut client).await,
+                [(b'I', vec![]), (b'Z', vec![b'I'])]
+            );
+            let core = Arc::clone(wire.connection().unwrap());
+            assert_eq!(core.state().await, SessionState::Ready);
+            finish_wire_server(&mut client, server).await;
+            assert_eq!(core.state().await, SessionState::Closed);
+        }
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn startup_rejections_are_fixed_fatal_and_a_later_connection_recovers() {
         let (_temp, engine) = engine(2).await;
         let adapter = Adapter::new(engine.clone());
@@ -2471,6 +2566,11 @@ mod tests {
             ),
             (
                 startup_packet_with(131_072, &[("user", "client_user"), ("database", "default")]),
+                "08P01",
+                "the PostgreSQL protocol message is invalid",
+            ),
+            (
+                startup_packet_with(262_144, &[("user", "client_user"), ("database", "default")]),
                 "08P01",
                 "the PostgreSQL protocol message is invalid",
             ),
@@ -2563,11 +2663,6 @@ mod tests {
                 ),
                 "0A000",
                 "PostgreSQL replication startup is unsupported",
-            ),
-            (
-                startup_packet_with(196_610, &[("user", "client_user"), ("database", "default")]),
-                "08P01",
-                "the PostgreSQL protocol version is unsupported",
             ),
         ];
 

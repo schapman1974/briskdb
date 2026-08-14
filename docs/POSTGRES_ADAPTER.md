@@ -1,7 +1,8 @@
 # PostgreSQL adapter decision record
 
 Status: accepted for roadmap issue #29; amended by issue #30 production startup
-activation and issue #31 extended-query execution
+activation, issue #31 extended-query execution, and issue #32 protocol
+negotiation
 
 BriskDB needs a PostgreSQL frontend library that can own protocol framing and
 message dispatch without becoming the database engine, routing policy,
@@ -129,8 +130,8 @@ particular:
 
 - `pgwire`'s default startup handler advertises dependency-owned version and
   parameter values. Production startup therefore uses BriskDB-owned handlers,
-  validates protocol 3.0 and a finite parameter set, and emits only the status
-  documented in `POSTGRES_LISTENER.md`.
+  validates the protocol 3.0 baseline and a finite parameter set, and emits only
+  the status documented in `POSTGRES_LISTENER.md`.
 - Its default in-memory statement/portal store is unbounded, replacement does
   not return the old object for cleanup, and statement removal does not cascade
   into BriskDB handles. The adapter therefore mirrors every bound portal and
@@ -161,8 +162,10 @@ particular:
   is still closed. Raw-frame regression tests cover malformed input both before
   and after successful startup.
 - The selected version understands protocol 3.0 and 3.2 and defaults its own
-  client state to 3.2. BriskDB now overrides that state with an exact 3.0
-  baseline; issue #32 owns explicit newer-minor negotiation.
+  client state to 3.2. BriskDB overrides that state with its exact 3.0 baseline.
+  Any newer 3.x request receives a BriskDB-owned downgrade message naming minor
+  zero; unsupported `_pq_.` options are sorted and reported in the same frame.
+  The adapter never advertises 3.2 cancellation-key semantics before issue #35.
 - The raw-frame caps are transport-retention boundaries, not budgets for SQL,
   names, raw parameters, prepared objects, or rows. Those values and connection
   tasks still require their BriskDB-owned finite limits.
@@ -181,7 +184,9 @@ addresses. The listener validates a finite startup parameter set, resolves an
 exact logical database through the core catalog, creates one session only after
 validation, emits BriskDB-owned status, and tracks that session through
 termination and server shutdown. It does not use the dependency's default
-startup values or protocol-version state.
+startup values or protocol-version state. Issue #32 adds deterministic
+newer-minor and protocol-option negotiation without expanding the implemented
+3.0 message semantics.
 
 Issue #157 adds the simple-query slice. Issue #31 adds bounded named/unnamed
 Parse, zero-parameter Bind, statement/portal Describe, resumable Execute,

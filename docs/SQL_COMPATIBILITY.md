@@ -50,7 +50,7 @@ claiming to be a drop-in PostgreSQL or MySQL replacement.
 
 The initial alpha exposes experimental HTTP plus a disabled-by-default,
 separately configured loopback PostgreSQL listener. PostgreSQL implements exact
-protocol-3.0 startup, logical database/user selection, BriskDB parameter
+protocol-3.0 baseline and newer-minor downgrade, logical database/user selection, BriskDB parameter
 status, tracked session termination, simple queries, and zero-parameter
 text-format extended queries through a pinned `pgwire` 0.36.3 boundary. There
 is no MySQL listener. The public Rust SQL facade
@@ -94,7 +94,7 @@ set, every shard for an unconstrained Sharded read, or shard 0 once for a
 | HTTP `/v1/query` | Experimental | Empty catalog: legacy raw SQLite query. Populated catalog: exactly one SQLite common-subset read; no session cache; multi-shard execution is limited to the row-local scatter-safe subset | Empty catalog requires caller `shard_key`; populated catalog derives targets from registered metadata, reads Global data once on shard 0, and denies Catalog/undeclared tables |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch; populated catalogs reject row-moving DML, table drops, and trigger creation | Preflight on every shard, then ascending resumable apply |
 | HTTP `/admin` browser | Experimental, read-only | No caller SQL; metadata-driven logical table discovery, specialized exact logical `COUNT(*)`, and bounded deterministic `SELECT *` page slices | Sharded tables visit all files; Global tables visit shard 0 once; no browser shard selector or arbitrary SQL |
-| PostgreSQL wire protocol | Protocol-3.0 startup plus simple `Query` and zero-parameter text-format extended flow on loopback | Registered-table `SELECT`, `INSERT`, `UPDATE`, and `DELETE`; parameters, binary formats, DDL, and transactions remain unsupported | Startup selects an exact logical database; both flows use Engine prepare/bind/logical execution and fixed SQLSTATE mapping |
+| PostgreSQL wire protocol | Protocol-3.0 baseline with newer 3.x minor downgrade, plus simple `Query` and zero-parameter text-format extended flow on loopback | Registered-table `SELECT`, `INSERT`, `UPDATE`, and `DELETE`; parameters, binary formats, DDL, and transactions remain unsupported | Startup selects an exact logical database; both flows use Engine prepare/bind/logical execution and fixed SQLSTATE mapping |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
 The parser, subset validator, statement classifier, placeholder normalizer, SQL
@@ -782,7 +782,8 @@ boundary are normative in
 ## PostgreSQL differences
 
 The PostgreSQL TCP listener hosts the selected `pgwire` 0.36.3 boundary for
-exact protocol-3.0 startup on loopback. It validates a finite parameter set,
+an exact protocol-3.0 baseline on loopback and downgrades newer 3.x minor
+requests explicitly. It validates a finite parameter set,
 selects one logical database and user label, advertises BriskDB-owned status,
 and tracks the selected core session through termination. Simple and
 zero-parameter extended SQL messages use the bounded Engine lifecycle;
