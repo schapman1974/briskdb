@@ -114,6 +114,7 @@ pub struct EngineStatus {
 pub struct CheckpointShardReport {
     shard: u16,
     busy: bool,
+    counts_available: bool,
     wal_frames: u64,
     checkpointed_frames: u64,
 }
@@ -129,20 +130,70 @@ impl CheckpointShardReport {
         self.busy
     }
 
-    /// Return the number of frames SQLite observed in the WAL.
+    /// Return whether SQLite supplied WAL and checkpointed frame counts.
+    ///
+    /// A competing checkpoint can make both counts unavailable while still
+    /// producing a successful, busy report. In that case the count accessors
+    /// return zero and [`CheckpointShardReport::complete`] returns `false`.
+    pub const fn counts_available(self) -> bool {
+        self.counts_available
+    }
+
+    /// Return the number of frames SQLite observed in the WAL, or zero when
+    /// [`CheckpointShardReport::counts_available`] is `false`.
     pub const fn wal_frames(self) -> u64 {
         self.wal_frames
     }
 
-    /// Return the number of frames SQLite copied into the database file.
+    /// Return the number of frames SQLite copied into the database file, or
+    /// zero when [`CheckpointShardReport::counts_available`] is `false`.
     pub const fn checkpointed_frames(self) -> u64 {
         self.checkpointed_frames
     }
 
     /// Return whether every WAL frame observed by this attempt was copied.
     pub const fn complete(self) -> bool {
-        self.checkpointed_frames >= self.wal_frames
+        self.counts_available && self.checkpointed_frames >= self.wal_frames
     }
+}
+
+fn checkpoint_shard_report(
+    shard: u16,
+    busy: i64,
+    wal_frames: i64,
+    checkpointed_frames: i64,
+) -> EngineResult<CheckpointShardReport> {
+    if wal_frames == -1 && checkpointed_frames == -1 && busy != 0 {
+        // sqlite3_wal_checkpoint_v2() uses -1 for both output counts when a
+        // competing process already owns the checkpoint lock. Preserve the
+        // successful retryable report without inventing frame counts.
+        return Ok(CheckpointShardReport {
+            shard,
+            busy: true,
+            counts_available: false,
+            wal_frames: 0,
+            checkpointed_frames: 0,
+        });
+    }
+    let wal_frames = u64::try_from(wal_frames).map_err(|_| {
+        EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "SQLite returned an invalid WAL frame count",
+        )
+    })?;
+    let checkpointed_frames = u64::try_from(checkpointed_frames).map_err(|_| {
+        EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "SQLite returned an invalid checkpointed frame count",
+        )
+    })?;
+    Ok(CheckpointShardReport {
+        shard,
+        busy: busy != 0,
+        counts_available: true,
+        wal_frames,
+        checkpointed_frames,
+    })
 }
 
 /// Ordered result of a passive checkpoint across every physical shard.
@@ -794,25 +845,12 @@ impl Engine {
                                             },
                                         )
                                         .map_err(crate::sqlite_error::storage)?;
-                                    let wal_frames = u64::try_from(wal_frames).map_err(|_| {
-                                        EngineError::new(
-                                            EngineErrorKind::DataCorruption,
-                                            "SQLite returned a negative WAL frame count",
-                                        )
-                                    })?;
-                                    let checkpointed_frames =
-                                        u64::try_from(checkpointed_frames).map_err(|_| {
-                                            EngineError::new(
-                                                EngineErrorKind::DataCorruption,
-                                                "SQLite returned a negative checkpointed frame count",
-                                            )
-                                        })?;
-                                    Ok(CheckpointShardReport {
+                                    checkpoint_shard_report(
                                         shard,
-                                        busy: busy != 0,
+                                        busy,
                                         wal_frames,
                                         checkpointed_frames,
-                                    })
+                                    )
                                 },
                             );
                             retire_if_broken(&mut connection, &result);
@@ -3031,6 +3069,30 @@ mod tests {
     use crate::core::{
         Column, DataType, Row, SessionState, ShardKeyMetadata, ShardKeyType, TableDeclaration,
     };
+
+    #[test]
+    fn competing_checkpoint_sentinel_is_a_busy_report_without_invented_counts() {
+        let report = checkpoint_shard_report(2, 1, -1, -1).unwrap();
+
+        assert_eq!(report.shard(), 2);
+        assert!(report.busy());
+        assert!(!report.counts_available());
+        assert_eq!(report.wal_frames(), 0);
+        assert_eq!(report.checkpointed_frames(), 0);
+        assert!(!report.complete());
+    }
+
+    #[test]
+    fn malformed_checkpoint_counts_remain_fail_closed() {
+        for (wal_frames, checkpointed_frames) in [(-2, -2), (-1, 0), (0, -1)] {
+            let error = checkpoint_shard_report(0, 1, wal_frames, checkpointed_frames).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        }
+        assert_eq!(
+            checkpoint_shard_report(0, 0, -1, -1).unwrap_err().kind(),
+            EngineErrorKind::DataCorruption
+        );
+    }
 
     fn engine() -> (tempfile::TempDir, Engine) {
         let temp = tempfile::tempdir().unwrap();
