@@ -6,6 +6,9 @@ Status: implemented by issue #189
 engine inside a Rust application. Opening it does not bind sockets, install
 signal handlers, configure tracing, or change process-global state.
 
+See [Embedded SQL](EMBEDDED_SQL.md) for direct and prepared command APIs,
+value guarantees, and the foreign-language runtime boundary.
+
 ```rust
 use briskdb::{BriskDb, Statement, Value};
 

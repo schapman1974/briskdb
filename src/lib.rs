@@ -13,11 +13,14 @@ mod sqlite_error;
 pub use protocol::http as api;
 
 pub use core::{
-    CancellationToken, CheckpointReport, CheckpointShardReport, EngineError, EngineErrorKind,
-    EngineOptions, EngineResult, EngineState, EngineStatus, Executed, PreparedStatementLimits,
-    RequestContext, ResultLimits, ResultSet, Routed, Session, ShutdownReport, Statement, Value,
-    WriteResult,
+    CancellationToken, CheckpointReport, CheckpointShardReport, Column, DataType, Decimal,
+    DescribeTarget, EngineError, EngineErrorKind, EngineOptions, EngineResult, EngineState,
+    EngineStatus, Executed, GeneratedKey, ParseDecimalError, PortalId, PrepareRequest,
+    PreparedExecution, PreparedStatementDescription, PreparedStatementId, PreparedStatementLimits,
+    RequestContext, ResultLimits, ResultSet, ResultSetShapeError, Routed, Row, Session, SessionId,
+    SessionState, ShutdownReport, Statement, Value, WriteResult,
 };
 pub use embedded::{
     BriskDb, BriskDbBuilder, DEFAULT_EMBEDDED_SHARDS, DocumentSupport, RuntimeBehavior,
 };
+pub use sql::{SqlDialect, SqlTranslationMode, StatementBehavior};
