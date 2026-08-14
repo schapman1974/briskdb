@@ -173,6 +173,12 @@ impl Database {
         })
     }
 
+    /// Detect the immutable shard count from an initialized data directory
+    /// without creating or upgrading storage.
+    pub fn detect_shard_count(root: impl AsRef<Path>) -> EngineResult<u16> {
+        crate::storage::detect_shard_count(root)
+    }
+
     pub fn shard_count(&self) -> u16 {
         self.storage.shard_count()
     }

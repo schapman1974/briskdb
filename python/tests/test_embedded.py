@@ -49,6 +49,38 @@ class EmbeddedBriskDbTests(unittest.TestCase):
             ):
                 briskdb.Config(max_result_rows=0)
 
+    def test_shard_count_is_required_for_creation_and_detected_for_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            missing = Path(parent) / "missing"
+            with self.assertRaisesRegex(
+                briskdb.FailedPreconditionError, "set a shard count to create it"
+            ):
+                briskdb.open(missing)
+            self.assertFalse(missing.exists())
+
+            empty = Path(parent) / "empty"
+            empty.mkdir()
+            with self.assertRaisesRegex(
+                briskdb.FailedPreconditionError, "set a shard count to create it"
+            ):
+                briskdb.open(empty)
+            self.assertEqual(list(empty.iterdir()), [])
+
+            data_dir = Path(parent) / "data"
+            briskdb.open(data_dir, shards=6).close()
+            with self.assertRaisesRegex(
+                briskdb.FailedPreconditionError,
+                "database was created with 6 shards, but 4 were requested",
+            ):
+                briskdb.open(data_dir, shards=4)
+
+            config = briskdb.Config(connections_per_shard=1)
+            self.assertIsNone(config.shards)
+            reopened = briskdb.open(data_dir, config=config)
+            self.assertEqual(reopened.shard_count, 6)
+            self.assertEqual(reopened.config.shards, 6)
+            reopened.close()
+
     def test_basic_write_read_checkpoint_close_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as data_dir:
             database = briskdb.open(data_dir, shards=2)
@@ -296,7 +328,7 @@ session.query("SELECT 1")
             manifest = Path(data_dir) / "manifest.sqlite"
             manifest.write_bytes(b"not a SQLite database")
             with self.assertRaises(briskdb.DataCorruptionError) as raised:
-                briskdb.open(data_dir, shards=2)
+                briskdb.open(data_dir)
             self.assertEqual(raised.exception.code, "data_corruption")
 
 

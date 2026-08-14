@@ -8599,6 +8599,13 @@ fn validate_manifest_configuration(
     connection: &Connection,
     requested_shards: u16,
 ) -> EngineResult<u16> {
+    let shard_count = read_manifest_shard_count(connection)?;
+    ensure_requested_shards(shard_count, requested_shards)?;
+
+    Ok(shard_count)
+}
+
+fn read_manifest_shard_count(connection: &Connection) -> EngineResult<u16> {
     let mut config_statement = connection
         .prepare("SELECT singleton, shard_count FROM briskdb_manifest ORDER BY singleton LIMIT 3")
         .map_err(|error| manifest_read_error(error, "failed to read manifest configuration"))?;
@@ -8621,9 +8628,71 @@ fn validate_manifest_configuration(
         )
     })?;
     validate_shard_range(shard_count)?;
-    ensure_requested_shards(shard_count, requested_shards)?;
-
     Ok(shard_count)
+}
+
+/// Read and validate the immutable shard count without upgrading storage.
+///
+/// This is the discovery half of an embedded open with no requested count.
+/// The normal startup path validates the manifest again after discovery, so a
+/// concurrently replaced or damaged manifest still fails closed.
+pub(super) fn detect_shard_count(connection: &Connection) -> EngineResult<u16> {
+    let (application_id, version) = read_identity(connection)?;
+    let candidate = if application_id == MANIFEST_APPLICATION_ID {
+        if version > i64::from(CURRENT_SCHEMA_VERSION) {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "manifest schema version {version} is newer than this BriskDB build supports ({CURRENT_SCHEMA_VERSION})"
+                ),
+            ));
+        }
+        read_manifest_shard_count(connection)?
+    } else if application_id == 0 {
+        let objects = schema_objects(connection)?;
+        if version == 0 && objects.is_empty() {
+            return Err(shard_count_required());
+        }
+        if (version == 0 || version == i64::from(LEGACY_SCHEMA_VERSION))
+            && objects == legacy_objects()
+        {
+            match read_legacy_metadata(connection)? {
+                LegacyMetadata::Initialized { shard_count } => shard_count,
+                LegacyMetadata::Empty => return Err(shard_count_required()),
+            }
+        } else if objects
+            .iter()
+            .any(|object| object.name.starts_with("briskdb_"))
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "manifest identity and BriskDB schema objects are inconsistent",
+            ));
+        } else {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "manifest.sqlite is not an empty or recognized BriskDB manifest",
+            ));
+        }
+    } else {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("manifest.sqlite has foreign application identifier {application_id:#010x}"),
+        ));
+    };
+
+    match inspect_with_plan(connection, candidate, CURRENT_PLAN)? {
+        ManifestState::LegacyV1 { shard_count } => Ok(shard_count),
+        ManifestState::Versioned { snapshot, .. } => Ok(snapshot.shard_count),
+        ManifestState::Empty | ManifestState::LegacyUninitialized => Err(shard_count_required()),
+    }
+}
+
+fn shard_count_required() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::FailedPrecondition,
+        "data directory has no initialized BriskDB manifest; set a shard count to create it",
+    )
 }
 
 fn validate_downgrade_fence(connection: &Connection, expected_version: u32) -> EngineResult<()> {

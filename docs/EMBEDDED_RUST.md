@@ -50,11 +50,16 @@ Run the complete example with:
 cargo run --example embedded -- ./briskdb-embedded-example
 ```
 
+Creating a database requires `.with_shard_count(...)`. After that,
+`BriskDb::open(path)` detects the immutable count from the manifest. Supplying
+a different explicit count fails with `FailedPrecondition` instead of opening
+the data under the wrong layout.
+
 ## Defaults
 
 | Setting | Default |
 | --- | ---: |
-| Physical shards | 4 |
+| Physical shards | Detected when opening; explicit when creating |
 | Active SQLite connections per shard | 4 |
 | Queued operations per shard | 32 |
 | Result rows | 10,000 |
@@ -65,8 +70,9 @@ cargo run --example embedded -- ./briskdb-embedded-example
 | Native document support | Disabled |
 
 Use `EngineOptions`, `ResultLimits`, and `PreparedStatementLimits` to replace
-resource defaults. The builder validates the complete shard/runtime/document
-configuration before opening or creating storage.
+resource defaults. Explicit shard counts are validated before storage is
+created; count-dependent limits are validated after an existing manifest is
+detected.
 
 ## Lifecycle and errors
 

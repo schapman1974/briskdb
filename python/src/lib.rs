@@ -60,7 +60,7 @@ impl Drop for DatabaseShared {
 #[pyclass(module = "briskdb._briskdb", frozen, get_all, skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct Config {
-    shards: u16,
+    shards: Option<u16>,
     connections_per_shard: usize,
     queue_capacity_per_shard: usize,
     max_result_rows: u64,
@@ -75,7 +75,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            shards: briskdb::DEFAULT_EMBEDDED_SHARDS,
+            shards: None,
             connections_per_shard: briskdb::core::DEFAULT_CONNECTIONS_PER_SHARD,
             queue_capacity_per_shard: briskdb::core::DEFAULT_QUEUE_CAPACITY_PER_SHARD,
             max_result_rows: briskdb::core::DEFAULT_MAX_RESULT_ROWS,
@@ -106,7 +106,9 @@ impl Config {
                 .with_prepared_statement_limits(prepared_statement_limits)
                 .with_request_timeout(request_timeout)?
                 .with_shutdown_grace(Duration::from_millis(self.shutdown_grace_ms))?;
-        options.validate_for_shards(self.shards)?;
+        if let Some(shards) = self.shards {
+            options.validate_for_shards(shards)?;
+        }
         Ok(options)
     }
 }
@@ -116,7 +118,7 @@ impl Config {
     #[new]
     #[pyo3(signature = (
         *,
-        shards = briskdb::DEFAULT_EMBEDDED_SHARDS,
+        shards = None,
         connections_per_shard = briskdb::core::DEFAULT_CONNECTIONS_PER_SHARD,
         queue_capacity_per_shard = briskdb::core::DEFAULT_QUEUE_CAPACITY_PER_SHARD,
         max_result_rows = briskdb::core::DEFAULT_MAX_RESULT_ROWS,
@@ -129,7 +131,7 @@ impl Config {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        shards: u16,
+        shards: Option<u16>,
         connections_per_shard: usize,
         queue_capacity_per_shard: usize,
         max_result_rows: u64,
@@ -157,9 +159,12 @@ impl Config {
     }
 
     fn __repr__(&self) -> String {
+        let shards = self
+            .shards
+            .map_or_else(|| "None".to_owned(), |shards| shards.to_string());
         format!(
-            "Config(shards={}, connections_per_shard={}, queue_capacity_per_shard={})",
-            self.shards, self.connections_per_shard, self.queue_capacity_per_shard
+            "Config(shards={shards}, connections_per_shard={}, queue_capacity_per_shard={})",
+            self.connections_per_shard, self.queue_capacity_per_shard
         )
     }
 }
@@ -372,12 +377,14 @@ impl Database {
                 .thread_name("briskdb-python")
                 .build()
                 .map_err(|error| NativeError::Runtime(error.to_string()))?;
-            let database = runtime.block_on(
-                BriskDb::builder(&root)
-                    .with_shard_count(config.shards)
-                    .with_engine_options(engine_options)
-                    .open(),
-            )?;
+            let builder = BriskDb::builder(&root).with_engine_options(engine_options);
+            let builder = match config.shards {
+                Some(shards) => builder.with_shard_count(shards),
+                None => builder,
+            };
+            let database = runtime.block_on(builder.open())?;
+            let mut config = config;
+            config.shards = Some(database.shard_count());
             let runtime = Arc::new(RuntimeOwner { runtime });
             Ok(Self {
                 shared: Arc::new(DatabaseShared {
@@ -412,7 +419,10 @@ impl Database {
 
     #[getter]
     fn shard_count(&self) -> u16 {
-        self.shared.config.shards
+        self.shared
+            .config
+            .shards
+            .expect("an opened database always has a resolved shard count")
     }
 
     #[getter]
@@ -500,7 +510,7 @@ impl Database {
         Ok(format!(
             "Database(path={:?}, shards={}, state={:?})",
             self.shared.root,
-            self.shared.config.shards,
+            self.shard_count(),
             self.state()?
         ))
     }
@@ -777,7 +787,7 @@ fn resolve_config(shards: Option<u16>, config: Option<&Config>) -> PyResult<Conf
         )),
         (Some(shards), None) => {
             let config = Config {
-                shards,
+                shards: Some(shards),
                 ..Config::default()
             };
             config.engine_options()?;
