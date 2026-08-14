@@ -4,6 +4,72 @@ BriskDB's Criterion suite establishes repeatable controls for the synchronous
 storage path and the bounded asynchronous engine. It is a measurement tool, not
 a claim about production capacity or a timing threshold for shared CI runners.
 
+## Global-index before/after gate
+
+Issue [#226](https://github.com/schapman1974/briskdb/issues/226) freezes the
+protocol-neutral Engine baseline that every global-index phase must compare
+against. The matrix covers 2, 4, 10, and 64 shards in both one-process and
+four-process modes. Each case uses deterministic data and validates returned
+rows, affected rows, shard targets, constraint outcomes, and every SQLite
+file's `PRAGMA quick_check` before accepting timing data.
+
+| Workload | Current routing | Purpose |
+| --- | --- | --- |
+| `point_read` | One shard | Preserve exact shard-key routing cost |
+| `scatter_read` | Every shard | Measure bounded logical fan-out |
+| `indexed_hit` / `indexed_miss` | Every shard, using a shard-local SQLite index | Freeze the cost that global index routing should remove |
+| `insert` / `update` / `delete` | One shard | Quantify foreground write cost before index maintenance |
+| `contended_unique_insert` | One authoritative shard today | Quantify unique-conflict and multi-process contention cost before global reservations |
+
+Every result is a tab-separated record with attempts, successes, constraint
+failures, returned rows, visited shards, throughput, p50/p95/p99 latency,
+process CPU, peak RSS, operating-system-reported physical write bytes, peak WAL
+growth, and SQLite durability mode. `physical_write_bytes` comes from
+`getrusage`; a platform/filesystem may report zero. The harness does not invent
+an fsync count when portable syscall accounting is unavailable. It records the
+production `WAL` plus `synchronous=FULL` policy explicitly, while WAL growth
+provides a portable storage-cost signal.
+
+Run the parser/budget unit test and the same short correctness smoke used by CI:
+
+```bash
+cargo test --locked --test global_index_baseline \
+  report_parser_and_regression_budgets_are_deterministic -- --exact
+cargo test --locked --test global_index_baseline \
+  global_index_baseline_smoke -- --ignored --exact --test-threads=1
+```
+
+One command runs the complete optimized matrix locally:
+
+```bash
+cargo test --release --locked --test global_index_baseline \
+  release_global_index_baseline -- \
+  --ignored --exact --nocapture --test-threads=1
+```
+
+Use a quiet machine, the same local filesystem, toolchain, power policy, and
+warm-cache policy for before/after comparisons. Set `BRISKDB_BENCH_COMPARE` to
+the committed TSV baseline to enforce the deliberately broad stable-host
+budgets: at least 50% of baseline throughput; p99 no greater than the broader
+of 3x baseline or 5 ms of host-scheduling jitter; at most 2x CPU, physical
+writes, or WAL growth per attempt; and at most 64 MiB additional peak RSS.
+Shared CI runs correctness smoke and synthetic budget tests, not cross-host
+timing thresholds.
+
+```bash
+BRISKDB_BENCH_COMPARE=docs/benchmarks/global-index-before-2026-08-14.tsv \
+  cargo test --release --locked --test global_index_baseline \
+  release_global_index_baseline -- \
+  --ignored --exact --nocapture --test-threads=1
+```
+
+The frozen pre-index artifact is
+[`global-index-before-2026-08-14.tsv`](benchmarks/global-index-before-2026-08-14.tsv).
+It records the exact engine revision, host, compiler, controls, and all 64
+results. The local SQLite secondary index makes individual child lookups cheap,
+but `indexed_hit` and `indexed_miss` still visit 2/4/10/64 shards respectively;
+future gains therefore cannot be mistaken for cache-only improvements.
+
 ## Workload contract
 
 Every benchmark creates a fresh temporary BriskDB database with exactly four
