@@ -3,6 +3,7 @@
 mod hilo;
 mod manifest;
 mod migration;
+mod process_lock;
 mod schema_gate;
 mod shard;
 #[cfg(feature = "experimental-vtab")]
@@ -61,6 +62,7 @@ pub(crate) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = manifest::MAX_SCHEMA_MI
 #[derive(Debug)]
 struct RootSchemaCoordination {
     gate: schema_gate::SchemaGate,
+    _process_lease: process_lock::RootProcessLease,
     catalogs: Mutex<Vec<Weak<CatalogSnapshot>>>,
     schema_digests: Mutex<RuntimeSchemaDigests>,
     #[cfg_attr(not(feature = "experimental-vtab"), allow(dead_code))]
@@ -100,9 +102,10 @@ struct RuntimeSchemaDigests {
 }
 
 impl RootSchemaCoordination {
-    fn new() -> EngineResult<Self> {
+    fn new(root: &Path) -> EngineResult<Self> {
         Ok(Self {
             gate: schema_gate::SchemaGate::new(),
+            _process_lease: process_lock::RootProcessLease::acquire(root)?,
             catalogs: Mutex::new(Vec::new()),
             schema_digests: Mutex::new(RuntimeSchemaDigests::default()),
             hilo_allocator: hilo::HiloAllocator::new()?,
@@ -352,7 +355,7 @@ fn root_schema_coordination(root: &Path) -> EngineResult<Arc<RootSchemaCoordinat
     if let Some(coordination) = registry.get(root).and_then(Weak::upgrade) {
         return Ok(coordination);
     }
-    let coordination = Arc::new(RootSchemaCoordination::new()?);
+    let coordination = Arc::new(RootSchemaCoordination::new(root)?);
     registry.insert(root.to_path_buf(), Arc::downgrade(&coordination));
     Ok(coordination)
 }

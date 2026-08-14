@@ -77,6 +77,7 @@ getrandom = "=0.4.3"
 futures = { version = "0.3", optional = true }
 hyper = { version = "1.11", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1.20", features = ["service", "tokio"], optional = true }
+libc = "0.2"
 # 0.36.3 is the newest pgwire release that supports BriskDB's Rust 1.85
 # baseline. Keep the pre-1.0 dependency exact and enable only the plaintext
 # server surface; later roadmap work owns TLS and extended type adapters.
@@ -98,7 +99,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional =
 
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false }
-libc = "0.2"
 proptest = "1.7"
 tempfile = "3.23"
 
