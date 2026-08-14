@@ -197,6 +197,7 @@ Follow the [roadmap](ROADMAP.md) or browse the
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Embedded Rust](docs/EMBEDDED_RUST.md)
+- [Embedded SQL](docs/EMBEDDED_SQL.md)
 - [PostgreSQL quickstart](docs/POSTGRES_QUICKSTART.md)
 - [SQL compatibility](docs/SQL_COMPATIBILITY.md)
 - [Generated keys](docs/GENERATED_KEYS.md)

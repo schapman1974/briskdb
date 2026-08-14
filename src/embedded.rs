@@ -8,9 +8,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::core::{
-    CancellationToken, Catalog, CheckpointReport, Engine, EngineOptions, EngineResult, EngineState,
-    EngineStatus, Executed, RequestContext, ResultSet, Routed, Session, ShutdownReport, Statement,
-    WriteResult,
+    CancellationToken, Catalog, CheckpointReport, DescribeTarget, Engine, EngineOptions,
+    EngineResult, EngineState, EngineStatus, Executed, PortalId, PrepareRequest, PreparedExecution,
+    PreparedStatementDescription, PreparedStatementId, RequestContext, ResultSet, Routed, Session,
+    ShutdownReport, Statement, Value, WriteResult,
 };
 use crate::{EngineError, EngineErrorKind};
 
@@ -216,6 +217,27 @@ impl BriskDb {
         self.engine.status(session).await
     }
 
+    /// Execute one routed write and return only its affected-row count.
+    pub async fn execute(
+        &self,
+        session: &Session,
+        statement: Statement,
+    ) -> EngineResult<Routed<usize>> {
+        self.engine.execute(session, statement).await
+    }
+
+    /// Execute one routed write with host-supplied request controls.
+    pub async fn execute_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<usize>> {
+        self.engine
+            .execute_with_context(session, statement, context)
+            .await
+    }
+
     /// Execute one routed write and return the selected shard and write result.
     pub async fn execute_write(
         &self,
@@ -223,6 +245,18 @@ impl BriskDb {
         statement: Statement,
     ) -> EngineResult<Routed<WriteResult>> {
         self.engine.execute_write(session, statement).await
+    }
+
+    /// Execute one routed write with request controls and generated-key data.
+    pub async fn execute_write_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<WriteResult>> {
+        self.engine
+            .execute_write_with_context(session, statement, context)
+            .await
     }
 
     /// Query one routed physical owner.
@@ -234,6 +268,18 @@ impl BriskDb {
         self.engine.query(session, statement).await
     }
 
+    /// Query one routed owner with cancellation, deadline, and result controls.
+    pub async fn query_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<ResultSet>> {
+        self.engine
+            .query_with_context(session, statement, context)
+            .await
+    }
+
     /// Query the logical table view selected by catalog metadata.
     pub async fn query_logical(
         &self,
@@ -243,6 +289,143 @@ impl BriskDb {
         self.engine.query_logical(session, statement).await
     }
 
+    /// Query the logical table view with host-supplied request controls.
+    pub async fn query_logical_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Executed<ResultSet>> {
+        self.engine
+            .query_logical_with_context(session, statement, context)
+            .await
+    }
+
+    /// Parse, validate, translate, and compile one prepared SQL statement.
+    pub async fn prepare(
+        &self,
+        session: &Session,
+        request: PrepareRequest,
+    ) -> EngineResult<PreparedStatementId> {
+        self.engine.prepare_statement(session, request).await
+    }
+
+    /// Prepare one statement with host-supplied request controls.
+    pub async fn prepare_with_context(
+        &self,
+        session: &Session,
+        request: PrepareRequest,
+        context: RequestContext,
+    ) -> EngineResult<PreparedStatementId> {
+        self.engine
+            .prepare_statement_with_context(session, request, context)
+            .await
+    }
+
+    /// Bind typed values and the session's current route into a portal.
+    pub async fn bind(
+        &self,
+        session: &Session,
+        statement: PreparedStatementId,
+        parameters: Vec<Value>,
+    ) -> EngineResult<PortalId> {
+        self.engine
+            .bind_statement(session, statement, parameters)
+            .await
+    }
+
+    /// Bind a prepared statement with host-supplied request controls.
+    pub async fn bind_with_context(
+        &self,
+        session: &Session,
+        statement: PreparedStatementId,
+        parameters: Vec<Value>,
+        context: RequestContext,
+    ) -> EngineResult<PortalId> {
+        self.engine
+            .bind_statement_with_context(session, statement, parameters, context)
+            .await
+    }
+
+    /// Describe a prepared statement or bound portal.
+    pub async fn describe(
+        &self,
+        session: &Session,
+        target: DescribeTarget,
+    ) -> EngineResult<PreparedStatementDescription> {
+        self.engine.describe_prepared(session, target).await
+    }
+
+    /// Describe a prepared object with host-supplied request controls.
+    pub async fn describe_with_context(
+        &self,
+        session: &Session,
+        target: DescribeTarget,
+        context: RequestContext,
+    ) -> EngineResult<PreparedStatementDescription> {
+        self.engine
+            .describe_prepared_with_context(session, target, context)
+            .await
+    }
+
+    /// Execute one immutable bound portal on its selected physical owner.
+    pub async fn execute_bound(
+        &self,
+        session: &Session,
+        portal: PortalId,
+    ) -> EngineResult<Routed<PreparedExecution>> {
+        self.engine.execute_portal(session, portal).await
+    }
+
+    /// Execute a bound portal with host-supplied request controls.
+    pub async fn execute_bound_with_context(
+        &self,
+        session: &Session,
+        portal: PortalId,
+        context: RequestContext,
+    ) -> EngineResult<Routed<PreparedExecution>> {
+        self.engine
+            .execute_portal_with_context(session, portal, context)
+            .await
+    }
+
+    /// Execute a bound portal through logical point/scatter planning.
+    pub async fn execute_bound_logical(
+        &self,
+        session: &Session,
+        portal: PortalId,
+    ) -> EngineResult<Executed<PreparedExecution>> {
+        self.engine.execute_portal_logical(session, portal).await
+    }
+
+    /// Execute a logical bound portal with host-supplied request controls.
+    pub async fn execute_bound_logical_with_context(
+        &self,
+        session: &Session,
+        portal: PortalId,
+        context: RequestContext,
+    ) -> EngineResult<Executed<PreparedExecution>> {
+        self.engine
+            .execute_portal_logical_with_context(session, portal, context)
+            .await
+    }
+
+    /// Close a prepared statement and every portal bound from it.
+    pub async fn close_prepared(
+        &self,
+        session: &Session,
+        statement: PreparedStatementId,
+    ) -> EngineResult<bool> {
+        self.engine
+            .close_prepared_statement(session, statement)
+            .await
+    }
+
+    /// Close one bound portal while retaining its prepared statement.
+    pub async fn close_bound(&self, session: &Session, portal: PortalId) -> EngineResult<bool> {
+        self.engine.close_portal(session, portal).await
+    }
+
     /// Apply one durable parameterless schema batch to every shard.
     pub async fn migrate(
         &self,
@@ -250,6 +433,18 @@ impl BriskDb {
         sql: impl Into<String>,
     ) -> EngineResult<Vec<u16>> {
         self.engine.broadcast(session, sql.into()).await
+    }
+
+    /// Apply one durable schema batch with host-supplied request controls.
+    pub async fn migrate_with_context(
+        &self,
+        session: &Session,
+        sql: impl Into<String>,
+        context: RequestContext,
+    ) -> EngineResult<Vec<u16>> {
+        self.engine
+            .broadcast_with_context(session, sql.into(), context)
+            .await
     }
 
     /// Ask SQLite to passively checkpoint every physical shard.
