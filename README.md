@@ -107,7 +107,7 @@ experimental and opt-in; the exact contract lives in
 | Durable virtual-bucket routing over independent SQLite WAL files | Working |
 | Exact-key routing and bounded scatter/gather reads | Working |
 | HTTP query/write API and admin data browser | Working, loopback-only |
-| PostgreSQL wire protocol | Simple and parameterized text/binary prepared `SELECT`/`INSERT`/`UPDATE`/`DELETE` |
+| PostgreSQL wire protocol | Simple and parameterized text/binary CRUD plus real single-shard `BEGIN`/`COMMIT`/`ROLLBACK` |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |

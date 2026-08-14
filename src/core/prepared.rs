@@ -204,6 +204,20 @@ pub enum PreparedExecution {
     GeneratedWrite(WriteResult),
     /// A read-only statement returned a bounded materialized result.
     Rows(ResultSet),
+    /// A protocol-neutral explicit transaction changed state.
+    Transaction(TransactionExecution),
+}
+
+/// The state transition completed by an explicit transaction statement.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransactionExecution {
+    /// A new transaction entered the active state.
+    Started,
+    /// An active transaction committed.
+    Committed,
+    /// A transaction ended by rolling back, including `COMMIT` while failed.
+    RolledBack,
 }
 
 #[derive(Clone)]

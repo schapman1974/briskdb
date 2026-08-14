@@ -115,7 +115,9 @@ impl SchemaGate {
                         )
                     })?;
                 Ok(SchemaOperationGuard {
-                    inner: Arc::clone(&self.inner),
+                    _lease: Arc::new(SchemaOperationLease {
+                        inner: Arc::clone(&self.inner),
+                    }),
                 })
             }
             SchemaGateState::Migrating => Err(EngineError::new(
@@ -199,13 +201,18 @@ impl Default for SchemaGate {
 }
 
 /// Owned admission retained for the complete lifetime of one ordinary operation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[must_use = "dropping the guard releases schema-operation admission"]
 pub(crate) struct SchemaOperationGuard {
+    _lease: Arc<SchemaOperationLease>,
+}
+
+#[derive(Debug)]
+struct SchemaOperationLease {
     inner: Arc<SchemaGateInner>,
 }
 
-impl Drop for SchemaOperationGuard {
+impl Drop for SchemaOperationLease {
     fn drop(&mut self) {
         self.inner.release_operation();
     }
@@ -315,6 +322,7 @@ mod tests {
     fn ready_admits_owned_operations_and_drop_releases_exactly_once() {
         let gate = SchemaGate::new();
         let first = gate.try_acquire_operation().unwrap();
+        let inherited = first.clone();
         let second = gate.try_acquire_operation().unwrap();
         assert_eq!(
             gate.snapshot(),
@@ -325,6 +333,8 @@ mod tests {
         );
 
         drop(first);
+        assert_eq!(gate.snapshot().active_operations, 2);
+        drop(inherited);
         assert_eq!(gate.snapshot().active_operations, 1);
         drop(second);
         assert_eq!(gate.snapshot().active_operations, 0);

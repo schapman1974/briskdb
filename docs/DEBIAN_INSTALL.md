@@ -84,7 +84,7 @@ BRISKDB_SHARDS=4
 Restart the service, then use the `psql` commands in the
 [PostgreSQL query quickstart](POSTGRES_QUICKSTART.md). The initial interface
 supports one simple-query statement at a time; it has no authentication, TLS,
-DDL, transactions, parameters, or extended-query protocol yet.
+DDL, savepoints, cross-shard transactions, or full PostgreSQL compatibility yet.
 
 ## Logging
 

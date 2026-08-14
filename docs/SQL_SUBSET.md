@@ -81,10 +81,11 @@ an explicit `AND NO CHAIN`, to the same semantic AST forms. The validator
 deliberately accepts that AST family and does not search retained source text to
 distinguish equivalent spellings; the explicit source dialect must still parse
 a spelling first. `BEGIN`, `COMMIT`, and `ROLLBACK` remain syntax families only
-at this boundary. The separate issue #25 compatibility translator canonicalizes
-the accepted aliases to SQLite SQL. Real multi-call transaction state,
-failed-transaction behavior, connection and shard pinning, and protocol status
-reporting remain issues #34 and #47.
+at this validation boundary. The compatibility translator canonicalizes the
+accepted aliases to SQLite SQL. The protocol-neutral engine now supplies
+multi-call state, failed-transaction behavior, retained connection ownership,
+and single-shard pinning for PostgreSQL; MySQL wire integration remains issue
+#47.
 
 An absent `WHERE` on `UPDATE` or `DELETE` is structurally valid. Likewise,
 validation does not inspect whether an assignment changes a shard-key column.

@@ -118,7 +118,9 @@ typed dedicated-runtime and document-support modes are reserved and fail with
 The host may install any tracing subscriber it wants; the library emits through
 the normal `tracing` facade and never configures global logging itself.
 
-Explicit single-shard transaction handles and streaming cursors are not yet
-part of the embedded contract; they remain tracked by #34 and #39. Autocommit
-commands, prepared portals, cancellation, bounded queueing, and materialized
-result limits use the same engine semantics as protocol adapters.
+An engine `Session` accepts `BEGIN`, `COMMIT`, and `ROLLBACK`, retains and pins
+the first exact one-shard connection, and exposes failed-transaction recovery.
+Streaming cursors are not yet part of the embedded contract and remain
+tracked by #39. Autocommit commands, prepared portals, cancellation, bounded
+queueing, and materialized result limits use the same engine semantics as
+protocol adapters.

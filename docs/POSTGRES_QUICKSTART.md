@@ -68,6 +68,18 @@ psql "host=127.0.0.1 port=5433 user=briskdb dbname=default sslmode=disable" \
   -c "DELETE FROM records WHERE tenant_id = 'tenant-a'"
 ```
 
+Interactive sessions can group operations on one shard:
+
+```sql
+BEGIN;
+UPDATE records SET payload = 'atomic' WHERE tenant_id = 'tenant-a';
+SELECT payload FROM records WHERE tenant_id = 'tenant-a';
+COMMIT;
+```
+
+The first data statement pins the transaction to its physical shard. Every
+later statement must resolve to that same shard.
+
 For the Debian service, first stop `briskdb`, run the importer as the
 `briskdb` system user into a destination below `/var/lib/briskdb` that does not
 already exist, set that destination as `BRISKDB_DATA_DIR`, and set
@@ -93,10 +105,14 @@ and inspect it with `systemctl status briskdb` and
 - Parameterized prepared queries support named and unnamed
   `Parse`/`Bind`/`Describe`/`Execute`, basic OIDs, mixed text/binary values and
   results, portal suspension, `Flush`, `Sync`, and cascading `Close`.
-- DDL, transactions, `COPY`, authentication, authorization, TLS, and full
+- `BEGIN`/`COMMIT`/`ROLLBACK` provide a real single-shard SQLite transaction,
+  including read-your-writes and PostgreSQL `I`/`T`/`E` status. Cross-shard
+  access is rejected before mutation.
+- DDL, savepoints, `COPY`, authentication, authorization, TLS, and full
   PostgreSQL compatibility are not supported. Initialize the catalog offline
   with `briskdb-import` before starting the server.
 
 The detailed wire and lifecycle contract is in
 [`POSTGRES_LISTENER.md`](POSTGRES_LISTENER.md). The import's validation and
-publication rules are in [`SQLITE_IMPORT.md`](SQLITE_IMPORT.md).
+publication rules are in [`SQLITE_IMPORT.md`](SQLITE_IMPORT.md). Transaction
+semantics are in [`POSTGRES_TRANSACTIONS.md`](POSTGRES_TRANSACTIONS.md).

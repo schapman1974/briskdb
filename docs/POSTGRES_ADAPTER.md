@@ -193,8 +193,10 @@ Parse, Bind, statement/portal Describe, resumable Execute, Flush, Sync error
 recovery, and cascading Close. Issue #33 adds declared result types, resolved
 parameter OIDs, and basic text/binary value codecs while keeping PostgreSQL
 types and raw bytes at this adapter edge. Both paths execute registered table
-reads and writes through the Engine. Later roadmap issues retain transaction,
-cancellation, TLS/SCRAM, client-matrix, and row-streaming scopes. The exact
+reads and writes through the Engine. Issue #34 adds protocol-neutral
+single-shard transactions, retained connection ownership, failed state, and
+exact `I`/`T`/`E` wire status. Later roadmap issues retain cancellation,
+TLS/SCRAM, client-matrix, and row-streaming scopes. The exact
 live contract and user workflow are in the
 [PostgreSQL listener document](POSTGRES_LISTENER.md) and
 [query quickstart](POSTGRES_QUICKSTART.md).
@@ -206,8 +208,9 @@ The compile bridge converts an `EngineError` only by calling
 the table's five-character SQLSTATE, and the fixed safe message. Trusted SQL,
 SQLite text, paths, and source chains in `diagnostic()` are never serialized.
 Startup applies fixed fatal severity and closes after its error; pre-query
-errors use fixed ordinary severity. Failed-transaction state remains part of
-the later transaction work.
+errors use fixed ordinary severity. An error in an active transaction changes
+the core session and PostgreSQL status to failed; later statements receive
+`25P02` until rollback.
 
 This decision adds no CLI or environment setting and does not change listener
 defaults, HTTP routes, JSON, SQL support, routing, engine limits, manifest or
