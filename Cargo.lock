@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "briskdb"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "briskdb-python"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "briskdb",
  "pyo3",

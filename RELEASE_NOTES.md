@@ -1,93 +1,68 @@
-# BriskDB 0.1.0-alpha.3
+# BriskDB 0.1.0-alpha.4
 
-This is the third BriskDB alpha release. It is intended for local evaluation
-and development, not production deployment.
+Alpha 4 makes BriskDB usable as an in-process Rust or Python database, while
+keeping the standalone HTTP/PostgreSQL server and Debian service from alpha 3.
+It is intended for local evaluation and development, not production deployment.
 
-This update makes the disabled-by-default PostgreSQL listener query-capable for
-the first time. After initializing a registered catalog with `briskdb-import`,
-a standard PostgreSQL simple-query client can execute one `SELECT`, `INSERT`,
-`UPDATE`, or `DELETE` statement at a time through BriskDB's shared catalog,
-shard routing, limits, session lifecycle, and fixed-error boundary.
+## Install from PyPI
 
-## PostgreSQL quickstart
-
-The complete copy/paste workflow for creating a SQLite source, importing it,
-starting BriskDB, and using `psql` is in
-`docs/POSTGRES_QUICKSTART.md`. The listener remains disabled by default. Enable
-it only on loopback:
+Compiler-free `cp39-abi3` wheels support CPython 3.9 through 3.14 on Linux
+x86-64/ARM64 (`manylinux_2_28`) and macOS Intel/Apple Silicon (macOS 11+):
 
 ```bash
-briskdb \
-  --data-dir /path/to/imported-briskdb-data \
-  --shards 4 \
-  --postgres-listen 127.0.0.1:5433
+python -m pip install briskdb==0.1.0a4
 ```
-
-Psycopg 3 has been exercised against the standalone alpha.3 binaries. Use
-`psycopg.ClientCursor`, which performs client-side parameter binding and sends
-the supported simple-query protocol:
 
 ```python
-import psycopg
-from psycopg import ClientCursor
+import briskdb
 
-connection = psycopg.connect(
-    "host=127.0.0.1 port=5433 user=briskdb "
-    "dbname=default sslmode=disable",
-    autocommit=True,
-)
-
-with ClientCursor(connection) as cursor:
-    cursor.execute(
-        "INSERT INTO records (tenant_id, payload) VALUES (%s, %s)",
-        ("tenant-a", "hello"),
-    )
-    cursor.execute(
-        "SELECT tenant_id, payload FROM records WHERE tenant_id = %s",
-        ("tenant-a",),
-    )
-    print(cursor.fetchone())
+with briskdb.connect("./data", shards=4) as db:
+    with db.session(routing_key="account-1") as session:
+        session.migrate(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)"
+        )
+        session.execute("INSERT INTO notes VALUES (?1, ?2)", [1, "hello"])
+        print(session.query("SELECT body FROM notes WHERE id = ?1", [1]))
 ```
 
-The ordinary Psycopg cursor uses PostgreSQL's extended-query protocol and is
-not compatible with this release.
+The typed package includes synchronous context managers and an asyncio facade.
+It runs the native Rust engine in the Python process without a listener,
+subprocess, signal handler, or global logger. Async task cancellation reaches
+the engine's native cancellation token.
 
-## Included binaries
+## Embedded Rust library
 
-Each archive contains `briskdb`, `briskdb-import`, this file, `README.md`, the
-MIT license, and the repository documentation. Native archives are provided
-for:
+The root crate now separates its listener-free engine from optional HTTP,
+PostgreSQL, importer, and CLI layers. Downstream Rust applications can select
+only the embedded API:
 
-- Ubuntu 24.04 x86-64;
-- Ubuntu 24.04 ARM64;
-- macOS Intel x86-64; and
-- macOS Apple Silicon ARM64.
+```toml
+[dependencies]
+briskdb = { git = "https://github.com/schapman1974/briskdb", tag = "v0.1.0-alpha.4", default-features = false, features = ["embedded"] }
+```
 
-Ubuntu 24.04 x86-64 is the only full-suite CI-supported platform. The other
-archives are preview builds compiled and startup-smoke-tested on native
-GitHub-hosted runners. Verify downloads against `SHA256SUMS`.
+`BriskDb` and owned `BriskSession` handles expose initialization, migrations,
+prepared statements, routed SQL execution, checkpoints, cancellation,
+deadlines, bounded results, and graceful close without installing process-wide
+runtime behavior.
 
-Linux release assets also contain
-`briskdb_0.1.0.alpha.3-1_amd64.deb` and
-`briskdb_0.1.0.alpha.3-1_arm64.deb`. Each package installs an unprivileged
-`briskdb` account, hardened systemd service, administrator configuration under
-`/etc/default/briskdb`, persistent state under `/var/lib/briskdb`, and journald
-logging. Native Ubuntu release runners install, start, query, reinstall, and
-remove each package while verifying configuration and database retention.
+## Standalone distributions
 
-## What is available
+The release also provides `briskdb` and `briskdb-import` archives for Ubuntu
+24.04 x86-64/ARM64 and macOS Intel/Apple Silicon. Linux assets include systemd
+`.deb` packages for `amd64` and `arm64`. Each package installs an unprivileged
+`briskdb` account, administrator configuration under `/etc/default/briskdb`,
+persistent state under `/var/lib/briskdb`, and journald logging.
 
-- A protocol-neutral asynchronous engine over multiple bundled SQLite files.
-- Deterministic keyed routing, bounded scatter reads, connection pools,
-  cancellation, deadlines, result budgets, and graceful shutdown.
-- An HTTP SQL interface and embedded read-only admin browser on loopback.
-- Versioned manifest migrations, generated-key policies, prepared statements,
-  standard SQLite import, and a tested stopped-server backup/restore procedure.
-- A disabled-by-default loopback PostgreSQL endpoint with protocol 3.0 startup,
-  registered-table simple queries, text-format rows, DML command tags, fixed
-  safe SQLSTATE errors, recovery, and prepared-object cleanup.
-- Native archives for four OS/architecture combinations and native Debian
-  packages for Ubuntu 24.04 `amd64` and `arm64`.
+The disabled-by-default PostgreSQL listener supports one registered-table
+simple-query `SELECT`, `INSERT`, `UPDATE`, or `DELETE` statement at a time.
+Psycopg 3 clients must use `psycopg.ClientCursor`; the ordinary cursor uses the
+unsupported extended-query protocol. See `docs/POSTGRES_QUICKSTART.md`.
+
+Every native archive and wheel is built and smoke-tested on its matching native
+GitHub runner. Wheels are installed and tested under CPython 3.9 and 3.14, and
+native dependencies are audited. Verify downloads against `SHA256SUMS` and the
+GitHub build-provenance attestation.
 
 ## Critical alpha boundaries
 
@@ -96,8 +71,7 @@ remove each package while verifying configuration and database retention.
 - PostgreSQL extended-query protocol is unsupported. Parameters sent through
   Parse/Bind/Execute, server-side prepared statements, transactions, DDL,
   `COPY`, and binary results are unavailable. Psycopg must use
-  `psycopg.ClientCursor`; an ordinary cursor's unsupported pipelined extended
-  sequence closes that connection.
+  `psycopg.ClientCursor`.
 - PostgreSQL accepts exactly one simple-query statement per message and only
   operates on an offline imported/registered catalog. It does not provide an
   online `CREATE TABLE` workflow or full PostgreSQL compatibility.
@@ -107,6 +81,8 @@ remove each package while verifying configuration and database retention.
 - Backups require a stopped server and a complete data-directory copy. Online
   backup/restore, resharding, and online rebalance are unsupported.
 - There is no production metrics or observability suite.
+- The Python package does not claim DB-API 2.0 compatibility, transaction
+  methods, retained SQLite streaming cursors, or native document operations.
 
 ## Storage compatibility
 
@@ -115,8 +91,8 @@ manifest version 12 and accepts the exact documented legacy version-1 shape and
 manifest versions 2 through 11 for automatic, ordered forward migration.
 Unknown, malformed, partially migrated, or newer layouts fail closed.
 
-Before opening existing data, stop the old process and make a complete backup
-as described in `docs/OFFLINE_BACKUP.md`. Startup may migrate the data.
+Before opening existing data, stop every process and make a complete backup as
+described in `docs/OFFLINE_BACKUP.md`. Startup may migrate the data.
 In-place downgrade is unsupported; rollback requires restoring the complete
-pre-upgrade backup. This release has no on-disk format change from
-`0.1.0-alpha.1` or `0.1.0-alpha.2`.
+pre-upgrade backup. This release has no on-disk format change from alpha 1,
+alpha 2, or alpha 3.

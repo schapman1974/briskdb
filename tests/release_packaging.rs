@@ -1,6 +1,6 @@
 #[test]
 fn alpha_release_contract_covers_every_native_archive_and_safety_boundary() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-alpha.3");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-alpha.4");
 
     let workflow = include_str!("../.github/workflows/release.yml");
     for required in [
@@ -95,7 +95,8 @@ fn python_release_contract_covers_every_supported_wheel_and_publish_gate() {
         "briskdb-python-wheel-*",
         "briskdb-python-sdist",
         "pypa/gh-action-pypi-publish",
-        "attestations: true",
+        "password: ${{ secrets.PYPI_API_TOKEN }}",
+        "attestations: false",
     ] {
         assert!(
             release.contains(required),

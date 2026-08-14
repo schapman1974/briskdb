@@ -2,9 +2,11 @@
 
 ## Unreleased
 
+## 0.1.0-alpha.4 — 2026-08-13
+
 - Added `cp39-abi3` wheel automation for macOS and manylinux on x86-64/ARM64.
 - Added packaged type information, artifact audits, sdist testing, release
-  checksums/provenance, and trusted PyPI publishing gates.
+  checksums/provenance, and token-authenticated PyPI publishing gates.
 - Documented the exact runtime/platform and pre-1.0 compatibility policy.
 
 ## 0.1.0-alpha.3 — 2026-08-13
