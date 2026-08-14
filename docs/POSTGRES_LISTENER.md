@@ -1,6 +1,6 @@
 # PostgreSQL startup and listener contract
 
-BriskDB serves PostgreSQL protocol 3.0 startup plus bounded simple and
+BriskDB serves a PostgreSQL protocol 3.0 baseline plus bounded simple and
 zero-parameter extended queries on a disabled-by-default, separately configured
 loopback TCP listener. A successful startup selects one logical database,
 creates one protocol-neutral core session, publishes BriskDB-owned parameter
@@ -61,14 +61,20 @@ supported retry.
 
 ## Startup protocol
 
-The listener accepts PostgreSQL protocol version 3.0 exactly. Newer minor
-version negotiation belongs to issue #32. `SSLRequest` and `GSSENCRequest` must
-each be an exact eight-byte frame and receive `N`, after which the client may
-send a plaintext startup packet on the loopback socket. Malformed negotiation
-lengths cannot consume bytes from a following startup packet. No TLS or GSS
-session is accepted in the current phase. The listener waits at most 60 seconds
-for negotiation and a startup packet; that timeout closes the socket without
-creating a core session.
+The implemented wire baseline is protocol 3.0. A startup request for any newer
+3.x minor version receives `NegotiateProtocolVersion` with highest supported
+minor zero, after which startup continues using 3.0. A different major version
+is fatal. Version 3.1 is not treated as an implemented protocol; it is
+downgraded just like 3.2 or a future minor. Unsupported `_pq_.` protocol options
+are sorted, listed in the same negotiation message, ignored, and do not become
+session metadata. Other unknown startup keys remain errors.
+
+`SSLRequest` and `GSSENCRequest` must each be an exact eight-byte frame and
+receive `N`, after which the client may send a plaintext startup packet on the
+loopback socket. Malformed negotiation lengths cannot consume bytes from a
+following startup packet. No TLS or GSS session is accepted in the current
+phase. The listener waits at most 60 seconds for negotiation and a startup
+packet; that timeout closes the socket without creating a core session.
 
 For the startup packet and subsequent typed messages, a BriskDB-owned raw-frame
 gate runs before general dependency decoding and releases exactly one complete
@@ -102,14 +108,15 @@ database selection have passed validation.
 
 Successful startup emits these frames in order:
 
-1. `AuthenticationOk`;
-2. `ParameterStatus(server_version, <BriskDB package version>-briskdb)`;
-3. `ParameterStatus(server_encoding, UTF8)`;
-4. `ParameterStatus(client_encoding, UTF8)`;
-5. `ParameterStatus(standard_conforming_strings, on)`;
-6. `ParameterStatus(integer_datetimes, on)`;
-7. optional validated `ParameterStatus(application_name, ...)`; and
-8. `ReadyForQuery(I)`.
+1. optional `NegotiateProtocolVersion(0, unsupported _pq_ options)`;
+2. `AuthenticationOk`;
+3. `ParameterStatus(server_version, <BriskDB package version>-briskdb)`;
+4. `ParameterStatus(server_encoding, UTF8)`;
+5. `ParameterStatus(client_encoding, UTF8)`;
+6. `ParameterStatus(standard_conforming_strings, on)`;
+7. `ParameterStatus(integer_datetimes, on)`;
+8. optional validated `ParameterStatus(application_name, ...)`; and
+9. `ReadyForQuery(I)`.
 
 The values and ordering are BriskDB-owned rather than dependency defaults.
 `BackendKeyData` is omitted until cancellation identifiers are implemented in
@@ -128,7 +135,7 @@ can instead close without a response.
 | Empty, invalid, or unknown logical database | `3D000` |
 | Invalid client encoding or application name | `22023` |
 | Unknown startup key or unsupported replication value | `0A000` |
-| Unsupported protocol version or malformed startup message | `08P01` |
+| Unsupported protocol major version or malformed startup message | `08P01` |
 
 A failed startup creates no retained core session, statement, portal, route, or
 SQLite operation. A later connection can start normally.
@@ -229,6 +236,8 @@ Automated coverage includes:
 - exact `SSLRequest`/`GSSENCRequest` refusal and boundary handling, startup frame
   order, selected identity, omitted-database behavior, and useful BriskDB server
   identification;
+- exact 3.0 startup, deterministic downgrade of 3.1/3.2/future 3.x requests,
+  sorted unsupported `_pq_.` option reporting, and continued 3.0 queries;
 - the 60-second production startup timeout through an accelerated timer test;
 - startup and typed-message size boundaries, exact frame isolation, UTF-8 and
   structural validation, duplicate startup keys, and unsupported message types;

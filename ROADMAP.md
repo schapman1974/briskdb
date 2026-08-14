@@ -250,7 +250,7 @@ the engine regardless of its eventual wire protocol.
 - [x] Support simple query flow and extended Parse/Bind/Describe/Execute/Sync,
   including named and unnamed statements/portals, Flush/Close, protocol error
   resynchronization, and portal suspension.
-- [ ] Negotiate explicitly supported newer protocol minor versions from the
+- [x] Negotiate explicitly supported newer protocol minor versions from the
   exact 3.0 baseline rather than conflating protocol and server versions.
 - [ ] Map BriskDB types to PostgreSQL OIDs and support text format first, then
   the binary formats required by tested drivers (issue #33, including the

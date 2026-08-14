@@ -49,7 +49,8 @@ the human-readable text to identify an error.
 PostgreSQL startup also has a finite protocol-specific table: invalid user
 labels use `28000`, unknown logical databases use `3D000`, invalid startup
 values use `22023`, unsupported startup features use `0A000`, and malformed or
-unsupported protocol versions use `08P01`. These are fixed `FATAL` responses
+unsupported protocol major versions use `08P01`. Newer 3.x minor requests are
+downgraded to the 3.0 baseline rather than rejected. These are fixed `FATAL` responses
 followed by socket close, without `ReadyForQuery`. Simple and extended-query
 Engine failures use their mapped SQLSTATE. Extended-flow name conflicts use
 fixed `42P03`/`42P05`, missing handles use fixed `34000`/`26000`, and unsupported
