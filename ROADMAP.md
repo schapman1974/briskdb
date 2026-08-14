@@ -385,21 +385,53 @@ diagnose BriskDB using tested procedures.
 Exit criterion: storage-format compatibility, operational recovery, and the
 supported client matrix have release gates rather than best-effort claims.
 
-## Immediate implementation sequence
-The first buildable slices should be small and merge independently:
+## Prioritized implementation efforts
 
-1. Add protocol-neutral `Value`, `Column`, `Row`, `ResultSet`, and `EngineError`.
-2. Change the HTTP adapter to use those types and preserve duplicate columns.
-3. Add a bounded per-shard SQLite pool and load/concurrency tests.
-4. Define manifest schema v2 and golden routing vectors.
-5. Add the virtual-bucket map while test data can still be discarded.
-6. Add `Session`, transaction state, and one-shard pinning.
-7. Add SQL parsing, structural common-subset validation, and source-preserving
-   placeholder normalization without general syntax translation.
-8. Infer routing for one-table equality CRUD and reject unroutable writes.
-9. Spike PostgreSQL simple-query connectivity end to end.
-10. Add PostgreSQL extended query flow, then reuse the same conformance suite
-    for the MySQL prepared-statement path.
+Each effort should remain a sequence of small, independently tested and merged
+changes. Complete them in this order unless a correctness or release blocker
+requires an earlier dependency:
+
+1. [x] **Finish the SQLite facade and shard-safe generated IDs.** Keep ordinary
+   SQLite WAL files, version the allocation policies, support native shard
+   ranges and durable hi/lo leases, and retain the general virtual-table path
+   behind its measured rollout gate.
+2. [ ] **Complete PostgreSQL support.** Finish the simple and extended query
+   lifecycle, type mapping, transactions, cancellation, compatibility shims,
+   and real-client conformance tests.
+3. [ ] **Implement global indexes, uniqueness, and value allocation.** Add the
+   protocol-neutral authority and routing metadata needed for cross-shard
+   constraints, collision-free allocation, and exact indexed shard targeting.
+4. [ ] **Finish the embedded Rust API.** Make sessions, transactions,
+   cancellation, concurrency, document commands, and shutdown safe for a host
+   process.
+5. [ ] **Finish the Python API and wheels.** Provide matching synchronous and
+   asynchronous APIs, lossless values and exceptions, typing, documentation,
+   and tested Linux/macOS ARM64/x86-64 wheels.
+6. [ ] **Complete HTTP administration and the data browser.** Version the API,
+   separate administration and data planes, add operational endpoints and
+   pagination, and preserve protocol-neutral engine behavior.
+7. [ ] **Complete cross-shard query execution.** Add bounded fan-out,
+   pushdown, deterministic global ordering and pagination, supported
+   aggregation, and explainable per-shard execution.
+8. [ ] **Complete security, backup, observability, and production hardening.**
+   Add identity and authorization, TLS, resource governance, metrics and
+   tracing, online backup and restore, fault testing, and compatibility gates.
+9. [ ] **Complete serverless support.** Define atomic snapshot storage,
+   ephemeral-runtime lifecycle adapters, warm reuse, and fenced writer
+   guarantees.
+10. [ ] **Implement native MongoDB protocol compatibility with TinyMongo
+    parity.** Build the document engine, BSON and wire layers, query and write
+    semantics, indexes, aggregation, sharding behavior, and differential
+    compatibility suites.
+11. [ ] **Implement online resharding and rebalance.** Add durable bucket
+    movement, generation-aware retries, verification, and a supported offline
+    reshard path before online movement.
+12. [ ] **Decide and implement the cross-shard transaction boundary.** Either
+    retain explicit rejection or add a crash-proven durable coordinator without
+    implying unsupported atomicity.
+13. [ ] **Implement MySQL support.** Add the listener, wire lifecycle, prepared
+    statements, type and error mapping, transactions, security, and real-client
+    conformance after the higher-priority frontends are stable.
 
 ## Test strategy
 
