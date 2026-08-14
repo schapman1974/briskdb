@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "server"), allow(dead_code))]
+
 //! BriskDB-owned boundary for the selected PostgreSQL wire library.
 //!
 //! The configured loopback listener delegates startup framing and dispatch to

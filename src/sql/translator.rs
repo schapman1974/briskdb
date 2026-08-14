@@ -1,10 +1,11 @@
 use std::{fmt, ops::ControlFlow};
 
 use sqlparser::ast::{
-    BinaryLength, CharacterLength, DataType as AstDataType, ExactNumberInfo, Ident, LimitClause,
-    Offset, OffsetRows, Query as AstQuery, Statement as AstStatement, Value as AstValue,
-    ValueWithSpan, VisitMut, VisitorMut,
+    BinaryLength, CharacterLength, DataType as AstDataType, ExactNumberInfo, LimitClause, Offset,
+    OffsetRows, Query as AstQuery, Statement as AstStatement, Value as AstValue, ValueWithSpan,
+    VisitMut, VisitorMut,
 };
+use sqlparser::{dialect::MySqlDialect, tokenizer::Token, tokenizer::Tokenizer};
 
 use super::{GeneratedTableIntent, NormalizedSql, SqlDialect, StatementParameters, generated};
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
@@ -212,6 +213,11 @@ fn translate_compatibility(
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("; ");
+    let sqlite_sql = if normalized.dialect() == SqlDialect::MySql {
+        canonicalize_mysql_identifier_quotes(&sqlite_sql)?
+    } else {
+        sqlite_sql
+    };
     if sqlite_sql.as_bytes().contains(&0) {
         return Err(EngineError::new(
             EngineErrorKind::InvalidQuery,
@@ -219,6 +225,29 @@ fn translate_compatibility(
         ));
     }
     Ok(sqlite_sql)
+}
+
+/// Convert only MySQL-delimited identifiers in parser-rendered SQL. String
+/// literals and comments remain token-distinct, and embedded double quotes are
+/// escaped for SQLite's standard identifier spelling.
+fn canonicalize_mysql_identifier_quotes(sql: &str) -> EngineResult<String> {
+    let tokens = Tokenizer::new(&MySqlDialect {}, sql)
+        .tokenize()
+        .map_err(|_| translation_invariant())?;
+    let mut output = String::with_capacity(sql.len());
+
+    for token in tokens {
+        match token {
+            Token::Word(word) if word.quote_style == Some('`') => {
+                output.push('"');
+                output.push_str(&word.value.replace('"', "\"\""));
+                output.push('"');
+            }
+            token => output.push_str(&token.to_string()),
+        }
+    }
+
+    Ok(output)
 }
 
 fn translate_column_types(
@@ -434,13 +463,6 @@ impl VisitorMut for CompatibilityVisitor<'_> {
                 value.value = AstValue::Number(if *boolean { "1" } else { "0" }.to_owned(), false);
             }
             _ => {}
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_ident(&mut self, identifier: &mut Ident) -> ControlFlow<Self::Break> {
-        if identifier.quote_style == Some('`') {
-            identifier.quote_style = Some('"');
         }
         ControlFlow::Continue(())
     }

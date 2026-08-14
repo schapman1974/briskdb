@@ -5,10 +5,10 @@ use sqlparser::ast::{
     CreateIndex, CreateTable, CreateTableOptions, DataType, Delete, Distinct, Expr, FromTable,
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, HiveDistributionStyle,
     IndexColumn, Insert, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, OrderBy,
-    OrderByExpr, OrderByKind, OrderBySort, PrimaryKeyConstraint, Query, Select, SelectFlavor,
-    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement as AstStatement,
-    TableConstraint, TableFactor, TableObject, TableWithJoins, UnaryOperator, UniqueConstraint,
-    Update, Value, WildcardAdditionalOptions,
+    OrderByExpr, OrderByKind, PrimaryKeyConstraint, Query, Select, SelectFlavor, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement as AstStatement, TableConstraint,
+    TableFactor, TableObject, TableWithJoins, UnaryOperator, UniqueConstraint, Update, Value,
+    WildcardAdditionalOptions,
 };
 use sqlparser::tokenizer::Span;
 
@@ -209,7 +209,6 @@ fn validate_create_table(
     let CreateTable {
         or_replace,
         temporary,
-        unlogged,
         external,
         dynamic,
         global,
@@ -254,7 +253,6 @@ fn validate_create_table(
         with_storage_lifecycle_policy,
         with_tags,
         external_volume,
-        with_connection,
         base_location,
         catalog,
         catalog_sync,
@@ -268,14 +266,10 @@ fn validate_create_table(
         distkey,
         sortkey,
         backup,
-        multiset,
-        fallback,
-        with_data,
     } = table;
 
     if *or_replace
         || *temporary
-        || *unlogged
         || *external
         || *dynamic
         || global.is_some()
@@ -329,7 +323,6 @@ fn validate_create_table(
         || with_storage_lifecycle_policy.is_some()
         || with_tags.is_some()
         || external_volume.is_some()
-        || with_connection.is_some()
         || base_location.is_some()
         || catalog.is_some()
         || catalog_sync.is_some()
@@ -343,9 +336,6 @@ fn validate_create_table(
         || distkey.is_some()
         || sortkey.is_some()
         || backup.is_some()
-        || multiset.is_some()
-        || fallback.is_some()
-        || with_data.is_some()
     {
         return unsupported("vendor-specific CREATE TABLE options");
     }
@@ -407,7 +397,6 @@ fn validate_table_constraint(constraint: &TableConstraint) -> SubsetResult {
 fn validate_primary_key(constraint: &PrimaryKeyConstraint, allow_empty: bool) -> SubsetResult {
     if constraint.index_name.is_some()
         || constraint.index_type.is_some()
-        || !constraint.include.is_empty()
         || !constraint.index_options.is_empty()
         || constraint.characteristics.is_some()
     {
@@ -426,7 +415,6 @@ fn validate_unique(constraint: &UniqueConstraint, allow_empty: bool) -> SubsetRe
     if constraint.index_name.is_some()
         || !constraint.index_type_display.is_none()
         || constraint.index_type.is_some()
-        || !constraint.include.is_empty()
         || !constraint.index_options.is_empty()
         || constraint.characteristics.is_some()
         || !matches!(constraint.nulls_distinct, NullsDistinctOption::None)
@@ -464,7 +452,6 @@ fn validate_create_index(index: &CreateIndex) -> SubsetResult {
     }
     if index.using.is_some()
         || index.concurrently
-        || index.r#async
         || !index.include.is_empty()
         || index.nulls_distinct.is_some()
         || !index.with.is_empty()
@@ -484,7 +471,6 @@ fn validate_index_column(column: &IndexColumn) -> SubsetResult {
     if column.operator_class.is_some()
         || column.column.with_fill.is_some()
         || column.column.options.nulls_first.is_some()
-        || matches!(column.column.options.sort, Some(OrderBySort::Using(_)))
     {
         return unsupported("index column options");
     }
@@ -663,10 +649,7 @@ fn validate_order_by_expression(
     order_by: &OrderByExpr,
     validation: &mut ValidationState,
 ) -> SubsetResult {
-    if order_by.with_fill.is_some()
-        || order_by.options.nulls_first.is_some()
-        || matches!(order_by.options.sort, Some(OrderBySort::Using(_)))
-    {
+    if order_by.with_fill.is_some() || order_by.options.nulls_first.is_some() {
         return unsupported("ORDER BY options");
     }
     validate_expression(&order_by.expr, ExprContext::SELECT, validation)

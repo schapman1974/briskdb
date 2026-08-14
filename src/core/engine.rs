@@ -37,6 +37,7 @@ const MAX_SCATTER_CONCURRENCY: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecuteOwnerPolicy {
     Session,
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     ReuseValidatedCatalogWrite,
 }
 
@@ -1387,6 +1388,7 @@ impl Engine {
     /// populated catalog, raw planning proves that the request is one routed
     /// common-subset write before the shared stateless ownership domain is
     /// selected.
+    #[cfg(feature = "http")]
     pub(crate) async fn execute_http_request(
         &self,
         session: &Session,
@@ -2099,6 +2101,7 @@ impl Engine {
     /// pool, worker, cancellation, and result-budget behavior. The SQL adapter
     /// verifies that the prepared SQLite statement is read-only before it is
     /// stepped.
+    #[cfg(any(feature = "http", test))]
     pub(crate) async fn inspect_shard(
         &self,
         session: &Session,
@@ -2110,6 +2113,7 @@ impl Engine {
     }
 
     /// Run an explicit-shard inspection with request-scoped controls.
+    #[cfg(any(feature = "http", test))]
     pub(crate) async fn inspect_shard_with_context(
         &self,
         session: &Session,

@@ -43,14 +43,16 @@ flowchart LR
         PG[PostgreSQL clients]
         MONGO[MongoDB clients · planned]
         MYSQL[MySQL clients · planned]
-        EMBED[Rust + Python · planned]
+        RUST[Rust embedding]
+        PY[Python · planned]
     end
 
     WEB --> ENGINE
     PG --> ENGINE
     MONGO -.-> ENGINE
     MYSQL -.-> ENGINE
-    EMBED -.-> ENGINE
+    RUST --> ENGINE
+    PY -.-> ENGINE
 
     ENGINE[Protocol-neutral Rust engine] --> ROUTER[4,096 virtual buckets]
     ROUTER --> S0[(SQLite WAL · shard 0)]
@@ -150,7 +152,9 @@ macOS/Linux ARM64 and x86-64 archives plus Linux `.deb` packages.
 
 Embedding in Rust starts with `BriskDb::open()` or the validated builder. The
 [embedded Rust guide](docs/EMBEDDED_RUST.md) includes a complete listener-free
-example and documents every default.
+example and documents every default. Use `default-features = false` with the
+`embedded` feature to leave the network and CLI stacks out; see the
+[crate feature map](docs/CRATE_FEATURES.md).
 
 ## Still just inspectable files
 
@@ -198,6 +202,7 @@ Follow the [roadmap](ROADMAP.md) or browse the
 - [Architecture](docs/ARCHITECTURE.md)
 - [Embedded Rust](docs/EMBEDDED_RUST.md)
 - [Embedded SQL](docs/EMBEDDED_SQL.md)
+- [Crate features and support tiers](docs/CRATE_FEATURES.md)
 - [PostgreSQL quickstart](docs/POSTGRES_QUICKSTART.md)
 - [SQL compatibility](docs/SQL_COMPATIBILITY.md)
 - [Generated keys](docs/GENERATED_KEYS.md)

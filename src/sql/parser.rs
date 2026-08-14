@@ -3,7 +3,9 @@ use std::{borrow::Cow, fmt, ops::ControlFlow};
 use sqlparser::{
     ast::{Expr, ObjectNamePart, ObjectType, Statement as AstStatement, visit_expressions},
     dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
+    keywords::Keyword,
     parser::{Parser, ParserError},
+    tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace},
 };
 
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
@@ -121,9 +123,9 @@ pub fn parse<'a>(dialect: SqlDialect, source: impl Into<Cow<'a, str>>) -> Engine
     }
 
     let statements = match dialect {
-        SqlDialect::Sqlite => parse_with(&SQLiteDialect {}, &source),
-        SqlDialect::PostgreSql => parse_with(&PostgreSqlDialect {}, &source),
-        SqlDialect::MySql => parse_with(&MySqlDialect {}, &source),
+        SqlDialect::Sqlite => parse_with(&SQLiteDialect {}, &source, false),
+        SqlDialect::PostgreSql => parse_with(&PostgreSqlDialect {}, &source, true),
+        SqlDialect::MySql => parse_with(&MySqlDialect {}, &source, false),
     }
     .map_err(|error| classify_parser_error(dialect, error))?;
 
@@ -212,11 +214,68 @@ fn connection_local_counter_function(function: &str) -> bool {
         .any(|counter| function.eq_ignore_ascii_case(counter))
 }
 
-fn parse_with(dialect: &dyn Dialect, source: &str) -> Result<Vec<AstStatement>, ParserError> {
+fn parse_with(
+    dialect: &dyn Dialect,
+    source: &str,
+    postgres_abort_alias: bool,
+) -> Result<Vec<AstStatement>, ParserError> {
+    let mut tokens = Tokenizer::new(dialect, source).tokenize_with_location()?;
+    reject_unguarded_interval_recursion(&tokens)?;
+    if postgres_abort_alias {
+        rewrite_postgres_abort_alias(&mut tokens);
+    }
     let mut parser = Parser::new(dialect)
         .with_recursion_limit(SQL_PARSE_RECURSION_LIMIT)
-        .try_with_sql(source)?;
+        .with_tokens_with_locations(tokens);
     parser.parse_statements()
+}
+
+/// Protect the one recursive sqlparser 0.62 path that was missing its own
+/// recursion counter. Keeping the check at BriskDB's parser boundary lets the
+/// published crate use the registry release without losing the stack-safety
+/// guarantee covered by `deep_interval_recursion_is_rejected_without_aborting_the_process`.
+fn reject_unguarded_interval_recursion(tokens: &[TokenWithSpan]) -> Result<(), ParserError> {
+    let mut consecutive_intervals = 0;
+
+    for token in tokens {
+        match &token.token {
+            Token::Word(word) if word.keyword == Keyword::INTERVAL => {
+                consecutive_intervals += 1;
+                if consecutive_intervals > SQL_PARSE_RECURSION_LIMIT {
+                    return Err(ParserError::RecursionLimitExceeded);
+                }
+            }
+            Token::Whitespace(
+                Whitespace::Space
+                | Whitespace::Newline
+                | Whitespace::Tab
+                | Whitespace::SingleLineComment { .. }
+                | Whitespace::MultiLineComment(_),
+            ) => {}
+            _ => consecutive_intervals = 0,
+        }
+    }
+
+    Ok(())
+}
+
+/// sqlparser learned PostgreSQL's top-level `ABORT` alias after 0.62. Keep the
+/// source token spans while presenting that release's parser with the
+/// equivalent `ROLLBACK` keyword, including in multi-statement batches.
+fn rewrite_postgres_abort_alias(tokens: &mut [TokenWithSpan]) {
+    let mut statement_start = true;
+
+    for token in tokens {
+        match &mut token.token {
+            Token::Whitespace(_) => {}
+            Token::SemiColon => statement_start = true,
+            Token::Word(word) if statement_start && word.keyword == Keyword::ABORT => {
+                word.keyword = Keyword::ROLLBACK;
+                statement_start = false;
+            }
+            _ => statement_start = false,
+        }
+    }
 }
 
 fn classify_parser_error(dialect: SqlDialect, error: ParserError) -> EngineError {
