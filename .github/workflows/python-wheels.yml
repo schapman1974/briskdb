@@ -78,6 +78,7 @@ jobs:
           set -euo pipefail
           python -m venv "$RUNNER_TEMP/briskdb-sdist"
           "$RUNNER_TEMP/briskdb-sdist/bin/python" -m pip install dist/*.tar.gz
+          "$RUNNER_TEMP/briskdb-sdist/bin/python" -m pip install -r python/test-requirements.txt
           "$RUNNER_TEMP/briskdb-sdist/bin/python" -m unittest discover -s python/tests -v
 
       - name: Upload source distribution
@@ -176,6 +177,7 @@ jobs:
       - name: Run minimum-version wheel tests without a source build
         run: |
           python -m pip install --no-index --only-binary=:all: --force-reinstall dist/*.whl
+          python -m pip install -r python/test-requirements.txt
           python -m unittest discover -s python/tests -v
 
       - name: Install and test wheel on CPython 3.14
@@ -186,6 +188,7 @@ jobs:
       - name: Run maximum-version wheel tests without a source build
         run: |
           python -m pip install --no-index --only-binary=:all: --force-reinstall dist/*.whl
+          python -m pip install -r python/test-requirements.txt
           python -m unittest discover -s python/tests -v
           python -m pip install mypy==1.19.1
           python -m mypy --strict --python-version 3.9 python/tests/typing_contract.py

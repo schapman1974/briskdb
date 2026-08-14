@@ -1,4 +1,4 @@
-#![cfg_attr(not(feature = "server"), allow(dead_code))]
+#![cfg_attr(not(feature = "listeners"), allow(dead_code))]
 
 //! BriskDB-owned boundary for the selected PostgreSQL wire library.
 //!

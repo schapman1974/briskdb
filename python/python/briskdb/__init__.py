@@ -1,4 +1,4 @@
-"""Listener-free native Python bindings for embedded BriskDB."""
+"""Native Python bindings for embedded BriskDB and optional listeners."""
 
 from ._briskdb import (
     BriskDBError,
@@ -28,6 +28,7 @@ from ._briskdb import (
     PermissionDeniedError,
     ProgrammingError,
     ReadOnlyError,
+    Server,
     Session,
     ShuttingDownError,
     StorageFullError,
@@ -38,7 +39,15 @@ from ._briskdb import (
     __version__,
     open,
 )
-from .api import AsyncCursor, AsyncDatabase, AsyncSession, connect, connect_async, open_async
+from .api import (
+    AsyncCursor,
+    AsyncDatabase,
+    AsyncServer,
+    AsyncSession,
+    connect,
+    connect_async,
+    open_async,
+)
 
 __all__ = [
     "BriskDBError",
@@ -68,6 +77,7 @@ __all__ = [
     "PermissionDeniedError",
     "ProgrammingError",
     "ReadOnlyError",
+    "Server",
     "Session",
     "ShuttingDownError",
     "StorageFullError",
@@ -77,6 +87,7 @@ __all__ = [
     "UnsupportedError",
     "AsyncCursor",
     "AsyncDatabase",
+    "AsyncServer",
     "AsyncSession",
     "__version__",
     "connect",

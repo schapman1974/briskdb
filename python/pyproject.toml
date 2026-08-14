@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "briskdb"
 dynamic = ["version"]
-description = "In-process sharded SQLite through BriskDB's native Rust engine"
+description = "In-process sharded SQLite with optional HTTP and PostgreSQL listeners"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"

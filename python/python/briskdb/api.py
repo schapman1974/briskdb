@@ -13,6 +13,7 @@ from ._briskdb import (
     Config,
     Cursor,
     Database,
+    Server,
     Session,
     open as _native_open,
 )
@@ -24,7 +25,7 @@ def connect(
     shards: Optional[int] = None,
     config: Optional[Config] = None,
 ) -> Database:
-    """Open a synchronous, listener-free database connection."""
+    """Open an in-process database; no listener starts unless ``serve()`` is called."""
 
     return _native_open(path, shards=shards, config=config)
 
@@ -248,7 +249,7 @@ class AsyncSession:
 
 
 class AsyncDatabase:
-    """Asyncio facade for one listener-free native BriskDB database."""
+    """Asyncio facade for one in-process native BriskDB database."""
 
     def __init__(self, database: Database) -> None:
         self._database = database
@@ -291,10 +292,56 @@ class AsyncDatabase:
             cancellation=cancellation,
         )
 
+    async def serve(
+        self,
+        *,
+        http: str = "127.0.0.1:0",
+        postgres: Optional[str] = None,
+    ) -> AsyncServer:
+        """Start loopback listeners against this database's existing engine."""
+
+        server = await asyncio.to_thread(
+            self._database.serve, http=http, postgres=postgres
+        )
+        return AsyncServer(server)
+
     async def close(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._database.close)
 
     async def __aenter__(self) -> AsyncDatabase:
+        return self
+
+    async def __aexit__(self, *_exception: object) -> bool:
+        await self.close()
+        return False
+
+
+class AsyncServer:
+    """Asyncio lifecycle wrapper for an attached native listener server."""
+
+    def __init__(self, server: Server) -> None:
+        self._server = server
+
+    @property
+    def native(self) -> Server:
+        return self._server
+
+    @property
+    def http_address(self) -> str:
+        return self._server.http_address
+
+    @property
+    def postgres_address(self) -> Optional[str]:
+        return self._server.postgres_address
+
+    @property
+    def closed(self) -> bool:
+        return self._server.closed
+
+    async def close(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._server.close)
+
+    async def __aenter__(self) -> AsyncServer:
         return self
 
     async def __aexit__(self, *_exception: object) -> bool:
@@ -308,7 +355,7 @@ async def connect_async(
     shards: Optional[int] = None,
     config: Optional[Config] = None,
 ) -> AsyncDatabase:
-    """Open a listener-free database without blocking the event loop."""
+    """Open an in-process database without blocking the event loop."""
 
     database = await asyncio.to_thread(connect, path, shards=shards, config=config)
     return AsyncDatabase(database)

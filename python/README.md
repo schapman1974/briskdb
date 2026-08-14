@@ -1,7 +1,9 @@
 # BriskDB for Python
 
 This package runs BriskDB's sharded SQLite engine in the Python process. It
-starts no listener, subprocess, signal handler, or global logger.
+starts no listener by default and never installs a signal handler or global
+logger. A database can optionally expose its exact engine through
+host-controlled loopback HTTP and PostgreSQL listeners.
 
 Tagged releases publish compiler-free wheels for CPython 3.9–3.14 on supported
 macOS and Linux targets:
@@ -40,6 +42,20 @@ config = briskdb.Config(shards=4, max_result_rows=5_000)
 db = briskdb.open("./data", config=config)
 ```
 
+To serve that same open database to browser/HTTP and PostgreSQL clients:
+
+```python
+with briskdb.open("./data") as db:
+    with db.serve(postgres="127.0.0.1:0") as server:
+        print(server.http_address)      # actual address; port 0 is resolved
+        print(server.postgres_address)
+```
+
+Listeners are loopback-only while authentication and TLS are unavailable.
+Closing a server leaves the database usable; closing the database first closes
+all of its attached servers. The asyncio API provides `await db.serve()` and
+an `AsyncServer` context manager with the same lifecycle.
+
 Database and session handles own their native resources, `close()` is
 idempotent, and blocking engine work releases Python's GIL. Dropping live
 handles during interpreter shutdown is also safe.
@@ -73,4 +89,5 @@ errors when SQLite cannot store a value losslessly. See the executable
 stable `BriskDBError` hierarchy.
 
 Native Mongo/document commands are not claimed until BriskDB's document engine
-lands. The extension uses only the listener-free `embedded` Rust feature.
+lands. The extension uses the host-controlled `listeners` Rust feature and
+does not include the daemon CLI, signal handler, or logging subscriber.

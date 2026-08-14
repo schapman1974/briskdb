@@ -4,7 +4,7 @@ pub mod embedded;
 #[cfg(feature = "sqlite-import")]
 pub mod import;
 pub mod protocol;
-#[cfg(feature = "server")]
+#[cfg(feature = "listeners")]
 pub mod server;
 pub mod sql;
 pub mod storage;
