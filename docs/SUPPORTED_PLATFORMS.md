@@ -34,6 +34,9 @@ The supported runner tests separate Tokio TCP listeners on numeric IPv4
 secure/non-secure address validation, concurrent HTTP and PostgreSQL sessions,
 disabled PostgreSQL binding, bind-failure cleanup, TLS/SCRAM exchange, and
 shutdown of both listeners.
+It also starts a real imported two-shard server and gates releases on
+transaction CRUD, error recovery, close, and reconnect through Ubuntu's
+`psql`, tokio-postgres 0.7.18, psycopg 3.2.13, and SQLAlchemy 2.0.43.
 Numeric IPv6 `SocketAddr` parsing is part of the CLI contract; an individual
 host must still provide the requested address family. The PostgreSQL endpoint
 supports bounded SQL execution, cancellation, and single-shard transactions.

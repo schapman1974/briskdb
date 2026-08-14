@@ -88,6 +88,9 @@ engine = create_engine(
 )
 ```
 
+The exact release-gating versions and exercised behavior are listed in the
+[PostgreSQL client matrix](POSTGRES_CLIENTS.md).
+
 ## TLS and SCRAM-SHA-256
 
 Secure mode needs a PEM certificate chain, matching PEM private key, one user,
@@ -159,10 +162,14 @@ and inspect it with `systemctl status briskdb` and
   results, portal suspension, `Flush`, `Sync`, and cascading `Close`.
 - `BEGIN`/`COMMIT`/`ROLLBACK` provide a real single-shard SQLite transaction,
   including read-your-writes and PostgreSQL `I`/`T`/`E` status. Cross-shard
-  access is rejected before mutation.
+  access is rejected before mutation. Bare `START TRANSACTION`, as emitted by
+  tested tokio-postgres, is equivalent to `BEGIN`; transaction-mode clauses
+  remain unsupported.
 - `version()`, identity probes, common `SHOW` settings, and psycopg's exact
   extension-type lookup have bounded compatibility responses. This is not a
   general `pg_catalog` or PostgreSQL 14 compatibility claim.
+- A PostgreSQL placeholder followed by an unparameterized `::VARCHAR` cast is
+  accepted for tested SQLAlchemy DML. This does not add general cast support.
 - DDL, savepoints, `COPY`, roles/authorization, and full PostgreSQL
   compatibility are not supported. Initialize the catalog offline with
   `briskdb-import` before starting the server.

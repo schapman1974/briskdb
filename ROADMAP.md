@@ -263,7 +263,8 @@ the engine regardless of its eventual wire protocol.
   password authentication on an unencrypted listener.
 - [x] Add compatibility shims for `SELECT version()`, common `SHOW` commands,
   and only the catalog queries needed by explicitly tested clients.
-- [ ] Test with `psql`, `tokio-postgres`, `psycopg`, and one migration/ORM tool.
+- [x] Test with `psql`, `tokio-postgres`, `psycopg`, and SQLAlchemy ORM through
+  a live, release-gating client matrix.
 - [ ] Stream rows with backpressure while preserving the PostgreSQL
   `CancelRequest` to SQLite interrupt path.
 
