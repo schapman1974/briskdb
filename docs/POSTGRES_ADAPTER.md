@@ -213,9 +213,11 @@ Issue #37 adds exact version, identity, common setting, and psycopg absent-type
 discovery responses. The advertised PostgreSQL 14 version is explicitly a
 client-parser compatibility marker; the separate `briskdb_version` status
 retains product identity, and no general PostgreSQL 14 compatibility is
-claimed.
-Later roadmap issues retain client-matrix and row-streaming scopes. The exact
-live contract and user workflow are in the
+claimed. Issue #38 adds the release-gating psql, tokio-postgres, psycopg, and
+SQLAlchemy ORM matrix plus the exact bare `START TRANSACTION` and bind-only
+`::VARCHAR` adapters those tested clients require.
+The remaining roadmap issue retains row-streaming scope. The exact live
+contract and user workflow are in the
 [PostgreSQL listener document](POSTGRES_LISTENER.md) and
 [query quickstart](POSTGRES_QUICKSTART.md).
 

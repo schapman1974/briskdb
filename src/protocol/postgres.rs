@@ -13,6 +13,7 @@ use std::{
     fmt,
     fs::{self, File},
     io::{self, BufReader},
+    ops::ControlFlow,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
@@ -65,7 +66,13 @@ use pgwire::{
         tokio_rustls::{TlsAcceptor, rustls},
     },
 };
-use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+use sqlparser::{
+    ast::{
+        CastKind, DataType as AstDataType, Expr as AstExpr, Value as AstValue, VisitMut, VisitorMut,
+    },
+    dialect::PostgreSqlDialect,
+    parser::Parser,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
@@ -1201,6 +1208,7 @@ struct PgWireBoundPortal {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompatibilityShim {
+    Sql(&'static str),
     Static {
         column: &'static str,
         value: &'static str,
@@ -1215,6 +1223,9 @@ enum CompatibilityShim {
 
 impl CompatibilityShim {
     fn sqlite_sql(self, connection: &ConnectionState) -> String {
+        if let Self::Sql(sql) = self {
+            return sql.to_owned();
+        }
         if matches!(self, Self::PsycopgTypeInfo) {
             return "SELECT NULL AS \"name\", NULL AS \"oid\", NULL AS \"array_oid\", \
                     NULL AS \"regtype\", NULL AS \"delimiter\" \
@@ -1222,6 +1233,7 @@ impl CompatibilityShim {
                 .to_owned();
         }
         let (column, value) = match self {
+            Self::Sql(_) => unreachable!("the SQL compatibility rewrite returned above"),
             Self::Static { column, value } => (column, value),
             Self::CurrentDatabase => ("current_database", connection.database_name.as_ref()),
             Self::CurrentSchema => ("current_schema", "public"),
@@ -1239,6 +1251,7 @@ fn postgres_compatibility_shim(sql: &str) -> Option<CompatibilityShim> {
     };
     let canonical = statement.to_string().to_ascii_lowercase();
     match canonical.as_str() {
+        "start transaction" => Some(CompatibilityShim::Sql("BEGIN")),
         "select version()" | "select pg_catalog.version()" => Some(CompatibilityShim::Static {
             column: "version",
             value: VERSION_BANNER,
@@ -1347,10 +1360,56 @@ fn sqlite_text_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+#[derive(Default)]
+struct PostgreSqlBindCastVisitor {
+    rewritten: bool,
+}
+
+impl VisitorMut for PostgreSqlBindCastVisitor {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, expression: &mut AstExpr) -> ControlFlow<Self::Break> {
+        let AstExpr::Cast {
+            kind: CastKind::DoubleColon,
+            expr,
+            data_type: AstDataType::Varchar(None),
+            array: false,
+            format: None,
+        } = expression
+        else {
+            return ControlFlow::Continue(());
+        };
+        if matches!(
+            expr.as_ref(),
+            AstExpr::Value(value) if matches!(value.value, AstValue::Placeholder(_))
+        ) {
+            *expression = expr.as_ref().clone();
+            self.rewritten = true;
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn postgres_client_bind_cast_sql(sql: &str) -> Option<String> {
+    let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).ok()?;
+    let [statement] = statements.as_mut_slice() else {
+        return None;
+    };
+    let mut visitor = PostgreSqlBindCastVisitor::default();
+    if statement.visit(&mut visitor).is_break() || !visitor.rewritten {
+        return None;
+    }
+    Some(statement.to_string())
+}
+
 fn postgres_compatibility_sql<'a>(connection: &ConnectionState, sql: &'a str) -> Cow<'a, str> {
-    postgres_compatibility_shim(sql).map_or(Cow::Borrowed(sql), |shim| {
+    if let Some(shim) = postgres_compatibility_shim(sql) {
         Cow::Owned(shim.sqlite_sql(connection))
-    })
+    } else if let Some(sql) = postgres_client_bind_cast_sql(sql) {
+        Cow::Owned(sql)
+    } else {
+        Cow::Borrowed(sql)
+    }
 }
 
 /// Protocol-owned state for one PostgreSQL connection.
@@ -4545,6 +4604,7 @@ mod tests {
         for query in [
             "SELECT version()",
             " select pg_catalog.version() ; ",
+            "START TRANSACTION",
             "SELECT current_database()",
             "SELECT pg_catalog.current_database()",
             "SELECT current_schema()",
@@ -4585,6 +4645,7 @@ mod tests {
             "SELECT version() AS invented_alias",
             "SELECT version() FROM application_table",
             "SELECT version(); SELECT 1",
+            "START TRANSACTION ISOLATION LEVEL READ COMMITTED",
             "SHOW work_mem",
             "SELECT current_setting('work_mem')",
             "SELECT * FROM pg_catalog.pg_class",
@@ -4592,6 +4653,38 @@ mod tests {
             assert!(
                 postgres_compatibility_shim(query).is_none(),
                 "unexpected compatibility shim for {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlalchemy_varchar_bind_casts_are_removed_without_broad_cast_support() {
+        assert_eq!(
+            postgres_client_bind_cast_sql(
+                "INSERT INTO records (tenant_id, payload) VALUES ($1::VARCHAR, $2::VARCHAR)"
+            )
+            .as_deref(),
+            Some("INSERT INTO records (tenant_id, payload) VALUES ($1, $2)")
+        );
+        assert_eq!(
+            postgres_client_bind_cast_sql(
+                "SELECT records.payload FROM records WHERE records.tenant_id = $1::VARCHAR"
+            )
+            .as_deref(),
+            Some("SELECT records.payload FROM records WHERE records.tenant_id = $1")
+        );
+
+        for query in [
+            "SELECT 'private'::VARCHAR",
+            "SELECT $1::TEXT",
+            "SELECT $1::VARCHAR(20)",
+            "SELECT CAST($1 AS VARCHAR)",
+            "SELECT $1::VARCHAR; SELECT $2::VARCHAR",
+        ] {
+            assert_eq!(
+                postgres_client_bind_cast_sql(query),
+                None,
+                "unexpected bind-cast rewrite for {query:?}"
             );
         }
     }
