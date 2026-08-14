@@ -54,8 +54,10 @@ downgraded to the 3.0 baseline rather than rejected. These are fixed `FATAL` res
 followed by socket close, without `ReadyForQuery`. Simple and extended-query
 Engine failures use their mapped SQLSTATE. Extended-flow name conflicts use
 fixed `42P03`/`42P05`, missing handles use fixed `34000`/`26000`, and unsupported
-OID, parameter, or binary-format requests use `0A000`. Neither path includes
-query text. The complete sequencing is in
+OIDs use `0A000`. Invalid parameter values use `22P02`, invalid parameter text
+uses `22021`, decoded count mismatches use `08P01`, and dynamic result/type
+mismatches use `42804`. Invalid raw format codes remain protocol failures.
+Neither path includes query text or parameter bytes. The complete sequencing is in
 [PostgreSQL startup and listener](POSTGRES_LISTENER.md).
 
 ### Experimental virtual-table rollout boundary
@@ -67,7 +69,7 @@ is intentionally asymmetric:
 | Surface | Reachability and tested unsupported behavior | Remaining dependency |
 | --- | --- | --- |
 | HTTP | A populated catalog with `experimental-vtab` and the write opt-in can reach the coordinator. The execute endpoint maps `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints, and attachments to the fixed `Unsupported` 501 problem; caller-authored DML `RETURNING` has that result through both data endpoints. All fail before pool admission, and protocol tests verify that the shard files are unchanged. | Transaction support still requires a protocol-neutral pinned transaction state machine. |
-| PostgreSQL | Production simple `Query` and zero-parameter text-format extended queries execute registered-table reads and explicit-key writes through the Engine. Unsupported session/schema statements fail before mutation and extended errors discard input through `Sync`. | Parameter/OID/binary mapping remains issue #33; transaction state and shard pinning are issue #34. |
+| PostgreSQL | Production simple `Query` and parameterized text/binary extended queries execute registered-table reads and writes through the Engine. Unsupported session/schema statements fail before mutation and extended errors discard input through `Sync`. | Transaction state and shard pinning are issue #34. |
 | MySQL | There is no listener or command state machine. `mysql_error(Unsupported)` is only the deterministic future-adapter contract: error 1235, SQLSTATE `42000`, and the same safe message. | Listener and query flow are issues #40–#43; result/error encoding is issue #44; transactions are issue #47. |
 
 Consequently, issue #131 cannot declare cross-wire facade rollout complete

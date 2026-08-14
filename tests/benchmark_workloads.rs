@@ -15,9 +15,9 @@ fn point_read_returns_the_seeded_row() {
     assert_eq!(
         result.columns(),
         vec![
-            Column::new("id", DataType::Unknown),
-            Column::new("writes", DataType::Unknown),
-            Column::new("payload", DataType::Unknown),
+            Column::new("id", DataType::Text),
+            Column::new("writes", DataType::Int64),
+            Column::new("payload", DataType::Text),
         ]
     );
     assert_eq!(
@@ -73,9 +73,9 @@ fn engine_point_read_returns_the_seeded_row_through_the_default_pool() {
     assert_eq!(
         result.columns(),
         vec![
-            Column::new("id", DataType::Unknown),
-            Column::new("writes", DataType::Unknown),
-            Column::new("payload", DataType::Unknown),
+            Column::new("id", DataType::Text),
+            Column::new("writes", DataType::Int64),
+            Column::new("payload", DataType::Text),
         ]
     );
     assert_eq!(

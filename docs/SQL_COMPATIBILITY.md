@@ -50,10 +50,10 @@ claiming to be a drop-in PostgreSQL or MySQL replacement.
 
 The initial alpha exposes experimental HTTP plus a disabled-by-default,
 separately configured loopback PostgreSQL listener. PostgreSQL implements exact
-protocol-3.0 baseline and newer-minor downgrade, logical database/user selection, BriskDB parameter
-status, tracked session termination, simple queries, and zero-parameter
-text-format extended queries through a pinned `pgwire` 0.36.3 boundary. There
-is no MySQL listener. The public Rust SQL facade
+protocol-3.0 baseline and newer-minor downgrade, logical database/user
+selection, BriskDB parameter status, tracked session termination, simple
+queries, and parameterized text/binary extended queries through a pinned
+`pgwire` 0.36.3 boundary. There is no MySQL listener. The public Rust SQL facade
 can parse an explicitly selected SQLite, PostgreSQL, or MySQL dialect, consume
 that result with
 `validate_common_subset(ParsedSql)`, borrow the result with
@@ -94,7 +94,7 @@ set, every shard for an unconstrained Sharded read, or shard 0 once for a
 | HTTP `/v1/query` | Experimental | Empty catalog: legacy raw SQLite query. Populated catalog: exactly one SQLite common-subset read; no session cache; multi-shard execution is limited to the row-local scatter-safe subset | Empty catalog requires caller `shard_key`; populated catalog derives targets from registered metadata, reads Global data once on shard 0, and denies Catalog/undeclared tables |
 | HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch; populated catalogs reject row-moving DML, table drops, and trigger creation | Preflight on every shard, then ascending resumable apply |
 | HTTP `/admin` browser | Experimental, read-only | No caller SQL; metadata-driven logical table discovery, specialized exact logical `COUNT(*)`, and bounded deterministic `SELECT *` page slices | Sharded tables visit all files; Global tables visit shard 0 once; no browser shard selector or arbitrary SQL |
-| PostgreSQL wire protocol | Protocol-3.0 baseline with newer 3.x minor downgrade, plus simple `Query` and zero-parameter text-format extended flow on loopback | Registered-table `SELECT`, `INSERT`, `UPDATE`, and `DELETE`; parameters, binary formats, DDL, and transactions remain unsupported | Startup selects an exact logical database; both flows use Engine prepare/bind/logical execution and fixed SQLSTATE mapping |
+| PostgreSQL wire protocol | Protocol-3.0 baseline with newer 3.x minor downgrade, plus simple `Query` and parameterized text/binary extended flow on loopback | Registered-table `SELECT`, `INSERT`, `UPDATE`, and `DELETE`; basic OIDs and value formats are implemented, while DDL and transactions remain unsupported | Startup selects an exact logical database; both flows use Engine prepare/bind/logical execution and fixed SQLSTATE mapping |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
 The parser, subset validator, statement classifier, placeholder normalizer, SQL
@@ -403,8 +403,9 @@ For every row, `rows[row_index][column_index]` is described by
 used as JSON object keys. A query that produces no rows still returns all of its
 ordered column metadata with `"rows": []`. The `data_type` label is one of
 `unknown`, `null`, `boolean`, `int64`, `uint64`, `float64`, `decimal`, `text`,
-or `binary`. SQLite result columns currently report `unknown` because SQLite
-does not guarantee one static result type.
+or `binary`. Direct SQLite columns now retain the conservative declared-type
+mapping documented for PostgreSQL; expressions and unrecognized declarations
+remain `unknown` because SQLite does not guarantee one static result type.
 
 The `/v1/query` cell encoding retains the existing HTTP policy: nulls, booleans,
 signed and unsigned integers, finite floats, and valid text use their direct
@@ -786,7 +787,7 @@ an exact protocol-3.0 baseline on loopback and downgrades newer 3.x minor
 requests explicitly. It validates a finite parameter set,
 selects one logical database and user label, advertises BriskDB-owned status,
 and tracks the selected core session through termination. Simple and
-zero-parameter extended SQL messages use the bounded Engine lifecycle;
+parameterized extended SQL messages use the bounded Engine lifecycle;
 extended errors discard messages until `Sync`. PostgreSQL-specific behavior is
 not implemented unless listed as implemented in this document.
 Configuration and lifecycle semantics are normative in the [PostgreSQL listener
@@ -795,13 +796,13 @@ normative in the [adapter decision record](POSTGRES_ADAPTER.md).
 
 | Area | PostgreSQL | BriskDB contract |
 | --- | --- | --- |
-| Parameters | `$1`, `$2`, ... | Named/unnamed wire prepare/bind/describe/execute works for zero parameters; OID/value mapping remains issue #33 |
+| Parameters | `$1`, `$2`, ... | Named/unnamed prepare/bind/describe/execute supports basic explicit OIDs plus conservative text inference, exact counts, and mixed text/binary values |
 | Identifier quoting | Double quotes | Retained by opt-in compatibility translation; PostgreSQL case folding and catalog equivalence are not claimed |
-| Type system | Static types identified by OIDs | Opt-in Rust translation maps a finite declaration set to `BIGINT`, `BOOLEAN`, `REAL`, `TEXT`, or `BLOB`; OID and value/result adaptation remain planned |
-| Boolean | Dedicated `boolean` type | Opt-in translation maps the declaration to `BOOLEAN` and literals to `1`/`0`; Boolean wire/result metadata remains planned |
-| `BIGSERIAL`, identity, sequences | Sequence-backed generation | Compatibility translation accepts exactly inline `BIGSERIAL PRIMARY KEY` or `BIGINT PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY` as `native_range_v1` intent and canonical SQLite `AUTOINCREMENT`; sequence objects/options and PostgreSQL wire result behavior remain unsupported |
-| `bytea` | Binary value | Opt-in declaration translation maps it to SQLite `BLOB`; binary value and wire adaptation remain planned |
-| `json` / `jsonb` | Distinct PostgreSQL types | Planned JSON validation; no promise of PostgreSQL `jsonb` storage or operators |
+| Type system | Static types identified by OIDs | Declared SQLite columns map conservatively to `bool`, `int8`, `float8`, `numeric`, `text`, or `bytea`; expressions and unknown declarations use `text` |
+| Boolean | Dedicated `boolean` type | Translation maps literals to SQLite `1`/`0`; declared Boolean results return OID `bool` and canonical text or one-byte binary values |
+| `BIGSERIAL`, identity, sequences | Sequence-backed generation | Compatibility translation accepts exactly inline `BIGSERIAL PRIMARY KEY` or `BIGINT PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY` as `native_range_v1` intent and canonical SQLite `AUTOINCREMENT`; successful wire inserts use standard `INSERT 0 n` and never invent a generated-key row without `RETURNING` |
+| `bytea` | Binary value | Translation maps it to SQLite `BLOB`; parameters accept hex/escape text or raw binary and results use hex text or raw binary |
+| `json` / `jsonb` | Distinct PostgreSQL types | Parameters decode to protocol-neutral text (including the JSONB binary version byte); JSON validation, storage semantics, and operators are not claimed |
 | Arrays, ranges, enums, domains | Native PostgreSQL types | Unsupported initially |
 | Schemas and `search_path` | Multiple schemas per database | Unsupported initially; compatibility shims may expose one logical schema |
 | `RETURNING` | Common DML feature | Not in the initial common subset |
@@ -812,9 +813,9 @@ normative in the [adapter decision record](POSTGRES_ADAPTER.md).
 | `COPY`, replication, `LISTEN/NOTIFY` | PostgreSQL subprotocols/features | Deferred and unsupported initially |
 
 PostgreSQL's static result metadata does not always have an exact equivalent in
-SQLite's dynamic type system. BriskDB will honor declared and bound types where
-safe, infer expression types conservatively, and reject indeterminate binary
-parameters instead of guessing.
+SQLite's dynamic type system. BriskDB honors recognized declared types, reports
+expressions conservatively as text, and rejects a dynamic stored value that
+cannot satisfy the advertised type instead of emitting corrupt wire bytes.
 
 ## MySQL differences
 

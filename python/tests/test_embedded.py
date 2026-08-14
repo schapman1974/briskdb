@@ -107,8 +107,8 @@ class EmbeddedBriskDbTests(unittest.TestCase):
             self.assertEqual(
                 result["columns"],
                 [
-                    {"name": "id", "type": "unknown"},
-                    {"name": "body", "type": "unknown"},
+                    {"name": "id", "type": "int64"},
+                    {"name": "body", "type": "text"},
                 ],
             )
             self.assertEqual(result["rows"], [(1, "hello")])

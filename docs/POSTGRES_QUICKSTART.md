@@ -83,16 +83,16 @@ and inspect it with `systemctl status briskdb` and
 - Registered-table `SELECT`, `INSERT`, `UPDATE`, and `DELETE` execute through
   the same catalog, routing, limits, and fixed-error boundary as the core
   engine.
-- Results use PostgreSQL text format. Unknown SQLite compile metadata is
-  reported conservatively as PostgreSQL `text`; known protocol-neutral
-  metadata maps to boolean, signed integer, numeric, double precision, text,
-  or bytea OIDs. Stored non-UTF-8 text is rejected instead of being replaced.
+- Simple-query results use PostgreSQL text format. Recognized SQLite declared
+  types map to boolean, signed integer, numeric, double precision, text, or
+  bytea OIDs; expressions and unrecognized declarations remain conservative
+  PostgreSQL `text`. Stored non-UTF-8 text is rejected instead of being
+  replaced.
 - Sharded writes must contain enough literal shard-key information to select
   exactly one owner. Reads use the engine's bounded logical read path.
-- Zero-parameter text-format prepared queries support named and unnamed
-  `Parse`/`Bind`/`Describe`/`Execute`, portal suspension, `Flush`, `Sync`, and
-  cascading `Close`. Bind parameters, explicit parameter OIDs, and binary
-  formats remain deferred to type mapping in issue #33.
+- Parameterized prepared queries support named and unnamed
+  `Parse`/`Bind`/`Describe`/`Execute`, basic OIDs, mixed text/binary values and
+  results, portal suspension, `Flush`, `Sync`, and cascading `Close`.
 - DDL, transactions, `COPY`, authentication, authorization, TLS, and full
   PostgreSQL compatibility are not supported. Initialize the catalog offline
   with `briskdb-import` before starting the server.

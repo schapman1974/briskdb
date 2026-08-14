@@ -312,15 +312,15 @@ translation are pure SQL operations and do not require these execution gates.
 `SQLite`, `PostgreSQL`, and `MySQL` in the DDL table identify the selected
 source-language parsers; they do not imply completed PostgreSQL or MySQL wire
 behavior. The HTTP adapter and protocol-neutral Rust result are implemented
-now. PostgreSQL generated-key
-type/OID and result behavior remains coordinated with
-[issue #33](https://github.com/schapman1974/briskdb/issues/33). MySQL
+now. PostgreSQL maps a generated `Int64` value to `int8` when it is part of a
+row, but a successful insert sends the standard `INSERT 0 n` command tag and
+never invents an unsolicited generated-key row. Caller-authored `RETURNING`
+remains outside the SQL subset. MySQL
 `AUTO_INCREMENT` result/status encoding remains coordinated with
 [issue #44](https://github.com/schapman1974/briskdb/issues/44). There is
-currently no MySQL listener. PostgreSQL simple queries can execute explicit-key
-writes; omitted generated-key inserts still depend on the documented compile
-and runtime coordinator gates, and the wire response exposes only the affected
-row command tag in this initial slice.
+currently no MySQL listener. PostgreSQL omitted generated-key inserts still
+depend on the documented compile and runtime coordinator gates, and the wire
+response exposes only the affected-row command tag.
 
 This release does not promise PostgreSQL sequence objects or sequence options,
 MySQL session variables such as `LAST_INSERT_ID()`, caller-authored

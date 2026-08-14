@@ -1,8 +1,8 @@
 # PostgreSQL adapter decision record
 
 Status: accepted for roadmap issue #29; amended by issue #30 production startup
-activation, issue #31 extended-query execution, and issue #32 protocol
-negotiation
+activation, issue #31 extended-query execution, issue #32 protocol
+negotiation, and issue #33 type/format mapping
 
 BriskDB needs a PostgreSQL frontend library that can own protocol framing and
 message dispatch without becoming the database engine, routing policy,
@@ -35,7 +35,7 @@ behavior, and MSRV decision followed by the complete verification matrix.
 
 Only `server-api` is enabled. That supplies the Tokio socket entrypoint,
 frontend/backend messages, handler traits, PostgreSQL type descriptors, and
-row encoders used by startup and the query adapter.
+row messages used by startup and the query adapter.
 
 The dependency's defaults are disabled because they additionally select an
 AWS-LC TLS backend and extended chrono, decimal, and JSON adapters. BriskDB does
@@ -45,9 +45,9 @@ not need those dependencies for the issue-29 fit check:
 | --- | --- | --- |
 | Plain server API | Enabled | Foundation for issues #30 and #31 |
 | AWS-LC or ring TLS provider | Not enabled | TLS and SCRAM issue #36 |
-| Chrono type adapter | Not enabled | Type mapping issue #33 |
-| Rust-decimal adapter | Not enabled | Type mapping issue #33 |
-| Serde-JSON adapter | Not enabled | Type mapping issue #33 |
+| Chrono type adapter | Not enabled | No BriskDB date/time value type yet |
+| Rust-decimal adapter | Not enabled | BriskDB-owned arbitrary decimal wire codec |
+| Serde-JSON adapter | Not enabled | JSON parameters remain protocol-neutral text |
 | Client API | Not enabled | Named external-client matrix issue #38 |
 
 The resolved graph uses the repository's existing Tokio 1.53.1 rather than a
@@ -75,18 +75,18 @@ The connection retains a private implementation of `pgwire`'s `QueryParser`
 trait as the compile-time bridge. Its probe path prepares PostgreSQL-dialect
 SQL through `Engine::prepare_statement` with compatibility translation and
 describes the resulting BriskDB handle. It neither opens SQLite directly nor
-computes a route. PostgreSQL parameter OID lists are rejected as `Unsupported`
-until issue #33 defines their exact mapping. Because `pgwire`
-collapses both raw OID zero and unknown/custom OIDs to `None` before invoking
-`QueryParser`, the probe rejects every nonempty parameter-type list rather than
-guessing which raw value produced it.
+computes a route. Production Parse validates raw OIDs before `pgwire` can
+collapse both OID zero and unknown/custom OIDs to `None`. The private parser
+therefore receives only validated types, treats `None` as inference-to-text,
+and retains the resolved PostgreSQL types beside the protocol-neutral handle.
 
-The private prepared wrapper contains only a BriskDB
-`PreparedStatementId` and `PreparedStatementDescription`. It does not expose
-the dependency's statement, portal, message, or type objects through a BriskDB
-signature. Production Parse/Bind name management mirrors the wire store into
-bounded core handles. Statement closure cascades to dependent portals, and
-unnamed replacement performs the same cleanup before installing its successor.
+The private prepared wrapper contains a BriskDB `PreparedStatementId` and
+`PreparedStatementDescription` plus connection-local PostgreSQL parameter
+descriptors. It does not expose the dependency's statement, portal, message,
+or type objects through a BriskDB signature. Production Parse/Bind name
+management mirrors the wire store into bounded core handles. Statement closure
+cascades to dependent portals, and unnamed replacement performs the same
+cleanup before installing its successor.
 
 ## Compatibility probe
 
@@ -122,7 +122,7 @@ The selected version provides the protocol pieces required by the roadmap:
 - startup, simple-query, extended-query, copy, error, and cancellation handler
   traits selected by a per-socket factory;
 - Parse/Bind/Describe/Execute/Flush/Sync/Close message dispatch;
-- text and binary field descriptors and row encoders; and
+- text and binary field descriptors and data-row messages; and
 - PostgreSQL connection and transaction-status tracking.
 
 Those conveniences do not transfer product ownership to the library. In
@@ -138,9 +138,9 @@ particular:
   makes the Engine's finite per-session prepared-statement, portal, and
   retained-value budgets authoritative.
 - The default Bind path retains dependency-owned raw parameter bytes and does
-  not call `Engine::bind_statement`. The production adapter already binds the
-  zero-parameter slice into a core portal so its route snapshot is immutable
-  before Execute; issue #33 owns decoding typed values into BriskDB `Value`s.
+  not call `Engine::bind_statement`. BriskDB's handler decodes supported
+  text/binary values into BriskDB `Value`s first, binds one core portal, and
+  snapshots the portal's result fields/formats before Execute.
 - The selected socket loop does not treat `Terminate` as terminal and has no
   BriskDB session-close callback. Production uses a narrow BriskDB-owned loop
   around the library's public decoder/dispatcher and closes its `Connection`
@@ -189,12 +189,13 @@ newer-minor and protocol-option negotiation without expanding the implemented
 3.0 message semantics.
 
 Issue #157 adds the simple-query slice. Issue #31 adds bounded named/unnamed
-Parse, zero-parameter Bind, statement/portal Describe, resumable Execute,
-Flush, Sync error recovery, and cascading Close. Both paths execute registered
-table reads and writes through the Engine and return text-format rows or
-command tags. Later roadmap issues retain their minor-version negotiation,
-broader type, transaction, cancellation, TLS/SCRAM, client-matrix, and
-row-streaming scopes. The exact live contract and user workflow are in the
+Parse, Bind, statement/portal Describe, resumable Execute, Flush, Sync error
+recovery, and cascading Close. Issue #33 adds declared result types, resolved
+parameter OIDs, and basic text/binary value codecs while keeping PostgreSQL
+types and raw bytes at this adapter edge. Both paths execute registered table
+reads and writes through the Engine. Later roadmap issues retain transaction,
+cancellation, TLS/SCRAM, client-matrix, and row-streaming scopes. The exact
+live contract and user workflow are in the
 [PostgreSQL listener document](POSTGRES_LISTENER.md) and
 [query quickstart](POSTGRES_QUICKSTART.md).
 

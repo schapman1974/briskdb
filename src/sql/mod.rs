@@ -276,11 +276,44 @@ fn statement_metadata(statement: &SqlStatement<'_>) -> StatementMetadata {
     StatementMetadata {
         parameter_count: statement.parameter_count(),
         columns: statement
-            .column_names()
+            .columns()
             .into_iter()
-            .map(|name| Column::new(name, DataType::Unknown))
+            .map(|column| {
+                Column::new(
+                    column.name(),
+                    column
+                        .decl_type()
+                        .map(declared_data_type)
+                        .unwrap_or(DataType::Unknown),
+                )
+            })
             .collect(),
         readonly: statement.readonly(),
+    }
+}
+
+fn declared_data_type(declaration: &str) -> DataType {
+    let declaration = declaration.trim().to_ascii_uppercase();
+    if matches!(declaration.as_str(), "BOOL" | "BOOLEAN") {
+        DataType::Boolean
+    } else if declaration.contains("INT") {
+        DataType::Int64
+    } else if declaration.contains("CHAR")
+        || declaration.contains("CLOB")
+        || declaration.contains("TEXT")
+    {
+        DataType::Text
+    } else if declaration.contains("BLOB") {
+        DataType::Binary
+    } else if declaration.contains("REAL")
+        || declaration.contains("FLOA")
+        || declaration.contains("DOUB")
+    {
+        DataType::Float64
+    } else if declaration.contains("DECIMAL") || declaration.contains("NUMERIC") {
+        DataType::Decimal
+    } else {
+        DataType::Unknown
     }
 }
 
@@ -615,12 +648,39 @@ mod tests {
         assert_eq!(
             returning.columns(),
             [
-                Column::new("id", DataType::Unknown),
-                Column::new("value", DataType::Unknown),
+                Column::new("id", DataType::Int64),
+                Column::new("value", DataType::Text),
             ]
         );
         assert!(!returning.readonly());
         assert!(returning.produces_columns());
+
+        let selected =
+            describe_statement(&connection, "SELECT id, value FROM metadata_test").unwrap();
+        assert_eq!(
+            selected.columns(),
+            [
+                Column::new("id", DataType::Int64),
+                Column::new("value", DataType::Text),
+            ]
+        );
+        assert!(selected.readonly());
+    }
+
+    #[test]
+    fn sqlite_declarations_map_to_conservative_protocol_neutral_types() {
+        for (declaration, expected) in [
+            ("BOOLEAN", DataType::Boolean),
+            ("unsigned big int", DataType::Int64),
+            ("VARCHAR(255)", DataType::Text),
+            ("BLOB", DataType::Binary),
+            ("DOUBLE PRECISION", DataType::Float64),
+            ("DECIMAL(20, 4)", DataType::Decimal),
+            ("DATE", DataType::Unknown),
+            ("", DataType::Unknown),
+        ] {
+            assert_eq!(declared_data_type(declaration), expected, "{declaration}");
+        }
     }
 
     #[test]
@@ -1471,12 +1531,12 @@ mod tests {
         assert_eq!(
             result.columns(),
             vec![
-                Column::new("id", DataType::Unknown),
-                Column::new("enabled", DataType::Unknown),
-                Column::new("ratio", DataType::Unknown),
-                Column::new("text_value", DataType::Unknown),
-                Column::new("blob_value", DataType::Unknown),
-                Column::new("optional_value", DataType::Unknown),
+                Column::new("id", DataType::Int64),
+                Column::new("enabled", DataType::Int64),
+                Column::new("ratio", DataType::Float64),
+                Column::new("text_value", DataType::Text),
+                Column::new("blob_value", DataType::Binary),
+                Column::new("optional_value", DataType::Text),
             ]
         );
         assert_eq!(
