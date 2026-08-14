@@ -178,8 +178,8 @@ particular:
   names, raw parameters, prepared objects, or rows. Those values and connection
   tasks still require their BriskDB-owned finite limits.
 - Portal suspension cannot cause a BriskDB portal to execute twice. The adapter
-  retains and resumes the already produced bounded materialized response;
-  issue #39 owns a separately reviewed streaming contract.
+  retains and resumes the same bounded Engine row stream. The stream keeps the
+  request cancellation key active until completion or close.
 
 These are adapter requirements, not reasons to move protocol state into core.
 The library remains replaceable as long as the BriskDB seam and conformance
@@ -216,8 +216,9 @@ retains product identity, and no general PostgreSQL 14 compatibility is
 claimed. Issue #38 adds the release-gating psql, tokio-postgres, psycopg, and
 SQLAlchemy ORM matrix plus the exact bare `START TRANSACTION` and bind-only
 `::VARCHAR` adapters those tested clients require.
-The remaining roadmap issue retains row-streaming scope. The exact live
-contract and user workflow are in the
+Issue #39 adds protocol-neutral bounded row streaming and carries an exact
+`CancelRequest` through portal suspension to the leased SQLite interrupt
+handle. The exact live contract and user workflow are in the
 [PostgreSQL listener document](POSTGRES_LISTENER.md) and
 [query quickstart](POSTGRES_QUICKSTART.md).
 

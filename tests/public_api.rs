@@ -1210,6 +1210,8 @@ async fn prepared_lifecycle_is_public_owned_and_protocol_neutral() {
     assert_owned::<core::DescribeTarget>();
     assert_owned::<core::PreparedStatementDescription>();
     assert_owned::<core::PreparedExecution>();
+    assert_owned::<core::RowStream>();
+    assert_eq!(core::DEFAULT_STREAM_BUFFER_ROWS, 16);
 
     let temp = tempfile::tempdir().unwrap();
     let mut database = core::Database::open(temp.path(), 4).unwrap();
@@ -1305,6 +1307,21 @@ async fn prepared_lifecycle_is_public_owned_and_protocol_neutral() {
             core::Value::from("private-literal")
         ]
     );
+
+    let mut streamed = engine
+        .stream_portal_logical(&session, select_portal)
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(streamed.columns(), description.columns());
+    assert_eq!(
+        streamed.next_row().await.unwrap().unwrap().values(),
+        [
+            core::Value::from(42_i64),
+            core::Value::from("private-literal")
+        ]
+    );
+    assert!(streamed.next_row().await.is_none());
 
     assert!(engine.close_portal(&session, select_portal).await.unwrap());
     assert!(

@@ -147,12 +147,14 @@ request currently running on that backend; an unknown, stale, or mismatched key
 does nothing. Each command receives a fresh core cancellation token so a token
 for completed command A cannot interrupt later command B.
 
-Cancellation can interrupt a SQLite lock wait or active SQLite statement. It
-returns SQLSTATE `57014`. Inside an explicit transaction, the transaction then
-reports failed status (`E`) until `ROLLBACK`; the same connection can continue
-after rollback. Clients must wait for the cancelled command's response before
-starting another command on that connection. Disconnect and server shutdown
-unregister the key and cancel any active work.
+Cancellation can interrupt a SQLite lock wait, active SQLite statement, or a
+producer paused behind a slow client. It returns SQLSTATE `57014`. A suspended
+portal keeps the same request key and SQLite operation, so cancellation between
+`Execute` messages is also effective. Inside an explicit transaction, the
+transaction then reports failed status (`E`) until `ROLLBACK`; the same
+connection can continue after rollback. Clients must wait for the cancelled
+command's response before starting another command on that connection.
+Disconnect and server shutdown unregister the key and cancel active work.
 
 ## Startup errors
 
@@ -230,8 +232,10 @@ fixed Engine-to-SQLSTATE mapping, appends the session's exact `ReadyForQuery`
 status, never includes query text, and leaves an idle connection reusable. An
 error in a transaction reports `E` and requires rollback.
 
-Rows are bounded and materialized by the Engine, then returned in PostgreSQL
-text format. Declared SQLite columns map `BOOL`/`BOOLEAN` to `bool`, names
+Rows are decoded into a protocol-neutral Engine stream and returned in
+PostgreSQL text format. A bounded 16-row handoff applies backpressure before
+SQLite steps farther; the existing operation-wide row and logical-byte limits
+still apply. Declared SQLite columns map `BOOL`/`BOOLEAN` to `bool`, names
 containing `INT` to `int8`, `REAL`/`FLOA`/`DOUB` to `float8`,
 `DECIMAL`/`NUMERIC` to `numeric`, `CHAR`/`CLOB`/`TEXT` to `text`, and `BLOB` to
 `bytea`. Unknown declarations and expressions remain conservative `text`.
@@ -259,8 +263,9 @@ The parameterized text/binary extended flow uses the same Engine lifecycle:
   fields, or the bound portal's immutable requested result formats, without
   execution.
 - `Execute` returns rows or a command tag. A positive row limit suspends and
-  resumes the already materialized bounded response without rerunning the core
-  portal; a completed portal cannot replay a write.
+  resumes the same bounded Engine stream without rerunning the core portal; a
+  completed portal cannot replay a write. Closing a suspended portal cancels
+  its stream before releasing its core handle.
 - `Close` releases a portal or cascades statement closure to its portals;
   `Flush` flushes pending output; `Sync` reports the current `I`, `T`, or `E`
   status and causes skipped extended messages to be accepted again.

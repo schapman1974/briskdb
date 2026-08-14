@@ -209,8 +209,10 @@ or routing bytes.
 
 Portals are reusable and are not consumed by execution. Multiple portals may
 refer to one prepared statement, subject to the per-session limits. Portal row
-suspension and protocol cursor semantics are not implemented; each execution
-materializes one complete bounded result or returns an error.
+suspension remains a frontend concern. PostgreSQL resumes the same bounded
+protocol-neutral `RowStream`; other Engine execution methods continue to
+materialize one complete bounded `ResultSet`. A completed stream does not
+consume its core portal, so a later execution can intentionally rerun it.
 
 ## Cache limits and exact byte accounting
 

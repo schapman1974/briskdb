@@ -384,6 +384,50 @@ pub(crate) fn query_with_scatter_budget(
     materialize_rows_with_scatter_budget(&mut statement, metadata.columns, params, budget)
 }
 
+/// Step one read-only SQLite statement and publish each owned row through a
+/// bounded protocol-neutral sink.
+///
+/// `publish_columns` runs after successful prepare and budget validation but
+/// before SQLite is stepped. Scatter callers share one budget and invoke this
+/// once per shard, which also verifies identical column metadata.
+pub(crate) fn stream_query_with_budget(
+    connection: &Connection,
+    statement: &str,
+    params: &[Value],
+    budget: &ScatterResultBudget,
+    publish_columns: impl FnOnce(&[Column]) -> EngineResult<()>,
+    mut publish_row: impl FnMut(Row) -> EngineResult<()>,
+) -> EngineResult<()> {
+    let params = sqlite_parameters(params)?;
+    let mut statement = connection
+        .prepare(statement)
+        .map_err(sqlite_error::statement)?;
+    if !statement.readonly() {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidQuery,
+            "streamed query statements must be read-only",
+        ));
+    }
+
+    let metadata = statement_metadata(&statement);
+    budget.register_columns(&metadata.columns)?;
+    publish_columns(&metadata.columns)?;
+    let mut sqlite_rows = statement
+        .query(params_from_iter(params))
+        .map_err(sqlite_error::statement)?;
+    while let Some(sqlite_row) = sqlite_rows.next().map_err(sqlite_error::statement)? {
+        budget.reserve_sqlite_row(sqlite_row, metadata.columns.len())?;
+        let mut values = Vec::with_capacity(metadata.columns.len());
+        for index in 0..metadata.columns.len() {
+            values.push(sql_to_value(
+                sqlite_row.get_ref(index).map_err(sqlite_error::statement)?,
+            ));
+        }
+        publish_row(Row::new(values))?;
+    }
+    Ok(())
+}
+
 fn materialize_rows(
     statement: &mut SqlStatement<'_>,
     columns: Vec<Column>,

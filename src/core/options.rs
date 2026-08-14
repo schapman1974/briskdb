@@ -10,10 +10,10 @@ pub const DEFAULT_CONNECTIONS_PER_SHARD: usize = 4;
 /// Default number of operations admitted to each shard's pending queue.
 pub const DEFAULT_QUEUE_CAPACITY_PER_SHARD: usize = 32;
 
-/// Default maximum number of rows materialized by one query.
+/// Default maximum number of rows produced by one query.
 pub const DEFAULT_MAX_RESULT_ROWS: u64 = 10_000;
 
-/// Default maximum logical size of one materialized query result (16 MiB).
+/// Default maximum logical size of one query result (16 MiB).
 pub const DEFAULT_MAX_RESULT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Default engine-enforced request deadline in milliseconds.
@@ -37,10 +37,10 @@ pub const MAX_CONNECTIONS_PER_SHARD: usize = 16;
 /// Maximum configurable pending operations per shard.
 pub const MAX_QUEUE_CAPACITY_PER_SHARD: usize = 1_024;
 
-/// Maximum configurable rows in one materialized query result.
+/// Maximum configurable rows in one query result.
 pub const MAX_RESULT_ROWS: u64 = 1_000_000;
 
-/// Maximum configurable logical size of one materialized query result (1 GiB).
+/// Maximum configurable logical size of one query result (1 GiB).
 pub const MAX_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Maximum configured request timeout (24 hours).
@@ -60,7 +60,7 @@ pub const MAX_RETAINED_BOUND_VALUE_BYTES: u64 = 1024 * 1024 * 1024;
 
 const MAX_TOTAL_ACTIVE_CONNECTIONS: usize = 512;
 
-/// Validated finite limits for a materialized query result.
+/// Validated finite limits for a materialized or streamed query result.
 ///
 /// BriskDB accounts a result independently of any wire protocol: 16 bytes for
 /// the result envelope, one type byte plus an eight-byte length and the UTF-8
@@ -96,7 +96,7 @@ impl ResultLimits {
         })
     }
 
-    /// Return the maximum number of rows materialized by one query.
+    /// Return the maximum number of rows produced by one query.
     pub const fn max_rows(self) -> u64 {
         self.max_rows
     }
@@ -122,7 +122,7 @@ impl Default for ResultLimits {
 /// by all portals in a session. The same ceiling conservatively bounds one
 /// bind's planning expansion by charging the captured route once and every
 /// normalized marker occurrence twice, once for typed inference and once for
-/// canonical routing. It is independent of the materialized query-result byte
+/// canonical routing. It is independent of the query-result byte
 /// limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedStatementLimits {
@@ -260,12 +260,12 @@ impl EngineOptions {
         self.queue_capacity_per_shard
     }
 
-    /// Return the finite limits applied to each materialized query result.
+    /// Return the finite limits applied to each query result.
     pub const fn result_limits(&self) -> ResultLimits {
         self.result_limits
     }
 
-    /// Replace the finite limits applied to each materialized query result.
+    /// Replace the finite limits applied to each query result.
     #[must_use]
     pub const fn with_result_limits(mut self, result_limits: ResultLimits) -> Self {
         self.result_limits = result_limits;

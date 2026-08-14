@@ -84,8 +84,8 @@ use crate::{
     core::{
         CancellationToken, DataType, DescribeTarget, Engine, EngineError, EngineResult,
         EngineStatus, LogicalDatabaseId, PortalId, PrepareRequest, PreparedExecution,
-        PreparedStatementDescription, PreparedStatementId, RequestContext, ResultSet, Session,
-        SessionId, TransactionExecution, Value,
+        PreparedStatementDescription, PreparedStatementId, RequestContext, ResultSet, RowStream,
+        Session, SessionId, TransactionExecution, Value,
     },
     protocol::error::postgres_error,
     sql::{MAX_PARSED_SQL_BYTES, SqlDialect, SqlTranslationMode, StatementBehavior, WriteBehavior},
@@ -1453,6 +1453,7 @@ impl Connection {
         self.state.engine.status(&self.state.session).await
     }
 
+    #[cfg(test)]
     async fn execute_simple_query(
         &self,
         sql: &str,
@@ -1487,6 +1488,102 @@ impl Connection {
         }
     }
 
+    async fn execute_simple_query_streaming(
+        &self,
+        sql: &str,
+        context: RequestContext,
+    ) -> EngineResult<(StatementBehavior, SimpleWireExecution)> {
+        let sql = postgres_compatibility_sql(&self.state, sql);
+        let statement = self
+            .state
+            .engine
+            .prepare_statement_with_context(
+                &self.state.session,
+                PrepareRequest::new(
+                    self.state.database,
+                    SqlDialect::PostgreSql,
+                    SqlTranslationMode::Compatibility,
+                    sql.as_ref(),
+                ),
+                context.clone(),
+            )
+            .await?;
+        let result = self
+            .execute_prepared_simple_query_streaming(statement, context)
+            .await;
+        if result.is_err() {
+            let _ = self
+                .state
+                .engine
+                .close_prepared_statement(&self.state.session, statement)
+                .await;
+        }
+        result
+    }
+
+    async fn execute_prepared_simple_query_streaming(
+        &self,
+        statement: PreparedStatementId,
+        context: RequestContext,
+    ) -> EngineResult<(StatementBehavior, SimpleWireExecution)> {
+        let description = self
+            .state
+            .engine
+            .describe_prepared_with_context(
+                &self.state.session,
+                DescribeTarget::Statement(statement),
+                context.clone(),
+            )
+            .await?;
+        let behavior = description.behavior();
+        let portal = self
+            .state
+            .engine
+            .bind_statement_with_context(
+                &self.state.session,
+                statement,
+                Vec::new(),
+                context.clone(),
+            )
+            .await?;
+        if matches!(behavior, StatementBehavior::Read) {
+            let stream = self
+                .state
+                .engine
+                .stream_portal_logical_with_context(&self.state.session, portal, context)
+                .await?
+                .value;
+            return Ok((
+                behavior,
+                SimpleWireExecution::Stream {
+                    stream,
+                    cleanup: SimpleQueryCleanup {
+                        state: Arc::clone(&self.state),
+                        statement: Some(statement),
+                    },
+                },
+            ));
+        }
+
+        let result = self
+            .state
+            .engine
+            .execute_portal_logical_with_context(&self.state.session, portal, context)
+            .await
+            .map(|executed| executed.value);
+        let cleanup = self
+            .state
+            .engine
+            .close_prepared_statement(&self.state.session, statement)
+            .await;
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(execution), Ok(_)) => Ok((behavior, SimpleWireExecution::Materialized(execution))),
+        }
+    }
+
+    #[cfg(test)]
     async fn execute_prepared_simple_query(
         &self,
         statement: PreparedStatementId,
@@ -1536,6 +1633,48 @@ impl Connection {
     /// this on ordinary termination, EOF, error, shutdown, and forced cleanup.
     pub async fn close(&self) -> EngineResult<()> {
         self.state.session.close().await
+    }
+}
+
+enum SimpleWireExecution {
+    Materialized(PreparedExecution),
+    Stream {
+        stream: RowStream,
+        cleanup: SimpleQueryCleanup,
+    },
+}
+
+struct SimpleQueryCleanup {
+    state: Arc<ConnectionState>,
+    statement: Option<PreparedStatementId>,
+}
+
+impl SimpleQueryCleanup {
+    async fn finish(&mut self) {
+        if let Some(statement) = self.statement.take() {
+            let _ = self
+                .state
+                .engine
+                .close_prepared_statement(&self.state.session, statement)
+                .await;
+        }
+    }
+}
+
+impl Drop for SimpleQueryCleanup {
+    fn drop(&mut self) {
+        let Some(statement) = self.statement.take() else {
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = state
+                    .engine
+                    .close_prepared_statement(&state.session, statement)
+                    .await;
+            });
+        }
     }
 }
 
@@ -1753,17 +1892,20 @@ impl WireHandlers {
             return Ok(());
         };
         let connection = self.connection.installed()?;
+        let portals =
+            remove_bound_portals_for_statement(&connection.state, statement.statement.id)?;
+        for portal_name in &portals {
+            if let Some(portal) = client.portal_store().get_portal(portal_name) {
+                *portal.state().lock().await = PortalExecutionState::Finished;
+            }
+            client.portal_store().rm_portal(portal_name);
+        }
         connection
             .state
             .engine
             .close_prepared_statement(&connection.state.session, statement.statement.id)
             .await
             .map_err(engine_error_to_pgwire)?;
-        let portals =
-            remove_bound_portals_for_statement(&connection.state, statement.statement.id)?;
-        for portal in portals {
-            client.portal_store().rm_portal(&portal);
-        }
         client.portal_store().rm_statement(name);
         Ok(())
     }
@@ -1777,13 +1919,17 @@ impl WireHandlers {
     {
         let connection = self.connection.installed()?;
         if let Some(portal) = bound_portal(&connection.state, name)? {
+            if let Some(wire_portal) = client.portal_store().get_portal(name) {
+                *wire_portal.state().lock().await = PortalExecutionState::Finished;
+            }
+            client.portal_store().rm_portal(name);
+            remove_bound_portal(&connection.state, name)?;
             connection
                 .state
                 .engine
                 .close_portal(&connection.state.session, portal.id)
                 .await
                 .map_err(engine_error_to_pgwire)?;
-            remove_bound_portal(&connection.state, name)?;
         }
         client.portal_store().rm_portal(name);
         Ok(())
@@ -1793,7 +1939,7 @@ impl WireHandlers {
         &self,
         _client: &mut C,
         portal: &Portal<PgWirePrepared>,
-        context: RequestContext,
+        request: ActiveRequest,
     ) -> PgWireResult<Response>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -1804,6 +1950,7 @@ impl WireHandlers {
         let connection = self.connection.installed()?;
         let bound = bound_portal(&connection.state, portal.name.as_str())?
             .ok_or_else(|| PgWireError::PortalNotFound(portal.name.clone()))?;
+        let context = request.context();
         let behavior = connection
             .state
             .engine
@@ -1815,13 +1962,24 @@ impl WireHandlers {
             .await
             .map_err(engine_error_to_pgwire)?
             .behavior();
-        let execution = connection
-            .state
-            .engine
-            .execute_portal_logical_with_context(&connection.state.session, bound.id, context)
-            .await
-            .map_err(engine_error_to_pgwire)?;
-        execution_response(behavior, execution.value, Some(Arc::clone(&bound.fields)))
+        if matches!(behavior, StatementBehavior::Read) {
+            let stream = connection
+                .state
+                .engine
+                .stream_portal_logical_with_context(&connection.state.session, bound.id, context)
+                .await
+                .map_err(engine_error_to_pgwire)?
+                .value;
+            row_stream_response(stream, Arc::clone(&bound.fields), request, None)
+        } else {
+            let execution = connection
+                .state
+                .engine
+                .execute_portal_logical_with_context(&connection.state.session, bound.id, context)
+                .await
+                .map_err(engine_error_to_pgwire)?;
+            execution_response(behavior, execution.value, Some(Arc::clone(&bound.fields)))
+        }
     }
 }
 
@@ -2103,10 +2261,19 @@ impl SimpleQueryHandler for WireHandlers {
         let (behavior, execution) = self
             .connection
             .installed()?
-            .execute_simple_query(query, request.context())
+            .execute_simple_query_streaming(query, request.context())
             .await
             .map_err(engine_error_to_pgwire)?;
-        Ok(vec![simple_query_response(behavior, execution)?])
+        let response = match execution {
+            SimpleWireExecution::Materialized(execution) => {
+                simple_query_response(behavior, execution)?
+            }
+            SimpleWireExecution::Stream { stream, cleanup } => {
+                let fields = result_columns_to_fields(stream.columns());
+                row_stream_response(stream, fields, request, Some(cleanup))?
+            }
+        };
+        Ok(vec![response])
     }
 }
 
@@ -2163,12 +2330,17 @@ fn write_tag(behavior: StatementBehavior, rows: usize) -> PgWireResult<Tag> {
 
 fn result_set_response(result: ResultSet) -> PgWireResult<Response> {
     let (columns, rows) = result.into_parts();
-    let fields = Arc::new(
+    let fields = result_columns_to_fields(&columns);
+    encode_query_response(rows, fields)
+}
+
+fn result_columns_to_fields(columns: &[crate::core::Column]) -> Arc<Vec<FieldInfo>> {
+    Arc::new(
         columns
-            .into_iter()
+            .iter()
             .map(|column| {
                 FieldInfo::new(
-                    column.name,
+                    column.name.clone(),
                     None,
                     None,
                     postgres_type(column.data_type),
@@ -2176,8 +2348,7 @@ fn result_set_response(result: ResultSet) -> PgWireResult<Response> {
                 )
             })
             .collect::<Vec<_>>(),
-    );
-    encode_query_response(rows, fields)
+    )
 }
 
 fn result_set_response_with_fields(
@@ -2203,6 +2374,63 @@ fn encode_query_response(
         fields,
         stream::iter(encoded.into_iter().map(Ok)),
     )))
+}
+
+struct PgRowStreamState {
+    stream: RowStream,
+    fields: Arc<Vec<FieldInfo>>,
+    _request: ActiveRequest,
+    cleanup: Option<SimpleQueryCleanup>,
+    finished: bool,
+}
+
+fn row_stream_response(
+    stream: RowStream,
+    fields: Arc<Vec<FieldInfo>>,
+    request: ActiveRequest,
+    cleanup: Option<SimpleQueryCleanup>,
+) -> PgWireResult<Response> {
+    if stream.columns().len() != fields.len() {
+        return Err(internal_query_error());
+    }
+    let state = PgRowStreamState {
+        stream,
+        fields: Arc::clone(&fields),
+        _request: request,
+        cleanup,
+        finished: false,
+    };
+    let rows = stream::unfold(state, |mut state| async move {
+        if state.finished {
+            return None;
+        }
+        match state.stream.next_row().await {
+            Some(Ok(row)) => {
+                let encoded = encode_data_row(Arc::clone(&state.fields), row.into_values());
+                if encoded.is_err() {
+                    state.finished = true;
+                    if let Some(cleanup) = &mut state.cleanup {
+                        cleanup.finish().await;
+                    }
+                }
+                Some((encoded, state))
+            }
+            Some(Err(error)) => {
+                state.finished = true;
+                if let Some(cleanup) = &mut state.cleanup {
+                    cleanup.finish().await;
+                }
+                Some((Err(engine_error_to_pgwire(error)), state))
+            }
+            None => {
+                if let Some(cleanup) = &mut state.cleanup {
+                    cleanup.finish().await;
+                }
+                None
+            }
+        }
+    });
+    Ok(Response::Query(QueryResponse::new(fields, rows)))
 }
 
 fn description_fields(description: &PreparedStatementDescription) -> Vec<FieldInfo> {
@@ -3060,7 +3288,6 @@ impl ExtendedQueryHandler for WireHandlers {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.sync_failed_transaction(client).await?;
-        let request = self.connection.begin_request()?;
         if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
             return Err(PgWireError::NotReadyForQuery);
         }
@@ -3078,10 +3305,8 @@ impl ExtendedQueryHandler for WireHandlers {
         let mut portal_state = portal_state_lock.lock().await;
         match &mut *portal_state {
             PortalExecutionState::Initial => {
-                match self
-                    .execute_bound_portal(client, &portal, request.context())
-                    .await?
-                {
+                let request = self.connection.begin_request()?;
+                match self.execute_bound_portal(client, &portal, request).await? {
                     Response::Query(mut response) if max_rows > 0 => {
                         if send_partial_query_response(client, &mut response, max_rows).await? {
                             *portal_state = PortalExecutionState::Suspended(response);
@@ -3111,8 +3336,13 @@ impl ExtendedQueryHandler for WireHandlers {
                 }
             }
             PortalExecutionState::Suspended(response) => {
-                if !send_partial_query_response(client, response, max_rows).await? {
-                    *portal_state = PortalExecutionState::Finished;
+                match send_partial_query_response(client, response, max_rows).await {
+                    Ok(true) => {}
+                    Ok(false) => *portal_state = PortalExecutionState::Finished,
+                    Err(error) => {
+                        *portal_state = PortalExecutionState::Finished;
+                        return Err(error);
+                    }
                 }
             }
             PortalExecutionState::Finished => {
@@ -3207,8 +3437,7 @@ impl ExtendedQueryHandler for WireHandlers {
     {
         self.sync_failed_transaction(client).await?;
         let request = self.connection.begin_request()?;
-        self.execute_bound_portal(client, portal, request.context())
-            .await
+        self.execute_bound_portal(client, portal, request).await
     }
 }
 
@@ -5895,6 +6124,122 @@ mod tests {
         assert_eq!(total_rows, 1, "a finished write portal must not re-execute");
 
         finish_wire_server(&mut client, server).await;
+        assert_eq!(
+            wire.connection().unwrap().state().await,
+            SessionState::Closed
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_request_interrupts_a_suspended_stream_and_the_connection_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = crate::core::Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast("CREATE TABLE global_records (value INTEGER NOT NULL)")
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                crate::core::TableDeclaration::global(logical_database, "global_records").unwrap(),
+            ])
+            .unwrap();
+        let connection =
+            rusqlite::Connection::open(temp.path().join("shards/0000.sqlite")).unwrap();
+        for value in 0..64_i64 {
+            connection
+                .execute("INSERT INTO global_records (value) VALUES (?1)", [value])
+                .unwrap();
+        }
+        drop(connection);
+
+        let engine = Engine::from_database(Arc::new(database));
+        let adapter = Adapter::new(engine.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let wire = adapter.wire_connection();
+        let served = wire.clone();
+        let cancellation_adapter = adapter.clone();
+        let (main_tx, main_rx) = tokio::sync::oneshot::channel();
+        let cancellation_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let main =
+                tokio::spawn(async move { served.serve(stream, std::future::pending()).await });
+            main_tx.send(main).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            cancellation_adapter
+                .wire_connection()
+                .serve(stream, std::future::pending())
+                .await
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let main_server = main_rx.await.unwrap();
+        client.write_all(&startup_packet()).await.unwrap();
+        let startup = read_until_ready(&mut client).await;
+        let key = startup
+            .iter()
+            .find(|frame| frame.0 == b'K')
+            .map(|frame| backend_key(&frame.1))
+            .unwrap();
+        let start_stream = [
+            parse_packet("stream", "SELECT value FROM global_records ORDER BY value"),
+            bind_packet("stream_portal", "stream"),
+            execute_packet("stream_portal", 1),
+            typed_packet(b'H', &[]),
+        ]
+        .concat();
+        client.write_all(&start_stream).await.unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            frames.push(read_frame(&mut client).await);
+        }
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'1', b'2', b'D', b's']
+        );
+        assert_eq!(adapter.cancellations.active_len(), 1);
+
+        let mut cancellation = TcpStream::connect(address).await.unwrap();
+        cancellation
+            .write_all(&cancel_packet(key.pid, key.secret))
+            .await
+            .unwrap();
+        assert_eof(&mut cancellation).await;
+        cancellation_server.abort();
+        let _ = cancellation_server.await;
+
+        client
+            .write_all(&[execute_packet("stream_portal", 1), typed_packet(b'S', &[])].concat())
+            .await
+            .unwrap();
+        let cancelled = read_until_ready(&mut client).await;
+        assert_eq!(cancelled[0].0, b'E');
+        assert_eq!(
+            message_fields(&cancelled[0].1)
+                .get(&b'C')
+                .map(String::as_str),
+            Some("57014")
+        );
+        assert_eq!(adapter.cancellations.active_len(), 0);
+
+        client
+            .write_all(&typed_packet(b'Q', b"SELECT 1\0"))
+            .await
+            .unwrap();
+        let recovered = read_until_ready(&mut client).await;
+        assert_eq!(
+            recovered.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'T', b'D', b'C', b'Z']
+        );
+
+        client.write_all(&typed_packet(b'X', &[])).await.unwrap();
+        assert_eof(&mut client).await;
+        tokio::time::timeout(Duration::from_secs(2), main_server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(
             wire.connection().unwrap().state().await,
             SessionState::Closed

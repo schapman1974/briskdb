@@ -13,7 +13,9 @@ these exact client lines; it is not a claim of general PostgreSQL compatibility.
 
 All data work runs through the same protocol-neutral Engine, catalog, routing,
 limits, and fixed-error boundary used by BriskDB's other frontends. The first
-data statement pins each transaction to one physical shard.
+data statement pins each transaction to one physical shard. Query rows cross a
+bounded 16-row Engine handoff; a slow client therefore stops SQLite stepping,
+and PostgreSQL cancellation interrupts the exact leased SQLite handle.
 
 ## Bounded client adaptations
 
