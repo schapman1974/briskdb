@@ -34,7 +34,7 @@ server ---------> protocol::http
 | `import` | Offline source-schema preflight, explicit placement and generated-ID plan validation, exact-value row routing into private staging, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, generated-ID inference, implicit Global placement, or protocol-specific behavior |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
-| `protocol::postgres` | BriskDB-owned bounded protocol-3.0 framing, finite parameter validation, selected identity/status, per-connection core-session ownership, query-deferral responses, and private compile/query-parser seam around the exactly pinned `pgwire` library | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
+| `protocol::postgres` | BriskDB-owned bounded protocol-3.0 framing, selected identity/status, per-connection core-session ownership, simple query execution, bounded zero-parameter extended lifecycle, fixed error recovery, and private compile/query-parser seam around exactly pinned `pgwire` | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, loopback validation, separate HTTP/PostgreSQL listener binding, finite connection-task supervision, and shared graceful/forced draining | SQL parsing, PostgreSQL wire framing, or storage implementation details |
 
@@ -111,14 +111,15 @@ startup order.
 Issue #29 selects exact `pgwire` 0.36.3 with only `server-api` and adds the
 BriskDB-owned `protocol::postgres::{Adapter, Connection}` seam. Issue #30
 connects the production loopback listener to that adapter for exact protocol
-3.0 startup. Parameter validation, logical database/user selection, fixed
-status/error frames, and terminal session cleanup stay in
+3.0 startup. Issue #31 adds bounded named and unnamed prepared statements and
+portals, zero-parameter text-format Describe/Execute, suspension without
+re-execution, cascading Close, Flush, and Sync recovery. Parameter validation,
+logical database/user selection, fixed status/error frames, and terminal session cleanup stay in
 `protocol::postgres`; socket binding, the 256-task cap, and task draining stay
 in `server`. A successful startup creates one core `Session` only after
 validation. `Terminate`, EOF, and protocol failure close it; shutdown hands it
 to the bounded cleanup lifecycle described below. No dependency-owned type
-crosses into core or the public server contract. SQL message execution remains
-issue #31. See the
+crosses into core or the public server contract. See the
 [adapter decision record](POSTGRES_ADAPTER.md).
 
 ## Admin browser boundary

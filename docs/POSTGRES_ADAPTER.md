@@ -1,7 +1,7 @@
 # PostgreSQL adapter decision record
 
 Status: accepted for roadmap issue #29; amended by issue #30 production startup
-activation
+activation and issue #31 extended-query execution
 
 BriskDB needs a PostgreSQL frontend library that can own protocol framing and
 message dispatch without becoming the database engine, routing policy,
@@ -34,7 +34,7 @@ behavior, and MSRV decision followed by the complete verification matrix.
 
 Only `server-api` is enabled. That supplies the Tokio socket entrypoint,
 frontend/backend messages, handler traits, PostgreSQL type descriptors, and
-row encoders used by startup and the planned query adapter.
+row encoders used by startup and the query adapter.
 
 The dependency's defaults are disabled because they additionally select an
 AWS-LC TLS backend and extended chrono, decimal, and JSON adapters. BriskDB does
@@ -83,8 +83,9 @@ guessing which raw value produced it.
 The private prepared wrapper contains only a BriskDB
 `PreparedStatementId` and `PreparedStatementDescription`. It does not expose
 the dependency's statement, portal, message, or type objects through a BriskDB
-signature. Production Parse/Bind name management and cleanup do not use this
-probe yet; issue #31 owns that state machine.
+signature. Production Parse/Bind name management mirrors the wire store into
+bounded core handles. Statement closure cascades to dependent portals, and
+unnamed replacement performs the same cleanup before installing its successor.
 
 ## Compatibility probe
 
@@ -132,13 +133,13 @@ particular:
   documented in `POSTGRES_LISTENER.md`.
 - Its default in-memory statement/portal store is unbounded, replacement does
   not return the old object for cleanup, and statement removal does not cascade
-  into BriskDB handles. Issue #31 must keep the engine's existing finite
-  per-session prepared-statement, portal, and retained-value budgets
-  authoritative.
+  into BriskDB handles. The adapter therefore mirrors every bound portal and
+  makes the Engine's finite per-session prepared-statement, portal, and
+  retained-value budgets authoritative.
 - The default Bind path retains dependency-owned raw parameter bytes and does
-  not call `Engine::bind_statement`. The production adapter must decode into
-  BriskDB `Value` objects and bind at Bind time so the route snapshot is
-  immutable before Execute.
+  not call `Engine::bind_statement`. The production adapter already binds the
+  zero-parameter slice into a core portal so its route snapshot is immutable
+  before Execute; issue #33 owns decoding typed values into BriskDB `Value`s.
 - The selected socket loop does not treat `Terminate` as terminal and has no
   BriskDB session-close callback. Production uses a narrow BriskDB-owned loop
   around the library's public decoder/dispatcher and closes its `Connection`
@@ -150,10 +151,11 @@ particular:
   negotiation: `SSLRequest` and `GSSENCRequest` must each be exactly eight bytes
   before the dependency identifies them, so a malformed negotiation cannot
   consume a following startup. Startup frames have a maximum declared length
-  of 10,000 bytes. After startup, only `Query`, `Parse`, `Sync`, and `Terminate`
-  are admitted, with a maximum declared length of 65,541 bytes; strings must be
-  valid UTF-8 and each frame must satisfy its exact structural boundary. Other
-  frontend message types are rejected until their owning roadmap issues.
+  of 10,000 bytes. After startup, the simple and extended query lifecycle plus
+  `Terminate` are admitted, with a maximum declared length of 65,541 bytes;
+  strings, counts, lengths, formats, targets, and each frame boundary are
+  validated before dependency decoding. Other frontend message types are
+  rejected until their owning roadmap issues.
   Malformed or oversized input receives BriskDB's fixed `08P01` response when a
   response can be sent, the socket closes, and an already-selected core session
   is still closed. Raw-frame regression tests cover malformed input both before
@@ -164,10 +166,9 @@ particular:
 - The raw-frame caps are transport-retention boundaries, not budgets for SQL,
   names, raw parameters, prepared objects, or rows. Those values and connection
   tasks still require their BriskDB-owned finite limits.
-- Portal suspension in the dependency cannot cause a BriskDB portal to execute
-  twice. The core currently returns a complete bounded materialized result;
-  issue #31 must retain and resume the already produced response or provide a
-  separately reviewed streaming contract.
+- Portal suspension cannot cause a BriskDB portal to execute twice. The adapter
+  retains and resumes the already produced bounded materialized response;
+  issue #39 owns a separately reviewed streaming contract.
 
 These are adapter requirements, not reasons to move protocol state into core.
 The library remains replaceable as long as the BriskDB seam and conformance
@@ -182,14 +183,13 @@ validation, emits BriskDB-owned status, and tracks that session through
 termination and server shutdown. It does not use the dependency's default
 startup values or protocol-version state.
 
-Issue #157 adds the bounded first slice of issue #31: one simple-query statement
-can execute registered-table reads and writes through the Engine, return
-text-format rows or command tags, clean up its temporary prepared objects, and
-recover after fixed public errors. Extended `Parse` remains fixed `0A000` with
-no retained dependency statement. Later roadmap issues retain their existing
-extended-query, minor-version negotiation, broader type, transaction,
-cancellation, TLS/SCRAM, client-matrix, and row-streaming scopes. The exact
-live contract and user workflow are in the
+Issue #157 adds the simple-query slice. Issue #31 adds bounded named/unnamed
+Parse, zero-parameter Bind, statement/portal Describe, resumable Execute,
+Flush, Sync error recovery, and cascading Close. Both paths execute registered
+table reads and writes through the Engine and return text-format rows or
+command tags. Later roadmap issues retain their minor-version negotiation,
+broader type, transaction, cancellation, TLS/SCRAM, client-matrix, and
+row-streaming scopes. The exact live contract and user workflow are in the
 [PostgreSQL listener document](POSTGRES_LISTENER.md) and
 [query quickstart](POSTGRES_QUICKSTART.md).
 

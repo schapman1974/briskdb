@@ -107,7 +107,7 @@ experimental and opt-in; the exact contract lives in
 | Durable virtual-bucket routing over independent SQLite WAL files | Working |
 | Exact-key routing and bounded scatter/gather reads | Working |
 | HTTP query/write API and admin data browser | Working, loopback-only |
-| PostgreSQL wire protocol | Simple `SELECT`/`INSERT`/`UPDATE`/`DELETE` |
+| PostgreSQL wire protocol | Simple and zero-parameter prepared `SELECT`/`INSERT`/`UPDATE`/`DELETE` |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
@@ -133,7 +133,8 @@ Then open the [data browser](http://127.0.0.1:7654/admin) or check the server:
 curl http://127.0.0.1:7654/health
 ```
 
-Enable the current PostgreSQL simple-query listener explicitly:
+Enable the PostgreSQL listener explicitly. Simple queries and zero-parameter
+text-format prepared queries share the same bounded engine path:
 
 ```bash
 cargo run --release -- --postgres-listen 127.0.0.1:5433
@@ -201,8 +202,8 @@ and integrity metadata. Application rows stay in ordinary SQLite files.
 
 - **MongoDB:** a native Rust Mongo listener with BSON, queries, updates,
   indexes, cursors, aggregation, and differential TinyMongo parity.
-- **More wire protocols:** PostgreSQL extended queries and MySQL compatibility,
-  all sharing the same engine behavior.
+- **More wire protocols:** broader PostgreSQL client compatibility and a MySQL
+  listener, all sharing the same engine behavior.
 - **Serverless storage:** atomic snapshots, object-store adapters, and fenced
   single-writer operation beyond today's embedded warm-handler pattern.
 - **Future storage adapters:** SQLite is the first backend, while the engine

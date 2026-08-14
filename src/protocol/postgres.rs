@@ -8,10 +8,10 @@
 //! not accept or return `pgwire` types.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt, io,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
     time::Duration,
 };
@@ -20,22 +20,29 @@ use async_trait::async_trait;
 use futures::{Sink, SinkExt, StreamExt, stream};
 use pgwire::{
     api::{
-        ClientInfo, ClientPortalStore, DefaultClient, ErrorHandler, PgWireConnectionState,
-        PgWireServerHandlers, Type,
+        ClientInfo, ClientPortalStore, DEFAULT_NAME, DefaultClient, ErrorHandler,
+        PgWireConnectionState, PgWireServerHandlers, Type,
         auth::StartupHandler,
-        portal::Portal,
-        query::{ExtendedQueryHandler, SimpleQueryHandler},
+        portal::{Portal, PortalExecutionState},
+        query::{
+            ExtendedQueryHandler, SimpleQueryHandler, send_execution_response,
+            send_partial_query_response, send_query_response,
+        },
         results::{
             DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
             FieldInfo, QueryResponse, Response, Tag,
         },
-        stmt::{NoopQueryParser, QueryParser, StoredStatement},
+        stmt::{QueryParser, StoredStatement},
         store::PortalStore,
     },
     error::{ErrorInfo, PgWireError, PgWireResult},
     messages::{
         PgWireBackendMessage, PgWireFrontendMessage, ProtocolVersion, SslNegotiationMetaMessage,
-        extendedquery::Parse,
+        data::NoData,
+        extendedquery::{
+            Bind, BindComplete, Close, CloseComplete, Execute, Parse, ParseComplete,
+            TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
+        },
         response::{GssEncResponse, ReadyForQuery, SslResponse, TransactionStatus},
         startup::{Authentication, ParameterStatus},
     },
@@ -50,8 +57,8 @@ use tokio_util::codec::Framed;
 use crate::{
     core::{
         DataType, DescribeTarget, Engine, EngineError, EngineResult, EngineStatus,
-        LogicalDatabaseId, PrepareRequest, PreparedExecution, PreparedStatementDescription,
-        PreparedStatementId, ResultSet, Session, SessionId, Value,
+        LogicalDatabaseId, PortalId, PrepareRequest, PreparedExecution,
+        PreparedStatementDescription, PreparedStatementId, ResultSet, Session, SessionId, Value,
     },
     protocol::error::postgres_error,
     sql::{MAX_PARSED_SQL_BYTES, SqlDialect, SqlTranslationMode, StatementBehavior, WriteBehavior},
@@ -61,6 +68,7 @@ const POSTGRES_PROTOCOL_MAJOR: u16 = 3;
 const POSTGRES_PROTOCOL_MINOR: u16 = 0;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_STARTUP_NAME_BYTES: usize = 63;
+const MAX_EXTENDED_NAME_BYTES: usize = 63;
 const MAX_STARTUP_PACKET_LENGTH: usize = 10_000;
 const MAX_FRONTEND_MESSAGE_LENGTH: usize = MAX_PARSED_SQL_BYTES + 5;
 const CANCEL_REQUEST_CODE: i32 = 80_877_102;
@@ -345,9 +353,115 @@ fn validate_typed_frame(frame: &[u8]) -> io::Result<()> {
                 Err(invalid_frontend_frame())
             }
         }
-        Some(b'S') | Some(b'X') if body.is_empty() => Ok(()),
+        Some(b'B') => validate_bind_frame_body(body),
+        Some(b'D') | Some(b'C') => validate_named_target_frame_body(body),
+        Some(b'E') => validate_execute_frame_body(body),
+        Some(b'H') | Some(b'S') | Some(b'X') if body.is_empty() => Ok(()),
         _ => Err(invalid_frontend_frame()),
     }
+}
+
+fn validate_bind_frame_body(body: &[u8]) -> io::Result<()> {
+    let (_, cursor) = consume_utf8_cstring(body, 0).ok_or_else(invalid_frontend_frame)?;
+    let (_, mut cursor) = consume_utf8_cstring(body, cursor).ok_or_else(invalid_frontend_frame)?;
+
+    let (format_count, next) = consume_u16(body, cursor)?;
+    cursor = next;
+    for _ in 0..format_count {
+        let (format, next) = consume_i16(body, cursor)?;
+        if !matches!(format, 0 | 1) {
+            return Err(invalid_frontend_frame());
+        }
+        cursor = next;
+    }
+
+    let (parameter_count, next) = consume_u16(body, cursor)?;
+    cursor = next;
+    if !matches!(format_count, 0 | 1) && format_count != parameter_count {
+        return Err(invalid_frontend_frame());
+    }
+    for _ in 0..parameter_count {
+        let (length, next) = consume_i32(body, cursor)?;
+        cursor = next;
+        if length < -1 {
+            return Err(invalid_frontend_frame());
+        }
+        if length >= 0 {
+            let length = usize::try_from(length).map_err(|_| invalid_frontend_frame())?;
+            cursor = cursor
+                .checked_add(length)
+                .filter(|end| *end <= body.len())
+                .ok_or_else(invalid_frontend_frame)?;
+        }
+    }
+
+    let (result_count, next) = consume_i16(body, cursor)?;
+    let result_count = u16::try_from(result_count).map_err(|_| invalid_frontend_frame())?;
+    cursor = next;
+    for _ in 0..result_count {
+        let (format, next) = consume_i16(body, cursor)?;
+        if !matches!(format, 0 | 1) {
+            return Err(invalid_frontend_frame());
+        }
+        cursor = next;
+    }
+    if cursor == body.len() {
+        Ok(())
+    } else {
+        Err(invalid_frontend_frame())
+    }
+}
+
+fn validate_named_target_frame_body(body: &[u8]) -> io::Result<()> {
+    if !matches!(body.first(), Some(b'S' | b'P')) {
+        return Err(invalid_frontend_frame());
+    }
+    let (_, end) = consume_utf8_cstring(body, 1).ok_or_else(invalid_frontend_frame)?;
+    if end == body.len() {
+        Ok(())
+    } else {
+        Err(invalid_frontend_frame())
+    }
+}
+
+fn validate_execute_frame_body(body: &[u8]) -> io::Result<()> {
+    let (_, cursor) = consume_utf8_cstring(body, 0).ok_or_else(invalid_frontend_frame)?;
+    let (max_rows, end) = consume_i32(body, cursor)?;
+    if max_rows >= 0 && end == body.len() {
+        Ok(())
+    } else {
+        Err(invalid_frontend_frame())
+    }
+}
+
+fn consume_u16(buffer: &[u8], start: usize) -> io::Result<(u16, usize)> {
+    let end = start.checked_add(2).ok_or_else(invalid_frontend_frame)?;
+    let bytes = buffer.get(start..end).ok_or_else(invalid_frontend_frame)?;
+    Ok((
+        u16::from_be_bytes(
+            bytes
+                .try_into()
+                .expect("the guarded two-byte field length was checked"),
+        ),
+        end,
+    ))
+}
+
+fn consume_i16(buffer: &[u8], start: usize) -> io::Result<(i16, usize)> {
+    consume_u16(buffer, start).map(|(value, end)| (value as i16, end))
+}
+
+fn consume_i32(buffer: &[u8], start: usize) -> io::Result<(i32, usize)> {
+    let end = start.checked_add(4).ok_or_else(invalid_frontend_frame)?;
+    let bytes = buffer.get(start..end).ok_or_else(invalid_frontend_frame)?;
+    Ok((
+        i32::from_be_bytes(
+            bytes
+                .try_into()
+                .expect("the guarded four-byte field length was checked"),
+        ),
+        end,
+    ))
 }
 
 fn declared_frame_length_matches(frame: &[u8], offset: usize, type_length: usize) -> bool {
@@ -445,6 +559,7 @@ impl Adapter {
             user: user.map(Into::into),
             database,
             database_name: database_name.into(),
+            extended: Mutex::new(PgWireExtendedState::default()),
         });
         let wire_parser = Arc::new(PgWireQueryParser {
             state: Arc::clone(&state),
@@ -478,6 +593,18 @@ struct ConnectionState {
     user: Option<Box<str>>,
     database: LogicalDatabaseId,
     database_name: Box<str>,
+    extended: Mutex<PgWireExtendedState>,
+}
+
+#[derive(Default)]
+struct PgWireExtendedState {
+    portals: BTreeMap<String, PgWireBoundPortal>,
+}
+
+#[derive(Clone, Copy)]
+struct PgWireBoundPortal {
+    id: PortalId,
+    statement: PreparedStatementId,
 }
 
 /// Protocol-owned state for one PostgreSQL connection.
@@ -711,6 +838,55 @@ struct WireHandlers {
     connection: WireConnection,
 }
 
+impl WireHandlers {
+    async fn remove_statement<C>(&self, client: &mut C, name: &str) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = PgWirePrepared>,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let Some(statement) = client.portal_store().get_statement(name) else {
+            return Ok(());
+        };
+        let connection = self.connection.installed()?;
+        connection
+            .state
+            .engine
+            .close_prepared_statement(&connection.state.session, statement.statement.id)
+            .await
+            .map_err(engine_error_to_pgwire)?;
+        let portals =
+            remove_bound_portals_for_statement(&connection.state, statement.statement.id)?;
+        for portal in portals {
+            client.portal_store().rm_portal(&portal);
+        }
+        client.portal_store().rm_statement(name);
+        Ok(())
+    }
+
+    async fn remove_portal<C>(&self, client: &mut C, name: &str) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = PgWirePrepared>,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let connection = self.connection.installed()?;
+        if let Some(portal) = bound_portal(&connection.state, name)? {
+            connection
+                .state
+                .engine
+                .close_portal(&connection.state.session, portal.id)
+                .await
+                .map_err(engine_error_to_pgwire)?;
+            remove_bound_portal(&connection.state, name)?;
+        }
+        client.portal_store().rm_portal(name);
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl StartupHandler for WireHandlers {
     async fn on_startup<C>(
@@ -910,6 +1086,22 @@ fn result_set_response(result: ResultSet) -> PgWireResult<Response> {
     )))
 }
 
+fn description_fields(description: &PreparedStatementDescription) -> Vec<FieldInfo> {
+    description
+        .columns()
+        .iter()
+        .map(|column| {
+            FieldInfo::new(
+                column.name.clone(),
+                None,
+                None,
+                postgres_type(column.data_type),
+                FieldFormat::Text,
+            )
+        })
+        .collect()
+}
+
 fn postgres_type(data_type: DataType) -> Type {
     match data_type {
         DataType::Boolean => Type::BOOL,
@@ -958,27 +1150,250 @@ fn invalid_text_query_error() -> PgWireError {
 
 #[async_trait]
 impl ExtendedQueryHandler for WireHandlers {
-    type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type Statement = PgWirePrepared;
+    type QueryParser = PgWireQueryParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
-        Arc::new(NoopQueryParser)
+        Arc::clone(
+            &self
+                .connection
+                .installed()
+                .expect("the extended-query handler is called only after PostgreSQL startup")
+                .wire_parser,
+        )
     }
 
-    async fn on_parse<C>(&self, _client: &mut C, _message: Parse) -> PgWireResult<()>
+    async fn on_parse<C>(&self, client: &mut C, message: Parse) -> PgWireResult<()>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore<Statement = Self::Statement>,
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Err(unsupported_query_error())
+        let name = valid_extended_name(message.name.as_deref())?;
+        if name != DEFAULT_NAME && client.portal_store().get_statement(name).is_some() {
+            return Err(query_wire_error(
+                "42P05",
+                "a prepared statement with that name already exists",
+            ));
+        }
+
+        if name == DEFAULT_NAME {
+            self.remove_statement(client, name).await?;
+        }
+
+        if !message.type_oids.is_empty() {
+            return Err(query_wire_error(
+                "0A000",
+                "PostgreSQL parameter OID lists are deferred to type mapping",
+            ));
+        }
+        let statement = self
+            .query_parser()
+            .parse_sql(client, &message.query, &[])
+            .await?;
+        if !statement.description.parameter_types().is_empty() {
+            let connection = self.connection.installed()?;
+            let _ = connection
+                .state
+                .engine
+                .close_prepared_statement(&connection.state.session, statement.id)
+                .await;
+            return Err(query_wire_error(
+                "0A000",
+                "PostgreSQL bound parameters are deferred to type mapping",
+            ));
+        }
+        let statement = StoredStatement::new(name.to_owned(), statement, Vec::new());
+        client.portal_store().put_statement(Arc::new(statement));
+        client
+            .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
+            .await?;
+        Ok(())
+    }
+
+    async fn on_bind<C>(&self, client: &mut C, message: Bind) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let portal_name = valid_extended_name(message.portal_name.as_deref())?;
+        let statement_name = valid_extended_name(message.statement_name.as_deref())?;
+        let statement = client
+            .portal_store()
+            .get_statement(statement_name)
+            .ok_or_else(|| PgWireError::StatementNotFound(statement_name.to_owned()))?;
+
+        if !message.parameters.is_empty()
+            || !matches!(message.parameter_format_codes.as_slice(), [] | [0])
+        {
+            return Err(query_wire_error(
+                "0A000",
+                "PostgreSQL bound parameters are deferred to type mapping",
+            ));
+        }
+        let result_formats = message.result_column_format_codes.as_slice();
+        if !result_formats.iter().all(|format| *format == 0) {
+            return Err(query_wire_error(
+                "0A000",
+                "PostgreSQL binary result formats are deferred to type mapping",
+            ));
+        }
+        if portal_name != DEFAULT_NAME && client.portal_store().get_portal(portal_name).is_some() {
+            return Err(query_wire_error(
+                "42P03",
+                "a portal with that name already exists",
+            ));
+        }
+        let connection = self.connection.installed()?;
+        let description = connection
+            .state
+            .engine
+            .describe_prepared(
+                &connection.state.session,
+                DescribeTarget::Statement(statement.statement.id),
+            )
+            .await
+            .map_err(engine_error_to_pgwire)?;
+        if !(result_formats.is_empty()
+            || result_formats.len() == 1
+            || result_formats.len() == description.columns().len())
+        {
+            return Err(query_wire_error(
+                "22023",
+                "the PostgreSQL result format count does not match the columns",
+            ));
+        }
+        if portal_name == DEFAULT_NAME {
+            self.remove_portal(client, portal_name).await?;
+        }
+
+        let portal_id = connection
+            .state
+            .engine
+            .bind_statement(
+                &connection.state.session,
+                statement.statement.id,
+                Vec::new(),
+            )
+            .await
+            .map_err(engine_error_to_pgwire)?;
+        let portal = match Portal::try_new(&message, Arc::clone(&statement)) {
+            Ok(portal) => portal,
+            Err(error) => {
+                let _ = connection
+                    .state
+                    .engine
+                    .close_portal(&connection.state.session, portal_id)
+                    .await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = insert_bound_portal(
+            &connection.state,
+            portal_name,
+            PgWireBoundPortal {
+                id: portal_id,
+                statement: statement.statement.id,
+            },
+        ) {
+            let _ = connection
+                .state
+                .engine
+                .close_portal(&connection.state.session, portal_id)
+                .await;
+            return Err(error);
+        }
+        client.portal_store().put_portal(Arc::new(portal));
+        client
+            .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+            .await?;
+        Ok(())
+    }
+
+    async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
+        let portal_name = valid_extended_name(message.name.as_deref())?;
+        let max_rows = usize::try_from(message.max_rows).map_err(|_| {
+            query_wire_error("22023", "the PostgreSQL Execute row limit is invalid")
+        })?;
+        let portal = client
+            .portal_store()
+            .get_portal(portal_name)
+            .ok_or_else(|| PgWireError::PortalNotFound(portal_name.to_owned()))?;
+
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        let portal_state_lock = portal.state();
+        let mut portal_state = portal_state_lock.lock().await;
+        match &mut *portal_state {
+            PortalExecutionState::Initial => {
+                match ExtendedQueryHandler::do_query(self, client, &portal, max_rows).await? {
+                    Response::Query(mut response) if max_rows > 0 => {
+                        if send_partial_query_response(client, &mut response, max_rows).await? {
+                            *portal_state = PortalExecutionState::Suspended(response);
+                        } else {
+                            *portal_state = PortalExecutionState::Finished;
+                        }
+                    }
+                    Response::Query(mut response) => {
+                        send_query_response(client, &mut response, false).await?;
+                        *portal_state = PortalExecutionState::Finished;
+                    }
+                    Response::Execution(tag) => {
+                        send_execution_response(client, tag).await?;
+                        *portal_state = PortalExecutionState::Finished;
+                    }
+                    _ => return Err(internal_query_error()),
+                }
+            }
+            PortalExecutionState::Suspended(response) => {
+                if !send_partial_query_response(client, response, max_rows).await? {
+                    *portal_state = PortalExecutionState::Finished;
+                }
+            }
+            PortalExecutionState::Finished => {
+                client
+                    .send(PgWireBackendMessage::NoData(NoData::new()))
+                    .await?;
+            }
+        }
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        Ok(())
+    }
+
+    async fn on_close<C>(&self, client: &mut C, message: Close) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = valid_extended_name(message.name.as_deref())?;
+        match message.target_type {
+            TARGET_TYPE_BYTE_STATEMENT => self.remove_statement(client, name).await?,
+            TARGET_TYPE_BYTE_PORTAL => self.remove_portal(client, name).await?,
+            target => return Err(PgWireError::InvalidTargetType(target)),
+        }
+        client
+            .send(PgWireBackendMessage::CloseComplete(CloseComplete::new()))
+            .await?;
+        Ok(())
     }
 
     async fn do_describe_statement<C>(
         &self,
         _client: &mut C,
-        _target: &StoredStatement<Self::Statement>,
+        target: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -986,13 +1401,32 @@ impl ExtendedQueryHandler for WireHandlers {
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Err(unsupported_query_error())
+        let description = self
+            .connection
+            .installed()?
+            .state
+            .engine
+            .describe_prepared(
+                &self.connection.installed()?.state.session,
+                DescribeTarget::Statement(target.statement.id),
+            )
+            .await
+            .map_err(engine_error_to_pgwire)?;
+        Ok(DescribeStatementResponse::new(
+            description
+                .parameter_types()
+                .iter()
+                .copied()
+                .map(postgres_type)
+                .collect(),
+            description_fields(&description),
+        ))
     }
 
     async fn do_describe_portal<C>(
         &self,
         _client: &mut C,
-        _target: &Portal<Self::Statement>,
+        target: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -1000,13 +1434,24 @@ impl ExtendedQueryHandler for WireHandlers {
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Err(unsupported_query_error())
+        let portal = bound_portal(&self.connection.installed()?.state, target.name.as_str())?
+            .ok_or_else(|| PgWireError::PortalNotFound(target.name.clone()))?;
+        let connection = self.connection.installed()?;
+        let description = connection
+            .state
+            .engine
+            .describe_prepared(&connection.state.session, DescribeTarget::Portal(portal.id))
+            .await
+            .map_err(engine_error_to_pgwire)?;
+        Ok(DescribePortalResponse::new(description_fields(
+            &description,
+        )))
     }
 
     async fn do_query<C>(
         &self,
         _client: &mut C,
-        _portal: &Portal<Self::Statement>,
+        portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
     where
@@ -1015,7 +1460,23 @@ impl ExtendedQueryHandler for WireHandlers {
         C::Error: fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Err(unsupported_query_error())
+        let connection = self.connection.installed()?;
+        let bound = bound_portal(&connection.state, portal.name.as_str())?
+            .ok_or_else(|| PgWireError::PortalNotFound(portal.name.clone()))?;
+        let behavior = connection
+            .state
+            .engine
+            .describe_prepared(&connection.state.session, DescribeTarget::Portal(bound.id))
+            .await
+            .map_err(engine_error_to_pgwire)?
+            .behavior();
+        let execution = connection
+            .state
+            .engine
+            .execute_portal_logical(&connection.state.session, bound.id)
+            .await
+            .map_err(engine_error_to_pgwire)?;
+        simple_query_response(behavior, execution.value)
     }
 }
 
@@ -1025,6 +1486,14 @@ impl ErrorHandler for WireHandlers {
         C: ClientInfo,
     {
         if matches!(error, PgWireError::UserError(_)) {
+            return;
+        }
+        if matches!(error, PgWireError::PortalNotFound(_)) {
+            *error = query_wire_error("34000", "the PostgreSQL portal does not exist");
+            return;
+        }
+        if matches!(error, PgWireError::StatementNotFound(_)) {
+            *error = query_wire_error("26000", "the PostgreSQL prepared statement does not exist");
             return;
         }
         *error = if matches!(
@@ -1065,7 +1534,7 @@ impl PgWireServerHandlers for WireHandlers {
     }
 }
 
-type GuardedSocket = Framed<GuardedPgStream<TcpStream>, PgWireMessageServerCodec<String>>;
+type GuardedSocket = Framed<GuardedPgStream<TcpStream>, PgWireMessageServerCodec<PgWirePrepared>>;
 
 async fn negotiate_plaintext(stream: TcpStream) -> io::Result<Option<GuardedSocket>> {
     let peer = stream.peer_addr()?;
@@ -1079,7 +1548,7 @@ async fn negotiate_plaintext(stream: TcpStream) -> io::Result<Option<GuardedSock
         return Ok(None);
     }
 
-    let client = DefaultClient::<String>::new(peer, false);
+    let client = DefaultClient::<PgWirePrepared>::new(peer, false);
     let codec = PgWireMessageServerCodec::new(client);
     let mut socket = Framed::new(GuardedPgStream::new(stream, Vec::new()), codec);
 
@@ -1218,11 +1687,81 @@ fn fatal_wire_error(code: &'static str, message: &'static str) -> PgWireError {
     )))
 }
 
+fn query_wire_error(code: &'static str, message: &'static str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        code.to_owned(),
+        message.to_owned(),
+    )))
+}
+
 fn unsupported_query_error() -> PgWireError {
     engine_error_to_pgwire(EngineError::new(
         crate::core::EngineErrorKind::Unsupported,
         "the PostgreSQL extended query flow is not implemented yet",
     ))
+}
+
+fn valid_extended_name(name: Option<&str>) -> PgWireResult<&str> {
+    let name = name.unwrap_or(DEFAULT_NAME);
+    if name.len() <= MAX_EXTENDED_NAME_BYTES {
+        Ok(name)
+    } else {
+        Err(query_wire_error(
+            "42622",
+            "the PostgreSQL statement or portal name is too long",
+        ))
+    }
+}
+
+fn lock_extended_state(
+    state: &ConnectionState,
+) -> PgWireResult<std::sync::MutexGuard<'_, PgWireExtendedState>> {
+    state.extended.lock().map_err(|_| internal_query_error())
+}
+
+fn bound_portal(state: &ConnectionState, name: &str) -> PgWireResult<Option<PgWireBoundPortal>> {
+    Ok(lock_extended_state(state)?.portals.get(name).copied())
+}
+
+fn insert_bound_portal(
+    state: &ConnectionState,
+    name: &str,
+    portal: PgWireBoundPortal,
+) -> PgWireResult<()> {
+    let mut extended = lock_extended_state(state)?;
+    if extended.portals.contains_key(name) {
+        return Err(query_wire_error(
+            "42P03",
+            "a portal with that name already exists",
+        ));
+    }
+    extended.portals.insert(name.to_owned(), portal);
+    Ok(())
+}
+
+fn remove_bound_portal(
+    state: &ConnectionState,
+    name: &str,
+) -> PgWireResult<Option<PgWireBoundPortal>> {
+    Ok(lock_extended_state(state)?.portals.remove(name))
+}
+
+fn remove_bound_portals_for_statement(
+    state: &ConnectionState,
+    statement: PreparedStatementId,
+) -> PgWireResult<Vec<String>> {
+    let mut extended = lock_extended_state(state)?;
+    let names = extended
+        .portals
+        .iter()
+        .filter(|(_, portal)| portal.statement == statement)
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    for name in &names {
+        extended.portals.remove(name);
+    }
+    Ok(names)
 }
 
 fn valid_user_label(user: &str) -> bool {
@@ -1467,6 +2006,48 @@ mod tests {
         packet.extend_from_slice(&length.to_be_bytes());
         packet.extend_from_slice(body);
         packet
+    }
+
+    fn push_cstring(body: &mut Vec<u8>, value: &str) {
+        body.extend_from_slice(value.as_bytes());
+        body.push(0);
+    }
+
+    fn parse_packet(name: &str, query: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        push_cstring(&mut body, name);
+        push_cstring(&mut body, query);
+        body.extend_from_slice(&0_u16.to_be_bytes());
+        typed_packet(b'P', &body)
+    }
+
+    fn bind_packet(portal: &str, statement: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        push_cstring(&mut body, portal);
+        push_cstring(&mut body, statement);
+        body.extend_from_slice(&0_u16.to_be_bytes());
+        body.extend_from_slice(&0_u16.to_be_bytes());
+        body.extend_from_slice(&0_i16.to_be_bytes());
+        typed_packet(b'B', &body)
+    }
+
+    fn describe_packet(target: u8, name: &str) -> Vec<u8> {
+        let mut body = vec![target];
+        push_cstring(&mut body, name);
+        typed_packet(b'D', &body)
+    }
+
+    fn execute_packet(portal: &str, max_rows: i32) -> Vec<u8> {
+        let mut body = Vec::new();
+        push_cstring(&mut body, portal);
+        body.extend_from_slice(&max_rows.to_be_bytes());
+        typed_packet(b'E', &body)
+    }
+
+    fn close_packet(target: u8, name: &str) -> Vec<u8> {
+        let mut body = vec![target];
+        push_cstring(&mut body, name);
+        typed_packet(b'C', &body)
     }
 
     async fn read_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
@@ -2205,9 +2786,8 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    #[cfg(feature = "experimental-vtab")]
     #[tokio::test]
-    async fn extended_query_remains_blocked_when_simple_writes_are_enabled() {
+    async fn extended_query_executes_named_writes_reads_describe_and_close() {
         let temp = tempfile::tempdir().unwrap();
         let mut database = crate::core::Database::open(temp.path(), 2).unwrap();
         database
@@ -2234,58 +2814,83 @@ mod tests {
             ])
             .unwrap();
         let database = Arc::new(database);
-        let options = crate::core::EngineOptions::new(2, 16)
-            .unwrap()
-            .with_experimental_vtab_writes(true);
-        let engine = Engine::from_database_with_options(Arc::clone(&database), options).unwrap();
+        let engine = Engine::from_database(Arc::clone(&database));
         let adapter = Adapter::new(engine.clone());
         let (address, wire, server) = spawn_wire_server(&adapter).await;
         let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(&startup_packet()).await.unwrap();
         read_until_ready(&mut client).await;
-        let expected = postgres_error(EngineErrorKind::Unsupported);
 
-        for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
-            let mut body = sql.as_bytes().to_vec();
-            body.push(0);
-            client.write_all(&typed_packet(b'Q', &body)).await.unwrap();
-            let frames = read_until_ready(&mut client).await;
-            assert_eq!(frames.len(), 2, "simple-query response for {sql}");
-            let fields = message_fields(&frames[0].1);
-            assert_eq!(fields.get(&b'S').map(String::as_str), Some("ERROR"));
-            assert_eq!(
-                fields.get(&b'C').map(String::as_str),
-                Some(expected.sqlstate)
-            );
-            assert_eq!(
-                fields.get(&b'M').map(String::as_str),
-                Some(expected.message)
-            );
-            assert!(!fields.get(&b'M').unwrap().contains(sql));
-            assert_eq!(frames[1], (b'Z', vec![b'I']));
-        }
+        let write_flow = [
+            parse_packet(
+                "write_record",
+                "INSERT INTO records (tenant_id, payload) VALUES ('tenant-e', 'extended')",
+            ),
+            bind_packet("write_portal", "write_record"),
+            execute_packet("write_portal", 0),
+            execute_packet("write_portal", 0),
+            typed_packet(b'S', &[]),
+        ]
+        .concat();
+        client.write_all(&write_flow).await.unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'1', b'2', b'C', b'n', b'Z']
+        );
+        assert_eq!(command_tag(&frames[2].1), "INSERT 0 1");
 
-        let extended_sql = "INSERT INTO records (tenant_id, payload) VALUES ('extended-blocked', 'must-not-be-stored')";
-        let mut parse = Vec::new();
-        parse.push(0);
-        parse.extend_from_slice(extended_sql.as_bytes());
-        parse.push(0);
-        parse.extend_from_slice(&0_u16.to_be_bytes());
-        client.write_all(&typed_packet(b'P', &parse)).await.unwrap();
-        let error = read_frame(&mut client).await;
-        assert_eq!(error.0, b'E');
-        let fields = message_fields(&error.1);
+        let read_flow = [
+            parse_packet(
+                "read_record",
+                "SELECT tenant_id, payload FROM records WHERE tenant_id = 'tenant-e'",
+            ),
+            bind_packet("read_portal", "read_record"),
+            describe_packet(TARGET_TYPE_BYTE_STATEMENT, "read_record"),
+            describe_packet(TARGET_TYPE_BYTE_PORTAL, "read_portal"),
+            execute_packet("read_portal", 1),
+            execute_packet("read_portal", 1),
+            typed_packet(b'H', &[]),
+            typed_packet(b'S', &[]),
+        ]
+        .concat();
+        client.write_all(&read_flow).await.unwrap();
+        let frames = read_until_ready(&mut client).await;
         assert_eq!(
-            fields.get(&b'C').map(String::as_str),
-            Some(expected.sqlstate)
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'1', b'2', b't', b'T', b'T', b'D', b's', b'C', b'Z']
         );
+        assert_eq!(u16::from_be_bytes(frames[2].1[..2].try_into().unwrap()), 0);
+        assert_eq!(row_description(&frames[3].1), row_description(&frames[4].1));
         assert_eq!(
-            fields.get(&b'M').map(String::as_str),
-            Some(expected.message)
+            data_row(&frames[5].1),
+            [Some(b"tenant-e".to_vec()), Some(b"extended".to_vec())]
         );
-        assert!(!fields.get(&b'M').unwrap().contains(extended_sql));
-        client.write_all(&typed_packet(b'S', &[])).await.unwrap();
-        assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
+
+        client
+            .write_all(
+                &[
+                    close_packet(TARGET_TYPE_BYTE_STATEMENT, "read_record"),
+                    typed_packet(b'S', &[]),
+                ]
+                .concat(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read_until_ready(&mut client).await,
+            [(b'3', vec![]), (b'Z', vec![b'I'])]
+        );
+
+        client
+            .write_all(&[execute_packet("read_portal", 0), typed_packet(b'S', &[])].concat())
+            .await
+            .unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'E', b'Z']
+        );
 
         for shard in 0..database.shard_count() {
             let rows =
@@ -2295,11 +2900,19 @@ mod tests {
                         row.get::<_, i64>(0)
                     })
                     .unwrap();
-            assert_eq!(
-                rows, 0,
-                "extended PostgreSQL query mutated physical shard {shard}"
-            );
+            assert!(rows <= 1, "write was replayed on physical shard {shard}");
         }
+        let total_rows = (0..database.shard_count())
+            .map(|shard| {
+                rusqlite::Connection::open(temp.path().join(format!("shards/{shard:04}.sqlite")))
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM records", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+            .sum::<i64>();
+        assert_eq!(total_rows, 1, "a finished write portal must not re-execute");
 
         finish_wire_server(&mut client, server).await;
         assert_eq!(
@@ -2310,7 +2923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extended_query_rejects_before_storage_and_sync_recovers() {
+    async fn extended_query_errors_resync_and_unnamed_replacement_cleans_up_portals() {
         let (_temp, engine) = engine(2).await;
         let adapter = Adapter::new(engine.clone());
         let (address, wire, server) = spawn_wire_server(&adapter).await;
@@ -2320,9 +2933,10 @@ mod tests {
         let core = Arc::clone(wire.connection().unwrap());
 
         let mut parse = Vec::new();
-        parse.push(0);
-        parse.extend_from_slice(b"SELECT 'private extended text'\0");
-        parse.extend_from_slice(&0_u16.to_be_bytes());
+        push_cstring(&mut parse, "private_statement");
+        push_cstring(&mut parse, "SELECT 'private extended text'");
+        parse.extend_from_slice(&1_u16.to_be_bytes());
+        parse.extend_from_slice(&Type::INT4.oid().to_be_bytes());
         client.write_all(&typed_packet(b'P', &parse)).await.unwrap();
         let error = read_frame(&mut client).await;
         assert_eq!(error.0, b'E');
@@ -2330,12 +2944,123 @@ mod tests {
         assert_eq!(fields.get(&b'C').map(String::as_str), Some("0A000"));
         assert_eq!(
             fields.get(&b'M').map(String::as_str),
-            Some(postgres_error(crate::core::EngineErrorKind::Unsupported).message)
+            Some("PostgreSQL parameter OID lists are deferred to type mapping")
         );
         assert!(!fields.get(&b'M').unwrap().contains("private extended text"));
 
         client.write_all(&typed_packet(b'S', &[])).await.unwrap();
         assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
+
+        client
+            .write_all(&parse_packet("parameterized", "SELECT $1"))
+            .await
+            .unwrap();
+        let error = read_frame(&mut client).await;
+        assert_eq!(error.0, b'E');
+        let fields = message_fields(&error.1);
+        assert_eq!(fields.get(&b'C').map(String::as_str), Some("0A000"));
+        client.write_all(&typed_packet(b'S', &[])).await.unwrap();
+        assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
+
+        client
+            .write_all(&parse_packet(
+                &"n".repeat(MAX_EXTENDED_NAME_BYTES + 1),
+                "SELECT 1",
+            ))
+            .await
+            .unwrap();
+        let error = read_frame(&mut client).await;
+        assert_eq!(
+            message_fields(&error.1).get(&b'C').map(String::as_str),
+            Some("42622")
+        );
+        client.write_all(&typed_packet(b'S', &[])).await.unwrap();
+        assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
+
+        client
+            .write_all(&parse_packet("duplicate_statement", "SELECT 1"))
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut client).await, (b'1', vec![]));
+        client
+            .write_all(&parse_packet("duplicate_statement", "SELECT 2"))
+            .await
+            .unwrap();
+        let error = read_frame(&mut client).await;
+        assert_eq!(
+            message_fields(&error.1).get(&b'C').map(String::as_str),
+            Some("42P05")
+        );
+        client.write_all(&typed_packet(b'S', &[])).await.unwrap();
+        assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
+
+        client
+            .write_all(&bind_packet("duplicate_portal", "duplicate_statement"))
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut client).await, (b'2', vec![]));
+        client
+            .write_all(&bind_packet("duplicate_portal", "duplicate_statement"))
+            .await
+            .unwrap();
+        let error = read_frame(&mut client).await;
+        assert_eq!(
+            message_fields(&error.1).get(&b'C').map(String::as_str),
+            Some("42P03")
+        );
+        client.write_all(&typed_packet(b'S', &[])).await.unwrap();
+        assert_eq!(read_frame(&mut client).await, (b'Z', vec![b'I']));
+        client
+            .write_all(
+                &[
+                    close_packet(TARGET_TYPE_BYTE_STATEMENT, "duplicate_statement"),
+                    typed_packet(b'S', &[]),
+                ]
+                .concat(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_until_ready(&mut client).await[0].0, b'3');
+
+        let replacement_flow = [
+            parse_packet("", "SELECT 1 AS first_value"),
+            bind_packet("", ""),
+            parse_packet("", "SELECT 2 AS replacement_value"),
+            execute_packet("", 0),
+            typed_packet(b'S', &[]),
+        ]
+        .concat();
+        client.write_all(&replacement_flow).await.unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(
+            frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+            [b'1', b'2', b'1', b'E', b'Z']
+        );
+        let fields = message_fields(&frames[3].1);
+        assert_eq!(fields.get(&b'C').map(String::as_str), Some("34000"));
+
+        let replacement_execute = [
+            bind_packet("", ""),
+            execute_packet("", 0),
+            close_packet(TARGET_TYPE_BYTE_PORTAL, ""),
+            close_packet(TARGET_TYPE_BYTE_STATEMENT, ""),
+            typed_packet(b'S', &[]),
+        ]
+        .concat();
+        client.write_all(&replacement_execute).await.unwrap();
+        let frames = read_until_ready(&mut client).await;
+        assert_eq!(frames.first().unwrap().0, b'2');
+        assert!(frames.iter().any(|frame| frame.0 == b'D'));
+        assert_eq!(
+            frames
+                .iter()
+                .rev()
+                .take(3)
+                .map(|frame| frame.0)
+                .collect::<Vec<_>>(),
+            [b'Z', b'3', b'3']
+        );
+        assert!(core.state.extended.lock().unwrap().portals.is_empty());
         assert_eq!(core.status().await.unwrap().shard_count(), 2);
 
         finish_wire_server(&mut client, server).await;
@@ -2597,8 +3322,26 @@ mod tests {
         parse.extend_from_slice(&1_u16.to_be_bytes());
         parse.extend_from_slice(&23_u32.to_be_bytes());
         validate_typed_frame(&typed_packet(b'P', &parse)).unwrap();
+        validate_typed_frame(&bind_packet("portal", "statement")).unwrap();
+        validate_typed_frame(&describe_packet(TARGET_TYPE_BYTE_STATEMENT, "statement")).unwrap();
+        validate_typed_frame(&describe_packet(TARGET_TYPE_BYTE_PORTAL, "portal")).unwrap();
+        validate_typed_frame(&execute_packet("portal", 1)).unwrap();
+        validate_typed_frame(&close_packet(TARGET_TYPE_BYTE_STATEMENT, "statement")).unwrap();
+        validate_typed_frame(&close_packet(TARGET_TYPE_BYTE_PORTAL, "portal")).unwrap();
+        validate_typed_frame(&typed_packet(b'H', &[])).unwrap();
         validate_typed_frame(&typed_packet(b'S', &[])).unwrap();
         validate_typed_frame(&typed_packet(b'X', &[])).unwrap();
+
+        let mut negative_parameter_length = Vec::new();
+        push_cstring(&mut negative_parameter_length, "portal");
+        push_cstring(&mut negative_parameter_length, "statement");
+        negative_parameter_length.extend_from_slice(&0_u16.to_be_bytes());
+        negative_parameter_length.extend_from_slice(&1_u16.to_be_bytes());
+        negative_parameter_length.extend_from_slice(&(-2_i32).to_be_bytes());
+        negative_parameter_length.extend_from_slice(&0_i16.to_be_bytes());
+        let mut negative_result_count = bind_packet("portal", "statement");
+        let end = negative_result_count.len();
+        negative_result_count[end - 2..].copy_from_slice(&(-1_i16).to_be_bytes());
 
         let mut oversized_query_body = vec![b'a'; MAX_PARSED_SQL_BYTES + 1];
         oversized_query_body.push(0);
@@ -2611,8 +3354,14 @@ mod tests {
             typed_packet(b'P', b"statement\0SELECT 1\0\0\x01"),
             typed_packet(b'P', b"statement\0SELECT 1\0\0\x01\0\0\0"),
             typed_packet(b'S', &[0]),
+            typed_packet(b'H', &[0]),
             typed_packet(b'X', &[0]),
             typed_packet(b'B', &[]),
+            typed_packet(b'B', &negative_parameter_length),
+            negative_result_count,
+            describe_packet(b'X', "statement"),
+            execute_packet("portal", -1),
+            close_packet(b'X', "statement"),
         ];
         for rejected in invalid_typed_frames {
             assert!(
