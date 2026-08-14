@@ -20,12 +20,14 @@ def handler(event, _context):
         return {"rows": result["rows"]}
 ```
 
-The path must be writable, durable for the desired lifetime, and owned by one
-coordinated BriskDB instance. `/tmp` is suitable only for disposable data.
-Independent autoscaled instances pointed at independent local files are
+The path must be writable and durable for the desired lifetime. `/tmp` is
+suitable only for disposable data. Independently spawned processes on one host
+may share one local path under the [multi-process contract](../docs/MULTIPROCESS.md).
+Independent autoscaled instances pointed at independent local files remain
 independent databases.
 
 This is an embedded warm-handler pattern, not a production serverless storage
-claim. Atomic object-store snapshots, restore fencing, provider adapters, and
-multi-instance coordination remain tracked in issues #194–#196. Do not upload
-live SQLite/WAL files individually as a backup.
+claim. A shared network mount or object store does not become safe because
+local multi-process locking exists. Atomic snapshots, provider adapters, and
+multi-host fencing remain tracked in issues #194–#196. Do not upload live
+SQLite/WAL files individually as a backup.

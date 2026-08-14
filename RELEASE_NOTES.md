@@ -1,3 +1,15 @@
+# Changes after 0.1.0-alpha.4
+
+- Independent server, Rust, and Python processes may concurrently open one
+  ready data root on the same Linux or macOS host and local filesystem.
+- Schema, catalog, initialization, upgrade, and recovery work requires
+  sole-process ownership and returns retryable `Busy` while a peer is open.
+- Each process must open its own handle. Inherited live handles after `fork()`,
+  network filesystems, multi-host volumes, and online backup remain unsupported.
+- Installed-wheel and Rust subprocess tests cover overlapping writes,
+  checkpoints, generated IDs, abrupt exit, recovery, and service-plus-embedded
+  operation. See `docs/MULTIPROCESS.md`.
+
 # BriskDB 0.1.0-alpha.4
 
 Alpha 4 makes BriskDB usable as an in-process Rust or Python database, while

@@ -39,6 +39,13 @@ Database and session handles own their native resources, `close()` is
 idempotent, and blocking engine work releases Python's GIL. Dropping live
 handles during interpreter shutdown is also safe.
 
+Multiple independently spawned Python processes may open the same ready data
+directory on one local Linux or macOS host. Each process must create its own
+handle; use `multiprocessing.get_context("spawn")`, not an inherited live
+handle after `fork()`. Schema changes require every peer to close first and
+otherwise return retryable `BusyError`. See the
+[multi-process contract](../docs/MULTIPROCESS.md).
+
 Synchronous handles support `with`; the asyncio facade keeps engine work off
 the event loop and propagates task cancellation into Rust:
 

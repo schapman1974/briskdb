@@ -36,6 +36,14 @@ The package creates a locked, unprivileged `briskdb` system account. systemd's
 mode `0750`. The service has no writable access to `/etc`, `/usr`, home
 directories, devices, kernel controls, or other application state.
 
+An embedded Rust or Python application may share the ready data root with the
+service on this host, but it must run with the same effective `briskdb` UID.
+The coordination sidecars are deliberately owner-only (`0600`), so adding an
+application user to the `briskdb` group is not sufficient. Run the worker as
+`briskdb`, configure the same path and shard count, and stop every peer before
+schema changes, upgrades, imports, backups, or restores. See the
+[multi-process contract](MULTIPROCESS.md).
+
 `/etc/default/briskdb` is a dpkg conffile: administrator edits survive upgrades
 and removals. Edit it with `sudoedit`, validate the loopback/security boundary,
 then restart:

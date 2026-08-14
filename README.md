@@ -112,6 +112,7 @@ experimental and opt-in; the exact contract lives in
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
 | Debian package and hardened systemd service | Published |
 | Listener-free Rust library entrypoint | Working |
+| Same-host service and embedded processes sharing one ready root | Working on local filesystems |
 | Native MongoDB wire protocol with TinyMongo parity | [Planned](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
 | Native Python extension | Sync/async API working; tagged releases build audited macOS/Linux ARM/x86 wheels |
@@ -166,12 +167,16 @@ python -m pip install ./python
 See the [Python quickstart](python/README.md) for sync and asyncio write/read
 examples. Tagged releases publish compiler-free `cp39-abi3` wheels for the
 [supported platform matrix](python/COMPATIBILITY.md); repository checkouts can
-still be installed from source with Rust 1.85+.
+still be installed from source with Rust 1.85+. Independently spawned Python,
+Rust, and server processes can share a ready local data directory; read the
+[multi-process contract](docs/MULTIPROCESS.md) before deploying that pattern.
 
 ## Still just inspectable files
 
 ```text
 briskdb-data/
+├── .briskdb-process.lock
+├── .briskdb-startup.lock
 ├── manifest.sqlite
 └── shards/
     ├── 0000.sqlite
@@ -203,7 +208,10 @@ Follow the [roadmap](ROADMAP.md) or browse the
 - No general atomic transaction across multiple shard files.
 - Global ordering/pagination and general aggregate pushdown are still limited.
 - The supported backup today is a stopped-server copy of the complete data
-  directory; online/serverless snapshots are planned.
+  directory after every server and embedder exits; online/serverless snapshots
+  are planned.
+- Multi-process access is same-host/local-filesystem only. Schema, catalog,
+  upgrade, and recovery work requires sole-process ownership.
 - Pre-1.0 storage and public-library compatibility can change between releases.
 - Ubuntu 24.04 x86-64 receives the full required Rust CI suite. Python wheels
   receive native build, audit, install, restart, corruption, and concurrency
@@ -219,6 +227,7 @@ Follow the [roadmap](ROADMAP.md) or browse the
 - [SQL compatibility](docs/SQL_COMPATIBILITY.md)
 - [Generated keys](docs/GENERATED_KEYS.md)
 - [Storage format](docs/STORAGE_FORMAT.md)
+- [Sharing one data directory between processes](docs/MULTIPROCESS.md)
 - [Debian and systemd installation](docs/DEBIAN_INSTALL.md)
 - [Pre-1.0 compatibility policy](docs/PRE_1_COMPATIBILITY.md)
 - [Contributing](CONTRIBUTING.md)

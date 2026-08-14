@@ -76,6 +76,13 @@ data directories can be opened independently in one process. Create a distinct
 work ends, and explicitly await `BriskDb::close()` before the final handle is
 dropped.
 
+Independent processes may also open the same ready root on one local Linux or
+macOS host. Every process must construct its own handle after it starts; using
+an inherited handle after `fork()` is unsupported. Reads, autocommit writes,
+generated IDs, and passive checkpoints may overlap. Schema/catalog/layout
+changes require sole-process ownership and return retryable `Busy` while a peer
+is open. See [sharing one data directory between processes](MULTIPROCESS.md).
+
 `BriskDb::owned_session()` returns a cloneable `BriskSession` that retains its
 owning database identity and exposes direct/prepared SQL methods without a
 separate database argument. Clones share routing, prepared state, and terminal
@@ -88,7 +95,9 @@ machine-readable `EngineError::code()`; diagnostic text is intended for trusted
 logs and is not a compatibility contract.
 
 Schema changes use `BriskDb::migrate()` and the crash-resumable migration
-journal. Ordinary DDL is deliberately rejected through the write method.
+journal. Ordinary DDL is deliberately rejected through the write method. Stop
+other processes before migrating, then retry the exact migration if ownership
+contention returned `Busy`.
 
 The embedding host owns process cancellation. It can call `begin_close()` to
 stop admission synchronously, `close_with_grace()` to select a finite drain
