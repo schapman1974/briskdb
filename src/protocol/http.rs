@@ -1873,6 +1873,28 @@ mod tests {
     }
 
     #[test]
+    fn http_parameters_use_the_shared_canonical_index_key_encoding() {
+        let through_http = [
+            json_to_value(json!(true)),
+            json_to_value(json!(-42)),
+            json_to_value(json!(9_223_372_036_854_775_809_u64)),
+            json_to_value(json!(1.5)),
+            json_to_value(json!("shared")),
+        ];
+        let direct = [
+            Value::Boolean(true),
+            Value::Int64(-42),
+            Value::UInt64(9_223_372_036_854_775_809),
+            Value::Float64(1.5),
+            Value::Text("shared".to_owned()),
+        ];
+        assert_eq!(
+            crate::core::CanonicalIndexKey::encode_values(&through_http).unwrap(),
+            crate::core::CanonicalIndexKey::encode_values(&direct).unwrap()
+        );
+    }
+
+    #[test]
     fn routed_requests_preserve_or_omit_the_optional_shard_key() {
         let read = serde_json::from_value::<QueryRequest>(json!({
             "sql": "SELECT payload FROM events"

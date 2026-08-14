@@ -8,6 +8,7 @@ mod control;
 mod engine;
 mod error;
 pub(crate) mod generated_id;
+mod index_key;
 mod lifecycle;
 mod options;
 mod planner;
@@ -34,6 +35,11 @@ pub use control::{CancellationToken, RequestContext};
 pub use engine::{CheckpointReport, CheckpointShardReport, Engine, EngineStatus, Statement};
 pub use error::{EngineError, EngineErrorKind, EngineResult};
 pub(crate) use generated_id::AllocationOwnerMap;
+pub use index_key::{
+    CanonicalIndexKey, DecodedIndexKeyPart, INDEX_KEY_ENCODING_VERSION, IndexKeyCollation,
+    IndexKeyOrder, IndexKeyPart, IndexKeyValue, IndexKeyValueRef, IndexNullOrder,
+    UniqueNullSemantics,
+};
 pub use lifecycle::{EngineState, ShutdownReport};
 pub(crate) use lifecycle::{Lifecycle, OperationLease};
 pub use options::{

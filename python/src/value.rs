@@ -177,3 +177,39 @@ pub(crate) fn write_result_to_python(
     }
     Ok(output.into_any().unbind())
 }
+
+#[cfg(test)]
+mod tests {
+    use briskdb::CanonicalIndexKey;
+    use pyo3::{conversion::IntoPyObjectExt, types::PyBytes};
+
+    use super::*;
+
+    #[test]
+    fn python_parameters_use_the_shared_canonical_index_key_encoding() {
+        Python::initialize();
+        Python::attach(|py| {
+            let params = vec![
+                true.into_py_any(py).unwrap(),
+                (-42_i64).into_py_any(py).unwrap(),
+                9_223_372_036_854_775_809_u64.into_py_any(py).unwrap(),
+                1.5_f64.into_py_any(py).unwrap(),
+                "shared".into_py_any(py).unwrap(),
+                PyBytes::new(py, &[0, 255]).into_any().unbind(),
+            ];
+            let through_python = extract_params(py, Some(params)).unwrap();
+            let direct = [
+                Value::Boolean(true),
+                Value::Int64(-42),
+                Value::UInt64(9_223_372_036_854_775_809),
+                Value::Float64(1.5),
+                Value::Text("shared".to_owned()),
+                Value::Binary(vec![0, 255]),
+            ];
+            assert_eq!(
+                CanonicalIndexKey::encode_values(&through_python).unwrap(),
+                CanonicalIndexKey::encode_values(&direct).unwrap()
+            );
+        });
+    }
+}

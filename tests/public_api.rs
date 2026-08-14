@@ -208,6 +208,42 @@ fn legacy_and_explicit_module_paths_are_both_available() {
 }
 
 #[test]
+fn canonical_index_key_encoding_is_public_versioned_and_protocol_neutral() {
+    fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
+    fn assert_copy_public<T: Copy + Send + Sync + 'static>() {}
+
+    assert_owned_public::<core::CanonicalIndexKey>();
+    assert_owned_public::<core::DecodedIndexKeyPart>();
+    assert_owned_public::<core::IndexKeyValue>();
+    assert_copy_public::<core::IndexKeyOrder>();
+    assert_copy_public::<core::IndexNullOrder>();
+    assert_copy_public::<core::IndexKeyCollation>();
+    assert_copy_public::<core::UniqueNullSemantics>();
+    assert_eq!(core::INDEX_KEY_ENCODING_VERSION, 1);
+
+    let values = [
+        core::Value::Int64(-42),
+        core::Value::Text("public-api".to_owned()),
+        core::Value::Binary(vec![0, 255]),
+    ];
+    let key = core::CanonicalIndexKey::encode_values(&values).unwrap();
+    assert_eq!(key.encoding_version(), 1);
+    assert_eq!(key.component_count(), values.len());
+    assert_eq!(key.decode().unwrap().len(), values.len());
+    assert_eq!(
+        core::CanonicalIndexKey::from_bytes(key.as_bytes()).unwrap(),
+        key
+    );
+
+    let date_and_timestamp = core::CanonicalIndexKey::encode(&[
+        core::IndexKeyPart::ascending(core::IndexKeyValueRef::Date(0)),
+        core::IndexKeyPart::descending(core::IndexKeyValueRef::Timestamp(1_000_000)),
+    ])
+    .unwrap();
+    assert_eq!(date_and_timestamp.component_count(), 2);
+}
+
+#[test]
 fn sqlite_import_generated_id_opt_in_is_public_owned_and_explicit() {
     fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}
 

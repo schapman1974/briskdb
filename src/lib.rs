@@ -17,12 +17,14 @@ mod sqlite_error;
 pub use protocol::http as api;
 
 pub use core::{
-    CancellationToken, CheckpointReport, CheckpointShardReport, Column, DataType, Decimal,
-    DescribeTarget, EngineError, EngineErrorKind, EngineOptions, EngineResult, EngineState,
-    EngineStatus, Executed, GeneratedKey, ParseDecimalError, PortalId, PrepareRequest,
+    CancellationToken, CanonicalIndexKey, CheckpointReport, CheckpointShardReport, Column,
+    DataType, Decimal, DecodedIndexKeyPart, DescribeTarget, EngineError, EngineErrorKind,
+    EngineOptions, EngineResult, EngineState, EngineStatus, Executed, GeneratedKey,
+    INDEX_KEY_ENCODING_VERSION, IndexKeyCollation, IndexKeyOrder, IndexKeyPart, IndexKeyValue,
+    IndexKeyValueRef, IndexNullOrder, ParseDecimalError, PortalId, PrepareRequest,
     PreparedExecution, PreparedStatementDescription, PreparedStatementId, PreparedStatementLimits,
     RequestContext, ResultLimits, ResultSet, ResultSetShapeError, Routed, Row, Session, SessionId,
-    SessionState, ShutdownReport, Statement, Value, WriteResult,
+    SessionState, ShutdownReport, Statement, UniqueNullSemantics, Value, WriteResult,
 };
 #[cfg(feature = "embedded")]
 pub use embedded::{
