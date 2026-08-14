@@ -32,6 +32,14 @@ The wheel uses the same files, manifest version, migrations, downgrade fence,
 and recovery rules as the matching Rust release. There is no separate Python
 storage format and no stable pre-1.0 compatibility promise.
 
+Independently spawned interpreters may concurrently read and write one ready
+root on the same supported host and local filesystem. Each interpreter must
+open and close its own handle. Inherited post-`fork()` handles and network or
+multi-host filesystems are unsupported. Schema/catalog/layout changes require
+sole-process ownership and return retryable `BusyError` while a peer remains
+open. The complete boundary and systemd account requirements are documented in
+[sharing one data directory between processes](../docs/MULTIPROCESS.md).
+
 Before upgrading a wheel that opens existing data, stop every user of the data
 directory and retain a complete stopped-database backup. Startup can migrate
 the directory. In-place downgrade is unsupported; rollback means restoring the

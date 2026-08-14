@@ -100,12 +100,17 @@ and proven sequence-exhausted does it return non-retryable `LimitExceeded`.
 Hi/lo instead reserves all possible target pools before it consumes an
 irrevocable allocation.
 
-Schema migration instead uses an in-process gate shared by handles for the same
-canonical root, plus fresh coordinator-owned connections.
-While that gate is `Migrating`, new
+Schema migration uses an in-process gate shared by handles for the same
+canonical root, plus fresh coordinator-owned connections. Before durable
+inspection or mutation, the coordinator also requires a sole-process root
+lease. A peer process holding its lifetime shared lease makes the migration
+return retryable `Busy` without changing the manifest or shards.
+While the local gate is `Migrating`, new
 ordinary operations and another migration coordinator receive retryable
 `Busy`. Clients that retry should use the same bounded exponential backoff and
-jitter as for SQLite-originated `Busy` failures.
+jitter as for SQLite-originated `Busy` failures. Catalog registration,
+generated-table DDL, initialization, upgrade, and recovery use the same
+cross-process fence; see the [multi-process contract](MULTIPROCESS.md).
 
 If a failed, cancelled, or dropped migration has already published a durable
 journal row, the gate becomes `Pending`. Ordinary operations then receive

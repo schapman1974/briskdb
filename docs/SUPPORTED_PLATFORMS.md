@@ -99,19 +99,22 @@ layout members by themselves. The directory must nevertheless permit SQLite to
 create and recover its sidecars. Do not infer damage from a missing sidecar;
 BriskDB validates the database's persistent journal mode instead.
 
-Only a single BriskDB server process per data directory is supported. The
-process-wide registry makes independent `Database` and `Engine` handles that
-resolve to the same canonical root share schema admission and catalog
-publication. It does not coordinate separate server processes.
+Multiple independently started server and embedded processes may open one
+current ready data directory on the same host. Lifetime advisory leases fence
+schema, catalog, initialization, upgrade, and recovery mutations to a sole
+process while SQLite WAL coordinates steady-state reads and writes. Startup is
+serialized. The exact operation matrix, lock files, retry behavior, and
+post-`fork()` exclusion are defined in the
+[multi-process contract](MULTIPROCESS.md).
 Admin browser sessions likewise belong to one process, but are not part of that
 data-directory registry: their absolute eight-hour state is memory-only and is
 discarded on restart.
 Do not copy, move, edit, or separately open the manifest, shard, WAL, or shared
 memory files while the server is running. The stopped-server,
 complete-directory procedure in [offline backup](OFFLINE_BACKUP.md) is supported
-and tested. Live or partial copies, coordinated online backup, multi-process
-access, filesystem-fault behavior, and broader crash-recovery guarantees remain
-unsupported until their roadmap issues add corresponding automated tests.
+and tested. Live or partial copies, coordinated online backup, filesystem-fault
+behavior, and broader crash-recovery guarantees remain unsupported until their
+roadmap issues add corresponding automated tests.
 
 Opening a data directory can transactionally upgrade `manifest.sqlite` and can
 resume a manifest-recorded cross-file shard provisioning, adoption, or
@@ -141,10 +144,10 @@ against accidental wrong-file placement. They are not authentication or
 protection from a process that can write the data directory. The semantic and
 schema checksums introduced in v7 and retained by v8 are likewise unkeyed
 corruption detectors, not authentication, and do not checksum application row
-values. Targeted
-subprocess-abort tests cover schema-journal persistence boundaries, but
-arbitrary process-kill timing, power-loss, and filesystem-fault certification
-remain later hardening work.
+values. Targeted subprocess-abort tests cover schema-journal persistence
+boundaries and an abruptly terminated steady-state writer, but arbitrary
+process-kill timing, power-loss, and filesystem-fault certification remain
+later hardening work.
 
 When reporting a platform problem, include the BriskDB revision, `rustc -Vv`,
 operating-system and architecture details, filesystem type, mount options, and

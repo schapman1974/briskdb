@@ -538,11 +538,14 @@ the fence, and installs checksum version 5 without changing a shard.
 There is no automatic downgrade; an older binary requires a backup from before
 the newer format.
 
-Startup first canonicalizes the data-directory path and joins the process-wide
-root coordination keyed by that path. It acquires the shared schema gate before
-loading the manifest, so independent `Storage`, `Database`, and `Engine` handles
-in one process serialize startup and migration against ordinary admission and
-share catalog-generation publication.
+Startup first canonicalizes the data-directory path, takes the root startup
+lock, and joins the in-memory coordination keyed by that path. Each process
+holds a shared root lease for its handle lifetime. Initialization, format
+upgrade, recovery, schema migration, catalog registration, and generated-table
+DDL must upgrade that lease to sole-process ownership before mutation. Current
+`Ready`/`Degraded` opens retain the shared lease, so independent processes may
+serve steady-state work while in-process handles continue to share schema
+admission and catalog-generation publication.
 
 Each manifest connection enables and reads back SQLite cell-size checks and
 requires a full manifest integrity check before parsing control-plane state.
@@ -797,11 +800,10 @@ the first value. Independent BriskDB processes that reach this narrow allocator
 path serialize only that refill transaction through SQLite and receive
 non-overlapping ranges. The fence distinguishes successive durable reservations;
 it is not an expiry time and does not revoke earlier IDs. There are no clocks,
-heartbeats, or reclaim decisions. This cross-process uniqueness property does
-not by itself broaden the rest of BriskDB's single-process-per-root deployment
-boundary. Independently started processes, including processes after `exec`,
-are the tested allocator model. Continuing to use an inherited live handle or
-lease cache after `fork()` is unsupported.
+heartbeats, or reclaim decisions. The same lifetime process lease permits
+independently started same-host processes to serve steady-state work on a ready
+local root. Processes after `exec` are supported; continuing to use an inherited
+live handle or lease cache after `fork()` is not.
 
 Committed leases are irrevocable. The process cache advances before the target
 shard insert, never returns an ID after rollback, cancellation, constraint
@@ -994,8 +996,10 @@ receives non-retryable `FailedPrecondition`, while a new migration call may
 enter `Migrating` to resume the byte-identical SQL. Startup recovery completes
 an active journal while holding the same in-process gate. Independent handles
 for the same canonical root share the gate and live catalog publication.
-Separate server processes for one data directory are unsupported; the gate is
-not a distributed coordination mechanism.
+An outer filesystem lease requires sole-process ownership before the migration
+can inspect or publish durable state. A live peer therefore receives no schema
+change; the coordinator returns retryable `Busy`. This is local-host advisory
+coordination, not a distributed lock for network filesystems or object storage.
 
 Every-shard preflight executes the complete batch inside a rollback-only
 transaction. When the authoritative table catalog is populated, that tentative

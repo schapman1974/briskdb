@@ -13,6 +13,13 @@ permitted; later migration opens never create a missing replacement, use
 SQLite's no-follow mode, and revalidate the freshly opened layout identity
 inside the same manifest transaction before changing journal state.
 
+The root also contains `.briskdb-process.lock` and
+`.briskdb-startup.lock`. They are owner-only regular coordination files, not
+SQLite databases or manifest state. Their bytes do not record ownership; the
+kernel releases their advisory locks when the process exits. They must not be
+replaced while a process is live. See the
+[multi-process contract](MULTIPROCESS.md).
+
 ## Current format: version 12
 
 SQLite header fields identify the file and its format:
@@ -684,13 +691,11 @@ file, timestamp, expiry, or revocation of IDs issued under an older fence. No
 wall or monotonic clock is stored or consulted. Independent processes contend
 on SQLite's manifest transaction and therefore cannot commit overlapping
 ranges. Process-local handles for the same canonical root share one cache per
-table and write the manifest once per block, not once per row. This narrow
-cross-process allocator property does not change the wider deployment boundary
-for simultaneously serving one data root from multiple BriskDB processes.
-Here, independent processes means processes that initialize BriskDB after their
-own start (including an `exec` boundary). A child must not inherit and continue
-using a live BriskDB handle or cached lease across `fork()`; inherited handles
-are outside the supported process model.
+table and write the manifest once per block, not once per row. Independently
+started same-host processes may also serve ordinary work on the same ready
+local root. Each must initialize BriskDB after its own start, including after an
+`exec` boundary. A child must not inherit and continue using a live BriskDB
+handle or cached lease across `fork()`.
 
 Every committed block is irrevocable. The allocator consumes an ID before
 taking the target-shard write lock and never returns it to the cache after a
@@ -1790,19 +1795,16 @@ the known-good manifest, rather than the terminal `Degraded` manifest from the
 failed root. A corrupt semantic root likewise must be restored, because
 BriskDB will not sign altered manifest payload while reporting the failure.
 
-The current deployment boundary remains local storage and one BriskDB process
-per data directory. Independent handles inside that process share a gate,
-schema fingerprints, and live catalog coordination keyed by the canonical
-root. The supported alpha recovery workflow is the complete stopped-directory
-copy documented in [offline backup](OFFLINE_BACKUP.md); coordinated online
-backup remains unimplemented. Recovery to an older binary requires a backup
-from before the unsupported format. Separate server processes against one data
-directory are unsupported even though SQLite and the manifest use file locks;
-the in-process coordination is intentionally not a distributed lock. The
-`hilo_v1` reservation transaction is deliberately stronger at its narrow
-boundary: competing processes obtain non-overlapping fenced blocks. That
-allocator guarantee is tested independently and does not certify concurrent
-multi-server operation for the rest of the root.
+The deployment boundary remains one host and local storage. Independent
+processes hold shared root leases for steady-state operations; schema, catalog,
+initialization, upgrade, and recovery work requires a sole-process lease.
+In-process handles additionally share a gate, schema fingerprints, and live
+catalog publication keyed by the canonical root. This coordination is not a
+distributed lock and does not support NFS, SMB, shared multi-host volumes, or
+object storage. The supported recovery workflow is the complete
+stopped-directory copy documented in [offline backup](OFFLINE_BACKUP.md);
+coordinated online backup remains unimplemented. Recovery to an older binary
+requires a backup from before the unsupported format.
 
 ## Verification contract
 

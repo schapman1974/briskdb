@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added installed-wheel `spawn` multiprocessing coverage for concurrent
+  same-root writes, checkpoints, abrupt child exit, reopen, and retryable schema
+  ownership contention.
+- Documented the same-host/local-filesystem boundary and the prohibition on
+  inherited post-`fork()` handles.
+
 ## 0.1.0-alpha.4 — 2026-08-13
 
 - Added `cp39-abi3` wheel automation for macOS and manylinux on x86-64/ARM64.

@@ -13,17 +13,19 @@ issue #67.
 
 1. Record the BriskDB version, configured shard count, and absolute data
    directory path.
-2. Stop the BriskDB process cleanly and wait for it to exit. A service manager
-   must report the process stopped before copying begins.
+2. Stop every BriskDB server and embedded application cleanly and wait for each
+   to exit. A service manager must report its service stopped before copying.
 3. Verify that no other BriskDB process or embedder is using the directory.
 4. Copy the complete data directory into a new backup directory. Include
    `manifest.sqlite`, the entire `shards` directory, the import receipt when
-   present, and every SQLite `-wal`, `-shm`, or journal sidecar that exists.
-   Do not select individual database files.
+   present, `.briskdb-process.lock`, `.briskdb-startup.lock`, and every SQLite
+   `-wal`, `-shm`, or journal sidecar that exists. The lock files contain no
+   persistent ownership, but a complete-directory copy includes them. Do not
+   select individual database files.
 5. Make the backup durable using the snapshot, archive, or copy tool's normal
    completion and sync guarantees. Retain the recorded BriskDB version and
    shard count with the backup.
-6. Restart the original server only after the copy has completed.
+6. Restart servers and embedders only after the copy has completed.
 
 On the supported Linux platform, one simple local-filesystem copy is:
 
