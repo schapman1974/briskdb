@@ -261,7 +261,7 @@ the engine regardless of its eventual wire protocol.
 - [x] Support `CancelRequest`/backend keys and wire cancellation to the core.
 - [x] Add TLS and SCRAM-SHA-256 before non-loopback use; never ship cleartext
   password authentication on an unencrypted listener.
-- [ ] Add compatibility shims for `SELECT version()`, common `SHOW` commands,
+- [x] Add compatibility shims for `SELECT version()`, common `SHOW` commands,
   and only the catalog queries needed by explicitly tested clients.
 - [ ] Test with `psql`, `tokio-postgres`, `psycopg`, and one migration/ORM tool.
 - [ ] Stream rows with backpressure while preserving the PostgreSQL

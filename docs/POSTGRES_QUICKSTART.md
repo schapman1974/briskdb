@@ -67,6 +67,27 @@ psql "host=127.0.0.1 port=5433 user=briskdb dbname=default sslmode=disable" \
   -c "DELETE FROM records WHERE tenant_id = 'tenant-a'"
 ```
 
+Common client discovery probes are supported without exposing a fake general
+PostgreSQL catalog:
+
+```bash
+psql "host=127.0.0.1 port=5433 user=briskdb dbname=default sslmode=disable" \
+  -c "SELECT version()" -c "SHOW transaction isolation level"
+```
+
+psycopg can use the same connection directly. SQLAlchemy 2 with psycopg must
+disable native `hstore` discovery because its default discovery path creates a
+nested savepoint, and BriskDB does not implement savepoints:
+
+```python
+from sqlalchemy import create_engine
+
+engine = create_engine(
+    "postgresql+psycopg://briskdb@127.0.0.1:5433/default",
+    use_native_hstore=False,
+)
+```
+
 ## TLS and SCRAM-SHA-256
 
 Secure mode needs a PEM certificate chain, matching PEM private key, one user,
@@ -139,6 +160,9 @@ and inspect it with `systemctl status briskdb` and
 - `BEGIN`/`COMMIT`/`ROLLBACK` provide a real single-shard SQLite transaction,
   including read-your-writes and PostgreSQL `I`/`T`/`E` status. Cross-shard
   access is rejected before mutation.
+- `version()`, identity probes, common `SHOW` settings, and psycopg's exact
+  extension-type lookup have bounded compatibility responses. This is not a
+  general `pg_catalog` or PostgreSQL 14 compatibility claim.
 - DDL, savepoints, `COPY`, roles/authorization, and full PostgreSQL
   compatibility are not supported. Initialize the catalog offline with
   `briskdb-import` before starting the server.
