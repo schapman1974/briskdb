@@ -32,10 +32,11 @@ Database and session handles own their native resources, `close()` is
 idempotent, and blocking engine work releases Python's GIL. Dropping live
 handles during interpreter shutdown is also safe.
 
-This is an alpha API. SQL supports `None`, `bool`, signed 64-bit integers,
-finite `float`, `str`, and `bytes` in the initial binding. The complete
-lossless conversion and exception contract is tracked separately in issue
-[#198](https://github.com/schapman1974/briskdb/issues/198).
+This is an alpha API. SQL supports `None`, `bool`, bounded integers, `float`,
+`str`, bytes-like values, and exact `decimal.Decimal` conversion with explicit
+errors when SQLite cannot store a value losslessly. See the executable
+[value and exception contract](VALUE_CONVERSIONS.md) for boundaries and the
+stable `BriskDBError` hierarchy.
 
 Native Mongo/document commands are not claimed until BriskDB's document engine
 lands. The extension uses only the listener-free `embedded` Rust feature.
