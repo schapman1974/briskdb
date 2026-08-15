@@ -11,7 +11,9 @@ Python wheel use the same locks and SQLite WAL files.
 | Reads and autocommit writes | Supported; normal SQLite writer contention can return retryable `Busy` |
 | Generated IDs | Supported; native ranges and manifest-leased hi/lo blocks remain unique |
 | Passive checkpoints | Supported; a competing checkpoint can report `busy` with unavailable frame counts |
+| Read-only global-index catalog inspection | Supported; readers observe one complete old or new checksummed snapshot |
 | Opening a current `Ready`/`Degraded` root | Supported; startup inspection is serialized |
+| Global-index create/lifecycle/remove | Requires sole-process ownership; each checksummed transition is one manifest transaction |
 | Schema migration, catalog registration, generated-table DDL, initialization, upgrade, or recovery | Requires sole-process ownership; retryable `Busy` is returned before mutation when a peer is open |
 | Offline import or backup/restore | Stop every server and embedder first |
 
@@ -97,6 +99,7 @@ directory. See [offline backup](OFFLINE_BACKUP.md) and the
 
 `tests/multiprocess_shared_root.rs` covers overlapping same- and cross-shard
 traffic, pooled handles, checkpoints, generated IDs, retryable contention,
-abrupt termination, reopen/integrity validation, and one service plus one
-embedder. `python/tests/test_multiprocess.py` repeats the public wheel contract
-with independently spawned interpreters.
+global-index writer fencing and atomic read-only catalog snapshots, abrupt
+termination, reopen/integrity validation, and one service plus one embedder.
+`python/tests/test_multiprocess.py` repeats the public wheel contract with
+independently spawned interpreters.

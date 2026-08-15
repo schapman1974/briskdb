@@ -8,6 +8,7 @@ mod control;
 mod engine;
 mod error;
 pub(crate) mod generated_id;
+mod global_index;
 mod index_key;
 mod lifecycle;
 mod options;
@@ -35,6 +36,13 @@ pub use control::{CancellationToken, RequestContext};
 pub use engine::{CheckpointReport, CheckpointShardReport, Engine, EngineStatus, Statement};
 pub use error::{EngineError, EngineErrorKind, EngineResult};
 pub(crate) use generated_id::AllocationOwnerMap;
+pub use global_index::{
+    GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart, GlobalIndexKeySource,
+    GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexStorageTopology,
+};
+pub(crate) use global_index::{
+    MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_SQL_BYTES, MAX_GLOBAL_INDEXES,
+};
 pub use index_key::{
     CanonicalIndexKey, DecodedIndexKeyPart, INDEX_KEY_ENCODING_VERSION, IndexKeyCollation,
     IndexKeyOrder, IndexKeyPart, IndexKeyValue, IndexKeyValueRef, IndexNullOrder,
@@ -188,6 +196,14 @@ impl Database {
         crate::storage::detect_shard_count(root)
     }
 
+    /// Validate and inspect global-index definitions without creating or
+    /// upgrading storage.
+    pub fn inspect_global_indexes(
+        root: impl AsRef<Path>,
+    ) -> EngineResult<Box<[GlobalIndexMetadata]>> {
+        crate::storage::inspect_global_indexes(root)
+    }
+
     pub fn shard_count(&self) -> u16 {
         self.storage.shard_count()
     }
@@ -205,6 +221,34 @@ impl Database {
     /// schema-and-catalog migration.
     pub fn register_tables(&mut self, declarations: Vec<TableDeclaration>) -> EngineResult<()> {
         self.storage.register_tables(declarations)
+    }
+
+    /// Atomically add one durable global-index definition in `Creating` state.
+    ///
+    /// This lifecycle API publishes metadata only. Physical index construction
+    /// and query use are implemented by the later global-index build stages.
+    pub fn create_global_index(
+        &mut self,
+        declaration: GlobalIndexDeclaration,
+    ) -> EngineResult<GlobalIndexId> {
+        self.storage.create_global_index(declaration)
+    }
+
+    /// Atomically apply one legal global-index lifecycle transition.
+    ///
+    /// Callers must not publish `Ready` until the declared physical topology is
+    /// complete and validated.
+    pub fn transition_global_index(
+        &mut self,
+        index_id: GlobalIndexId,
+        target: GlobalIndexLifecycle,
+    ) -> EngineResult<()> {
+        self.storage.transition_global_index(index_id, target)
+    }
+
+    /// Remove a global-index definition after it reaches `Dropping`.
+    pub fn remove_global_index(&mut self, index_id: GlobalIndexId) -> EngineResult<()> {
+        self.storage.remove_global_index(index_id)
     }
 
     /// Create and durably register one generated-ID Sharded table from a
