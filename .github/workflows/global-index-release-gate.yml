@@ -1,0 +1,111 @@
+name: Global-index release gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fault-and-soak:
+    name: Fault, recovery, backup, and soak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Select stable Rust
+        run: rustup default stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: global-index-release-gate
+
+      - name: Run public global-index correctness suites
+        run: |
+          cargo test --release --locked --test global_index_authority -- --test-threads=1
+          cargo test --release --locked --test global_index_write_maintenance -- --test-threads=1
+          cargo test --release --locked --test global_index_async -- --test-threads=1
+          cargo test --release --locked --test global_index_candidate_verification -- --test-threads=1
+          cargo test --release --locked --test global_index_recovery -- --test-threads=1
+          cargo test --release --locked --test global_index_shard_summaries -- --test-threads=1
+          cargo test --release --locked --test global_index_topology -- --test-threads=1
+          cargo test --release --locked --test offline_backup -- --test-threads=1
+
+      - name: Run commit-boundary and disk-full fault suites
+        run: |
+          cargo test --release --locked --lib global_authority_retries_converge_after_real_process_abort_at_every_boundary -- --test-threads=1
+          cargo test --release --locked --lib indexed_write_recovers_across_the_physical_commit_boundary -- --test-threads=1
+          cargo test --release --locked --lib global_index_read_repair_recovers_at_every_transaction_boundary -- --test-threads=1
+          cargo test --release --locked --lib process_abort_preserves_row_event_cursor_and_prune_atomicity -- --test-threads=1
+          cargo test --release --locked --lib restart_recovers_every_async_apply_and_watermark_boundary -- --test-threads=1
+          cargo test --release --locked --lib clock_jumps_cannot_revive_a_stale_async_lease_fence -- --test-threads=1
+          cargo test --release --locked --lib writable_sqlite_full_rolls_back_and_exact_retry_preserves_invariants -- --test-threads=1
+
+      - name: Run mixed single-process and multi-process soak
+        run: >-
+          cargo test --release --locked --test global_index_release_gate
+          global_index_release_soak --
+          --ignored --exact --test-threads=1
+
+  performance:
+    name: Same-host before/after matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Select stable Rust
+        run: rustup default stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: global-index-release-performance
+
+      - name: Create report directory
+        run: mkdir -p artifacts
+
+      - name: Measure same-host before matrix
+        env:
+          BRISKDB_BENCH_OUTPUT: artifacts/global-index-before.tsv
+        run: >-
+          cargo test --release --locked --test global_index_baseline
+          release_global_index_baseline --
+          --ignored --exact --nocapture --test-threads=1
+
+      - name: Measure and enforce after matrix
+        env:
+          BRISKDB_BENCH_COMPARE: artifacts/global-index-before.tsv
+          BRISKDB_BENCH_OUTPUT: artifacts/global-index-after.tsv
+        run: >-
+          cargo test --release --locked --test global_index_baseline
+          release_global_index_after --
+          --ignored --exact --nocapture --test-threads=1
+
+      - name: Upload operator evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: global-index-release-gate-${{ github.run_id }}
+          path: |
+            artifacts/*.tsv
+            docs/GLOBAL_INDEX_RELEASE_GATE.md
+          if-no-files-found: error
+          retention-days: 30

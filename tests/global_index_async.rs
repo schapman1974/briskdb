@@ -4,8 +4,8 @@ use std::{path::Path, sync::Arc, time::Duration};
 use std::{fs, process::Command};
 
 use briskdb::core::{
-    Database, Engine, EngineErrorKind, GlobalIndexAsyncOptions, GlobalIndexRoutingKind,
-    ShardKeyMetadata, ShardKeyType, TableDeclaration,
+    Database, Engine, EngineErrorKind, GlobalIndexAsyncOptions, GlobalIndexHealthState,
+    GlobalIndexRoutingKind, ShardKeyMetadata, ShardKeyType, TableDeclaration,
 };
 use briskdb::{
     GlobalIndexDeclaration, GlobalIndexKeyPart, GlobalIndexKeySource, GlobalIndexKeyType,
@@ -95,6 +95,39 @@ async fn write(engine: &Engine, route: &str, sql: &str, parameters: Vec<Value>) 
         .await
         .unwrap();
     session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn operational_report_tracks_lag_retention_and_recovery_without_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let (database, engine, routes, index) = setup(temp.path());
+    let initial = engine.global_index_operational_report().await.unwrap();
+    assert_eq!(initial.state(), GlobalIndexHealthState::Healthy);
+    assert_eq!(initial.indexes()[0].summary_ready_shards(), 2);
+
+    write(
+        &engine,
+        &routes[0],
+        "INSERT INTO async_users (tenant_id, email) VALUES (?1, ?2)",
+        vec![routes[0].clone().into(), "operator@example.test".into()],
+    )
+    .await;
+    let lagged = database.global_index_operational_report().unwrap();
+    assert_eq!(lagged.state(), GlobalIndexHealthState::Degraded);
+    assert_eq!(lagged.indexes()[0].authority_entries(), 0);
+    assert_eq!(lagged.indexes()[0].async_lag(), 1);
+    assert_eq!(lagged.retained_outbox_events(), 1);
+    assert!(lagged.retained_outbox_bytes() > 0);
+    assert_eq!(lagged.indexes()[0].pending_read_repairs(), 0);
+    assert_eq!(lagged.indexes()[0].active_operations(), 0);
+
+    database
+        .process_global_index_async(index, GlobalIndexAsyncOptions::default())
+        .unwrap();
+    let recovered = engine.global_index_operational_report().await.unwrap();
+    assert_eq!(recovered.state(), GlobalIndexHealthState::Healthy);
+    assert_eq!(recovered.indexes()[0].authority_entries(), 1);
+    assert_eq!(recovered.indexes()[0].async_lag(), 0);
 }
 
 #[tokio::test]

@@ -399,7 +399,7 @@ requires an earlier dependency:
 2. [x] **Complete PostgreSQL support.** Finish the simple and extended query
    lifecycle, type mapping, transactions, cancellation, compatibility shims,
    and real-client conformance tests.
-3. [ ] **Implement global indexes, uniqueness, and value allocation.** Add the
+3. [x] **Implement global indexes, uniqueness, and value allocation.** Add the
    protocol-neutral authority and routing metadata needed for cross-shard
    constraints, collision-free allocation, and exact indexed shard targeting.
    Track the rollout in [#225](https://github.com/schapman1974/briskdb/issues/225):
@@ -417,7 +417,7 @@ requires an earlier dependency:
    - [x] [#236](https://github.com/schapman1974/briskdb/issues/236) — transactional shard outboxes
    - [x] [#237](https://github.com/schapman1974/briskdb/issues/237) — asynchronous indexing and watermarks
    - [x] [#238](https://github.com/schapman1974/briskdb/issues/238) — Bloom/min-max shard summaries
-   - [ ] [#239](https://github.com/schapman1974/briskdb/issues/239) — production/release gates
+   - [x] [#239](https://github.com/schapman1974/briskdb/issues/239) — production/release gates
 4. [ ] **Finish the embedded Rust API.** Make sessions, transactions,
    cancellation, concurrency, document commands, and shutdown safe for a host
    process.

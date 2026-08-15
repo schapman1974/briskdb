@@ -46,13 +46,15 @@ pub use crate::core::Database;
 use crate::core::TableId;
 use crate::{
     core::{
-        Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
-        GeneratedTableDdlReceipt, GlobalIndexAsyncOptions, GlobalIndexAsyncProcessReport,
-        GlobalIndexAsyncStatus, GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId,
-        GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexOutboxBatch,
-        GlobalIndexOutboxCursor, GlobalIndexOutboxPruneReport, GlobalIndexOutboxShardStatus,
-        GlobalIndexRepairReport, GlobalIndexShardSummaryPredicate,
-        GlobalIndexShardSummaryReadResolution, GlobalIndexShardSummaryRebuildReport,
+        Catalog, CatalogSnapshot, CheckpointDatabase, CheckpointDatabaseReport, EngineError,
+        EngineErrorKind, EngineResult, GeneratedIdPolicy, GeneratedTableDdlReceipt,
+        GlobalIndexAsyncOptions, GlobalIndexAsyncProcessReport, GlobalIndexAsyncStatus,
+        GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyType,
+        GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexOperationalReport,
+        GlobalIndexOperationalStatus, GlobalIndexOutboxBatch, GlobalIndexOutboxCursor,
+        GlobalIndexOutboxPruneReport, GlobalIndexOutboxShardStatus, GlobalIndexRepairReport,
+        GlobalIndexShardSummaryPredicate, GlobalIndexShardSummaryReadResolution,
+        GlobalIndexShardSummaryRebuildReport, GlobalIndexShardSummaryState,
         GlobalIndexShardSummaryStatus, GlobalIndexValidationMode, GlobalIndexValidationOptions,
         GlobalIndexValidationReport, GlobalOperationId, GlobalUniqueMutation,
         GlobalUniqueReservation, GlobalValueLease, IndexKeyValue, MAX_TABLES, ShardKeyType,
@@ -916,6 +918,24 @@ impl Storage {
 
     pub(crate) fn shard_count(&self) -> u16 {
         self.catalog.routing().shard_count()
+    }
+
+    pub(crate) fn checkpoint_auxiliary_databases(
+        &self,
+    ) -> EngineResult<Vec<CheckpointDatabaseReport>> {
+        let manifest = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+        configure_manifest_connection(&manifest)?;
+        let mut reports = vec![checkpoint_database(
+            &manifest,
+            CheckpointDatabase::Manifest,
+        )?];
+        if let Some((global_index, _)) = global_index::open_existing(&self.root)? {
+            reports.push(checkpoint_database(
+                &global_index,
+                CheckpointDatabase::GlobalIndex,
+            )?);
+        }
+        Ok(reports)
     }
 
     pub(crate) fn shard_for_key(&self, key: &[u8]) -> u16 {
@@ -2051,6 +2071,114 @@ impl Storage {
         self.fail_closed_on_corruption(result)
     }
 
+    pub(crate) fn global_index_operational_report(
+        &self,
+    ) -> EngineResult<GlobalIndexOperationalReport> {
+        let result = (|| {
+            let outboxes = index_outbox::inspect(self)?;
+            let retained_outbox_events = outboxes
+                .iter()
+                .map(GlobalIndexOutboxShardStatus::retained_events)
+                .fold(0_u64, u64::saturating_add);
+            let retained_outbox_bytes = outboxes
+                .iter()
+                .map(GlobalIndexOutboxShardStatus::retained_bytes)
+                .fold(0_u64, u64::saturating_add);
+            let backpressured_outbox_shards = u16::try_from(
+                outboxes
+                    .iter()
+                    .filter(|outbox| outbox.is_backpressured())
+                    .count(),
+            )
+            .map_err(|_| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    "global-index outbox shard count overflowed",
+                )
+            })?;
+
+            let mut indexes = Vec::with_capacity(self.catalog.logical().global_indexes().len());
+            for index in self.catalog.logical().global_indexes() {
+                let counts = global_index::operational_counts(&self.root, index.id())?;
+                let async_status = (!index.is_unique())
+                    .then(|| global_index_async::status(self, index))
+                    .transpose()?;
+                let (async_lag, async_failures, poisoned_shards, leased_shards, paused, rebuild) =
+                    async_status
+                        .as_ref()
+                        .map_or((0, 0, 0, 0, false, false), |status| {
+                            let failures = status
+                                .shards()
+                                .iter()
+                                .map(|shard| shard.failure_count())
+                                .fold(0_u64, u64::saturating_add);
+                            let poisoned = status
+                                .shards()
+                                .iter()
+                                .filter(|shard| shard.poison_cursor().is_some())
+                                .count() as u16;
+                            let leased = status
+                                .shards()
+                                .iter()
+                                .filter(|shard| shard.is_leased())
+                                .count() as u16;
+                            (
+                                status.lag(),
+                                failures,
+                                poisoned,
+                                leased,
+                                status.is_paused(),
+                                status.rebuild_required(),
+                            )
+                        });
+                let summaries = shard_summary::status(self, index)?;
+                let summary_ready_shards = summaries
+                    .shards()
+                    .iter()
+                    .filter(|shard| shard.state() == GlobalIndexShardSummaryState::Ready)
+                    .count() as u16;
+                let summary_degraded_shards = summaries
+                    .shards()
+                    .iter()
+                    .filter(|shard| shard.state() != GlobalIndexShardSummaryState::Ready)
+                    .count() as u16;
+                let summary_saturated_shards = summaries
+                    .shards()
+                    .iter()
+                    .filter(|shard| shard.is_saturated())
+                    .count() as u16;
+                indexes.push(GlobalIndexOperationalStatus::new(
+                    index.id(),
+                    index.is_unique(),
+                    index.lifecycle(),
+                    counts.authority_entries,
+                    counts.unique_keys,
+                    counts.active_operations,
+                    counts.active_unique_reservations,
+                    counts.active_value_leases,
+                    counts.pending_read_repairs,
+                    counts.applied_read_repairs,
+                    async_lag,
+                    async_failures,
+                    poisoned_shards,
+                    leased_shards,
+                    paused,
+                    rebuild,
+                    summary_ready_shards,
+                    summary_degraded_shards,
+                    summary_saturated_shards,
+                ));
+            }
+            Ok(GlobalIndexOperationalReport::new(
+                indexes,
+                retained_outbox_events,
+                retained_outbox_bytes,
+                backpressured_outbox_shards,
+            ))
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
     pub(crate) fn global_index_shard_summary_status(
         &self,
         index_id: GlobalIndexId,
@@ -3037,6 +3165,22 @@ impl Storage {
             },
         ))
     }
+}
+
+fn checkpoint_database(
+    connection: &Connection,
+    database: CheckpointDatabase,
+) -> EngineResult<CheckpointDatabaseReport> {
+    let (busy, wal_frames, checkpointed_frames) = connection
+        .query_row("PRAGMA main.wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(sqlite_error::storage)?;
+    CheckpointDatabaseReport::new(database, busy, wal_frames, checkpointed_frames)
 }
 
 /// Detect the immutable physical shard count without creating or upgrading

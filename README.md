@@ -46,7 +46,14 @@ HTTP and PostgreSQL. Native MongoDB, MySQL, and serverless use are on the roadma
   even those lagging shards for equality, `IN`, and supported range predicates,
   without introducing false negatives.
   [See the replay design](docs/GLOBAL_INDEX_ASYNC.md) and
-  [summary pruning contract](docs/GLOBAL_INDEX_SHARD_SUMMARIES.md).
+  [summary pruning contract](docs/GLOBAL_INDEX_SHARD_SUMMARIES.md). The
+  [measured release gate](docs/GLOBAL_INDEX_RELEASE_GATE.md) is equally direct:
+  shard avoidance works, but current metadata inspection makes this an
+  explicit experimental feature—not yet a latency win on small hot datasets.
+- **Inspectable operations, not mystery state.** Health, admin JSON, Prometheus
+  metrics, and the Rust API expose index lifecycle, lag, poison/rebuild state,
+  contention, repairs, summary health, and outbox pressure without leaking
+  indexed values.
 - **Bring the client you already have.** HTTP and PostgreSQL are available now;
   MongoDB and MySQL wire compatibility are being built over the same engine.
 - **Files remain files.** The layout is a manifest plus normal SQLite databases,
@@ -127,7 +134,8 @@ experimental and opt-in; the exact contract lives in
 | PostgreSQL wire protocol | TLS/SCRAM, backpressured row streaming, SQLite-interrupt cancellation, text/binary CRUD, real single-shard transactions, and a live psql/tokio-postgres/psycopg/SQLAlchemy matrix |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
-| Cross-shard indexes and global value leases | Unique enforcement/value leases, asynchronous non-unique replay, freshness routing, and conservative Bloom/min-max shard pruning work |
+| Cross-shard indexes and global value leases | Experimental/opt-in: correctness, recovery, and shard pruning pass; current latency/write overhead is documented in the release gate |
+| Global-index health and Prometheus metrics | `/health`, `/v1/admin/global-indexes`, `/metrics`, plus Rust operational reports |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working |
@@ -149,6 +157,7 @@ Then open the [data browser](http://127.0.0.1:7654/admin) or check the server:
 
 ```bash
 curl http://127.0.0.1:7654/health
+curl http://127.0.0.1:7654/metrics
 ```
 
 Enable the PostgreSQL listener explicitly. Simple and parameterized
@@ -244,19 +253,24 @@ Follow the [roadmap](ROADMAP.md) or browse the
 - No general atomic transaction across multiple shard files.
 - Global ordering/pagination and general aggregate pushdown are still limited.
 - The supported backup today is a stopped-server copy of the complete data
-  directory after every server and embedder exits; online/serverless snapshots
-  are planned.
+  directory after every server and embedder exits. Passive checkpoints now
+  report shards, manifest, and global-index storage, but are not an online
+  snapshot; online/serverless snapshots are planned.
 - Multi-process access is same-host/local-filesystem only. Schema, catalog,
   upgrade, and recovery work requires sole-process ownership.
 - Pre-1.0 storage and public-library compatibility can change between releases.
 - Ubuntu 24.04 x86-64 receives the full required Rust CI suite. Python wheels
   receive native build, audit, install, restart, corruption, and concurrency
   checks on Linux/macOS x86-64 and ARM64.
+- Global-index operational metrics are available, but BriskDB still lacks the
+  broader production suite for traces, slow-query logs, resource saturation,
+  alert rules, and long-running capacity validation.
 
 ## Go deeper
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Global uniqueness and value authority](docs/GLOBAL_INDEX_AUTHORITY.md)
+- [Global-index production gate](docs/GLOBAL_INDEX_RELEASE_GATE.md)
 - [Embedded Rust](docs/EMBEDDED_RUST.md)
 - [Embedded SQL](docs/EMBEDDED_SQL.md)
 - [Crate features and support tiers](docs/CRATE_FEATURES.md)

@@ -48,6 +48,17 @@ const OPERATION_ROLLED_BACK: i64 = 3;
 const UNIQUE_REQUEST_DIGEST_DOMAIN: &[u8] = b"briskdb.global-index.unique-operation.v1\0";
 const VALUE_REQUEST_DIGEST_DOMAIN: &[u8] = b"briskdb.global-index.value-operation.v1\0";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OperationalCounts {
+    pub(super) authority_entries: u64,
+    pub(super) unique_keys: u64,
+    pub(super) active_operations: u64,
+    pub(super) active_unique_reservations: u64,
+    pub(super) active_value_leases: u64,
+    pub(super) pending_read_repairs: u64,
+    pub(super) applied_read_repairs: u64,
+}
+
 const SCHEMA_SQL: &str = "
 CREATE TABLE briskdb_global_index_storage (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -4987,6 +4998,67 @@ pub(super) fn open_existing(root: &Path) -> EngineResult<Option<(Connection, Pat
     configure(&connection)?;
     validate(&connection)?;
     Ok(Some((connection, path)))
+}
+
+pub(super) fn operational_counts(
+    root: &Path,
+    index_id: GlobalIndexId,
+) -> EngineResult<OperationalCounts> {
+    let (connection, _) = open_existing(root)?
+        .ok_or_else(|| corrupt("cataloged global index has no physical storage"))?;
+    let index_id = to_sqlite_id(index_id)?;
+    let count = |sql: &str, parameters: &[&dyn rusqlite::ToSql]| -> EngineResult<u64> {
+        let value = connection
+            .query_row(sql, parameters, |row| row.get::<_, i64>(0))
+            .map_err(sqlite_error::storage)?;
+        from_sqlite_u64(value, "global-index operational count")
+    };
+    Ok(OperationalCounts {
+        authority_entries: count(
+            "SELECT COUNT(*) FROM briskdb_global_index_entries WHERE index_id = ?1",
+            &[&index_id],
+        )?,
+        unique_keys: count(
+            "SELECT COUNT(*) FROM briskdb_global_index_unique_keys WHERE index_id = ?1",
+            &[&index_id],
+        )?,
+        active_operations: count(
+            "SELECT COUNT(*) FROM briskdb_global_operations AS operation
+             WHERE operation.operation_state = ?1 AND (
+                 EXISTS (
+                     SELECT 1 FROM briskdb_global_unique_mutations AS mutation
+                     WHERE mutation.operation_id = operation.operation_id
+                       AND mutation.index_id = ?2
+                 ) OR EXISTS (
+                     SELECT 1 FROM briskdb_global_value_leases AS lease
+                     WHERE lease.operation_id = operation.operation_id
+                       AND lease.index_id = ?2
+                 )
+             )",
+            &[&OPERATION_ACTIVE, &index_id],
+        )?,
+        active_unique_reservations: count(
+            "SELECT COUNT(*) FROM briskdb_global_unique_reservations WHERE index_id = ?1",
+            &[&index_id],
+        )?,
+        active_value_leases: count(
+            "SELECT COUNT(*) FROM briskdb_global_value_leases AS lease
+             JOIN briskdb_global_operations AS operation
+               ON operation.operation_id = lease.operation_id
+             WHERE lease.index_id = ?1 AND operation.operation_state = ?2",
+            &[&index_id, &OPERATION_ACTIVE],
+        )?,
+        pending_read_repairs: count(
+            "SELECT COUNT(*) FROM briskdb_global_index_read_repairs
+             WHERE index_id = ?1 AND repair_state = 1",
+            &[&index_id],
+        )?,
+        applied_read_repairs: count(
+            "SELECT COUNT(*) FROM briskdb_global_index_read_repairs
+             WHERE index_id = ?1 AND repair_state = 2",
+            &[&index_id],
+        )?,
+    })
 }
 
 fn configure(connection: &Connection) -> EngineResult<()> {

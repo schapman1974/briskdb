@@ -18,12 +18,12 @@ use super::session::TransactionState;
 use super::{
     BlockingPool, BoundStatementPlan, CancelOnDrop, CancellationReason, CancellationToken,
     Database, DescribeTarget, EngineError, EngineErrorKind, EngineOptions, EngineResult,
-    EngineState, Executed, Lifecycle, LogicalDatabaseId, OperationControl, OperationLease,
-    PortalId, PrepareRequest, PreparedExecution, PreparedStatementDescription, PreparedStatementId,
-    PreparedStatementLimits, RawDataOperation, RawDataTarget, RequestContext, ResultLimits,
-    ResultSet, Routed, RowProducer, RowStream, Session, SessionInner, ShutdownReport,
-    TablePlacement, TransactionExecution, Value, merge_scatter_results, wait_for_cancellation,
-    wait_pending,
+    EngineState, Executed, GlobalIndexOperationalReport, Lifecycle, LogicalDatabaseId,
+    OperationControl, OperationLease, PortalId, PrepareRequest, PreparedExecution,
+    PreparedStatementDescription, PreparedStatementId, PreparedStatementLimits, RawDataOperation,
+    RawDataTarget, RequestContext, ResultLimits, ResultSet, Routed, RowProducer, RowStream,
+    Session, SessionInner, ShutdownReport, TablePlacement, TransactionExecution, Value,
+    merge_scatter_results, wait_for_cancellation, wait_pending,
 };
 use crate::{
     sql,
@@ -198,10 +198,98 @@ fn checkpoint_shard_report(
     })
 }
 
-/// Ordered result of a passive checkpoint across every physical shard.
+/// A non-shard SQLite database included in an engine checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CheckpointDatabase {
+    /// The catalog, routing, schema, and generated-ID manifest.
+    Manifest,
+    /// Global-index entries, reservations, leases, repairs, cursors, and watermarks.
+    GlobalIndex,
+}
+
+impl CheckpointDatabase {
+    /// Return the stable machine-readable database name.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::GlobalIndex => "global_index",
+        }
+    }
+}
+
+/// Result of one passive WAL checkpoint on an auxiliary SQLite database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointDatabaseReport {
+    database: CheckpointDatabase,
+    busy: bool,
+    counts_available: bool,
+    wal_frames: u64,
+    checkpointed_frames: u64,
+}
+
+impl CheckpointDatabaseReport {
+    pub(crate) fn new(
+        database: CheckpointDatabase,
+        busy: i64,
+        wal_frames: i64,
+        checkpointed_frames: i64,
+    ) -> EngineResult<Self> {
+        if wal_frames == -1 && checkpointed_frames == -1 && busy != 0 {
+            return Ok(Self {
+                database,
+                busy: true,
+                counts_available: false,
+                wal_frames: 0,
+                checkpointed_frames: 0,
+            });
+        }
+        let wal_frames = u64::try_from(wal_frames).map_err(|_| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "SQLite returned an invalid auxiliary WAL frame count",
+            )
+        })?;
+        let checkpointed_frames = u64::try_from(checkpointed_frames).map_err(|_| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "SQLite returned an invalid auxiliary checkpointed frame count",
+            )
+        })?;
+        Ok(Self {
+            database,
+            busy: busy != 0,
+            counts_available: true,
+            wal_frames,
+            checkpointed_frames,
+        })
+    }
+
+    pub const fn database(self) -> CheckpointDatabase {
+        self.database
+    }
+    pub const fn busy(self) -> bool {
+        self.busy
+    }
+    pub const fn counts_available(self) -> bool {
+        self.counts_available
+    }
+    pub const fn wal_frames(self) -> u64 {
+        self.wal_frames
+    }
+    pub const fn checkpointed_frames(self) -> u64 {
+        self.checkpointed_frames
+    }
+    pub const fn complete(self) -> bool {
+        self.counts_available && self.checkpointed_frames >= self.wal_frames
+    }
+}
+
+/// Ordered result of a passive checkpoint across all BriskDB SQLite files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointReport {
     shards: Vec<CheckpointShardReport>,
+    databases: Vec<CheckpointDatabaseReport>,
 }
 
 impl CheckpointReport {
@@ -210,14 +298,21 @@ impl CheckpointReport {
         &self.shards
     }
 
-    /// Return whether any shard reported incomplete checkpoint progress.
-    pub fn busy(&self) -> bool {
-        self.shards.iter().any(|shard| shard.busy())
+    /// Return the manifest and optional global-index database reports.
+    pub fn databases(&self) -> &[CheckpointDatabaseReport] {
+        &self.databases
     }
 
-    /// Return whether every shard checkpoint copied all frames it observed.
+    /// Return whether any managed SQLite file reported incomplete progress.
+    pub fn busy(&self) -> bool {
+        self.shards.iter().any(|shard| shard.busy())
+            || self.databases.iter().any(|database| database.busy())
+    }
+
+    /// Return whether every managed SQLite file copied all frames it observed.
     pub fn complete(&self) -> bool {
         self.shards.iter().all(|shard| shard.complete())
+            && self.databases.iter().all(|database| database.complete())
     }
 }
 
@@ -912,6 +1007,51 @@ impl Engine {
         operation.finish(result)
     }
 
+    /// Inspect redaction-safe global-index health and operational counters.
+    pub async fn global_index_operational_report(
+        &self,
+    ) -> EngineResult<GlobalIndexOperationalReport> {
+        self.global_index_operational_report_with_context(RequestContext::new())
+            .await
+    }
+
+    /// Inspect global-index operations with host-supplied request controls.
+    pub async fn global_index_operational_report_with_context(
+        &self,
+        context: RequestContext,
+    ) -> EngineResult<GlobalIndexOperationalReport> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if let Err(error) = operation.check_before_start() {
+            return operation.finish(Err(error));
+        }
+        let lease = operation.take_lease();
+        let worker_control = Arc::clone(&operation.control);
+        let storage = self.inner.database.storage.clone();
+        let storage_for_corruption = storage.clone();
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _schema_operation = schema_operation;
+            let result = storage.global_index_operational_report();
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                storage_for_corruption.record_schema_degraded();
+            }
+            worker_control.complete(result)
+        });
+        let result = operation.wait_started(join).await;
+        operation.finish_started(result)
+    }
+
     /// Ask SQLite to passively checkpoint every shard without blocking writers.
     ///
     /// The operation participates in ordinary engine admission, cancellation,
@@ -954,6 +1094,7 @@ impl Engine {
         let lease = operation.take_lease();
         let control = Arc::clone(&operation.control);
         let worker_control = Arc::clone(&control);
+        let storage = self.inner.database.storage.clone();
         let join = worker.spawn(move || {
             let _lease = lease;
             let _schema_operation = schema_operation;
@@ -992,7 +1133,10 @@ impl Engine {
                         })
                 })
                 .collect::<EngineResult<Vec<_>>>()
-                .map(|shards| CheckpointReport { shards });
+                .and_then(|shards| {
+                    let databases = storage.checkpoint_auxiliary_databases()?;
+                    Ok(CheckpointReport { shards, databases })
+                });
             worker_control.complete(result)
         });
         let result = operation.wait_started(join).await;

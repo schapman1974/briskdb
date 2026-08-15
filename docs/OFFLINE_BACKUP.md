@@ -12,22 +12,27 @@ issue #67.
 
 ## Backup
 
-1. Record the BriskDB version, configured shard count, and absolute data
+1. Optionally ask the running engine to perform a passive checkpoint and inspect
+   every returned shard plus the `manifest` and optional `global_index`
+   database report. Retry a `busy`/incomplete report if reducing retained WAL
+   is important. This is preparation only: it does not make a live copy safe
+   or establish a cross-file recovery point.
+2. Record the BriskDB version, configured shard count, and absolute data
    directory path.
-2. Stop every BriskDB server and embedded application cleanly and wait for each
+3. Stop every BriskDB server and embedded application cleanly and wait for each
    to exit. A service manager must report its service stopped before copying.
-3. Verify that no other BriskDB process or embedder is using the directory.
-4. Copy the complete data directory into a new backup directory. Include
+4. Verify that no other BriskDB process or embedder is using the directory.
+5. Copy the complete data directory into a new backup directory. Include
    `manifest.sqlite`, the entire `shards` directory, the entire
    `global-indexes` directory when present, the import receipt when present,
    `.briskdb-process.lock`, `.briskdb-startup.lock`, and every SQLite `-wal`,
    `-shm`, or journal sidecar that exists. The lock files contain no persistent
    ownership, but a complete-directory copy includes them. Do not select
    individual database files.
-5. Make the backup durable using the snapshot, archive, or copy tool's normal
+6. Make the backup durable using the snapshot, archive, or copy tool's normal
    completion and sync guarantees. Retain the recorded BriskDB version and
    shard count with the backup.
-6. Restart servers and embedders only after the copy has completed.
+7. Restart servers and embedders only after the copy has completed.
 
 On the supported Linux platform, one simple local-filesystem copy is:
 
@@ -72,9 +77,13 @@ For release upgrades and rollback, follow the additional requirements in the
 ## Automated evidence
 
 `tests/offline_backup.rs` creates schema and one routed row on every shard,
-builds and validates a global index, performs explicit engine shutdown, copies
-the complete layout through a backup directory into a new root, reopens it, and
-verifies the schema generation, global-index authority, physical route, and row
-value for every shard. The test freezes the stopped-copy contract but does not
-claim online snapshot safety or certify a particular third-party backup
-product.
+builds unique, non-unique, and integer-value global indexes, then preserves a
+lagging outbox/watermark, live unique reservation, completed value lease,
+summary state, and a later indexed row. It checks the complete shard/manifest/
+global-index checkpoint report, performs explicit shutdown, copies the whole
+layout through a backup directory into a new root, and reopens it. Restore
+releases the reservation, proves the next range does not reuse IDs, catches up
+the async index, rebuilds and fully validates every index, and reads all known
+rows. The test freezes the stopped-copy contract but does not claim online
+snapshot safety or certify a third-party backup product. The broader fault and
+performance evidence is in the [global-index release gate](GLOBAL_INDEX_RELEASE_GATE.md).

@@ -1088,6 +1088,8 @@ mod tests {
 
     use rusqlite::Connection;
 
+    use super::{Storage, acquire_lease, validate_lease};
+
     use crate::{
         Statement, Value,
         core::{
@@ -1234,6 +1236,53 @@ mod tests {
                 .iter()
                 .all(|shard| shard.poison_cursor().is_none())
         );
+    }
+
+    #[test]
+    fn clock_jumps_cannot_revive_a_stale_async_lease_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let (index_id, _) = setup(temp.path());
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let index = storage
+            .logical_catalog()
+            .global_index_by_id(index_id)
+            .unwrap()
+            .clone();
+        let first_owner = [1_u8; 16];
+        let second_owner = [2_u8; 16];
+        let first = acquire_lease(&storage, &index, 0, first_owner, 100, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.fence, 1);
+        assert!(
+            acquire_lease(&storage, &index, 0, second_owner, 100, 0)
+                .unwrap()
+                .is_none(),
+            "a backward clock jump must conservatively retain the current lease"
+        );
+        let replacement = acquire_lease(&storage, &index, 0, second_owner, 100, 111)
+            .unwrap()
+            .unwrap();
+        assert!(replacement.fence > first.fence);
+
+        let mut authority =
+            Connection::open(temp.path().join("global-indexes/global.sqlite")).unwrap();
+        let transaction = authority.transaction().unwrap();
+        assert_eq!(
+            validate_lease(&transaction, index_id, 0, first_owner, first.fence, 50,)
+                .unwrap_err()
+                .kind(),
+            crate::core::EngineErrorKind::Busy
+        );
+        validate_lease(
+            &transaction,
+            index_id,
+            0,
+            second_owner,
+            replacement.fence,
+            112,
+        )
+        .unwrap();
     }
 
     #[test]

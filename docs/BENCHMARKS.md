@@ -70,6 +70,36 @@ results. The local SQLite secondary index makes individual child lookups cheap,
 but `indexed_hit` and `indexed_miss` still visit 2/4/10/64 shards respectively;
 future gains therefore cannot be mistaken for cache-only improvements.
 
+Issue #239 adds an `after` mode that builds a non-unique lookup index and a
+unique constraint index before running the identical matrix. It includes the
+global authority WAL in storage telemetry, runs `quick_check` on that file,
+requires every indexed hit and miss to visit exactly one shard, and writes a
+complete report through `BRISKDB_BENCH_OUTPUT`. A miss still compiles one shard
+to preserve exact result metadata.
+
+```bash
+BRISKDB_BENCH_OUTPUT=/tmp/global-index-before.tsv \
+  cargo test --release --locked --test global_index_baseline \
+  release_global_index_baseline -- \
+  --ignored --exact --test-threads=1
+
+BRISKDB_BENCH_COMPARE=/tmp/global-index-before.tsv \
+BRISKDB_BENCH_OUTPUT=/tmp/global-index-after.tsv \
+  cargo test --release --locked --test global_index_baseline \
+  release_global_index_after -- \
+  --ignored --exact --nocapture --test-threads=1
+```
+
+The committed same-host artifacts are the
+[#239 before rerun](benchmarks/global-index-before-239-2026-08-15.tsv) and
+the [after run](benchmarks/global-index-after-2026-08-15.tsv). They prove exact
+result/constraint parity and 2/4/10/64-to-1 shard avoidance, but they do not
+show an end-to-end speedup: durable freshness/summary inspection dominates
+this small hot-cache fixture. Global indexes therefore remain an explicit
+experimental alpha feature while that metadata path and write coordination are
+optimized. Exact measurements, accepted guardrails, and the release decision
+are in the [global-index production gate](GLOBAL_INDEX_RELEASE_GATE.md).
+
 The Criterion `global_index_routing/*` group records the new authority-planning
 cost for a rotating hit, a miss, a repeated hot key, and a four-key `IN`
 lookup:

@@ -1,3 +1,19 @@
+# Unreleased
+
+Global indexes now have a production/release gate: redaction-safe Rust health
+reports, richer `/health` and `/v1/admin/global-indexes` responses, Prometheus
+`/metrics`, complete shard/manifest/global-index checkpoint reporting, and a
+restore test covering reservations, value sequences, outboxes, watermarks, and
+summaries. Dedicated fault, clock, disk-full, crash-boundary, and mixed
+multi-process soak suites run through a manual GitHub workflow.
+
+The same-host 2/4/10/64-shard before/after matrix confirms identical results
+and constraints while indexed hits/misses execute on one shard. It also finds
+that current freshness/summary inspection and write coordination are slower
+than the direct hot-cache baseline. Global indexes therefore remain explicit,
+experimental alpha functionality and are not yet recommended for
+latency-sensitive production use. See `docs/GLOBAL_INDEX_RELEASE_GATE.md`.
+
 # BriskDB 0.1.0-alpha.5
 
 Alpha 5 lets independently started BriskDB server, Rust, and Python processes
