@@ -30,7 +30,7 @@ server ---------> protocol::http
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
 | `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, generated-ID policy and codec types, canonical global-index keys, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, logical Sharded read target selection and scatter/gather, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
-| `storage` | Versioned routing and authoritative logical manifest, persisted generated-ID policy/activation, stable active/retired allocation-owner slots, durable per-table hi/lo block leases, recoverable one-time table provisioning, shard layout, migration journals and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
+| `storage` | Versioned routing and authoritative logical/global-index manifest, persisted generated-ID policy/activation, stable active/retired allocation-owner slots, durable per-table hi/lo block leases, recoverable one-time table provisioning, shard layout, migration journals and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `import` | Offline source-schema preflight, explicit placement and generated-ID plan validation, exact-value row routing into private staging, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, generated-ID inference, implicit Global placement, or protocol-specific behavior |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
 | `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
@@ -324,9 +324,10 @@ this core boundary after converting to protocol-neutral values. The exact
 format and compatibility rules are in [canonical global-index
 keys](INDEX_KEY_ENCODING.md).
 
-Issue #227 introduces only this public codec. It adds no manifest record or
-global-index file; the catalog lifecycle in issue #228 is the first consumer
-that may persist its version.
+Version 13 persists this codec version with each global-index definition. The
+catalog records stable identity, owning table, key parts, uniqueness and NULL
+semantics, predicate, schema generation, lifecycle, and selected topology; it
+does not yet create a global-index file or route a query through one.
 
 ### Bound statement-planning boundary
 
@@ -527,6 +528,20 @@ infer authority. The v11-to-v12 migration itself is manifest-only: it adds an
 empty bridge table, raises the downgrade fence, advances the semantic root to
 version 5, and changes no shard or application row.
 
+Version 13 adds `briskdb_global_indexes` and
+`briskdb_global_index_parts` plus manifest digest version 6. Definitions retain
+stable identity, owning table, ordered key parts, uniqueness/NULL semantics,
+predicate, schema generation, canonical key encoding, lifecycle, and selected
+topology. Create, lifecycle transition, and removal each replace the validated
+catalog snapshot only after one checksummed `BEGIN IMMEDIATE` commit. The
+durable states are `Creating`, `Ready`, `Invalid`, `Rebuilding`, and
+`Dropping`; ready/rebuilding definitions require a versioned topology and the
+current schema generation. Schema migration is fenced while any definition
+exists. Read-only inspection validates without initializing or upgrading.
+Writers use the existing sole-process mutation fence, while concurrent readers
+see only complete SQLite snapshots. The v12-to-v13 migration creates empty
+catalog tables and changes no shard; physical construction starts in #229/#230.
+
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4
 migration remains manifest-atomic. The v4-to-v5 step first validates the v4
@@ -554,6 +569,8 @@ The v10-to-v11 step is likewise manifest-only: it creates the empty durable
 hi/lo allocation table, raises the fence, and installs checksum version 4.
 The v11-to-v12 step adds the empty durable generated-table DDL bridge, raises
 the fence, and installs checksum version 5 without changing a shard.
+The v12-to-v13 step adds the empty durable global-index catalog, raises the
+fence, and installs checksum version 6 without changing a shard.
 There is no automatic downgrade; an older binary requires a backup from before
 the newer format.
 
@@ -582,7 +599,7 @@ lock through independently durable per-shard work and `Ready` publication. A
 lagging opener re-reads `Ready` and strictly validates instead of provisioning
 from a stale `Creating` observation. Only a locked, durable `Creating` state
 permits missing canonical shard files to be created and WAL to be enabled. The
-validated v12 manifest may also retain one generated-table DDL bridge and one
+validated v13 manifest may also retain one generated-table DDL bridge and one
 matching active table-provisioning record. Startup first resumes any
 `Applying` physical migration under its ordinary exact-prefix rules. It then
 keeps admission `Pending`, advances the bridge from `ApplyingPhysical` to

@@ -12,11 +12,15 @@ use crate::{
     core::{
         AllocationOwnerMap, BUCKET_ALGORITHM_VERSION, Catalog, CatalogSnapshot,
         DEFAULT_LOGICAL_DATABASE_ID, DEFAULT_LOGICAL_DATABASE_NAME, EngineError, EngineErrorKind,
-        EngineResult, GeneratedIdPolicy, HASH_VERSION, IDENTIFIER_ENCODING_VERSION,
-        INITIAL_MAP_GENERATION, KEY_ENCODING_VERSION, LogicalDatabaseId, LogicalDatabaseMetadata,
+        EngineResult, GeneratedIdPolicy, GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart,
+        GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata,
+        GlobalIndexStorageTopology, HASH_VERSION, IDENTIFIER_ENCODING_VERSION,
+        INDEX_KEY_ENCODING_VERSION, INITIAL_MAP_GENERATION, IndexKeyCollation, IndexKeyOrder,
+        IndexNullOrder, KEY_ENCODING_VERSION, LogicalDatabaseId, LogicalDatabaseMetadata,
+        MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_SQL_BYTES, MAX_GLOBAL_INDEXES,
         MAX_LOGICAL_DATABASES, MAX_TABLES, RoutingCatalog, ShardKeyMetadata, ShardKeyType,
-        TableDeclaration, TableId, TableMetadata, TablePlacement, VIRTUAL_BUCKET_COUNT,
-        initial_physical_shard, validate_catalog_identifier,
+        TableDeclaration, TableId, TableMetadata, TablePlacement, UniqueNullSemantics,
+        VIRTUAL_BUCKET_COUNT, initial_physical_shard, validate_catalog_identifier,
     },
     sql::SqlDialect,
     sqlite_error,
@@ -41,7 +45,8 @@ const V9_SCHEMA_VERSION: u32 = 9;
 const V10_SCHEMA_VERSION: u32 = 10;
 const V11_SCHEMA_VERSION: u32 = 11;
 const V12_SCHEMA_VERSION: u32 = 12;
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = V12_SCHEMA_VERSION;
+const V13_SCHEMA_VERSION: u32 = 13;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = V13_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
 
 pub(super) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = 65_536;
@@ -55,12 +60,14 @@ const V2_MANIFEST_DIGEST_VERSION: u32 = 2;
 const V3_MANIFEST_DIGEST_VERSION: u32 = 3;
 const V4_MANIFEST_DIGEST_VERSION: u32 = 4;
 const V5_MANIFEST_DIGEST_VERSION: u32 = 5;
+const V6_MANIFEST_DIGEST_VERSION: u32 = 6;
 pub(super) const SCHEMA_DIGEST_VERSION: u32 = 1;
 const V1_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v1\0";
 const V2_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v2\0";
 const V3_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v3\0";
 const V4_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v4\0";
 const V5_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v5\0";
+const V6_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v6\0";
 const TABLE_PROVISIONING_DIGEST_DOMAIN: &[u8] = b"briskdb.table-provisioning.v1\0";
 const GENERATED_TABLE_DDL_DIGEST_DOMAIN: &[u8] = b"briskdb.generated-table-ddl.v1\0";
 
@@ -99,6 +106,34 @@ const MAX_ALLOCATION_OWNER_SLOT: i64 = 1_023;
 const ALLOCATION_OWNER_ACTIVE: i64 = 1;
 const ALLOCATION_OWNER_RETIRED: i64 = 2;
 
+const GLOBAL_INDEX_CREATING: i64 = 1;
+const GLOBAL_INDEX_READY: i64 = 2;
+const GLOBAL_INDEX_INVALID: i64 = 3;
+const GLOBAL_INDEX_REBUILDING: i64 = 4;
+const GLOBAL_INDEX_DROPPING: i64 = 5;
+const GLOBAL_INDEX_NON_UNIQUE: i64 = 0;
+const GLOBAL_INDEX_UNIQUE: i64 = 1;
+const GLOBAL_INDEX_NULLS_DISTINCT: i64 = 1;
+const GLOBAL_INDEX_NULLS_NOT_DISTINCT: i64 = 2;
+const GLOBAL_INDEX_TOPOLOGY_UNASSIGNED: i64 = 0;
+const GLOBAL_INDEX_TOPOLOGY_SHARED_SQLITE: i64 = 1;
+const GLOBAL_INDEX_TOPOLOGY_HASH_PARTITIONED_SQLITE: i64 = 2;
+const GLOBAL_INDEX_SOURCE_COLUMN: i64 = 1;
+const GLOBAL_INDEX_SOURCE_EXPRESSION: i64 = 2;
+const GLOBAL_INDEX_KEY_BOOLEAN: i64 = 1;
+const GLOBAL_INDEX_KEY_INT64: i64 = 2;
+const GLOBAL_INDEX_KEY_UINT64: i64 = 3;
+const GLOBAL_INDEX_KEY_FLOAT64: i64 = 4;
+const GLOBAL_INDEX_KEY_DATE: i64 = 5;
+const GLOBAL_INDEX_KEY_TIMESTAMP: i64 = 6;
+const GLOBAL_INDEX_KEY_TEXT: i64 = 7;
+const GLOBAL_INDEX_KEY_BINARY: i64 = 8;
+const GLOBAL_INDEX_ASCENDING: i64 = 1;
+const GLOBAL_INDEX_DESCENDING: i64 = 2;
+const GLOBAL_INDEX_NULLS_FIRST: i64 = 1;
+const GLOBAL_INDEX_NULLS_LAST: i64 = 2;
+const GLOBAL_INDEX_BINARY_COLLATION: i64 = 1;
+
 const ACTIVE_LIFECYCLE_STATE: &str = "active";
 
 #[cfg(test)]
@@ -121,6 +156,13 @@ fn abort_table_registration_at_test_boundary(boundary: &str) {
 #[cfg(test)]
 fn abort_hilo_lease_at_test_boundary(boundary: &str) {
     if std::env::var("BRISKDB_HILO_LEASE_ABORT_POINT").as_deref() == Ok(boundary) {
+        std::process::abort();
+    }
+}
+
+#[cfg(test)]
+fn abort_global_index_at_test_boundary(boundary: &str) {
+    if std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_POINT").as_deref() == Ok(boundary) {
         std::process::abort();
     }
 }
@@ -176,6 +218,10 @@ const V11_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
 const V12_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
         CHECK (requires_manifest_version >= 12)
+) STRICT";
+const V13_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 13)
 ) STRICT";
 const V3_ROUTING_TABLE_SQL: &str = "CREATE TABLE briskdb_routing (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -574,6 +620,62 @@ const V12_GENERATED_TABLE_DDL_TABLE_SQL: &str = "CREATE TABLE briskdb_generated_
             AND table_id IS NOT NULL
         )
     )
+) STRICT";
+const V13_GLOBAL_INDEXES_TABLE_SQL: &str = "CREATE TABLE briskdb_global_indexes (
+    index_id INTEGER PRIMARY KEY CHECK (index_id > 0),
+    table_id INTEGER NOT NULL,
+    index_name TEXT NOT NULL COLLATE BINARY
+        CHECK (
+            length(index_name) BETWEEN 1 AND 63
+            AND instr(index_name, char(0)) = 0
+            AND index_name NOT GLOB '*[^a-z0-9_]*'
+            AND substr(index_name, 1, 1) GLOB '[a-z_]'
+            AND index_name <> 'briskdb'
+            AND index_name NOT GLOB 'briskdb_*'
+            AND index_name NOT GLOB 'sqlite_*'
+        ),
+    is_unique INTEGER NOT NULL CHECK (is_unique IN (0, 1)),
+    null_semantics INTEGER NOT NULL CHECK (null_semantics > 0),
+    predicate_sql TEXT
+        CHECK (
+            predicate_sql IS NULL
+            OR (
+                typeof(predicate_sql) = 'text'
+                AND length(CAST(predicate_sql AS BLOB)) BETWEEN 1 AND 4096
+                AND instr(predicate_sql, char(0)) = 0
+            )
+        ),
+    lifecycle_state INTEGER NOT NULL CHECK (lifecycle_state > 0),
+    key_encoding_version INTEGER NOT NULL CHECK (key_encoding_version > 0),
+    schema_generation INTEGER NOT NULL
+        CHECK (schema_generation BETWEEN 0 AND 2147483647),
+    topology_kind INTEGER NOT NULL CHECK (topology_kind >= 0),
+    topology_version INTEGER NOT NULL CHECK (topology_version >= 0),
+    partition_count INTEGER NOT NULL CHECK (partition_count BETWEEN 0 AND 256),
+    UNIQUE (table_id, index_name),
+    FOREIGN KEY (table_id)
+        REFERENCES briskdb_tables (table_id)
+        ON DELETE RESTRICT,
+    CHECK (is_unique = 1 OR null_semantics = 1)
+) STRICT";
+const V13_GLOBAL_INDEX_PARTS_TABLE_SQL: &str = "CREATE TABLE briskdb_global_index_parts (
+    index_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 15),
+    source_kind INTEGER NOT NULL CHECK (source_kind > 0),
+    source_text TEXT NOT NULL COLLATE BINARY
+        CHECK (
+            typeof(source_text) = 'text'
+            AND length(CAST(source_text AS BLOB)) BETWEEN 1 AND 4096
+            AND instr(source_text, char(0)) = 0
+        ),
+    key_type INTEGER NOT NULL CHECK (key_type > 0),
+    sort_order INTEGER NOT NULL CHECK (sort_order > 0),
+    null_order INTEGER NOT NULL CHECK (null_order > 0),
+    collation_version INTEGER NOT NULL CHECK (collation_version > 0),
+    PRIMARY KEY (index_id, ordinal),
+    FOREIGN KEY (index_id)
+        REFERENCES briskdb_global_indexes (index_id)
+        ON DELETE CASCADE
 ) STRICT";
 const V5_SHARD_LAYOUT_TABLE_SQL: &str = "CREATE TABLE briskdb_shard_layout (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1129,6 +1231,13 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v11_to_v12,
         validate: validate_v12,
     },
+    Migration {
+        from: V12_SCHEMA_VERSION,
+        to: V13_SCHEMA_VERSION,
+        name: "global_index_catalog_and_lifecycle",
+        apply: migrate_v12_to_v13,
+        validate: validate_v13,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -1142,8 +1251,8 @@ struct MigrationPlan<'a> {
 const CURRENT_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: CURRENT_SCHEMA_VERSION,
     migrations: MIGRATIONS,
-    initialize_current: create_v12_schema,
-    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v12,
+    initialize_current: create_v13_schema,
+    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v13,
 };
 
 // Startup uses this frozen plan only to finish an already-active v6 journal
@@ -2756,7 +2865,9 @@ pub(super) fn inspect_with_v9_plan_for_test(
 fn downgrade_v10_manifest_to_v9_for_test(connection: &Connection) -> EngineResult<()> {
     connection
         .execute_batch(
-            "DROP TABLE IF EXISTS briskdb_hilo_leases;
+            "DROP TABLE IF EXISTS briskdb_global_index_parts;
+             DROP TABLE IF EXISTS briskdb_global_indexes;
+             DROP TABLE IF EXISTS briskdb_hilo_leases;
              DROP TABLE IF EXISTS briskdb_generated_table_ddl;
              DROP TABLE briskdb_table_provisioning_declarations;
              DROP TABLE briskdb_table_provisioning;
@@ -2817,9 +2928,12 @@ fn downgrade_v11_manifest_to_v10_for_test(
     connection: &Connection,
     shard_count: u16,
 ) -> EngineResult<()> {
+    if read_identity(connection)?.1 >= i64::from(V12_SCHEMA_VERSION) {
+        downgrade_v12_manifest_to_v11_for_test(connection, shard_count)?;
+    }
     connection
         .execute_batch(
-            "DROP TABLE briskdb_generated_table_ddl;
+            "DROP TABLE IF EXISTS briskdb_generated_table_ddl;
              DROP TABLE briskdb_hilo_leases;
              DROP TABLE briskdb_metadata;",
         )
@@ -2850,6 +2964,9 @@ fn downgrade_v12_manifest_to_v11_for_test(
     connection: &Connection,
     shard_count: u16,
 ) -> EngineResult<()> {
+    if read_identity(connection)?.1 == i64::from(V13_SCHEMA_VERSION) {
+        downgrade_v13_manifest_to_v12_for_test(connection, shard_count)?;
+    }
     connection
         .execute_batch(
             "DROP TABLE briskdb_generated_table_ddl;
@@ -2874,6 +2991,39 @@ fn downgrade_v12_manifest_to_v11_for_test(
     set_identity(connection, V11_SCHEMA_VERSION)?;
     refresh_manifest_digest(connection)?;
     validate_v11(connection, shard_count, &schema_objects(connection)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn downgrade_v13_manifest_to_v12_for_test(
+    connection: &Connection,
+    shard_count: u16,
+) -> EngineResult<()> {
+    connection
+        .execute_batch(
+            "DROP TABLE briskdb_global_index_parts;
+             DROP TABLE briskdb_global_indexes;
+             DROP TABLE briskdb_metadata;",
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(V12_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V12_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "UPDATE briskdb_integrity SET manifest_digest_version = ?1 WHERE singleton = 1",
+            [V5_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    set_identity(connection, V12_SCHEMA_VERSION)?;
+    refresh_manifest_digest(connection)?;
+    validate_v12(connection, shard_count, &schema_objects(connection)?)?;
     Ok(())
 }
 
@@ -3524,6 +3674,418 @@ where
         ));
     }
     Ok(replacement)
+}
+
+/// Atomically add one checksummed global-index definition in `Creating` state.
+pub(super) fn create_global_index<F>(
+    connection: &mut Connection,
+    requested_shards: u16,
+    declaration: &GlobalIndexDeclaration,
+    on_commit_attempted: F,
+) -> EngineResult<(CatalogSnapshot, GlobalIndexId)>
+where
+    F: FnOnce(),
+{
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let current = current_manifest_snapshot(&transaction, requested_shards)?;
+    ensure_global_index_catalog_ready(&current)?;
+    let catalog = current.logical_catalog.as_ref().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "global-index creation omitted the logical catalog",
+        )
+    })?;
+    let Some(table) = catalog.table_by_id(declaration.table_id()) else {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            format!(
+                "global index {} references unknown table {}",
+                declaration.name(),
+                declaration.table_id()
+            ),
+        ));
+    };
+    if !matches!(table.placement(), TablePlacement::Sharded(_)) {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "global indexes currently require Sharded table placement",
+        ));
+    }
+    if catalog.global_indexes().len() >= MAX_GLOBAL_INDEXES {
+        return Err(EngineError::new(
+            EngineErrorKind::LimitExceeded,
+            format!("global-index catalog has reached its {MAX_GLOBAL_INDEXES}-entry limit"),
+        ));
+    }
+    if let Some(existing) = catalog.global_indexes().iter().find(|index| {
+        index.table_id() == declaration.table_id() && index.name() == declaration.name()
+    }) {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "global index {} already exists with ID {} and lifecycle {:?}",
+                declaration.name(),
+                existing.id(),
+                existing.lifecycle()
+            ),
+        ));
+    }
+
+    let index_id = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(index_id), 0) FROM briskdb_global_indexes",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| manifest_read_error(error, "failed to allocate a global-index ID"))?
+        .checked_add(1)
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::NumericOutOfRange,
+                "global-index ID space is exhausted",
+            )
+        })?;
+    let table_id = i64::try_from(declaration.table_id().get()).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::NumericOutOfRange,
+            "global-index table ID does not fit in SQLite",
+            error,
+        )
+    })?;
+    let (topology_kind, topology_version, partition_count) =
+        declaration.topology().persisted_parts();
+    transaction
+        .execute(
+            "INSERT INTO briskdb_global_indexes (
+                index_id, table_id, index_name, is_unique, null_semantics,
+                predicate_sql, lifecycle_state, key_encoding_version,
+                schema_generation, topology_kind, topology_version, partition_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                index_id,
+                table_id,
+                declaration.name(),
+                if declaration.is_unique() {
+                    GLOBAL_INDEX_UNIQUE
+                } else {
+                    GLOBAL_INDEX_NON_UNIQUE
+                },
+                encode_unique_null_semantics(declaration.null_semantics()),
+                declaration.predicate(),
+                GLOBAL_INDEX_CREATING,
+                INDEX_KEY_ENCODING_VERSION,
+                i64::try_from(catalog.schema_generation()).expect("schema generation fits SQLite"),
+                topology_kind,
+                topology_version,
+                partition_count,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO briskdb_global_index_parts (
+                    index_id, ordinal, source_kind, source_text, key_type,
+                    sort_order, null_order, collation_version
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )
+            .map_err(sqlite_error::storage)?;
+        for (ordinal, part) in declaration.key_parts().iter().enumerate() {
+            insert
+                .execute(rusqlite::params![
+                    index_id,
+                    i64::try_from(ordinal).expect("global-index ordinal fits SQLite"),
+                    part.source().kind_code(),
+                    part.source().source(),
+                    encode_global_index_key_type(part.key_type()),
+                    encode_global_index_order(part.order()),
+                    encode_global_index_null_order(part.null_order()),
+                    encode_global_index_collation(part.collation()),
+                ])
+                .map_err(sqlite_error::storage)?;
+        }
+    }
+    refresh_manifest_digest(&transaction)?;
+    let replacement = current_manifest_snapshot(&transaction, requested_shards)?;
+    let persisted_id = GlobalIndexId::from_validated(
+        u64::try_from(index_id).expect("positive global-index ID fits u64"),
+    );
+    if replacement
+        .logical_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.global_index_by_id(persisted_id))
+        .is_none_or(|index| index.lifecycle() != GlobalIndexLifecycle::Creating)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "global-index creation did not persist its complete Creating definition",
+        ));
+    }
+    let replacement = catalog_snapshot_from_manifest(replacement)?;
+    on_commit_attempted();
+    #[cfg(test)]
+    abort_global_index_at_test_boundary("create-before-commit");
+    transaction.commit().map_err(sqlite_error::storage)?;
+    #[cfg(test)]
+    abort_global_index_at_test_boundary("create-after-commit");
+    Ok((replacement, persisted_id))
+}
+
+/// Atomically apply one validated lifecycle transition.
+pub(super) fn transition_global_index<F>(
+    connection: &mut Connection,
+    requested_shards: u16,
+    index_id: GlobalIndexId,
+    target: GlobalIndexLifecycle,
+    on_commit_attempted: F,
+) -> EngineResult<CatalogSnapshot>
+where
+    F: FnOnce(),
+{
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let current = current_manifest_snapshot(&transaction, requested_shards)?;
+    ensure_global_index_catalog_ready(&current)?;
+    let catalog = current.logical_catalog.as_ref().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "global-index transition omitted the logical catalog",
+        )
+    })?;
+    let existing = catalog.global_index_by_id(index_id).ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            format!("global index {index_id} does not exist"),
+        )
+    })?;
+    if !existing.lifecycle().can_transition_to(target) {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "global index {index_id} cannot transition from {:?} to {target:?}",
+                existing.lifecycle()
+            ),
+        ));
+    }
+    if matches!(
+        target,
+        GlobalIndexLifecycle::Ready | GlobalIndexLifecycle::Rebuilding
+    ) && existing.topology() == GlobalIndexStorageTopology::Unassigned
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("global index {index_id} cannot become {target:?} without a storage topology"),
+        ));
+    }
+    if matches!(
+        target,
+        GlobalIndexLifecycle::Ready | GlobalIndexLifecycle::Rebuilding
+    ) && existing.schema_generation() != catalog.schema_generation()
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "global index {index_id} belongs to schema generation {}, not current generation {}",
+                existing.schema_generation(),
+                catalog.schema_generation()
+            ),
+        ));
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE briskdb_global_indexes
+             SET lifecycle_state = ?1
+             WHERE index_id = ?2 AND lifecycle_state = ?3",
+            rusqlite::params![
+                encode_global_index_lifecycle(target),
+                i64::try_from(index_id.get()).map_err(|error| {
+                    EngineError::from_source(
+                        EngineErrorKind::NumericOutOfRange,
+                        "global-index ID does not fit in SQLite",
+                        error,
+                    )
+                })?,
+                encode_global_index_lifecycle(existing.lifecycle()),
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    if changed != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::Busy,
+            format!("global index {index_id} changed concurrently; reload the catalog and retry"),
+        ));
+    }
+    refresh_manifest_digest(&transaction)?;
+    let replacement = current_manifest_snapshot(&transaction, requested_shards)?;
+    if replacement
+        .logical_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.global_index_by_id(index_id))
+        .is_none_or(|index| index.lifecycle() != target)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "global-index lifecycle transition did not persist",
+        ));
+    }
+    let replacement = catalog_snapshot_from_manifest(replacement)?;
+    on_commit_attempted();
+    #[cfg(test)]
+    abort_global_index_at_test_boundary("transition-before-commit");
+    transaction.commit().map_err(sqlite_error::storage)?;
+    #[cfg(test)]
+    abort_global_index_at_test_boundary("transition-after-commit");
+    Ok(replacement)
+}
+
+/// Remove a definition only after its durable `Dropping` phase is visible.
+pub(super) fn remove_global_index<F>(
+    connection: &mut Connection,
+    requested_shards: u16,
+    index_id: GlobalIndexId,
+    on_commit_attempted: F,
+) -> EngineResult<CatalogSnapshot>
+where
+    F: FnOnce(),
+{
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let current = current_manifest_snapshot(&transaction, requested_shards)?;
+    ensure_global_index_catalog_ready(&current)?;
+    let existing = current
+        .logical_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.global_index_by_id(index_id))
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!("global index {index_id} does not exist"),
+            )
+        })?;
+    if existing.lifecycle() != GlobalIndexLifecycle::Dropping {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("global index {index_id} must enter Dropping before removal"),
+        ));
+    }
+    let changed = transaction
+        .execute(
+            "DELETE FROM briskdb_global_indexes
+             WHERE index_id = ?1 AND lifecycle_state = ?2",
+            rusqlite::params![
+                i64::try_from(index_id.get()).map_err(|error| {
+                    EngineError::from_source(
+                        EngineErrorKind::NumericOutOfRange,
+                        "global-index ID does not fit in SQLite",
+                        error,
+                    )
+                })?,
+                GLOBAL_INDEX_DROPPING,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    if changed != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::Busy,
+            format!("global index {index_id} changed concurrently; reload the catalog and retry"),
+        ));
+    }
+    refresh_manifest_digest(&transaction)?;
+    let replacement = current_manifest_snapshot(&transaction, requested_shards)?;
+    if replacement
+        .logical_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.global_index_by_id(index_id))
+        .is_some()
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "global-index removal did not remove its catalog definition",
+        ));
+    }
+    let replacement = catalog_snapshot_from_manifest(replacement)?;
+    on_commit_attempted();
+    #[cfg(test)]
+    abort_global_index_at_test_boundary("remove-before-commit");
+    transaction.commit().map_err(sqlite_error::storage)?;
+    #[cfg(test)]
+    abort_global_index_at_test_boundary("remove-after-commit");
+    Ok(replacement)
+}
+
+fn ensure_global_index_catalog_ready(snapshot: &ManifestSnapshot) -> EngineResult<()> {
+    ensure_table_registration_ready(snapshot)?;
+    if snapshot.active_table_provisioning.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "global-index catalog mutation cannot overlap table provisioning",
+        ));
+    }
+    if snapshot
+        .generated_table_ddl
+        .as_ref()
+        .is_some_and(|ddl| ddl.lifecycle() != GeneratedTableDdlLifecycle::Complete)
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "global-index catalog mutation cannot overlap generated-table DDL",
+        ));
+    }
+    Ok(())
+}
+
+const fn encode_unique_null_semantics(value: UniqueNullSemantics) -> i64 {
+    match value {
+        UniqueNullSemantics::Distinct => GLOBAL_INDEX_NULLS_DISTINCT,
+        UniqueNullSemantics::NotDistinct => GLOBAL_INDEX_NULLS_NOT_DISTINCT,
+    }
+}
+
+const fn encode_global_index_lifecycle(value: GlobalIndexLifecycle) -> i64 {
+    match value {
+        GlobalIndexLifecycle::Creating => GLOBAL_INDEX_CREATING,
+        GlobalIndexLifecycle::Ready => GLOBAL_INDEX_READY,
+        GlobalIndexLifecycle::Invalid => GLOBAL_INDEX_INVALID,
+        GlobalIndexLifecycle::Rebuilding => GLOBAL_INDEX_REBUILDING,
+        GlobalIndexLifecycle::Dropping => GLOBAL_INDEX_DROPPING,
+    }
+}
+
+const fn encode_global_index_key_type(value: GlobalIndexKeyType) -> i64 {
+    match value {
+        GlobalIndexKeyType::Boolean => GLOBAL_INDEX_KEY_BOOLEAN,
+        GlobalIndexKeyType::Int64 => GLOBAL_INDEX_KEY_INT64,
+        GlobalIndexKeyType::UInt64 => GLOBAL_INDEX_KEY_UINT64,
+        GlobalIndexKeyType::Float64 => GLOBAL_INDEX_KEY_FLOAT64,
+        GlobalIndexKeyType::Date => GLOBAL_INDEX_KEY_DATE,
+        GlobalIndexKeyType::Timestamp => GLOBAL_INDEX_KEY_TIMESTAMP,
+        GlobalIndexKeyType::Text => GLOBAL_INDEX_KEY_TEXT,
+        GlobalIndexKeyType::Binary => GLOBAL_INDEX_KEY_BINARY,
+    }
+}
+
+const fn encode_global_index_order(value: IndexKeyOrder) -> i64 {
+    match value {
+        IndexKeyOrder::Ascending => GLOBAL_INDEX_ASCENDING,
+        IndexKeyOrder::Descending => GLOBAL_INDEX_DESCENDING,
+    }
+}
+
+const fn encode_global_index_null_order(value: IndexNullOrder) -> i64 {
+    match value {
+        IndexNullOrder::First => GLOBAL_INDEX_NULLS_FIRST,
+        IndexNullOrder::Last => GLOBAL_INDEX_NULLS_LAST,
+    }
+}
+
+const fn encode_global_index_collation(value: IndexKeyCollation) -> i64 {
+    match value {
+        IndexKeyCollation::Binary => GLOBAL_INDEX_BINARY_COLLATION,
+    }
 }
 
 fn insert_authoritative_table_catalog(
@@ -4257,6 +4819,11 @@ fn create_v12_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineR
     migrate_v11_to_v12(transaction, shard_count)
 }
 
+fn create_v13_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
+    create_v12_schema(transaction, shard_count)?;
+    migrate_v12_to_v13(transaction, shard_count)
+}
+
 fn migrate_interrupted_legacy_to_v6(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -4324,6 +4891,7 @@ fn migrate_interrupted_legacy_to_v11(
     create_v11_schema(transaction, shard_count)
 }
 
+#[cfg(test)]
 fn migrate_interrupted_legacy_to_v12(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -4332,6 +4900,16 @@ fn migrate_interrupted_legacy_to_v12(
         .execute_batch("DROP TABLE briskdb_metadata;")
         .map_err(sqlite_error::storage)?;
     create_v12_schema(transaction, shard_count)
+}
+
+fn migrate_interrupted_legacy_to_v13(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v13_schema(transaction, shard_count)
 }
 
 #[cfg(test)]
@@ -4810,6 +5388,36 @@ fn migrate_v11_to_v12(transaction: &Transaction<'_>, _shard_count: u16) -> Engin
     Ok(())
 }
 
+fn migrate_v12_to_v13(transaction: &Transaction<'_>, _shard_count: u16) -> EngineResult<()> {
+    transaction
+        .execute_batch(V13_GLOBAL_INDEXES_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V13_GLOBAL_INDEX_PARTS_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V13_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V13_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "UPDATE briskdb_integrity
+             SET manifest_digest_version = ?1
+             WHERE singleton = 1",
+            [V6_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
 fn add_v5_schema(transaction: &Transaction<'_>, state: ShardLayoutState) -> EngineResult<()> {
     transaction
         .execute_batch("DROP TABLE briskdb_metadata;")
@@ -5158,6 +5766,20 @@ fn v12_objects() -> Vec<SchemaObject> {
     objects
 }
 
+fn v13_objects() -> Vec<SchemaObject> {
+    let mut objects = v12_objects();
+    for name in ["briskdb_global_index_parts", "briskdb_global_indexes"] {
+        objects.push(SchemaObject {
+            object_type: "table".to_owned(),
+            name: name.to_owned(),
+        });
+    }
+    objects.sort_by(|left, right| {
+        (&left.object_type, &left.name).cmp(&(&right.object_type, &right.name))
+    });
+    objects
+}
+
 fn schema_objects(connection: &Connection) -> EngineResult<Vec<SchemaObject>> {
     let mut statement = connection
         .prepare(
@@ -5290,6 +5912,14 @@ fn validate_table(
         "briskdb_generated_table_ddl" => {
             "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
              FROM pragma_table_xinfo('briskdb_generated_table_ddl') LIMIT ?1"
+        }
+        "briskdb_global_indexes" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_global_indexes') LIMIT ?1"
+        }
+        "briskdb_global_index_parts" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_global_index_parts') LIMIT ?1"
         }
         _ => {
             return Err(EngineError::new(
@@ -5892,7 +6522,7 @@ fn validate_v12(
     requested_shards: u16,
     objects: &[SchemaObject],
 ) -> EngineResult<ManifestSnapshot> {
-    let mut snapshot = validate_integrity_manifest_with_definition(
+    validate_v12_features(
         connection,
         requested_shards,
         objects,
@@ -5903,6 +6533,48 @@ fn validate_v12(
             expected_manifest_digest_version: V5_MANIFEST_DIGEST_VERSION,
             generated_ids: true,
         },
+    )
+}
+
+fn validate_v13(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    let mut snapshot = validate_v12_features(
+        connection,
+        requested_shards,
+        objects,
+        IntegrityManifestDefinition {
+            version: V13_SCHEMA_VERSION,
+            downgrade_fence_sql: V13_DOWNGRADE_FENCE_SQL,
+            expected_objects: &v13_objects(),
+            expected_manifest_digest_version: V6_MANIFEST_DIGEST_VERSION,
+            generated_ids: true,
+        },
+    )?;
+    let catalog = snapshot.logical_catalog.take().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "global-index validation omitted the logical table catalog",
+        )
+    })?;
+    let indexes = validate_global_indexes(connection, &catalog)?;
+    snapshot.logical_catalog = Some(catalog.with_global_indexes(indexes));
+    Ok(snapshot)
+}
+
+fn validate_v12_features(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+    definition: IntegrityManifestDefinition<'_>,
+) -> EngineResult<ManifestSnapshot> {
+    let mut snapshot = validate_integrity_manifest_with_definition(
+        connection,
+        requested_shards,
+        objects,
+        definition,
     )?;
     snapshot.allocation_owners = Some(validate_allocation_owners(
         connection,
@@ -5919,7 +6591,7 @@ fn validate_v12(
     )?;
     snapshot.active_table_provisioning = validate_table_provisioning(
         connection,
-        V12_SCHEMA_VERSION,
+        definition.version,
         snapshot.shard_count,
         snapshot.logical_catalog.as_ref(),
         snapshot.active_migration.as_ref(),
@@ -5956,6 +6628,488 @@ fn validate_v12(
     )?;
     snapshot.generated_table_ddl = validate_generated_table_ddl(connection, &snapshot)?;
     Ok(snapshot)
+}
+
+#[derive(Debug)]
+struct ValidatedGlobalIndexRow {
+    id: u64,
+    table_id: u64,
+    name: String,
+    unique: bool,
+    null_semantics: UniqueNullSemantics,
+    predicate: Option<String>,
+    lifecycle: GlobalIndexLifecycle,
+    schema_generation: u64,
+    topology: GlobalIndexStorageTopology,
+}
+
+#[allow(clippy::type_complexity)]
+fn validate_global_indexes(
+    connection: &Connection,
+    catalog: &Catalog,
+) -> EngineResult<Box<[GlobalIndexMetadata]>> {
+    validate_table(
+        connection,
+        "briskdb_global_indexes",
+        &[
+            TableColumn::expected(0, "index_id", "INTEGER", false, 1),
+            TableColumn::expected(1, "table_id", "INTEGER", true, 0),
+            TableColumn::expected(2, "index_name", "TEXT", true, 0),
+            TableColumn::expected(3, "is_unique", "INTEGER", true, 0),
+            TableColumn::expected(4, "null_semantics", "INTEGER", true, 0),
+            TableColumn::expected(5, "predicate_sql", "TEXT", false, 0),
+            TableColumn::expected(6, "lifecycle_state", "INTEGER", true, 0),
+            TableColumn::expected(7, "key_encoding_version", "INTEGER", true, 0),
+            TableColumn::expected(8, "schema_generation", "INTEGER", true, 0),
+            TableColumn::expected(9, "topology_kind", "INTEGER", true, 0),
+            TableColumn::expected(10, "topology_version", "INTEGER", true, 0),
+            TableColumn::expected(11, "partition_count", "INTEGER", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_global_indexes",
+        V13_GLOBAL_INDEXES_TABLE_SQL,
+    )?;
+    validate_table(
+        connection,
+        "briskdb_global_index_parts",
+        &[
+            TableColumn::expected(0, "index_id", "INTEGER", true, 1),
+            TableColumn::expected(1, "ordinal", "INTEGER", true, 2),
+            TableColumn::expected(2, "source_kind", "INTEGER", true, 0),
+            TableColumn::expected(3, "source_text", "TEXT", true, 0),
+            TableColumn::expected(4, "key_type", "INTEGER", true, 0),
+            TableColumn::expected(5, "sort_order", "INTEGER", true, 0),
+            TableColumn::expected(6, "null_order", "INTEGER", true, 0),
+            TableColumn::expected(7, "collation_version", "INTEGER", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_global_index_parts",
+        V13_GLOBAL_INDEX_PARTS_TABLE_SQL,
+    )?;
+
+    let rows = connection
+        .prepare(
+            "SELECT index_id, table_id, index_name, is_unique, null_semantics,
+                    predicate_sql, lifecycle_state, key_encoding_version,
+                    schema_generation, topology_kind, topology_version, partition_count
+             FROM briskdb_global_indexes
+             ORDER BY index_id
+             LIMIT 4097",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| manifest_read_error(error, "failed to read global-index catalog"))?;
+    if rows.len() > MAX_GLOBAL_INDEXES {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "global-index catalog exceeds its supported entry limit",
+        ));
+    }
+
+    let mut validated_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (
+            id,
+            table_id,
+            name,
+            unique,
+            null_semantics,
+            predicate,
+            lifecycle,
+            key_encoding_version,
+            schema_generation,
+            topology_kind,
+            topology_version,
+            partition_count,
+        ) = row;
+        let id = positive_catalog_id(id, "global index")?;
+        let table_id = positive_catalog_id(table_id, "table")?;
+        if !validate_catalog_identifier(&name) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {id} has an invalid canonical name"),
+            ));
+        }
+        if predicate.as_ref().is_some_and(|predicate| {
+            predicate.is_empty()
+                || predicate.len() > MAX_GLOBAL_INDEX_SQL_BYTES
+                || predicate.as_bytes().contains(&0)
+        }) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {id} has an invalid predicate"),
+            ));
+        }
+        let Some(table) = catalog.table_by_id(TableId::from_validated(table_id)) else {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {id} references a missing table"),
+            ));
+        };
+        if !matches!(table.placement(), TablePlacement::Sharded(_)) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {id} must reference a Sharded table"),
+            ));
+        }
+        let unique = match unique {
+            GLOBAL_INDEX_NON_UNIQUE => false,
+            GLOBAL_INDEX_UNIQUE => true,
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!("global index {id} has invalid uniqueness metadata"),
+                ));
+            }
+        };
+        let null_semantics = match null_semantics {
+            GLOBAL_INDEX_NULLS_DISTINCT => UniqueNullSemantics::Distinct,
+            GLOBAL_INDEX_NULLS_NOT_DISTINCT if unique => UniqueNullSemantics::NotDistinct,
+            value if value > GLOBAL_INDEX_NULLS_NOT_DISTINCT => {
+                return Err(unsupported_global_index(
+                    id,
+                    "NULL-semantics version",
+                    value,
+                ));
+            }
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!("global index {id} has inconsistent NULL semantics"),
+                ));
+            }
+        };
+        let lifecycle = decode_global_index_lifecycle(id, lifecycle)?;
+        if key_encoding_version > i64::from(INDEX_KEY_ENCODING_VERSION) {
+            return Err(unsupported_global_index(
+                id,
+                "key encoding version",
+                key_encoding_version,
+            ));
+        }
+        if key_encoding_version != i64::from(INDEX_KEY_ENCODING_VERSION) {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {id} has an invalid key encoding version"),
+            ));
+        }
+        let schema_generation = u64::try_from(schema_generation).map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::DataCorruption,
+                format!("global index {id} has an invalid schema generation"),
+                error,
+            )
+        })?;
+        let topology =
+            decode_global_index_topology(id, topology_kind, topology_version, partition_count)?;
+        if matches!(
+            lifecycle,
+            GlobalIndexLifecycle::Creating
+                | GlobalIndexLifecycle::Ready
+                | GlobalIndexLifecycle::Rebuilding
+        ) && schema_generation != catalog.schema_generation()
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "global index {id} targets schema generation {schema_generation}, but the catalog is at generation {}; mark, rebuild, or drop the index before opening",
+                    catalog.schema_generation()
+                ),
+            ));
+        }
+        if matches!(
+            lifecycle,
+            GlobalIndexLifecycle::Ready | GlobalIndexLifecycle::Rebuilding
+        ) && topology == GlobalIndexStorageTopology::Unassigned
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {id} is active without a storage topology"),
+            ));
+        }
+        validated_rows.push(ValidatedGlobalIndexRow {
+            id,
+            table_id,
+            name,
+            unique,
+            null_semantics,
+            predicate,
+            lifecycle,
+            schema_generation,
+            topology,
+        });
+    }
+
+    let part_limit = i64::try_from(MAX_GLOBAL_INDEXES * MAX_GLOBAL_INDEX_PARTS + 1)
+        .expect("global-index part limit fits SQLite");
+    let parts = connection
+        .prepare(
+            "SELECT index_id, ordinal, source_kind, source_text, key_type,
+                    sort_order, null_order, collation_version
+             FROM briskdb_global_index_parts
+             ORDER BY index_id, ordinal
+             LIMIT ?1",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([part_limit], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| manifest_read_error(error, "failed to read global-index key parts"))?;
+    if parts.len() > MAX_GLOBAL_INDEXES * MAX_GLOBAL_INDEX_PARTS {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "global-index key-part catalog exceeds its supported limit",
+        ));
+    }
+
+    let mut part_cursor = 0;
+    let mut indexes = Vec::with_capacity(validated_rows.len());
+    for row in validated_rows {
+        let mut key_parts = Vec::new();
+        while let Some(part) = parts.get(part_cursor) {
+            let part_index_id = positive_catalog_id(part.0, "global index")?;
+            if part_index_id != row.id {
+                break;
+            }
+            let expected_ordinal =
+                i64::try_from(key_parts.len()).expect("key-part ordinal fits i64");
+            if part.1 != expected_ordinal || key_parts.len() >= MAX_GLOBAL_INDEX_PARTS {
+                return Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    format!(
+                        "global index {} has non-contiguous or excessive key parts",
+                        row.id
+                    ),
+                ));
+            }
+            key_parts.push(decode_global_index_key_part(row.id, part)?);
+            part_cursor += 1;
+        }
+        if key_parts.is_empty() {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {} has no key parts", row.id),
+            ));
+        }
+        indexes.push(GlobalIndexMetadata::from_validated(
+            row.id,
+            row.table_id,
+            row.name,
+            key_parts.into_boxed_slice(),
+            row.unique,
+            row.null_semantics,
+            row.predicate,
+            row.lifecycle,
+            row.schema_generation,
+            row.topology,
+        ));
+    }
+    if part_cursor != parts.len() {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "global-index key parts do not match their catalog entries",
+        ));
+    }
+    Ok(indexes.into_boxed_slice())
+}
+
+fn decode_global_index_lifecycle(id: u64, value: i64) -> EngineResult<GlobalIndexLifecycle> {
+    match value {
+        GLOBAL_INDEX_CREATING => Ok(GlobalIndexLifecycle::Creating),
+        GLOBAL_INDEX_READY => Ok(GlobalIndexLifecycle::Ready),
+        GLOBAL_INDEX_INVALID => Ok(GlobalIndexLifecycle::Invalid),
+        GLOBAL_INDEX_REBUILDING => Ok(GlobalIndexLifecycle::Rebuilding),
+        GLOBAL_INDEX_DROPPING => Ok(GlobalIndexLifecycle::Dropping),
+        value if value > GLOBAL_INDEX_DROPPING => {
+            Err(unsupported_global_index(id, "lifecycle state", value))
+        }
+        _ => Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            format!("global index {id} has an invalid lifecycle state"),
+        )),
+    }
+}
+
+fn decode_global_index_topology(
+    id: u64,
+    kind: i64,
+    version: i64,
+    partitions: i64,
+) -> EngineResult<GlobalIndexStorageTopology> {
+    let supported = match (kind, version, partitions) {
+        (GLOBAL_INDEX_TOPOLOGY_UNASSIGNED, 0, 0) | (GLOBAL_INDEX_TOPOLOGY_SHARED_SQLITE, 1, 1) => {
+            true
+        }
+        (GLOBAL_INDEX_TOPOLOGY_HASH_PARTITIONED_SQLITE, 1, partitions) => {
+            (2..=256).contains(&partitions) && partitions & (partitions - 1) == 0
+        }
+        _ => false,
+    };
+    if supported {
+        return Ok(GlobalIndexStorageTopology::from_validated_parts(
+            kind, version, partitions,
+        ));
+    }
+    if kind > GLOBAL_INDEX_TOPOLOGY_HASH_PARTITIONED_SQLITE || version > 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "global index {id} uses unsupported storage topology kind {kind} version {version}"
+            ),
+        ));
+    }
+    Err(EngineError::new(
+        EngineErrorKind::DataCorruption,
+        format!("global index {id} has inconsistent storage topology metadata"),
+    ))
+}
+
+fn decode_global_index_key_part(
+    index_id: u64,
+    part: &(i64, i64, i64, String, i64, i64, i64, i64),
+) -> EngineResult<GlobalIndexKeyPart> {
+    let source = match part.2 {
+        GLOBAL_INDEX_SOURCE_COLUMN if validate_catalog_identifier(&part.3) => {
+            GlobalIndexKeySource::from_validated(part.2, part.3.clone())
+        }
+        GLOBAL_INDEX_SOURCE_EXPRESSION
+            if !part.3.is_empty()
+                && part.3.len() <= MAX_GLOBAL_INDEX_SQL_BYTES
+                && !part.3.as_bytes().contains(&0) =>
+        {
+            GlobalIndexKeySource::from_validated(part.2, part.3.clone())
+        }
+        value if value > GLOBAL_INDEX_SOURCE_EXPRESSION => {
+            return Err(unsupported_global_index(
+                index_id,
+                "key-source version",
+                value,
+            ));
+        }
+        _ => {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {index_id} has an invalid key source"),
+            ));
+        }
+    };
+    let key_type = match part.4 {
+        GLOBAL_INDEX_KEY_BOOLEAN => GlobalIndexKeyType::Boolean,
+        GLOBAL_INDEX_KEY_INT64 => GlobalIndexKeyType::Int64,
+        GLOBAL_INDEX_KEY_UINT64 => GlobalIndexKeyType::UInt64,
+        GLOBAL_INDEX_KEY_FLOAT64 => GlobalIndexKeyType::Float64,
+        GLOBAL_INDEX_KEY_DATE => GlobalIndexKeyType::Date,
+        GLOBAL_INDEX_KEY_TIMESTAMP => GlobalIndexKeyType::Timestamp,
+        GLOBAL_INDEX_KEY_TEXT => GlobalIndexKeyType::Text,
+        GLOBAL_INDEX_KEY_BINARY => GlobalIndexKeyType::Binary,
+        value if value > GLOBAL_INDEX_KEY_BINARY => {
+            return Err(unsupported_global_index(index_id, "key type", value));
+        }
+        _ => {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {index_id} has an invalid key type"),
+            ));
+        }
+    };
+    let order = match part.5 {
+        GLOBAL_INDEX_ASCENDING => IndexKeyOrder::Ascending,
+        GLOBAL_INDEX_DESCENDING => IndexKeyOrder::Descending,
+        value if value > GLOBAL_INDEX_DESCENDING => {
+            return Err(unsupported_global_index(
+                index_id,
+                "sort-order version",
+                value,
+            ));
+        }
+        _ => {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {index_id} has an invalid sort order"),
+            ));
+        }
+    };
+    let null_order = match part.6 {
+        GLOBAL_INDEX_NULLS_FIRST => IndexNullOrder::First,
+        GLOBAL_INDEX_NULLS_LAST => IndexNullOrder::Last,
+        value if value > GLOBAL_INDEX_NULLS_LAST => {
+            return Err(unsupported_global_index(
+                index_id,
+                "NULL-order version",
+                value,
+            ));
+        }
+        _ => {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {index_id} has an invalid NULL order"),
+            ));
+        }
+    };
+    let collation = match part.7 {
+        GLOBAL_INDEX_BINARY_COLLATION => IndexKeyCollation::Binary,
+        value if value > GLOBAL_INDEX_BINARY_COLLATION => {
+            return Err(unsupported_global_index(
+                index_id,
+                "collation version",
+                value,
+            ));
+        }
+        _ => {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global index {index_id} has an invalid collation version"),
+            ));
+        }
+    };
+    Ok(GlobalIndexKeyPart::from_validated(
+        source, key_type, order, null_order, collation,
+    ))
+}
+
+fn unsupported_global_index(id: u64, field: &str, value: i64) -> EngineError {
+    EngineError::new(
+        EngineErrorKind::FailedPrecondition,
+        format!(
+            "global index {id} requires unsupported {field} {value}; upgrade BriskDB before opening this data"
+        ),
+    )
 }
 
 #[allow(clippy::type_complexity)]
@@ -6423,7 +7577,7 @@ fn validate_manifest_semantic_root(
             "manifest checksum version must be positive",
         ));
     }
-    if *version > i64::from(V5_MANIFEST_DIGEST_VERSION) {
+    if *version > i64::from(V6_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -6644,6 +7798,38 @@ const V5_GENERATED_TABLE_DDL_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQ
     ],
     sql: "SELECT singleton, logical_id, logical_digest_version, source_dialect, translation_version, source_sql, physical_migration_id, physical_sql, database_id, table_name, generated_column, generated_policy, generated_encoding_version, lifecycle_state, provisioning_id, provisioning_schema_digest, table_id FROM briskdb_generated_table_ddl ORDER BY singleton",
 };
+const V6_GLOBAL_INDEXES_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
+    table: "briskdb_global_indexes",
+    columns: &[
+        "index_id",
+        "table_id",
+        "index_name",
+        "is_unique",
+        "null_semantics",
+        "predicate_sql",
+        "lifecycle_state",
+        "key_encoding_version",
+        "schema_generation",
+        "topology_kind",
+        "topology_version",
+        "partition_count",
+    ],
+    sql: "SELECT index_id, table_id, index_name, is_unique, null_semantics, predicate_sql, lifecycle_state, key_encoding_version, schema_generation, topology_kind, topology_version, partition_count FROM briskdb_global_indexes ORDER BY index_id",
+};
+const V6_GLOBAL_INDEX_PARTS_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
+    table: "briskdb_global_index_parts",
+    columns: &[
+        "index_id",
+        "ordinal",
+        "source_kind",
+        "source_text",
+        "key_type",
+        "sort_order",
+        "null_order",
+        "collation_version",
+    ],
+    sql: "SELECT index_id, ordinal, source_kind, source_text, key_type, sort_order, null_order, collation_version FROM briskdb_global_index_parts ORDER BY index_id, ordinal",
+};
 
 fn manifest_semantic_digest_for_version(
     connection: &Connection,
@@ -6714,6 +7900,25 @@ fn manifest_semantic_digest_for_version(
                 }
             }
             (V5_MANIFEST_DIGEST_DOMAIN, queries)
+        }
+        V6_MANIFEST_DIGEST_VERSION => {
+            let mut queries = Vec::with_capacity(V1_MANIFEST_DIGEST_QUERIES.len() + 8);
+            for query in V1_MANIFEST_DIGEST_QUERIES {
+                queries.push(query);
+                if query.table == "briskdb_physical_shards" {
+                    queries.push(&V3_ALLOCATION_OWNERS_DIGEST_QUERY);
+                }
+                if query.table == "briskdb_tables" {
+                    queries.push(&V3_GENERATED_IDS_DIGEST_QUERY);
+                    queries.push(&V5_GENERATED_TABLE_DDL_DIGEST_QUERY);
+                    queries.push(&V6_GLOBAL_INDEXES_DIGEST_QUERY);
+                    queries.push(&V6_GLOBAL_INDEX_PARTS_DIGEST_QUERY);
+                    queries.push(&V4_HILO_LEASES_DIGEST_QUERY);
+                    queries.push(&V3_TABLE_PROVISIONING_DIGEST_QUERY);
+                    queries.push(&V3_TABLE_PROVISIONING_DECLARATIONS_DIGEST_QUERY);
+                }
+            }
+            (V6_MANIFEST_DIGEST_DOMAIN, queries)
         }
         0 => {
             return Err(EngineError::new(
@@ -6854,7 +8059,8 @@ fn refresh_manifest_digest_if_checksummed(connection: &Connection) -> EngineResu
                 | V9_SCHEMA_VERSION
                 | V10_SCHEMA_VERSION
                 | V11_SCHEMA_VERSION
-                | V12_SCHEMA_VERSION)
+                | V12_SCHEMA_VERSION
+                | V13_SCHEMA_VERSION)
         )
     {
         let _ = refresh_manifest_digest(connection)?;
@@ -6918,7 +8124,7 @@ fn validate_manifest_integrity(
             "manifest checksum version must be positive",
         ));
     }
-    if *manifest_version > i64::from(V5_MANIFEST_DIGEST_VERSION) {
+    if *manifest_version > i64::from(V6_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -8688,6 +9894,23 @@ pub(super) fn detect_shard_count(connection: &Connection) -> EngineResult<u16> {
     }
 }
 
+/// Validate and return the durable global-index catalog without upgrading the
+/// manifest. Formats before v13 have no global-index definitions.
+pub(super) fn inspect_global_indexes(
+    connection: &Connection,
+) -> EngineResult<Box<[GlobalIndexMetadata]>> {
+    let shard_count = detect_shard_count(connection)?;
+    match inspect_with_plan(connection, shard_count, CURRENT_PLAN)? {
+        ManifestState::Versioned { snapshot, .. } => Ok(snapshot
+            .logical_catalog
+            .as_ref()
+            .map_or_else(Vec::new, |catalog| catalog.global_indexes().to_vec())
+            .into_boxed_slice()),
+        ManifestState::LegacyV1 { .. } => Ok(Box::new([])),
+        ManifestState::Empty | ManifestState::LegacyUninitialized => Err(shard_count_required()),
+    }
+}
+
 fn shard_count_required() -> EngineError {
     EngineError::new(
         EngineErrorKind::FailedPrecondition,
@@ -9468,7 +10691,7 @@ mod tests {
             identity(connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(connection).unwrap(), v12_objects());
+        assert_eq!(schema_objects(connection).unwrap(), v13_objects());
         assert_eq!(
             connection
                 .query_row(
@@ -9535,7 +10758,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V5_MANIFEST_DIGEST_VERSION)
+            i64::from(V6_MANIFEST_DIGEST_VERSION)
         );
         let (layout_id, application_id, metadata_version, state) = shard_layout_row(connection);
         assert_eq!(layout_id.len(), 16);
@@ -9654,6 +10877,7 @@ mod tests {
                 (9, 10),
                 (10, 11),
                 (11, 12),
+                (12, 13),
             ]
         );
         assert_generation_one_catalog(&connection, 4);
@@ -9724,7 +10948,7 @@ mod tests {
 
                 load_or_create_manifest(&mut connection, 4).unwrap();
                 assert_eq!(identity(&connection).1, i64::from(CURRENT_SCHEMA_VERSION));
-                assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
+                assert_eq!(schema_objects(&connection).unwrap(), v13_objects());
                 assert_eq!(
                     connection
                         .query_row(
@@ -9733,7 +10957,7 @@ mod tests {
                             |row| row.get::<_, i64>(0),
                         )
                         .unwrap(),
-                    i64::from(V5_MANIFEST_DIGEST_VERSION)
+                    i64::from(V6_MANIFEST_DIGEST_VERSION)
                 );
                 assert_eq!(
                     connection
@@ -10274,7 +11498,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v13_objects());
         assert_eq!(table_metadata_rows(&connection), tables_before);
         assert_eq!(logical_databases(&connection), databases_before);
         assert_eq!(routing_configuration(&connection), routing_before);
@@ -10317,7 +11541,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V5_MANIFEST_DIGEST_VERSION)
+            i64::from(V6_MANIFEST_DIGEST_VERSION)
         );
         assert_eq!(
             manifest_semantic_digest(&connection).unwrap(),
@@ -10379,7 +11603,9 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE briskdb_generated_table_ddl;
+                "DROP TABLE briskdb_global_index_parts;
+                 DROP TABLE briskdb_global_indexes;
+                 DROP TABLE briskdb_generated_table_ddl;
                  DROP TABLE briskdb_hilo_leases;
                  DROP TABLE briskdb_table_provisioning_declarations;
                  DROP TABLE briskdb_table_provisioning;
@@ -10851,7 +12077,7 @@ mod tests {
                     identity(&connection),
                     (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
                 );
-                assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
+                assert_eq!(schema_objects(&connection).unwrap(), v13_objects());
                 assert_eq!(
                     manifest_semantic_digest(&connection).unwrap(),
                     stored_manifest_digest(&connection)
@@ -11217,7 +12443,7 @@ mod tests {
     fn semantic_root_covers_every_authoritative_manifest_table_and_integrity_state() {
         let mutations = [
             "UPDATE briskdb_manifest SET singleton = 2 WHERE singleton = 1",
-            "UPDATE briskdb_metadata SET requires_manifest_version = 13",
+            "UPDATE briskdb_metadata SET requires_manifest_version = 14",
             "UPDATE briskdb_routing SET hash_version = 2 WHERE singleton = 1",
             "UPDATE briskdb_physical_shards SET lifecycle_state = 'retired' WHERE shard_id = 0",
             "UPDATE briskdb_allocation_owners SET owner_slot = 100 WHERE owner_slot = 0",
@@ -11227,6 +12453,11 @@ mod tests {
             "INSERT INTO briskdb_tables VALUES (1, 1, 'widgets', 2, NULL, NULL)",
             "INSERT INTO briskdb_generated_ids VALUES (1, 0, NULL, NULL, 0)",
             "INSERT INTO briskdb_generated_table_ddl VALUES (1, zeroblob(32), 1, 1, 1, 'x', zeroblob(32), 'x', 1, 'events', 'id', 1, 1, 1, NULL, NULL, NULL)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'events', 1, 'tenant_id', 2);
+             INSERT INTO briskdb_global_indexes VALUES (1, 1, 'events_email', 0, 1, NULL, 1, 1, 0, 0, 0, 0)",
+            "INSERT INTO briskdb_tables VALUES (1, 1, 'events', 1, 'tenant_id', 2);
+             INSERT INTO briskdb_global_indexes VALUES (1, 1, 'events_email', 0, 1, NULL, 1, 1, 0, 0, 0, 0);
+             INSERT INTO briskdb_global_index_parts VALUES (1, 0, 1, 'email', 7, 1, 1, 1)",
             "INSERT INTO briskdb_hilo_leases VALUES (1, 4096, 1, 0, NULL, NULL, NULL)",
             "UPDATE briskdb_shard_layout SET layout_id = randomblob(16) WHERE singleton = 1",
             "INSERT INTO briskdb_schema_migrations VALUES (1, 0, randomblob(32), 1, 'SELECT 1', 4, 2, 4)",
@@ -11265,6 +12496,54 @@ mod tests {
                 "{mutation}"
             );
             assert_eq!(stored_manifest_digest(&connection), trusted, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn global_index_future_formats_are_actionable_after_checksum_validation() {
+        for (mutation, diagnostic) in [
+            (
+                "UPDATE briskdb_global_indexes SET key_encoding_version = 2",
+                "key encoding version",
+            ),
+            (
+                "UPDATE briskdb_global_indexes SET lifecycle_state = 6",
+                "lifecycle state",
+            ),
+            (
+                "UPDATE briskdb_global_indexes
+                 SET topology_kind = 1, topology_version = 2, partition_count = 1",
+                "storage topology",
+            ),
+            (
+                "UPDATE briskdb_global_index_parts SET source_kind = 3",
+                "key-source version",
+            ),
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_ready_current_manifest(&mut connection, 4);
+            insert_valid_table_catalog(&connection);
+            let declaration = GlobalIndexDeclaration::new(
+                TableId::new(3).unwrap(),
+                "accounts_email",
+                vec![GlobalIndexKeyPart::new(
+                    GlobalIndexKeySource::column("email").unwrap(),
+                    GlobalIndexKeyType::Text,
+                )],
+            )
+            .unwrap()
+            .with_topology(GlobalIndexStorageTopology::SharedSqliteV1);
+            create_global_index(&mut connection, 4, &declaration, || {}).unwrap();
+            connection.execute_batch(mutation).unwrap();
+            refresh_manifest_digest(&connection).unwrap();
+
+            let error = load_or_create_manifest(&mut connection, 4).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+            assert!(
+                error.diagnostic().contains(diagnostic),
+                "unexpected diagnostic for {mutation}: {}",
+                error.diagnostic()
+            );
         }
     }
 
@@ -11384,7 +12663,7 @@ mod tests {
     #[test]
     fn integrity_versions_lengths_and_forged_state_invariants_fail_closed() {
         for (version_column, unsupported_version) in
-            [("manifest_digest_version", 6), ("schema_digest_version", 2)]
+            [("manifest_digest_version", 7), ("schema_digest_version", 2)]
         {
             let mut unsupported = Connection::open_in_memory().unwrap();
             create_ready_current_manifest(&mut unsupported, 4);
@@ -11612,7 +12891,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v13_objects());
         assert_eq!(
             shard_layout_row(&connection).3,
             ShardLayoutState::Adopting.code()
@@ -11636,7 +12915,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v13_objects());
         assert_eq!(layout.state(), ShardLayoutState::Ready);
         assert_eq!(shard_layout_row(&connection), layout_before);
         assert_eq!(catalog.logical().schema_generation(), 0);
@@ -11728,7 +13007,7 @@ mod tests {
                 identity(&connection),
                 (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
             );
-            assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
+            assert_eq!(schema_objects(&connection).unwrap(), v13_objects());
         }
 
         let mut connection = Connection::open_in_memory().unwrap();
@@ -13665,6 +14944,43 @@ mod tests {
                 migration_state INTEGER NOT NULL,
                 next_shard INTEGER NOT NULL
              ) STRICT;",
+            "DROP TABLE briskdb_global_index_parts;
+             CREATE TABLE briskdb_global_index_parts (
+                index_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                source_kind INTEGER NOT NULL,
+                source_text TEXT NOT NULL,
+                key_type INTEGER NOT NULL,
+                sort_order INTEGER NOT NULL,
+                null_order INTEGER NOT NULL,
+                collation_version INTEGER NOT NULL
+             ) STRICT;",
+            "DROP TABLE briskdb_global_index_parts;
+             DROP TABLE briskdb_global_indexes;
+             CREATE TABLE briskdb_global_indexes (
+                index_id INTEGER PRIMARY KEY,
+                table_id INTEGER NOT NULL,
+                index_name TEXT NOT NULL,
+                is_unique INTEGER NOT NULL,
+                null_semantics INTEGER NOT NULL,
+                predicate_sql TEXT,
+                lifecycle_state INTEGER NOT NULL,
+                key_encoding_version INTEGER NOT NULL,
+                schema_generation INTEGER NOT NULL,
+                topology_kind INTEGER NOT NULL,
+                topology_version INTEGER NOT NULL,
+                partition_count INTEGER NOT NULL
+             ) STRICT;
+             CREATE TABLE briskdb_global_index_parts (
+                index_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                source_kind INTEGER NOT NULL,
+                source_text TEXT NOT NULL,
+                key_type INTEGER NOT NULL,
+                sort_order INTEGER NOT NULL,
+                null_order INTEGER NOT NULL,
+                collation_version INTEGER NOT NULL
+             ) STRICT;",
         ] {
             let mut connection = Connection::open_in_memory().unwrap();
             load_or_create(&mut connection, 4).unwrap();
@@ -13736,6 +15052,12 @@ mod tests {
             initialize_current: create_v11_schema,
             initialize_interrupted_legacy: migrate_interrupted_legacy_to_v11,
         };
+        const V12_PLAN: MigrationPlan<'static> = MigrationPlan {
+            current_version: V12_SCHEMA_VERSION,
+            migrations: MIGRATIONS,
+            initialize_current: create_v12_schema,
+            initialize_interrupted_legacy: migrate_interrupted_legacy_to_v12,
+        };
         for phase in [
             MigrationPhase::AfterSchemaChange,
             MigrationPhase::AfterVersionStamp,
@@ -13762,7 +15084,9 @@ mod tests {
 
         let mut connection = Connection::open_in_memory().unwrap();
         create_ready_v11_manifest(&mut connection, 4);
-        load_or_create_manifest(&mut connection, 4).unwrap();
+        let mut no_hook = |_| Ok(());
+        load_or_create_snapshot_with_plan(&mut connection, 4, V12_PLAN, true, &mut no_hook)
+            .unwrap();
         assert_eq!(identity(&connection).1, i64::from(V12_SCHEMA_VERSION));
         assert_eq!(schema_objects(&connection).unwrap(), v12_objects());
         assert_eq!(
@@ -13794,6 +15118,73 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             EngineErrorKind::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn v12_to_v13_upgrade_is_atomic_read_only_discoverable_and_downgrade_fenced() {
+        const V12_PLAN: MigrationPlan<'static> = MigrationPlan {
+            current_version: V12_SCHEMA_VERSION,
+            migrations: MIGRATIONS,
+            initialize_current: create_v12_schema,
+            initialize_interrupted_legacy: migrate_interrupted_legacy_to_v12,
+        };
+        for phase in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ] {
+            let mut interrupted = Connection::open_in_memory().unwrap();
+            create_ready_current_manifest(&mut interrupted, 4);
+            downgrade_v13_manifest_to_v12_for_test(&interrupted, 4).unwrap();
+            let root = stored_manifest_digest(&interrupted);
+            let error = load_or_create_with_hook(&mut interrupted, 4, |point| {
+                if point.from == V12_SCHEMA_VERSION && point.phase == phase {
+                    Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "injected v12 to v13 failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+            assert_eq!(identity(&interrupted).1, i64::from(V12_SCHEMA_VERSION));
+            assert_eq!(schema_objects(&interrupted).unwrap(), v12_objects());
+            assert_eq!(stored_manifest_digest(&interrupted), root);
+        }
+
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_ready_current_manifest(&mut connection, 4);
+        downgrade_v13_manifest_to_v12_for_test(&connection, 4).unwrap();
+        let root = stored_manifest_digest(&connection);
+        assert!(inspect_global_indexes(&connection).unwrap().is_empty());
+        assert_eq!(identity(&connection).1, i64::from(V12_SCHEMA_VERSION));
+        assert_eq!(stored_manifest_digest(&connection), root);
+
+        load_or_create_manifest(&mut connection, 4).unwrap();
+        assert_eq!(identity(&connection).1, i64::from(V13_SCHEMA_VERSION));
+        assert_eq!(schema_objects(&connection).unwrap(), v13_objects());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT requires_manifest_version, manifest_digest_version
+                     FROM briskdb_metadata
+                     JOIN briskdb_integrity ON briskdb_integrity.singleton = 1",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (
+                i64::from(V13_SCHEMA_VERSION),
+                i64::from(V6_MANIFEST_DIGEST_VERSION)
+            )
+        );
+        assert!(
+            load_or_create_snapshot_with_plan(&mut connection, 4, V12_PLAN, true, &mut |_| Ok(()))
+                .unwrap_err()
+                .kind()
+                == EngineErrorKind::FailedPrecondition
         );
     }
 

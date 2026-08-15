@@ -127,6 +127,127 @@ fn assert_catalog_fixture(catalog: &core::Catalog) {
     );
 }
 
+fn global_email_index(table_id: core::TableId) -> core::GlobalIndexDeclaration {
+    core::GlobalIndexDeclaration::new(
+        table_id,
+        "accounts_email",
+        vec![core::GlobalIndexKeyPart::new(
+            core::GlobalIndexKeySource::column("payload").unwrap(),
+            core::GlobalIndexKeyType::Text,
+        )],
+    )
+    .unwrap()
+    .unique(core::UniqueNullSemantics::Distinct)
+    .with_predicate("payload IS NOT NULL")
+    .unwrap()
+    .with_topology(core::GlobalIndexStorageTopology::SharedSqliteV1)
+}
+
+#[test]
+fn global_index_catalog_is_read_only_reopenable_and_lifecycle_fenced() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut database = core::Database::open(temp.path(), 2).unwrap();
+    register_catalog_fixture(&mut database);
+    let accounts = database
+        .catalog()
+        .table("default", "accounts")
+        .unwrap()
+        .unwrap();
+    let declaration = global_email_index(accounts.id());
+    drop(database);
+
+    let manifest = temp.path().join("manifest.sqlite");
+    let before = std::fs::read(&manifest).unwrap();
+    assert!(
+        core::Database::inspect_global_indexes(temp.path())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(std::fs::read(&manifest).unwrap(), before);
+
+    let mut database = core::Database::open(temp.path(), 2).unwrap();
+    let index_id = database.create_global_index(declaration).unwrap();
+    assert_eq!(database.catalog().global_indexes().len(), 1);
+    assert_eq!(
+        database.remove_global_index(index_id).unwrap_err().kind(),
+        core::EngineErrorKind::FailedPrecondition
+    );
+    assert_eq!(
+        database
+            .broadcast("CREATE INDEX accounts_payload ON accounts(payload)")
+            .unwrap_err()
+            .kind(),
+        core::EngineErrorKind::FailedPrecondition
+    );
+    drop(database);
+
+    let inspected = core::Database::inspect_global_indexes(temp.path()).unwrap();
+    assert_eq!(inspected.len(), 1);
+    assert_eq!(inspected[0].id(), index_id);
+    assert_eq!(inspected[0].name(), "accounts_email");
+    assert_eq!(
+        inspected[0].lifecycle(),
+        core::GlobalIndexLifecycle::Creating
+    );
+    assert_eq!(
+        inspected[0].topology(),
+        core::GlobalIndexStorageTopology::SharedSqliteV1
+    );
+    assert_eq!(
+        inspected[0].key_encoding_version(),
+        core::INDEX_KEY_ENCODING_VERSION
+    );
+    assert_eq!(
+        core::Database::open(temp.path(), 4).unwrap_err().kind(),
+        core::EngineErrorKind::FailedPrecondition
+    );
+    assert_eq!(
+        core::Database::inspect_global_indexes(temp.path())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut database = core::Database::open(temp.path(), 2).unwrap();
+    database
+        .transition_global_index(index_id, core::GlobalIndexLifecycle::Ready)
+        .unwrap();
+    assert_eq!(
+        database
+            .transition_global_index(index_id, core::GlobalIndexLifecycle::Creating)
+            .unwrap_err()
+            .kind(),
+        core::EngineErrorKind::FailedPrecondition
+    );
+    database
+        .transition_global_index(index_id, core::GlobalIndexLifecycle::Rebuilding)
+        .unwrap();
+    database
+        .transition_global_index(index_id, core::GlobalIndexLifecycle::Ready)
+        .unwrap();
+    database
+        .transition_global_index(index_id, core::GlobalIndexLifecycle::Dropping)
+        .unwrap();
+    drop(database);
+    assert_eq!(
+        core::Database::inspect_global_indexes(temp.path()).unwrap()[0].lifecycle(),
+        core::GlobalIndexLifecycle::Dropping
+    );
+
+    let mut database = core::Database::open(temp.path(), 2).unwrap();
+    database.remove_global_index(index_id).unwrap();
+    assert!(database.catalog().global_indexes().is_empty());
+    database
+        .broadcast("CREATE INDEX accounts_payload ON accounts(payload)")
+        .unwrap();
+    drop(database);
+    assert!(
+        core::Database::inspect_global_indexes(temp.path())
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn legacy_and_explicit_module_paths_are_both_available() {
     fn assert_owned_public<T: Clone + Send + Sync + 'static>() {}

@@ -5,7 +5,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use super::{AllocationOwnerMap, EngineError, EngineErrorKind, EngineResult, RoutingCatalog};
+use super::{
+    AllocationOwnerMap, EngineError, EngineErrorKind, EngineResult, GlobalIndexId,
+    GlobalIndexMetadata, RoutingCatalog,
+};
 
 pub(crate) const IDENTIFIER_ENCODING_VERSION: u32 = 1;
 pub(crate) const DEFAULT_LOGICAL_DATABASE_ID: u64 = 1;
@@ -508,6 +511,7 @@ pub struct Catalog {
     default_database_id: LogicalDatabaseId,
     databases: Box<[LogicalDatabaseMetadata]>,
     tables: Box<[TableMetadata]>,
+    global_indexes: Box<[GlobalIndexMetadata]>,
 }
 
 impl fmt::Debug for Catalog {
@@ -522,6 +526,7 @@ impl fmt::Debug for Catalog {
             .field("default_database_id", &self.default_database_id)
             .field("databases", &self.databases)
             .field("tables", &self.tables)
+            .field("global_indexes", &self.global_indexes)
             .finish()
     }
 }
@@ -537,6 +542,7 @@ impl Clone for Catalog {
             default_database_id: self.default_database_id,
             databases: self.databases.clone(),
             tables: self.tables.clone(),
+            global_indexes: self.global_indexes.clone(),
         }
     }
 }
@@ -551,6 +557,7 @@ impl PartialEq for Catalog {
             && self.default_database_id == other.default_database_id
             && self.databases == other.databases
             && self.tables == other.tables
+            && self.global_indexes == other.global_indexes
     }
 }
 
@@ -588,7 +595,19 @@ impl Catalog {
             default_database_id: LogicalDatabaseId::from_validated(default_database_id),
             databases,
             tables,
+            global_indexes: Box::new([]),
         }
+    }
+
+    pub(crate) fn with_global_indexes(mut self, indexes: Box<[GlobalIndexMetadata]>) -> Self {
+        debug_assert!(indexes.windows(2).all(|rows| rows[0].id() < rows[1].id()));
+        debug_assert!(
+            indexes
+                .iter()
+                .all(|index| self.table_by_id(index.table_id()).is_some())
+        );
+        self.global_indexes = indexes;
+        self
     }
 
     /// Return the persisted identifier-encoding version.
@@ -652,6 +671,19 @@ impl Catalog {
     /// Return tables in logical-database-ID then canonical-name order.
     pub fn tables(&self) -> &[TableMetadata] {
         &self.tables
+    }
+
+    /// Return durable global-index definitions in stable numeric-ID order.
+    pub fn global_indexes(&self) -> &[GlobalIndexMetadata] {
+        &self.global_indexes
+    }
+
+    /// Look up a durable global index by stable ID.
+    pub fn global_index_by_id(&self, id: GlobalIndexId) -> Option<&GlobalIndexMetadata> {
+        self.global_indexes
+            .binary_search_by_key(&id, GlobalIndexMetadata::id)
+            .ok()
+            .map(|index| &self.global_indexes[index])
     }
 
     /// Look up a logical database by stable ID.

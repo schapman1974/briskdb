@@ -12,7 +12,11 @@ use std::{
 use briskdb::core::GeneratedIdPolicy;
 use briskdb::{
     BriskDb, EngineError, EngineErrorKind, EngineOptions, Statement, Value,
-    core::{Database, ShardKeyMetadata, ShardKeyType, TableDeclaration},
+    core::{
+        Database, GlobalIndexDeclaration, GlobalIndexKeyPart, GlobalIndexKeySource,
+        GlobalIndexKeyType, GlobalIndexStorageTopology, ShardKeyMetadata, ShardKeyType,
+        TableDeclaration,
+    },
 };
 #[cfg(feature = "experimental-vtab")]
 use std::collections::BTreeSet;
@@ -306,6 +310,30 @@ fn shared_root_process_child() {
                 database.close().await.expect("close lock-holder database");
             });
         }
+        "index-holder" => {
+            let _database = Database::open(&root, SHARDS).expect("open catalog holder");
+            fs::write(&ready, b"ready").expect("publish catalog-holder readiness");
+            wait_for_path(&go);
+            let count = Database::inspect_global_indexes(&root)
+                .expect("inspect catalog while holding root")
+                .len();
+            fs::write(&output, count.to_string()).expect("publish held catalog count");
+        }
+        "index-reader" => {
+            fs::write(&ready, b"ready").expect("publish catalog-reader readiness");
+            wait_for_path(&go);
+            let observations = (0..128)
+                .map(|_| {
+                    let count = Database::inspect_global_indexes(&root)
+                        .expect("inspect concurrent global-index catalog")
+                        .len();
+                    thread::yield_now();
+                    count.to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(&output, observations).expect("publish catalog observations");
+        }
         #[cfg(feature = "experimental-vtab")]
         "hilo" => {
             runtime.block_on(run_hilo_writer(
@@ -352,6 +380,25 @@ fn setup_events(root: &Path) -> (String, String) {
         .find(|candidate| database.shard_for_key(candidate.as_bytes()) != same_shard)
         .expect("find a route on another shard");
     (same_route, different_route)
+}
+
+fn global_index_declaration(database: &Database, name: &str) -> GlobalIndexDeclaration {
+    let table_id = database
+        .catalog()
+        .table("default", "events")
+        .unwrap()
+        .unwrap()
+        .id();
+    GlobalIndexDeclaration::new(
+        table_id,
+        name,
+        vec![GlobalIndexKeyPart::new(
+            GlobalIndexKeySource::column("payload").unwrap(),
+            GlobalIndexKeyType::Text,
+        )],
+    )
+    .unwrap()
+    .with_topology(GlobalIndexStorageTopology::SharedSqliteV1)
 }
 
 #[cfg(feature = "experimental-vtab")]
@@ -545,6 +592,78 @@ fn cross_process_sqlite_contention_is_retryable_and_the_exact_retry_succeeds() {
     });
 
     assert_eq!(total_rows(temp.path(), "events"), 1);
+    assert_root_integrity(temp.path());
+}
+
+#[test]
+fn global_index_catalog_serializes_writers_and_readers_see_only_complete_snapshots() {
+    let temp = tempfile::tempdir().expect("create global-index root");
+    setup_events(temp.path());
+
+    let holder_ready = temp.path().join("index-holder-ready");
+    let holder_go = temp.path().join("index-holder-go");
+    let holder_output = temp.path().join("index-holder-output");
+    let mut holder = spawn_test_child(
+        temp.path(),
+        "index-holder",
+        0,
+        None,
+        &holder_ready,
+        &holder_go,
+        &holder_output,
+    );
+    wait_for_path(&holder_ready);
+
+    let mut database = Database::open(temp.path(), SHARDS).expect("open catalog writer");
+    let declaration = global_index_declaration(&database, "events_payload_global");
+    let error = database
+        .create_global_index(declaration.clone())
+        .expect_err("a live peer must fence catalog mutation");
+    assert_eq!(error.kind(), EngineErrorKind::Busy);
+    assert!(error.is_retryable());
+    assert!(
+        Database::inspect_global_indexes(temp.path())
+            .unwrap()
+            .is_empty()
+    );
+
+    fs::write(&holder_go, b"release").expect("release catalog holder");
+    holder.wait_success();
+    assert_eq!(fs::read_to_string(&holder_output).unwrap(), "0");
+    database
+        .create_global_index(declaration)
+        .expect("retry catalog mutation after peer closes");
+
+    let reader_ready = temp.path().join("index-reader-ready");
+    let reader_go = temp.path().join("index-reader-go");
+    let reader_output = temp.path().join("index-reader-output");
+    let mut reader = spawn_test_child(
+        temp.path(),
+        "index-reader",
+        1,
+        None,
+        &reader_ready,
+        &reader_go,
+        &reader_output,
+    );
+    wait_for_path(&reader_ready);
+    fs::write(&reader_go, b"race").expect("release catalog reader");
+    let second_declaration = global_index_declaration(&database, "events_payload_global_2");
+    database
+        .create_global_index(second_declaration)
+        .expect("commit catalog mutation beside read-only inspector");
+    reader.wait_success();
+
+    let observations = fs::read_to_string(&reader_output).unwrap();
+    assert!(
+        observations.lines().all(|count| matches!(count, "1" | "2")),
+        "reader observed a partial catalog: {observations}"
+    );
+    assert_eq!(
+        Database::inspect_global_indexes(temp.path()).unwrap().len(),
+        2
+    );
+    drop(database);
     assert_root_integrity(temp.path());
 }
 

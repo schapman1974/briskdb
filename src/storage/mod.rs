@@ -44,7 +44,8 @@ use crate::core::TableId;
 use crate::{
     core::{
         Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
-        GeneratedTableDdlReceipt, MAX_TABLES, ShardKeyType, TableDeclaration, TablePlacement,
+        GeneratedTableDdlReceipt, GlobalIndexDeclaration, GlobalIndexId, GlobalIndexLifecycle,
+        GlobalIndexMetadata, MAX_TABLES, ShardKeyType, TableDeclaration, TablePlacement,
         generated_id::{
             NATIVE_RANGE_V1_FORMAT_MARKER, native_range_v1_sequence_ceiling,
             native_range_v1_sequence_floor,
@@ -178,7 +179,7 @@ impl RootSchemaCoordination {
         {
             return Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
-                "the committed table catalog conflicts with a live database handle; close stale handles before reopening",
+                "the committed catalog conflicts with a live database handle; close stale handles before reopening",
             ));
         }
         let loaded = Arc::new(loaded);
@@ -193,7 +194,7 @@ impl RootSchemaCoordination {
         if Arc::strong_count(current) != 1 {
             return Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
-                "table registration requires one exclusively owned database handle",
+                "catalog mutation requires one exclusively owned database handle",
             ));
         }
         let mut catalogs = self.catalogs.lock().map_err(|error| {
@@ -210,7 +211,7 @@ impl RootSchemaCoordination {
         if live.next().is_none_or(|catalog| !catalog.ptr_eq(&current)) || live.next().is_some() {
             return Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
-                "table registration requires every other database handle to be closed",
+                "catalog mutation requires every other database handle to be closed",
             ));
         }
         Ok(CatalogReplacementGuard { catalogs })
@@ -288,7 +289,7 @@ impl RootSchemaCoordination {
         {
             return Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
-                "the validated table catalog conflicts with a live database handle",
+                "the validated catalog conflicts with a live database handle",
             ));
         }
 
@@ -339,6 +340,7 @@ fn immutable_catalog_metadata_matches(left: &CatalogSnapshot, right: &CatalogSna
         && left_logical.default_database().id() == right_logical.default_database().id()
         && left_logical.logical_databases() == right_logical.logical_databases()
         && left_logical.tables() == right_logical.tables()
+        && left_logical.global_indexes() == right_logical.global_indexes()
 }
 
 static ROOT_SCHEMA_COORDINATIONS: OnceLock<Mutex<HashMap<PathBuf, Weak<RootSchemaCoordination>>>> =
@@ -1265,6 +1267,97 @@ impl Storage {
         migration.publish_ready()
     }
 
+    pub(crate) fn create_global_index(
+        &mut self,
+        declaration: GlobalIndexDeclaration,
+    ) -> EngineResult<GlobalIndexId> {
+        let result = self.create_global_index_inner(declaration);
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn create_global_index_inner(
+        &mut self,
+        declaration: GlobalIndexDeclaration,
+    ) -> EngineResult<GlobalIndexId> {
+        let mut mutation =
+            SchemaMigrationGuard::new(self.schema_coordination.gate.begin_new_migration()?);
+        mutation.wait_for_quiescence_blocking();
+        mutation.acquire_process_ownership(&self.schema_coordination.process_lease)?;
+        let replacement_guard = self
+            .schema_coordination
+            .reserve_catalog_replacement(&self.catalog)?;
+        let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+        configure_manifest_connection(&manifest_connection)?;
+        let (replacement, index_id) = manifest::create_global_index(
+            &mut manifest_connection,
+            self.shard_count(),
+            &declaration,
+            || mutation.mark_pending_on_drop(),
+        )?;
+        self.catalog = replacement_guard.publish(&self.catalog, replacement)?;
+        mutation.publish_ready()?;
+        Ok(index_id)
+    }
+
+    pub(crate) fn transition_global_index(
+        &mut self,
+        index_id: GlobalIndexId,
+        target: GlobalIndexLifecycle,
+    ) -> EngineResult<()> {
+        let result = self.transition_global_index_inner(index_id, target);
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn transition_global_index_inner(
+        &mut self,
+        index_id: GlobalIndexId,
+        target: GlobalIndexLifecycle,
+    ) -> EngineResult<()> {
+        let mut mutation =
+            SchemaMigrationGuard::new(self.schema_coordination.gate.begin_new_migration()?);
+        mutation.wait_for_quiescence_blocking();
+        mutation.acquire_process_ownership(&self.schema_coordination.process_lease)?;
+        let replacement_guard = self
+            .schema_coordination
+            .reserve_catalog_replacement(&self.catalog)?;
+        let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+        configure_manifest_connection(&manifest_connection)?;
+        let replacement = manifest::transition_global_index(
+            &mut manifest_connection,
+            self.shard_count(),
+            index_id,
+            target,
+            || mutation.mark_pending_on_drop(),
+        )?;
+        self.catalog = replacement_guard.publish(&self.catalog, replacement)?;
+        mutation.publish_ready()
+    }
+
+    pub(crate) fn remove_global_index(&mut self, index_id: GlobalIndexId) -> EngineResult<()> {
+        let result = self.remove_global_index_inner(index_id);
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn remove_global_index_inner(&mut self, index_id: GlobalIndexId) -> EngineResult<()> {
+        let mut mutation =
+            SchemaMigrationGuard::new(self.schema_coordination.gate.begin_new_migration()?);
+        mutation.wait_for_quiescence_blocking();
+        mutation.acquire_process_ownership(&self.schema_coordination.process_lease)?;
+        let replacement_guard = self
+            .schema_coordination
+            .reserve_catalog_replacement(&self.catalog)?;
+        let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+        configure_manifest_connection(&manifest_connection)?;
+        let replacement = manifest::remove_global_index(
+            &mut manifest_connection,
+            self.shard_count(),
+            index_id,
+            || mutation.mark_pending_on_drop(),
+        )?;
+        self.catalog = replacement_guard.publish(&self.catalog, replacement)?;
+        mutation.publish_ready()
+    }
+
     fn validate_table_declaration_request(
         &self,
         declarations: &[TableDeclaration],
@@ -1689,6 +1782,12 @@ impl Storage {
         guard: &mut SchemaMigrationGuard,
         control: Option<Arc<crate::core::OperationControl>>,
     ) -> EngineResult<Vec<u16>> {
+        if !self.catalog.logical().global_indexes().is_empty() {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "application-schema migration is fenced while global-index definitions exist; drop them before migrating",
+            ));
+        }
         guard.acquire_process_ownership(&self.schema_coordination.process_lease)?;
         migration::apply_schema_migration(self, sql, guard, control)
     }
@@ -2044,7 +2143,42 @@ impl Storage {
 /// Detect the immutable physical shard count without creating or upgrading
 /// any database files.
 pub(crate) fn detect_shard_count(root: impl AsRef<Path>) -> EngineResult<u16> {
-    let root = root.as_ref();
+    inspect_manifest_snapshot(root.as_ref(), manifest::detect_shard_count)
+}
+
+/// Validate and inspect durable global-index definitions without creating or
+/// upgrading any database files.
+pub(crate) fn inspect_global_indexes(
+    root: impl AsRef<Path>,
+) -> EngineResult<Box<[GlobalIndexMetadata]>> {
+    inspect_manifest_snapshot(root.as_ref(), manifest::inspect_global_indexes)
+}
+
+fn inspect_manifest_snapshot<T>(
+    root: &Path,
+    inspect: impl FnOnce(&Connection) -> EngineResult<T>,
+) -> EngineResult<T> {
+    let connection = open_manifest_for_read_only_inspection(root)?;
+    connection
+        .execute_batch("BEGIN DEFERRED TRANSACTION")
+        .map_err(sqlite_error::storage)?;
+    match inspect(&connection) {
+        Ok(value) => {
+            connection
+                .execute_batch("COMMIT")
+                .map_err(sqlite_error::storage)?;
+            Ok(value)
+        }
+        Err(error) => {
+            // Preserve the validation error. A read-only rollback is best-effort
+            // cleanup and cannot make the original manifest diagnosis clearer.
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn open_manifest_for_read_only_inspection(root: &Path) -> EngineResult<Connection> {
     let metadata = fs::symlink_metadata(root).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             EngineError::from_source(
@@ -2094,7 +2228,7 @@ pub(crate) fn detect_shard_count(root: impl AsRef<Path>) -> EngineResult<u16> {
     }
     let connection = open_existing_manifest_read_only(&manifest_path)?;
     configure_manifest_connection(&connection)?;
-    manifest::detect_shard_count(&connection)
+    Ok(connection)
 }
 
 fn declarations_match_catalog(catalog: &Catalog, declarations: &[TableDeclaration]) -> bool {
@@ -3211,6 +3345,8 @@ mod tests {
             manifest
                 .execute_batch(
                     "BEGIN IMMEDIATE;
+                     DROP TABLE briskdb_global_index_parts;
+                     DROP TABLE briskdb_global_indexes;
                      DROP TABLE briskdb_generated_table_ddl;
                      DROP TABLE briskdb_hilo_leases;
                      DROP TABLE briskdb_table_provisioning_declarations;
@@ -3315,6 +3451,8 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_global_index_parts;
+                 DROP TABLE briskdb_global_indexes;
                  DROP TABLE briskdb_generated_table_ddl;
                  DROP TABLE briskdb_hilo_leases;
                  DROP TABLE briskdb_table_provisioning_declarations;
@@ -3413,6 +3551,8 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_global_index_parts;
+                 DROP TABLE briskdb_global_indexes;
                  DROP TABLE briskdb_generated_table_ddl;
                  DROP TABLE briskdb_hilo_leases;
                  DROP TABLE briskdb_table_provisioning_declarations;
@@ -5723,6 +5863,145 @@ mod tests {
             let declarations = registered_table_declarations(&reopened);
             reopened.register_tables(declarations).unwrap();
             assert_eq!(reopened.catalog().tables().len(), 2);
+        }
+    }
+
+    fn global_index_test_declaration(database: &Database) -> GlobalIndexDeclaration {
+        let table_id = database
+            .catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap()
+            .id();
+        GlobalIndexDeclaration::new(
+            table_id,
+            "events_payload_global",
+            vec![crate::core::GlobalIndexKeyPart::new(
+                crate::core::GlobalIndexKeySource::column("payload").unwrap(),
+                crate::core::GlobalIndexKeyType::Binary,
+            )],
+        )
+        .unwrap()
+        .with_topology(crate::core::GlobalIndexStorageTopology::SharedSqliteV1)
+    }
+
+    fn setup_global_index_root(root: &Path) -> Database {
+        let mut database = Database::open(root, 2).unwrap();
+        create_registered_table_schema(&database);
+        database
+            .register_tables(registered_table_declarations(&database))
+            .unwrap();
+        database
+    }
+
+    #[test]
+    fn global_index_catalog_crash_child() {
+        let Ok(root) = std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_ROOT") else {
+            return;
+        };
+        let mode = std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_MODE").unwrap();
+        let mut database = Database::open(root, 2).unwrap();
+        let result = match mode.as_str() {
+            "create" => {
+                let declaration = global_index_test_declaration(&database);
+                database.create_global_index(declaration).map(|_| ())
+            }
+            "transition" => {
+                let id = GlobalIndexId::new(
+                    std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_ID")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+                .unwrap();
+                database.transition_global_index(id, GlobalIndexLifecycle::Ready)
+            }
+            "remove" => {
+                let id = GlobalIndexId::new(
+                    std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_ID")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+                .unwrap();
+                database.remove_global_index(id)
+            }
+            unexpected => panic!("unexpected global-index crash mode: {unexpected}"),
+        };
+        panic!("child did not reach requested global-index boundary: {result:?}");
+    }
+
+    fn abort_global_index_child(
+        root: &Path,
+        mode: &str,
+        boundary: &str,
+        id: Option<GlobalIndexId>,
+    ) {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("storage::tests::global_index_catalog_crash_child")
+            .arg("--nocapture")
+            .env("BRISKDB_GLOBAL_INDEX_ABORT_ROOT", root)
+            .env("BRISKDB_GLOBAL_INDEX_ABORT_MODE", mode)
+            .env("BRISKDB_GLOBAL_INDEX_ABORT_POINT", boundary);
+        if let Some(id) = id {
+            command.env("BRISKDB_GLOBAL_INDEX_ABORT_ID", id.get().to_string());
+        }
+        let status = command.status().unwrap();
+        assert!(!status.success(), "child did not abort at {boundary}");
+    }
+
+    #[test]
+    fn global_index_catalog_recovers_at_every_transaction_boundary() {
+        for (boundary, expected_count) in [("create-before-commit", 0), ("create-after-commit", 1)]
+        {
+            let temp = tempfile::tempdir().unwrap();
+            drop(setup_global_index_root(temp.path()));
+            abort_global_index_child(temp.path(), "create", boundary, None);
+            assert_eq!(
+                Database::inspect_global_indexes(temp.path()).unwrap().len(),
+                expected_count,
+                "boundary {boundary}"
+            );
+            drop(Database::open(temp.path(), 2).unwrap());
+        }
+
+        for (boundary, expected) in [
+            ("transition-before-commit", GlobalIndexLifecycle::Creating),
+            ("transition-after-commit", GlobalIndexLifecycle::Ready),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut database = setup_global_index_root(temp.path());
+            let declaration = global_index_test_declaration(&database);
+            let id = database.create_global_index(declaration).unwrap();
+            drop(database);
+            abort_global_index_child(temp.path(), "transition", boundary, Some(id));
+            assert_eq!(
+                Database::inspect_global_indexes(temp.path()).unwrap()[0].lifecycle(),
+                expected,
+                "boundary {boundary}"
+            );
+            drop(Database::open(temp.path(), 2).unwrap());
+        }
+
+        for (boundary, expected_count) in [("remove-before-commit", 1), ("remove-after-commit", 0)]
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let mut database = setup_global_index_root(temp.path());
+            let declaration = global_index_test_declaration(&database);
+            let id = database.create_global_index(declaration).unwrap();
+            database
+                .transition_global_index(id, GlobalIndexLifecycle::Dropping)
+                .unwrap();
+            drop(database);
+            abort_global_index_child(temp.path(), "remove", boundary, Some(id));
+            assert_eq!(
+                Database::inspect_global_indexes(temp.path()).unwrap().len(),
+                expected_count,
+                "boundary {boundary}"
+            );
+            drop(Database::open(temp.path(), 2).unwrap());
         }
     }
 

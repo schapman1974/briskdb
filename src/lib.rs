@@ -20,6 +20,8 @@ pub use core::{
     CancellationToken, CanonicalIndexKey, CheckpointReport, CheckpointShardReport, Column,
     DataType, Decimal, DecodedIndexKeyPart, DescribeTarget, EngineError, EngineErrorKind,
     EngineOptions, EngineResult, EngineState, EngineStatus, Executed, GeneratedKey,
+    GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart, GlobalIndexKeySource,
+    GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexStorageTopology,
     INDEX_KEY_ENCODING_VERSION, IndexKeyCollation, IndexKeyOrder, IndexKeyPart, IndexKeyValue,
     IndexKeyValueRef, IndexNullOrder, ParseDecimalError, PortalId, PrepareRequest,
     PreparedExecution, PreparedStatementDescription, PreparedStatementId, PreparedStatementLimits,
