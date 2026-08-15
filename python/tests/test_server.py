@@ -38,9 +38,22 @@ class AttachedServerTests(unittest.TestCase):
             with database.serve(postgres="127.0.0.1:0") as server:
                 self.assertNotEqual(split_address(server.http_address)[1], 0)
                 self.assertIsNotNone(server.postgres_address)
+                health = http_json(server.http_address, "/health")
+                self.assertEqual(health["status"], "ok")
+                self.assertEqual(health["shards"], 2)
                 self.assertEqual(
-                    http_json(server.http_address, "/health"),
-                    {"status": "ok", "shards": 2},
+                    health["global_indexes"],
+                    {
+                        "state": "healthy",
+                        "total": 0,
+                        "healthy": 0,
+                        "degraded": 0,
+                        "unavailable": 0,
+                        "async_lag": 0,
+                        "retained_outbox_events": 0,
+                        "retained_outbox_bytes": 0,
+                        "backpressured_outbox_shards": 0,
+                    },
                 )
                 query = http_json(
                     server.http_address,
