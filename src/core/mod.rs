@@ -65,7 +65,10 @@ pub use options::{
     MAX_QUEUE_CAPACITY_PER_SHARD, MAX_REQUEST_TIMEOUT_MS, MAX_RESULT_BYTES, MAX_RESULT_ROWS,
     MAX_RETAINED_BOUND_VALUE_BYTES, MAX_SHUTDOWN_GRACE_MS, PreparedStatementLimits, ResultLimits,
 };
-pub use planner::{BoundStatementPlan, PlannedRoute};
+pub use planner::{
+    BoundStatementPlan, GlobalIndexRoutingFallback, GlobalIndexRoutingKind, GlobalIndexRoutingPlan,
+    PlannedRoute,
+};
 #[cfg(any(test, feature = "experimental-vtab", feature = "sqlite-import"))]
 pub(crate) use planner::{CanonicalShardKeyRef, canonical_shard_key_bytes};
 pub(crate) use prepared::PreparedState;
@@ -562,7 +565,7 @@ impl Database {
         let translated = sql::translate_sql(normalized, sql::SqlTranslationMode::StrictSqlite)?;
         let (hash_version, key_encoding_version, bucket_algorithm_version, map_generation) =
             self.routing_provenance();
-        let plan = planner::plan_bound_statement(
+        let mut plan = planner::plan_bound_statement(
             planner::BoundStatementPlanInput::new(
                 catalog,
                 catalog.default_database().id(),
@@ -579,6 +582,14 @@ impl Database {
                 map_generation,
             ),
             |key| self.shard_for_key(key),
+        )?;
+        planner::apply_global_index_routing(
+            &mut plan,
+            catalog,
+            translated.normalized_sql(),
+            params,
+            self.shard_count(),
+            |index_id, keys| self.storage.global_index_read_candidates(index_id, keys),
         )?;
         let target = raw_data_execution_target(&plan, catalog, operation)?;
         Ok(Some(RawDataPlan {

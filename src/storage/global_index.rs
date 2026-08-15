@@ -1,7 +1,7 @@
 //! Offline construction and durable storage for global indexes.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs::{self, File},
     path::{Path, PathBuf},
     str,
@@ -548,6 +548,131 @@ pub(super) fn active_unique_mutations(
             Ok((operation_id, public_unique_mutation(stored)?))
         })
         .collect()
+}
+
+/// Resolve exact canonical keys to every shard that can contain a matching
+/// row. Active unique mutations are included with both their previous and new
+/// owners, closing the physical-commit/index-finalize visibility window.
+pub(super) fn lookup_authoritative_owners(
+    storage: &Storage,
+    index: &GlobalIndexMetadata,
+    keys: &[CanonicalIndexKey],
+) -> EngineResult<Vec<GlobalIndexOwner>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (connection, _) = open_existing(&storage.root)?
+        .ok_or_else(|| corrupt("ready global index has no physical storage"))?;
+    connection
+        .busy_timeout(std::time::Duration::ZERO)
+        .map_err(sqlite_error::storage)?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(sqlite_error::storage)?;
+    validate_physical_authority(&transaction, index, storage.shard_count())?;
+    let index_id = to_sqlite_id(index.id())?;
+    let mut owners = HashSet::new();
+
+    let mut entry_statement = transaction
+        .prepare_cached(
+            "SELECT source_shard, source_locator
+             FROM briskdb_global_index_entries
+             WHERE index_id = ?1 AND encoded_key = ?2",
+        )
+        .map_err(sqlite_error::storage)?;
+    for key in keys {
+        let mut rows = entry_statement
+            .query(params![index_id, key.as_bytes()])
+            .map_err(sqlite_error::storage)?;
+        while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
+            owners.insert(read_lookup_owner(row, storage.shard_count())?);
+        }
+    }
+    drop(entry_statement);
+
+    let mut active_statement = transaction
+        .prepare_cached(
+            "SELECT mutation.new_key,
+                    mutation.new_source_shard,
+                    mutation.new_source_locator,
+                    mutation.previous_key,
+                    mutation.previous_source_shard,
+                    mutation.previous_source_locator
+             FROM briskdb_global_unique_reservations AS reservation
+             JOIN briskdb_global_unique_mutations AS mutation
+               ON mutation.operation_id = reservation.operation_id
+             JOIN briskdb_global_operations AS operation
+               ON operation.operation_id = reservation.operation_id
+             WHERE reservation.index_id = ?1
+               AND reservation.encoded_key = ?2
+               AND operation.operation_kind = ?3
+               AND operation.operation_state = ?4",
+        )
+        .map_err(sqlite_error::storage)?;
+    for key in keys {
+        let mut rows = active_statement
+            .query(params![
+                index_id,
+                key.as_bytes(),
+                UNIQUE_OPERATION,
+                OPERATION_ACTIVE
+            ])
+            .map_err(sqlite_error::storage)?;
+        while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
+            for offset in [0, 3] {
+                let mutation_key = row
+                    .get::<_, Option<Vec<u8>>>(offset)
+                    .map_err(sqlite_error::storage)?;
+                let shard = row
+                    .get::<_, Option<i64>>(offset + 1)
+                    .map_err(sqlite_error::storage)?;
+                let locator = row
+                    .get::<_, Option<Vec<u8>>>(offset + 2)
+                    .map_err(sqlite_error::storage)?;
+                match (mutation_key, shard, locator) {
+                    (None, None, None) => {}
+                    (Some(mutation_key), Some(shard), Some(locator)) => {
+                        CanonicalIndexKey::from_bytes(&mutation_key)?;
+                        // A mutation found through either locked key can move
+                        // between two different keys; both owners are possible
+                        // until the physical/finalization outcome is visible.
+                        owners.insert(lookup_owner(shard, locator, storage.shard_count())?);
+                    }
+                    _ => {
+                        return Err(corrupt(
+                            "active global-index mutation has an invalid owner record",
+                        ));
+                    }
+                }
+            }
+        }
+        drop(rows);
+    }
+    drop(active_statement);
+    transaction.commit().map_err(sqlite_error::storage)?;
+
+    let mut owners = owners.into_iter().collect::<Vec<_>>();
+    owners.sort_by(|left, right| {
+        left.source_shard()
+            .cmp(&right.source_shard())
+            .then_with(|| left.locator().cmp(right.locator()))
+    });
+    Ok(owners)
+}
+
+fn read_lookup_owner(row: &rusqlite::Row<'_>, shard_count: u16) -> EngineResult<GlobalIndexOwner> {
+    let shard = row.get::<_, i64>(0).map_err(sqlite_error::storage)?;
+    let locator = row.get::<_, Vec<u8>>(1).map_err(sqlite_error::storage)?;
+    lookup_owner(shard, locator, shard_count)
+}
+
+fn lookup_owner(shard: i64, locator: Vec<u8>, shard_count: u16) -> EngineResult<GlobalIndexOwner> {
+    let shard = u16::try_from(shard)
+        .ok()
+        .filter(|shard| *shard < shard_count)
+        .ok_or_else(|| corrupt("global-index lookup returned an invalid source shard"))?;
+    GlobalIndexOwner::new(shard, locator)
+        .map_err(|_| corrupt("global-index lookup returned an invalid row locator"))
 }
 
 /// Finalize one coordinator-owned reservation and refresh every affected

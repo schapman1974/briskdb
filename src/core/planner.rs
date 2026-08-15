@@ -9,8 +9,9 @@ use crate::sql::{
 };
 
 use super::{
-    AllocationOwnerMap, Catalog, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
-    LogicalDatabaseId, TableId, TableMetadata, TablePlacement, Value,
+    AllocationOwnerMap, CanonicalIndexKey, Catalog, EngineError, EngineErrorKind, EngineResult,
+    GeneratedIdPolicy, GlobalIndexId, GlobalIndexOwner, LogicalDatabaseId, TableId, TableMetadata,
+    TablePlacement, Value,
     generated_id::{
         GeneratedIdClassification, HILO_V1_FORMAT_MARKER, classify_caller_generated_id,
     },
@@ -77,6 +78,130 @@ pub(crate) struct GeneratedInsertPlan {
     policy: GeneratedIdPolicy,
 }
 
+/// Outcome of considering authoritative global-index routing for one read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GlobalIndexRoutingKind {
+    /// The statement is not an eligible sharded read.
+    NotApplicable,
+    /// An authoritative index narrowed the physical target set.
+    Routed,
+    /// Exact keys were proven but no authoritative owner exists.
+    Empty,
+    /// The planner retained its ordinary shard-key/scatter route.
+    Fallback,
+}
+
+/// Stable reason an authoritative index was not used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GlobalIndexRoutingFallback {
+    NoReadyAuthoritativeIndex,
+    UnsupportedIndexDefinition,
+    PredicateNotExact,
+    TooManyKeys,
+    IndexUnavailable,
+}
+
+impl GlobalIndexRoutingFallback {
+    /// Return a stable machine-readable explanation code.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NoReadyAuthoritativeIndex => "no_ready_authoritative_index",
+            Self::UnsupportedIndexDefinition => "unsupported_index_definition",
+            Self::PredicateNotExact => "predicate_not_exact",
+            Self::TooManyKeys => "too_many_exact_keys",
+            Self::IndexUnavailable => "index_unavailable",
+        }
+    }
+}
+
+/// Redaction-safe explain data for global-index read routing.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GlobalIndexRoutingPlan {
+    kind: GlobalIndexRoutingKind,
+    index_id: Option<GlobalIndexId>,
+    index_name: Option<Arc<str>>,
+    lookup_key_count: usize,
+    candidate_count: usize,
+    target_shards: Vec<u16>,
+    fallback: Option<GlobalIndexRoutingFallback>,
+}
+
+impl GlobalIndexRoutingPlan {
+    const fn not_applicable() -> Self {
+        Self {
+            kind: GlobalIndexRoutingKind::NotApplicable,
+            index_id: None,
+            index_name: None,
+            lookup_key_count: 0,
+            candidate_count: 0,
+            target_shards: Vec::new(),
+            fallback: None,
+        }
+    }
+
+    fn fallback(reason: GlobalIndexRoutingFallback, target_shards: Vec<u16>) -> Self {
+        Self {
+            kind: GlobalIndexRoutingKind::Fallback,
+            fallback: Some(reason),
+            target_shards,
+            ..Self::not_applicable()
+        }
+    }
+
+    /// Return the planner outcome.
+    pub const fn kind(&self) -> GlobalIndexRoutingKind {
+        self.kind
+    }
+
+    /// Return the selected global index, if exact-key inference chose one.
+    pub const fn index_id(&self) -> Option<GlobalIndexId> {
+        self.index_id
+    }
+
+    /// Return the selected global-index name, if any.
+    pub fn index_name(&self) -> Option<&str> {
+        self.index_name.as_deref()
+    }
+
+    /// Return the number of distinct canonical keys probed.
+    pub const fn lookup_key_count(&self) -> usize {
+        self.lookup_key_count
+    }
+
+    /// Return the owner candidates read before shard deduplication/intersection.
+    pub const fn candidate_count(&self) -> usize {
+        self.candidate_count
+    }
+
+    /// Return the exact logical shard target set. An empty set is executed on
+    /// a harmless sentinel shard only to preserve SQLite result metadata.
+    pub fn target_shards(&self) -> &[u16] {
+        &self.target_shards
+    }
+
+    /// Return why ordinary routing was retained.
+    pub const fn fallback_reason(&self) -> Option<GlobalIndexRoutingFallback> {
+        self.fallback
+    }
+}
+
+impl fmt::Debug for GlobalIndexRoutingPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GlobalIndexRoutingPlan")
+            .field("kind", &self.kind)
+            .field("index_id", &self.index_id)
+            .field("index_name", &self.index_name)
+            .field("lookup_key_count", &self.lookup_key_count)
+            .field("candidate_count", &self.candidate_count)
+            .field("target_shards", &self.target_shards)
+            .field("fallback", &self.fallback)
+            .finish()
+    }
+}
+
 impl GeneratedInsertPlan {
     pub(crate) const fn table_id(&self) -> TableId {
         self.table_id
@@ -112,6 +237,7 @@ pub struct BoundStatementPlan {
     explicit_route: Option<PlannedRoute>,
     generated_insert: Option<GeneratedInsertPlan>,
     assigned_shard: Option<u16>,
+    global_index_routing: GlobalIndexRoutingPlan,
 }
 
 impl BoundStatementPlan {
@@ -185,6 +311,11 @@ impl BoundStatementPlan {
     pub const fn assigned_shard(&self) -> Option<u16> {
         self.assigned_shard
     }
+
+    /// Return redaction-safe authoritative global-index routing explain data.
+    pub const fn global_index_routing(&self) -> &GlobalIndexRoutingPlan {
+        &self.global_index_routing
+    }
 }
 
 impl fmt::Debug for BoundStatementPlan {
@@ -204,6 +335,7 @@ impl fmt::Debug for BoundStatementPlan {
             .field("has_explicit_route", &self.explicit_route.is_some())
             .field("has_generated_insert", &self.generated_insert.is_some())
             .field("assigned_shard", &self.assigned_shard)
+            .field("global_index_routing", &self.global_index_routing)
             .finish()
     }
 }
@@ -402,7 +534,156 @@ where
         explicit_route,
         generated_insert,
         assigned_shard,
+        global_index_routing: GlobalIndexRoutingPlan::not_applicable(),
     })
+}
+
+pub(super) fn apply_global_index_routing<F>(
+    plan: &mut BoundStatementPlan,
+    catalog: &Catalog,
+    normalized: &NormalizedSql,
+    parameters: &[Value],
+    shard_count: u16,
+    mut resolve: F,
+) -> EngineResult<()>
+where
+    F: FnMut(GlobalIndexId, &[CanonicalIndexKey]) -> EngineResult<Vec<GlobalIndexOwner>>,
+{
+    if plan.behavior != StatementBehavior::Read {
+        return Ok(());
+    }
+    let Some(table_id) = plan.inference.table_id() else {
+        return Ok(());
+    };
+    let Some(table) = catalog.table_by_id(table_id) else {
+        return Err(planning_invariant());
+    };
+    if !matches!(table.placement(), TablePlacement::Sharded(_)) {
+        return Ok(());
+    }
+    let fallback_targets = ordinary_read_targets(plan, shard_count)?;
+
+    let candidate = match crate::sql::infer_global_index_lookup(
+        catalog,
+        plan.database,
+        normalized,
+        plan.statement_index,
+        parameters,
+        table_id,
+    )? {
+        Ok(candidate) => candidate,
+        Err(reason) => {
+            plan.global_index_routing = GlobalIndexRoutingPlan::fallback(
+                match reason {
+                    crate::sql::GlobalIndexInferenceFallback::NoReadyAuthoritativeIndex => {
+                        GlobalIndexRoutingFallback::NoReadyAuthoritativeIndex
+                    }
+                    crate::sql::GlobalIndexInferenceFallback::UnsupportedIndexDefinition => {
+                        GlobalIndexRoutingFallback::UnsupportedIndexDefinition
+                    }
+                    crate::sql::GlobalIndexInferenceFallback::PredicateNotExact => {
+                        GlobalIndexRoutingFallback::PredicateNotExact
+                    }
+                    crate::sql::GlobalIndexInferenceFallback::TooManyKeys => {
+                        GlobalIndexRoutingFallback::TooManyKeys
+                    }
+                },
+                fallback_targets,
+            );
+            return Ok(());
+        }
+    };
+    let index_id = candidate.index_id();
+    let index_name: Arc<str> = Arc::from(candidate.index_name());
+    let lookup_key_count = candidate.keys().len();
+    if candidate.keys().is_empty() {
+        plan.global_index_routing = GlobalIndexRoutingPlan {
+            kind: GlobalIndexRoutingKind::Empty,
+            index_id: Some(index_id),
+            index_name: Some(index_name),
+            lookup_key_count,
+            candidate_count: 0,
+            target_shards: Vec::new(),
+            fallback: None,
+        };
+        return Ok(());
+    }
+
+    let owners = match resolve(index_id, candidate.keys()) {
+        Ok(owners) => owners,
+        Err(_) => {
+            plan.global_index_routing = GlobalIndexRoutingPlan {
+                index_id: Some(index_id),
+                index_name: Some(index_name),
+                lookup_key_count,
+                ..GlobalIndexRoutingPlan::fallback(
+                    GlobalIndexRoutingFallback::IndexUnavailable,
+                    fallback_targets,
+                )
+            };
+            return Ok(());
+        }
+    };
+    let candidate_count = owners.len();
+    let mut target_shards = owners
+        .iter()
+        .map(GlobalIndexOwner::source_shard)
+        .collect::<Vec<_>>();
+    target_shards.sort_unstable();
+    target_shards.dedup();
+
+    match plan.inference.kind() {
+        ShardKeyInferenceKind::Exact | ShardKeyInferenceKind::Multiple => {
+            let mut routed = plan
+                .inferred_routes
+                .iter()
+                .map(PlannedRoute::shard)
+                .collect::<Vec<_>>();
+            routed.sort_unstable();
+            routed.dedup();
+            target_shards.retain(|shard| routed.binary_search(shard).is_ok());
+        }
+        ShardKeyInferenceKind::Contradiction => target_shards.clear(),
+        ShardKeyInferenceKind::Unconstrained => {}
+        ShardKeyInferenceKind::NotApplicable | ShardKeyInferenceKind::NotSharded => {
+            return Err(planning_invariant());
+        }
+    }
+    plan.global_index_routing = GlobalIndexRoutingPlan {
+        kind: if target_shards.is_empty() {
+            GlobalIndexRoutingKind::Empty
+        } else {
+            GlobalIndexRoutingKind::Routed
+        },
+        index_id: Some(index_id),
+        index_name: Some(index_name),
+        lookup_key_count,
+        candidate_count,
+        target_shards,
+        fallback: None,
+    };
+    Ok(())
+}
+
+fn ordinary_read_targets(plan: &BoundStatementPlan, shard_count: u16) -> EngineResult<Vec<u16>> {
+    let mut shards = match plan.inference.kind() {
+        ShardKeyInferenceKind::Unconstrained => (0..shard_count).collect(),
+        ShardKeyInferenceKind::Contradiction => Vec::new(),
+        ShardKeyInferenceKind::Exact | ShardKeyInferenceKind::Multiple => plan
+            .inferred_routes
+            .iter()
+            .map(PlannedRoute::shard)
+            .collect(),
+        ShardKeyInferenceKind::NotApplicable | ShardKeyInferenceKind::NotSharded => {
+            return Err(planning_invariant());
+        }
+    };
+    shards.sort_unstable();
+    shards.dedup();
+    if shards.iter().any(|shard| *shard >= shard_count) {
+        return Err(planning_invariant());
+    }
+    Ok(shards)
 }
 
 fn plan_generated_insert(

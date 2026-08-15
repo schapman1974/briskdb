@@ -1650,6 +1650,20 @@ impl Storage {
         self.fail_closed_on_corruption(result)
     }
 
+    pub(crate) fn global_index_read_candidates(
+        &self,
+        index_id: GlobalIndexId,
+        keys: &[crate::core::CanonicalIndexKey],
+    ) -> EngineResult<Vec<crate::core::GlobalIndexOwner>> {
+        (|| {
+            let index = self.validate_authority_index(index_id, true, false)?;
+            for key in keys {
+                self.validate_authority_key(index, key)?;
+            }
+            global_index::lookup_authoritative_owners(self, index, keys)
+        })()
+    }
+
     /// Recover only coordinator-owned active reservations whose OS lease is
     /// no longer held by a live writer.
     pub(crate) fn recover_global_unique_writes(
