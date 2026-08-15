@@ -1,6 +1,7 @@
 //! SQLite file layout, versioned manifest management, and connection configuration.
 
 mod global_index;
+mod global_index_async;
 mod hilo;
 mod index_outbox;
 mod manifest;
@@ -41,12 +42,12 @@ pub(crate) use schema_gate::SchemaOperationGuard;
 pub(crate) use schema_gate::{SchemaGateSnapshot, SchemaGateState};
 
 pub use crate::core::Database;
-#[cfg(any(feature = "experimental-vtab", test))]
 use crate::core::TableId;
 use crate::{
     core::{
         Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
-        GeneratedTableDdlReceipt, GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId,
+        GeneratedTableDdlReceipt, GlobalIndexAsyncOptions, GlobalIndexAsyncProcessReport,
+        GlobalIndexAsyncStatus, GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId,
         GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexOutboxBatch,
         GlobalIndexOutboxCursor, GlobalIndexOutboxPruneReport, GlobalIndexOutboxShardStatus,
         GlobalIndexRepairReport, GlobalIndexValidationMode, GlobalIndexValidationOptions,
@@ -2034,6 +2035,82 @@ impl Storage {
     ) -> EngineResult<GlobalIndexOutboxPruneReport> {
         let result = index_outbox::prune(self, shard, limit, cancellation);
         self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn global_index_async_status(
+        &self,
+        index_id: GlobalIndexId,
+    ) -> EngineResult<GlobalIndexAsyncStatus> {
+        let result = (|| {
+            let index = self.global_index_metadata(index_id)?;
+            global_index_async::status(self, &index)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn process_global_index_async(
+        &self,
+        index_id: GlobalIndexId,
+        owner_id: [u8; 16],
+        options: GlobalIndexAsyncOptions,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexAsyncProcessReport> {
+        let result = (|| {
+            let _schema = self.enter_schema_operation()?;
+            let index = self.global_index_metadata(index_id)?;
+            if index.lifecycle() != GlobalIndexLifecycle::Ready {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!("global index {index_id} is not ready for asynchronous maintenance"),
+                ));
+            }
+            global_index_async::process_index(self, &index, owner_id, options, cancellation)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn set_global_index_async_paused(
+        &self,
+        index_id: GlobalIndexId,
+        paused: bool,
+    ) -> EngineResult<()> {
+        let result = (|| {
+            let _schema = self.enter_schema_operation()?;
+            let index = self.global_index_metadata(index_id)?;
+            global_index_async::set_paused(self, &index, paused)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn ready_nonunique_global_indexes(&self) -> Vec<GlobalIndexId> {
+        self.catalog
+            .logical()
+            .global_indexes()
+            .iter()
+            .filter(|index| !index.is_unique() && index.lifecycle() == GlobalIndexLifecycle::Ready)
+            .map(GlobalIndexMetadata::id)
+            .collect()
+    }
+
+    pub(crate) fn fence_uncoordinated_nonunique_write(
+        &self,
+        table_id: TableId,
+    ) -> EngineResult<()> {
+        for index_id in self
+            .catalog
+            .logical()
+            .global_indexes()
+            .iter()
+            .filter(|index| {
+                index.table_id() == table_id
+                    && !index.is_unique()
+                    && index.lifecycle() == GlobalIndexLifecycle::Ready
+            })
+            .map(GlobalIndexMetadata::id)
+        {
+            global_index_async::mark_rebuild_required(self, index_id)?;
+        }
+        Ok(())
     }
 
     fn validate_nonunique_outbox_index(&self, index_id: GlobalIndexId) -> EngineResult<()> {
@@ -6808,16 +6885,16 @@ mod tests {
                 let reservation = storage
                     .reserve_global_unique_write(&mutation, &cancellation)
                     .unwrap();
-                database
-                    .execute(
-                        "crash-writer",
-                        "INSERT INTO events (id, tenant_id, payload) VALUES (1, ?1, ?2)",
-                        &[
-                            crate::core::Value::from("crash-writer"),
-                            crate::core::Value::from(vec![1_u8, 2, 3]),
-                        ],
-                    )
-                    .unwrap();
+                let connection = storage.open_shard(shard).unwrap();
+                crate::sql::execute(
+                    &connection,
+                    "INSERT INTO events (id, tenant_id, payload) VALUES (1, ?1, ?2)",
+                    &[
+                        crate::core::Value::from("crash-writer"),
+                        crate::core::Value::from(vec![1_u8, 2, 3]),
+                    ],
+                )
+                .unwrap();
                 storage
                     .finalize_global_unique_write(&reservation, &cancellation)
                     .map(|_| ())
@@ -7186,7 +7263,7 @@ mod tests {
     fn global_authority_format_upgrade_recovers_from_real_process_abort() {
         for (boundary, expected_version) in [
             ("upgrade-before-commit", 1_i64),
-            ("upgrade-after-commit", 3_i64),
+            ("upgrade-after-commit", 4_i64),
         ] {
             let temp = tempfile::tempdir().unwrap();
             setup_upgrade_test_root(temp.path());
@@ -7241,7 +7318,7 @@ mod tests {
             authority
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             authority
@@ -7264,6 +7341,49 @@ mod tests {
                     |row| row.get::<_, bool>(0),
                 )
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn global_authority_v3_upgrade_preserves_entries_and_requires_async_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = setup_global_index_root(temp.path());
+        database
+            .execute(
+                "v3-upgrade-route",
+                "INSERT INTO events (id, tenant_id, payload) VALUES (1, ?1, ?2)",
+                &[
+                    crate::core::Value::from("v3-upgrade-route"),
+                    crate::core::Value::from(vec![4_u8, 5, 6]),
+                ],
+            )
+            .unwrap();
+        let index = database
+            .create_global_index(global_index_test_declaration(&database))
+            .unwrap();
+        database.build_global_index(index).unwrap();
+        drop(database);
+        global_index::downgrade_to_v3_for_test(temp.path());
+
+        let database = Database::open(temp.path(), 2).unwrap();
+        let status = database.global_index_async_status(index).unwrap();
+        assert!(status.rebuild_required());
+        let authority = Connection::open(temp.path().join("global-indexes/global.sqlite")).unwrap();
+        assert_eq!(
+            authority
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            authority
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_global_index_entries WHERE index_id = ?1",
+                    [i64::try_from(index.get()).unwrap()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
         );
     }
 

@@ -105,6 +105,21 @@ control. These local numbers expose the current alpha cost; they are not a
 cross-host CI threshold. The larger #239 release gate owns optimization and the
 same-host p99/WAL regression decision.
 
+The `global_index_async/*` group measures a one-event catch-up pass, foreground
+write plus immediate apply, fully fresh miss planning, and a miss while one of
+four shards is lagging:
+
+```bash
+cargo bench --locked --bench storage -- global_index_async
+```
+
+On the same Apple M1 Pro host, a 2026-08-15 release run measured one-event
+catch-up at 3.99 ms / 251 events/s and write-plus-apply at 9.45 ms / 106 ops/s.
+The apply is normally performed by the background worker and is not part of the
+foreground row acknowledgement. A fresh miss plan measured 3.60 ms / 278
+plans/s; the one-lagging-shard hybrid plan measured 3.63 ms / 276 plans/s, about
+0.6% slower in this fixture. These are local medians, not release thresholds.
+
 ## Workload contract
 
 Every benchmark creates a fresh temporary BriskDB database with exactly four

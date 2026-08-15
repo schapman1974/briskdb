@@ -733,6 +733,14 @@ impl Engine {
         self.inner.options
     }
 
+    /// Start a caller-owned background consumer for ready non-unique indexes.
+    pub fn start_global_index_worker(
+        &self,
+        options: super::GlobalIndexAsyncOptions,
+    ) -> EngineResult<super::GlobalIndexWorker> {
+        self.inner.database.start_global_index_worker(options)
+    }
+
     /// Return the lifecycle state shared by every engine clone.
     pub fn state(&self) -> EngineState {
         self.inner.lifecycle.state()

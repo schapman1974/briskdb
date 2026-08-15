@@ -7,6 +7,8 @@ safe across service, Rust, and Python processes sharing one local data root.
 Ready unique indexes are maintained automatically for successful autocommit
 `INSERT`, `UPDATE`, and `DELETE` statements through the shared Rust engine. The
 same path serves the Rust and Python libraries, HTTP, and PostgreSQL.
+Legacy synchronous `Database::execute` writes fence ready non-unique indexes for
+rebuild before mutation; ready or invalid unique indexes reject that path.
 
 ## Coordinated SQL writes
 
@@ -38,9 +40,9 @@ Unique maintenance remains synchronous and refreshes the affected index/shard
 snapshot before acknowledging the write. Non-unique maintenance now writes a
 versioned event into the owning shard's outbox in the same SQLite transaction
 as the row. It therefore adds no independent commit or fsync and cannot publish
-an event for a rolled-back row. Asynchronous index application and freshness
-watermarks are the next stage in
-[#237](https://github.com/schapman1974/briskdb/issues/237).
+an event for a rolled-back row. Fenced asynchronous consumers now apply those
+events and publish durable per-shard freshness watermarks; see
+[asynchronous global indexes](GLOBAL_INDEX_ASYNC.md).
 
 ## Transactional non-unique outbox
 
@@ -97,17 +99,19 @@ shard. Deleted, moved, malformed, and no-longer-matching candidates are never
 returned as index evidence. Up to 64 stale observations per plan become
 idempotent durable tombstones; applied tombstones are skipped on later reads.
 
-Non-unique candidates cannot yet prove that another shard has no newer match,
-so these plans retain the ordinary safe scatter route with the stable
-`freshness_unproven` reason. Issue
-[#237](https://github.com/schapman1974/briskdb/issues/237) adds the watermarks
-needed for exclusion. Partial indexes, expression keys, unsupported predicate
+Non-unique candidates are combined with a query-time outbox high-water vector.
+Fresh shards use verified candidates; lagging, poisoned, or uninitialized
+shards retain their ordinary scan. A partially fresh plan therefore targets
+candidate shards plus only uncertain shards. If every possible shard is
+uncertain, the plan retains the full safe scatter route with the stable
+`freshness_unproven` reason. Partial indexes, expression keys, unsupported predicate
 shapes/types, oversized key/candidate sets, invalid lifecycle state, and
 unavailable index storage also fall back without omitting a shard. Active old
 and new unique-mutation owners remain included through the physical-commit
 window. `BoundStatementPlan::global_index_routing()` exposes authoritative
 status, candidates, verified/rejected/stale counts, repairs, diagnostic
-candidate shards, exact execution targets, and a stable fallback reason.
+candidate shards, uncertain shards, exact execution targets, and a stable
+fallback reason.
 
 ## Unique-key state machine
 
@@ -156,10 +160,13 @@ reservations back before reconstructing ownership from the authoritative shard
 rows.
 
 Physical global-index storage version 2 added the operation, reservation,
-sequence, and lease tables to `global-indexes/global.sqlite`. Version 3 adds
-bounded non-unique read-repair tombstones. Startup upgrades versions 1 and 2
-atomically and requires sole-process ownership; a live peer receives retryable
-`Busy` before any format mutation.
+sequence, and lease tables to `global-indexes/global.sqlite`. Version 3 added
+bounded non-unique read-repair tombstones. Version 4 adds asynchronous controls,
+fenced leases, per-shard watermarks, poison state, counters, and last-batch
+timing. Startup upgrades versions 1 through 3 atomically and requires
+sole-process ownership; an older ready non-unique index must be rebuilt before
+watermark-based shard exclusion. A live peer receives retryable `Busy` before
+any format mutation.
 
 ## Verification and benchmarks
 
@@ -171,8 +178,10 @@ contention, four-process range leasing, durable process-abort boundaries,
 format-upgrade crashes, peer fencing, stale-candidate differential properties,
 cancellation/deadlines, process exits around repair enqueue/application,
 transactional outbox rollback, insert/update/delete/tombstone replay, durable
-cursors and safe pruning, explicit backpressure, and independent-process cursor
-ordering.
+cursors and safe pruning, explicit backpressure, asynchronous state-machine
+properties against forced scatter, fenced competing-process consumers, lease
+handoff, durable poison/rebuild, every apply/watermark process-abort boundary,
+and independent-process cursor ordering.
 
 Criterion includes three focused measurements:
 
@@ -188,3 +197,6 @@ The `global_index_outbox` Criterion group compares the same indexed-key update
 with and without transactional outbox capture. The release baseline harness
 continues to record throughput, p50/p95/p99 latency, physical write bytes, and
 peak shard WAL growth for before/after gates.
+
+The `global_index_async` group measures one-event catch-up, steady-state write
+plus apply, a fully fresh miss plan, and a lagged hybrid miss plan.

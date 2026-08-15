@@ -3,13 +3,14 @@ mod support;
 use std::{cell::Cell, hint::black_box, sync::Arc, time::Duration};
 
 use briskdb::core::{
-    CanonicalIndexKey, Database, Engine, EngineOptions, GlobalIndexDeclaration, GlobalIndexKeyPart,
-    GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexOwner, GlobalIndexStorageTopology,
-    GlobalOperationId, GlobalUniqueMutation, LogicalDatabaseId, Session, ShardKeyMetadata,
-    ShardKeyType, Statement, TableDeclaration, UniqueNullSemantics, Value,
+    CanonicalIndexKey, Database, Engine, EngineOptions, GlobalIndexAsyncOptions,
+    GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart, GlobalIndexKeySource,
+    GlobalIndexKeyType, GlobalIndexOwner, GlobalIndexStorageTopology, GlobalOperationId,
+    GlobalUniqueMutation, LogicalDatabaseId, Session, ShardKeyMetadata, ShardKeyType, Statement,
+    TableDeclaration, UniqueNullSemantics, Value,
 };
 
-use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use support::{
     BENCHMARK_SHARDS, BenchmarkFixture, EngineBenchmarkFixture, engine_benchmark_runtime,
 };
@@ -468,8 +469,12 @@ fn global_index_routing_benchmarks(criterion: &mut Criterion) {
 
 struct GlobalIndexOutboxWriteBenchmark {
     _root: tempfile::TempDir,
+    database: Arc<Database>,
     engine: Engine,
     session: Arc<Session>,
+    logical: LogicalDatabaseId,
+    lookup: briskdb::sql::NormalizedSql,
+    index: Option<GlobalIndexId>,
     route: String,
     next_value: Cell<bool>,
 }
@@ -505,7 +510,7 @@ impl GlobalIndexOutboxWriteBenchmark {
                 &[route.clone().into(), "value-a@example.test".into()],
             )
             .expect("seed outbox benchmark row");
-        if indexed {
+        let index = if indexed {
             let table = database
                 .catalog()
                 .table("default", "outbox_benchmark")
@@ -529,9 +534,24 @@ impl GlobalIndexOutboxWriteBenchmark {
             database
                 .build_global_index(index)
                 .expect("build outbox benchmark index");
-        }
+            Some(index)
+        } else {
+            None
+        };
+        let lookup = briskdb::sql::normalize_placeholders(
+            briskdb::sql::validate_common_subset(
+                briskdb::sql::parse(
+                    briskdb::SqlDialect::Sqlite,
+                    "SELECT tenant_id FROM outbox_benchmark WHERE email = ?1",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let database = Arc::new(database);
         let engine = Engine::from_database_with_options(
-            Arc::new(database),
+            Arc::clone(&database),
             EngineOptions::default().with_experimental_vtab_writes(coordinator),
         )
         .expect("open outbox benchmark engine");
@@ -541,8 +561,12 @@ impl GlobalIndexOutboxWriteBenchmark {
             .expect("route outbox benchmark session");
         Self {
             _root: root,
+            database,
             engine,
             session,
+            logical,
+            lookup,
+            index,
             route,
             next_value: Cell::new(true),
         }
@@ -566,6 +590,24 @@ impl GlobalIndexOutboxWriteBenchmark {
             ))
             .expect("update outbox benchmark row")
             .value
+    }
+
+    fn process(&self) -> u64 {
+        self.database
+            .process_global_index_async(
+                self.index.expect("indexed async benchmark"),
+                GlobalIndexAsyncOptions::default(),
+            )
+            .expect("process async benchmark outbox")
+            .applied_events()
+    }
+
+    fn plan_lookup(&self, email: &str) {
+        black_box(
+            self.engine
+                .plan_bound_statement(self.logical, &self.lookup, 0, &[email.into()], None)
+                .expect("plan async benchmark lookup"),
+        );
     }
 }
 
@@ -592,6 +634,36 @@ fn global_index_outbox_benchmarks(criterion: &mut Criterion) {
         bencher.iter(|| black_box(indexed.update(&runtime)));
     });
     group.finish();
+
+    let catch_up = GlobalIndexOutboxWriteBenchmark::new(&runtime, true, false);
+    let steady = GlobalIndexOutboxWriteBenchmark::new(&runtime, true, false);
+    let fresh_read = GlobalIndexOutboxWriteBenchmark::new(&runtime, true, false);
+    let lagged_read = GlobalIndexOutboxWriteBenchmark::new(&runtime, true, false);
+    assert_eq!(lagged_read.update(&runtime), 1);
+    let mut async_group = criterion.benchmark_group("global_index_async");
+    async_group.sample_size(20);
+    async_group.sampling_mode(SamplingMode::Flat);
+    async_group.throughput(Throughput::Elements(1));
+    async_group.bench_function("catch_up_single_event", |bencher| {
+        bencher.iter_batched(
+            || assert_eq!(catch_up.update(&runtime), 1),
+            |()| black_box(catch_up.process()),
+            BatchSize::SmallInput,
+        );
+    });
+    async_group.bench_function("steady_state_write_and_apply", |bencher| {
+        bencher.iter(|| {
+            assert_eq!(steady.update(&runtime), 1);
+            black_box(steady.process())
+        });
+    });
+    async_group.bench_function("fresh_miss_plan", |bencher| {
+        bencher.iter(|| fresh_read.plan_lookup("missing@example.test"));
+    });
+    async_group.bench_function("lagged_hybrid_miss_plan", |bencher| {
+        bencher.iter(|| lagged_read.plan_lookup("value-b@example.test"));
+    });
+    async_group.finish();
 }
 
 criterion_group!(

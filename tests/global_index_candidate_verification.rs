@@ -105,27 +105,38 @@ fn setup(root: &Path) -> (Arc<Database>, Engine, Vec<String>, briskdb::GlobalInd
     (database, engine, routes, index)
 }
 
-fn inject_stale_candidates(
+async fn inject_source_staleness(engine: &Engine, routes: &[String]) {
+    for (route, statement) in [
+        (
+            &routes[2],
+            Statement::new(
+                "DELETE FROM candidate_users WHERE tenant_id = ?1 AND email = ?2",
+                vec![routes[2].clone().into(), SHARED_EMAIL.into()],
+            ),
+        ),
+        (
+            &routes[3],
+            Statement::new(
+                "UPDATE candidate_users SET email = 'moved@example.test'
+                 WHERE tenant_id = ?1 AND email = ?2",
+                vec![routes[3].clone().into(), SHARED_EMAIL.into()],
+            ),
+        ),
+    ] {
+        let session = engine.session();
+        session.set_routing_key(route).await.unwrap();
+        engine.execute_write(&session, statement).await.unwrap();
+        session.close().await.unwrap();
+    }
+}
+
+async fn inject_stale_candidates(
     root: &Path,
-    database: &Database,
+    engine: &Engine,
     routes: &[String],
     index: briskdb::GlobalIndexId,
 ) {
-    database
-        .execute(
-            &routes[2],
-            "DELETE FROM candidate_users WHERE tenant_id = ?1 AND email = ?2",
-            &[routes[2].clone().into(), SHARED_EMAIL.into()],
-        )
-        .unwrap();
-    database
-        .execute(
-            &routes[3],
-            "UPDATE candidate_users SET email = 'moved@example.test'
-             WHERE tenant_id = ?1 AND email = ?2",
-            &[routes[3].clone().into(), SHARED_EMAIL.into()],
-        )
-        .unwrap();
+    inject_source_staleness(engine, routes).await;
 
     let shared = CanonicalIndexKey::encode_values(&[Value::from(SHARED_EMAIL)]).unwrap();
     let invalid = CanonicalIndexKey::encode_values(&[Value::from("invalid@example.test")]).unwrap();
@@ -143,8 +154,8 @@ fn inject_stale_candidates(
 #[tokio::test]
 async fn stale_candidates_are_verified_repaired_and_never_change_query_results() {
     let temp = tempfile::tempdir().unwrap();
-    let (database, engine, routes, index) = setup(temp.path());
-    inject_stale_candidates(temp.path(), &database, &routes, index);
+    let (_database, engine, routes, index) = setup(temp.path());
+    inject_stale_candidates(temp.path(), &engine, &routes, index).await;
     let logical = engine.catalog().default_database().id();
     let query = normalized(
         briskdb::SqlDialect::Sqlite,
@@ -249,6 +260,31 @@ async fn stale_candidates_are_verified_repaired_and_never_change_query_results()
         postgres_plan.global_index_routing().fallback_reason(),
         Some(GlobalIndexRoutingFallback::FreshnessUnproven)
     );
+}
+
+#[tokio::test]
+async fn a_key_created_after_the_watermark_is_found_without_an_index_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let (database, engine, routes, index) = setup(temp.path());
+    inject_source_staleness(&engine, &routes).await;
+    assert_eq!(
+        database.global_index_async_status(index).unwrap().shards()[3].lag(),
+        1
+    );
+
+    let result = engine
+        .query_logical(
+            &engine.session(),
+            Statement::new(
+                "SELECT tenant_id, email, payload FROM candidate_users
+                 WHERE email = ?1 AND payload = ?2",
+                vec!["moved@example.test".into(), "reject".into()],
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(result.shards.contains(&3));
+    assert_eq!(result.value.len(), 1);
 }
 
 #[test]
@@ -366,14 +402,14 @@ proptest! {
         ];
         let payloads = ["keep", "reject", "missing"];
         let temp = tempfile::tempdir().unwrap();
-        let (database, engine, routes, index) = setup(temp.path());
-        inject_stale_candidates(temp.path(), &database, &routes, index);
-        let session = engine.session();
+        let (_database, engine, routes, _index) = setup(temp.path());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let (indexed, forced) = runtime.block_on(async {
+            inject_source_staleness(&engine, &routes).await;
+            let session = engine.session();
             let parameters = vec![emails[email_choice].into(), payloads[payload_choice].into()];
             let indexed = engine
                 .query_logical(
@@ -401,6 +437,7 @@ proptest! {
             (indexed, forced)
         });
         prop_assert_eq!(indexed.value, forced.value);
-        prop_assert_eq!(indexed.shards, vec![0, 1, 2, 3]);
+        prop_assert!(!indexed.shards.is_empty());
+        prop_assert!(indexed.shards.iter().all(|shard| *shard < 4));
     }
 }

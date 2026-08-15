@@ -16,6 +16,8 @@ use tokio::{
 use tower::ServiceExt;
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "server")]
+use crate::core::GlobalIndexAsyncOptions;
 use crate::{
     core::Engine,
     embedded::BriskDb,
@@ -159,6 +161,9 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
         }
     };
     let engine = database.engine().clone();
+    let _global_index_worker = database
+        .start_global_index_worker(GlobalIndexAsyncOptions::default())
+        .context("failed to start asynchronous global-index maintenance")?;
 
     #[cfg(feature = "experimental-vtab")]
     let experimental_vtab_writes = engine.options().experimental_vtab_writes();

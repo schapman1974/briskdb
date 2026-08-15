@@ -37,9 +37,12 @@ pub use engine::{CheckpointReport, CheckpointShardReport, Engine, EngineStatus, 
 pub use error::{EngineError, EngineErrorKind, EngineResult};
 pub(crate) use generated_id::AllocationOwnerMap;
 pub use global_index::{
-    GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart,
-    GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata,
-    GlobalIndexOutboxBatch, GlobalIndexOutboxCursor, GlobalIndexOutboxEvent,
+    DEFAULT_GLOBAL_INDEX_ASYNC_BATCH_EVENTS, DEFAULT_GLOBAL_INDEX_ASYNC_LEASE_MS,
+    DEFAULT_GLOBAL_INDEX_ASYNC_POLL_MS, GlobalIndexAsyncOptions, GlobalIndexAsyncProcessReport,
+    GlobalIndexAsyncShardOutcome, GlobalIndexAsyncShardReport, GlobalIndexAsyncShardStatus,
+    GlobalIndexAsyncStatus, GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId,
+    GlobalIndexKeyPart, GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexLifecycle,
+    GlobalIndexMetadata, GlobalIndexOutboxBatch, GlobalIndexOutboxCursor, GlobalIndexOutboxEvent,
     GlobalIndexOutboxEventKind, GlobalIndexOutboxPruneReport, GlobalIndexOutboxShardStatus,
     GlobalIndexOwner, GlobalIndexRepairReport, GlobalIndexStorageTopology,
     GlobalIndexValidationIssue, GlobalIndexValidationIssueKind, GlobalIndexValidationMode,
@@ -96,7 +99,12 @@ pub(crate) use worker::BlockingPool;
 
 use session::SessionInner;
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, Condvar, Mutex},
+    thread,
+    time::Duration,
+};
 
 use crate::{sql, storage::Storage};
 
@@ -122,6 +130,74 @@ pub(crate) enum RawDataTarget {
 #[derive(Debug)]
 pub struct Database {
     storage: Storage,
+    global_index_worker_id: [u8; 16],
+}
+
+/// Caller-owned background maintenance loop for non-unique global indexes.
+///
+/// Dropping the handle requests shutdown and joins the worker. Multiple
+/// processes may run workers against one data directory; durable leases fence
+/// every index/shard pair.
+pub struct GlobalIndexWorker {
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for GlobalIndexWorker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GlobalIndexWorker")
+            .field(
+                "running",
+                &self.join.as_ref().is_some_and(|join| !join.is_finished()),
+            )
+            .finish()
+    }
+}
+
+impl GlobalIndexWorker {
+    /// Request worker shutdown and wait for its thread. Returns whether it had
+    /// already been stopped.
+    pub fn stop(&mut self) -> bool {
+        let already_stopped = self.join.is_none();
+        {
+            let (lock, wake) = &*self.wake;
+            let mut stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *stopped = true;
+            wake.notify_all();
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        already_stopped
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
+}
+
+impl Drop for GlobalIndexWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn random_global_index_worker_id() -> EngineResult<[u8; 16]> {
+    let mut owner_id = [0_u8; 16];
+    getrandom::fill(&mut owner_id).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::StorageUnavailable,
+            "could not generate a global-index worker identity",
+            error,
+        )
+    })?;
+    if owner_id == [0; 16] {
+        owner_id[0] = 1;
+    }
+    Ok(owner_id)
 }
 
 /// Durable identities and catalog result of one generated-table DDL request.
@@ -201,6 +277,121 @@ impl Database {
     pub fn open(root: impl AsRef<Path>, requested_shards: u16) -> EngineResult<Self> {
         Ok(Self {
             storage: Storage::open(root, requested_shards)?,
+            global_index_worker_id: random_global_index_worker_id()?,
+        })
+    }
+
+    /// Inspect durable asynchronous freshness, lag, leases, and poison state.
+    pub fn global_index_async_status(
+        &self,
+        index_id: GlobalIndexId,
+    ) -> EngineResult<GlobalIndexAsyncStatus> {
+        self.storage.global_index_async_status(index_id)
+    }
+
+    /// Apply one bounded batch per shard using this handle's fenced identity.
+    pub fn process_global_index_async(
+        &self,
+        index_id: GlobalIndexId,
+        options: GlobalIndexAsyncOptions,
+    ) -> EngineResult<GlobalIndexAsyncProcessReport> {
+        self.process_global_index_async_with_cancellation(
+            index_id,
+            options,
+            &CancellationToken::new(),
+        )
+    }
+
+    pub fn process_global_index_async_with_cancellation(
+        &self,
+        index_id: GlobalIndexId,
+        options: GlobalIndexAsyncOptions,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalIndexAsyncProcessReport> {
+        self.storage.process_global_index_async(
+            index_id,
+            self.global_index_worker_id,
+            options,
+            cancellation,
+        )
+    }
+
+    /// Pause future consumer passes for one non-unique global index.
+    pub fn pause_global_index_async(&self, index_id: GlobalIndexId) -> EngineResult<()> {
+        self.storage.set_global_index_async_paused(index_id, true)
+    }
+
+    /// Resume future consumer passes. A poison or rebuild-required state stays
+    /// fenced until the index is rebuilt.
+    pub fn resume_global_index_async(&self, index_id: GlobalIndexId) -> EngineResult<()> {
+        self.storage.set_global_index_async_paused(index_id, false)
+    }
+
+    /// Start a managed background consumer for every ready non-unique index.
+    pub fn start_global_index_worker(
+        &self,
+        options: GlobalIndexAsyncOptions,
+    ) -> EngineResult<GlobalIndexWorker> {
+        let owner_id = random_global_index_worker_id()?;
+        let storage = self.storage.clone();
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_wake = Arc::clone(&wake);
+        let join = thread::Builder::new()
+            .name("briskdb-global-index".to_owned())
+            .spawn(move || {
+                let cancellation = CancellationToken::new();
+                loop {
+                    let (lock, _) = &*worker_wake;
+                    if *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+                        break;
+                    }
+                    let mut made_progress = false;
+                    for index_id in storage.ready_nonunique_global_indexes() {
+                        match storage.process_global_index_async(
+                            index_id,
+                            owner_id,
+                            options,
+                            &cancellation,
+                        ) {
+                            Ok(report) => made_progress |= report.applied_events() != 0,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    EngineErrorKind::Busy
+                                        | EngineErrorKind::Cancelled
+                                        | EngineErrorKind::DeadlineExceeded
+                                ) => {}
+                            Err(error) => {
+                                #[cfg(any(feature = "http", feature = "sqlite-import"))]
+                                tracing::warn!(index_id = %index_id, error = %error, "global-index worker pass failed");
+                                #[cfg(not(any(feature = "http", feature = "sqlite-import")))]
+                                let _ = (index_id, error);
+                            }
+                        }
+                    }
+                    if made_progress {
+                        continue;
+                    }
+                    let (lock, wake) = &*worker_wake;
+                    let stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if *stopped {
+                        break;
+                    }
+                    let _ = wake
+                        .wait_timeout(stopped, Duration::from_millis(options.poll_ms()))
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            })
+            .map_err(|error| {
+                EngineError::from_source(
+                    EngineErrorKind::StorageUnavailable,
+                    "failed to start the global-index worker",
+                    error,
+                )
+            })?;
+        Ok(GlobalIndexWorker {
+            wake,
+            join: Some(join),
         })
     }
 
@@ -720,6 +911,22 @@ impl Database {
                 EngineErrorKind::Unsupported,
                 "generated-key INSERT requires the asynchronous Engine coordinator",
             ));
+        }
+        if let Some(table_id) = plan.as_ref().and_then(|plan| plan.table_id) {
+            if self.catalog().global_indexes().iter().any(|index| {
+                index.table_id() == table_id
+                    && index.is_unique()
+                    && matches!(
+                        index.lifecycle(),
+                        GlobalIndexLifecycle::Ready | GlobalIndexLifecycle::Invalid
+                    )
+            }) {
+                return Err(EngineError::new(
+                    EngineErrorKind::Unsupported,
+                    "writes to a ready or invalid globally unique table require the Engine coordinator",
+                ));
+            }
+            self.storage.fence_uncoordinated_nonunique_write(table_id)?;
         }
         let statement = plan
             .as_ref()

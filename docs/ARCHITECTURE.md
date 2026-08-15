@@ -985,7 +985,10 @@ keys, and asks storage for candidate owners. Unique indexes include both
 finalized entries and old/new active-mutation owners in one snapshot, then
 authoritatively prune shards. Non-unique candidates are physically rechecked
 against their row locator, canonical key, and complete predicate; bounded stale
-entries are tombstoned, but execution still scatters until freshness is proven.
+entries are tombstoned. Each plan also captures the shard outbox high-water
+vector and reads authority watermarks in the candidate snapshot. Verified
+candidates are combined with only lagging, poisoned, or uninitialized shards;
+fully fresh shards with no candidate are excluded.
 The public bound plan carries redaction-safe explain metadata. Any unsupported
 definition or predicate, excessive expansion/candidates, invalid lifecycle, or
 authority/verification failure retains the ordinary correct route.
@@ -999,8 +1002,12 @@ or tombstone event is appended to a private shard-local outbox before the child
 decision. Rollback removes both. One shard-wide cursor supplies replay order
 across processes, while per-index durable consumer cursors bound safe prefix
 pruning. Hard event/byte limits turn retention exhaustion into retryable `Busy`
-before the row commits. Issue #237 consumes these events into non-unique global
-index storage and publishes the freshness watermarks needed for shard pruning.
+before the row commits. Expiring per-index/per-shard leases fence competing
+processes. Entry application and watermark advancement share one authority
+transaction; shard acknowledgement follows, making crash replay idempotent.
+The server owns a default worker, while embedded callers can start a managed
+worker or schedule bounded passes explicitly. The complete contract is in
+[asynchronous global indexes](GLOBAL_INDEX_ASYNC.md).
 
 Each PostgreSQL connection also owns a random, in-memory backend PID/secret pair.
 The adapter registers a fresh core cancellation token only for the command that
