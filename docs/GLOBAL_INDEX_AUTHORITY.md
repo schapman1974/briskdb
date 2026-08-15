@@ -61,13 +61,24 @@ flowchart LR
     AUTH -. unavailable .-> SCATTER
 ```
 
-Only synchronously maintained, ready unique indexes are eligible today.
-Partial indexes, expression keys, non-unique indexes, unsupported predicate
-shapes/types, oversized key sets, invalid lifecycle state, and unavailable
-index storage fall back without omitting a shard. Active old and new mutation
-owners are included so the physical-commit/finalization window is conservative.
-`BoundStatementPlan::global_index_routing()` exposes the selected index,
-redaction-safe counts, exact target shards, and a stable fallback reason.
+Ready non-unique column indexes can also supply candidates. BriskDB reads at
+most 4,096 candidates, fetches each by its stable physical locator, recomputes
+the canonical key, and evaluates the complete original predicate on that
+shard. Deleted, moved, malformed, and no-longer-matching candidates are never
+returned as index evidence. Up to 64 stale observations per plan become
+idempotent durable tombstones; applied tombstones are skipped on later reads.
+
+Non-unique candidates cannot yet prove that another shard has no newer match,
+so these plans retain the ordinary safe scatter route with the stable
+`freshness_unproven` reason. Issue
+[#237](https://github.com/schapman1974/briskdb/issues/237) adds the watermarks
+needed for exclusion. Partial indexes, expression keys, unsupported predicate
+shapes/types, oversized key/candidate sets, invalid lifecycle state, and
+unavailable index storage also fall back without omitting a shard. Active old
+and new unique-mutation owners remain included through the physical-commit
+window. `BoundStatementPlan::global_index_routing()` exposes authoritative
+status, candidates, verified/rejected/stale counts, repairs, diagnostic
+candidate shards, exact execution targets, and a stable fallback reason.
 
 ## Unique-key state machine
 
@@ -115,10 +126,11 @@ reports `active_unique_reservation`. A unique-index rebuild rolls active
 reservations back before reconstructing ownership from the authoritative shard
 rows.
 
-Physical global-index storage version 2 adds the operation, reservation,
-sequence, and lease tables to `global-indexes/global.sqlite`. Startup upgrades
-version 1 atomically and requires sole-process ownership; a live peer receives
-retryable `Busy` before any format mutation.
+Physical global-index storage version 2 added the operation, reservation,
+sequence, and lease tables to `global-indexes/global.sqlite`. Version 3 adds
+bounded non-unique read-repair tombstones. Startup upgrades versions 1 and 2
+atomically and requires sole-process ownership; a live peer receives retryable
+`Busy` before any format mutation.
 
 ## Verification and benchmarks
 
@@ -127,7 +139,8 @@ partial/compound/NULL key derivation, constraint outcomes, competing-process
 insert/update/delete races and exact retries, Python and PostgreSQL clients,
 replacement locking, serial-model property histories, four-process hot-key
 contention, four-process range leasing, durable process-abort boundaries,
-format-upgrade crashes, and peer fencing.
+format-upgrade crashes, peer fencing, stale-candidate differential properties,
+cancellation/deadlines, and process exits around repair enqueue/application.
 
 Criterion includes three focused measurements:
 

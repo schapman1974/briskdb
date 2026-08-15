@@ -413,7 +413,7 @@ requires an earlier dependency:
    - [x] [#232](https://github.com/schapman1974/briskdb/issues/232) — unique reservations and global allocation
    - [x] [#233](https://github.com/schapman1974/briskdb/issues/233) — authoritative write maintenance
    - [x] [#234](https://github.com/schapman1974/briskdb/issues/234) — exact indexed routing
-   - [ ] [#235](https://github.com/schapman1974/briskdb/issues/235) — candidate verification and repair
+   - [x] [#235](https://github.com/schapman1974/briskdb/issues/235) — candidate verification and repair
    - [ ] [#236](https://github.com/schapman1974/briskdb/issues/236) — transactional shard outboxes
    - [ ] [#237](https://github.com/schapman1974/briskdb/issues/237) — asynchronous indexing and watermarks
    - [ ] [#238](https://github.com/schapman1974/briskdb/issues/238) — Bloom/min-max shard summaries

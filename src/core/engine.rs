@@ -632,12 +632,14 @@ impl Engine {
         explicit_routing_key: Option<&[u8]>,
     ) -> EngineResult<BoundStatementPlan> {
         let _schema_operation = self.inner.database.storage.enter_schema_operation()?;
+        let cancellation = CancellationToken::new();
         self.plan_bound_statement_admitted(
             database,
             normalized,
             statement_index,
             parameters,
             explicit_routing_key,
+            (&cancellation, None),
         )
     }
 
@@ -648,6 +650,7 @@ impl Engine {
         statement_index: usize,
         parameters: &[Value],
         explicit_routing_key: Option<&[u8]>,
+        read_control: (&CancellationToken, Option<Instant>),
     ) -> EngineResult<BoundStatementPlan> {
         let (hash_version, key_encoding_version, bucket_algorithm_version, map_generation) =
             self.inner.database.routing_provenance();
@@ -675,11 +678,15 @@ impl Engine {
             normalized,
             parameters,
             self.shard_count(),
-            |index_id, keys| {
-                self.inner
-                    .database
-                    .storage
-                    .global_index_read_candidates(index_id, keys)
+            |index_id, keys, predicate, alias, parameters| {
+                self.inner.database.storage.global_index_read_resolution(
+                    index_id,
+                    keys,
+                    predicate,
+                    alias,
+                    parameters,
+                    read_control,
+                )
             },
         )?;
         Ok(plan)
@@ -689,6 +696,8 @@ impl Engine {
         &self,
         statement: &str,
         parameters: &[Value],
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
     ) -> EngineResult<(Vec<u16>, String)> {
         let parsed = sql::parse(sql::SqlDialect::Sqlite, statement)?;
         if parsed.statement_count() != 1 {
@@ -706,6 +715,7 @@ impl Engine {
             0,
             parameters,
             None,
+            (cancellation, deadline),
         )?;
         if !matches!(plan.behavior(), sql::StatementBehavior::Read) {
             return Err(EngineError::new(
@@ -1151,6 +1161,7 @@ impl Engine {
                 0,
                 &parameters,
                 routing_key,
+                (&operation.cancellation, operation.deadline),
             )?;
             operation.check_before_start()?;
             let routing_key = routing_key.map(<[u8]>::to_vec);
@@ -1296,6 +1307,7 @@ impl Engine {
             0,
             portal_snapshot.parameters(),
             portal_snapshot.routing_key(),
+            (&operation.cancellation, operation.deadline),
         ) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1513,6 +1525,7 @@ impl Engine {
             0,
             portal_snapshot.parameters(),
             explicit_routing_key,
+            (&operation.cancellation, operation.deadline),
         ) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1767,6 +1780,7 @@ impl Engine {
             0,
             portal_snapshot.parameters(),
             None,
+            (&operation.cancellation, operation.deadline),
         ) {
             Ok(plan) => plan,
             Err(error) => {
@@ -2745,7 +2759,12 @@ impl Engine {
             Err(error) => return operation.finish(Err(error)),
         };
         let (sql, params) = statement.into_parts();
-        let (shards, sql) = match self.logical_raw_query_plan(&sql, &params) {
+        let (shards, sql) = match self.logical_raw_query_plan(
+            &sql,
+            &params,
+            &operation.cancellation,
+            operation.deadline,
+        ) {
             Ok(plan) => plan,
             Err(error) => return operation.finish(Err(error)),
         };

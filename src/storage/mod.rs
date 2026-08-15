@@ -1650,17 +1650,34 @@ impl Storage {
         self.fail_closed_on_corruption(result)
     }
 
-    pub(crate) fn global_index_read_candidates(
+    pub(crate) fn global_index_read_resolution(
         &self,
         index_id: GlobalIndexId,
         keys: &[crate::core::CanonicalIndexKey],
-    ) -> EngineResult<Vec<crate::core::GlobalIndexOwner>> {
+        query_predicate_sql: &str,
+        query_table_alias: Option<&str>,
+        parameters: &[crate::core::Value],
+        read_control: (&crate::core::CancellationToken, Option<Instant>),
+    ) -> EngineResult<crate::core::GlobalIndexReadResolution> {
         (|| {
-            let index = self.validate_authority_index(index_id, true, false)?;
+            let index = self.validate_authority_index(index_id, false, false)?;
             for key in keys {
                 self.validate_authority_key(index, key)?;
             }
-            global_index::lookup_authoritative_owners(self, index, keys)
+            if index.is_unique() {
+                global_index::lookup_authoritative_owners(self, index, keys)
+                    .map(crate::core::GlobalIndexReadResolution::authoritative)
+            } else {
+                global_index::verify_nonunique_candidates(
+                    self,
+                    index,
+                    keys,
+                    query_predicate_sql,
+                    query_table_alias,
+                    parameters,
+                    read_control,
+                )
+            }
         })()
     }
 
@@ -6667,6 +6684,26 @@ mod tests {
                 .unwrap();
                 database.repair_global_index(id).map(|_| ())
             }
+            "read-repair" => {
+                let logical_database = database.catalog().default_database().id();
+                let parsed = crate::sql::parse(
+                    crate::sql::SqlDialect::Sqlite,
+                    "SELECT id FROM events WHERE payload = ?1",
+                )
+                .unwrap();
+                let common = crate::sql::validate_common_subset(parsed).unwrap();
+                let normalized = crate::sql::normalize_placeholders(common).unwrap();
+                let engine = crate::core::Engine::from_database(Arc::new(database));
+                engine
+                    .plan_bound_statement(
+                        logical_database,
+                        &normalized,
+                        0,
+                        &[crate::core::Value::from(vec![1_u8, 2, 3])],
+                        None,
+                    )
+                    .map(|_| ())
+            }
             "authority-reserve" => {
                 let (id, operation, mutation) = authority_crash_request();
                 debug_assert_eq!(id, mutation.index_id());
@@ -7086,7 +7123,7 @@ mod tests {
     fn global_authority_format_upgrade_recovers_from_real_process_abort() {
         for (boundary, expected_version) in [
             ("upgrade-before-commit", 1_i64),
-            ("upgrade-after-commit", 2_i64),
+            ("upgrade-after-commit", 3_i64),
         ] {
             let temp = tempfile::tempdir().unwrap();
             setup_upgrade_test_root(temp.path());
@@ -7110,6 +7147,167 @@ mod tests {
             drop(Database::open(temp.path(), 2).unwrap());
             let canonical = fs::canonicalize(temp.path()).unwrap();
             assert!(!global_index::startup_requires_upgrade(&canonical).unwrap());
+        }
+    }
+
+    #[test]
+    fn global_authority_v2_upgrade_preserves_ready_index_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = setup_global_index_root(temp.path());
+        database
+            .execute(
+                "v2-upgrade-route",
+                "INSERT INTO events (id, tenant_id, payload) VALUES (1, ?1, ?2)",
+                &[
+                    crate::core::Value::from("v2-upgrade-route"),
+                    crate::core::Value::from(vec![1_u8, 2, 3]),
+                ],
+            )
+            .unwrap();
+        let index = database
+            .create_global_index(global_index_test_declaration(&database))
+            .unwrap();
+        database.build_global_index(index).unwrap();
+        drop(database);
+        global_index::downgrade_to_v2_for_test(temp.path());
+
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        assert!(database.validate_global_index(index).unwrap().is_valid());
+        let authority = Connection::open(temp.path().join("global-indexes/global.sqlite")).unwrap();
+        assert_eq!(
+            authority
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            authority
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_global_index_entries WHERE index_id = ?1",
+                    [i64::try_from(index.get()).unwrap()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert!(
+            authority
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_schema
+                         WHERE name = 'briskdb_global_index_read_repairs'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+    }
+
+    fn setup_stale_read_repair_root(root: &Path) -> GlobalIndexId {
+        let mut database = setup_global_index_root(root);
+        database
+            .execute(
+                "read-repair-route",
+                "INSERT INTO events (id, tenant_id, payload) VALUES (1, ?1, ?2)",
+                &[
+                    crate::core::Value::from("read-repair-route"),
+                    crate::core::Value::from(vec![1_u8, 2, 3]),
+                ],
+            )
+            .unwrap();
+        let index = database
+            .create_global_index(global_index_test_declaration(&database))
+            .unwrap();
+        database.build_global_index(index).unwrap();
+        let shard = database.shard_for_key(&crate::core::canonical_shard_key_bytes(
+            crate::core::CanonicalShardKeyRef::Text("read-repair-route"),
+        ));
+        drop(database);
+        Connection::open(shard_file(root, shard))
+            .unwrap()
+            .execute(
+                "DELETE FROM events WHERE tenant_id = ?1 AND id = 1",
+                ["read-repair-route"],
+            )
+            .unwrap();
+        index
+    }
+
+    fn plan_stale_read_repair(root: &Path) -> crate::core::GlobalIndexRoutingPlan {
+        let database = Arc::new(Database::open(root, 2).unwrap());
+        let logical_database = database.catalog().default_database().id();
+        let engine = crate::core::Engine::from_database(database);
+        let parsed = crate::sql::parse(
+            crate::sql::SqlDialect::Sqlite,
+            "SELECT id FROM events WHERE payload = ?1",
+        )
+        .unwrap();
+        let common = crate::sql::validate_common_subset(parsed).unwrap();
+        let normalized = crate::sql::normalize_placeholders(common).unwrap();
+        engine
+            .plan_bound_statement(
+                logical_database,
+                &normalized,
+                0,
+                &[crate::core::Value::from(vec![1_u8, 2, 3])],
+                None,
+            )
+            .unwrap()
+            .global_index_routing()
+            .clone()
+    }
+
+    #[test]
+    fn global_index_read_repair_recovers_at_every_transaction_boundary() {
+        for (boundary, expected_state) in [
+            ("read-repair-before-enqueue-commit", None),
+            ("read-repair-after-enqueue-commit", Some(1_i64)),
+            ("read-repair-before-apply-commit", Some(1_i64)),
+            ("read-repair-after-apply-commit", Some(2_i64)),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let index = setup_stale_read_repair_root(temp.path());
+            abort_global_index_child(temp.path(), "read-repair", boundary, Some(index));
+            let authority =
+                Connection::open(temp.path().join("global-indexes/global.sqlite")).unwrap();
+            let state = authority
+                .query_row(
+                    "SELECT repair_state FROM briskdb_global_index_read_repairs
+                     WHERE index_id = ?1",
+                    [i64::try_from(index.get()).unwrap()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(state, expected_state, "boundary {boundary}");
+            drop(authority);
+
+            let recovered = plan_stale_read_repair(temp.path());
+            assert_eq!(
+                recovered.fallback_reason(),
+                Some(crate::core::GlobalIndexRoutingFallback::FreshnessUnproven)
+            );
+            let authority =
+                Connection::open(temp.path().join("global-indexes/global.sqlite")).unwrap();
+            assert_eq!(
+                authority
+                    .query_row(
+                        "SELECT COUNT(*) FROM briskdb_global_index_read_repairs
+                         WHERE index_id = ?1 AND repair_state = 2",
+                        [i64::try_from(index.get()).unwrap()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "boundary {boundary} did not converge"
+            );
+            drop(authority);
+
+            let retry = plan_stale_read_repair(temp.path());
+            assert_eq!(retry.candidate_count(), 0);
+            assert_eq!(retry.stale_candidate_count(), 0);
+            assert_eq!(retry.repairs_queued(), 0);
         }
     }
 

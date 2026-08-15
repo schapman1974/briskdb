@@ -22,7 +22,10 @@ use crate::core::{
 pub(crate) struct GlobalIndexLookupCandidate {
     index_id: GlobalIndexId,
     index_name: String,
+    unique: bool,
     keys: Vec<CanonicalIndexKey>,
+    query_predicate_sql: String,
+    query_table_alias: Option<String>,
 }
 
 impl GlobalIndexLookupCandidate {
@@ -34,8 +37,20 @@ impl GlobalIndexLookupCandidate {
         &self.index_name
     }
 
+    pub(crate) const fn is_unique(&self) -> bool {
+        self.unique
+    }
+
     pub(crate) fn keys(&self) -> &[CanonicalIndexKey] {
         &self.keys
+    }
+
+    pub(crate) fn query_predicate_sql(&self) -> &str {
+        &self.query_predicate_sql
+    }
+
+    pub(crate) fn query_table_alias(&self) -> Option<&str> {
+        self.query_table_alias.as_deref()
     }
 }
 
@@ -135,7 +150,7 @@ pub(crate) fn infer_global_index_lookup(
         .iter()
         .filter(|index| index.table_id() == table_id)
     {
-        if index.lifecycle() != GlobalIndexLifecycle::Ready || !index.is_unique() {
+        if index.lifecycle() != GlobalIndexLifecycle::Ready {
             continue;
         }
         saw_ready = true;
@@ -154,7 +169,12 @@ pub(crate) fn infer_global_index_lookup(
             IndexKeys::Finite(keys) => candidates.push(GlobalIndexLookupCandidate {
                 index_id: index.id(),
                 index_name: index.name().to_owned(),
+                unique: index.is_unique(),
                 keys,
+                query_predicate_sql: String::new(),
+                query_table_alias: alias
+                    .as_ref()
+                    .map(|alias| reference_identifier(&alias.name)),
             }),
         }
     }
@@ -166,12 +186,15 @@ pub(crate) fn infer_global_index_lookup(
             .global_index_by_id(candidate.index_id)
             .map_or(0, |index| index.key_parts().len());
         (
+            !candidate.unique,
             candidate.keys.len(),
             usize::MAX - parts,
             candidate.index_id.get(),
         )
     });
-    if let Some(candidate) = candidates.into_iter().next() {
+    if let Some(mut candidate) = candidates.into_iter().next() {
+        candidate.query_predicate_sql =
+            super::translator::translated_query_predicate(normalized, statement_index)?;
         return Ok(Ok(candidate));
     }
     Ok(Err(if saw_too_many {
@@ -755,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_expression_nonunique_and_invalid_indexes_do_not_claim_routes() {
+    fn nonunique_indexes_produce_candidates_while_unsupported_and_invalid_indexes_fall_back() {
         let expression = GlobalIndexKeyPart::new(
             GlobalIndexKeySource::expression("lower(email)").unwrap(),
             GlobalIndexKeyType::Text,
@@ -787,33 +810,41 @@ mod tests {
                 Err(GlobalIndexInferenceFallback::UnsupportedIndexDefinition)
             );
         }
-        for index in [
-            metadata(
+        let candidate = infer(
+            &catalog(vec![metadata(
                 1,
                 "nonunique",
                 vec![column("email", GlobalIndexKeyType::Text)],
                 None,
                 GlobalIndexLifecycle::Ready,
                 false,
+            )]),
+            "SELECT * FROM users AS u WHERE u.email = 'a@example.test'",
+            &[],
+        )
+        .unwrap();
+        assert!(!candidate.is_unique());
+        assert_eq!(candidate.query_table_alias(), Some("u"));
+        assert_eq!(
+            candidate.query_predicate_sql(),
+            "u.email = 'a@example.test'"
+        );
+
+        assert_eq!(
+            infer(
+                &catalog(vec![metadata(
+                    1,
+                    "invalid",
+                    vec![column("email", GlobalIndexKeyType::Text)],
+                    None,
+                    GlobalIndexLifecycle::Invalid,
+                    true,
+                )]),
+                "SELECT * FROM users WHERE email = 'a@example.test'",
+                &[],
             ),
-            metadata(
-                1,
-                "invalid",
-                vec![column("email", GlobalIndexKeyType::Text)],
-                None,
-                GlobalIndexLifecycle::Invalid,
-                true,
-            ),
-        ] {
-            assert_eq!(
-                infer(
-                    &catalog(vec![index]),
-                    "SELECT * FROM users WHERE email = 'a@example.test'",
-                    &[],
-                ),
-                Err(GlobalIndexInferenceFallback::NoReadyAuthoritativeIndex)
-            );
-        }
+            Err(GlobalIndexInferenceFallback::NoReadyAuthoritativeIndex)
+        );
     }
 
     proptest! {

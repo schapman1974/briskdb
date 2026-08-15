@@ -46,7 +46,8 @@ pub use global_index::{
     HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1,
 };
 pub(crate) use global_index::{
-    MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_SQL_BYTES, MAX_GLOBAL_INDEXES,
+    GlobalIndexReadResolution, MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_READ_CANDIDATES,
+    MAX_GLOBAL_INDEX_READ_REPAIRS, MAX_GLOBAL_INDEX_SQL_BYTES, MAX_GLOBAL_INDEXES,
     MAX_GLOBAL_VALUE_LEASE_COUNT,
 };
 pub use index_key::{
@@ -583,13 +584,23 @@ impl Database {
             ),
             |key| self.shard_for_key(key),
         )?;
+        let cancellation = CancellationToken::new();
         planner::apply_global_index_routing(
             &mut plan,
             catalog,
             translated.normalized_sql(),
             params,
             self.shard_count(),
-            |index_id, keys| self.storage.global_index_read_candidates(index_id, keys),
+            |index_id, keys, predicate, alias, parameters| {
+                self.storage.global_index_read_resolution(
+                    index_id,
+                    keys,
+                    predicate,
+                    alias,
+                    parameters,
+                    (&cancellation, None),
+                )
+            },
         )?;
         let target = raw_data_execution_target(&plan, catalog, operation)?;
         Ok(Some(RawDataPlan {

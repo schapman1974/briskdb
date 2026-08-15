@@ -227,6 +227,57 @@ fn translate_compatibility(
     Ok(sqlite_sql)
 }
 
+/// Render one validated query predicate as canonical SQLite SQL while
+/// preserving the statement-local normalized parameter indexes. Global-index
+/// candidate verification embeds this expression in a locator-constrained
+/// physical query; it never executes the caller's projection twice.
+pub(crate) fn translated_query_predicate(
+    normalized: &NormalizedSql,
+    statement_index: usize,
+) -> EngineResult<String> {
+    let mut statement = normalized
+        .common()
+        .statements()
+        .get(statement_index)
+        .cloned()
+        .ok_or_else(translation_invariant)?;
+    let expected_placeholders = normalized
+        .statement_parameters()
+        .get(statement_index)
+        .ok_or_else(translation_invariant)?
+        .occurrence_count();
+    let mut visitor = CompatibilityVisitor {
+        normalized,
+        statement_index,
+        placeholder_count: 0,
+    };
+    if statement.visit(&mut visitor).is_break()
+        || visitor.placeholder_count != expected_placeholders
+    {
+        return Err(translation_invariant());
+    }
+    let AstStatement::Query(query) = statement else {
+        return Err(translation_invariant());
+    };
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(translation_invariant());
+    };
+    let predicate = select
+        .selection
+        .as_ref()
+        .ok_or_else(translation_invariant)?
+        .to_string();
+    let predicate = if normalized.dialect() == SqlDialect::MySql {
+        canonicalize_mysql_identifier_quotes(&predicate)?
+    } else {
+        predicate
+    };
+    if predicate.as_bytes().contains(&0) {
+        return Err(translation_invariant());
+    }
+    Ok(predicate)
+}
+
 /// Convert only MySQL-delimited identifiers in parser-rendered SQL. String
 /// literals and comments remain token-distinct, and embedded double quotes are
 /// escaped for SQLite's standard identifier spelling.
