@@ -904,6 +904,11 @@ async fn bound_statement_planning_is_public_owned_value_aware_and_opt_in() {
     assert_owned_public::<core::GlobalIndexRoutingPlan>();
     assert_owned_public::<core::GlobalIndexRoutingKind>();
     assert_owned_public::<core::GlobalIndexRoutingFallback>();
+    assert_owned_public::<core::ShardSummaryRoutingPlan>();
+    assert_owned_public::<core::ShardSummaryPredicateKind>();
+    assert_owned_public::<core::ShardSummaryRoutingFallback>();
+    assert_owned_public::<core::ShardSummaryPruningReason>();
+    assert_owned_public::<core::ShardSummaryPrunedShard>();
     assert_owned_public::<core::PlannedRoute>();
 
     let temp = tempfile::tempdir().unwrap();

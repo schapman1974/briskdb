@@ -30,6 +30,10 @@ flowchart LR
 - Each query captures an outbox high-water vector. A shard is excluded only
   when its poison-free watermark covers that shard's requirement. Lag therefore
   costs extra SQLite scans, never missing rows.
+- Ready [Bloom/min-max summaries](GLOBAL_INDEX_SHARD_SUMMARIES.md) may then
+  prove that a lagging shard cannot match the bound equality, `IN`, or range.
+  Verified candidates stay protected and unhealthy summary state retains the
+  scan.
 - Applied shard cursors advance only after the authority commit. A crash in
   between is harmless: restart reads from the authority watermark and repairs
   the acknowledgement.

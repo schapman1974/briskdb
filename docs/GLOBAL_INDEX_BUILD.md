@@ -35,7 +35,7 @@ must stop every service and embedded process using the root, open one exclusive
 ```
 
 It is a separate, application-identified, storage-version-4 SQLite database in
-WAL mode with `synchronous=FULL`. It contains eleven BriskDB-owned tables:
+WAL mode with `synchronous=FULL`. It contains fourteen BriskDB-owned tables:
 
 | Table | Authority |
 | --- | --- |
@@ -53,6 +53,12 @@ WAL mode with `synchronous=FULL`. It contains eleven BriskDB-owned tables:
 | `briskdb_global_unique_reservations` | Active atomic locks on affected unique keys |
 | `briskdb_global_value_sequences` | Per-index positive integer head and fence token |
 | `briskdb_global_value_leases` | Irrevocable operation-bound value ranges |
+
+After physical authority completion, the builder also publishes one
+`briskdb_global_index_shard_summaries` row inside each source shard. These
+restartable Bloom/min-max hints are not authority and are ignored unless their
+format, definition digest, and state are ready; see
+[shard-summary pruning](GLOBAL_INDEX_SHARD_SUMMARIES.md).
 
 Storage versions 1 and 2 are upgraded atomically during sole-process startup. The
 online state machines are documented in [global uniqueness and value

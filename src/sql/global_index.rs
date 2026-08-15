@@ -14,7 +14,8 @@ use super::NormalizedSql;
 use crate::core::{
     CanonicalIndexKey, Catalog, EngineError, EngineErrorKind, EngineResult, GlobalIndexId,
     GlobalIndexKeyPart, GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexLifecycle,
-    IndexKeyPart, IndexKeyValue, LogicalDatabaseId, TableId, Value,
+    GlobalIndexShardSummaryBound, GlobalIndexShardSummaryPredicate, IndexKeyOrder, IndexKeyPart,
+    IndexKeyValue, LogicalDatabaseId, TableId, Value,
 };
 
 /// Bound exact-key lookups for one authoritative index.
@@ -61,6 +62,33 @@ pub(crate) enum GlobalIndexInferenceFallback {
     UnsupportedIndexDefinition,
     PredicateNotExact,
     TooManyKeys,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShardSummaryLookupCandidate {
+    index_id: GlobalIndexId,
+    index_name: String,
+    predicate: GlobalIndexShardSummaryPredicate,
+}
+
+impl ShardSummaryLookupCandidate {
+    pub(crate) const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+
+    pub(crate) fn index_name(&self) -> &str {
+        &self.index_name
+    }
+
+    pub(crate) const fn predicate(&self) -> &GlobalIndexShardSummaryPredicate {
+        &self.predicate
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShardSummaryInferenceFallback {
+    NoReadySummaryDefinition,
+    PredicateUnsupported,
 }
 
 /// Bound the planner's Cartesian expansion for compound `IN` predicates.
@@ -206,6 +234,409 @@ pub(crate) fn infer_global_index_lookup(
     } else {
         GlobalIndexInferenceFallback::NoReadyAuthoritativeIndex
     }))
+}
+
+pub(crate) fn infer_shard_summary_lookup(
+    catalog: &Catalog,
+    database: LogicalDatabaseId,
+    normalized: &NormalizedSql,
+    statement_index: usize,
+    parameters: &[Value],
+    table_id: TableId,
+) -> EngineResult<Result<ShardSummaryLookupCandidate, ShardSummaryInferenceFallback>> {
+    let statement = normalized
+        .common()
+        .statements()
+        .get(statement_index)
+        .ok_or_else(inference_invariant)?;
+    let layout = normalized
+        .statement_parameters()
+        .get(statement_index)
+        .ok_or_else(inference_invariant)?;
+    if parameters.len() != layout.parameter_count() {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            format!(
+                "statement {} requires exactly {} bound parameters for shard-summary inference",
+                statement_index + 1,
+                layout.parameter_count()
+            ),
+        ));
+    }
+    let database_name = catalog
+        .database_by_id(database)
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "selected logical database does not exist",
+            )
+        })?
+        .name();
+    let AstStatement::Query(query) = statement else {
+        return Ok(Err(ShardSummaryInferenceFallback::PredicateUnsupported));
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(Err(ShardSummaryInferenceFallback::PredicateUnsupported));
+    };
+    let [from] = select.from.as_slice() else {
+        return Ok(Err(ShardSummaryInferenceFallback::PredicateUnsupported));
+    };
+    if !from.joins.is_empty() {
+        return Ok(Err(ShardSummaryInferenceFallback::PredicateUnsupported));
+    }
+    let TableFactor::Table { name, alias, .. } = &from.relation else {
+        return Ok(Err(ShardSummaryInferenceFallback::PredicateUnsupported));
+    };
+    let [ObjectNamePart::Identifier(source)] = name.0.as_slice() else {
+        return Ok(Err(ShardSummaryInferenceFallback::PredicateUnsupported));
+    };
+    let source_name = catalog_identifier(source).ok_or_else(inference_invariant)?;
+    let table = catalog
+        .table(database_name, &source_name)?
+        .ok_or_else(inference_invariant)?;
+    if table.id() != table_id {
+        return Err(inference_invariant());
+    }
+    let Some(predicate) = select.selection.as_ref() else {
+        return Ok(Err(ShardSummaryInferenceFallback::PredicateUnsupported));
+    };
+    let qualifier = alias.as_ref().map_or_else(
+        || reference_identifier(source),
+        |alias| reference_identifier(&alias.name),
+    );
+    let context = InferenceContext {
+        normalized,
+        statement_index,
+        parameters,
+        qualifier,
+    };
+
+    let mut saw_ready = false;
+    let mut candidates = Vec::new();
+    for index in catalog
+        .global_indexes()
+        .iter()
+        .filter(|index| index.table_id() == table_id)
+    {
+        if index.lifecycle() != GlobalIndexLifecycle::Ready {
+            continue;
+        }
+        saw_ready = true;
+        if index.predicate().is_some()
+            || index
+                .key_parts()
+                .iter()
+                .any(|part| !matches!(part.source(), GlobalIndexKeySource::Column(_)))
+        {
+            continue;
+        }
+        match infer_index_keys(predicate, index.key_parts(), &context)? {
+            IndexKeys::Finite(keys) => candidates.push((
+                0_u8,
+                keys.len(),
+                usize::MAX - index.key_parts().len(),
+                ShardSummaryLookupCandidate {
+                    index_id: index.id(),
+                    index_name: index.name().to_owned(),
+                    predicate: GlobalIndexShardSummaryPredicate::Equality(keys.into_boxed_slice()),
+                },
+            )),
+            IndexKeys::Unconstrained | IndexKeys::TooMany => {
+                if let [part] = index.key_parts() {
+                    if let Some(range) = infer_summary_range(predicate, part, &context)? {
+                        candidates.push((
+                            1_u8,
+                            usize::MAX,
+                            0,
+                            ShardSummaryLookupCandidate {
+                                index_id: index.id(),
+                                index_name: index.name().to_owned(),
+                                predicate: range,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    candidates.sort_by_key(|(kind, keys, parts, candidate)| {
+        (*kind, *keys, *parts, candidate.index_id.get())
+    });
+    Ok(candidates
+        .into_iter()
+        .next()
+        .map(|(_, _, _, candidate)| candidate)
+        .ok_or(if saw_ready {
+            ShardSummaryInferenceFallback::PredicateUnsupported
+        } else {
+            ShardSummaryInferenceFallback::NoReadySummaryDefinition
+        }))
+}
+
+#[derive(Debug, Clone)]
+enum EncodedRangeDomain {
+    Any,
+    Empty,
+    Bounds {
+        lower: Option<GlobalIndexShardSummaryBound>,
+        upper: Option<GlobalIndexShardSummaryBound>,
+    },
+}
+
+fn infer_summary_range(
+    expression: &Expr,
+    part: &GlobalIndexKeyPart,
+    context: &InferenceContext<'_>,
+) -> EngineResult<Option<GlobalIndexShardSummaryPredicate>> {
+    let GlobalIndexKeySource::Column(column) = part.source() else {
+        return Ok(None);
+    };
+    let domain = infer_range_domain(expression, column, part, context)?;
+    Ok(match domain {
+        EncodedRangeDomain::Any => None,
+        EncodedRangeDomain::Empty => Some(GlobalIndexShardSummaryPredicate::Equality(Box::new([]))),
+        EncodedRangeDomain::Bounds { lower, upper } if lower.is_some() || upper.is_some() => {
+            Some(GlobalIndexShardSummaryPredicate::Range { lower, upper })
+        }
+        EncodedRangeDomain::Bounds { .. } => None,
+    })
+}
+
+fn infer_range_domain(
+    expression: &Expr,
+    column: &str,
+    part: &GlobalIndexKeyPart,
+    context: &InferenceContext<'_>,
+) -> EngineResult<EncodedRangeDomain> {
+    match peel_nested(expression) {
+        Expr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+            ) =>
+        {
+            if is_target_column(left, column, context) {
+                return range_comparison(op, right, false, part, context);
+            }
+            if is_target_column(right, column, context) {
+                return range_comparison(op, left, true, part, context);
+            }
+            Ok(EncodedRangeDomain::Any)
+        }
+        Expr::Between {
+            expr,
+            negated: false,
+            low,
+            high,
+        } if is_target_column(expr, column, context) => {
+            let lower = range_comparison(&BinaryOperator::GtEq, low, false, part, context)?;
+            let upper = range_comparison(&BinaryOperator::LtEq, high, false, part, context)?;
+            Ok(intersect_ranges(lower, upper))
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => Ok(intersect_ranges(
+            infer_range_domain(left, column, part, context)?,
+            infer_range_domain(right, column, part, context)?,
+        )),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => Ok(union_ranges(
+            infer_range_domain(left, column, part, context)?,
+            infer_range_domain(right, column, part, context)?,
+        )),
+        _ => Ok(EncodedRangeDomain::Any),
+    }
+}
+
+fn range_comparison(
+    operator: &BinaryOperator,
+    atom: &Expr,
+    reversed: bool,
+    part: &GlobalIndexKeyPart,
+    context: &InferenceContext<'_>,
+) -> EngineResult<EncodedRangeDomain> {
+    let value = match infer_atom(atom, part.key_type(), context)? {
+        InferredAtom::Unresolved => return Ok(EncodedRangeDomain::Any),
+        InferredAtom::Null => return Ok(EncodedRangeDomain::Empty),
+        InferredAtom::Value(value) => value,
+    };
+    let key = encode_single_key(&value, part)?;
+    let operator = if reversed {
+        match operator {
+            BinaryOperator::Lt => BinaryOperator::Gt,
+            BinaryOperator::LtEq => BinaryOperator::GtEq,
+            BinaryOperator::Gt => BinaryOperator::Lt,
+            BinaryOperator::GtEq => BinaryOperator::LtEq,
+            _ => return Ok(EncodedRangeDomain::Any),
+        }
+    } else {
+        operator.clone()
+    };
+    let (mut lower, mut upper) = match operator {
+        BinaryOperator::Gt => (Some(GlobalIndexShardSummaryBound::new(key, false)), None),
+        BinaryOperator::GtEq => (Some(GlobalIndexShardSummaryBound::new(key, true)), None),
+        BinaryOperator::Lt => (None, Some(GlobalIndexShardSummaryBound::new(key, false))),
+        BinaryOperator::LtEq => (None, Some(GlobalIndexShardSummaryBound::new(key, true))),
+        _ => return Ok(EncodedRangeDomain::Any),
+    };
+    if part.order() == IndexKeyOrder::Descending {
+        std::mem::swap(&mut lower, &mut upper);
+    }
+    Ok(EncodedRangeDomain::Bounds { lower, upper })
+}
+
+fn encode_single_key(
+    value: &IndexKeyValue,
+    part: &GlobalIndexKeyPart,
+) -> EngineResult<CanonicalIndexKey> {
+    let encoded_part = match part.order() {
+        IndexKeyOrder::Ascending => IndexKeyPart::ascending(value.as_ref()),
+        IndexKeyOrder::Descending => IndexKeyPart::descending(value.as_ref()),
+    }
+    .with_null_order(part.null_order())
+    .with_collation(part.collation());
+    CanonicalIndexKey::encode(&[encoded_part])
+}
+
+fn intersect_ranges(left: EncodedRangeDomain, right: EncodedRangeDomain) -> EncodedRangeDomain {
+    match (left, right) {
+        (EncodedRangeDomain::Empty, _) | (_, EncodedRangeDomain::Empty) => {
+            EncodedRangeDomain::Empty
+        }
+        (EncodedRangeDomain::Any, domain) | (domain, EncodedRangeDomain::Any) => domain,
+        (
+            EncodedRangeDomain::Bounds {
+                lower: left_lower,
+                upper: left_upper,
+            },
+            EncodedRangeDomain::Bounds {
+                lower: right_lower,
+                upper: right_upper,
+            },
+        ) => {
+            let lower = tighter_lower(left_lower, right_lower);
+            let upper = tighter_upper(left_upper, right_upper);
+            if range_is_empty(lower.as_ref(), upper.as_ref()) {
+                EncodedRangeDomain::Empty
+            } else {
+                EncodedRangeDomain::Bounds { lower, upper }
+            }
+        }
+    }
+}
+
+fn union_ranges(left: EncodedRangeDomain, right: EncodedRangeDomain) -> EncodedRangeDomain {
+    match (left, right) {
+        (EncodedRangeDomain::Any, _) | (_, EncodedRangeDomain::Any) => EncodedRangeDomain::Any,
+        (EncodedRangeDomain::Empty, domain) | (domain, EncodedRangeDomain::Empty) => domain,
+        (
+            EncodedRangeDomain::Bounds {
+                lower: left_lower,
+                upper: left_upper,
+            },
+            EncodedRangeDomain::Bounds {
+                lower: right_lower,
+                upper: right_upper,
+            },
+        ) => EncodedRangeDomain::Bounds {
+            lower: looser_lower(left_lower, right_lower),
+            upper: looser_upper(left_upper, right_upper),
+        },
+    }
+}
+
+fn tighter_lower(
+    left: Option<GlobalIndexShardSummaryBound>,
+    right: Option<GlobalIndexShardSummaryBound>,
+) -> Option<GlobalIndexShardSummaryBound> {
+    match (left, right) {
+        (None, bound) | (bound, None) => bound,
+        (Some(left), Some(right)) => {
+            Some(match left.key().as_bytes().cmp(right.key().as_bytes()) {
+                std::cmp::Ordering::Less => right,
+                std::cmp::Ordering::Greater => left,
+                std::cmp::Ordering::Equal => GlobalIndexShardSummaryBound::new(
+                    left.key().clone(),
+                    left.inclusive() && right.inclusive(),
+                ),
+            })
+        }
+    }
+}
+
+fn tighter_upper(
+    left: Option<GlobalIndexShardSummaryBound>,
+    right: Option<GlobalIndexShardSummaryBound>,
+) -> Option<GlobalIndexShardSummaryBound> {
+    match (left, right) {
+        (None, bound) | (bound, None) => bound,
+        (Some(left), Some(right)) => {
+            Some(match left.key().as_bytes().cmp(right.key().as_bytes()) {
+                std::cmp::Ordering::Less => left,
+                std::cmp::Ordering::Greater => right,
+                std::cmp::Ordering::Equal => GlobalIndexShardSummaryBound::new(
+                    left.key().clone(),
+                    left.inclusive() && right.inclusive(),
+                ),
+            })
+        }
+    }
+}
+
+fn looser_lower(
+    left: Option<GlobalIndexShardSummaryBound>,
+    right: Option<GlobalIndexShardSummaryBound>,
+) -> Option<GlobalIndexShardSummaryBound> {
+    match (left, right) {
+        (None, _) | (_, None) => None,
+        (Some(left), Some(right)) => {
+            Some(match left.key().as_bytes().cmp(right.key().as_bytes()) {
+                std::cmp::Ordering::Less => left,
+                std::cmp::Ordering::Greater => right,
+                std::cmp::Ordering::Equal => GlobalIndexShardSummaryBound::new(
+                    left.key().clone(),
+                    left.inclusive() || right.inclusive(),
+                ),
+            })
+        }
+    }
+}
+
+fn looser_upper(
+    left: Option<GlobalIndexShardSummaryBound>,
+    right: Option<GlobalIndexShardSummaryBound>,
+) -> Option<GlobalIndexShardSummaryBound> {
+    match (left, right) {
+        (None, _) | (_, None) => None,
+        (Some(left), Some(right)) => {
+            Some(match left.key().as_bytes().cmp(right.key().as_bytes()) {
+                std::cmp::Ordering::Less => right,
+                std::cmp::Ordering::Greater => left,
+                std::cmp::Ordering::Equal => GlobalIndexShardSummaryBound::new(
+                    left.key().clone(),
+                    left.inclusive() || right.inclusive(),
+                ),
+            })
+        }
+    }
+}
+
+fn range_is_empty(
+    lower: Option<&GlobalIndexShardSummaryBound>,
+    upper: Option<&GlobalIndexShardSummaryBound>,
+) -> bool {
+    lower.zip(upper).is_some_and(|(lower, upper)| {
+        lower.key().as_bytes() > upper.key().as_bytes()
+            || (lower.key() == upper.key() && (!lower.inclusive() || !upper.inclusive()))
+    })
 }
 
 struct InferenceContext<'a> {

@@ -666,12 +666,263 @@ fn global_index_outbox_benchmarks(criterion: &mut Criterion) {
     async_group.finish();
 }
 
+struct ShardSummaryBenchmark {
+    _root: tempfile::TempDir,
+    database: Arc<Database>,
+    engine: Engine,
+    logical: LogicalDatabaseId,
+    email_index: GlobalIndexId,
+    equality: briskdb::sql::NormalizedSql,
+    range: briskdb::sql::NormalizedSql,
+}
+
+impl ShardSummaryBenchmark {
+    fn new(runtime: &tokio::runtime::Runtime) -> Self {
+        let root = tempfile::tempdir().expect("create shard-summary benchmark root");
+        let mut database =
+            Database::open(root.path(), 4).expect("open shard-summary benchmark database");
+        database
+            .broadcast(
+                "CREATE TABLE shard_summary_benchmark (
+                     tenant_id TEXT PRIMARY KEY NOT NULL,
+                     email TEXT NOT NULL,
+                     age INTEGER NOT NULL
+                 ) STRICT",
+            )
+            .expect("create shard-summary benchmark table");
+        let logical = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical,
+                    "shard_summary_benchmark",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .expect("register shard-summary benchmark table");
+        let mut routes = vec![None; 4];
+        for value in 0_u64..100_000 {
+            let route = format!("summary-benchmark-{value}");
+            let shard = usize::from(database.shard_for_key(route.as_bytes()));
+            routes[shard].get_or_insert(route);
+            if routes.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let routes = routes
+            .into_iter()
+            .map(|route| route.expect("find one route per benchmark shard"))
+            .collect::<Vec<_>>();
+        for (shard, route) in routes.iter().enumerate() {
+            database
+                .execute(
+                    route,
+                    "INSERT INTO shard_summary_benchmark (tenant_id, email, age)
+                     VALUES (?1, ?2, ?3)",
+                    &[
+                        route.clone().into(),
+                        format!("summary-{shard}@example.test").into(),
+                        Value::Int64((shard as i64 + 1) * 10),
+                    ],
+                )
+                .expect("seed shard-summary benchmark row");
+        }
+        let table = database
+            .catalog()
+            .table("default", "shard_summary_benchmark")
+            .unwrap()
+            .unwrap()
+            .id();
+        let create_index =
+            |database: &mut Database, name: &str, column: &str, key_type: GlobalIndexKeyType| {
+                database
+                    .create_global_index(
+                        GlobalIndexDeclaration::new(
+                            table,
+                            name,
+                            vec![GlobalIndexKeyPart::new(
+                                GlobalIndexKeySource::column(column).unwrap(),
+                                key_type,
+                            )],
+                        )
+                        .unwrap()
+                        .with_topology(GlobalIndexStorageTopology::selected_v1()),
+                    )
+                    .unwrap()
+            };
+        let email_index = create_index(
+            &mut database,
+            "shard_summary_benchmark_email",
+            "email",
+            GlobalIndexKeyType::Text,
+        );
+        let age_index = create_index(
+            &mut database,
+            "shard_summary_benchmark_age",
+            "age",
+            GlobalIndexKeyType::Int64,
+        );
+        database.build_global_index(email_index).unwrap();
+        database.build_global_index(age_index).unwrap();
+        let database = Arc::new(database);
+        let engine = Engine::from_database(Arc::clone(&database));
+        for (shard, route) in routes.iter().enumerate() {
+            let session = engine.session();
+            runtime.block_on(session.set_routing_key(route)).unwrap();
+            runtime
+                .block_on(engine.execute_write(
+                    &session,
+                    Statement::new(
+                        "UPDATE shard_summary_benchmark SET email = ?1 WHERE tenant_id = ?2",
+                        vec![
+                            format!("summary-lag-{shard}@example.test").into(),
+                            route.clone().into(),
+                        ],
+                    ),
+                ))
+                .unwrap();
+            runtime.block_on(session.close()).unwrap();
+        }
+        let normalize = |source| {
+            briskdb::sql::normalize_placeholders(
+                briskdb::sql::validate_common_subset(
+                    briskdb::sql::parse(briskdb::SqlDialect::Sqlite, source).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        Self {
+            _root: root,
+            database,
+            engine,
+            logical,
+            email_index,
+            equality: normalize("SELECT tenant_id FROM shard_summary_benchmark WHERE email = ?1"),
+            range: normalize(
+                "SELECT tenant_id FROM shard_summary_benchmark WHERE age >= ?1 AND age < ?2",
+            ),
+        }
+    }
+
+    fn plan_missing(&self) -> usize {
+        self.engine
+            .plan_bound_statement(
+                self.logical,
+                &self.equality,
+                0,
+                &["summary-missing@example.test".into()],
+                None,
+            )
+            .unwrap()
+            .shard_summary_routing()
+            .pruned_shard_count()
+    }
+
+    fn plan_range(&self) -> usize {
+        self.engine
+            .plan_bound_statement(
+                self.logical,
+                &self.range,
+                0,
+                &[Value::Int64(25), Value::Int64(35)],
+                None,
+            )
+            .unwrap()
+            .shard_summary_routing()
+            .pruned_shard_count()
+    }
+
+    fn memory_bytes(&self) -> u64 {
+        self.database
+            .global_index_shard_summary_status(self.email_index)
+            .unwrap()
+            .memory_bytes()
+    }
+
+    fn estimated_false_positive_rate_ppm(&self) -> u32 {
+        let status = self
+            .database
+            .global_index_shard_summary_status(self.email_index)
+            .unwrap();
+        let rates = status
+            .shards()
+            .iter()
+            .filter_map(|shard| shard.estimated_false_positive_rate_ppm())
+            .collect::<Vec<_>>();
+        rates.iter().sum::<u32>() / rates.len() as u32
+    }
+
+    fn observed_false_positive_rate_ppm(&self, probes: u32) -> u32 {
+        let retained = (0..probes)
+            .map(|probe| {
+                self.engine
+                    .plan_bound_statement(
+                        self.logical,
+                        &self.equality,
+                        0,
+                        &[format!("summary-absent-{probe}@example.test").into()],
+                        None,
+                    )
+                    .unwrap()
+                    .global_index_routing()
+                    .target_shards()
+                    .len() as u64
+            })
+            .sum::<u64>();
+        u32::try_from(retained * 1_000_000 / (u64::from(probes) * 4)).unwrap()
+    }
+}
+
+fn global_index_shard_summary_benchmarks(criterion: &mut Criterion) {
+    let runtime = engine_benchmark_runtime().expect("initialize shard-summary benchmark runtime");
+    let fixture = ShardSummaryBenchmark::new(&runtime);
+    assert_eq!(fixture.plan_missing(), 4);
+    assert_eq!(fixture.plan_range(), 3);
+    assert_eq!(fixture.memory_bytes(), 4 * 16 * 1024);
+    assert!(fixture.estimated_false_positive_rate_ppm() < 100);
+    let observed_false_positive_rate_ppm = fixture.observed_false_positive_rate_ppm(64);
+    assert!(observed_false_positive_rate_ppm < 50_000);
+    eprintln!(
+        "shard-summary fixture: bloom_bytes={}, estimated_fpr_ppm={}, observed_fpr_ppm={}, bloom_shards_avoided=4, range_shards_avoided=3",
+        fixture.memory_bytes(),
+        fixture.estimated_false_positive_rate_ppm(),
+        observed_false_positive_rate_ppm,
+    );
+
+    let mut group = criterion.benchmark_group("global_index_shard_summaries");
+    group.sample_size(20);
+    group.sampling_mode(SamplingMode::Flat);
+    group.throughput(Throughput::Elements(4));
+    group.bench_function("bloom_lagged_miss_shards_avoided", |bencher| {
+        bencher.iter(|| black_box(fixture.plan_missing()));
+    });
+    group.bench_function("min_max_range_shards_avoided", |bencher| {
+        bencher.iter(|| black_box(fixture.plan_range()));
+    });
+    group.throughput(Throughput::Bytes(fixture.memory_bytes()));
+    group.bench_function("status_memory_bytes", |bencher| {
+        bencher.iter(|| black_box(fixture.memory_bytes()));
+    });
+    group.throughput(Throughput::Elements(4));
+    group.bench_function("estimated_false_positive_rate_ppm", |bencher| {
+        bencher.iter(|| black_box(fixture.estimated_false_positive_rate_ppm()));
+    });
+    group.throughput(Throughput::Elements(64 * 4));
+    group.bench_function("observed_false_positive_rate_64_probes", |bencher| {
+        bencher.iter(|| black_box(fixture.observed_false_positive_rate_ppm(64)));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     storage_benchmarks,
     engine_benchmarks,
     global_authority_benchmarks,
     global_index_routing_benchmarks,
-    global_index_outbox_benchmarks
+    global_index_outbox_benchmarks,
+    global_index_shard_summary_benchmarks
 );
 criterion_main!(benches);

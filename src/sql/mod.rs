@@ -28,7 +28,10 @@ pub use classifier::{
     WriteBehavior, classify_statements,
 };
 pub use generated::{GeneratedIdPolicyIntent, GeneratedTableIntent};
-pub(crate) use global_index::{GlobalIndexInferenceFallback, infer_global_index_lookup};
+pub(crate) use global_index::{
+    GlobalIndexInferenceFallback, ShardSummaryInferenceFallback, infer_global_index_lookup,
+    infer_shard_summary_lookup,
+};
 pub use inference::{ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue, infer_shard_keys};
 pub use normalizer::{
     MAX_SQL_PARAMETERS, NormalizedSql, StatementParameters, normalize_placeholders,

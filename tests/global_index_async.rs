@@ -130,8 +130,10 @@ async fn bounded_replay_makes_insert_update_delete_fresh_and_prunes_shards() {
         .unwrap();
     assert_eq!(
         lagged.global_index_routing().kind(),
-        GlobalIndexRoutingKind::Fallback
+        GlobalIndexRoutingKind::Routed
     );
+    assert_eq!(lagged.global_index_routing().target_shards(), &[0]);
+    assert_eq!(lagged.shard_summary_routing().pruned_shard_count(), 1);
 
     let report = database.process_global_index_async(index, options).unwrap();
     assert_eq!(report.applied_events(), 2);
@@ -257,8 +259,9 @@ async fn lag_scans_only_uncertain_shards_beside_verified_candidates() {
         GlobalIndexRoutingKind::Routed
     );
     assert_eq!(plan.global_index_routing().candidate_shards(), &[0]);
-    assert_eq!(plan.global_index_routing().uncertain_shards(), &[3]);
-    assert_eq!(plan.global_index_routing().target_shards(), &[0, 3]);
+    assert!(plan.global_index_routing().uncertain_shards().is_empty());
+    assert_eq!(plan.global_index_routing().target_shards(), &[0]);
+    assert_eq!(plan.shard_summary_routing().pruned_shard_count(), 1);
 }
 
 #[test]
@@ -289,9 +292,10 @@ fn legacy_raw_writes_force_safe_scanning_until_rebuild() {
         .unwrap();
     assert_eq!(
         plan.global_index_routing().kind(),
-        GlobalIndexRoutingKind::Fallback
+        GlobalIndexRoutingKind::Routed
     );
-    assert_eq!(plan.global_index_routing().target_shards(), &[0, 1]);
+    assert_eq!(plan.global_index_routing().target_shards(), &[0]);
+    assert_eq!(plan.shard_summary_routing().pruned_shard_count(), 1);
 }
 
 #[tokio::test]

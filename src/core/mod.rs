@@ -38,23 +38,28 @@ pub use error::{EngineError, EngineErrorKind, EngineResult};
 pub(crate) use generated_id::AllocationOwnerMap;
 pub use global_index::{
     DEFAULT_GLOBAL_INDEX_ASYNC_BATCH_EVENTS, DEFAULT_GLOBAL_INDEX_ASYNC_LEASE_MS,
-    DEFAULT_GLOBAL_INDEX_ASYNC_POLL_MS, GlobalIndexAsyncOptions, GlobalIndexAsyncProcessReport,
-    GlobalIndexAsyncShardOutcome, GlobalIndexAsyncShardReport, GlobalIndexAsyncShardStatus,
-    GlobalIndexAsyncStatus, GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId,
-    GlobalIndexKeyPart, GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexLifecycle,
-    GlobalIndexMetadata, GlobalIndexOutboxBatch, GlobalIndexOutboxCursor, GlobalIndexOutboxEvent,
-    GlobalIndexOutboxEventKind, GlobalIndexOutboxPruneReport, GlobalIndexOutboxShardStatus,
-    GlobalIndexOwner, GlobalIndexRepairReport, GlobalIndexStorageTopology,
-    GlobalIndexValidationIssue, GlobalIndexValidationIssueKind, GlobalIndexValidationMode,
-    GlobalIndexValidationOptions, GlobalIndexValidationReport, GlobalOperationId,
-    GlobalOperationState, GlobalUniqueMutation, GlobalUniqueReservation, GlobalValueLease,
-    HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1, MAX_GLOBAL_INDEX_OUTBOX_BATCH_EVENTS,
-    MAX_GLOBAL_INDEX_OUTBOX_BYTES_PER_SHARD, MAX_GLOBAL_INDEX_OUTBOX_EVENTS_PER_SHARD,
+    DEFAULT_GLOBAL_INDEX_ASYNC_POLL_MS, GLOBAL_INDEX_SHARD_SUMMARY_BLOOM_BYTES,
+    GLOBAL_INDEX_SHARD_SUMMARY_FORMAT_VERSION, GlobalIndexAsyncOptions,
+    GlobalIndexAsyncProcessReport, GlobalIndexAsyncShardOutcome, GlobalIndexAsyncShardReport,
+    GlobalIndexAsyncShardStatus, GlobalIndexAsyncStatus, GlobalIndexBuildReport,
+    GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart, GlobalIndexKeySource,
+    GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexOutboxBatch,
+    GlobalIndexOutboxCursor, GlobalIndexOutboxEvent, GlobalIndexOutboxEventKind,
+    GlobalIndexOutboxPruneReport, GlobalIndexOutboxShardStatus, GlobalIndexOwner,
+    GlobalIndexRepairReport, GlobalIndexShardSummaryRebuildReport,
+    GlobalIndexShardSummaryShardStatus, GlobalIndexShardSummaryState,
+    GlobalIndexShardSummaryStatus, GlobalIndexStorageTopology, GlobalIndexValidationIssue,
+    GlobalIndexValidationIssueKind, GlobalIndexValidationMode, GlobalIndexValidationOptions,
+    GlobalIndexValidationReport, GlobalOperationId, GlobalOperationState, GlobalUniqueMutation,
+    GlobalUniqueReservation, GlobalValueLease, HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1,
+    MAX_GLOBAL_INDEX_OUTBOX_BATCH_EVENTS, MAX_GLOBAL_INDEX_OUTBOX_BYTES_PER_SHARD,
+    MAX_GLOBAL_INDEX_OUTBOX_EVENTS_PER_SHARD,
 };
 pub(crate) use global_index::{
-    GlobalIndexReadResolution, MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_READ_CANDIDATES,
-    MAX_GLOBAL_INDEX_READ_REPAIRS, MAX_GLOBAL_INDEX_SQL_BYTES, MAX_GLOBAL_INDEXES,
-    MAX_GLOBAL_VALUE_LEASE_COUNT,
+    GlobalIndexReadResolution, GlobalIndexShardSummaryBound, GlobalIndexShardSummaryPredicate,
+    GlobalIndexShardSummaryPrunedShard, GlobalIndexShardSummaryReadResolution,
+    MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_READ_CANDIDATES, MAX_GLOBAL_INDEX_READ_REPAIRS,
+    MAX_GLOBAL_INDEX_SQL_BYTES, MAX_GLOBAL_INDEXES, MAX_GLOBAL_VALUE_LEASE_COUNT,
 };
 pub use index_key::{
     CanonicalIndexKey, DecodedIndexKeyPart, INDEX_KEY_ENCODING_VERSION, IndexKeyCollation,
@@ -74,7 +79,8 @@ pub use options::{
 };
 pub use planner::{
     BoundStatementPlan, GlobalIndexRoutingFallback, GlobalIndexRoutingKind, GlobalIndexRoutingPlan,
-    PlannedRoute,
+    PlannedRoute, ShardSummaryPredicateKind, ShardSummaryPrunedShard, ShardSummaryPruningReason,
+    ShardSummaryRoutingFallback, ShardSummaryRoutingPlan,
 };
 #[cfg(any(test, feature = "experimental-vtab", feature = "sqlite-import"))]
 pub(crate) use planner::{CanonicalShardKeyRef, canonical_shard_key_bytes};
@@ -287,6 +293,34 @@ impl Database {
         index_id: GlobalIndexId,
     ) -> EngineResult<GlobalIndexAsyncStatus> {
         self.storage.global_index_async_status(index_id)
+    }
+
+    /// Inspect compact Bloom/min-max state without exposing indexed values.
+    pub fn global_index_shard_summary_status(
+        &self,
+        index_id: GlobalIndexId,
+    ) -> EngineResult<GlobalIndexShardSummaryStatus> {
+        self.storage.global_index_shard_summary_status(index_id)
+    }
+
+    /// Rebuild compact summaries one source shard at a time.
+    pub fn rebuild_global_index_shard_summaries(
+        &self,
+        index_id: GlobalIndexId,
+    ) -> EngineResult<GlobalIndexShardSummaryRebuildReport> {
+        self.rebuild_global_index_shard_summaries_with_cancellation(
+            index_id,
+            &CancellationToken::new(),
+        )
+    }
+
+    pub fn rebuild_global_index_shard_summaries_with_cancellation(
+        &self,
+        index_id: GlobalIndexId,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalIndexShardSummaryRebuildReport> {
+        self.storage
+            .rebuild_global_index_shard_summaries(index_id, cancellation)
     }
 
     /// Apply one bounded batch per shard using this handle's fenced identity.
@@ -875,6 +909,19 @@ impl Database {
                 )
             },
         )?;
+        planner::apply_shard_summary_routing(
+            &mut plan,
+            catalog,
+            translated.normalized_sql(),
+            params,
+            |index_id, predicate, target_shards| {
+                self.storage.global_index_shard_summary_resolution(
+                    index_id,
+                    predicate,
+                    target_shards,
+                )
+            },
+        )?;
         let target = raw_data_execution_target(&plan, catalog, operation)?;
         Ok(Some(RawDataPlan {
             target,
@@ -926,7 +973,8 @@ impl Database {
                     "writes to a ready or invalid globally unique table require the Engine coordinator",
                 ));
             }
-            self.storage.fence_uncoordinated_nonunique_write(table_id)?;
+            self.storage
+                .fence_uncoordinated_nonunique_write(table_id, shard)?;
         }
         let statement = plan
             .as_ref()

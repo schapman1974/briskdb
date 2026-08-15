@@ -11,7 +11,8 @@ use crate::sql::{
 use super::{
     AllocationOwnerMap, CanonicalIndexKey, Catalog, EngineError, EngineErrorKind, EngineResult,
     GeneratedIdPolicy, GlobalIndexId, GlobalIndexOwner, GlobalIndexReadResolution,
-    LogicalDatabaseId, TableId, TableMetadata, TablePlacement, Value,
+    GlobalIndexShardSummaryPredicate, GlobalIndexShardSummaryReadResolution, LogicalDatabaseId,
+    TableId, TableMetadata, TablePlacement, Value,
     generated_id::{
         GeneratedIdClassification, HILO_V1_FORMAT_MARKER, classify_caller_generated_id,
     },
@@ -281,6 +282,135 @@ impl fmt::Debug for GlobalIndexRoutingPlan {
     }
 }
 
+/// Predicate family used by compact shard-local summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ShardSummaryPredicateKind {
+    Equality,
+    Range,
+}
+
+/// Why compact summaries could not narrow a read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ShardSummaryRoutingFallback {
+    NoReadySummaryDefinition,
+    PredicateUnsupported,
+    SummaryUnavailable,
+    NoShardExcluded,
+}
+
+impl ShardSummaryRoutingFallback {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NoReadySummaryDefinition => "no_ready_summary_definition",
+            Self::PredicateUnsupported => "summary_predicate_unsupported",
+            Self::SummaryUnavailable => "summary_unavailable",
+            Self::NoShardExcluded => "summary_no_shard_excluded",
+        }
+    }
+}
+
+/// Conservative proof used to exclude one physical shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ShardSummaryPruningReason {
+    EmptySummary,
+    BloomMiss,
+    MaximumBelowLowerBound,
+    MinimumAboveUpperBound,
+}
+
+impl ShardSummaryPruningReason {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::EmptySummary => "empty_summary",
+            Self::BloomMiss => "bloom_miss",
+            Self::MaximumBelowLowerBound => "maximum_below_query_lower_bound",
+            Self::MinimumAboveUpperBound => "minimum_above_query_upper_bound",
+        }
+    }
+}
+
+/// One redaction-safe shard exclusion and its exact proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShardSummaryPrunedShard {
+    shard: u16,
+    reason: ShardSummaryPruningReason,
+}
+
+impl ShardSummaryPrunedShard {
+    pub(crate) const fn new(shard: u16, reason: ShardSummaryPruningReason) -> Self {
+        Self { shard, reason }
+    }
+
+    pub const fn shard(self) -> u16 {
+        self.shard
+    }
+
+    pub const fn reason(self) -> ShardSummaryPruningReason {
+        self.reason
+    }
+}
+
+/// Redaction-safe explain data for Bloom/min-max shard pruning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardSummaryRoutingPlan {
+    index_id: Option<GlobalIndexId>,
+    index_name: Option<Arc<str>>,
+    predicate_kind: Option<ShardSummaryPredicateKind>,
+    examined_shards: usize,
+    pruned_shards: Vec<ShardSummaryPrunedShard>,
+    estimated_false_positive_rate_ppm: Option<u32>,
+    fallback: Option<ShardSummaryRoutingFallback>,
+}
+
+impl ShardSummaryRoutingPlan {
+    const fn not_applicable() -> Self {
+        Self {
+            index_id: None,
+            index_name: None,
+            predicate_kind: None,
+            examined_shards: 0,
+            pruned_shards: Vec::new(),
+            estimated_false_positive_rate_ppm: None,
+            fallback: None,
+        }
+    }
+
+    pub const fn index_id(&self) -> Option<GlobalIndexId> {
+        self.index_id
+    }
+    pub fn index_name(&self) -> Option<&str> {
+        self.index_name.as_deref()
+    }
+    pub const fn predicate_kind(&self) -> Option<ShardSummaryPredicateKind> {
+        self.predicate_kind
+    }
+    pub const fn examined_shards(&self) -> usize {
+        self.examined_shards
+    }
+    pub fn pruned_shards(&self) -> &[ShardSummaryPrunedShard] {
+        &self.pruned_shards
+    }
+    pub fn pruned_shard_count(&self) -> usize {
+        self.pruned_shards.len()
+    }
+    pub const fn estimated_false_positive_rate_ppm(&self) -> Option<u32> {
+        self.estimated_false_positive_rate_ppm
+    }
+    pub fn observed_pruning_rate_ppm(&self) -> u32 {
+        if self.examined_shards == 0 {
+            return 0;
+        }
+        u32::try_from((self.pruned_shards.len() as u64) * 1_000_000 / (self.examined_shards as u64))
+            .unwrap_or(1_000_000)
+    }
+    pub const fn fallback_reason(&self) -> Option<ShardSummaryRoutingFallback> {
+        self.fallback
+    }
+}
+
 impl GeneratedInsertPlan {
     pub(crate) const fn table_id(&self) -> TableId {
         self.table_id
@@ -317,6 +447,7 @@ pub struct BoundStatementPlan {
     generated_insert: Option<GeneratedInsertPlan>,
     assigned_shard: Option<u16>,
     global_index_routing: GlobalIndexRoutingPlan,
+    shard_summary_routing: ShardSummaryRoutingPlan,
 }
 
 impl BoundStatementPlan {
@@ -395,6 +526,11 @@ impl BoundStatementPlan {
     pub const fn global_index_routing(&self) -> &GlobalIndexRoutingPlan {
         &self.global_index_routing
     }
+
+    /// Return redaction-safe Bloom/min-max routing explain data.
+    pub const fn shard_summary_routing(&self) -> &ShardSummaryRoutingPlan {
+        &self.shard_summary_routing
+    }
 }
 
 impl fmt::Debug for BoundStatementPlan {
@@ -415,6 +551,7 @@ impl fmt::Debug for BoundStatementPlan {
             .field("has_generated_insert", &self.generated_insert.is_some())
             .field("assigned_shard", &self.assigned_shard)
             .field("global_index_routing", &self.global_index_routing)
+            .field("shard_summary_routing", &self.shard_summary_routing)
             .finish()
     }
 }
@@ -614,6 +751,7 @@ where
         generated_insert,
         assigned_shard,
         global_index_routing: GlobalIndexRoutingPlan::not_applicable(),
+        shard_summary_routing: ShardSummaryRoutingPlan::not_applicable(),
     })
 }
 
@@ -823,6 +961,145 @@ where
         uncertain_shards,
         target_shards,
         fallback,
+    };
+    Ok(())
+}
+
+pub(super) fn apply_shard_summary_routing<F>(
+    plan: &mut BoundStatementPlan,
+    catalog: &Catalog,
+    normalized: &NormalizedSql,
+    parameters: &[Value],
+    mut resolve: F,
+) -> EngineResult<()>
+where
+    F: FnMut(
+        GlobalIndexId,
+        &GlobalIndexShardSummaryPredicate,
+        &[u16],
+    ) -> EngineResult<GlobalIndexShardSummaryReadResolution>,
+{
+    if plan.behavior != StatementBehavior::Read {
+        return Ok(());
+    }
+    let Some(table_id) = plan.inference.table_id() else {
+        return Ok(());
+    };
+    let Some(table) = catalog.table_by_id(table_id) else {
+        return Err(planning_invariant());
+    };
+    if !matches!(table.placement(), TablePlacement::Sharded(_)) {
+        return Ok(());
+    }
+    let candidate = match crate::sql::infer_shard_summary_lookup(
+        catalog,
+        plan.database,
+        normalized,
+        plan.statement_index,
+        parameters,
+        table_id,
+    )? {
+        Ok(candidate) => candidate,
+        Err(reason) => {
+            plan.shard_summary_routing = ShardSummaryRoutingPlan {
+                fallback: Some(match reason {
+                    crate::sql::ShardSummaryInferenceFallback::NoReadySummaryDefinition => {
+                        ShardSummaryRoutingFallback::NoReadySummaryDefinition
+                    }
+                    crate::sql::ShardSummaryInferenceFallback::PredicateUnsupported => {
+                        ShardSummaryRoutingFallback::PredicateUnsupported
+                    }
+                }),
+                ..ShardSummaryRoutingPlan::not_applicable()
+            };
+            return Ok(());
+        }
+    };
+    let predicate_kind = match candidate.predicate() {
+        GlobalIndexShardSummaryPredicate::Equality(_) => ShardSummaryPredicateKind::Equality,
+        GlobalIndexShardSummaryPredicate::Range { .. } => ShardSummaryPredicateKind::Range,
+    };
+    let base_targets = plan.global_index_routing.target_shards.clone();
+    let protected = &plan.global_index_routing.candidate_shards;
+    let eligible = base_targets
+        .iter()
+        .copied()
+        .filter(|shard| protected.binary_search(shard).is_err())
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        plan.shard_summary_routing = ShardSummaryRoutingPlan {
+            index_id: Some(candidate.index_id()),
+            index_name: Some(Arc::from(candidate.index_name())),
+            predicate_kind: Some(predicate_kind),
+            fallback: Some(ShardSummaryRoutingFallback::NoShardExcluded),
+            ..ShardSummaryRoutingPlan::not_applicable()
+        };
+        return Ok(());
+    }
+    let resolution = match resolve(candidate.index_id(), candidate.predicate(), &eligible) {
+        Ok(resolution) => resolution,
+        Err(_) => {
+            plan.shard_summary_routing = ShardSummaryRoutingPlan {
+                index_id: Some(candidate.index_id()),
+                index_name: Some(Arc::from(candidate.index_name())),
+                predicate_kind: Some(predicate_kind),
+                fallback: Some(ShardSummaryRoutingFallback::SummaryUnavailable),
+                ..ShardSummaryRoutingPlan::not_applicable()
+            };
+            return Ok(());
+        }
+    };
+    if resolution
+        .retained_shards()
+        .iter()
+        .any(|shard| eligible.binary_search(shard).is_err())
+        || resolution
+            .pruned_shards()
+            .iter()
+            .any(|pruned| eligible.binary_search(&pruned.shard()).is_err())
+    {
+        return Err(planning_invariant());
+    }
+    let pruned_shards = resolution
+        .pruned_shards()
+        .iter()
+        .copied()
+        .map(|pruned| ShardSummaryPrunedShard::new(pruned.shard(), pruned.reason()))
+        .collect::<Vec<_>>();
+    let fallback = if pruned_shards.is_empty() {
+        Some(if resolution.examined_shards() == 0 {
+            ShardSummaryRoutingFallback::SummaryUnavailable
+        } else {
+            ShardSummaryRoutingFallback::NoShardExcluded
+        })
+    } else {
+        None
+    };
+    plan.shard_summary_routing = ShardSummaryRoutingPlan {
+        index_id: Some(candidate.index_id()),
+        index_name: Some(Arc::from(candidate.index_name())),
+        predicate_kind: Some(predicate_kind),
+        examined_shards: resolution.examined_shards(),
+        pruned_shards,
+        estimated_false_positive_rate_ppm: resolution.estimated_false_positive_rate_ppm(),
+        fallback,
+    };
+    if plan.shard_summary_routing.pruned_shards.is_empty() {
+        return Ok(());
+    }
+
+    let mut targets = protected.clone();
+    targets.extend_from_slice(resolution.retained_shards());
+    targets.sort_unstable();
+    targets.dedup();
+    plan.global_index_routing
+        .uncertain_shards
+        .retain(|shard| targets.binary_search(shard).is_ok());
+    plan.global_index_routing.target_shards = targets;
+    plan.global_index_routing.kind = if plan.global_index_routing.target_shards.is_empty() {
+        GlobalIndexRoutingKind::Empty
+    } else {
+        GlobalIndexRoutingKind::Routed
     };
     Ok(())
 }

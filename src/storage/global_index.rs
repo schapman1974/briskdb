@@ -2609,6 +2609,11 @@ fn build_inner(
     transaction.commit().map_err(sqlite_error::storage)?;
     abort_at_test_boundary("complete-after-commit");
 
+    // Compact summaries are rebuilt shard-at-a-time after the exact authority
+    // is complete. A crash leaves a Building row, which the planner ignores;
+    // retrying this build safely restarts that shard.
+    super::shard_summary::rebuild(storage, index, cancellation)?;
+
     checkpoint_and_sync(&connection, &path)?;
     Ok(GlobalIndexBuildReport::from_validated(
         index.id(),
@@ -4004,6 +4009,23 @@ where
     })
 }
 
+pub(super) fn scan_source_keys<F>(
+    storage: &Storage,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+    cancellation: &CancellationToken,
+    mut visitor: F,
+) -> EngineResult<u64>
+where
+    F: FnMut(&CanonicalIndexKey) -> EngineResult<()>,
+{
+    let outcome =
+        scan_source_shard_with_visitor(storage, index, shard, cancellation, |_, entry| {
+            visitor(&entry.encoded_key)
+        })?;
+    Ok(outcome.indexed_rows)
+}
+
 fn read_source_entry(
     row: &rusqlite::Row<'_>,
     index: &GlobalIndexMetadata,
@@ -4842,7 +4864,7 @@ fn append_locator_bytes(output: &mut Vec<u8>, value: &[u8]) -> EngineResult<()> 
     Ok(())
 }
 
-fn definition_digest(index: &GlobalIndexMetadata) -> [u8; 32] {
+pub(super) fn definition_digest(index: &GlobalIndexMetadata) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(DEFINITION_DIGEST_DOMAIN);
     hasher.update(&index.id().get().to_le_bytes());

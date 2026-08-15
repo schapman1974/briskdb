@@ -9,6 +9,7 @@ mod migration;
 mod process_lock;
 mod schema_gate;
 mod shard;
+mod shard_summary;
 #[cfg(feature = "experimental-vtab")]
 #[allow(dead_code)]
 mod sharded_vtab;
@@ -50,7 +51,9 @@ use crate::{
         GlobalIndexAsyncStatus, GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId,
         GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexOutboxBatch,
         GlobalIndexOutboxCursor, GlobalIndexOutboxPruneReport, GlobalIndexOutboxShardStatus,
-        GlobalIndexRepairReport, GlobalIndexValidationMode, GlobalIndexValidationOptions,
+        GlobalIndexRepairReport, GlobalIndexShardSummaryPredicate,
+        GlobalIndexShardSummaryReadResolution, GlobalIndexShardSummaryRebuildReport,
+        GlobalIndexShardSummaryStatus, GlobalIndexValidationMode, GlobalIndexValidationOptions,
         GlobalIndexValidationReport, GlobalOperationId, GlobalUniqueMutation,
         GlobalUniqueReservation, GlobalValueLease, IndexKeyValue, MAX_TABLES, ShardKeyType,
         TableDeclaration, TablePlacement,
@@ -2048,6 +2051,40 @@ impl Storage {
         self.fail_closed_on_corruption(result)
     }
 
+    pub(crate) fn global_index_shard_summary_status(
+        &self,
+        index_id: GlobalIndexId,
+    ) -> EngineResult<GlobalIndexShardSummaryStatus> {
+        let index = self.global_index_metadata(index_id)?;
+        shard_summary::status(self, &index)
+    }
+
+    pub(crate) fn rebuild_global_index_shard_summaries(
+        &self,
+        index_id: GlobalIndexId,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexShardSummaryRebuildReport> {
+        let _schema = self.enter_schema_operation()?;
+        let index = self.global_index_metadata(index_id)?;
+        if index.lifecycle() != GlobalIndexLifecycle::Ready {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!("global index {index_id} is not ready for shard-summary rebuild"),
+            ));
+        }
+        shard_summary::rebuild(self, &index, cancellation)
+    }
+
+    pub(crate) fn global_index_shard_summary_resolution(
+        &self,
+        index_id: GlobalIndexId,
+        predicate: &GlobalIndexShardSummaryPredicate,
+        target_shards: &[u16],
+    ) -> EngineResult<GlobalIndexShardSummaryReadResolution> {
+        let index = self.global_index_metadata(index_id)?;
+        shard_summary::resolve(self, &index, predicate, target_shards)
+    }
+
     pub(crate) fn process_global_index_async(
         &self,
         index_id: GlobalIndexId,
@@ -2095,8 +2132,9 @@ impl Storage {
     pub(crate) fn fence_uncoordinated_nonunique_write(
         &self,
         table_id: TableId,
+        shard: u16,
     ) -> EngineResult<()> {
-        for index_id in self
+        let index_ids = self
             .catalog
             .logical()
             .global_indexes()
@@ -2107,9 +2145,11 @@ impl Storage {
                     && index.lifecycle() == GlobalIndexLifecycle::Ready
             })
             .map(GlobalIndexMetadata::id)
-        {
-            global_index_async::mark_rebuild_required(self, index_id)?;
+            .collect::<Vec<_>>();
+        for index_id in &index_ids {
+            global_index_async::mark_rebuild_required(self, *index_id)?;
         }
+        shard_summary::mark_stale(self, shard, &index_ids)?;
         Ok(())
     }
 
@@ -2203,6 +2243,7 @@ impl Storage {
         if !index.is_unique() {
             index_outbox::deactivate_index(self, index_id)?;
         }
+        shard_summary::remove_index(self, index_id)?;
         global_index::remove_artifacts(&self.root, index_id)?;
         let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
         configure_manifest_connection(&manifest_connection)?;

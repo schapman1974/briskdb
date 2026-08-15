@@ -1009,6 +1009,19 @@ The server owns a default worker, while embedded callers can start a managed
 worker or schedule bounded passes explicitly. The complete contract is in
 [asynchronous global indexes](GLOBAL_INDEX_ASYNC.md).
 
+Every built global index also owns one compact summary row in each source shard.
+A 128-Kibit Bloom filter answers equality and `IN` impossibility checks; typed
+canonical minima and maxima answer supported single-column ranges. New keys are
+added inside the application-row transaction. Deletes never clear bits or shrink
+extrema, so they can create false positives but never false negatives. Summary
+rebuilds publish one shard at a time, merge writes that committed during the
+scan, and leave interrupted shards in an ignored `Building` state. The planner
+intersects these proofs with shard-key targets and verified global-index
+candidates, while missing, stale, saturated, corrupt, or definition-mismatched
+state retains the shard. Public plans report every excluded shard and reason,
+plus estimated Bloom and observed pruning rates. See
+[shard-summary pruning](GLOBAL_INDEX_SHARD_SUMMARIES.md).
+
 Each PostgreSQL connection also owns a random, in-memory backend PID/secret pair.
 The adapter registers a fresh core cancellation token only for the command that
 is currently running. A separate exact-key `CancelRequest` cancels that token;

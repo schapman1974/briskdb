@@ -225,7 +225,7 @@ async fn stale_candidates_are_verified_repaired_and_never_change_query_results()
         )
         .await
         .unwrap();
-    assert_eq!(moved.shards, vec![0, 1, 2, 3]);
+    assert_eq!(moved.shards, vec![3]);
     assert_eq!(moved.value.len(), 1);
 
     let repair_database =
