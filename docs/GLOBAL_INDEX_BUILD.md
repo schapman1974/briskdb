@@ -90,9 +90,10 @@ while the catalog remains `Creating` for an exact retry after the data is fixed.
 The repeated source-digest pass also rejects nondeterministic expressions or
 predicates instead of publishing an index that cannot be reproduced.
 
-## Current limit
+## Validation and replacement
 
-Issue #230 builds only new `Creating` indexes in `SharedSqliteV1`. Online
-construction is not supported. Validation, repair, and replacement builds from
-`Invalid`/`Rebuilding` state belong to issue #231; write maintenance and query
-routing remain later rollout stages.
+[Global-index recovery](GLOBAL_INDEX_RECOVERY.md) adds full or sampled
+validation, bounded machine-readable findings, targeted non-unique repair, and
+resumable replacement builds. Unique authority is never repaired by inference;
+it must be rebuilt. All construction and recovery remain offline. Write
+maintenance and query routing are later rollout stages.

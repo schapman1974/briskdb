@@ -341,6 +341,13 @@ file is fully checked, checkpointed, and synchronized before the checksummed
 manifest alone publishes `Creating` to `Ready`; the public lifecycle API cannot
 bypass this boundary.
 
+[Global-index recovery](GLOBAL_INDEX_RECOVERY.md) uses the same maintenance
+fence for full or sampled validation, targeted non-unique shard repair, and
+replacement builds. The manifest moves to `Rebuilding` before physical state is
+read or changed. Only a durable, fully verified result returns to `Ready`;
+findings become `Invalid`, while cancellation or process loss leaves a safe,
+retryable `Rebuilding` state. Unique authority is rebuilt, never guessed.
+
 ### Bound statement-planning boundary
 
 Synchronous `Engine::plan_bound_statement` accepts a `NormalizedSql` batch, one
@@ -554,11 +561,13 @@ Writers use the existing sole-process mutation fence, while concurrent readers
 see only complete SQLite snapshots. The v12-to-v13 migration creates empty
 catalog tables and changes no shard. Issue #229 selects the one-file
 `SharedSqliteV1` layout after comparing it with 16 hash-partitioned files;
-issue #230 adds its offline, resumable physical construction. The builder uses
+issue #230 adds its offline, resumable physical construction. Issue #231 adds
+full/sampled validation, targeted non-unique repair, and replacement builds.
+The builder and recovery paths use
 the same local schema gate and sole-process lease as schema mutation, so another
 service or embedded process receives retryable `Busy`. Cancellation restores
-ordinary admission while retaining only complete shard checkpoints. Online and
-replacement construction remain later work.
+ordinary admission while retaining only complete shard checkpoints. Online
+construction remains later work.
 
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4

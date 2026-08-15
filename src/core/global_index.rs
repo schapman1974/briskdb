@@ -11,6 +11,9 @@ use super::{
 pub(crate) const MAX_GLOBAL_INDEXES: usize = 4_096;
 pub(crate) const MAX_GLOBAL_INDEX_PARTS: usize = 16;
 pub(crate) const MAX_GLOBAL_INDEX_SQL_BYTES: usize = 4_096;
+const DEFAULT_MAX_REPORTED_VALIDATION_ISSUES: u16 = 128;
+const MAX_REPORTED_VALIDATION_ISSUES: u16 = 1_024;
+const MAX_VALIDATION_SAMPLES_PER_SHARD: u16 = 4_096;
 
 /// Version-1 comparison and migration target for hash-partitioned index storage.
 pub const HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1: u16 = 16;
@@ -459,6 +462,305 @@ impl GlobalIndexBuildReport {
     /// Return the exact number of qualifying physical source rows indexed.
     pub const fn indexed_rows(self) -> u64 {
         self.indexed_rows
+    }
+}
+
+/// Amount of source data covered by one global-index validation pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GlobalIndexValidationMode {
+    /// Compare every qualifying source row with physical index state.
+    Full,
+    /// Compare a deterministic, evenly distributed sample on each shard.
+    Sampled,
+}
+
+impl GlobalIndexValidationMode {
+    /// Return the stable machine-readable mode name.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Sampled => "sampled",
+        }
+    }
+}
+
+/// Bounded options for a global-index validation pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalIndexValidationOptions {
+    mode: GlobalIndexValidationMode,
+    samples_per_shard: u16,
+    max_reported_issues: u16,
+}
+
+impl GlobalIndexValidationOptions {
+    /// Validate every qualifying source row and physical entry.
+    pub const fn full() -> Self {
+        Self {
+            mode: GlobalIndexValidationMode::Full,
+            samples_per_shard: 0,
+            max_reported_issues: DEFAULT_MAX_REPORTED_VALIDATION_ISSUES,
+        }
+    }
+
+    /// Validate an evenly distributed sample from each source shard.
+    pub fn sampled(samples_per_shard: u16) -> EngineResult<Self> {
+        if samples_per_shard == 0 || samples_per_shard > MAX_VALIDATION_SAMPLES_PER_SHARD {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!(
+                    "sampled global-index validation requires 1..={MAX_VALIDATION_SAMPLES_PER_SHARD} samples per shard"
+                ),
+            ));
+        }
+        Ok(Self {
+            mode: GlobalIndexValidationMode::Sampled,
+            samples_per_shard,
+            max_reported_issues: DEFAULT_MAX_REPORTED_VALIDATION_ISSUES,
+        })
+    }
+
+    /// Bound the retained issue details while preserving the exact total count.
+    pub fn with_max_reported_issues(mut self, maximum: u16) -> EngineResult<Self> {
+        if maximum == 0 || maximum > MAX_REPORTED_VALIDATION_ISSUES {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!(
+                    "global-index validation requires 1..={MAX_REPORTED_VALIDATION_ISSUES} reported issues"
+                ),
+            ));
+        }
+        self.max_reported_issues = maximum;
+        Ok(self)
+    }
+
+    pub const fn mode(self) -> GlobalIndexValidationMode {
+        self.mode
+    }
+
+    pub const fn samples_per_shard(self) -> u16 {
+        self.samples_per_shard
+    }
+
+    pub const fn max_reported_issues(self) -> u16 {
+        self.max_reported_issues
+    }
+}
+
+impl Default for GlobalIndexValidationOptions {
+    fn default() -> Self {
+        Self::full()
+    }
+}
+
+/// Typed condition detected while validating one global index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GlobalIndexValidationIssueKind {
+    MissingPhysicalStorage,
+    MissingBuildRecord,
+    IncompleteBuild,
+    DefinitionMismatch,
+    MissingCheckpoint,
+    UnexpectedCheckpoint,
+    CheckpointMismatch,
+    MissingEntry,
+    DanglingEntry,
+    StaleEntry,
+    DuplicateAuthoritativeKey,
+    BadShardTarget,
+    IncompatibleKeyEncoding,
+    IncompatibleLocatorEncoding,
+    MissingUniqueReservation,
+    DanglingUniqueReservation,
+    MismatchedUniqueReservation,
+}
+
+impl GlobalIndexValidationIssueKind {
+    /// Return the stable machine-readable issue code.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MissingPhysicalStorage => "missing_physical_storage",
+            Self::MissingBuildRecord => "missing_build_record",
+            Self::IncompleteBuild => "incomplete_build",
+            Self::DefinitionMismatch => "definition_mismatch",
+            Self::MissingCheckpoint => "missing_checkpoint",
+            Self::UnexpectedCheckpoint => "unexpected_checkpoint",
+            Self::CheckpointMismatch => "checkpoint_mismatch",
+            Self::MissingEntry => "missing_entry",
+            Self::DanglingEntry => "dangling_entry",
+            Self::StaleEntry => "stale_entry",
+            Self::DuplicateAuthoritativeKey => "duplicate_authoritative_key",
+            Self::BadShardTarget => "bad_shard_target",
+            Self::IncompatibleKeyEncoding => "incompatible_key_encoding",
+            Self::IncompatibleLocatorEncoding => "incompatible_locator_encoding",
+            Self::MissingUniqueReservation => "missing_unique_reservation",
+            Self::DanglingUniqueReservation => "dangling_unique_reservation",
+            Self::MismatchedUniqueReservation => "mismatched_unique_reservation",
+        }
+    }
+}
+
+/// One bounded, machine-readable global-index validation finding.
+///
+/// Key and row identities are eight-byte BLAKE3 prefixes. They identify repeat
+/// findings without exposing application keys or physical primary-key values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexValidationIssue {
+    kind: GlobalIndexValidationIssueKind,
+    source_shard: Option<u16>,
+    key_fingerprint: Option<[u8; 8]>,
+    row_fingerprint: Option<[u8; 8]>,
+}
+
+impl GlobalIndexValidationIssue {
+    pub(crate) const fn from_validated(
+        kind: GlobalIndexValidationIssueKind,
+        source_shard: Option<u16>,
+        key_fingerprint: Option<[u8; 8]>,
+        row_fingerprint: Option<[u8; 8]>,
+    ) -> Self {
+        Self {
+            kind,
+            source_shard,
+            key_fingerprint,
+            row_fingerprint,
+        }
+    }
+
+    pub const fn kind(&self) -> GlobalIndexValidationIssueKind {
+        self.kind
+    }
+
+    pub const fn source_shard(&self) -> Option<u16> {
+        self.source_shard
+    }
+
+    pub const fn key_fingerprint(&self) -> Option<[u8; 8]> {
+        self.key_fingerprint
+    }
+
+    pub const fn row_fingerprint(&self) -> Option<[u8; 8]> {
+        self.row_fingerprint
+    }
+}
+
+/// Bounded result of one offline global-index validation pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexValidationReport {
+    index_id: GlobalIndexId,
+    mode: GlobalIndexValidationMode,
+    lifecycle_before: GlobalIndexLifecycle,
+    lifecycle_after: GlobalIndexLifecycle,
+    source_rows_examined: u64,
+    physical_entries_examined: u64,
+    total_issues: u64,
+    issues: Box<[GlobalIndexValidationIssue]>,
+}
+
+impl GlobalIndexValidationReport {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_validated(
+        index_id: GlobalIndexId,
+        mode: GlobalIndexValidationMode,
+        lifecycle_before: GlobalIndexLifecycle,
+        lifecycle_after: GlobalIndexLifecycle,
+        source_rows_examined: u64,
+        physical_entries_examined: u64,
+        total_issues: u64,
+        issues: Vec<GlobalIndexValidationIssue>,
+    ) -> Self {
+        Self {
+            index_id,
+            mode,
+            lifecycle_before,
+            lifecycle_after,
+            source_rows_examined,
+            physical_entries_examined,
+            total_issues,
+            issues: issues.into_boxed_slice(),
+        }
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+
+    pub const fn mode(&self) -> GlobalIndexValidationMode {
+        self.mode
+    }
+
+    pub const fn lifecycle_before(&self) -> GlobalIndexLifecycle {
+        self.lifecycle_before
+    }
+
+    pub const fn lifecycle_after(&self) -> GlobalIndexLifecycle {
+        self.lifecycle_after
+    }
+
+    pub const fn source_rows_examined(&self) -> u64 {
+        self.source_rows_examined
+    }
+
+    pub const fn physical_entries_examined(&self) -> u64 {
+        self.physical_entries_examined
+    }
+
+    pub const fn total_issues(&self) -> u64 {
+        self.total_issues
+    }
+
+    pub fn issues(&self) -> &[GlobalIndexValidationIssue] {
+        &self.issues
+    }
+
+    pub const fn is_valid(&self) -> bool {
+        self.total_issues == 0
+    }
+
+    pub fn issues_truncated(&self) -> bool {
+        self.total_issues > self.issues.len() as u64
+    }
+}
+
+/// Durable outcome of a bounded non-unique global-index repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexRepairReport {
+    index_id: GlobalIndexId,
+    repaired_shards: Box<[u16]>,
+    indexed_rows: u64,
+    validation: GlobalIndexValidationReport,
+}
+
+impl GlobalIndexRepairReport {
+    pub(crate) fn from_validated(
+        index_id: GlobalIndexId,
+        repaired_shards: Vec<u16>,
+        indexed_rows: u64,
+        validation: GlobalIndexValidationReport,
+    ) -> Self {
+        Self {
+            index_id,
+            repaired_shards: repaired_shards.into_boxed_slice(),
+            indexed_rows,
+            validation,
+        }
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+
+    pub fn repaired_shards(&self) -> &[u16] {
+        &self.repaired_shards
+    }
+
+    pub const fn indexed_rows(&self) -> u64 {
+        self.indexed_rows
+    }
+
+    pub const fn validation(&self) -> &GlobalIndexValidationReport {
+        &self.validation
     }
 }
 
