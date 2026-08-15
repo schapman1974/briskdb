@@ -414,6 +414,54 @@ pub struct GlobalIndexMetadata {
     topology: GlobalIndexStorageTopology,
 }
 
+/// Durable outcome of an offline global-index build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalIndexBuildReport {
+    index_id: GlobalIndexId,
+    shard_count: u16,
+    resumed_from_shard: u16,
+    indexed_rows: u64,
+}
+
+impl GlobalIndexBuildReport {
+    pub(crate) const fn from_validated(
+        index_id: GlobalIndexId,
+        shard_count: u16,
+        resumed_from_shard: u16,
+        indexed_rows: u64,
+    ) -> Self {
+        Self {
+            index_id,
+            shard_count,
+            resumed_from_shard,
+            indexed_rows,
+        }
+    }
+
+    /// Return the durable index identity that was built or revalidated.
+    pub const fn index_id(self) -> GlobalIndexId {
+        self.index_id
+    }
+
+    /// Return the number of source shards represented by the completed index.
+    pub const fn shard_count(self) -> u16 {
+        self.shard_count
+    }
+
+    /// Return the first shard that did not already have a reusable checkpoint.
+    ///
+    /// This equals [`Self::shard_count`] when every shard checkpoint could be
+    /// revalidated and only final publication remained.
+    pub const fn resumed_from_shard(self) -> u16 {
+        self.resumed_from_shard
+    }
+
+    /// Return the exact number of qualifying physical source rows indexed.
+    pub const fn indexed_rows(self) -> u64 {
+        self.indexed_rows
+    }
+}
+
 impl GlobalIndexMetadata {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_validated(

@@ -594,8 +594,10 @@ or `Dropping`; `Ready` may become `Invalid`, `Rebuilding`, or `Dropping`;
 `Invalid` may become `Rebuilding` or `Dropping`; and `Rebuilding` may become
 `Ready`, `Invalid`, or `Dropping`. Removal is legal only from `Dropping`.
 `Ready` and `Rebuilding` require an assigned versioned topology and the current
-schema generation. Application-schema migration is fenced while any definition
-exists, avoiding a catalog/schema split until later coordinated rebuild work.
+schema generation. Public callers cannot transition an index to `Ready`; the
+offline builder owns that transition after validating durable physical state.
+Application-schema migration is fenced while any definition exists, avoiding a
+catalog/schema split until later coordinated rebuild work.
 
 Each create, transition, and removal is one `BEGIN IMMEDIATE` transaction that
 reseals the semantic root before commit. The existing process mutation fence
@@ -606,7 +608,9 @@ only the complete old or complete new snapshot. Version 13 stores metadata
 only. The measured initial physical choice is `SharedSqliteV1`, with one
 partition and every key routed to partition zero; the exact comparison and
 migration option are documented in the [topology decision](GLOBAL_INDEX_TOPOLOGY.md).
-Physical index files and construction begin in issue #230.
+Issue #230 adds the separate physical format and offline construction described
+in [offline global-index construction](GLOBAL_INDEX_BUILD.md); it does not
+change the version-13 manifest or any shard-file format.
 
 Table placement and shard-key type use stable numeric codes:
 
@@ -1312,7 +1316,34 @@ planning](SQL_PLANNING.md).
 This routing format is intentionally distinct from the tagged, order-preserving
 [canonical global-index key format](INDEX_KEY_ENCODING.md). Version 13 records
 the codec version in every global-index definition but does not persist physical
-index entries or change shard placement.
+index entries or change shard placement. Physical entries live in the separate
+storage-version-1 `global-indexes/global.sqlite` authority, never in a shard.
+
+### Physical global-index storage version 1
+
+The selected `SharedSqliteV1` layout is one real regular file at
+`global-indexes/global.sqlite`. Its `application_id` is `0x42524749`, its
+`user_version` is `1`, its journal mode is `WAL`, and writers use
+`synchronous=FULL`. The exact five-table schema and ownership rules are listed
+in [offline global-index construction](GLOBAL_INDEX_BUILD.md).
+
+One build row binds the index ID to a BLAKE3 digest of its complete manifest
+definition, schema generation, shard count, and build state. Checkpoints form
+exactly one contiguous source-shard prefix. Each checkpoint contains the
+qualifying row count, unique-reservation count, and a domain-separated digest
+of canonical key plus versioned physical locator in locator order. Entries use
+`(index_id, encoded_key, source_shard, source_locator)` as their primary key and
+retain a unique per-shard scan ordinal so validation can replay digest order;
+unique reservations use `(index_id, encoded_key)`.
+
+Source-shard entries and their checkpoint commit together. Resume re-hashes
+every completed prefix shard and restarts from zero if application data changed.
+After a second full digest pass and exact count validation, the builder commits
+physical `Complete`, truncates the WAL, synchronizes the file and parent
+directory, and then publishes manifest lifecycle `Ready` in its existing
+checksummed transaction. Thus physical completion always precedes visibility.
+Removal is legal only after `Dropping` and deletes physical rows before removing
+the unavailable manifest definition.
 
 Bucket algorithm version 1 deliberately preserves legacy placement even when
 `N` does not divide 4,096. Given the version-1 64-bit hash `H`:
