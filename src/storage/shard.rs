@@ -402,6 +402,12 @@ pub(super) fn calculate_schema_digest(
                 &table_name,
                 sql.as_deref(),
             )
+            || super::shard_summary::is_exact_schema_object(
+                &object_type,
+                &name,
+                &table_name,
+                sql.as_deref(),
+            )
         {
             continue;
         }
@@ -1851,6 +1857,12 @@ pub(super) fn validate_stateless_catalog_schema(connection: &Connection) -> Engi
 
     for (object_type, name, table_name, sql) in objects {
         if super::index_outbox::is_exact_schema_object(&object_type, &name, &table_name, Some(&sql))
+            || super::shard_summary::is_exact_schema_object(
+                &object_type,
+                &name,
+                &table_name,
+                Some(&sql),
+            )
         {
             continue;
         }
@@ -2095,6 +2107,7 @@ fn application_table_names(connection: &Connection) -> EngineResult<BTreeSet<Str
                AND name NOT GLOB 'sqlite_*'
                AND name <> 'briskdb_shard_metadata'
                AND name NOT GLOB 'briskdb_global_index_outbox_*'
+               AND name <> 'briskdb_global_index_shard_summaries'
              ORDER BY name COLLATE BINARY",
         )
         .map_err(sqlite_error::storage)?;

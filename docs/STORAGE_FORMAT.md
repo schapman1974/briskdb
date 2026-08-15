@@ -1347,6 +1347,31 @@ shard WAL transaction. Consumer advancement and pruning use separate immediate
 transactions; pruning stops at the minimum active durable cursor. A consumer
 behind `pruned_through` must rebuild rather than silently skip history.
 
+### Optional shard-local global-index summaries version 1
+
+Each global-index build lazily creates the exact STRICT table
+`briskdb_global_index_shard_summaries` in every source shard. Its index-ID row
+contains the complete definition digest, lifecycle state, a 16,384-byte Bloom
+bitmap with seven stable BLAKE3-derived probes, exact set-bit count, canonical
+minimum/maximum keys, scan row count, transactional addition count, and a
+saturation flag. At 95% occupancy equality pruning is disabled for that shard;
+min/max proofs remain usable.
+
+The table is excluded from the application schema digest and authoritative
+table set only when its SQL matches exactly. It remains inaccessible to ordinary
+SQL. A missing table or row is valid and makes the planner retain the shard;
+incomplete schema fails storage validation, while incompatible row versions,
+definition digests, states, or bit counts fall back conservatively at planning.
+
+Rebuild sets one shard row to `Building`, scans source keys in bounded memory,
+then atomically merges its bitmap and extrema with additions recorded by writes
+during the scan before publishing `Ready`. A crash is restartable because
+`Building` is never used to prune. Inserts and key-changing updates add only the
+new key in the row transaction. Deletes do not subtract state. Uncoordinated
+legacy writes mark the affected shard row `Stale` before changing application
+data. The complete behavior is documented in
+[global-index shard summaries](GLOBAL_INDEX_SHARD_SUMMARIES.md).
+
 ### Physical global-index storage version 4
 
 The selected `SharedSqliteV1` layout is one real regular file at

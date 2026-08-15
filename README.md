@@ -42,7 +42,11 @@ HTTP and PostgreSQL. Native MongoDB, MySQL, and serverless use are on the roadma
   its row. Fenced background consumers apply those events across processes and
   publish per-shard freshness watermarks; reads use verified candidates, scan
   only lagging shards, and automatically narrow further as the index catches up.
-  [See the replay and watermark design.](docs/GLOBAL_INDEX_ASYNC.md)
+  Compact shard-local Bloom filters and typed min/max summaries can now skip
+  even those lagging shards for equality, `IN`, and supported range predicates,
+  without introducing false negatives.
+  [See the replay design](docs/GLOBAL_INDEX_ASYNC.md) and
+  [summary pruning contract](docs/GLOBAL_INDEX_SHARD_SUMMARIES.md).
 - **Bring the client you already have.** HTTP and PostgreSQL are available now;
   MongoDB and MySQL wire compatibility are being built over the same engine.
 - **Files remain files.** The layout is a manifest plus normal SQLite databases,
@@ -123,7 +127,7 @@ experimental and opt-in; the exact contract lives in
 | PostgreSQL wire protocol | TLS/SCRAM, backpressured row streaming, SQLite-interrupt cancellation, text/binary CRUD, real single-shard transactions, and a live psql/tokio-postgres/psycopg/SQLAlchemy matrix |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
-| Cross-shard indexes and global value leases | Unique enforcement/value leases work; non-unique indexes replay asynchronously with durable watermarks and scan only lagging shards |
+| Cross-shard indexes and global value leases | Unique enforcement/value leases, asynchronous non-unique replay, freshness routing, and conservative Bloom/min-max shard pruning work |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working |

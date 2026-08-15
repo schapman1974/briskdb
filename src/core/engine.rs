@@ -687,6 +687,18 @@ impl Engine {
                 )
             },
         )?;
+        super::planner::apply_shard_summary_routing(
+            &mut plan,
+            self.catalog(),
+            normalized,
+            parameters,
+            |index_id, predicate, target_shards| {
+                self.inner
+                    .database
+                    .storage
+                    .global_index_shard_summary_resolution(index_id, predicate, target_shards)
+            },
+        )?;
         Ok(plan)
     }
 

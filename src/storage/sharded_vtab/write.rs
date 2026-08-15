@@ -36,7 +36,7 @@ use crate::{
     sqlite_error,
     storage::{
         CONNECTION_BUSY_TIMEOUT, GlobalWriteReservationGuard, SchemaOperationGuard, Storage,
-        global_index, hilo::HiloAllocation, index_outbox,
+        global_index, hilo::HiloAllocation, index_outbox, shard_summary,
     },
 };
 
@@ -578,6 +578,50 @@ fn plan_global_nonunique_outbox_events(
         }
     }
     Ok(events)
+}
+
+fn plan_global_summary_additions(
+    registry: &Registry,
+    shard: u16,
+    connection: &Connection,
+    changes: &[CapturedPhysicalChange],
+) -> EngineResult<Vec<(GlobalIndexId, CanonicalIndexKey)>> {
+    let mut additions = Vec::new();
+    for change in changes {
+        let Some(row) = change.new.as_ref() else {
+            continue;
+        };
+        let spec = registry.table_named(&change.table).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "global-index capture references unregistered physical table {}",
+                    change.table
+                ),
+            )
+        })?;
+        if row.values.len() != spec.columns.len() {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "physical table {} changed column count during shard-summary capture",
+                    spec.name
+                ),
+            ));
+        }
+        for index in &spec.global_indexes {
+            if let Some(key) = evaluate_captured_index_key(connection, index, shard, row)? {
+                additions.push((index.metadata.id(), key));
+            }
+        }
+    }
+    additions.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+    });
+    additions.dedup();
+    Ok(additions)
 }
 
 fn validate_allocation_sequence_capacity(
@@ -2734,6 +2778,10 @@ impl WriteTransaction {
         if self.authority_cancellation.is_cancelled() {
             return Err(cancelled_error());
         }
+
+        let summary_additions =
+            plan_global_summary_additions(registry, child.shard, &child.connection, &changes)?;
+        shard_summary::record_additions(&child.connection, &summary_additions)?;
 
         let outbox_events = plan_global_nonunique_outbox_events(
             registry,

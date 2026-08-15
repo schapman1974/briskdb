@@ -416,7 +416,7 @@ requires an earlier dependency:
    - [x] [#235](https://github.com/schapman1974/briskdb/issues/235) — candidate verification and repair
    - [x] [#236](https://github.com/schapman1974/briskdb/issues/236) — transactional shard outboxes
    - [x] [#237](https://github.com/schapman1974/briskdb/issues/237) — asynchronous indexing and watermarks
-   - [ ] [#238](https://github.com/schapman1974/briskdb/issues/238) — Bloom/min-max shard summaries
+   - [x] [#238](https://github.com/schapman1974/briskdb/issues/238) — Bloom/min-max shard summaries
    - [ ] [#239](https://github.com/schapman1974/briskdb/issues/239) — production/release gates
 4. [ ] **Finish the embedded Rust API.** Make sessions, transactions,
    cancellation, concurrency, document commands, and shutdown safe for a host

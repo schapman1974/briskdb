@@ -285,16 +285,13 @@ async fn miss_active_write_and_unavailable_storage_remain_conservative() {
         .unwrap();
     assert_eq!(
         fallback.global_index_routing().kind(),
-        GlobalIndexRoutingKind::Fallback
+        GlobalIndexRoutingKind::Routed
     );
     assert_eq!(
         fallback.global_index_routing().fallback_reason(),
         Some(GlobalIndexRoutingFallback::IndexUnavailable)
     );
-    assert_eq!(
-        fallback.global_index_routing().target_shards(),
-        &[0, 1, 2, 3]
-    );
+    assert_eq!(fallback.global_index_routing().target_shards(), &[1]);
     let scattered = engine
         .query_logical(
             &session,
@@ -306,6 +303,6 @@ async fn miss_active_write_and_unavailable_storage_remain_conservative() {
         .await
         .unwrap();
     fs::rename(&unavailable, &authority).unwrap();
-    assert_eq!(scattered.shards, vec![0, 1, 2, 3]);
+    assert_eq!(scattered.shards, vec![1]);
     assert_eq!(scattered.value, indexed.value);
 }

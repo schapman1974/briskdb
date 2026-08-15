@@ -120,6 +120,34 @@ foreground row acknowledgement. A fresh miss plan measured 3.60 ms / 278
 plans/s; the one-lagging-shard hybrid plan measured 3.63 ms / 276 plans/s, about
 0.6% slower in this fixture. These are local medians, not release thresholds.
 
+The `global_index_shard_summaries/*` group measures Bloom and min/max planning,
+logical Bloom memory, estimated and observed false-positive rates, and shards
+avoided. The existing transactional-outbox update is the before/after write-cost
+control because summary additions commit in that same row transaction:
+
+```bash
+cargo bench --locked --bench storage -- global_index_shard_summaries
+cargo bench --locked --bench storage -- global_index_outbox/
+```
+
+An Apple M1 Pro release run on 2026-08-15 produced:
+
+| Measurement | Result |
+| --- | ---: |
+| Bloom lagged miss | 5.997 ms per plan; all 4 shards avoided |
+| Typed min/max range | 2.356 ms per plan; 3 of 4 shards avoided |
+| Summary status | 2.297 ms; 65,536 logical Bloom bytes across 4 shards |
+| Estimated / observed Bloom FPR | 0 / 0 ppm in 64 absent-key probes (256 shard checks) |
+| Indexed write before summaries | 1.092 ms; 916 updates/s |
+| Indexed write with summaries | 1.152 ms; 868 updates/s |
+
+The foreground summary increment was about 60 µs, or 5.5% elapsed time and
+5.2% throughput in this tiny one-row fixture. The 16-KiB-per-index/shard Bloom
+allocation is fixed; SQLite row/page overhead is not included in the logical
+memory figure. False-positive rate grows with occupancy, is exposed per shard,
+and disables equality pruning at 95% occupancy. These are engineering results
+from one local filesystem, not capacity promises or CI thresholds.
+
 ## Workload contract
 
 Every benchmark creates a fresh temporary BriskDB database with exactly four

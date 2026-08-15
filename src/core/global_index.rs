@@ -20,6 +20,10 @@ pub const MAX_GLOBAL_INDEX_OUTBOX_BYTES_PER_SHARD: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_GLOBAL_INDEX_ASYNC_BATCH_EVENTS: usize = 1_024;
 pub const DEFAULT_GLOBAL_INDEX_ASYNC_LEASE_MS: u64 = 5_000;
 pub const DEFAULT_GLOBAL_INDEX_ASYNC_POLL_MS: u64 = 25;
+/// Current shard-summary storage format.
+pub const GLOBAL_INDEX_SHARD_SUMMARY_FORMAT_VERSION: u32 = 1;
+/// Bytes in each shard-local equality Bloom filter.
+pub const GLOBAL_INDEX_SHARD_SUMMARY_BLOOM_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_GLOBAL_VALUE_LEASE_COUNT: u32 = 65_536;
 const DEFAULT_MAX_REPORTED_VALIDATION_ISSUES: u16 = 128;
 const MAX_REPORTED_VALIDATION_ISSUES: u16 = 1_024;
@@ -734,6 +738,253 @@ impl GlobalIndexAsyncStatus {
                 .shards
                 .iter()
                 .all(GlobalIndexAsyncShardStatus::is_fresh)
+    }
+}
+
+/// Durable state of one shard-local Bloom/min-max summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GlobalIndexShardSummaryState {
+    Missing,
+    Building,
+    Ready,
+    Stale,
+    Incompatible,
+}
+
+impl GlobalIndexShardSummaryState {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Building => "building",
+            Self::Ready => "ready",
+            Self::Stale => "stale",
+            Self::Incompatible => "incompatible",
+        }
+    }
+}
+
+/// Redaction-safe status for one physical shard's compact index summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexShardSummaryShardStatus {
+    shard: u16,
+    state: GlobalIndexShardSummaryState,
+    bloom_bytes: u32,
+    set_bits: u32,
+    observed_rows: u64,
+    additions: u64,
+    saturated: bool,
+    estimated_false_positive_rate_ppm: Option<u32>,
+}
+
+impl GlobalIndexShardSummaryShardStatus {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new(
+        shard: u16,
+        state: GlobalIndexShardSummaryState,
+        bloom_bytes: u32,
+        set_bits: u32,
+        observed_rows: u64,
+        additions: u64,
+        saturated: bool,
+        estimated_false_positive_rate_ppm: Option<u32>,
+    ) -> Self {
+        Self {
+            shard,
+            state,
+            bloom_bytes,
+            set_bits,
+            observed_rows,
+            additions,
+            saturated,
+            estimated_false_positive_rate_ppm,
+        }
+    }
+
+    pub const fn shard(&self) -> u16 {
+        self.shard
+    }
+    pub const fn state(&self) -> GlobalIndexShardSummaryState {
+        self.state
+    }
+    pub const fn bloom_bytes(&self) -> u32 {
+        self.bloom_bytes
+    }
+    pub const fn set_bits(&self) -> u32 {
+        self.set_bits
+    }
+    pub const fn observed_rows(&self) -> u64 {
+        self.observed_rows
+    }
+    pub const fn additions(&self) -> u64 {
+        self.additions
+    }
+    pub const fn is_saturated(&self) -> bool {
+        self.saturated
+    }
+    /// Estimated Bloom false-positive probability in parts per million.
+    pub const fn estimated_false_positive_rate_ppm(&self) -> Option<u32> {
+        self.estimated_false_positive_rate_ppm
+    }
+}
+
+/// Operator status for all shard-local summaries belonging to one index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexShardSummaryStatus {
+    index_id: GlobalIndexId,
+    shards: Box<[GlobalIndexShardSummaryShardStatus]>,
+}
+
+impl GlobalIndexShardSummaryStatus {
+    pub(crate) fn new(
+        index_id: GlobalIndexId,
+        shards: Vec<GlobalIndexShardSummaryShardStatus>,
+    ) -> Self {
+        Self {
+            index_id,
+            shards: shards.into_boxed_slice(),
+        }
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+    pub fn shards(&self) -> &[GlobalIndexShardSummaryShardStatus] {
+        &self.shards
+    }
+    pub fn ready_shards(&self) -> usize {
+        self.shards
+            .iter()
+            .filter(|shard| shard.state == GlobalIndexShardSummaryState::Ready)
+            .count()
+    }
+    pub fn memory_bytes(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| u64::from(shard.bloom_bytes))
+            .sum()
+    }
+}
+
+/// Result of a restartable shard-at-a-time summary rebuild.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexShardSummaryRebuildReport {
+    index_id: GlobalIndexId,
+    rebuilt_shards: u16,
+    observed_rows: u64,
+}
+
+impl GlobalIndexShardSummaryRebuildReport {
+    pub(crate) const fn new(
+        index_id: GlobalIndexId,
+        rebuilt_shards: u16,
+        observed_rows: u64,
+    ) -> Self {
+        Self {
+            index_id,
+            rebuilt_shards,
+            observed_rows,
+        }
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+    pub const fn rebuilt_shards(&self) -> u16 {
+        self.rebuilt_shards
+    }
+    pub const fn observed_rows(&self) -> u64 {
+        self.observed_rows
+    }
+}
+
+/// Bound in canonical index order for one shard-summary range probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GlobalIndexShardSummaryBound {
+    key: CanonicalIndexKey,
+    inclusive: bool,
+}
+
+impl GlobalIndexShardSummaryBound {
+    pub(crate) const fn new(key: CanonicalIndexKey, inclusive: bool) -> Self {
+        Self { key, inclusive }
+    }
+
+    pub(crate) const fn key(&self) -> &CanonicalIndexKey {
+        &self.key
+    }
+
+    pub(crate) const fn inclusive(&self) -> bool {
+        self.inclusive
+    }
+}
+
+/// Conservative predicate understood by shard-local summaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GlobalIndexShardSummaryPredicate {
+    Equality(Box<[CanonicalIndexKey]>),
+    Range {
+        lower: Option<GlobalIndexShardSummaryBound>,
+        upper: Option<GlobalIndexShardSummaryBound>,
+    },
+}
+
+/// One shard proven impossible by a valid compact summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GlobalIndexShardSummaryPrunedShard {
+    shard: u16,
+    reason: crate::core::ShardSummaryPruningReason,
+}
+
+impl GlobalIndexShardSummaryPrunedShard {
+    pub(crate) const fn new(shard: u16, reason: crate::core::ShardSummaryPruningReason) -> Self {
+        Self { shard, reason }
+    }
+
+    pub(crate) const fn shard(self) -> u16 {
+        self.shard
+    }
+
+    pub(crate) const fn reason(self) -> crate::core::ShardSummaryPruningReason {
+        self.reason
+    }
+}
+
+/// Storage result consumed by protocol-neutral summary routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GlobalIndexShardSummaryReadResolution {
+    retained_shards: Vec<u16>,
+    pruned_shards: Vec<GlobalIndexShardSummaryPrunedShard>,
+    examined_shards: usize,
+    estimated_false_positive_rate_ppm: Option<u32>,
+}
+
+impl GlobalIndexShardSummaryReadResolution {
+    pub(crate) fn new(
+        retained_shards: Vec<u16>,
+        pruned_shards: Vec<GlobalIndexShardSummaryPrunedShard>,
+        examined_shards: usize,
+        estimated_false_positive_rate_ppm: Option<u32>,
+    ) -> Self {
+        Self {
+            retained_shards,
+            pruned_shards,
+            examined_shards,
+            estimated_false_positive_rate_ppm,
+        }
+    }
+
+    pub(crate) fn retained_shards(&self) -> &[u16] {
+        &self.retained_shards
+    }
+    pub(crate) fn pruned_shards(&self) -> &[GlobalIndexShardSummaryPrunedShard] {
+        &self.pruned_shards
+    }
+    pub(crate) const fn examined_shards(&self) -> usize {
+        self.examined_shards
+    }
+    pub(crate) const fn estimated_false_positive_rate_ppm(&self) -> Option<u32> {
+        self.estimated_false_positive_rate_ppm
     }
 }
 
