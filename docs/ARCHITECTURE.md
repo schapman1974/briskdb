@@ -326,8 +326,12 @@ keys](INDEX_KEY_ENCODING.md).
 
 Version 13 persists this codec version with each global-index definition. The
 catalog records stable identity, owning table, key parts, uniqueness and NULL
-semantics, predicate, schema generation, lifecycle, and selected topology; it
-does not yet create a global-index file or route a query through one.
+semantics, predicate, schema generation, lifecycle, and selected topology.
+The measured initial topology is one shared WAL-mode SQLite database: every key
+routes to partition zero. A domain-separated `(index ID, canonical key)` BLAKE3
+mapping remains frozen for a possible 16-file rebuild, but is not the initial
+default. See the [topology decision](GLOBAL_INDEX_TOPOLOGY.md). Physical files
+are first created by the offline builder in #230.
 
 ### Bound statement-planning boundary
 
@@ -540,7 +544,9 @@ current schema generation. Schema migration is fenced while any definition
 exists. Read-only inspection validates without initializing or upgrading.
 Writers use the existing sole-process mutation fence, while concurrent readers
 see only complete SQLite snapshots. The v12-to-v13 migration creates empty
-catalog tables and changes no shard; physical construction starts in #229/#230.
+catalog tables and changes no shard. Issue #229 selects the one-file
+`SharedSqliteV1` layout after comparing it with 16 hash-partitioned files;
+physical construction starts in #230.
 
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4

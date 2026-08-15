@@ -1,0 +1,65 @@
+metadata	format	global-index-topology-v1
+metadata	date	2026-08-15
+metadata	os	macos
+metadata	arch	aarch64
+metadata	hardware	Apple M1 Pro; 16 GiB RAM
+metadata	source	589adb8 plus issue-229 working tree
+metadata	command	cargo test --release --locked --all-features --test global_index_topology release_global_index_topology_benchmark -- --ignored --exact --nocapture --test-threads=1
+control	rows_per_shard	16
+control	operations	256
+control	warmups	16
+control	process_workers	4
+control	trials	3
+control	trial_selection	median_elapsed
+control	journal_mode	WAL
+control	synchronous	FULL
+control	wal_autocheckpoint	0
+record	topology	mode	shards	workload	workers	attempts	busy_retries	elapsed_us	throughput_ops_s	p50_us	p95_us	p99_us	peak_wal_growth_bytes	recovery_us	sqlite_connections	storage_file_count	storage_bytes	sqlite_synchronous
+result	shared_sqlite_v1	single_process	2	lookup_hit	1	256	0	1448	176795.58	5	5	6	0	358	1	1	16384	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	2	lookup_hit	1	256	0	1518	168642.95	5	6	6	0	4676	16	16	262144	FULL
+result	shared_sqlite_v1	single_process	2	distinct_insert	1	256	0	31627	8094.35	97	199	822	2657432	659	1	1	49152	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	2	distinct_insert	1	256	0	30192	8479.07	83	209	959	2184112	4726	16	16	262144	FULL
+result	shared_sqlite_v1	single_process	2	hot_replace	1	256	0	19051	13437.61	68	112	163	1067112	469	1	1	16384	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	2	hot_replace	1	256	0	16407	15603.10	62	79	98	1108312	4593	16	16	262144	FULL
+result	shared_sqlite_v1	multi_process	2	lookup_hit	4	1024	0	2433	420879.57	8	11	13	0	483	4	1	16384	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	2	lookup_hit	4	1024	0	1843	555615.84	6	7	8	0	4672	64	16	262144	FULL
+result	shared_sqlite_v1	multi_process	2	distinct_insert	4	1024	0	29048	35252.00	103	128	221	13550712	999	4	1	159744	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	2	distinct_insert	4	1024	0	65592	15611.66	88	546	1699	8837912	4864	64	16	270336	FULL
+result	shared_sqlite_v1	multi_process	2	hot_replace	4	1024	0	42727	23966.11	57	67	210	4391952	388	4	1	16384	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	2	hot_replace	4	1024	0	43383	23603.72	59	79	235	4424912	4964	64	16	262144	FULL
+result	shared_sqlite_v1	single_process	4	lookup_hit	1	256	0	1424	179775.28	5	5	5	0	401	1	1	16384	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	4	lookup_hit	1	256	0	1496	171122.99	5	5	6	0	4633	16	16	262144	FULL
+result	shared_sqlite_v1	single_process	4	distinct_insert	1	256	0	28530	8973.01	98	189	485	2702752	590	1	1	53248	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	4	distinct_insert	1	256	0	19198	13334.72	71	87	165	2101712	4739	16	16	262144	FULL
+result	shared_sqlite_v1	single_process	4	hot_replace	1	256	0	18133	14117.91	63	102	208	1062992	419	1	1	16384	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	4	hot_replace	1	256	0	17624	14525.65	62	86	201	1063016	4448	16	16	262144	FULL
+result	shared_sqlite_v1	multi_process	4	lookup_hit	4	1024	0	2489	411410.20	9	11	14	0	460	4	1	16384	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	4	lookup_hit	4	1024	0	1862	549946.29	6	7	10	0	6274	64	16	262144	FULL
+result	shared_sqlite_v1	multi_process	4	distinct_insert	4	1024	0	95171	10759.58	91	183	291	13192272	1075	4	1	151552	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	4	distinct_insert	4	1024	0	74719	13704.68	114	1608	1840	8920312	5637	64	16	270336	FULL
+result	shared_sqlite_v1	multi_process	4	hot_replace	4	1024	0	18302	55950.17	66	81	96	4416672	455	4	1	16384	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	4	hot_replace	4	1024	0	65229	15698.54	59	73	87	4445512	4444	64	16	262144	FULL
+result	shared_sqlite_v1	single_process	10	lookup_hit	1	256	0	1401	182726.62	5	5	5	0	450	1	1	32768	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	10	lookup_hit	1	256	0	1427	179397.34	5	5	6	0	4028	16	16	262144	FULL
+result	shared_sqlite_v1	single_process	10	distinct_insert	1	256	0	24336	10519.40	95	110	126	3390792	522	1	1	69632	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	10	distinct_insert	1	256	0	27918	9169.71	107	117	159	2200616	4386	16	16	262144	FULL
+result	shared_sqlite_v1	single_process	10	hot_replace	1	256	0	14247	17968.70	51	67	150	1104216	519	1	1	32768	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	10	hot_replace	1	256	0	16406	15604.05	60	79	172	1062992	5434	16	16	262144	FULL
+result	shared_sqlite_v1	multi_process	10	lookup_hit	4	1024	0	1681	609161.21	6	7	10	0	441	4	1	32768	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	10	lookup_hit	4	1024	0	1627	629379.23	6	6	8	0	4446	64	16	262144	FULL
+result	shared_sqlite_v1	multi_process	10	distinct_insert	4	1024	0	26205	39076.51	97	116	129	15231672	1066	4	1	208896	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	10	distinct_insert	4	1024	0	53894	19000.26	85	1196	1815	8932696	5016	64	16	286720	FULL
+result	shared_sqlite_v1	multi_process	10	hot_replace	4	1024	0	76867	13321.71	53	64	99	4441392	463	4	1	32768	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	10	hot_replace	4	1024	0	23516	43544.82	54	72	102	4383712	4873	64	16	262144	FULL
+result	shared_sqlite_v1	single_process	64	lookup_hit	1	256	0	1411	181431.61	5	5	6	0	850	1	1	110592	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	64	lookup_hit	1	256	0	1447	176917.76	5	5	6	0	4916	16	16	262144	FULL
+result	shared_sqlite_v1	single_process	64	distinct_insert	1	256	0	25076	10208.96	101	115	124	3901672	1009	1	1	155648	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	64	distinct_insert	1	256	0	25409	10075.17	78	203	566	2208832	4768	16	16	262144	FULL
+result	shared_sqlite_v1	single_process	64	hot_replace	1	256	0	15414	16608.28	56	71	191	1124792	1068	1	1	110592	FULL
+result	hash_partitioned_sqlite_v1_16	single_process	64	hot_replace	1	256	0	16248	15755.79	63	71	76	1095952	5227	16	16	262144	FULL
+result	shared_sqlite_v1	multi_process	64	lookup_hit	4	1024	0	1723	594312.25	6	7	11	0	969	4	1	110592	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	64	lookup_hit	4	1024	0	1660	616867.47	6	6	9	0	5112	64	16	262144	FULL
+result	shared_sqlite_v1	multi_process	64	distinct_insert	4	1024	0	42967	23832.24	66	103	120	13740232	1599	4	1	233472	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	64	distinct_insert	4	1024	0	76527	13380.90	144	1499	1764	9402352	5937	64	16	524288	FULL
+result	shared_sqlite_v1	multi_process	64	hot_replace	4	1024	0	40776	25112.81	58	71	99	4449632	1033	4	1	110592	FULL
+result	hash_partitioned_sqlite_v1_16	multi_process	64	hot_replace	4	1024	0	90546	11309.17	59	69	83	4478472	4896	64	16	262144	FULL
