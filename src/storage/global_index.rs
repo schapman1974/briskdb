@@ -944,62 +944,61 @@ fn finalize_stored_unique_mutation(
         (&mutation.new, &mutation.previous),
         (Some(new), Some(previous)) if new.0 == previous.0
     );
-    if let (Some(new), Some(previous)) = (&mutation.new, &mutation.previous)
-        && same_key
-        && (new.1 != previous.1 || new.2 != previous.2)
-    {
-        let changed = transaction
-            .execute(
-                "UPDATE briskdb_global_index_unique_keys
-                 SET source_shard = ?1, source_locator = ?2
-                 WHERE index_id = ?3 AND encoded_key = ?4
-                   AND source_shard = ?5 AND source_locator = ?6",
-                params![
-                    new.1,
-                    &new.2,
-                    to_sqlite_id(mutation.index_id)?,
-                    &new.0,
-                    previous.1,
-                    &previous.2,
-                ],
-            )
-            .map_err(sqlite_error::storage)?;
-        if changed != 1 {
-            return Err(corrupt("global unique handoff lost its previous owner"));
+    if let (Some(new), Some(previous)) = (&mutation.new, &mutation.previous) {
+        if same_key && (new.1 != previous.1 || new.2 != previous.2) {
+            let changed = transaction
+                .execute(
+                    "UPDATE briskdb_global_index_unique_keys
+                     SET source_shard = ?1, source_locator = ?2
+                     WHERE index_id = ?3 AND encoded_key = ?4
+                       AND source_shard = ?5 AND source_locator = ?6",
+                    params![
+                        new.1,
+                        &new.2,
+                        to_sqlite_id(mutation.index_id)?,
+                        &new.0,
+                        previous.1,
+                        &previous.2,
+                    ],
+                )
+                .map_err(sqlite_error::storage)?;
+            if changed != 1 {
+                return Err(corrupt("global unique handoff lost its previous owner"));
+            }
         }
     }
-    if let Some((key, shard, locator)) = &mutation.previous
-        && !same_key
-    {
-        let deleted = transaction
-            .execute(
-                "DELETE FROM briskdb_global_index_unique_keys
-                 WHERE index_id = ?1 AND encoded_key = ?2
-                   AND source_shard = ?3 AND source_locator = ?4",
-                params![to_sqlite_id(mutation.index_id)?, key, shard, locator],
-            )
-            .map_err(sqlite_error::storage)?;
-        if deleted != 1 {
-            return Err(corrupt("global unique release lost its previous owner"));
+    if let Some((key, shard, locator)) = &mutation.previous {
+        if !same_key {
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM briskdb_global_index_unique_keys
+                     WHERE index_id = ?1 AND encoded_key = ?2
+                       AND source_shard = ?3 AND source_locator = ?4",
+                    params![to_sqlite_id(mutation.index_id)?, key, shard, locator],
+                )
+                .map_err(sqlite_error::storage)?;
+            if deleted != 1 {
+                return Err(corrupt("global unique release lost its previous owner"));
+            }
         }
     }
-    if let Some((key, shard, locator)) = &mutation.new
-        && !same_key
-    {
-        transaction
-            .execute(
-                "INSERT INTO briskdb_global_index_unique_keys (
-                     index_id, encoded_key, source_shard, source_locator
-                 ) VALUES (?1, ?2, ?3, ?4)",
-                params![to_sqlite_id(mutation.index_id)?, key, shard, locator],
-            )
-            .map_err(|error| {
-                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
-                    unique_conflict_bytes(mutation.index_id, key)
-                } else {
-                    sqlite_error::storage(error)
-                }
-            })?;
+    if let Some((key, shard, locator)) = &mutation.new {
+        if !same_key {
+            transaction
+                .execute(
+                    "INSERT INTO briskdb_global_index_unique_keys (
+                         index_id, encoded_key, source_shard, source_locator
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![to_sqlite_id(mutation.index_id)?, key, shard, locator],
+                )
+                .map_err(|error| {
+                    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                        unique_conflict_bytes(mutation.index_id, key)
+                    } else {
+                        sqlite_error::storage(error)
+                    }
+                })?;
+        }
     }
     Ok(())
 }
@@ -1055,10 +1054,10 @@ fn affected_unique_entries(
     if let Some(entry) = mutation.previous_entry() {
         entries.push(entry);
     }
-    if let Some(entry) = mutation.new_entry()
-        && entries.first().is_none_or(|(key, _)| *key != entry.0)
-    {
-        entries.push(entry);
+    if let Some(entry) = mutation.new_entry() {
+        if entries.first().is_none_or(|(key, _)| *key != entry.0) {
+            entries.push(entry);
+        }
     }
     entries
 }
