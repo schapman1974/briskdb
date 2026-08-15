@@ -31,6 +31,10 @@ HTTP and PostgreSQL. Native MongoDB, MySQL, and serverless use are on the roadma
 - **IDs without a central per-row bottleneck.** BriskDB can let SQLite
   `AUTOINCREMENT` allocate from non-overlapping shard ranges, or lease hi/lo ID
   blocks and route them through the normal shard map.
+- **A real cross-shard constraint authority.** Durable operation-ID
+  reservations can choose one global unique-key owner, while fenced range
+  leases allocate collision-free values across processes. SQL write-path
+  integration is the next rollout stage.
 - **Bring the client you already have.** HTTP and PostgreSQL are available now;
   MongoDB and MySQL wire compatibility are being built over the same engine.
 - **Files remain files.** The layout is a manifest plus normal SQLite databases,
@@ -111,6 +115,7 @@ experimental and opt-in; the exact contract lives in
 | PostgreSQL wire protocol | TLS/SCRAM, backpressured row streaming, SQLite-interrupt cancellation, text/binary CRUD, real single-shard transactions, and a live psql/tokio-postgres/psycopg/SQLAlchemy matrix |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
+| Cross-shard unique reservations and global value leases | Rust authority API working; automatic SQL maintenance is [next](https://github.com/schapman1974/briskdb/issues/233) |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working |
@@ -194,6 +199,8 @@ briskdb-data/
 ├── .briskdb-process.lock
 ├── .briskdb-startup.lock
 ├── manifest.sqlite
+├── global-indexes/
+│   └── global.sqlite
 └── shards/
     ├── 0000.sqlite
     ├── 0001.sqlite
@@ -237,6 +244,7 @@ Follow the [roadmap](ROADMAP.md) or browse the
 ## Go deeper
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Global uniqueness and value authority](docs/GLOBAL_INDEX_AUTHORITY.md)
 - [Embedded Rust](docs/EMBEDDED_RUST.md)
 - [Embedded SQL](docs/EMBEDDED_SQL.md)
 - [Crate features and support tiers](docs/CRATE_FEATURES.md)

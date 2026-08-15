@@ -30,6 +30,9 @@ Validation detects missing physical storage/build/checkpoint state, incomplete
 or definition-mismatched builds, missing/dangling/stale entries, bad shard
 targets, incompatible key/locator encodings, duplicate authoritative keys, and
 missing/dangling/mismatched unique reservations.
+It also reports an interrupted `active_unique_reservation`. A rebuild rolls
+that operation back before reconstructing unique authority; see [global
+uniqueness and value authority](GLOBAL_INDEX_AUTHORITY.md).
 
 ## Repair versus rebuild
 

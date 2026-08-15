@@ -18,8 +18,10 @@ use crate::{
         GlobalIndexBuildReport, GlobalIndexId, GlobalIndexKeySource, GlobalIndexKeyType,
         GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexStorageTopology,
         GlobalIndexValidationIssue, GlobalIndexValidationIssueKind, GlobalIndexValidationMode,
-        GlobalIndexValidationOptions, GlobalIndexValidationReport, INDEX_KEY_ENCODING_VERSION,
-        IndexKeyOrder, IndexKeyPart, IndexKeyValue, UniqueNullSemantics,
+        GlobalIndexValidationOptions, GlobalIndexValidationReport, GlobalOperationId,
+        GlobalOperationState, GlobalUniqueMutation, GlobalUniqueReservation, GlobalValueLease,
+        INDEX_KEY_ENCODING_VERSION, IndexKeyOrder, IndexKeyPart, IndexKeyValue,
+        MAX_GLOBAL_VALUE_LEASE_COUNT, UniqueNullSemantics,
     },
     sqlite_error,
 };
@@ -29,18 +31,25 @@ use super::{CONNECTION_BUSY_TIMEOUT, Storage};
 const DIRECTORY_NAME: &str = "global-indexes";
 const SHARED_FILE_NAME: &str = "global.sqlite";
 const APPLICATION_ID: i32 = 0x4252_4749;
-const STORAGE_VERSION: u32 = 1;
+const STORAGE_VERSION: u32 = 2;
 const BUILDING: i64 = 1;
 const COMPLETE: i64 = 2;
 const DEFINITION_DIGEST_DOMAIN: &[u8] = b"briskdb.global-index.definition.v1\0";
 const SOURCE_DIGEST_DOMAIN: &[u8] = b"briskdb.global-index.source-shard.v1\0";
 const LOCATOR_MAGIC: &[u8; 4] = b"BRIL";
 const LOCATOR_VERSION: u32 = 1;
+const UNIQUE_OPERATION: i64 = 1;
+const VALUE_LEASE_OPERATION: i64 = 2;
+const OPERATION_ACTIVE: i64 = 1;
+const OPERATION_FINALIZED: i64 = 2;
+const OPERATION_ROLLED_BACK: i64 = 3;
+const UNIQUE_REQUEST_DIGEST_DOMAIN: &[u8] = b"briskdb.global-index.unique-operation.v1\0";
+const VALUE_REQUEST_DIGEST_DOMAIN: &[u8] = b"briskdb.global-index.value-operation.v1\0";
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE briskdb_global_index_storage (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    storage_version INTEGER NOT NULL CHECK (storage_version = 1),
+    storage_version INTEGER NOT NULL CHECK (storage_version = 2),
     key_encoding_version INTEGER NOT NULL CHECK (key_encoding_version = 1)
 ) STRICT;
 
@@ -88,8 +97,94 @@ CREATE TABLE briskdb_global_index_unique_keys (
 
 INSERT INTO briskdb_global_index_storage (
     singleton, storage_version, key_encoding_version
-) VALUES (1, 1, 1);
+) VALUES (1, 2, 1);
 ";
+
+const AUTHORITY_SCHEMA_SQL: &str = "
+CREATE TABLE briskdb_global_operations (
+    operation_id BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
+    operation_kind INTEGER NOT NULL CHECK (operation_kind IN (1, 2)),
+    operation_state INTEGER NOT NULL CHECK (operation_state IN (1, 2, 3)),
+    request_digest BLOB NOT NULL CHECK (length(request_digest) = 32)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE briskdb_global_unique_mutations (
+    operation_id BLOB PRIMARY KEY,
+    index_id INTEGER NOT NULL CHECK (index_id > 0),
+    new_key BLOB,
+    new_source_shard INTEGER CHECK (new_source_shard BETWEEN 0 AND 63),
+    new_source_locator BLOB,
+    previous_key BLOB,
+    previous_source_shard INTEGER CHECK (previous_source_shard BETWEEN 0 AND 63),
+    previous_source_locator BLOB,
+    CHECK (
+        (new_key IS NULL AND new_source_shard IS NULL AND new_source_locator IS NULL)
+        OR
+        (new_key IS NOT NULL AND new_source_shard IS NOT NULL AND new_source_locator IS NOT NULL)
+    ),
+    CHECK (
+        (previous_key IS NULL AND previous_source_shard IS NULL AND previous_source_locator IS NULL)
+        OR
+        (previous_key IS NOT NULL AND previous_source_shard IS NOT NULL AND previous_source_locator IS NOT NULL)
+    ),
+    CHECK (new_key IS NOT NULL OR previous_key IS NOT NULL),
+    FOREIGN KEY (operation_id) REFERENCES briskdb_global_operations (operation_id)
+        ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE briskdb_global_unique_reservations (
+    index_id INTEGER NOT NULL CHECK (index_id > 0),
+    encoded_key BLOB NOT NULL,
+    operation_id BLOB NOT NULL,
+    reservation_role INTEGER NOT NULL CHECK (reservation_role IN (1, 2, 3)),
+    PRIMARY KEY (index_id, encoded_key),
+    FOREIGN KEY (operation_id) REFERENCES briskdb_global_operations (operation_id)
+        ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX briskdb_global_unique_reservations_operation
+    ON briskdb_global_unique_reservations (operation_id);
+
+CREATE TABLE briskdb_global_value_sequences (
+    index_id INTEGER PRIMARY KEY CHECK (index_id > 0),
+    next_value INTEGER NOT NULL CHECK (next_value > 0),
+    exhausted INTEGER NOT NULL CHECK (exhausted IN (0, 1)),
+    fence_token INTEGER NOT NULL CHECK (fence_token >= 0)
+) STRICT;
+
+CREATE TABLE briskdb_global_value_leases (
+    operation_id BLOB PRIMARY KEY,
+    index_id INTEGER NOT NULL CHECK (index_id > 0),
+    requested_count INTEGER NOT NULL CHECK (requested_count > 0),
+    first_value INTEGER NOT NULL CHECK (first_value > 0),
+    last_value INTEGER NOT NULL CHECK (last_value >= first_value),
+    fence_token INTEGER NOT NULL CHECK (fence_token > 0),
+    FOREIGN KEY (operation_id) REFERENCES briskdb_global_operations (operation_id)
+        ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+";
+
+const UPGRADE_V1_TO_V2_SQL: &str = "
+ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v1;
+CREATE TABLE briskdb_global_index_storage (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    storage_version INTEGER NOT NULL CHECK (storage_version = 2),
+    key_encoding_version INTEGER NOT NULL CHECK (key_encoding_version = 1)
+) STRICT;
+INSERT INTO briskdb_global_index_storage (
+    singleton, storage_version, key_encoding_version
+) VALUES (1, 2, 1);
+DROP TABLE briskdb_global_index_storage_v1;
+PRAGMA user_version = 2;
+";
+
+const EXPECTED_OBJECTS_V1: &[&str] = &[
+    "briskdb_global_index_builds",
+    "briskdb_global_index_checkpoints",
+    "briskdb_global_index_entries",
+    "briskdb_global_index_storage",
+    "briskdb_global_index_unique_keys",
+];
 
 const EXPECTED_OBJECTS: &[&str] = &[
     "briskdb_global_index_builds",
@@ -97,6 +192,12 @@ const EXPECTED_OBJECTS: &[&str] = &[
     "briskdb_global_index_entries",
     "briskdb_global_index_storage",
     "briskdb_global_index_unique_keys",
+    "briskdb_global_operations",
+    "briskdb_global_unique_mutations",
+    "briskdb_global_unique_reservations",
+    "briskdb_global_unique_reservations_operation",
+    "briskdb_global_value_leases",
+    "briskdb_global_value_sequences",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +259,1050 @@ struct UniqueReservation {
     encoded_key: Vec<u8>,
     source_shard: u16,
     source_locator: Vec<u8>,
+}
+
+pub(super) fn startup_requires_upgrade(root: &Path) -> EngineResult<bool> {
+    let directory = root.join(DIRECTORY_NAME);
+    match fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(sqlite_error::storage_io(
+                error,
+                format!("failed to inspect {}", directory.display()),
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "global-index path {} is not a real directory",
+                    directory.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let path = directory.join(SHARED_FILE_NAME);
+    if !ensure_regular_file_or_absent(&path)? {
+        return Ok(false);
+    }
+    let connection = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(sqlite_error::storage)?;
+    let application_id: i32 = connection
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(sqlite_error::storage)?;
+    if application_id != APPLICATION_ID {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "global-index SQLite file has a foreign application identity",
+        ));
+    }
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(sqlite_error::storage)?;
+    match version {
+        STORAGE_VERSION => Ok(false),
+        1 => Ok(true),
+        version if version > STORAGE_VERSION => Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("global-index storage version {version} is newer than this build"),
+        )),
+        version => Err(corrupt(format!(
+            "global-index storage version {version} cannot be upgraded"
+        ))),
+    }
+}
+
+pub(super) fn upgrade_if_needed(root: &Path) -> EngineResult<()> {
+    if !startup_requires_upgrade(root)? {
+        return Ok(());
+    }
+    let path = root.join(DIRECTORY_NAME).join(SHARED_FILE_NAME);
+    let mut connection = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(sqlite_error::storage)?;
+    configure(&connection)?;
+    validate_storage_contents(&connection, 1, EXPECTED_OBJECTS_V1)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(UPGRADE_V1_TO_V2_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(AUTHORITY_SCHEMA_SQL)
+        .map_err(sqlite_error::storage)?;
+    abort_at_authority_test_boundary("upgrade-before-commit");
+    transaction.commit().map_err(sqlite_error::storage)?;
+    abort_at_authority_test_boundary("upgrade-after-commit");
+    validate(&connection)?;
+    checkpoint_and_sync(&connection, &path)
+}
+
+#[cfg(test)]
+pub(super) fn downgrade_to_v1_for_test(root: &Path) {
+    let path = root.join(DIRECTORY_NAME).join(SHARED_FILE_NAME);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE briskdb_global_unique_reservations;
+             DROP TABLE briskdb_global_unique_mutations;
+             DROP TABLE briskdb_global_value_leases;
+             DROP TABLE briskdb_global_value_sequences;
+             DROP TABLE briskdb_global_operations;
+             ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v2;
+             CREATE TABLE briskdb_global_index_storage (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 storage_version INTEGER NOT NULL CHECK (storage_version = 1),
+                 key_encoding_version INTEGER NOT NULL CHECK (key_encoding_version = 1)
+             ) STRICT;
+             INSERT INTO briskdb_global_index_storage (
+                 singleton, storage_version, key_encoding_version
+             ) VALUES (1, 1, 1);
+             DROP TABLE briskdb_global_index_storage_v2;
+             PRAGMA user_version = 1;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+}
+
+pub(super) fn reserve_unique(
+    root: &Path,
+    operation_id: GlobalOperationId,
+    mutation: &GlobalUniqueMutation,
+    index: &GlobalIndexMetadata,
+    shard_count: u16,
+    cancellation: &CancellationToken,
+) -> EngineResult<GlobalUniqueReservation> {
+    debug_assert_eq!(mutation.index_id(), index.id());
+    ensure_authority_not_cancelled(cancellation, "before reserving a unique key")?;
+    let digest = unique_request_digest(mutation);
+    let (mut connection, _) = open_existing(root)?
+        .ok_or_else(|| corrupt("ready global index has no physical uniqueness authority"))?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    validate_physical_authority(&transaction, index, shard_count)?;
+    if let Some(state) =
+        load_matching_operation(&transaction, operation_id, UNIQUE_OPERATION, &digest)?
+    {
+        ensure_unique_mutation_record(&transaction, operation_id, mutation)?;
+        transaction.commit().map_err(sqlite_error::storage)?;
+        return Ok(GlobalUniqueReservation::from_validated(
+            operation_id,
+            mutation.index_id(),
+            state,
+        ));
+    }
+
+    if let Some((key, owner)) = mutation.previous_entry() {
+        ensure_finalized_owner(&transaction, mutation.index_id(), key, owner)?;
+    }
+    if let Some((key, _)) = mutation.new_entry() {
+        let replaces_same_key = mutation
+            .previous_entry()
+            .is_some_and(|(previous_key, _)| previous_key == key);
+        if !replaces_same_key && finalized_owner(&transaction, mutation.index_id(), key)?.is_some()
+        {
+            return Err(unique_conflict(mutation.index_id(), key));
+        }
+    }
+    for (key, _) in affected_unique_entries(mutation) {
+        if transaction
+            .query_row(
+                "SELECT 1 FROM briskdb_global_unique_reservations
+                 WHERE index_id = ?1 AND encoded_key = ?2",
+                params![to_sqlite_id(mutation.index_id())?, key.as_bytes()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(sqlite_error::storage)?
+            .is_some()
+        {
+            return Err(unique_conflict(mutation.index_id(), key));
+        }
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO briskdb_global_operations (
+                 operation_id, operation_kind, operation_state, request_digest
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                operation_id.as_bytes().as_slice(),
+                UNIQUE_OPERATION,
+                OPERATION_ACTIVE,
+                digest.as_slice(),
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    let (new_key, new_shard, new_locator) = optional_unique_entry(mutation.new_entry());
+    let (previous_key, previous_shard, previous_locator) =
+        optional_unique_entry(mutation.previous_entry());
+    transaction
+        .execute(
+            "INSERT INTO briskdb_global_unique_mutations (
+                 operation_id, index_id,
+                 new_key, new_source_shard, new_source_locator,
+                 previous_key, previous_source_shard, previous_source_locator
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                operation_id.as_bytes().as_slice(),
+                to_sqlite_id(mutation.index_id())?,
+                new_key,
+                new_shard,
+                new_locator,
+                previous_key,
+                previous_shard,
+                previous_locator,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    insert_unique_locks(&transaction, operation_id, mutation)?;
+    ensure_authority_not_cancelled(cancellation, "before committing a unique reservation")?;
+    abort_at_authority_test_boundary("unique-reserve-before-commit");
+    transaction.commit().map_err(sqlite_error::storage)?;
+    abort_at_authority_test_boundary("unique-reserve-after-commit");
+    Ok(GlobalUniqueReservation::from_validated(
+        operation_id,
+        mutation.index_id(),
+        GlobalOperationState::Active,
+    ))
+}
+
+pub(super) fn finalize_unique(
+    root: &Path,
+    operation_id: GlobalOperationId,
+    cancellation: &CancellationToken,
+) -> EngineResult<GlobalUniqueReservation> {
+    transition_unique_operation(root, operation_id, OPERATION_FINALIZED, cancellation)
+}
+
+pub(super) fn rollback_unique(
+    root: &Path,
+    operation_id: GlobalOperationId,
+    cancellation: &CancellationToken,
+) -> EngineResult<GlobalUniqueReservation> {
+    transition_unique_operation(root, operation_id, OPERATION_ROLLED_BACK, cancellation)
+}
+
+fn transition_unique_operation(
+    root: &Path,
+    operation_id: GlobalOperationId,
+    target: i64,
+    cancellation: &CancellationToken,
+) -> EngineResult<GlobalUniqueReservation> {
+    ensure_authority_not_cancelled(cancellation, "before changing a unique reservation")?;
+    let (mut connection, _) = open_existing(root)?
+        .ok_or_else(|| corrupt("global uniqueness operation has no physical authority"))?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let (kind, current) = load_operation_kind_and_state(&transaction, operation_id)?
+        .ok_or_else(|| unknown_operation(operation_id))?;
+    if kind != UNIQUE_OPERATION {
+        return Err(operation_reuse_error(operation_id));
+    }
+    let mutation = load_stored_unique_mutation(&transaction, operation_id)?;
+    if current == target {
+        transaction.commit().map_err(sqlite_error::storage)?;
+        return Ok(GlobalUniqueReservation::from_validated(
+            operation_id,
+            mutation.index_id,
+            operation_state(current)?,
+        ));
+    }
+    if current != OPERATION_ACTIVE {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "global unique operation {:?} is already {}",
+                operation_id,
+                operation_state(current)?.code()
+            ),
+        ));
+    }
+    validate_physical_build_complete(&transaction, mutation.index_id)?;
+    if target == OPERATION_FINALIZED {
+        finalize_stored_unique_mutation(&transaction, &mutation)?;
+    }
+    let deleted = transaction
+        .execute(
+            "DELETE FROM briskdb_global_unique_reservations WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+        )
+        .map_err(sqlite_error::storage)?;
+    if deleted != mutation.lock_count() {
+        return Err(corrupt(
+            "global unique operation lost a durable key reservation",
+        ));
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE briskdb_global_operations SET operation_state = ?1
+             WHERE operation_id = ?2 AND operation_state = ?3",
+            params![target, operation_id.as_bytes().as_slice(), OPERATION_ACTIVE],
+        )
+        .map_err(sqlite_error::storage)?;
+    if changed != 1 {
+        return Err(corrupt(
+            "global unique operation state changed unexpectedly",
+        ));
+    }
+    ensure_authority_not_cancelled(cancellation, "before committing a unique transition")?;
+    let boundary = if target == OPERATION_FINALIZED {
+        "unique-finalize-before-commit"
+    } else {
+        "unique-rollback-before-commit"
+    };
+    abort_at_authority_test_boundary(boundary);
+    transaction.commit().map_err(sqlite_error::storage)?;
+    let boundary = if target == OPERATION_FINALIZED {
+        "unique-finalize-after-commit"
+    } else {
+        "unique-rollback-after-commit"
+    };
+    abort_at_authority_test_boundary(boundary);
+    Ok(GlobalUniqueReservation::from_validated(
+        operation_id,
+        mutation.index_id,
+        operation_state(target)?,
+    ))
+}
+
+pub(super) fn lease_values(
+    root: &Path,
+    operation_id: GlobalOperationId,
+    index: &GlobalIndexMetadata,
+    shard_count: u16,
+    count: u32,
+    cancellation: &CancellationToken,
+) -> EngineResult<GlobalValueLease> {
+    let index_id = index.id();
+    if count == 0 || count > MAX_GLOBAL_VALUE_LEASE_COUNT {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            format!("global value leases require 1..={MAX_GLOBAL_VALUE_LEASE_COUNT} values"),
+        ));
+    }
+    ensure_authority_not_cancelled(cancellation, "before leasing global values")?;
+    let digest = value_request_digest(index_id, count);
+    let (mut connection, _) = open_existing(root)?
+        .ok_or_else(|| corrupt("ready global index has no physical value authority"))?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    validate_physical_authority(&transaction, index, shard_count)?;
+    if let Some(state) =
+        load_matching_operation(&transaction, operation_id, VALUE_LEASE_OPERATION, &digest)?
+    {
+        let lease = load_value_lease(&transaction, operation_id, state)?;
+        if lease.index_id() != index_id || lease.count() != u64::from(count) {
+            return Err(corrupt(
+                "global value lease does not match its request digest",
+            ));
+        }
+        transaction.commit().map_err(sqlite_error::storage)?;
+        return Ok(lease);
+    }
+    let sequence = transaction
+        .query_row(
+            "SELECT next_value, exhausted, fence_token
+             FROM briskdb_global_value_sequences WHERE index_id = ?1",
+            [to_sqlite_id(index_id)?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?
+        .unwrap_or((1, 0, 0));
+    if sequence.0 <= 0 || !matches!(sequence.1, 0 | 1) || sequence.2 < 0 {
+        return Err(corrupt("global value sequence contains invalid state"));
+    }
+    if sequence.1 == 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::LimitExceeded,
+            format!("global value sequence {index_id} is exhausted"),
+        ));
+    }
+    let first = sequence.0;
+    let last = first
+        .checked_add(i64::from(count) - 1)
+        .ok_or_else(|| sequence_exhausted(index_id))?;
+    let fence = sequence
+        .2
+        .checked_add(1)
+        .ok_or_else(|| sequence_exhausted(index_id))?;
+    let exhausted = i64::from(last == i64::MAX);
+    let next = if exhausted == 1 { i64::MAX } else { last + 1 };
+    transaction
+        .execute(
+            "INSERT INTO briskdb_global_operations (
+                 operation_id, operation_kind, operation_state, request_digest
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                operation_id.as_bytes().as_slice(),
+                VALUE_LEASE_OPERATION,
+                OPERATION_ACTIVE,
+                digest.as_slice(),
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_global_value_sequences (
+                 index_id, next_value, exhausted, fence_token
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (index_id) DO UPDATE SET
+                 next_value = excluded.next_value,
+                 exhausted = excluded.exhausted,
+                 fence_token = excluded.fence_token",
+            params![to_sqlite_id(index_id)?, next, exhausted, fence],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_global_value_leases (
+                 operation_id, index_id, requested_count,
+                 first_value, last_value, fence_token
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                operation_id.as_bytes().as_slice(),
+                to_sqlite_id(index_id)?,
+                i64::from(count),
+                first,
+                last,
+                fence,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    ensure_authority_not_cancelled(cancellation, "before committing a global value lease")?;
+    abort_at_authority_test_boundary("value-lease-before-commit");
+    transaction.commit().map_err(sqlite_error::storage)?;
+    abort_at_authority_test_boundary("value-lease-after-commit");
+    Ok(GlobalValueLease::from_validated(
+        operation_id,
+        index_id,
+        GlobalOperationState::Active,
+        first as u64,
+        last as u64,
+        fence as u64,
+    ))
+}
+
+pub(super) fn transition_value_lease(
+    root: &Path,
+    operation_id: GlobalOperationId,
+    finalize: bool,
+    cancellation: &CancellationToken,
+) -> EngineResult<GlobalValueLease> {
+    ensure_authority_not_cancelled(cancellation, "before changing a global value lease")?;
+    let target = if finalize {
+        OPERATION_FINALIZED
+    } else {
+        OPERATION_ROLLED_BACK
+    };
+    let (mut connection, _) = open_existing(root)?
+        .ok_or_else(|| corrupt("global value operation has no physical authority"))?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let (kind, current) = load_operation_kind_and_state(&transaction, operation_id)?
+        .ok_or_else(|| unknown_operation(operation_id))?;
+    if kind != VALUE_LEASE_OPERATION {
+        return Err(operation_reuse_error(operation_id));
+    }
+    if current != target && current != OPERATION_ACTIVE {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "global value operation {:?} is already {}",
+                operation_id,
+                operation_state(current)?.code()
+            ),
+        ));
+    }
+    if current == OPERATION_ACTIVE {
+        transaction
+            .execute(
+                "UPDATE briskdb_global_operations SET operation_state = ?1
+                 WHERE operation_id = ?2 AND operation_state = ?3",
+                params![target, operation_id.as_bytes().as_slice(), OPERATION_ACTIVE],
+            )
+            .map_err(sqlite_error::storage)?;
+        ensure_authority_not_cancelled(cancellation, "before committing a value transition")?;
+        abort_at_authority_test_boundary(if finalize {
+            "value-finalize-before-commit"
+        } else {
+            "value-abandon-before-commit"
+        });
+    }
+    let lease = load_value_lease(&transaction, operation_id, operation_state(target)?)?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+    abort_at_authority_test_boundary(if finalize {
+        "value-finalize-after-commit"
+    } else {
+        "value-abandon-after-commit"
+    });
+    Ok(lease)
+}
+
+#[derive(Debug)]
+struct StoredUniqueMutation {
+    index_id: GlobalIndexId,
+    new: Option<StoredUniqueEntry>,
+    previous: Option<StoredUniqueEntry>,
+}
+
+type StoredUniqueEntry = (Vec<u8>, i64, Vec<u8>);
+
+impl StoredUniqueMutation {
+    fn lock_count(&self) -> usize {
+        match (&self.new, &self.previous) {
+            (Some(new), Some(previous)) if new.0 == previous.0 => 1,
+            (Some(_), Some(_)) => 2,
+            _ => 1,
+        }
+    }
+}
+
+fn load_operation_kind_and_state(
+    transaction: &Transaction<'_>,
+    operation_id: GlobalOperationId,
+) -> EngineResult<Option<(i64, i64)>> {
+    let value = transaction
+        .query_row(
+            "SELECT operation_kind, operation_state FROM briskdb_global_operations
+             WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?;
+    if let Some((kind, state)) = value {
+        if !matches!(kind, UNIQUE_OPERATION | VALUE_LEASE_OPERATION) {
+            return Err(corrupt("global operation has an invalid kind"));
+        }
+        operation_state(state)?;
+    }
+    Ok(value)
+}
+
+fn load_matching_operation(
+    transaction: &Transaction<'_>,
+    operation_id: GlobalOperationId,
+    expected_kind: i64,
+    expected_digest: &[u8; 32],
+) -> EngineResult<Option<GlobalOperationState>> {
+    let value = transaction
+        .query_row(
+            "SELECT operation_kind, operation_state, request_digest
+             FROM briskdb_global_operations WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?;
+    let Some((kind, state, digest)) = value else {
+        return Ok(None);
+    };
+    if kind != expected_kind || digest.as_slice() != expected_digest {
+        return Err(operation_reuse_error(operation_id));
+    }
+    Ok(Some(operation_state(state)?))
+}
+
+fn operation_state(value: i64) -> EngineResult<GlobalOperationState> {
+    if !matches!(
+        value,
+        OPERATION_ACTIVE | OPERATION_FINALIZED | OPERATION_ROLLED_BACK
+    ) {
+        return Err(corrupt("global operation has an invalid state"));
+    }
+    Ok(GlobalOperationState::from_validated(value))
+}
+
+fn ensure_unique_mutation_record(
+    transaction: &Transaction<'_>,
+    operation_id: GlobalOperationId,
+    expected: &GlobalUniqueMutation,
+) -> EngineResult<()> {
+    let stored = load_stored_unique_mutation(transaction, operation_id)?;
+    let (new_key, new_shard, new_locator) = optional_unique_entry(expected.new_entry());
+    let (old_key, old_shard, old_locator) = optional_unique_entry(expected.previous_entry());
+    if stored.index_id != expected.index_id()
+        || stored.new.as_ref().map(|value| value.0.as_slice()) != new_key
+        || stored.new.as_ref().map(|value| value.1) != new_shard
+        || stored.new.as_ref().map(|value| value.2.as_slice()) != new_locator
+        || stored.previous.as_ref().map(|value| value.0.as_slice()) != old_key
+        || stored.previous.as_ref().map(|value| value.1) != old_shard
+        || stored.previous.as_ref().map(|value| value.2.as_slice()) != old_locator
+    {
+        return Err(corrupt(
+            "global unique operation does not match its request digest",
+        ));
+    }
+    Ok(())
+}
+
+fn load_stored_unique_mutation(
+    transaction: &Transaction<'_>,
+    operation_id: GlobalOperationId,
+) -> EngineResult<StoredUniqueMutation> {
+    type StoredRow = (
+        i64,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<Vec<u8>>,
+    );
+    let row: StoredRow = transaction
+        .query_row(
+            "SELECT index_id,
+                    new_key, new_source_shard, new_source_locator,
+                    previous_key, previous_source_shard, previous_source_locator
+             FROM briskdb_global_unique_mutations WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?
+        .ok_or_else(|| corrupt("global unique operation has no mutation record"))?;
+    let index_id = u64::try_from(row.0)
+        .ok()
+        .and_then(|value| GlobalIndexId::new(value).ok())
+        .ok_or_else(|| corrupt("global unique operation has an invalid index ID"))?;
+    let new = stored_optional_entry(row.1, row.2, row.3)?;
+    let previous = stored_optional_entry(row.4, row.5, row.6)?;
+    if new.is_none() && previous.is_none() {
+        return Err(corrupt("global unique operation has no affected key"));
+    }
+    Ok(StoredUniqueMutation {
+        index_id,
+        new,
+        previous,
+    })
+}
+
+fn stored_optional_entry(
+    key: Option<Vec<u8>>,
+    shard: Option<i64>,
+    locator: Option<Vec<u8>>,
+) -> EngineResult<Option<StoredUniqueEntry>> {
+    match (key, shard, locator) {
+        (None, None, None) => Ok(None),
+        (Some(key), Some(shard), Some(locator))
+            if (0..=63).contains(&shard) && !locator.is_empty() =>
+        {
+            CanonicalIndexKey::from_bytes(&key)?;
+            Ok(Some((key, shard, locator)))
+        }
+        _ => Err(corrupt(
+            "global unique operation has an invalid owner record",
+        )),
+    }
+}
+
+fn finalize_stored_unique_mutation(
+    transaction: &Transaction<'_>,
+    mutation: &StoredUniqueMutation,
+) -> EngineResult<()> {
+    let same_key = matches!(
+        (&mutation.new, &mutation.previous),
+        (Some(new), Some(previous)) if new.0 == previous.0
+    );
+    if let (Some(new), Some(previous)) = (&mutation.new, &mutation.previous) {
+        if same_key && (new.1 != previous.1 || new.2 != previous.2) {
+            let changed = transaction
+                .execute(
+                    "UPDATE briskdb_global_index_unique_keys
+                     SET source_shard = ?1, source_locator = ?2
+                     WHERE index_id = ?3 AND encoded_key = ?4
+                       AND source_shard = ?5 AND source_locator = ?6",
+                    params![
+                        new.1,
+                        &new.2,
+                        to_sqlite_id(mutation.index_id)?,
+                        &new.0,
+                        previous.1,
+                        &previous.2,
+                    ],
+                )
+                .map_err(sqlite_error::storage)?;
+            if changed != 1 {
+                return Err(corrupt("global unique handoff lost its previous owner"));
+            }
+        }
+    }
+    if let Some((key, shard, locator)) = &mutation.previous {
+        if !same_key {
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM briskdb_global_index_unique_keys
+                     WHERE index_id = ?1 AND encoded_key = ?2
+                       AND source_shard = ?3 AND source_locator = ?4",
+                    params![to_sqlite_id(mutation.index_id)?, key, shard, locator],
+                )
+                .map_err(sqlite_error::storage)?;
+            if deleted != 1 {
+                return Err(corrupt("global unique release lost its previous owner"));
+            }
+        }
+    }
+    if let Some((key, shard, locator)) = &mutation.new {
+        if !same_key {
+            transaction
+                .execute(
+                    "INSERT INTO briskdb_global_index_unique_keys (
+                         index_id, encoded_key, source_shard, source_locator
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![to_sqlite_id(mutation.index_id)?, key, shard, locator],
+                )
+                .map_err(|error| {
+                    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                        unique_conflict_bytes(mutation.index_id, key)
+                    } else {
+                        sqlite_error::storage(error)
+                    }
+                })?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_unique_locks(
+    transaction: &Transaction<'_>,
+    operation_id: GlobalOperationId,
+    mutation: &GlobalUniqueMutation,
+) -> EngineResult<()> {
+    match (mutation.previous_entry(), mutation.new_entry()) {
+        (Some((old, _)), Some((new, _))) if old == new => {
+            insert_unique_lock(transaction, operation_id, mutation.index_id(), old, 3)?;
+        }
+        (previous, new) => {
+            if let Some((key, _)) = previous {
+                insert_unique_lock(transaction, operation_id, mutation.index_id(), key, 1)?;
+            }
+            if let Some((key, _)) = new {
+                insert_unique_lock(transaction, operation_id, mutation.index_id(), key, 2)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_unique_lock(
+    transaction: &Transaction<'_>,
+    operation_id: GlobalOperationId,
+    index_id: GlobalIndexId,
+    key: &CanonicalIndexKey,
+    role: i64,
+) -> EngineResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO briskdb_global_unique_reservations (
+                 index_id, encoded_key, operation_id, reservation_role
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                to_sqlite_id(index_id)?,
+                key.as_bytes(),
+                operation_id.as_bytes().as_slice(),
+                role,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
+fn affected_unique_entries(
+    mutation: &GlobalUniqueMutation,
+) -> Vec<(&CanonicalIndexKey, &crate::core::GlobalIndexOwner)> {
+    let mut entries = Vec::with_capacity(2);
+    if let Some(entry) = mutation.previous_entry() {
+        entries.push(entry);
+    }
+    if let Some(entry) = mutation.new_entry() {
+        if entries.first().is_none_or(|(key, _)| *key != entry.0) {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+fn optional_unique_entry<'a>(
+    entry: Option<(&'a CanonicalIndexKey, &'a crate::core::GlobalIndexOwner)>,
+) -> (Option<&'a [u8]>, Option<i64>, Option<&'a [u8]>) {
+    match entry {
+        Some((key, owner)) => (
+            Some(key.as_bytes()),
+            Some(i64::from(owner.source_shard())),
+            Some(owner.locator()),
+        ),
+        None => (None, None, None),
+    }
+}
+
+fn finalized_owner(
+    transaction: &Transaction<'_>,
+    index_id: GlobalIndexId,
+    key: &CanonicalIndexKey,
+) -> EngineResult<Option<(i64, Vec<u8>)>> {
+    transaction
+        .query_row(
+            "SELECT source_shard, source_locator
+             FROM briskdb_global_index_unique_keys
+             WHERE index_id = ?1 AND encoded_key = ?2",
+            params![to_sqlite_id(index_id)?, key.as_bytes()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error::storage)
+}
+
+fn ensure_finalized_owner(
+    transaction: &Transaction<'_>,
+    index_id: GlobalIndexId,
+    key: &CanonicalIndexKey,
+    owner: &crate::core::GlobalIndexOwner,
+) -> EngineResult<()> {
+    let existing = finalized_owner(transaction, index_id, key)?;
+    if existing.as_ref().is_some_and(|(shard, locator)| {
+        *shard == i64::from(owner.source_shard()) && locator.as_slice() == owner.locator()
+    }) {
+        Ok(())
+    } else {
+        Err(unique_conflict(index_id, key))
+    }
+}
+
+fn validate_physical_build_complete(
+    transaction: &Transaction<'_>,
+    index_id: GlobalIndexId,
+) -> EngineResult<()> {
+    let state = transaction
+        .query_row(
+            "SELECT build_state FROM briskdb_global_index_builds WHERE index_id = ?1",
+            [to_sqlite_id(index_id)?],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?;
+    match state {
+        Some(COMPLETE) => Ok(()),
+        Some(BUILDING) => Err(EngineError::new(
+            EngineErrorKind::Busy,
+            format!("global index {index_id} is being rebuilt"),
+        )),
+        Some(_) => Err(corrupt("global-index build has an invalid state")),
+        None => Err(corrupt(format!(
+            "global index {index_id} has no physical build authority"
+        ))),
+    }
+}
+
+fn validate_physical_authority(
+    transaction: &Transaction<'_>,
+    index: &GlobalIndexMetadata,
+    shard_count: u16,
+) -> EngineResult<()> {
+    let build = transaction
+        .query_row(
+            "SELECT definition_digest, schema_generation, shard_count, build_state
+             FROM briskdb_global_index_builds WHERE index_id = ?1",
+            [to_sqlite_id(index.id())?],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?;
+    let Some((digest, generation, shards, state)) = build else {
+        return Err(corrupt(format!(
+            "global index {} has no physical build authority",
+            index.id()
+        )));
+    };
+    if digest.as_slice() != definition_digest(index)
+        || generation != to_sqlite_u64(index.schema_generation(), "schema generation")?
+        || shards != i64::from(shard_count)
+    {
+        return Err(corrupt(format!(
+            "global index {} physical authority does not match its catalog definition",
+            index.id()
+        )));
+    }
+    match state {
+        COMPLETE => Ok(()),
+        BUILDING => Err(EngineError::new(
+            EngineErrorKind::Busy,
+            format!("global index {} is being rebuilt", index.id()),
+        )),
+        _ => Err(corrupt("global-index build has an invalid state")),
+    }
+}
+
+fn load_value_lease(
+    transaction: &Transaction<'_>,
+    operation_id: GlobalOperationId,
+    state: GlobalOperationState,
+) -> EngineResult<GlobalValueLease> {
+    let row = transaction
+        .query_row(
+            "SELECT index_id, requested_count, first_value, last_value, fence_token
+             FROM briskdb_global_value_leases WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?
+        .ok_or_else(|| corrupt("global value operation has no lease record"))?;
+    let index_id = u64::try_from(row.0)
+        .ok()
+        .and_then(|value| GlobalIndexId::new(value).ok())
+        .ok_or_else(|| corrupt("global value lease has an invalid index ID"))?;
+    if row.1 <= 0 || row.2 <= 0 || row.3 < row.2 || row.4 <= 0 || row.3 - row.2 + 1 != row.1 {
+        return Err(corrupt("global value lease contains invalid bounds"));
+    }
+    Ok(GlobalValueLease::from_validated(
+        operation_id,
+        index_id,
+        state,
+        row.2 as u64,
+        row.3 as u64,
+        row.4 as u64,
+    ))
+}
+
+fn unique_request_digest(mutation: &GlobalUniqueMutation) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(UNIQUE_REQUEST_DIGEST_DOMAIN);
+    hasher.update(&mutation.index_id().get().to_le_bytes());
+    digest_optional_unique_entry(&mut hasher, mutation.previous_entry());
+    digest_optional_unique_entry(&mut hasher, mutation.new_entry());
+    *hasher.finalize().as_bytes()
+}
+
+fn digest_optional_unique_entry(
+    hasher: &mut blake3::Hasher,
+    entry: Option<(&CanonicalIndexKey, &crate::core::GlobalIndexOwner)>,
+) {
+    match entry {
+        Some((key, owner)) => {
+            hasher.update(&[1]);
+            update_framed(hasher, key.as_bytes());
+            hasher.update(&owner.source_shard().to_le_bytes());
+            update_framed(hasher, owner.locator());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn value_request_digest(index_id: GlobalIndexId, count: u32) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(VALUE_REQUEST_DIGEST_DOMAIN);
+    hasher.update(&index_id.get().to_le_bytes());
+    hasher.update(&count.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn unique_conflict(index_id: GlobalIndexId, key: &CanonicalIndexKey) -> EngineError {
+    unique_conflict_bytes(index_id, key.as_bytes())
+}
+
+fn unique_conflict_bytes(index_id: GlobalIndexId, key: &[u8]) -> EngineError {
+    EngineError::new(
+        EngineErrorKind::UniqueViolation,
+        format!(
+            "global index {index_id} already owns key {}",
+            locator_label(key)
+        ),
+    )
+}
+
+fn operation_reuse_error(operation_id: GlobalOperationId) -> EngineError {
+    EngineError::new(
+        EngineErrorKind::InvalidArgument,
+        format!(
+            "global operation {:?} was already used for a different request",
+            operation_id
+        ),
+    )
+}
+
+fn unknown_operation(operation_id: GlobalOperationId) -> EngineError {
+    EngineError::new(
+        EngineErrorKind::InvalidArgument,
+        format!("global operation {:?} does not exist", operation_id),
+    )
+}
+
+fn sequence_exhausted(index_id: GlobalIndexId) -> EngineError {
+    EngineError::new(
+        EngineErrorKind::LimitExceeded,
+        format!("global value sequence {index_id} is exhausted"),
+    )
+}
+
+fn ensure_authority_not_cancelled(
+    cancellation: &CancellationToken,
+    context: &str,
+) -> EngineResult<()> {
+    if cancellation.is_cancelled() {
+        Err(EngineError::new(
+            EngineErrorKind::Cancelled,
+            format!("global authority operation was cancelled {context}"),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -635,7 +1780,35 @@ pub(super) fn validate_index(
         options.mode(),
         &mut accumulator,
     )?;
+    validate_active_unique_reservations(&connection, index, &mut accumulator)?;
     Ok(ValidationOutcome { accumulator })
+}
+
+fn validate_active_unique_reservations(
+    connection: &Connection,
+    index: &GlobalIndexMetadata,
+    accumulator: &mut ValidationAccumulator,
+) -> EngineResult<()> {
+    let mut statement = connection
+        .prepare(
+            "SELECT encoded_key FROM briskdb_global_unique_reservations
+             WHERE index_id = ?1 ORDER BY encoded_key",
+        )
+        .map_err(sqlite_error::storage)?;
+    let mut rows = statement
+        .query([to_sqlite_id(index.id())?])
+        .map_err(sqlite_error::storage)?;
+    while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
+        let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error::storage)?;
+        CanonicalIndexKey::from_bytes(&key)?;
+        accumulator.record(
+            GlobalIndexValidationIssueKind::ActiveUniqueReservation,
+            None,
+            Some(&key),
+            None,
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn repair_non_unique(
@@ -1379,6 +2552,7 @@ pub(super) fn remove_artifacts(root: &Path, index_id: GlobalIndexId) -> EngineRe
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error::storage)?;
+    delete_authority_for_index(&transaction, index_id)?;
     transaction
         .execute(
             "DELETE FROM briskdb_global_index_builds WHERE index_id = ?1",
@@ -1453,6 +2627,11 @@ fn prepare_rebuild(
     shard_count: u16,
     definition_digest: &[u8; 32],
 ) -> EngineResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    rollback_active_unique_operations(&transaction, index.id())?;
+    transaction.commit().map_err(sqlite_error::storage)?;
     let resumable = load_build_state(connection, index.id(), shard_count, definition_digest)?
         .is_some_and(|state| state.state == BUILDING);
     if resumable {
@@ -1523,14 +2702,67 @@ fn cleanup_abandoned(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error::storage)?;
     for index_id in abandoned {
+        let index_id = GlobalIndexId::new(index_id as u64)
+            .map_err(|_| corrupt("abandoned global-index ID is invalid"))?;
+        delete_authority_for_index(&transaction, index_id)?;
         transaction
             .execute(
                 "DELETE FROM briskdb_global_index_builds WHERE index_id = ?1",
-                [index_id],
+                [to_sqlite_id(index_id)?],
             )
             .map_err(sqlite_error::storage)?;
     }
     transaction.commit().map_err(sqlite_error::storage)
+}
+
+fn rollback_active_unique_operations(
+    transaction: &Transaction<'_>,
+    index_id: GlobalIndexId,
+) -> EngineResult<()> {
+    transaction
+        .execute(
+            "UPDATE briskdb_global_operations SET operation_state = ?1
+             WHERE operation_state = ?2 AND operation_id IN (
+                 SELECT operation_id FROM briskdb_global_unique_mutations WHERE index_id = ?3
+             )",
+            params![
+                OPERATION_ROLLED_BACK,
+                OPERATION_ACTIVE,
+                to_sqlite_id(index_id)?
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "DELETE FROM briskdb_global_unique_reservations WHERE index_id = ?1",
+            [to_sqlite_id(index_id)?],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
+fn delete_authority_for_index(
+    transaction: &Transaction<'_>,
+    index_id: GlobalIndexId,
+) -> EngineResult<()> {
+    let index_id = to_sqlite_id(index_id)?;
+    transaction
+        .execute(
+            "DELETE FROM briskdb_global_operations WHERE operation_id IN (
+                 SELECT operation_id FROM briskdb_global_unique_mutations WHERE index_id = ?1
+                 UNION
+                 SELECT operation_id FROM briskdb_global_value_leases WHERE index_id = ?1
+             )",
+            [index_id],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "DELETE FROM briskdb_global_value_sequences WHERE index_id = ?1",
+            [index_id],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
 }
 
 fn load_build_state(
@@ -2487,6 +3719,9 @@ fn initialize(connection: &Connection) -> EngineResult<()> {
     connection
         .execute_batch(SCHEMA_SQL)
         .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(AUTHORITY_SCHEMA_SQL)
+        .map_err(sqlite_error::storage)?;
     validate(connection)
 }
 
@@ -2515,6 +3750,14 @@ fn validate(connection: &Connection) -> EngineResult<()> {
             ),
         ));
     }
+    validate_storage_contents(connection, STORAGE_VERSION, EXPECTED_OBJECTS)
+}
+
+fn validate_storage_contents(
+    connection: &Connection,
+    storage_version: u32,
+    expected_objects: &[&str],
+) -> EngineResult<()> {
     let mode: String = connection
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .map_err(sqlite_error::storage)?;
@@ -2541,7 +3784,7 @@ fn validate(connection: &Connection) -> EngineResult<()> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(sqlite_error::storage)?
     };
-    if objects != EXPECTED_OBJECTS {
+    if objects != expected_objects {
         return Err(corrupt("global-index storage schema is not canonical"));
     }
     let metadata = connection
@@ -2555,7 +3798,7 @@ fn validate(connection: &Connection) -> EngineResult<()> {
         .map_err(sqlite_error::storage)?;
     if metadata
         != Some((
-            i64::from(STORAGE_VERSION),
+            i64::from(storage_version),
             i64::from(INDEX_KEY_ENCODING_VERSION),
         ))
     {
@@ -2716,6 +3959,16 @@ fn abort_at_recovery_test_boundary(boundary: &str) {
 fn abort_at_recovery_test_boundary(_boundary: &str) {}
 
 #[cfg(test)]
+fn abort_at_authority_test_boundary(boundary: &str) {
+    if std::env::var("BRISKDB_GLOBAL_INDEX_AUTHORITY_ABORT_POINT").as_deref() == Ok(boundary) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(test))]
+fn abort_at_authority_test_boundary(_boundary: &str) {}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2817,5 +4070,45 @@ mod tests {
         assert!(error.diagnostic().contains("shard 1"));
         assert!(error.diagnostic().contains("key bytes are redacted"));
         assert!(!error.diagnostic().contains("duplicate@example.test"));
+    }
+
+    #[test]
+    fn version_one_storage_upgrades_atomically_to_the_authority_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let connection = open_or_create(&root).unwrap().0;
+        connection
+            .execute(
+                "INSERT INTO briskdb_global_index_builds
+                 VALUES (1, ?1, 0, 2, 2, 0)",
+                [&[0_u8; 32][..]],
+            )
+            .unwrap();
+        drop(connection);
+        downgrade_to_v1_for_test(&root);
+        assert!(startup_requires_upgrade(&root).unwrap());
+        upgrade_if_needed(&root).unwrap();
+        assert!(!startup_requires_upgrade(&root).unwrap());
+        let connection = open_existing(&root).unwrap().unwrap().0;
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_global_index_builds",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_global_operations",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
     }
 }

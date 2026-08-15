@@ -348,6 +348,13 @@ read or changed. Only a durable, fully verified result returns to `Ready`;
 findings become `Invalid`, while cancellation or process loss leaves a safe,
 retryable `Rebuilding` state. Unique authority is rebuilt, never guessed.
 
+Storage version 2 adds the synchronous [global uniqueness and value
+authority](GLOBAL_INDEX_AUTHORITY.md) to that shared file. Stable operation IDs
+make unique reserve/finalize/rollback and integer range leasing idempotent
+across retries and process loss. Key locks and finalized owners change in single
+SQLite transactions, so no protocol needs an unsafe scan-then-insert check.
+Automatic DML coordination remains the separate #233 write-path stage.
+
 ### Bound statement-planning boundary
 
 Synchronous `Engine::plan_bound_statement` accepts a `NormalizedSql` batch, one

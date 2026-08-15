@@ -46,9 +46,10 @@ use crate::{
     core::{
         Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
         GeneratedTableDdlReceipt, GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId,
-        GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexRepairReport,
+        GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexRepairReport,
         GlobalIndexValidationMode, GlobalIndexValidationOptions, GlobalIndexValidationReport,
-        MAX_TABLES, ShardKeyType, TableDeclaration, TablePlacement,
+        GlobalOperationId, GlobalUniqueMutation, GlobalUniqueReservation, GlobalValueLease,
+        IndexKeyValue, MAX_TABLES, ShardKeyType, TableDeclaration, TablePlacement,
         generated_id::{
             NATIVE_RANGE_V1_FORMAT_MARKER, native_range_v1_sequence_ceiling,
             native_range_v1_sequence_floor,
@@ -549,8 +550,15 @@ impl Storage {
         let mut startup = begin_startup_coordination(&schema_coordination)?;
         startup.wait_for_quiescence_blocking();
         let manifest_path = root.join("manifest.sqlite");
-        let requires_exclusive =
-            startup_requires_exclusive_ownership(&manifest_path, requested_shards);
+        let requires_exclusive = startup_requires_exclusive_ownership(
+            &manifest_path,
+            requested_shards,
+        )
+        .and_then(|manifest_requires_exclusive| {
+            global_index::startup_requires_upgrade(&root).map(|global_index_requires_exclusive| {
+                manifest_requires_exclusive || global_index_requires_exclusive
+            })
+        });
         let requires_exclusive = match requires_exclusive {
             Ok(requires_exclusive) => requires_exclusive,
             Err(error) => {
@@ -565,6 +573,12 @@ impl Storage {
         } else {
             None
         };
+        if let Err(error) = global_index::upgrade_if_needed(&root) {
+            if error.kind() == EngineErrorKind::DataCorruption {
+                schema_coordination.mark_degraded();
+            }
+            return Err(error);
+        }
         let shards_dir = root.join("shards");
         let fresh_layout_allowed = physical_layout_is_empty(&shards_dir)?;
         let mut manifest = open_manifest_for_startup(&manifest_path)?;
@@ -1519,6 +1533,212 @@ impl Storage {
     ) -> EngineResult<GlobalIndexRepairReport> {
         let result = self.repair_global_index_inner(index_id, cancellation);
         self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn reserve_global_unique(
+        &self,
+        operation_id: GlobalOperationId,
+        mutation: &GlobalUniqueMutation,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalUniqueReservation> {
+        let result = (|| {
+            let _operation = self.enter_schema_operation()?;
+            let index = self.validate_authority_index(mutation.index_id(), true, false)?;
+            for (_, owner) in [mutation.previous_entry(), mutation.new_entry()]
+                .into_iter()
+                .flatten()
+            {
+                if owner.source_shard() >= self.shard_count() {
+                    return Err(EngineError::new(
+                        EngineErrorKind::InvalidArgument,
+                        format!(
+                            "global-index owner shard {} is outside 0..{}",
+                            owner.source_shard(),
+                            self.shard_count()
+                        ),
+                    ));
+                }
+            }
+            for (key, _) in [mutation.previous_entry(), mutation.new_entry()]
+                .into_iter()
+                .flatten()
+            {
+                self.validate_authority_key(index, key)?;
+            }
+            debug_assert_eq!(index.id(), mutation.index_id());
+            global_index::reserve_unique(
+                &self.root,
+                operation_id,
+                mutation,
+                index,
+                self.shard_count(),
+                cancellation,
+            )
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn finalize_global_unique(
+        &self,
+        operation_id: GlobalOperationId,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalUniqueReservation> {
+        let result = (|| {
+            let _operation = self.enter_schema_operation()?;
+            global_index::finalize_unique(&self.root, operation_id, cancellation)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn rollback_global_unique(
+        &self,
+        operation_id: GlobalOperationId,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalUniqueReservation> {
+        let result = (|| {
+            let _operation = self.enter_schema_operation()?;
+            global_index::rollback_unique(&self.root, operation_id, cancellation)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn lease_global_values(
+        &self,
+        operation_id: GlobalOperationId,
+        index_id: GlobalIndexId,
+        count: u32,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalValueLease> {
+        let result = (|| {
+            let _operation = self.enter_schema_operation()?;
+            let index = self.validate_authority_index(index_id, true, true)?;
+            global_index::lease_values(
+                &self.root,
+                operation_id,
+                index,
+                self.shard_count(),
+                count,
+                cancellation,
+            )
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn transition_global_value_lease(
+        &self,
+        operation_id: GlobalOperationId,
+        finalize: bool,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalValueLease> {
+        let result = (|| {
+            let _operation = self.enter_schema_operation()?;
+            global_index::transition_value_lease(&self.root, operation_id, finalize, cancellation)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn validate_authority_index(
+        &self,
+        index_id: GlobalIndexId,
+        require_unique: bool,
+        require_integer: bool,
+    ) -> EngineResult<&GlobalIndexMetadata> {
+        let index = self
+            .catalog
+            .logical()
+            .global_index_by_id(index_id)
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!("global index {index_id} does not exist"),
+                )
+            })?;
+        if index.lifecycle() != GlobalIndexLifecycle::Ready {
+            return Err(EngineError::new(
+                EngineErrorKind::Busy,
+                format!(
+                    "global index {index_id} is not authoritative while {:?}",
+                    index.lifecycle()
+                ),
+            ));
+        }
+        if require_unique && !index.is_unique() {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!("global index {index_id} is not unique"),
+            ));
+        }
+        if require_integer
+            && (index.key_parts().len() != 1
+                || !matches!(
+                    index.key_parts()[0].key_type(),
+                    GlobalIndexKeyType::Int64 | GlobalIndexKeyType::UInt64
+                ))
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!("global index {index_id} is not a single integer value authority"),
+            ));
+        }
+        Ok(index)
+    }
+
+    fn validate_authority_key(
+        &self,
+        index: &GlobalIndexMetadata,
+        key: &crate::core::CanonicalIndexKey,
+    ) -> EngineResult<()> {
+        let parts = key.decode()?;
+        if parts.len() != index.key_parts().len() {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!(
+                    "global index {} requires {} key parts, not {}",
+                    index.id(),
+                    index.key_parts().len(),
+                    parts.len()
+                ),
+            ));
+        }
+        for (ordinal, (part, expected)) in parts.iter().zip(index.key_parts()).enumerate() {
+            let type_matches = matches!(
+                (expected.key_type(), part.value()),
+                (_, IndexKeyValue::Null)
+                    | (GlobalIndexKeyType::Boolean, IndexKeyValue::Boolean(_))
+                    | (GlobalIndexKeyType::Int64, IndexKeyValue::Int64(_))
+                    | (GlobalIndexKeyType::UInt64, IndexKeyValue::UInt64(_))
+                    | (GlobalIndexKeyType::Float64, IndexKeyValue::Float64(_))
+                    | (GlobalIndexKeyType::Date, IndexKeyValue::Date(_))
+                    | (GlobalIndexKeyType::Timestamp, IndexKeyValue::Timestamp(_))
+                    | (GlobalIndexKeyType::Text, IndexKeyValue::Text(_))
+                    | (GlobalIndexKeyType::Binary, IndexKeyValue::Binary(_))
+            );
+            if !type_matches
+                || part.order() != expected.order()
+                || part.null_order() != expected.null_order()
+                || part.collation() != expected.collation()
+            {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!(
+                        "global index {} key part {ordinal} does not match its definition",
+                        index.id()
+                    ),
+                ));
+            }
+            if matches!(part.value(), IndexKeyValue::Null)
+                && index.null_semantics() == crate::core::UniqueNullSemantics::Distinct
+            {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!(
+                        "global index {} uses distinct NULL semantics and must not reserve NULL keys",
+                        index.id()
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn repair_global_index_inner(
@@ -6324,9 +6544,68 @@ mod tests {
                 .unwrap();
                 database.repair_global_index(id).map(|_| ())
             }
+            "authority-reserve" => {
+                let (id, operation, mutation) = authority_crash_request();
+                debug_assert_eq!(id, mutation.index_id());
+                database
+                    .reserve_global_unique(operation, &mutation)
+                    .map(|_| ())
+            }
+            "authority-finalize" => {
+                let (_, operation, _) = authority_crash_request();
+                database.finalize_global_unique(operation).map(|_| ())
+            }
+            "authority-rollback" => {
+                let (_, operation, _) = authority_crash_request();
+                database.rollback_global_unique(operation).map(|_| ())
+            }
+            "authority-lease" => {
+                let (id, operation, _) = authority_crash_request();
+                database.lease_global_values(operation, id, 7).map(|_| ())
+            }
+            "authority-value-finalize" => {
+                let (_, operation, _) = authority_crash_request();
+                database.finalize_global_value_lease(operation).map(|_| ())
+            }
+            "authority-value-abandon" => {
+                let (_, operation, _) = authority_crash_request();
+                database.abandon_global_value_lease(operation).map(|_| ())
+            }
             unexpected => panic!("unexpected global-index crash mode: {unexpected}"),
         };
         panic!("child did not reach requested global-index boundary: {result:?}");
+    }
+
+    fn authority_crash_request() -> (
+        crate::core::GlobalIndexId,
+        crate::core::GlobalOperationId,
+        crate::core::GlobalUniqueMutation,
+    ) {
+        let id = crate::core::GlobalIndexId::new(
+            std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_ID")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        )
+        .unwrap();
+        authority_request(id)
+    }
+
+    fn authority_request(
+        id: crate::core::GlobalIndexId,
+    ) -> (
+        crate::core::GlobalIndexId,
+        crate::core::GlobalOperationId,
+        crate::core::GlobalUniqueMutation,
+    ) {
+        let operation = crate::core::GlobalOperationId::new([7; 16]).unwrap();
+        let key = crate::core::CanonicalIndexKey::encode_values(&[crate::core::Value::from(vec![
+            1_u8, 2, 3,
+        ])])
+        .unwrap();
+        let owner = crate::core::GlobalIndexOwner::new(0, b"authority-row".to_vec()).unwrap();
+        let mutation = crate::core::GlobalUniqueMutation::claim(id, key, owner);
+        (id, operation, mutation)
     }
 
     fn abort_global_index_child(
@@ -6342,12 +6621,243 @@ mod tests {
             .arg("--nocapture")
             .env("BRISKDB_GLOBAL_INDEX_ABORT_ROOT", root)
             .env("BRISKDB_GLOBAL_INDEX_ABORT_MODE", mode)
-            .env("BRISKDB_GLOBAL_INDEX_ABORT_POINT", boundary);
+            .env("BRISKDB_GLOBAL_INDEX_ABORT_POINT", boundary)
+            .env("BRISKDB_GLOBAL_INDEX_AUTHORITY_ABORT_POINT", boundary);
         if let Some(id) = id {
             command.env("BRISKDB_GLOBAL_INDEX_ABORT_ID", id.get().to_string());
         }
         let status = command.status().unwrap();
         assert!(!status.success(), "child did not abort at {boundary}");
+    }
+
+    fn setup_authority_crash_root(root: &Path) -> (GlobalIndexId, GlobalIndexId) {
+        let mut database = setup_global_index_root(root);
+        let unique = global_index_test_declaration(&database)
+            .unique(crate::core::UniqueNullSemantics::Distinct);
+        let unique_id = database.create_global_index(unique).unwrap();
+        database.build_global_index(unique_id).unwrap();
+        let table_id = database
+            .catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap()
+            .id();
+        let value = crate::core::GlobalIndexDeclaration::new(
+            table_id,
+            "events_id_global_value",
+            vec![crate::core::GlobalIndexKeyPart::new(
+                crate::core::GlobalIndexKeySource::column("id").unwrap(),
+                crate::core::GlobalIndexKeyType::Int64,
+            )],
+        )
+        .unwrap()
+        .unique(crate::core::UniqueNullSemantics::NotDistinct)
+        .with_topology(crate::core::GlobalIndexStorageTopology::SharedSqliteV1);
+        let value_id = database.create_global_index(value).unwrap();
+        database.build_global_index(value_id).unwrap();
+        (unique_id, value_id)
+    }
+
+    fn authority_operation_state(root: &Path) -> Option<i64> {
+        Connection::open(root.join("global-indexes/global.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT operation_state FROM briskdb_global_operations
+                 WHERE operation_id = ?1",
+                [&[7_u8; 16][..]],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    fn global_authority_retries_converge_after_real_process_abort_at_every_boundary() {
+        for (boundary, durable) in [
+            ("unique-reserve-before-commit", false),
+            ("unique-reserve-after-commit", true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (unique_id, _) = setup_authority_crash_root(temp.path());
+            abort_global_index_child(temp.path(), "authority-reserve", boundary, Some(unique_id));
+            assert_eq!(authority_operation_state(temp.path()).is_some(), durable);
+            let database = Database::open(temp.path(), 2).unwrap();
+            let (_, operation, mutation) = authority_request(unique_id);
+            assert_eq!(
+                database
+                    .reserve_global_unique(operation, &mutation)
+                    .unwrap()
+                    .state(),
+                crate::core::GlobalOperationState::Active
+            );
+        }
+
+        for (mode, boundaries, target) in [
+            (
+                "authority-finalize",
+                [
+                    "unique-finalize-before-commit",
+                    "unique-finalize-after-commit",
+                ],
+                crate::core::GlobalOperationState::Finalized,
+            ),
+            (
+                "authority-rollback",
+                [
+                    "unique-rollback-before-commit",
+                    "unique-rollback-after-commit",
+                ],
+                crate::core::GlobalOperationState::RolledBack,
+            ),
+        ] {
+            for (offset, boundary) in boundaries.into_iter().enumerate() {
+                let temp = tempfile::tempdir().unwrap();
+                let (unique_id, _) = setup_authority_crash_root(temp.path());
+                let database = Database::open(temp.path(), 2).unwrap();
+                let (_, operation, mutation) = authority_request(unique_id);
+                database
+                    .reserve_global_unique(operation, &mutation)
+                    .unwrap();
+                drop(database);
+                abort_global_index_child(temp.path(), mode, boundary, Some(unique_id));
+                assert_eq!(
+                    authority_operation_state(temp.path()),
+                    Some(if offset == 0 { 1 } else { target_code(target) })
+                );
+                let database = Database::open(temp.path(), 2).unwrap();
+                let report = if target == crate::core::GlobalOperationState::Finalized {
+                    database.finalize_global_unique(operation).unwrap()
+                } else {
+                    database.rollback_global_unique(operation).unwrap()
+                };
+                assert_eq!(report.state(), target);
+            }
+        }
+
+        for (boundary, durable) in [
+            ("value-lease-before-commit", false),
+            ("value-lease-after-commit", true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (_, value_id) = setup_authority_crash_root(temp.path());
+            abort_global_index_child(temp.path(), "authority-lease", boundary, Some(value_id));
+            assert_eq!(authority_operation_state(temp.path()).is_some(), durable);
+            let database = Database::open(temp.path(), 2).unwrap();
+            let (_, operation, _) = authority_request(value_id);
+            let lease = database
+                .lease_global_values(operation, value_id, 7)
+                .unwrap();
+            assert_eq!((lease.first(), lease.last()), (1, 7));
+        }
+
+        for (mode, boundaries, target) in [
+            (
+                "authority-value-finalize",
+                [
+                    "value-finalize-before-commit",
+                    "value-finalize-after-commit",
+                ],
+                crate::core::GlobalOperationState::Finalized,
+            ),
+            (
+                "authority-value-abandon",
+                ["value-abandon-before-commit", "value-abandon-after-commit"],
+                crate::core::GlobalOperationState::RolledBack,
+            ),
+        ] {
+            for (offset, boundary) in boundaries.into_iter().enumerate() {
+                let temp = tempfile::tempdir().unwrap();
+                let (_, value_id) = setup_authority_crash_root(temp.path());
+                let database = Database::open(temp.path(), 2).unwrap();
+                let (_, operation, _) = authority_request(value_id);
+                database
+                    .lease_global_values(operation, value_id, 7)
+                    .unwrap();
+                drop(database);
+                abort_global_index_child(temp.path(), mode, boundary, Some(value_id));
+                assert_eq!(
+                    authority_operation_state(temp.path()),
+                    Some(if offset == 0 { 1 } else { target_code(target) })
+                );
+                let database = Database::open(temp.path(), 2).unwrap();
+                let lease = if target == crate::core::GlobalOperationState::Finalized {
+                    database.finalize_global_value_lease(operation).unwrap()
+                } else {
+                    database.abandon_global_value_lease(operation).unwrap()
+                };
+                assert_eq!(lease.state(), target);
+            }
+        }
+    }
+
+    const fn target_code(state: crate::core::GlobalOperationState) -> i64 {
+        match state {
+            crate::core::GlobalOperationState::Active => 1,
+            crate::core::GlobalOperationState::Finalized => 2,
+            crate::core::GlobalOperationState::RolledBack => 3,
+        }
+    }
+
+    fn setup_upgrade_test_root(root: &Path) {
+        let mut database = setup_global_index_root(root);
+        let id = database
+            .create_global_index(global_index_test_declaration(&database))
+            .unwrap();
+        database.build_global_index(id).unwrap();
+        drop(database);
+        global_index::downgrade_to_v1_for_test(root);
+    }
+
+    #[test]
+    fn global_authority_format_upgrade_recovers_from_real_process_abort() {
+        for (boundary, expected_version) in [
+            ("upgrade-before-commit", 1_i64),
+            ("upgrade-after-commit", 2_i64),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            setup_upgrade_test_root(temp.path());
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("storage::tests::global_index_catalog_crash_child")
+                .arg("--nocapture")
+                .env("BRISKDB_GLOBAL_INDEX_ABORT_ROOT", temp.path())
+                .env("BRISKDB_GLOBAL_INDEX_ABORT_MODE", "create")
+                .env("BRISKDB_GLOBAL_INDEX_AUTHORITY_ABORT_POINT", boundary)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "child did not abort at {boundary}");
+            assert_eq!(
+                Connection::open(temp.path().join("global-indexes/global.sqlite"))
+                    .unwrap()
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                expected_version
+            );
+            drop(Database::open(temp.path(), 2).unwrap());
+            let canonical = fs::canonicalize(temp.path()).unwrap();
+            assert!(!global_index::startup_requires_upgrade(&canonical).unwrap());
+        }
+    }
+
+    #[test]
+    fn global_authority_format_upgrade_requires_sole_process_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = setup_global_index_root(temp.path());
+        let id = database
+            .create_global_index(global_index_test_declaration(&database))
+            .unwrap();
+        database.build_global_index(id).unwrap();
+        drop(database);
+        let (peer, release) = spawn_shared_root_peer(temp.path(), "global-authority-upgrade");
+        global_index::downgrade_to_v1_for_test(temp.path());
+        let error = Database::open(temp.path(), 2).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+        assert!(error.is_retryable());
+        let canonical = fs::canonicalize(temp.path()).unwrap();
+        assert!(global_index::startup_requires_upgrade(&canonical).unwrap());
+        release_shared_root_peer(peer, &release);
+        drop(Database::open(temp.path(), 2).unwrap());
+        assert!(!global_index::startup_requires_upgrade(&canonical).unwrap());
     }
 
     #[test]
