@@ -83,6 +83,28 @@ one consistent authority snapshot, active-mutation coverage, shard
 deduplication, and shard-key intersection. Database creation, index build, and
 seed writes remain outside measurement.
 
+The `global_index_outbox/*` group compares an identical registered-table key
+update on the direct path, on the writable-coordinator control path with no
+index, and with a ready non-unique index whose event is captured in the row
+transaction:
+
+```bash
+cargo bench --locked --bench storage -- global_index_outbox
+```
+
+Criterion reports foreground latency and throughput. Run the release
+`global_index_baseline` before/after matrix on the same host to compare its
+physical-write and peak-WAL-growth columns; the outbox deliberately performs no
+separate transaction or durability sync.
+
+An illustrative 2026-08-15 Apple ARM64 release run measured the direct path at
+51.5 µs / 19.4k updates/s, the writable-coordinator control at 798.6 µs / 1.25k
+updates/s, and the transactional outbox at 1.092 ms / 916 updates/s. The focused
+increment was therefore about 293 µs and 27% throughput versus the coordinator
+control. These local numbers expose the current alpha cost; they are not a
+cross-host CI threshold. The larger #239 release gate owns optimization and the
+same-host p99/WAL regression decision.
+
 ## Workload contract
 
 Every benchmark creates a fresh temporary BriskDB database with exactly four

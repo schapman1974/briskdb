@@ -1319,6 +1319,34 @@ the codec version in every global-index definition but does not persist physical
 index entries or change shard placement. Physical entries live in the separate
 storage-version-3 `global-indexes/global.sqlite` authority, never in a shard.
 
+### Optional shard-local global-index outbox version 1
+
+A shard lazily creates four reserved objects inside the first qualifying
+non-unique indexed row transaction:
+
+- `briskdb_global_index_outbox_state` stores the format version, monotonic
+  high-water cursor, pruned prefix, and retained event/byte counters;
+- `briskdb_global_index_outbox_events` stores the index ID, source shard,
+  16-byte operation ID, event kind, canonical old/new keys, stable old/new row
+  locators, and accounted payload bytes under its cursor primary key;
+- `briskdb_global_index_outbox_consumers` stores one durable active cursor per
+  index;
+- `briskdb_global_index_outbox_events_index_cursor` supports bounded per-index
+  replay.
+
+These objects are exact, STRICT, storage-owned schema. They are excluded from
+the application schema digest and authoritative application-table set only
+after their exact SQL is validated; incomplete or modified reserved objects
+fail closed as `DataCorruption`. Ordinary SQL connections cannot read or mutate
+them. Their absence remains valid, so existing shards need no eager migration.
+
+Event format 1 uses one positive cursor sequence per shard. Inserts have only a
+new key/locator, updates have both old and new, and deletes/tombstones have only
+old values. The outbox append and application-row mutation commit in the same
+shard WAL transaction. Consumer advancement and pruning use separate immediate
+transactions; pruning stops at the minimum active durable cursor. A consumer
+behind `pruned_through` must rebuild rather than silently skip history.
+
 ### Physical global-index storage version 3
 
 The selected `SharedSqliteV1` layout is one real regular file at

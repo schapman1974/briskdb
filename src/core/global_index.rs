@@ -14,6 +14,9 @@ pub(crate) const MAX_GLOBAL_INDEX_SQL_BYTES: usize = 4_096;
 pub(crate) const MAX_GLOBAL_OWNER_LOCATOR_BYTES: usize = 4_096;
 pub(crate) const MAX_GLOBAL_INDEX_READ_CANDIDATES: usize = 4_096;
 pub(crate) const MAX_GLOBAL_INDEX_READ_REPAIRS: usize = 64;
+pub const MAX_GLOBAL_INDEX_OUTBOX_BATCH_EVENTS: usize = 4_096;
+pub const MAX_GLOBAL_INDEX_OUTBOX_EVENTS_PER_SHARD: u64 = 1_000_000;
+pub const MAX_GLOBAL_INDEX_OUTBOX_BYTES_PER_SHARD: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_GLOBAL_VALUE_LEASE_COUNT: u32 = 65_536;
 const DEFAULT_MAX_REPORTED_VALIDATION_ISSUES: u16 = 128;
 const MAX_REPORTED_VALIDATION_ISSUES: u16 = 1_024;
@@ -134,6 +137,311 @@ impl fmt::Debug for GlobalIndexOwner {
             .field("source_shard", &self.source_shard)
             .field("locator", &"<redacted>")
             .finish()
+    }
+}
+
+/// Monotonic position in one physical shard's global-index outbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GlobalIndexOutboxCursor(u64);
+
+impl GlobalIndexOutboxCursor {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Logical non-unique index change captured beside its owning shard row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GlobalIndexOutboxEventKind {
+    Insert,
+    Update,
+    Delete,
+    Tombstone,
+}
+
+impl GlobalIndexOutboxEventKind {
+    pub(crate) const fn code(self) -> i64 {
+        match self {
+            Self::Insert => 1,
+            Self::Update => 2,
+            Self::Delete => 3,
+            Self::Tombstone => 4,
+        }
+    }
+
+    pub(crate) fn from_code(code: i64) -> EngineResult<Self> {
+        match code {
+            1 => Ok(Self::Insert),
+            2 => Ok(Self::Update),
+            3 => Ok(Self::Delete),
+            4 => Ok(Self::Tombstone),
+            _ => Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!("global-index outbox has unsupported event kind {code}"),
+            )),
+        }
+    }
+}
+
+/// One durable shard-local non-unique index event.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GlobalIndexOutboxEvent {
+    format_version: u32,
+    cursor: GlobalIndexOutboxCursor,
+    index_id: GlobalIndexId,
+    operation_id: GlobalOperationId,
+    kind: GlobalIndexOutboxEventKind,
+    old_key: Option<CanonicalIndexKey>,
+    new_key: Option<CanonicalIndexKey>,
+    old_owner: Option<GlobalIndexOwner>,
+    new_owner: Option<GlobalIndexOwner>,
+}
+
+impl GlobalIndexOutboxEvent {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_validated_parts(
+        format_version: u32,
+        cursor: u64,
+        index_id: GlobalIndexId,
+        operation_id: GlobalOperationId,
+        kind: GlobalIndexOutboxEventKind,
+        old_key: Option<CanonicalIndexKey>,
+        new_key: Option<CanonicalIndexKey>,
+        old_owner: Option<GlobalIndexOwner>,
+        new_owner: Option<GlobalIndexOwner>,
+    ) -> Self {
+        Self {
+            format_version,
+            cursor: GlobalIndexOutboxCursor::new(cursor),
+            index_id,
+            operation_id,
+            kind,
+            old_key,
+            new_key,
+            old_owner,
+            new_owner,
+        }
+    }
+
+    pub const fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    pub const fn cursor(&self) -> GlobalIndexOutboxCursor {
+        self.cursor
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+
+    pub const fn operation_id(&self) -> GlobalOperationId {
+        self.operation_id
+    }
+
+    pub const fn kind(&self) -> GlobalIndexOutboxEventKind {
+        self.kind
+    }
+
+    pub fn old_key(&self) -> Option<&CanonicalIndexKey> {
+        self.old_key.as_ref()
+    }
+
+    pub fn new_key(&self) -> Option<&CanonicalIndexKey> {
+        self.new_key.as_ref()
+    }
+
+    pub fn old_owner(&self) -> Option<&GlobalIndexOwner> {
+        self.old_owner.as_ref()
+    }
+
+    pub fn new_owner(&self) -> Option<&GlobalIndexOwner> {
+        self.new_owner.as_ref()
+    }
+}
+
+impl fmt::Debug for GlobalIndexOutboxEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GlobalIndexOutboxEvent")
+            .field("format_version", &self.format_version)
+            .field("cursor", &self.cursor)
+            .field("index_id", &self.index_id)
+            .field("operation_id", &self.operation_id)
+            .field("kind", &self.kind)
+            .field("old_key", &self.old_key)
+            .field("new_key", &self.new_key)
+            .field("old_owner", &self.old_owner)
+            .field("new_owner", &self.new_owner)
+            .finish()
+    }
+}
+
+/// Bounded replay result from one index on one shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexOutboxBatch {
+    shard: u16,
+    index_id: GlobalIndexId,
+    after: GlobalIndexOutboxCursor,
+    high_water: GlobalIndexOutboxCursor,
+    events: Box<[GlobalIndexOutboxEvent]>,
+}
+
+impl GlobalIndexOutboxBatch {
+    pub(crate) fn new(
+        shard: u16,
+        index_id: GlobalIndexId,
+        after: u64,
+        high_water: u64,
+        events: Vec<GlobalIndexOutboxEvent>,
+    ) -> Self {
+        Self {
+            shard,
+            index_id,
+            after: GlobalIndexOutboxCursor::new(after),
+            high_water: GlobalIndexOutboxCursor::new(high_water),
+            events: events.into_boxed_slice(),
+        }
+    }
+
+    pub const fn shard(&self) -> u16 {
+        self.shard
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+
+    pub const fn after(&self) -> GlobalIndexOutboxCursor {
+        self.after
+    }
+
+    pub const fn high_water(&self) -> GlobalIndexOutboxCursor {
+        self.high_water
+    }
+
+    pub fn events(&self) -> &[GlobalIndexOutboxEvent] {
+        &self.events
+    }
+}
+
+/// Storage and worst-consumer lag for one physical shard outbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexOutboxShardStatus {
+    shard: u16,
+    high_water: GlobalIndexOutboxCursor,
+    pruned_through: GlobalIndexOutboxCursor,
+    retained_events: u64,
+    retained_bytes: u64,
+    active_consumers: u64,
+    minimum_durable_cursor: GlobalIndexOutboxCursor,
+}
+
+impl GlobalIndexOutboxShardStatus {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        shard: u16,
+        high_water: u64,
+        pruned_through: u64,
+        retained_events: u64,
+        retained_bytes: u64,
+        active_consumers: u64,
+        minimum_durable_cursor: u64,
+    ) -> Self {
+        Self {
+            shard,
+            high_water: GlobalIndexOutboxCursor::new(high_water),
+            pruned_through: GlobalIndexOutboxCursor::new(pruned_through),
+            retained_events,
+            retained_bytes,
+            active_consumers,
+            minimum_durable_cursor: GlobalIndexOutboxCursor::new(minimum_durable_cursor),
+        }
+    }
+
+    pub const fn shard(&self) -> u16 {
+        self.shard
+    }
+
+    pub const fn high_water(&self) -> GlobalIndexOutboxCursor {
+        self.high_water
+    }
+
+    pub const fn pruned_through(&self) -> GlobalIndexOutboxCursor {
+        self.pruned_through
+    }
+
+    pub const fn retained_events(&self) -> u64 {
+        self.retained_events
+    }
+
+    pub const fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+
+    pub const fn active_consumers(&self) -> u64 {
+        self.active_consumers
+    }
+
+    pub const fn minimum_durable_cursor(&self) -> GlobalIndexOutboxCursor {
+        self.minimum_durable_cursor
+    }
+
+    pub const fn lag(&self) -> u64 {
+        self.high_water
+            .get()
+            .saturating_sub(self.minimum_durable_cursor.get())
+    }
+
+    pub const fn is_backpressured(&self) -> bool {
+        self.retained_events >= MAX_GLOBAL_INDEX_OUTBOX_EVENTS_PER_SHARD
+            || self.retained_bytes >= MAX_GLOBAL_INDEX_OUTBOX_BYTES_PER_SHARD
+    }
+}
+
+/// Result of one bounded, consumer-safe shard-local prune.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalIndexOutboxPruneReport {
+    shard: u16,
+    deleted_events: u64,
+    deleted_bytes: u64,
+    pruned_through: GlobalIndexOutboxCursor,
+}
+
+impl GlobalIndexOutboxPruneReport {
+    pub(crate) const fn new(
+        shard: u16,
+        deleted_events: u64,
+        deleted_bytes: u64,
+        pruned_through: u64,
+    ) -> Self {
+        Self {
+            shard,
+            deleted_events,
+            deleted_bytes,
+            pruned_through: GlobalIndexOutboxCursor::new(pruned_through),
+        }
+    }
+
+    pub const fn shard(&self) -> u16 {
+        self.shard
+    }
+
+    pub const fn deleted_events(&self) -> u64 {
+        self.deleted_events
+    }
+
+    pub const fn deleted_bytes(&self) -> u64 {
+        self.deleted_bytes
+    }
+
+    pub const fn pruned_through(&self) -> GlobalIndexOutboxCursor {
+        self.pruned_through
     }
 }
 
@@ -1361,5 +1669,49 @@ mod tests {
         assert_eq!(mutation.index_id(), index_id);
         assert!(mutation.previous_entry().is_some());
         assert!(mutation.new_entry().is_some());
+    }
+
+    #[test]
+    fn outbox_types_preserve_cursor_event_and_redaction_contracts() {
+        let index = GlobalIndexId::new(8).unwrap();
+        let operation = GlobalOperationId::new([4; 16]).unwrap();
+        let old_key = CanonicalIndexKey::encode_values(&["secret-old".into()]).unwrap();
+        let new_key = CanonicalIndexKey::encode_values(&["secret-new".into()]).unwrap();
+        let old_owner = GlobalIndexOwner::new(2, b"secret-owner-old".to_vec()).unwrap();
+        let new_owner = GlobalIndexOwner::new(2, b"secret-owner-new".to_vec()).unwrap();
+        let event = GlobalIndexOutboxEvent::from_validated_parts(
+            1,
+            11,
+            index,
+            operation,
+            GlobalIndexOutboxEventKind::Update,
+            Some(old_key),
+            Some(new_key),
+            Some(old_owner),
+            Some(new_owner),
+        );
+        assert_eq!(event.format_version(), 1);
+        assert_eq!(event.cursor(), GlobalIndexOutboxCursor::new(11));
+        assert_eq!(event.index_id(), index);
+        assert_eq!(event.operation_id(), operation);
+        assert_eq!(event.kind(), GlobalIndexOutboxEventKind::Update);
+        assert!(event.old_key().is_some());
+        assert!(event.new_owner().is_some());
+        let debug = format!("{event:?}");
+        assert!(!debug.contains("secret-old"));
+        assert!(!debug.contains("secret-owner-old"));
+
+        let batch = GlobalIndexOutboxBatch::new(2, index, 7, 11, vec![event]);
+        assert_eq!(batch.shard(), 2);
+        assert_eq!(batch.after().get(), 7);
+        assert_eq!(batch.high_water().get(), 11);
+        assert_eq!(batch.events().len(), 1);
+        let status = GlobalIndexOutboxShardStatus::new(2, 11, 3, 8, 512, 2, 7);
+        assert_eq!(status.lag(), 4);
+        assert!(!status.is_backpressured());
+        let report = GlobalIndexOutboxPruneReport::new(2, 3, 192, 6);
+        assert_eq!(report.deleted_events(), 3);
+        assert_eq!(report.deleted_bytes(), 192);
+        assert_eq!(report.pruned_through().get(), 6);
     }
 }

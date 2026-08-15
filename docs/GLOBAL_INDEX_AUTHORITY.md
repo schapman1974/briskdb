@@ -34,12 +34,41 @@ tables, `ON CONFLICT DO UPDATE`, and cross-shard `INSERT OR REPLACE` conflicts
 return `Unsupported` before commit. `INSERT OR IGNORE` returns zero affected
 rows on a global conflict. These restrictions avoid silently partial writes.
 
-Maintenance is synchronous and currently refreshes the affected index/shard
-snapshot before acknowledging the write. This favors correctness over write
-throughput in the alpha; the outbox and asynchronous-index stages tracked by
-[#236](https://github.com/schapman1974/briskdb/issues/236) and
-[#237](https://github.com/schapman1974/briskdb/issues/237) are the planned
-throughput path.
+Unique maintenance remains synchronous and refreshes the affected index/shard
+snapshot before acknowledging the write. Non-unique maintenance now writes a
+versioned event into the owning shard's outbox in the same SQLite transaction
+as the row. It therefore adds no independent commit or fsync and cannot publish
+an event for a rolled-back row. Asynchronous index application and freshness
+watermarks are the next stage in
+[#237](https://github.com/schapman1974/briskdb/issues/237).
+
+## Transactional non-unique outbox
+
+```mermaid
+flowchart LR
+    SQL[INSERT / UPDATE / DELETE] --> HOOK[SQLite pre-update hook]
+    HOOK --> KEY[Canonical old/new key + row locator]
+    KEY --> TX[(One shard WAL transaction)]
+    TX --> ROW[Application row]
+    TX --> EVENT[Versioned outbox event]
+    EVENT --> REPLAY[Bounded replay by index + cursor]
+    REPLAY --> ACK[Durable consumer cursor]
+    ACK --> PRUNE[Consumer-safe prefix prune]
+```
+
+Each shard has one monotonic cursor shared by all non-unique indexes. Events
+carry the index ID, source shard, nonzero operation ID, canonical old/new keys,
+stable old/new locators, and `insert`, `update`, `delete`, or `tombstone` kind.
+Replay is bounded to 4,096 events. A consumer cursor is durable across reopen,
+and pruning cannot cross the slowest active consumer. Retention is capped at
+1,000,000 events or 256 MiB per shard; a full outbox returns retryable `Busy`
+from the row write instead of dropping index work. Removing an index first
+deactivates its consumer so it cannot retain events forever.
+
+The outbox is ordinary STRICT SQLite schema created lazily inside the first
+qualifying row transaction. It uses the bundled SQLite engine and pre-update
+hook, not a loadable plugin. Independent processes serialize cursor allocation
+through the same shard WAL writer lock and observe one gap-free commit order.
 
 ## Exact indexed reads
 
@@ -140,7 +169,10 @@ insert/update/delete races and exact retries, Python and PostgreSQL clients,
 replacement locking, serial-model property histories, four-process hot-key
 contention, four-process range leasing, durable process-abort boundaries,
 format-upgrade crashes, peer fencing, stale-candidate differential properties,
-cancellation/deadlines, and process exits around repair enqueue/application.
+cancellation/deadlines, process exits around repair enqueue/application,
+transactional outbox rollback, insert/update/delete/tombstone replay, durable
+cursors and safe pruning, explicit backpressure, and independent-process cursor
+ordering.
 
 Criterion includes three focused measurements:
 
@@ -151,3 +183,8 @@ cargo bench --bench storage -- global_authority
 - uncontended reserve + finalize;
 - finalized hot-key rejection;
 - 64-value lease + finalize.
+
+The `global_index_outbox` Criterion group compares the same indexed-key update
+with and without transactional outbox capture. The release baseline harness
+continues to record throughput, p50/p95/p99 latency, physical write bytes, and
+peak shard WAL growth for before/after gates.

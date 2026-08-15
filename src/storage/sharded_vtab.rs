@@ -1270,7 +1270,7 @@ struct TableSpec {
     locator_point_select_sql: Option<String>,
     columns: Box<[PhysicalColumnSpec]>,
     locator: Option<PhysicalLocatorSpec>,
-    global_unique_indexes: Box<[GlobalUniqueIndexSpec]>,
+    global_indexes: Box<[GlobalIndexSpec]>,
     write_unsupported: Option<String>,
     column_count: usize,
     targets: Box<[u16]>,
@@ -1290,7 +1290,7 @@ struct PhysicalColumnSpec {
 }
 
 #[derive(Debug, Clone)]
-struct GlobalUniqueIndexSpec {
+struct GlobalIndexSpec {
     metadata: GlobalIndexMetadata,
     evaluation_sql: String,
 }
@@ -1578,15 +1578,13 @@ impl TableSpec {
             shard::writable_table_unsupported_reason(connection, name)?
         };
 
-        let global_unique_indexes = global_indexes
+        let global_indexes = global_indexes
             .iter()
             .filter(|index| {
-                index.table_id() == table.id()
-                    && index.is_unique()
-                    && index.lifecycle() == GlobalIndexLifecycle::Ready
+                index.table_id() == table.id() && index.lifecycle() == GlobalIndexLifecycle::Ready
             })
-            .map(|metadata| GlobalUniqueIndexSpec {
-                evaluation_sql: global_unique_evaluation_sql(metadata, &physical_columns),
+            .map(|metadata| GlobalIndexSpec {
+                evaluation_sql: global_index_evaluation_sql(metadata, &physical_columns),
                 metadata: metadata.clone(),
             })
             .collect::<Vec<_>>()
@@ -1626,7 +1624,7 @@ impl TableSpec {
             locator_point_select_sql,
             columns: physical_columns,
             locator,
-            global_unique_indexes,
+            global_indexes,
             write_unsupported,
             column_count: columns.len(),
             targets,
@@ -2004,7 +2002,7 @@ const fn affinity_name(affinity: SqliteAffinity) -> &'static str {
     }
 }
 
-fn global_unique_evaluation_sql(
+fn global_index_evaluation_sql(
     index: &GlobalIndexMetadata,
     columns: &[PhysicalColumnSpec],
 ) -> String {

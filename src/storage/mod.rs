@@ -2,6 +2,7 @@
 
 mod global_index;
 mod hilo;
+mod index_outbox;
 mod manifest;
 mod migration;
 mod process_lock;
@@ -46,10 +47,12 @@ use crate::{
     core::{
         Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
         GeneratedTableDdlReceipt, GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId,
-        GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexRepairReport,
-        GlobalIndexValidationMode, GlobalIndexValidationOptions, GlobalIndexValidationReport,
-        GlobalOperationId, GlobalUniqueMutation, GlobalUniqueReservation, GlobalValueLease,
-        IndexKeyValue, MAX_TABLES, ShardKeyType, TableDeclaration, TablePlacement,
+        GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexOutboxBatch,
+        GlobalIndexOutboxCursor, GlobalIndexOutboxPruneReport, GlobalIndexOutboxShardStatus,
+        GlobalIndexRepairReport, GlobalIndexValidationMode, GlobalIndexValidationOptions,
+        GlobalIndexValidationReport, GlobalOperationId, GlobalUniqueMutation,
+        GlobalUniqueReservation, GlobalValueLease, IndexKeyValue, MAX_TABLES, ShardKeyType,
+        TableDeclaration, TablePlacement,
         generated_id::{
             NATIVE_RANGE_V1_FORMAT_MARKER, native_range_v1_sequence_ceiling,
             native_range_v1_sequence_floor,
@@ -1987,6 +1990,63 @@ impl Storage {
             })
     }
 
+    pub(crate) fn global_index_outbox_status(
+        &self,
+    ) -> EngineResult<Vec<GlobalIndexOutboxShardStatus>> {
+        let result = index_outbox::inspect(self);
+        self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn read_global_index_outbox(
+        &self,
+        index_id: GlobalIndexId,
+        shard: u16,
+        after: GlobalIndexOutboxCursor,
+        limit: usize,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexOutboxBatch> {
+        let result = (|| {
+            self.validate_nonunique_outbox_index(index_id)?;
+            index_outbox::read_batch(self, index_id, shard, after.get(), limit, cancellation)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn advance_global_index_outbox(
+        &self,
+        index_id: GlobalIndexId,
+        shard: u16,
+        cursor: GlobalIndexOutboxCursor,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexOutboxShardStatus> {
+        let result = (|| {
+            self.validate_nonunique_outbox_index(index_id)?;
+            index_outbox::advance_consumer(self, index_id, shard, cursor.get(), cancellation)
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn prune_global_index_outbox(
+        &self,
+        shard: u16,
+        limit: usize,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexOutboxPruneReport> {
+        let result = index_outbox::prune(self, shard, limit, cancellation);
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn validate_nonunique_outbox_index(&self, index_id: GlobalIndexId) -> EngineResult<()> {
+        let index = self.global_index_metadata(index_id)?;
+        if index.is_unique() {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!("global index {index_id} is unique and does not use the shard outbox"),
+            ));
+        }
+        Ok(())
+    }
+
     fn publish_global_index_lifecycle(
         &mut self,
         index_id: GlobalIndexId,
@@ -2062,6 +2122,9 @@ impl Storage {
                 EngineErrorKind::FailedPrecondition,
                 format!("global index {index_id} must enter Dropping before removal"),
             ));
+        }
+        if !index.is_unique() {
+            index_outbox::deactivate_index(self, index_id)?;
         }
         global_index::remove_artifacts(&self.root, index_id)?;
         let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
@@ -3264,7 +3327,7 @@ fn physical_layout_is_empty(shards_dir: &Path) -> EngineResult<bool> {
     }
 }
 
-fn attach_storage_authorizer(connection: &Connection) -> EngineResult<()> {
+pub(super) fn attach_storage_authorizer(connection: &Connection) -> EngineResult<()> {
     connection
         .authorizer(Some(|context: AuthContext<'_>| {
             if shard::denies_client_action(context.action) {
