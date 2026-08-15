@@ -2,62 +2,52 @@
 
 [![CI](https://github.com/schapman1974/briskdb/actions/workflows/ci.yml/badge.svg)](https://github.com/schapman1974/briskdb/actions/workflows/ci.yml)
 [![Release](https://github.com/schapman1974/briskdb/actions/workflows/release.yml/badge.svg)](https://github.com/schapman1974/briskdb/actions/workflows/release.yml)
+[![PyPI](https://img.shields.io/pypi/v/briskdb?label=PyPI&color=56e0ac)](https://pypi.org/project/briskdb/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-56e0ac.svg)](LICENSE)
 
-> **SQLite grew up, learned to shard, and started speaking database protocols.**
+> **SQLite files. One sharded database.**
 
-BriskDB turns production-hardened SQLite into a small, fast, sharded database
-engine. It keeps the durability, WAL, transactions, tooling, and boring
-reliability developers already trust—then adds routing, parallel writer domains,
-global reads, generated IDs, an HTTP API, and wire-protocol frontends.
+BriskDB turns ordinary SQLite files into one database with **parallel writes,
+PostgreSQL compatibility, HTTP access, and embedded Rust/Python APIs**. It keeps
+SQLite's proven storage engine and tooling; BriskDB adds the routing layer,
+shard-safe IDs, cross-shard indexes, protocols, and operational guardrails.
 
-**HTTP, TLS/SCRAM-protected PostgreSQL queries, and in-process Rust and Python
-embedding work today. Embedded hosts can optionally expose the same engine over
-HTTP and PostgreSQL. Native MongoDB, MySQL, and serverless use are on the roadmap.**
+<p align="center">
+  <img src="docs/assets/briskdb-demo.gif" alt="BriskDB demo: four Python writer threads writing through one engine into four ordinary SQLite WAL shards, with HTTP and PostgreSQL listeners" width="900">
+</p>
 
-> [!WARNING]
-> BriskDB is an alpha. It is exciting infrastructure, not yet a production-ready
-> database service. HTTP and unauthenticated PostgreSQL remain loopback-only;
-> PostgreSQL may bind remotely only with TLS and SCRAM-SHA-256 configured.
+| The useful part | What it means |
+| --- | --- |
+| **Parallel SQLite writes** | Independent shard files have independent WAL writer locks. |
+| **Use existing clients** | PostgreSQL and HTTP work today; MongoDB and MySQL are next. |
+| **Embed or run a service** | The same Rust engine powers the binary, Python wheel, and Rust crate. |
+| **Keep inspectable files** | Every data shard remains a normal SQLite database—no SQLite fork. |
+
+[Try it without a compiler](#try-it-in-30-seconds) ·
+[Download an alpha](https://github.com/schapman1974/briskdb/releases) ·
+[Open the data browser](#browse-the-whole-logical-database) ·
+[Follow MongoDB and MySQL](#follow-the-build)
+
+> [!IMPORTANT]
+> BriskDB is an alpha, not a production-ready database service. The
+> [boundaries are explicit](#honest-alpha-boundaries), and measured results are
+> published even when they are not flattering.
 
 ## Why developers might care
 
-- **Sharding without an SQLite fork.** Every shard is an ordinary SQLite WAL
-  database that existing tools can inspect and repair.
-- **Real parallel writes.** Independent shard files mean independent SQLite
-  writer locks—no single shared WAL for the whole cluster.
-- **One logical database.** Exact keys route to one owner; broader reads gather
-  bounded work across the right shards.
-- **IDs without a central per-row bottleneck.** BriskDB can let SQLite
-  `AUTOINCREMENT` allocate from non-overlapping shard ranges, or lease hi/lo ID
-  blocks and route them through the normal shard map.
-- **A real cross-shard constraint authority.** Durable operation-ID
-  reservations can choose one global unique-key owner, while fenced range
-  leases allocate collision-free values across processes. Successful
-  single-shard `INSERT`, `UPDATE`, and `DELETE` statements now maintain ready
-  global unique indexes automatically, and exact indexed reads skip shards
-  that cannot own a match. Non-unique index hits are physically rechecked and
-  stale entries are repaired without trusting them as authority. Every
-  non-unique index change now commits to a bounded shard-local outbox beside
-  its row. Fenced background consumers apply those events across processes and
-  publish per-shard freshness watermarks; reads use verified candidates, scan
-  only lagging shards, and automatically narrow further as the index catches up.
-  Compact shard-local Bloom filters and typed min/max summaries can now skip
-  even those lagging shards for equality, `IN`, and supported range predicates,
-  without introducing false negatives.
-  [See the replay design](docs/GLOBAL_INDEX_ASYNC.md) and
-  [summary pruning contract](docs/GLOBAL_INDEX_SHARD_SUMMARIES.md). The
-  [measured release gate](docs/GLOBAL_INDEX_RELEASE_GATE.md) is equally direct:
-  shard avoidance works, but current metadata inspection makes this an
-  explicit experimental feature—not yet a latency win on small hot datasets.
-- **Inspectable operations, not mystery state.** Health, admin JSON, Prometheus
-  metrics, and the Rust API expose index lifecycle, lag, poison/rebuild state,
-  contention, repairs, summary health, and outbox pressure without leaking
-  indexed values.
-- **Bring the client you already have.** HTTP and PostgreSQL are available now;
-  MongoDB and MySQL wire compatibility are being built over the same engine.
-- **Files remain files.** The layout is a manifest plus normal SQLite databases,
-  not a proprietary page format.
+- **No SQLite fork.** Each shard is an ordinary SQLite WAL database that normal
+  tools can inspect.
+- **No central write lock.** Writes to different shards use different WALs and
+  can progress in parallel.
+- **No central ID write per row.** Native range and hi/lo allocation provide
+  collision-free generated IDs across shards and processes.
+- **Safe cross-shard pruning.** Global uniqueness is authoritative; asynchronous
+  indexes use verification, watermarks, Bloom filters, and min/max summaries so
+  an optimization cannot silently hide a row.
+- **One engine everywhere.** PostgreSQL, HTTP, Rust, and Python share routing,
+  limits, cancellation, errors, and storage behavior.
+- **Operations are visible.** `/health`, `/metrics`, admin JSON, and Rust status
+  reports expose lag, repairs, rebuilds, contention, and outbox pressure.
 
 ## One engine, many ways in
 
@@ -145,15 +135,50 @@ experimental and opt-in; the exact contract lives in
 | Native Python extension | Sync/async API working; tagged releases build audited macOS/Linux ARM/x86 wheels |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
 
+## Where BriskDB fits
+
+These projects solve different problems. This table is a compass, not a
+benchmark scoreboard.
+
+| Project | Built for | Write model | Access | Storage shape |
+| --- | --- | --- | --- | --- |
+| **BriskDB** | Same-host sharding, service + embedding | Parallel across independent shard WALs | PostgreSQL, HTTP, Rust, Python | Manifest + ordinary SQLite shard files |
+| [SQLite](https://sqlite.org/wal.html) | Small, embedded, single-file databases | One writer per WAL file | SQLite API and ecosystem | One ordinary SQLite file |
+| [rqlite](https://rqlite.io/docs/features/) | Simple multi-node availability | Writes flow through a Raft log; optimized for HA, not write scaling | HTTP + client libraries | Replicated SQLite state across nodes |
+| [Turso / libSQL](https://docs.turso.tech/sdk/introduction) | Cloud/edge access and local-first sync | Product-dependent primary or local push/pull model | SDKs + HTTP | Turso Database or legacy SQLite-compatible libSQL |
+| [Citus](https://www.postgresql.org/about/news/citus-120-released-2687/) | Mature distributed PostgreSQL | Parallel across PostgreSQL worker shards | PostgreSQL | PostgreSQL coordinator + worker cluster |
+
+Choose BriskDB when you want one local service or embedded engine to spread
+write contention across inspectable SQLite files while speaking familiar
+database protocols. Choose the others when a single SQLite file, replicated
+high availability, managed edge sync, or a mature multi-node PostgreSQL cluster
+is the real requirement.
+
 ## Try it in 30 seconds
 
-BriskDB requires Rust 1.85 or newer:
+Install the published native wheel—no clone and no Rust compiler:
 
 ```bash
-cargo run --release -- --data-dir ./briskdb-data --shards 4
+python -m pip install --only-binary=:all: briskdb
+curl -fsSLO https://raw.githubusercontent.com/schapman1974/briskdb/main/examples/launch_demo.py
+python launch_demo.py
 ```
 
-Then open the [data browser](http://127.0.0.1:7654/admin) or check the server:
+The demo makes 32 routed writes from four Python threads, proves that all four
+ordinary SQLite shard files received rows, reads every row back, checks HTTP
+health, and starts the PostgreSQL listener. It uses a temporary directory and
+cleans up after itself. The GIF renderer executes this exact scenario, and CI
+tests it against every published wheel target.
+
+To run the standalone service, download the matching macOS/Linux ARM64 or
+x86-64 archive from the [latest GitHub release](https://github.com/schapman1974/briskdb/releases),
+then:
+
+```bash
+./briskdb --data-dir ./briskdb-data --shards 4
+```
+
+Open the [data browser](http://127.0.0.1:7654/admin) or inspect the service:
 
 ```bash
 curl http://127.0.0.1:7654/health
@@ -164,7 +189,7 @@ Enable the PostgreSQL listener explicitly. Simple and parameterized
 text/binary prepared queries share the same bounded engine path:
 
 ```bash
-cargo run --release -- --postgres-listen 127.0.0.1:5433
+./briskdb --data-dir ./briskdb-data --postgres-listen 127.0.0.1:5433
 psql -h 127.0.0.1 -p 5433 -d default
 ```
 
@@ -181,9 +206,8 @@ curl -X POST http://127.0.0.1:7654/v1/query \
 ```
 
 Have an existing SQLite database? Use the offline
-[SQLite importer](docs/SQLITE_IMPORT.md). Prefer binaries? Download the latest
-[GitHub release](https://github.com/schapman1974/briskdb/releases), including
-macOS/Linux ARM64 and x86-64 archives plus Linux `.deb` packages.
+[SQLite importer](docs/SQLITE_IMPORT.md). Linux releases also include `.deb`
+packages with a hardened systemd service.
 
 Embedding in Rust starts with `BriskDb::open()` or the validated builder. The
 [embedded Rust guide](docs/EMBEDDED_RUST.md) includes a complete listener-free
@@ -192,13 +216,9 @@ the manifest and reject explicit mismatches. Use `default-features = false` with
 `embedded` feature to leave the network and CLI stacks out; see the
 [crate feature map](docs/CRATE_FEATURES.md).
 
-Python can run the same engine directly in-process. It starts no listener by
+Python runs the same engine directly in-process. It starts no listener by
 default, but `Database.serve()` can attach HTTP/PostgreSQL listeners (remote
 PostgreSQL requires its TLS/SCRAM arguments):
-
-```bash
-python -m pip install ./python
-```
 
 ```python
 with briskdb.open("./data", shards=4) as db:
@@ -245,6 +265,21 @@ and integrity metadata. Application rows stay in ordinary SQLite files.
 
 Follow the [roadmap](ROADMAP.md) or browse the
 [open issues](https://github.com/schapman1974/briskdb/issues).
+
+## Follow the build
+
+Star BriskDB if you want to follow any of these bets:
+
+- a native MongoDB wire protocol with large-app TinyMongo parity;
+- MySQL compatibility over the same protocol-neutral Rust engine;
+- serverless snapshots and object-store-backed lifecycle;
+- more storage backends without giving up the ordinary SQLite option; or
+- honest benchmark and failure evidence as the alpha becomes a real release.
+
+If you try it, an issue with your client, workload, or missing SQL shape is even
+more valuable than a star. Start with the
+[alpha releases](https://github.com/schapman1974/briskdb/releases), then tell us
+[what broke or what surprised you](https://github.com/schapman1974/briskdb/issues/new/choose).
 
 ## Honest alpha boundaries
 
