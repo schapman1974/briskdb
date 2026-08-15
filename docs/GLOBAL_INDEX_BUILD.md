@@ -104,5 +104,6 @@ predicates instead of publishing an index that cannot be reproduced.
 [Global-index recovery](GLOBAL_INDEX_RECOVERY.md) adds full or sampled
 validation, bounded machine-readable findings, targeted non-unique repair, and
 resumable replacement builds. Unique authority is never repaired by inference;
-it must be rebuilt. All construction and recovery remain offline. Write
-maintenance and query routing are later rollout stages.
+it must be rebuilt. All construction and recovery remain offline. Ready unique
+indexes receive synchronous single-shard SQL write maintenance; indexed query
+routing remains a later rollout stage.

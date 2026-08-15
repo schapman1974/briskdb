@@ -1164,7 +1164,13 @@ fn _briskdb(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::python_distribution_version;
+    use briskdb::core::{
+        Database as CoreDatabase, GlobalIndexDeclaration, GlobalIndexKeyPart, GlobalIndexKeySource,
+        GlobalIndexKeyType, GlobalIndexStorageTopology, ShardKeyMetadata, ShardKeyType,
+        TableDeclaration, UniqueNullSemantics,
+    };
+
+    use super::{Config, Database, error::UniqueViolationError, python_distribution_version};
 
     #[test]
     fn cargo_prereleases_match_python_distribution_versions() {
@@ -1172,5 +1178,88 @@ mod tests {
         assert_eq!(python_distribution_version("1.2.3-alpha.4"), "1.2.3a4");
         assert_eq!(python_distribution_version("1.2.3-beta.5"), "1.2.3b5");
         assert_eq!(python_distribution_version("1.2.3-rc.6"), "1.2.3rc6");
+    }
+
+    #[test]
+    fn python_session_writes_use_global_unique_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let mut core = CoreDatabase::open(root.path(), 2).unwrap();
+        core.broadcast(
+            "CREATE TABLE accounts (
+                tenant_id TEXT PRIMARY KEY NOT NULL,
+                email TEXT NOT NULL
+             )",
+        )
+        .unwrap();
+        let logical = core.catalog().default_database().id();
+        core.register_tables(vec![
+            TableDeclaration::sharded(
+                logical,
+                "accounts",
+                ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let table_id = core
+            .catalog()
+            .table("default", "accounts")
+            .unwrap()
+            .unwrap()
+            .id();
+        let declaration = GlobalIndexDeclaration::new(
+            table_id,
+            "accounts_email_unique",
+            vec![GlobalIndexKeyPart::new(
+                GlobalIndexKeySource::column("email").unwrap(),
+                GlobalIndexKeyType::Text,
+            )],
+        )
+        .unwrap()
+        .unique(UniqueNullSemantics::Distinct)
+        .with_topology(GlobalIndexStorageTopology::selected_v1());
+        let index_id = core.create_global_index(declaration).unwrap();
+        core.build_global_index(index_id).unwrap();
+        drop(core);
+
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let database = Database::create(py, root.path().to_path_buf(), Config::default())
+                .expect("open Python database wrapper");
+            let first = database
+                .session(py, Some("python-index-a".to_owned()))
+                .unwrap();
+            first
+                .execute(
+                    py,
+                    "INSERT INTO accounts (tenant_id, email) VALUES ('python-index-a', 'python-global@example.test')"
+                        .to_owned(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            first.close(py).unwrap();
+
+            let duplicate = database
+                .session(py, Some("python-index-b".to_owned()))
+                .unwrap();
+            let error = duplicate
+                .execute(
+                    py,
+                    "INSERT INTO accounts (tenant_id, email) VALUES ('python-index-b', 'python-global@example.test')"
+                        .to_owned(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap_err();
+            assert!(error.is_instance_of::<UniqueViolationError>(py));
+            duplicate.close(py).unwrap();
+            database.close(py).unwrap();
+        });
+
+        let mut core = CoreDatabase::open(root.path(), 2).unwrap();
+        assert!(core.validate_global_index(index_id).unwrap().is_valid());
     }
 }

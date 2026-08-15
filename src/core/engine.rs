@@ -553,6 +553,21 @@ impl Engine {
     }
 
     #[cfg(feature = "experimental-vtab")]
+    fn table_requires_global_unique_maintenance(&self, table: Option<super::TableId>) -> bool {
+        let Some(table) = table else {
+            return false;
+        };
+        self.catalog().global_indexes().iter().any(|index| {
+            index.table_id() == table
+                && index.is_unique()
+                && matches!(
+                    index.lifecycle(),
+                    super::GlobalIndexLifecycle::Ready | super::GlobalIndexLifecycle::Invalid
+                )
+        })
+    }
+
+    #[cfg(feature = "experimental-vtab")]
     fn generated_write_target_for_table(
         &self,
         table: super::TableId,
@@ -1272,6 +1287,12 @@ impl Engine {
                 return operation.finish(Err(error));
             }
         };
+        #[cfg(feature = "experimental-vtab")]
+        let global_unique_maintenance = matches!(
+            template.description().behavior(),
+            sql::StatementBehavior::Write(_)
+        ) && self
+            .table_requires_global_unique_maintenance(plan.inference().table_id());
         let sqlite_sql = template.translated().sqlite_sql().to_owned();
         let owner = ConnectionOwner::new(session.id().get());
         if guard.state() == super::SessionState::InTransaction && plan.generated_insert().is_some()
@@ -1331,6 +1352,31 @@ impl Engine {
         };
         let behavior = plan.behavior();
         let result_limits = operation.result_limits;
+        #[cfg(feature = "experimental-vtab")]
+        if global_unique_maintenance {
+            if guard.state() == super::SessionState::InTransaction {
+                let mut guard = guard;
+                guard.fail_transaction();
+                return operation.finish(Err(indexed_explicit_transaction_unsupported()));
+            }
+            let result = self
+                .run_coordinator_write(
+                    &mut operation,
+                    shard,
+                    owner,
+                    schema_operation,
+                    guard,
+                    sqlite_sql,
+                    portal_snapshot.parameters().to_vec(),
+                    None,
+                )
+                .await
+                .map(|routed| Routed {
+                    shard: routed.shard,
+                    value: PreparedExecution::AffectedRows(routed.value.rows_affected),
+                });
+            return operation.finish_started(result);
+        }
         if guard.state() == super::SessionState::InTransaction {
             let result = self
                 .run_transaction_statement(
@@ -1458,6 +1504,12 @@ impl Engine {
                 return operation.finish(Err(error));
             }
         };
+        #[cfg(feature = "experimental-vtab")]
+        let global_unique_maintenance = matches!(
+            template.description().behavior(),
+            sql::StatementBehavior::Write(_)
+        ) && self
+            .table_requires_global_unique_maintenance(plan.inference().table_id());
         let sqlite_sql = template.translated().sqlite_sql().to_owned();
         let owner = ConnectionOwner::new(session.id().get());
         if guard.state() == super::SessionState::InTransaction && plan.generated_insert().is_some()
@@ -1517,6 +1569,38 @@ impl Engine {
         };
         let behavior = plan.behavior();
         let result_limits = operation.result_limits;
+        #[cfg(feature = "experimental-vtab")]
+        if global_unique_maintenance {
+            if guard.state() == super::SessionState::InTransaction {
+                let mut guard = guard;
+                guard.fail_transaction();
+                return operation.finish(Err(indexed_explicit_transaction_unsupported()));
+            }
+            if shards.len() != 1 {
+                return operation.finish(Err(EngineError::new(
+                    EngineErrorKind::Unsupported,
+                    "authoritative global-index writes require one planned physical shard",
+                )));
+            }
+            let shard = shards[0];
+            let result = self
+                .run_coordinator_write(
+                    &mut operation,
+                    shard,
+                    owner,
+                    schema_operation,
+                    guard,
+                    sqlite_sql,
+                    portal_snapshot.parameters().to_vec(),
+                    None,
+                )
+                .await
+                .map(|routed| Executed {
+                    shards: vec![routed.shard],
+                    value: PreparedExecution::AffectedRows(routed.value.rows_affected),
+                });
+            return operation.finish_started(result);
+        }
         if guard.state() == super::SessionState::InTransaction {
             if shards.len() != 1 {
                 let mut guard = guard;
@@ -2177,6 +2261,10 @@ impl Engine {
             Err(error) => return operation.finish(Err(error)),
         };
         let catalog_authoritative = plan.is_some();
+        #[cfg(feature = "experimental-vtab")]
+        let global_unique_maintenance = plan
+            .as_ref()
+            .is_some_and(|plan| self.table_requires_global_unique_maintenance(plan.table_id));
         let owner = match (owner_policy, plan.is_some()) {
             (ExecuteOwnerPolicy::ReuseValidatedCatalogWrite, true) => {
                 ConnectionOwner::stateless_catalog_write()
@@ -2242,7 +2330,9 @@ impl Engine {
         };
 
         #[cfg(feature = "experimental-vtab")]
-        if catalog_authoritative && self.inner.options.experimental_vtab_writes() {
+        if catalog_authoritative
+            && (self.inner.options.experimental_vtab_writes() || global_unique_maintenance)
+        {
             let value = self
                 .run_coordinator_write(
                     &mut operation,
@@ -3914,6 +4004,14 @@ fn explicit_generated_write_unsupported() -> EngineError {
     EngineError::new(
         EngineErrorKind::Unsupported,
         "generated-key writes are not supported inside an explicit transaction",
+    )
+}
+
+#[cfg(feature = "experimental-vtab")]
+fn indexed_explicit_transaction_unsupported() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::Unsupported,
+        "explicit transactions on a table with an authoritative global unique index are not yet supported",
     )
 }
 

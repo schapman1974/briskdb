@@ -131,6 +131,7 @@ jobs:
           rust-toolchain: 1.85.0
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
+          before-script-linux: dnf install --assumeyes clang-devel
           args: >-
             --release
             --locked

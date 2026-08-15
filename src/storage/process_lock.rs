@@ -1,6 +1,7 @@
 //! Local-filesystem advisory locks shared by independent BriskDB processes.
 
 use std::{
+    fmt::Write,
     fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
@@ -9,12 +10,13 @@ use std::{
 };
 
 use crate::{
-    core::{EngineError, EngineErrorKind, EngineResult},
+    core::{EngineError, EngineErrorKind, EngineResult, GlobalOperationId},
     sqlite_error,
 };
 
 pub(super) const PROCESS_LEASE_FILE_NAME: &str = ".briskdb-process.lock";
 pub(super) const STARTUP_LOCK_FILE_NAME: &str = ".briskdb-startup.lock";
+const GLOBAL_WRITE_LOCK_PREFIX: &str = ".briskdb-global-write-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaseMode {
@@ -162,6 +164,70 @@ pub(super) struct RootStartupGuard {
     _file: File,
 }
 
+/// One exact cross-process lease for an integrated global-index write.
+///
+/// The file intentionally remains after the lock is released. Its presence
+/// durably distinguishes coordinator-owned operations from callers using the
+/// lower-level public reservation API, while `flock` distinguishes a live
+/// writer from an orphan left by process termination.
+#[derive(Debug)]
+pub(super) struct GlobalWriteOperationLease {
+    _file: File,
+}
+
+impl GlobalWriteOperationLease {
+    pub(super) fn acquire(root: &Path, operation_id: GlobalOperationId) -> EngineResult<Self> {
+        let path = global_write_lock_path(root, operation_id);
+        let file = open_regular_lock_file(&path)?;
+        lock_nonblocking(&file, LockRequest::Exclusive).map_err(|error| {
+            map_lock_error(
+                error,
+                &path,
+                "another process owns this global-index write operation",
+            )
+        })?;
+        Ok(Self { _file: file })
+    }
+
+    /// Acquire an existing coordinator marker only when its writer is gone.
+    pub(super) fn try_acquire_orphan(
+        root: &Path,
+        operation_id: GlobalOperationId,
+    ) -> EngineResult<Option<Self>> {
+        let path = global_write_lock_path(root, operation_id);
+        let file = match open_existing_regular_lock_file(&path)? {
+            Some(file) => file,
+            None => return Ok(None),
+        };
+        match lock_nonblocking(&file, LockRequest::Exclusive) {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(map_lock_error(
+                error,
+                &path,
+                "another process owns this global-index write operation",
+            )),
+        }
+    }
+}
+
+fn global_write_lock_path(root: &Path, operation_id: GlobalOperationId) -> PathBuf {
+    let mut name = String::with_capacity(GLOBAL_WRITE_LOCK_PREFIX.len() + 32 + 5);
+    name.push_str(GLOBAL_WRITE_LOCK_PREFIX);
+    for byte in operation_id.as_bytes() {
+        write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    name.push_str(".lock");
+    root.join(name)
+}
+
+pub(super) fn remove_global_write_marker(root: &Path, operation_id: GlobalOperationId) {
+    let path = global_write_lock_path(root, operation_id);
+    // A stale marker is harmless once the durable operation is no longer
+    // active; recovery filters by operation state first.
+    let _ = std::fs::remove_file(path);
+}
+
 impl RootStartupGuard {
     #[allow(dead_code)]
     pub(super) fn acquire(root: &Path, timeout: Duration) -> EngineResult<Self> {
@@ -223,6 +289,42 @@ fn open_regular_lock_file(path: &Path) -> EngineResult<File> {
     Ok(file)
 }
 
+fn open_existing_regular_lock_file(path: &Path) -> EngineResult<Option<File>> {
+    let file = match open_existing_lock_file(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(EngineError::from_source(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "BriskDB lock {} must not be a symbolic link",
+                    path.display()
+                ),
+                error,
+            ));
+        }
+        Err(error) => {
+            return Err(sqlite_error::storage_io(
+                error,
+                format!("failed to open BriskDB lock {}", path.display()),
+            ));
+        }
+    };
+    let metadata = file.metadata().map_err(|error| {
+        sqlite_error::storage_io(
+            error,
+            format!("failed to inspect BriskDB lock {}", path.display()),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!("BriskDB lock {} is not a regular file", path.display()),
+        ));
+    }
+    Ok(Some(file))
+}
+
 #[cfg(unix)]
 fn open_lock_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -237,11 +339,30 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+#[cfg(unix)]
+fn open_existing_lock_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
 #[cfg(not(unix))]
 fn open_lock_file(_path: &Path) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "cross-process BriskDB root leases require a supported Unix host",
+    ))
+}
+
+#[cfg(not(unix))]
+fn open_existing_lock_file(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cross-process BriskDB operation leases require a supported Unix host",
     ))
 }
 

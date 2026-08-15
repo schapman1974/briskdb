@@ -102,6 +102,7 @@ pub(crate) enum RawDataOperation {
 #[derive(Debug)]
 pub(crate) struct RawDataPlan {
     pub(crate) target: RawDataTarget,
+    pub(crate) table_id: Option<TableId>,
     pub(crate) sqlite_sql: String,
 }
 
@@ -582,6 +583,7 @@ impl Database {
         let target = raw_data_execution_target(&plan, catalog, operation)?;
         Ok(Some(RawDataPlan {
             target,
+            table_id: plan.inference().table_id(),
             sqlite_sql: translated.sqlite_sql().to_owned(),
         }))
     }

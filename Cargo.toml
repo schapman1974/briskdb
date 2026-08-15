@@ -20,7 +20,7 @@ categories = ["database-implementations"]
 default = ["server-cli", "sqlite-import-cli"]
 # Host-controlled Rust API with no networking by default. SQL execution,
 # routing, and the bundled SQLite storage engine are the embedded surface.
-embedded = []
+embedded = ["experimental-vtab"]
 # Network adapters can be selected independently by downstream applications.
 http = [
     "dep:axum",
@@ -98,7 +98,7 @@ libc = "0.2"
 # pulling in the dependency's defaults.
 pgwire = { version = "=0.36.3", default-features = false, features = ["server-api"], optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
-rusqlite = { version = "0.39.0", features = ["bundled", "column_decltype", "column_metadata", "hooks", "limits"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "column_decltype", "column_metadata", "hooks", "limits", "preupdate_hook"] }
 same-file = "1.0"
 serde = { version = "1.0.229", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }

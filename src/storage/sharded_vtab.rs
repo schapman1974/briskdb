@@ -36,8 +36,8 @@ use crate::{
     },
     core::{
         AllocationOwnerMap, CanonicalShardKeyRef, EngineError, EngineErrorKind, EngineResult,
-        GeneratedIdPolicy, OperationControl, ShardKeyType, TableMetadata, TablePlacement,
-        canonical_shard_key_bytes,
+        GeneratedIdPolicy, GlobalIndexKeySource, GlobalIndexLifecycle, GlobalIndexMetadata,
+        OperationControl, ShardKeyType, TableMetadata, TablePlacement, canonical_shard_key_bytes,
     },
     sqlite_error,
 };
@@ -313,6 +313,7 @@ impl CoordinatorCancellation {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.epoch.fetch_add(1, Ordering::AcqRel);
         if let Some(write_state) = &self.write_state {
+            write_state.cancel_authority();
             write_state.interrupt_child();
         }
         self.interrupt.interrupt();
@@ -772,6 +773,7 @@ impl Registry {
             let spec = TableSpec::from_physical_table(
                 shard,
                 table,
+                storage.logical_catalog().global_indexes(),
                 storage.generated_id_policy_is_active(table.id()),
                 allocation_owners.cloned(),
                 targets.into_boxed_slice(),
@@ -783,6 +785,10 @@ impl Registry {
 
     fn table(&self, id: u64) -> Option<Arc<TableSpec>> {
         self.tables.get(&id).cloned()
+    }
+
+    fn table_named(&self, name: &str) -> Option<&Arc<TableSpec>> {
+        self.tables.values().find(|spec| spec.name == name)
     }
 
     fn write_state(&self) -> &Arc<write::WriteState> {
@@ -1264,6 +1270,7 @@ struct TableSpec {
     locator_point_select_sql: Option<String>,
     columns: Box<[PhysicalColumnSpec]>,
     locator: Option<PhysicalLocatorSpec>,
+    global_unique_indexes: Box<[GlobalUniqueIndexSpec]>,
     write_unsupported: Option<String>,
     column_count: usize,
     targets: Box<[u16]>,
@@ -1277,34 +1284,47 @@ struct TableSpec {
 #[derive(Debug, Clone)]
 struct PhysicalColumnSpec {
     name: String,
+    affinity: SqliteAffinity,
+    collation: String,
     generated: bool,
 }
 
 #[derive(Debug, Clone)]
+struct GlobalUniqueIndexSpec {
+    metadata: GlobalIndexMetadata,
+    evaluation_sql: String,
+}
+
+#[derive(Debug, Clone)]
 enum PhysicalLocatorSpec {
-    Rowid { expression: String },
-    PrimaryKey { columns: Box<[String]> },
+    Rowid {
+        expression: String,
+    },
+    PrimaryKey {
+        columns: Box<[String]>,
+        column_indices: Box<[usize]>,
+    },
 }
 
 impl PhysicalLocatorSpec {
     fn expressions(&self) -> Box<[String]> {
         match self {
             Self::Rowid { expression } => vec![expression.clone()].into_boxed_slice(),
-            Self::PrimaryKey { columns } => columns.clone(),
+            Self::PrimaryKey { columns, .. } => columns.clone(),
         }
     }
 
     fn value_count(&self) -> usize {
         match self {
             Self::Rowid { .. } => 1,
-            Self::PrimaryKey { columns } => columns.len(),
+            Self::PrimaryKey { columns, .. } => columns.len(),
         }
     }
 
     fn predicate_sql(&self) -> String {
         match self {
             Self::Rowid { expression } => format!("{expression} = ?"),
-            Self::PrimaryKey { columns } => columns
+            Self::PrimaryKey { columns, .. } => columns
                 .iter()
                 .map(|column| format!("{} IS ?", quote_identifier(column)))
                 .collect::<Vec<_>>()
@@ -1323,6 +1343,7 @@ impl TableSpec {
     fn from_physical_table(
         connection: &Connection,
         table: &TableMetadata,
+        global_indexes: &[GlobalIndexMetadata],
         generated_id_policy_active: bool,
         allocation_owners: Option<Arc<AllocationOwnerMap>>,
         targets: Box<[u16]>,
@@ -1372,7 +1393,7 @@ impl TableSpec {
             ));
         }
 
-        let declared_columns = columns
+        let physical_columns = columns
             .iter()
             .map(|(column, declared_type, not_null, default_sql, _, _)| {
                 let (_, collation, _, _, _) = connection
@@ -1416,9 +1437,21 @@ impl TableSpec {
                     declaration.push_str(default_sql);
                     declaration.push(')');
                 }
-                Ok(declaration)
+                Ok((
+                    PhysicalColumnSpec {
+                        name: column.clone(),
+                        affinity,
+                        collation: collation.to_owned(),
+                        generated: false,
+                    },
+                    declaration,
+                ))
             })
             .collect::<EngineResult<Vec<_>>>()?;
+        let declared_columns = physical_columns
+            .iter()
+            .map(|(_, declaration)| declaration.as_str())
+            .collect::<Vec<_>>();
         let read_declared_schema = format!("CREATE TABLE x({})", declared_columns.join(", "));
         let write_declared_schema = format!(
             "CREATE TABLE x({}, {} BLOB HIDDEN PRIMARY KEY NOT NULL) WITHOUT ROWID",
@@ -1476,11 +1509,12 @@ impl TableSpec {
             _ => None,
         };
 
-        let physical_columns = columns
-            .iter()
-            .map(|(column, _, _, _, _, hidden)| PhysicalColumnSpec {
-                name: column.clone(),
-                generated: matches!(*hidden, 2 | 3),
+        let physical_columns = physical_columns
+            .into_iter()
+            .zip(columns.iter())
+            .map(|((mut column, _), (_, _, _, _, _, hidden))| {
+                column.generated = matches!(*hidden, 2 | 3);
+                column
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -1492,12 +1526,24 @@ impl TableSpec {
                 .map(|(column, _, _, _, primary_key, _)| (*primary_key, column.clone()))
                 .collect::<Vec<_>>();
             primary_key.sort_unstable_by_key(|(position, _)| *position);
-            (!primary_key.is_empty()).then(|| PhysicalLocatorSpec::PrimaryKey {
-                columns: primary_key
+            (!primary_key.is_empty()).then(|| {
+                let primary_key = primary_key
                     .into_iter()
                     .map(|(_, column)| column)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
+                    .collect::<Vec<_>>();
+                let column_indices = primary_key
+                    .iter()
+                    .map(|primary| {
+                        physical_columns
+                            .iter()
+                            .position(|column| column.name == *primary)
+                            .expect("primary-key column was discovered from this schema")
+                    })
+                    .collect::<Vec<_>>();
+                PhysicalLocatorSpec::PrimaryKey {
+                    columns: primary_key.into_boxed_slice(),
+                    column_indices: column_indices.into_boxed_slice(),
+                }
             })
         } else {
             let physical_names = columns
@@ -1520,9 +1566,31 @@ impl TableSpec {
             Some(format!(
                 "registered table {name} is not Sharded; the writable facade does not mutate replicated or catalog placement"
             ))
+        } else if global_indexes.iter().any(|index| {
+            index.table_id() == table.id()
+                && index.is_unique()
+                && index.lifecycle() == GlobalIndexLifecycle::Invalid
+        }) {
+            Some(format!(
+                "registered table {name} has an invalid authoritative global index; rebuild it before writing"
+            ))
         } else {
             shard::writable_table_unsupported_reason(connection, name)?
         };
+
+        let global_unique_indexes = global_indexes
+            .iter()
+            .filter(|index| {
+                index.table_id() == table.id()
+                    && index.is_unique()
+                    && index.lifecycle() == GlobalIndexLifecycle::Ready
+            })
+            .map(|metadata| GlobalUniqueIndexSpec {
+                evaluation_sql: global_unique_evaluation_sql(metadata, &physical_columns),
+                metadata: metadata.clone(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
         let (locator_select_sql, locator_point_select_sql) = locator
             .as_ref()
@@ -1558,6 +1626,7 @@ impl TableSpec {
             locator_point_select_sql,
             columns: physical_columns,
             locator,
+            global_unique_indexes,
             write_unsupported,
             column_count: columns.len(),
             targets,
@@ -1933,6 +2002,46 @@ const fn affinity_name(affinity: SqliteAffinity) -> &'static str {
         SqliteAffinity::Real => "REAL",
         SqliteAffinity::Numeric => "NUMERIC",
     }
+}
+
+fn global_unique_evaluation_sql(
+    index: &GlobalIndexMetadata,
+    columns: &[PhysicalColumnSpec],
+) -> String {
+    let input = columns
+        .iter()
+        .enumerate()
+        .map(|(ordinal, column)| {
+            let parameter = ordinal + 1;
+            let value = if column.affinity == SqliteAffinity::Blob {
+                format!("?{parameter}")
+            } else {
+                format!("CAST(?{parameter} AS {})", affinity_name(column.affinity))
+            };
+            format!(
+                "({value} COLLATE {}) AS {}",
+                quote_identifier(&column.collation),
+                quote_identifier(&column.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let keys = index
+        .key_parts()
+        .iter()
+        .map(|part| match part.source() {
+            GlobalIndexKeySource::Column(column) => quote_identifier(column),
+            GlobalIndexKeySource::Expression(expression) => format!("({expression})"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!("SELECT {keys} FROM (SELECT {input})");
+    if let Some(predicate) = index.predicate() {
+        sql.push_str(" WHERE (");
+        sql.push_str(predicate);
+        sql.push(')');
+    }
+    sql
 }
 
 #[derive(Default)]
@@ -2503,7 +2612,7 @@ impl Drop for BriskShardCursor {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum RawCell {
     Null,
     Integer(i64),
@@ -2532,6 +2641,16 @@ impl RawCell {
             }
         }
     }
+
+    fn as_value_ref(&self) -> ValueRef<'_> {
+        match self {
+            Self::Null => ValueRef::Null,
+            Self::Integer(value) => ValueRef::Integer(*value),
+            Self::Real(value) => ValueRef::Real(*value),
+            Self::Text(value) => ValueRef::Text(value),
+            Self::Blob(value) => ValueRef::Blob(value),
+        }
+    }
 }
 
 fn copy_bytes(bytes: &[u8]) -> EngineResult<Vec<u8>> {
@@ -2552,13 +2671,7 @@ fn allocation_error(error: std::collections::TryReserveError) -> EngineError {
 
 impl ToSql for RawCell {
     fn to_sql(&self) -> SqliteResult<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Borrowed(match self {
-            Self::Null => ValueRef::Null,
-            Self::Integer(value) => ValueRef::Integer(*value),
-            Self::Real(value) => ValueRef::Real(*value),
-            Self::Text(value) => ValueRef::Text(value),
-            Self::Blob(value) => ValueRef::Blob(value),
-        }))
+        Ok(ToSqlOutput::Borrowed(self.as_value_ref()))
     }
 }
 
@@ -2584,6 +2697,9 @@ fn vtab_error(error: EngineError) -> SqliteError {
             Some(ffi::SQLITE_INTERRUPT)
         }
         EngineErrorKind::LimitExceeded => Some(ffi::SQLITE_TOOBIG),
+        EngineErrorKind::Unsupported if write::is_global_index_write_unsupported(&error) => {
+            Some(ffi::SQLITE_NOLFS)
+        }
         EngineErrorKind::ShuttingDown => Some(ffi::SQLITE_ABORT),
         EngineErrorKind::StorageFull => Some(ffi::SQLITE_FULL),
         EngineErrorKind::OutOfMemory => Some(ffi::SQLITE_NOMEM),
@@ -6695,7 +6811,12 @@ mod tests {
         gate.release();
 
         let (mut coordinator, result) = worker.join().unwrap();
-        assert_eq!(result.unwrap_err().kind(), EngineErrorKind::Cancelled);
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.kind(),
+            EngineErrorKind::Cancelled,
+            "unexpected cancellation error: {error}"
+        );
         assert_eq!(fixture.row_count(), 0);
 
         let after = coordinator
