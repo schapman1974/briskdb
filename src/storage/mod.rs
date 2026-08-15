@@ -529,6 +529,12 @@ pub(crate) struct Storage {
     schema_coordination: Arc<RootSchemaCoordination>,
 }
 
+#[derive(Debug)]
+pub(crate) struct GlobalWriteReservationGuard {
+    operation_id: GlobalOperationId,
+    _lease: process_lock::GlobalWriteOperationLease,
+}
+
 impl Storage {
     pub(crate) fn open(root: impl AsRef<Path>, requested_shards: u16) -> EngineResult<Self> {
         validate_shard_count(requested_shards)?;
@@ -1574,6 +1580,109 @@ impl Storage {
                 self.shard_count(),
                 cancellation,
             )
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    /// Reserve one coordinator-owned unique mutation while holding an exact
+    /// process-liveness lease used by crash recovery.
+    pub(crate) fn reserve_global_unique_write(
+        &self,
+        mutation: &GlobalUniqueMutation,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalWriteReservationGuard> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::StorageUnavailable,
+                "could not generate a global-index write operation ID",
+                error,
+            )
+        })?;
+        if bytes == [0; 16] {
+            bytes[0] = 1;
+        }
+        let operation_id = GlobalOperationId::new(bytes)?;
+        let lease = process_lock::GlobalWriteOperationLease::acquire(&self.root, operation_id)?;
+        if let Err(error) = self.reserve_global_unique(operation_id, mutation, cancellation) {
+            process_lock::remove_global_write_marker(&self.root, operation_id);
+            return Err(error);
+        }
+        Ok(GlobalWriteReservationGuard {
+            operation_id,
+            _lease: lease,
+        })
+    }
+
+    pub(crate) fn finalize_global_unique_write(
+        &self,
+        reservation: &GlobalWriteReservationGuard,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalUniqueReservation> {
+        let result =
+            global_index::finalize_unique_write(self, reservation.operation_id, cancellation);
+        if result.is_ok() {
+            process_lock::remove_global_write_marker(&self.root, reservation.operation_id);
+        }
+        self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn rollback_global_unique_write(
+        &self,
+        reservation: &GlobalWriteReservationGuard,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalUniqueReservation> {
+        let result = self.rollback_global_unique(reservation.operation_id, cancellation);
+        if result.is_ok() {
+            process_lock::remove_global_write_marker(&self.root, reservation.operation_id);
+        }
+        result
+    }
+
+    pub(crate) fn refresh_global_unique_write_indexes(
+        &self,
+        index_ids: &[GlobalIndexId],
+        shard: u16,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<()> {
+        let result =
+            global_index::refresh_unique_write_indexes(self, index_ids, shard, cancellation);
+        self.fail_closed_on_corruption(result)
+    }
+
+    /// Recover only coordinator-owned active reservations whose OS lease is
+    /// no longer held by a live writer.
+    pub(crate) fn recover_global_unique_writes(
+        &self,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<usize> {
+        let result = (|| {
+            let mut recovered = 0_usize;
+            for (operation_id, mutation) in global_index::active_unique_mutations(&self.root)? {
+                let Some(_lease) = process_lock::GlobalWriteOperationLease::try_acquire_orphan(
+                    &self.root,
+                    operation_id,
+                )?
+                else {
+                    continue;
+                };
+                match global_index::decide_orphaned_unique_write(self, &mutation, cancellation)? {
+                    global_index::OrphanedUniqueWriteDecision::Finalize => {
+                        global_index::finalize_unique_write(self, operation_id, cancellation)?;
+                    }
+                    global_index::OrphanedUniqueWriteDecision::RollBack => {
+                        global_index::rollback_unique(&self.root, operation_id, cancellation)?;
+                    }
+                }
+                process_lock::remove_global_write_marker(&self.root, operation_id);
+                recovered = recovered.checked_add(1).ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::LimitExceeded,
+                        "global-index recovered operation count overflowed",
+                    )
+                })?;
+            }
+            Ok(recovered)
         })();
         self.fail_closed_on_corruption(result)
     }
@@ -6415,7 +6524,7 @@ mod tests {
         let Ok(root) = std::env::var("BRISKDB_TABLE_REGISTRATION_ABORT_ROOT") else {
             return;
         };
-        let mut database = Database::open(root, 2).unwrap();
+        let mut database = Database::open(&root, 2).unwrap();
         create_registered_table_schema(&database);
         let declarations = registered_table_declarations(&database);
         let result = database.register_tables(declarations);
@@ -6478,7 +6587,7 @@ mod tests {
             return;
         };
         let mode = std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_MODE").unwrap();
-        let mut database = Database::open(root, 2).unwrap();
+        let mut database = Database::open(&root, 2).unwrap();
         let result = match mode.as_str() {
             "create" => {
                 let declaration = global_index_test_declaration(&database);
@@ -6558,6 +6667,71 @@ mod tests {
             "authority-rollback" => {
                 let (_, operation, _) = authority_crash_request();
                 database.rollback_global_unique(operation).map(|_| ())
+            }
+            "authority-write-finalize" => {
+                let id = GlobalIndexId::new(
+                    std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_ID")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+                .unwrap();
+                let shard = database.shard_for_key(&crate::core::canonical_shard_key_bytes(
+                    crate::core::CanonicalShardKeyRef::Text("crash-writer"),
+                ));
+                let locator =
+                    global_index::encode_locator(&[rusqlite::types::ValueRef::Integer(1)]).unwrap();
+                let mutation = crate::core::GlobalUniqueMutation::claim(
+                    id,
+                    crate::core::CanonicalIndexKey::encode_values(&[crate::core::Value::from(
+                        vec![1_u8, 2, 3],
+                    )])
+                    .unwrap(),
+                    crate::core::GlobalIndexOwner::new(shard, locator).unwrap(),
+                );
+                let cancellation = crate::core::CancellationToken::new();
+                let storage = Storage::open(&root, 2).unwrap();
+                let reservation = storage
+                    .reserve_global_unique_write(&mutation, &cancellation)
+                    .unwrap();
+                database
+                    .execute(
+                        "crash-writer",
+                        "INSERT INTO events (id, tenant_id, payload) VALUES (1, ?1, ?2)",
+                        &[
+                            crate::core::Value::from("crash-writer"),
+                            crate::core::Value::from(vec![1_u8, 2, 3]),
+                        ],
+                    )
+                    .unwrap();
+                storage
+                    .finalize_global_unique_write(&reservation, &cancellation)
+                    .map(|_| ())
+            }
+            "authority-coordinator-write" => {
+                drop(database);
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let brisk = crate::BriskDb::open(&root).await?;
+                    let session = brisk.session();
+                    session.set_routing_key("crash-writer").await?;
+                    brisk
+                        .execute_write(
+                            &session,
+                            crate::Statement::new(
+                                "INSERT INTO events (id, tenant_id, payload) VALUES (1, ?1, ?2)",
+                                vec![
+                                    crate::core::Value::from("crash-writer"),
+                                    crate::core::Value::from(vec![1_u8, 2, 3]),
+                                ],
+                            ),
+                        )
+                        .await?;
+                    Ok(())
+                })
             }
             "authority-lease" => {
                 let (id, operation, _) = authority_crash_request();
@@ -6787,6 +6961,92 @@ mod tests {
                 };
                 assert_eq!(lease.state(), target);
             }
+        }
+    }
+
+    #[test]
+    fn indexed_write_recovery_converges_after_real_process_abort() {
+        for (boundary, expected_recovered) in [
+            ("unique-write-finalize-before-commit", 1_usize),
+            ("unique-write-finalize-after-commit", 0_usize),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut database = setup_global_index_root(temp.path());
+            let declaration = global_index_test_declaration(&database)
+                .unique(crate::core::UniqueNullSemantics::Distinct);
+            let index_id = database.create_global_index(declaration).unwrap();
+            database.build_global_index(index_id).unwrap();
+            drop(database);
+
+            abort_global_index_child(
+                temp.path(),
+                "authority-write-finalize",
+                boundary,
+                Some(index_id),
+            );
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            assert_eq!(
+                storage
+                    .recover_global_unique_writes(&crate::core::CancellationToken::new())
+                    .unwrap(),
+                expected_recovered
+            );
+            drop(storage);
+            let mut database = Database::open(temp.path(), 2).unwrap();
+            let report = database.validate_global_index(index_id).unwrap();
+            assert!(report.is_valid(), "{report:?}");
+        }
+    }
+
+    #[test]
+    fn indexed_write_recovers_across_the_physical_commit_boundary() {
+        for boundary in [
+            "unique-write-physical-before-commit",
+            "unique-write-physical-after-commit",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut database = setup_global_index_root(temp.path());
+            let declaration = global_index_test_declaration(&database)
+                .unique(crate::core::UniqueNullSemantics::Distinct);
+            let index_id = database.create_global_index(declaration).unwrap();
+            database.build_global_index(index_id).unwrap();
+            drop(database);
+
+            abort_global_index_child(
+                temp.path(),
+                "authority-coordinator-write",
+                boundary,
+                Some(index_id),
+            );
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            assert_eq!(
+                storage
+                    .recover_global_unique_writes(&crate::core::CancellationToken::new())
+                    .unwrap(),
+                1
+            );
+            drop(storage);
+            let mut database = Database::open(temp.path(), 2).unwrap();
+            let report = database.validate_global_index(index_id).unwrap();
+            assert!(report.is_valid(), "{report:?}");
+            assert_eq!(
+                database
+                    .query(
+                        "crash-writer",
+                        "SELECT COUNT(*) FROM events WHERE id = 1 AND tenant_id = ?1",
+                        &[crate::core::Value::from("crash-writer")],
+                    )
+                    .unwrap()
+                    .rows()[0]
+                    .get(0)
+                    .unwrap()
+                    .as_i64(),
+                Some(if boundary.ends_with("after-commit") {
+                    1
+                } else {
+                    0
+                })
+            );
         }
     }
 

@@ -33,8 +33,9 @@ HTTP and PostgreSQL. Native MongoDB, MySQL, and serverless use are on the roadma
   blocks and route them through the normal shard map.
 - **A real cross-shard constraint authority.** Durable operation-ID
   reservations can choose one global unique-key owner, while fenced range
-  leases allocate collision-free values across processes. SQL write-path
-  integration is the next rollout stage.
+  leases allocate collision-free values across processes. Successful
+  single-shard `INSERT`, `UPDATE`, and `DELETE` statements now maintain ready
+  global unique indexes automatically.
 - **Bring the client you already have.** HTTP and PostgreSQL are available now;
   MongoDB and MySQL wire compatibility are being built over the same engine.
 - **Files remain files.** The layout is a manifest plus normal SQLite databases,
@@ -115,7 +116,7 @@ experimental and opt-in; the exact contract lives in
 | PostgreSQL wire protocol | TLS/SCRAM, backpressured row streaming, SQLite-interrupt cancellation, text/binary CRUD, real single-shard transactions, and a live psql/tokio-postgres/psycopg/SQLAlchemy matrix |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
-| Cross-shard unique reservations and global value leases | Rust authority API working; automatic SQL maintenance is [next](https://github.com/schapman1974/briskdb/issues/233) |
+| Cross-shard unique reservations and global value leases | Automatic autocommit maintenance works across Rust, Python, HTTP, and PostgreSQL; indexed query routing is [next](https://github.com/schapman1974/briskdb/issues/234) |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working |

@@ -1,8 +1,39 @@
 use std::{env, error::Error, time::Duration};
 
+use briskdb::core::{
+    Database, GlobalIndexDeclaration, GlobalIndexKeyPart, GlobalIndexKeySource, GlobalIndexKeyType,
+    GlobalIndexStorageTopology, UniqueNullSemantics,
+};
 use tokio_postgres::{NoTls, SimpleQueryMessage, error::SqlState};
 
 const MATRIX_DSN_ENV: &str = "BRISKDB_POSTGRES_MATRIX_DSN";
+const MATRIX_ROOT_ENV: &str = "BRISKDB_POSTGRES_MATRIX_ROOT";
+
+#[test]
+#[ignore = "requires the imported matrix root prepared by tests/postgres_client_matrix.sh"]
+fn prepare_postgres_client_global_index() {
+    let root = env::var(MATRIX_ROOT_ENV).expect("matrix root");
+    let mut database = Database::open(root, 2).unwrap();
+    let table_id = database
+        .catalog()
+        .table("default", "indexed_records")
+        .unwrap()
+        .unwrap()
+        .id();
+    let declaration = GlobalIndexDeclaration::new(
+        table_id,
+        "indexed_records_payload_unique",
+        vec![GlobalIndexKeyPart::new(
+            GlobalIndexKeySource::column("payload").unwrap(),
+            GlobalIndexKeyType::Text,
+        )],
+    )
+    .unwrap()
+    .unique(UniqueNullSemantics::Distinct)
+    .with_topology(GlobalIndexStorageTopology::selected_v1());
+    let index_id = database.create_global_index(declaration).unwrap();
+    database.build_global_index(index_id).unwrap();
+}
 
 async fn connect(
     dsn: &str,
@@ -34,6 +65,29 @@ async fn tokio_postgres_client_matrix() -> Result<(), Box<dyn Error>> {
     let dsn = env::var(MATRIX_DSN_ENV)
         .map_err(|_| format!("{MATRIX_DSN_ENV} must name the live BriskDB listener"))?;
     let (mut client, connection) = connect(&dsn).await?;
+
+    eprintln!("tokio-postgres: indexed autocommit write");
+    assert_eq!(
+        client
+            .execute(
+                "INSERT INTO indexed_records (tenant_id, payload) VALUES ($1, $2)",
+                &[&"tokio-index-a", &"tokio-global-key"],
+            )
+            .await?,
+        1
+    );
+    let duplicate = client
+        .execute(
+            "INSERT INTO indexed_records (tenant_id, payload) VALUES ($1, $2)",
+            &[&"tokio-index-b", &"tokio-global-key"],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate.code(), Some(&SqlState::UNIQUE_VIOLATION));
+    assert_eq!(
+        client.query_one("SELECT 1", &[]).await?.get::<_, String>(0),
+        "1"
+    );
 
     eprintln!("tokio-postgres: begin CRUD transaction");
     let transaction = client.transaction().await?;

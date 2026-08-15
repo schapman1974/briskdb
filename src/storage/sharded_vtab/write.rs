@@ -1,6 +1,7 @@
 //! Writable coordinator execution and one-shard transaction state.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, MutexGuard, TryLockError,
         atomic::{AtomicBool, Ordering},
@@ -9,32 +10,438 @@ use std::{
 };
 
 use rusqlite::{
-    Connection, InterruptHandle, Params, Result as SqliteResult, types::ValueRef,
-    vtab::ConflictMode,
+    Connection, InterruptHandle, Params, Result as SqliteResult, hooks::PreUpdateCase,
+    types::ValueRef, vtab::ConflictMode,
 };
 
 use super::{
-    ALLOCATION_OVERHEAD_BYTES, CoordinatorCancellation, CursorLimits, ROW_ACCOUNTING_BYTES,
-    RawCell, Registry, RegistrySchemaCache, TableSpec, VALUE_ACCOUNTING_BYTES, allocation_error,
-    attach_writable_coordinator_authorizer, bootstrap_coordinator_schema, cancelled_error,
-    limit_error, locator, module_v2,
+    ALLOCATION_OVERHEAD_BYTES, CoordinatorCancellation, CursorLimits, PhysicalLocatorSpec,
+    ROW_ACCOUNTING_BYTES, RawCell, Registry, RegistrySchemaCache, TableSpec,
+    VALUE_ACCOUNTING_BYTES, allocation_error, attach_writable_coordinator_authorizer,
+    bootstrap_coordinator_schema, cancelled_error, limit_error, locator, module_v2,
 };
 #[cfg(test)]
 use super::{TestChildScanControl, TestChildScanGate};
 use crate::{
     core::{
-        CanonicalShardKeyRef, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
-        GeneratedKey, OperationControl, TableId, Value, canonical_shard_key_bytes,
+        CancellationToken, CanonicalIndexKey, CanonicalShardKeyRef, EngineError, EngineErrorKind,
+        EngineResult, GeneratedIdPolicy, GeneratedKey, GlobalIndexId, GlobalIndexOwner,
+        GlobalUniqueMutation, OperationControl, TableId, Value, canonical_shard_key_bytes,
         generated_id::{
             AllocationOwnerSlot, GeneratedIdClassification, classify_generated_id,
             native_range_v1_sequence_ceiling, native_range_v1_sequence_floor,
         },
     },
     sqlite_error,
-    storage::{CONNECTION_BUSY_TIMEOUT, SchemaOperationGuard, Storage, hilo::HiloAllocation},
+    storage::{
+        CONNECTION_BUSY_TIMEOUT, GlobalWriteReservationGuard, SchemaOperationGuard, Storage,
+        global_index, hilo::HiloAllocation,
+    },
 };
 
 const CANCELLABLE_BUSY_SLICE: Duration = Duration::from_millis(25);
+
+#[derive(Debug)]
+struct GlobalIndexWriteUnsupported;
+
+impl std::fmt::Display for GlobalIndexWriteUnsupported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("authoritative global-index write is unsupported")
+    }
+}
+
+impl std::error::Error for GlobalIndexWriteUnsupported {}
+
+fn global_index_write_unsupported(diagnostic: impl Into<String>) -> EngineError {
+    EngineError::from_source(
+        EngineErrorKind::Unsupported,
+        diagnostic,
+        GlobalIndexWriteUnsupported,
+    )
+}
+
+pub(super) fn is_global_index_write_unsupported(error: &EngineError) -> bool {
+    std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<GlobalIndexWriteUnsupported>())
+        .is_some()
+}
+
+#[cfg(test)]
+fn abort_at_global_write_test_boundary(boundary: &str) {
+    if std::env::var("BRISKDB_GLOBAL_INDEX_AUTHORITY_ABORT_POINT").as_deref() == Ok(boundary) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(test))]
+fn abort_at_global_write_test_boundary(_boundary: &str) {}
+
+#[derive(Debug, Clone)]
+struct CapturedPhysicalRow {
+    rowid: i64,
+    values: Vec<RawCell>,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedPhysicalChange {
+    table: String,
+    old: Option<CapturedPhysicalRow>,
+    new: Option<CapturedPhysicalRow>,
+}
+
+#[derive(Debug, Default)]
+struct GlobalMutationCapture {
+    changes: Vec<CapturedPhysicalChange>,
+    error: Option<String>,
+}
+
+impl GlobalMutationCapture {
+    fn record(&mut self, table: &str, case: &PreUpdateCase) -> EngineResult<()> {
+        let (old, new) = match case {
+            PreUpdateCase::Insert(accessor) => (
+                None,
+                Some(capture_new_row(
+                    accessor.get_new_row_id(),
+                    accessor.get_column_count(),
+                    |column| accessor.get_new_column_value(column),
+                )?),
+            ),
+            PreUpdateCase::Delete(accessor) => (
+                Some(capture_old_row(
+                    accessor.get_old_row_id(),
+                    accessor.get_column_count(),
+                    |column| accessor.get_old_column_value(column),
+                )?),
+                None,
+            ),
+            PreUpdateCase::Update {
+                old_value_accessor,
+                new_value_accessor,
+            } => (
+                Some(capture_old_row(
+                    old_value_accessor.get_old_row_id(),
+                    old_value_accessor.get_column_count(),
+                    |column| old_value_accessor.get_old_column_value(column),
+                )?),
+                Some(capture_new_row(
+                    new_value_accessor.get_new_row_id(),
+                    new_value_accessor.get_column_count(),
+                    |column| new_value_accessor.get_new_column_value(column),
+                )?),
+            ),
+            PreUpdateCase::Unknown => {
+                return Err(EngineError::new(
+                    EngineErrorKind::Unsupported,
+                    "SQLite reported an unknown physical change to global-index maintenance",
+                ));
+            }
+        };
+        self.changes.push(CapturedPhysicalChange {
+            table: table.to_owned(),
+            old,
+            new,
+        });
+        Ok(())
+    }
+}
+
+fn capture_old_row<'value>(
+    rowid: i64,
+    count: i32,
+    mut value: impl FnMut(i32) -> rusqlite::Result<ValueRef<'value>>,
+) -> EngineResult<CapturedPhysicalRow> {
+    capture_physical_row(rowid, count, &mut value)
+}
+
+fn capture_new_row<'value>(
+    rowid: i64,
+    count: i32,
+    mut value: impl FnMut(i32) -> rusqlite::Result<ValueRef<'value>>,
+) -> EngineResult<CapturedPhysicalRow> {
+    capture_physical_row(rowid, count, &mut value)
+}
+
+fn capture_physical_row<'value>(
+    rowid: i64,
+    count: i32,
+    value: &mut impl FnMut(i32) -> rusqlite::Result<ValueRef<'value>>,
+) -> EngineResult<CapturedPhysicalRow> {
+    let count = usize::try_from(count).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::DataCorruption,
+            "SQLite pre-update hook reported a negative column count",
+            error,
+        )
+    })?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(allocation_error)?;
+    for column in 0..count {
+        let column = i32::try_from(column).map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::LimitExceeded,
+                "physical row has too many columns for global-index capture",
+                error,
+            )
+        })?;
+        values.push(RawCell::try_copy_from(
+            value(column).map_err(sqlite_error::statement)?,
+        )?);
+    }
+    Ok(CapturedPhysicalRow { rowid, values })
+}
+
+#[derive(Debug)]
+struct CapturedOwnerState {
+    owner: GlobalIndexOwner,
+    initial: Option<CanonicalIndexKey>,
+    current: Option<CanonicalIndexKey>,
+}
+
+fn touched_global_unique_indexes(
+    registry: &Registry,
+    changes: &[CapturedPhysicalChange],
+) -> EngineResult<Vec<GlobalIndexId>> {
+    let mut touched = BTreeSet::new();
+    for change in changes {
+        let spec = registry.table_named(&change.table).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "global-index capture references unregistered physical table {}",
+                    change.table
+                ),
+            )
+        })?;
+        touched.extend(
+            spec.global_unique_indexes
+                .iter()
+                .map(|index| index.metadata.id()),
+        );
+    }
+    Ok(touched.into_iter().collect())
+}
+
+fn plan_global_unique_mutations(
+    registry: &Registry,
+    shard: u16,
+    connection: &Connection,
+    changes: &[CapturedPhysicalChange],
+) -> EngineResult<Vec<GlobalUniqueMutation>> {
+    let mut by_index = BTreeMap::<GlobalIndexId, BTreeMap<Vec<u8>, CapturedOwnerState>>::new();
+    for change in changes {
+        let spec = registry.table_named(&change.table).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "global-index capture references unregistered physical table {}",
+                    change.table
+                ),
+            )
+        })?;
+        if change
+            .old
+            .iter()
+            .chain(change.new.iter())
+            .any(|row| row.values.len() != spec.columns.len())
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "physical table {} changed column count during global-index capture",
+                    spec.name
+                ),
+            ));
+        }
+        for index in &spec.global_unique_indexes {
+            let states = by_index.entry(index.metadata.id()).or_default();
+            if let Some(old) = &change.old {
+                let owner = captured_global_owner(spec, shard, old)?;
+                let key = evaluate_captured_unique_key(connection, index, shard, old)?;
+                apply_captured_old(states, owner, key)?;
+            }
+            if let Some(new) = &change.new {
+                let owner = captured_global_owner(spec, shard, new)?;
+                let key = evaluate_captured_unique_key(connection, index, shard, new)?;
+                apply_captured_new(states, owner, key)?;
+            }
+        }
+    }
+
+    collapse_global_unique_mutations(by_index)
+}
+
+fn collapse_global_unique_mutations(
+    by_index: BTreeMap<GlobalIndexId, BTreeMap<Vec<u8>, CapturedOwnerState>>,
+) -> EngineResult<Vec<GlobalUniqueMutation>> {
+    let mut mutations = Vec::new();
+    for (index_id, states) in by_index {
+        let mut previous = Vec::new();
+        let mut new = Vec::new();
+        for state in states.into_values() {
+            if state.initial == state.current {
+                continue;
+            }
+            if let Some(key) = state.initial {
+                previous.push((key, state.owner.clone()));
+            }
+            if let Some(key) = state.current {
+                new.push((key, state.owner));
+            }
+        }
+        for left in 0..new.len() {
+            if new[left + 1..]
+                .iter()
+                .any(|(right, _)| *right == new[left].0)
+            {
+                return Err(EngineError::new(
+                    EngineErrorKind::UniqueViolation,
+                    format!(
+                        "one statement produced duplicate keys for global index {index_id}; key bytes are redacted"
+                    ),
+                ));
+            }
+        }
+        if previous.len() > 1 || new.len() > 1 {
+            return Err(global_index_write_unsupported(format!(
+                "global index {index_id} does not yet support one transaction changing more than one authoritative row"
+            )));
+        }
+        match (previous.pop(), new.pop()) {
+            (None, None) => {}
+            (None, Some((key, owner))) => {
+                mutations.push(GlobalUniqueMutation::claim(index_id, key, owner));
+            }
+            (Some((key, owner)), None) => {
+                mutations.push(GlobalUniqueMutation::release(index_id, key, owner));
+            }
+            (Some((previous_key, previous_owner)), Some((new_key, new_owner))) => {
+                mutations.push(GlobalUniqueMutation::replace(
+                    index_id,
+                    previous_key,
+                    previous_owner,
+                    new_key,
+                    new_owner,
+                ));
+            }
+        }
+    }
+    Ok(mutations)
+}
+
+fn apply_captured_old(
+    states: &mut BTreeMap<Vec<u8>, CapturedOwnerState>,
+    owner: GlobalIndexOwner,
+    key: Option<CanonicalIndexKey>,
+) -> EngineResult<()> {
+    if key.is_none() && !states.contains_key(owner.locator()) {
+        return Ok(());
+    }
+    let state = states
+        .entry(owner.locator().to_vec())
+        .or_insert_with(|| CapturedOwnerState {
+            owner,
+            initial: key.clone(),
+            current: key.clone(),
+        });
+    if state.current != key {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "global-index physical change history has a discontinuous old row",
+        ));
+    }
+    state.current = None;
+    Ok(())
+}
+
+fn apply_captured_new(
+    states: &mut BTreeMap<Vec<u8>, CapturedOwnerState>,
+    owner: GlobalIndexOwner,
+    key: Option<CanonicalIndexKey>,
+) -> EngineResult<()> {
+    if key.is_none() && !states.contains_key(owner.locator()) {
+        return Ok(());
+    }
+    let state = states
+        .entry(owner.locator().to_vec())
+        .or_insert_with(|| CapturedOwnerState {
+            owner,
+            initial: None,
+            current: None,
+        });
+    if state.current.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "global-index physical change history inserted over a live row identity",
+        ));
+    }
+    state.current = key;
+    Ok(())
+}
+
+fn captured_global_owner(
+    spec: &TableSpec,
+    shard: u16,
+    row: &CapturedPhysicalRow,
+) -> EngineResult<GlobalIndexOwner> {
+    let locator = spec.locator.as_ref().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Unsupported,
+            format!(
+                "registered table {} has no stable global-index row identity",
+                spec.name
+            ),
+        )
+    })?;
+    let rowid;
+    let values = match locator {
+        PhysicalLocatorSpec::Rowid { .. } => {
+            rowid = RawCell::Integer(row.rowid);
+            vec![rowid.as_value_ref()]
+        }
+        PhysicalLocatorSpec::PrimaryKey { column_indices, .. } => column_indices
+            .iter()
+            .map(|index| {
+                row.values
+                    .get(*index)
+                    .map(RawCell::as_value_ref)
+                    .ok_or_else(|| {
+                        EngineError::new(
+                            EngineErrorKind::DataCorruption,
+                            "global-index primary-key locator is outside the captured row",
+                        )
+                    })
+            })
+            .collect::<EngineResult<Vec<_>>>()?,
+    };
+    GlobalIndexOwner::new(shard, global_index::encode_locator(&values)?)
+}
+
+fn evaluate_captured_unique_key(
+    connection: &Connection,
+    index: &super::GlobalUniqueIndexSpec,
+    shard: u16,
+    row: &CapturedPhysicalRow,
+) -> EngineResult<Option<CanonicalIndexKey>> {
+    let mut statement = connection
+        .prepare_cached(&index.evaluation_sql)
+        .map_err(sqlite_error::statement)?;
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(&row.values))
+        .map_err(sqlite_error::statement)?;
+    let key = rows
+        .next()
+        .map_err(sqlite_error::statement)?
+        .map(|row| global_index::read_captured_unique_key(row, &index.metadata, shard))
+        .transpose()?
+        .flatten();
+    if rows.next().map_err(sqlite_error::statement)?.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "captured global-index expression returned more than one row",
+        ));
+    }
+    Ok(key)
+}
 
 fn validate_allocation_sequence_capacity(
     connection: &Connection,
@@ -889,6 +1296,7 @@ pub(super) struct WriteState {
     armed_statement_epoch: Mutex<Option<u64>>,
     generated_insert: Mutex<Option<GeneratedInsertIntent>>,
     active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
+    active_authority_cancellation: Mutex<Option<CancellationToken>>,
     commit_linearization: Mutex<()>,
     nonblocking_cancel_requested: AtomicBool,
     #[cfg(test)]
@@ -923,6 +1331,7 @@ impl WriteState {
             armed_statement_epoch: Mutex::new(None),
             generated_insert: Mutex::new(None),
             active_interrupt: Mutex::new(None),
+            active_authority_cancellation: Mutex::new(None),
             commit_linearization: Mutex::new(()),
             nonblocking_cancel_requested: AtomicBool::new(false),
             #[cfg(test)]
@@ -1195,6 +1604,24 @@ impl WriteState {
         }
     }
 
+    pub(super) fn cancel_authority(&self) {
+        if let Some(cancellation) = self
+            .active_authority_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            cancellation.cancel();
+        }
+    }
+
+    fn clear_authority_cancellation(&self) {
+        *self
+            .active_authority_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     #[cfg(test)]
     pub(super) fn has_active_child(&self) -> bool {
         self.active_interrupt
@@ -1299,8 +1726,8 @@ impl WriteState {
     }
 
     pub(super) fn sync(&self, registry: &Registry) -> EngineResult<()> {
-        let state = self.lock();
-        match &*state {
+        let mut state = self.lock();
+        match &mut *state {
             WriteTransactionState::Idle => Ok(()),
             WriteTransactionState::Active(transaction) => {
                 transaction.ensure_healthy(registry)?;
@@ -1314,6 +1741,7 @@ impl WriteState {
                         "brisk_shard child transaction ended before coordinator sync",
                     ));
                 }
+                transaction.prepare_global_authority(registry)?;
                 Ok(())
             }
             WriteTransactionState::PendingCommit(_) | WriteTransactionState::PendingRollback(_) => {
@@ -1404,6 +1832,7 @@ impl WriteState {
                 })
             }
         };
+        self.clear_authority_cancellation();
         self.clear_active_interrupt();
         registry.storage.fail_closed_on_corruption(result)
     }
@@ -1420,6 +1849,7 @@ impl WriteState {
             | WriteTransactionState::PendingCommit(mut transaction)
             | WriteTransactionState::PendingRollback(mut transaction) => transaction.rollback(),
         };
+        self.clear_authority_cancellation();
         self.clear_active_interrupt();
         registry.storage.fail_closed_on_corruption(result)
     }
@@ -1433,6 +1863,7 @@ impl WriteState {
                 transaction.statement_shard = None;
                 transaction.explicit_key = None;
                 transaction.generated_key = None;
+                transaction.statement_ignores_conflicts = false;
                 Ok(())
             }
             WriteTransactionState::PendingCommit(_) | WriteTransactionState::PendingRollback(_) => {
@@ -1489,6 +1920,7 @@ impl WriteState {
         conflict: ConflictMode,
     ) -> EngineResult<i64> {
         self.with_active(registry, |transaction| {
+            transaction.record_statement_conflict(&conflict);
             let shard_key = spec.write_shard_key(values)?;
             let generated_shard = self.generated_insert_target(
                 registry,
@@ -1532,6 +1964,7 @@ impl WriteState {
     ) -> EngineResult<()> {
         self.reject_generated_non_insert()?;
         self.with_active(registry, |transaction| {
+            transaction.record_statement_conflict(&conflict);
             transaction.update(
                 registry,
                 spec,
@@ -1615,7 +2048,18 @@ impl WriteState {
                 ));
             }
             let epoch = self.statement_epoch(registry)?;
-            *state = WriteTransactionState::Active(WriteTransaction::new(operation, epoch));
+            let authority_cancellation = CancellationToken::new();
+            *self
+                .active_authority_cancellation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(authority_cancellation.clone());
+            *state = WriteTransactionState::Active(WriteTransaction::new(
+                operation,
+                epoch,
+                registry.storage.clone(),
+                authority_cancellation,
+            ));
         }
         match state {
             WriteTransactionState::Active(transaction) => Ok(transaction),
@@ -1734,6 +2178,7 @@ impl CoordinatorCancellation {
             .nonblocking_cancel_requested
             .store(true, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::AcqRel);
+        write_state.cancel_authority();
         write_state.interrupt_child();
         self.interrupt.interrupt();
     }
@@ -2062,6 +2507,7 @@ enum WriteTransactionState {
 
 struct WriteTransaction {
     _operation: Option<SchemaOperationGuard>,
+    authority_storage: Storage,
     epoch: u64,
     child: Option<WriteChild>,
     savepoints: Vec<SavepointMark>,
@@ -2070,6 +2516,12 @@ struct WriteTransaction {
     statement_shard: Option<u16>,
     explicit_key: Option<Value>,
     generated_key: Option<GeneratedKey>,
+    statement_ignores_conflicts: bool,
+    authority_cancellation: CancellationToken,
+    global_reservations: Vec<GlobalWriteReservationGuard>,
+    global_reserved_indexes: Vec<GlobalIndexId>,
+    global_snapshot_indexes: Vec<GlobalIndexId>,
+    global_authority_prepared: bool,
 }
 
 struct SavepointMark {
@@ -2078,12 +2530,19 @@ struct SavepointMark {
     statement_shard: Option<u16>,
     explicit_key: Option<Value>,
     generated_key: Option<GeneratedKey>,
+    captured_changes: usize,
 }
 
 impl WriteTransaction {
-    fn new(operation: Option<SchemaOperationGuard>, epoch: u64) -> Self {
+    fn new(
+        operation: Option<SchemaOperationGuard>,
+        epoch: u64,
+        authority_storage: Storage,
+        authority_cancellation: CancellationToken,
+    ) -> Self {
         Self {
             _operation: operation,
+            authority_storage,
             epoch,
             child: None,
             savepoints: Vec::new(),
@@ -2092,6 +2551,12 @@ impl WriteTransaction {
             statement_shard: None,
             explicit_key: None,
             generated_key: None,
+            statement_ignores_conflicts: false,
+            authority_cancellation,
+            global_reservations: Vec::new(),
+            global_reserved_indexes: Vec::new(),
+            global_snapshot_indexes: Vec::new(),
+            global_authority_prepared: false,
         }
     }
 
@@ -2114,10 +2579,86 @@ impl WriteTransaction {
         Ok(())
     }
 
+    fn prepare_global_authority(&mut self, registry: &Registry) -> EngineResult<()> {
+        if self.global_authority_prepared {
+            return Ok(());
+        }
+        let Some(child) = &self.child else {
+            self.global_authority_prepared = true;
+            return Ok(());
+        };
+        let changes = child.captured_changes()?;
+        if changes.is_empty() {
+            self.global_authority_prepared = true;
+            return Ok(());
+        }
+        if self.authority_cancellation.is_cancelled() {
+            return Err(cancelled_error());
+        }
+
+        registry
+            .storage
+            .recover_global_unique_writes(&self.authority_cancellation)?;
+        self.global_snapshot_indexes = touched_global_unique_indexes(registry, &changes)?;
+        let mutations =
+            plan_global_unique_mutations(registry, child.shard, &child.connection, &changes)?;
+        let mut reservations = Vec::new();
+        reservations
+            .try_reserve_exact(mutations.len())
+            .map_err(allocation_error)?;
+        for mutation in &mutations {
+            match registry
+                .storage
+                .reserve_global_unique_write(mutation, &self.authority_cancellation)
+            {
+                Ok(reservation) => reservations.push(reservation),
+                Err(error) => {
+                    let cleanup = CancellationToken::new();
+                    for reservation in reservations.iter().rev() {
+                        let _ = registry
+                            .storage
+                            .rollback_global_unique_write(reservation, &cleanup);
+                    }
+                    if error.kind() == EngineErrorKind::UniqueViolation
+                        && self.statement_ignores_conflicts
+                    {
+                        if let Some(child) = self.child.take() {
+                            if !child.connection.is_autocommit() {
+                                child
+                                    .connection
+                                    .execute_batch("ROLLBACK")
+                                    .map_err(sqlite_error::statement)?;
+                            }
+                        }
+                        self.affected_rows = 0;
+                        self.statement_shard = None;
+                        self.explicit_key = None;
+                        self.generated_key = None;
+                        self.global_snapshot_indexes.clear();
+                        self.global_authority_prepared = true;
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        self.global_reserved_indexes = mutations
+            .iter()
+            .map(GlobalUniqueMutation::index_id)
+            .collect();
+        self.global_reservations = reservations;
+        self.global_authority_prepared = true;
+        Ok(())
+    }
+
     fn poison(&mut self, reason: impl Into<String>) {
         if self.poison.is_none() {
             self.poison = Some(reason.into());
         }
+    }
+
+    fn record_statement_conflict(&mut self, conflict: &ConflictMode) {
+        self.statement_ignores_conflicts = matches!(conflict, ConflictMode::Ignore);
     }
 
     fn record_physical_changes(&mut self, changed: usize) -> EngineResult<()> {
@@ -2265,6 +2806,32 @@ impl WriteTransaction {
                     "SQLite foreign-key enforcement is not enabled on a writable shard child",
                 ));
             }
+            let indexed_tables = registry
+                .tables
+                .values()
+                .filter(|spec| !spec.global_unique_indexes.is_empty())
+                .map(|spec| spec.name.clone())
+                .collect::<BTreeSet<_>>();
+            let mutation_capture = Arc::new(Mutex::new(GlobalMutationCapture::default()));
+            let hook_capture = Arc::clone(&mutation_capture);
+            connection
+                .preupdate_hook(Some(
+                    move |_action, database: &str, table: &str, case: &PreUpdateCase| {
+                        if database != "main" || !indexed_tables.contains(table) {
+                            return;
+                        }
+                        let mut capture = hook_capture
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if capture.error.is_some() {
+                            return;
+                        }
+                        if let Err(error) = capture.record(table, case) {
+                            capture.error = Some(error.to_string());
+                        }
+                    },
+                ))
+                .map_err(sqlite_error::storage)?;
             for savepoint in &self.savepoints {
                 if let Err(error) = connection
                     .execute_batch(&format!("SAVEPOINT brisk_vtab_{}", savepoint.number))
@@ -2288,6 +2855,7 @@ impl WriteTransaction {
             self.child = Some(WriteChild {
                 shard,
                 connection,
+                mutation_capture,
                 _interrupt: interrupt,
             });
         }
@@ -2370,6 +2938,7 @@ impl WriteTransaction {
         let statement_shard = self.statement_shard;
         let explicit_key = self.explicit_key.clone();
         let generated_key = self.generated_key.clone();
+        let captured_changes = self.child.as_ref().map_or(0, |child| child.capture_len());
         for missing in first_missing..=number {
             if let Some(child) = &self.child {
                 child
@@ -2383,6 +2952,7 @@ impl WriteTransaction {
                 statement_shard,
                 explicit_key: explicit_key.clone(),
                 generated_key: generated_key.clone(),
+                captured_changes,
             });
         }
         Ok(())
@@ -2425,6 +2995,9 @@ impl WriteTransaction {
         self.statement_shard = self.savepoints[position].statement_shard;
         self.explicit_key = self.savepoints[position].explicit_key.clone();
         self.generated_key = self.savepoints[position].generated_key.clone();
+        if let Some(child) = &self.child {
+            child.truncate_capture(self.savepoints[position].captured_changes);
+        }
         self.savepoints.truncate(position + 1);
         Ok(())
     }
@@ -3056,7 +3629,16 @@ impl WriteTransaction {
     }
 
     fn commit(&mut self) -> EngineResult<WriteOutcome> {
+        if self.child.is_some() && !self.global_authority_prepared {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "brisk_shard reached physical commit before preparing global-index authority",
+            ));
+        }
         if let Some(child) = self.child.take() {
+            if !self.global_snapshot_indexes.is_empty() {
+                abort_at_global_write_test_boundary("unique-write-physical-before-commit");
+            }
             if let Err(error) = child
                 .connection
                 .execute_batch("COMMIT")
@@ -3065,9 +3647,34 @@ impl WriteTransaction {
                 if !child.connection.is_autocommit() {
                     let _ = child.connection.execute_batch("ROLLBACK");
                 }
+                self.rollback_global_reservations();
                 return Err(error);
             }
+            if !self.global_snapshot_indexes.is_empty() {
+                abort_at_global_write_test_boundary("unique-write-physical-after-commit");
+            }
         }
+        // Once the physical shard commits, cancellation can no longer roll
+        // the row back. Complete authority with a fresh token so a deadline
+        // racing this boundary cannot leave a live process holding an active
+        // reservation solely because its client stopped waiting.
+        let completion = CancellationToken::new();
+        for reservation in &self.global_reservations {
+            self.authority_storage
+                .finalize_global_unique_write(reservation, &completion)?;
+        }
+        self.global_reservations.clear();
+        self.global_snapshot_indexes
+            .retain(|index| !self.global_reserved_indexes.contains(index));
+        self.global_reserved_indexes.clear();
+        if let Some(shard) = self.statement_shard {
+            self.authority_storage.refresh_global_unique_write_indexes(
+                &self.global_snapshot_indexes,
+                shard,
+                &completion,
+            )?;
+        }
+        self.global_snapshot_indexes.clear();
         Ok(WriteOutcome {
             affected_rows: std::mem::take(&mut self.affected_rows),
             shard: self.statement_shard.take(),
@@ -3077,22 +3684,69 @@ impl WriteTransaction {
     }
 
     fn rollback(&mut self) -> EngineResult<()> {
+        let mut physical_error = None;
         if let Some(child) = self.child.take() {
             if !child.connection.is_autocommit() {
-                child
+                if let Err(error) = child
                     .connection
                     .execute_batch("ROLLBACK")
-                    .map_err(sqlite_error::statement)?;
+                    .map_err(sqlite_error::statement)
+                {
+                    physical_error = Some(error);
+                }
             }
         }
-        Ok(())
+        self.rollback_global_reservations();
+        physical_error.map_or(Ok(()), Err)
+    }
+
+    fn rollback_global_reservations(&mut self) {
+        let cleanup = CancellationToken::new();
+        for reservation in self.global_reservations.drain(..).rev() {
+            let _ = self
+                .authority_storage
+                .rollback_global_unique_write(&reservation, &cleanup);
+        }
     }
 }
 
 struct WriteChild {
     shard: u16,
     connection: Connection,
+    mutation_capture: Arc<Mutex<GlobalMutationCapture>>,
     _interrupt: Arc<InterruptHandle>,
+}
+
+impl WriteChild {
+    fn capture_len(&self) -> usize {
+        self.mutation_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .changes
+            .len()
+    }
+
+    fn truncate_capture(&self, len: usize) {
+        self.mutation_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .changes
+            .truncate(len);
+    }
+
+    fn captured_changes(&self) -> EngineResult<Vec<CapturedPhysicalChange>> {
+        let capture = self
+            .mutation_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(error) = &capture.error {
+            return Err(EngineError::new(
+                EngineErrorKind::StorageUnavailable,
+                format!("could not capture a physical row for global-index maintenance: {error}"),
+            ));
+        }
+        Ok(capture.changes.clone())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3237,6 +3891,70 @@ mod tests {
                 .unwrap(),
             captured
         );
+    }
+
+    #[test]
+    fn captured_old_and_new_rows_collapse_into_claim_release_and_replace_plans() {
+        let index_id = GlobalIndexId::new(7).unwrap();
+        let old_key = CanonicalIndexKey::encode_values(&[Value::from("old")]).unwrap();
+        let new_key = CanonicalIndexKey::encode_values(&[Value::from("new")]).unwrap();
+        let claimed_key = CanonicalIndexKey::encode_values(&[Value::from("claimed")]).unwrap();
+        let released_key = CanonicalIndexKey::encode_values(&[Value::from("released")]).unwrap();
+        let replaced_owner = GlobalIndexOwner::new(1, b"replaced".to_vec()).unwrap();
+        let claimed_owner = GlobalIndexOwner::new(2, b"claimed".to_vec()).unwrap();
+        let released_owner = GlobalIndexOwner::new(3, b"released".to_vec()).unwrap();
+
+        let mut replace_states = BTreeMap::new();
+        apply_captured_old(
+            &mut replace_states,
+            replaced_owner.clone(),
+            Some(old_key.clone()),
+        )
+        .unwrap();
+        apply_captured_new(
+            &mut replace_states,
+            replaced_owner.clone(),
+            Some(new_key.clone()),
+        )
+        .unwrap();
+        let mut by_index = BTreeMap::new();
+        by_index.insert(index_id, replace_states);
+        let planned = collapse_global_unique_mutations(by_index).unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(
+            planned[0].previous_entry(),
+            Some((&old_key, &replaced_owner))
+        );
+        assert_eq!(planned[0].new_entry(), Some((&new_key, &replaced_owner)));
+
+        let mut claim_states = BTreeMap::new();
+        apply_captured_new(
+            &mut claim_states,
+            claimed_owner.clone(),
+            Some(claimed_key.clone()),
+        )
+        .unwrap();
+        let mut by_index = BTreeMap::new();
+        by_index.insert(index_id, claim_states);
+        let planned = collapse_global_unique_mutations(by_index).unwrap();
+        assert_eq!(planned[0].previous_entry(), None);
+        assert_eq!(planned[0].new_entry(), Some((&claimed_key, &claimed_owner)));
+
+        let mut release_states = BTreeMap::new();
+        apply_captured_old(
+            &mut release_states,
+            released_owner.clone(),
+            Some(released_key.clone()),
+        )
+        .unwrap();
+        let mut by_index = BTreeMap::new();
+        by_index.insert(index_id, release_states);
+        let planned = collapse_global_unique_mutations(by_index).unwrap();
+        assert_eq!(
+            planned[0].previous_entry(),
+            Some((&released_key, &released_owner))
+        );
+        assert_eq!(planned[0].new_entry(), None);
     }
 
     #[test]

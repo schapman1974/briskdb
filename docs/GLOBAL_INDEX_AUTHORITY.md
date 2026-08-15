@@ -4,9 +4,43 @@ BriskDB now has protocol-neutral primitives for enforcing a unique key across
 all SQLite shards and leasing collision-free global integer values. They are
 safe across service, Rust, and Python processes sharing one local data root.
 
-> Automatic `INSERT`/`UPDATE`/`DELETE` maintenance is the next rollout stage,
-> [#233](https://github.com/schapman1974/briskdb/issues/233). Until that lands,
-> SQL statements do not call these primitives automatically.
+Ready unique indexes are maintained automatically for successful autocommit
+`INSERT`, `UPDATE`, and `DELETE` statements through the shared Rust engine. The
+same path serves the Rust and Python libraries, HTTP, and PostgreSQL.
+
+## Coordinated SQL writes
+
+```mermaid
+flowchart LR
+    SQL[SQL mutation] --> CAPTURE[SQLite pre-update hook\ncaptures old + new rows]
+    CAPTURE --> PLAN[Evaluate predicate, expressions,\ncompound key, and NULL policy]
+    PLAN --> RESERVE[Reserve old/new canonical keys\nin global.sqlite]
+    RESERVE --> COMMIT[Commit one physical shard]
+    COMMIT --> FINALIZE[Publish ownership +\nrefresh shard snapshot]
+    COMMIT -. process exit .-> RECOVER[Next writer probes the row\nand finalizes or rolls back]
+    RECOVER --> FINALIZE
+```
+
+The hook is part of BriskDB's bundled SQLite build; it is not a loadable SQLite
+extension. Cascades and `REPLACE` side effects are captured at the physical-row
+boundary, so authority follows what SQLite actually changed. A durable
+per-operation marker and file lock distinguish a live coordinator from an
+orphaned write across independent processes.
+
+The alpha path deliberately accepts only mutations whose atomicity it can
+prove. One statement may change at most one authoritative row per global index,
+and the write must stay on one physical shard. Explicit transactions on indexed
+tables, `ON CONFLICT DO UPDATE`, and cross-shard `INSERT OR REPLACE` conflicts
+return `Unsupported` before commit. `INSERT OR IGNORE` returns zero affected
+rows on a global conflict. These restrictions avoid silently partial writes.
+
+Maintenance is synchronous and currently refreshes the affected index/shard
+snapshot before acknowledging the write. This favors correctness over write
+throughput in the alpha; the outbox and asynchronous-index stages tracked by
+[#236](https://github.com/schapman1974/briskdb/issues/236) and
+[#237](https://github.com/schapman1974/briskdb/issues/237) are the planned
+throughput path. Global-index query routing begins in
+[#234](https://github.com/schapman1974/briskdb/issues/234).
 
 ## Unique-key state machine
 
@@ -47,11 +81,12 @@ commit returns `Cancelled` without changing state.
 
 ## Recovery and maintenance
 
-An active operation survives a process exit. The write coordinator in #233 can
-retry the shard step with the same operation ID, then finalize or roll it back;
-there is no scan-then-insert race. Offline validation reports
-`active_unique_reservation`. A unique-index rebuild rolls active reservations
-back before reconstructing ownership from the authoritative shard rows.
+An active operation survives a process exit. The write coordinator probes the
+recorded physical row identity, then finalizes a committed mutation or rolls
+back an uncommitted one; there is no scan-then-insert race. Offline validation
+reports `active_unique_reservation`. A unique-index rebuild rolls active
+reservations back before reconstructing ownership from the authoritative shard
+rows.
 
 Physical global-index storage version 2 adds the operation, reservation,
 sequence, and lease tables to `global-indexes/global.sqlite`. Startup upgrades
@@ -60,10 +95,12 @@ retryable `Busy` before any format mutation.
 
 ## Verification and benchmarks
 
-The test suite covers deterministic transitions, exact retry mismatches,
-cancellation, replacement locking, serial-model property histories,
-four-process hot-key contention, four-process range leasing, every durable
-process-abort boundary, format-upgrade crashes, and peer fencing.
+The test suite covers deterministic transitions, old/new mutation planning,
+partial/compound/NULL key derivation, constraint outcomes, competing-process
+insert/update/delete races and exact retries, Python and PostgreSQL clients,
+replacement locking, serial-model property histories, four-process hot-key
+contention, four-process range leasing, durable process-abort boundaries,
+format-upgrade crashes, and peer fencing.
 
 Criterion includes three focused measurements:
 

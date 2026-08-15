@@ -38,6 +38,11 @@ with sqlite3.connect(sys.argv[1]) as connection:
         "tenant_id TEXT NOT NULL PRIMARY KEY, "
         "payload TEXT NOT NULL)"
     )
+    connection.execute(
+        "CREATE TABLE indexed_records ("
+        "tenant_id TEXT NOT NULL PRIMARY KEY, "
+        "payload TEXT NOT NULL)"
+    )
 PY
 
 "${python_command}" - "${plan}" <<'PY'
@@ -55,7 +60,16 @@ plan = {
                 "column": "tenant_id",
                 "key_type": "text",
             },
-        }
+        },
+        {
+            "name": "indexed_records",
+            "placement": "sharded",
+            "shard_key": {
+                "strategy": "column",
+                "column": "tenant_id",
+                "key_type": "text",
+            },
+        },
     ],
 }
 with open(sys.argv[1], "w", encoding="utf-8") as output:
@@ -68,6 +82,10 @@ target/debug/briskdb-import \
   --data-dir "${data_dir}" \
   --plan "${plan}" \
   --shards 2
+
+BRISKDB_POSTGRES_MATRIX_ROOT="${data_dir}" \
+  cargo test --locked --test postgres_client_matrix \
+  prepare_postgres_client_global_index -- --exact --ignored
 
 target/debug/briskdb \
   --data-dir "${data_dir}" \
@@ -91,6 +109,17 @@ curl --fail --silent "http://127.0.0.1:${http_port}/health" >/dev/null
 
 matrix_dsn="host=127.0.0.1 port=${postgres_port} user=briskdb dbname=default sslmode=disable"
 matrix_url="postgresql+psycopg://briskdb@127.0.0.1:${postgres_port}/default"
+
+"${psql_command}" "${matrix_dsn}" -X --set ON_ERROR_STOP=1 --command \
+  "INSERT INTO indexed_records (tenant_id, payload) VALUES ('psql-index-a', 'psql-global-key')" \
+  >/dev/null
+if "${psql_command}" "${matrix_dsn}" -X --set ON_ERROR_STOP=1 --command \
+  "INSERT INTO indexed_records (tenant_id, payload) VALUES ('psql-index-b', 'psql-global-key')" \
+  >/dev/null 2>&1; then
+  exit 1
+fi
+indexed_recovered="$("${psql_command}" "${matrix_dsn}" -X --tuples-only --no-align --command "SELECT 1")"
+test "${indexed_recovered}" = "1"
 
 "${psql_command}" "${matrix_dsn}" -X --set ON_ERROR_STOP=1 >/dev/null <<'SQL'
 BEGIN;

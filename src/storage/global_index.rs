@@ -9,14 +9,14 @@ use std::{
 
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
-    types::ValueRef,
+    types::{Value as SqliteValue, ValueRef},
 };
 
 use crate::{
     core::{
         CancellationToken, CanonicalIndexKey, EngineError, EngineErrorKind, EngineResult,
         GlobalIndexBuildReport, GlobalIndexId, GlobalIndexKeySource, GlobalIndexKeyType,
-        GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexStorageTopology,
+        GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexOwner, GlobalIndexStorageTopology,
         GlobalIndexValidationIssue, GlobalIndexValidationIssueKind, GlobalIndexValidationMode,
         GlobalIndexValidationOptions, GlobalIndexValidationReport, GlobalOperationId,
         GlobalOperationState, GlobalUniqueMutation, GlobalUniqueReservation, GlobalValueLease,
@@ -228,6 +228,18 @@ impl SourceLocator {
                 .iter()
                 .map(|column| quote_identifier(column))
                 .collect(),
+        }
+    }
+
+    fn predicate_sql(&self) -> String {
+        match self {
+            Self::RowId(name) => format!("{} = ?1", quote_identifier(name)),
+            Self::PrimaryKey(columns) => columns
+                .iter()
+                .enumerate()
+                .map(|(offset, column)| format!("{} IS ?{}", quote_identifier(column), offset + 1))
+                .collect::<Vec<_>>()
+                .join(" AND "),
         }
     }
 }
@@ -496,6 +508,221 @@ pub(super) fn rollback_unique(
     transition_unique_operation(root, operation_id, OPERATION_ROLLED_BACK, cancellation)
 }
 
+/// Return active unique mutations. The storage coordinator filters this list
+/// through its durable operation-lock markers before attempting recovery, so
+/// lower-level callers retain ownership of their manually managed operations.
+pub(super) fn active_unique_mutations(
+    root: &Path,
+) -> EngineResult<Vec<(GlobalOperationId, GlobalUniqueMutation)>> {
+    let Some((connection, _)) = open_existing(root)? else {
+        return Ok(Vec::new());
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT operation_id FROM briskdb_global_operations
+             WHERE operation_kind = ?1 AND operation_state = ?2
+             ORDER BY operation_id",
+        )
+        .map_err(sqlite_error::storage)?;
+    let operation_ids = statement
+        .query_map(params![UNIQUE_OPERATION, OPERATION_ACTIVE], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .map_err(sqlite_error::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error::storage)?;
+    drop(statement);
+    operation_ids
+        .into_iter()
+        .map(|bytes| {
+            let bytes: [u8; 16] = bytes
+                .try_into()
+                .map_err(|_| corrupt("global operation has an invalid identifier"))?;
+            let operation_id = GlobalOperationId::new(bytes)
+                .map_err(|_| corrupt("global operation has an invalid identifier"))?;
+            let transaction = connection
+                .unchecked_transaction()
+                .map_err(sqlite_error::storage)?;
+            let stored = load_stored_unique_mutation(&transaction, operation_id)?;
+            transaction.commit().map_err(sqlite_error::storage)?;
+            Ok((operation_id, public_unique_mutation(stored)?))
+        })
+        .collect()
+}
+
+/// Finalize one coordinator-owned reservation and refresh every affected
+/// unique-index source-shard snapshot in the same global SQLite transaction.
+/// The physical shard commit happens first; an active durable reservation
+/// remains conservative until this transaction succeeds or recovery retries.
+pub(super) fn finalize_unique_write(
+    storage: &Storage,
+    operation_id: GlobalOperationId,
+    cancellation: &CancellationToken,
+) -> EngineResult<GlobalUniqueReservation> {
+    ensure_authority_not_cancelled(cancellation, "before finalizing an indexed write")?;
+    let (mut connection, _) = open_existing(&storage.root)?
+        .ok_or_else(|| corrupt("global uniqueness operation has no physical authority"))?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let (kind, current) = load_operation_kind_and_state(&transaction, operation_id)?
+        .ok_or_else(|| unknown_operation(operation_id))?;
+    if kind != UNIQUE_OPERATION {
+        return Err(operation_reuse_error(operation_id));
+    }
+    let mutation = load_stored_unique_mutation(&transaction, operation_id)?;
+    if current == OPERATION_FINALIZED {
+        transaction.commit().map_err(sqlite_error::storage)?;
+        return Ok(GlobalUniqueReservation::from_validated(
+            operation_id,
+            mutation.index_id,
+            GlobalOperationState::Finalized,
+        ));
+    }
+    if current != OPERATION_ACTIVE {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "global unique operation {:?} is already {}",
+                operation_id,
+                operation_state(current)?.code()
+            ),
+        ));
+    }
+    let index = storage
+        .catalog
+        .logical()
+        .global_index_by_id(mutation.index_id)
+        .ok_or_else(|| corrupt("global unique operation references a missing index"))?;
+    if !index.is_unique() || index.lifecycle() != GlobalIndexLifecycle::Ready {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "global index {} is not ready for authoritative write finalization",
+                index.id()
+            ),
+        ));
+    }
+    validate_physical_authority(&transaction, index, storage.shard_count())?;
+
+    let affected_shards = [&mutation.previous, &mutation.new]
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.1 as u16)
+        .collect::<BTreeSet<_>>();
+    for shard in affected_shards {
+        refresh_unique_shard_snapshot(storage, &transaction, index, shard, cancellation)?;
+    }
+    finalize_stored_unique_mutation(&transaction, &mutation)?;
+    complete_unique_transition(&transaction, operation_id, &mutation, OPERATION_FINALIZED)?;
+    ensure_authority_not_cancelled(cancellation, "before committing an indexed write authority")?;
+    abort_at_authority_test_boundary("unique-write-finalize-before-commit");
+    transaction.commit().map_err(sqlite_error::storage)?;
+    abort_at_authority_test_boundary("unique-write-finalize-after-commit");
+    Ok(GlobalUniqueReservation::from_validated(
+        operation_id,
+        mutation.index_id,
+        GlobalOperationState::Finalized,
+    ))
+}
+
+/// Refresh authoritative unique-index entries and source checkpoints after a
+/// committed physical write, including partial or NULL-distinct rows that do
+/// not require a key reservation.
+pub(super) fn refresh_unique_write_indexes(
+    storage: &Storage,
+    index_ids: &[GlobalIndexId],
+    shard: u16,
+    cancellation: &CancellationToken,
+) -> EngineResult<()> {
+    if index_ids.is_empty() {
+        return Ok(());
+    }
+    ensure_authority_not_cancelled(cancellation, "before refreshing indexed write snapshots")?;
+    let (mut connection, _) = open_existing(&storage.root)?
+        .ok_or_else(|| corrupt("ready global index has no physical storage"))?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    for index_id in index_ids {
+        let index = storage
+            .catalog
+            .logical()
+            .global_index_by_id(*index_id)
+            .ok_or_else(|| corrupt("indexed write references a missing global index"))?;
+        if !index.is_unique() || index.lifecycle() != GlobalIndexLifecycle::Ready {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "global index {} is not ready for authoritative snapshot maintenance",
+                    index.id()
+                ),
+            ));
+        }
+        validate_physical_authority(&transaction, index, storage.shard_count())?;
+        refresh_unique_shard_snapshot(storage, &transaction, index, shard, cancellation)?;
+    }
+    ensure_authority_not_cancelled(cancellation, "before committing indexed write snapshots")?;
+    transaction.commit().map_err(sqlite_error::storage)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OrphanedUniqueWriteDecision {
+    Finalize,
+    RollBack,
+}
+
+/// Resolve whether the physical half of an orphaned coordinator operation
+/// committed. Active key reservations prevent another indexed write from
+/// changing either affected owner until this decision is made.
+pub(super) fn decide_orphaned_unique_write(
+    storage: &Storage,
+    mutation: &GlobalUniqueMutation,
+    cancellation: &CancellationToken,
+) -> EngineResult<OrphanedUniqueWriteDecision> {
+    ensure_authority_not_cancelled(cancellation, "before recovering an indexed write")?;
+    let index = storage
+        .catalog
+        .logical()
+        .global_index_by_id(mutation.index_id())
+        .ok_or_else(|| corrupt("global unique operation references a missing index"))?;
+    let new_matches = mutation
+        .new_entry()
+        .map(|(key, owner)| {
+            probe_unique_owner(storage, index, owner, cancellation)
+                .map(|observed| observed.as_ref() == Some(key))
+        })
+        .transpose()?;
+    let previous_matches = mutation
+        .previous_entry()
+        .map(|(key, owner)| {
+            probe_unique_owner(storage, index, owner, cancellation)
+                .map(|observed| observed.as_ref() == Some(key))
+        })
+        .transpose()?;
+    match (mutation.previous_entry(), mutation.new_entry()) {
+        (None, Some(_)) => Ok(if new_matches == Some(true) {
+            OrphanedUniqueWriteDecision::Finalize
+        } else {
+            OrphanedUniqueWriteDecision::RollBack
+        }),
+        (Some(_), None) => Ok(if previous_matches == Some(true) {
+            OrphanedUniqueWriteDecision::RollBack
+        } else {
+            OrphanedUniqueWriteDecision::Finalize
+        }),
+        (Some(previous), Some(new)) if previous == new => Ok(OrphanedUniqueWriteDecision::Finalize),
+        (Some(_), Some(_)) => match (previous_matches, new_matches) {
+            (Some(true), Some(false)) => Ok(OrphanedUniqueWriteDecision::RollBack),
+            (Some(false), Some(true)) => Ok(OrphanedUniqueWriteDecision::Finalize),
+            _ => Err(corrupt(
+                "orphaned global unique write has an ambiguous physical outcome",
+            )),
+        },
+        (None, None) => Err(corrupt("global unique operation has no affected key")),
+    }
+}
+
 fn transition_unique_operation(
     root: &Path,
     operation_id: GlobalOperationId,
@@ -536,6 +763,34 @@ fn transition_unique_operation(
     if target == OPERATION_FINALIZED {
         finalize_stored_unique_mutation(&transaction, &mutation)?;
     }
+    complete_unique_transition(&transaction, operation_id, &mutation, target)?;
+    ensure_authority_not_cancelled(cancellation, "before committing a unique transition")?;
+    let boundary = if target == OPERATION_FINALIZED {
+        "unique-finalize-before-commit"
+    } else {
+        "unique-rollback-before-commit"
+    };
+    abort_at_authority_test_boundary(boundary);
+    transaction.commit().map_err(sqlite_error::storage)?;
+    let boundary = if target == OPERATION_FINALIZED {
+        "unique-finalize-after-commit"
+    } else {
+        "unique-rollback-after-commit"
+    };
+    abort_at_authority_test_boundary(boundary);
+    Ok(GlobalUniqueReservation::from_validated(
+        operation_id,
+        mutation.index_id,
+        operation_state(target)?,
+    ))
+}
+
+fn complete_unique_transition(
+    transaction: &Transaction<'_>,
+    operation_id: GlobalOperationId,
+    mutation: &StoredUniqueMutation,
+    target: i64,
+) -> EngineResult<()> {
     let deleted = transaction
         .execute(
             "DELETE FROM briskdb_global_unique_reservations WHERE operation_id = ?1",
@@ -559,25 +814,7 @@ fn transition_unique_operation(
             "global unique operation state changed unexpectedly",
         ));
     }
-    ensure_authority_not_cancelled(cancellation, "before committing a unique transition")?;
-    let boundary = if target == OPERATION_FINALIZED {
-        "unique-finalize-before-commit"
-    } else {
-        "unique-rollback-before-commit"
-    };
-    abort_at_authority_test_boundary(boundary);
-    transaction.commit().map_err(sqlite_error::storage)?;
-    let boundary = if target == OPERATION_FINALIZED {
-        "unique-finalize-after-commit"
-    } else {
-        "unique-rollback-after-commit"
-    };
-    abort_at_authority_test_boundary(boundary);
-    Ok(GlobalUniqueReservation::from_validated(
-        operation_id,
-        mutation.index_id,
-        operation_state(target)?,
-    ))
+    Ok(())
 }
 
 pub(super) fn lease_values(
@@ -915,6 +1152,37 @@ fn load_stored_unique_mutation(
         new,
         previous,
     })
+}
+
+fn public_unique_mutation(stored: StoredUniqueMutation) -> EngineResult<GlobalUniqueMutation> {
+    let decode_entry = |entry: StoredUniqueEntry| {
+        Ok((
+            CanonicalIndexKey::from_bytes(&entry.0)?,
+            GlobalIndexOwner::new(entry.1 as u16, entry.2)?,
+        ))
+    };
+    match (stored.previous, stored.new) {
+        (None, Some(new)) => {
+            let (key, owner) = decode_entry(new)?;
+            Ok(GlobalUniqueMutation::claim(stored.index_id, key, owner))
+        }
+        (Some(previous), None) => {
+            let (key, owner) = decode_entry(previous)?;
+            Ok(GlobalUniqueMutation::release(stored.index_id, key, owner))
+        }
+        (Some(previous), Some(new)) => {
+            let (previous_key, previous_owner) = decode_entry(previous)?;
+            let (new_key, new_owner) = decode_entry(new)?;
+            Ok(GlobalUniqueMutation::replace(
+                stored.index_id,
+                previous_key,
+                previous_owner,
+                new_key,
+                new_owner,
+            ))
+        }
+        (None, None) => Err(corrupt("global unique operation has no affected key")),
+    }
 }
 
 fn stored_optional_entry(
@@ -2983,6 +3251,26 @@ fn read_source_entry(
     shard: u16,
     locator_count: usize,
 ) -> EngineResult<SourceEntry> {
+    let (encoded_key, reserves_unique_key) = read_source_key(row, index, shard)?;
+    let locator_values = (0..locator_count)
+        .map(|offset| {
+            row.get_ref(index.key_parts().len() + offset)
+                .map_err(sqlite_error::statement)
+        })
+        .collect::<EngineResult<Vec<_>>>()?;
+    let encoded_locator = encode_locator(&locator_values)?;
+    Ok(SourceEntry {
+        encoded_key,
+        encoded_locator,
+        reserves_unique_key,
+    })
+}
+
+fn read_source_key(
+    row: &rusqlite::Row<'_>,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+) -> EngineResult<(CanonicalIndexKey, bool)> {
     let values = index
         .key_parts()
         .iter()
@@ -3010,20 +3298,21 @@ fn read_source_entry(
         })
         .collect::<Vec<_>>();
     let encoded_key = CanonicalIndexKey::encode(&parts)?;
-    let locator_values = (0..locator_count)
-        .map(|offset| {
-            row.get_ref(index.key_parts().len() + offset)
-                .map_err(sqlite_error::statement)
-        })
-        .collect::<EngineResult<Vec<_>>>()?;
-    let encoded_locator = encode_locator(&locator_values)?;
     let reserves_unique_key = index.is_unique()
         && CanonicalIndexKey::encode_unique(&parts, index.null_semantics())?.is_some();
-    Ok(SourceEntry {
-        encoded_key,
-        encoded_locator,
-        reserves_unique_key,
-    })
+    Ok((encoded_key, reserves_unique_key))
+}
+
+/// Encode one qualifying captured source row with the exact key semantics used
+/// by offline builds. Rows excluded by a partial predicate never reach this
+/// helper; unique NULL-distinct rows return `None`.
+pub(super) fn read_captured_unique_key(
+    row: &rusqlite::Row<'_>,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+) -> EngineResult<Option<CanonicalIndexKey>> {
+    let (key, reserves) = read_source_key(row, index, shard)?;
+    Ok(reserves.then_some(key))
 }
 
 fn insert_entry(
@@ -3088,6 +3377,79 @@ fn insert_entry(
             locator_label(&entry.encoded_locator),
         ),
     ))
+}
+
+fn insert_snapshot_entry(
+    transaction: &Transaction<'_>,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+    source_ordinal: u64,
+    entry: &SourceEntry,
+) -> EngineResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO briskdb_global_index_entries (
+                 index_id, encoded_key, source_shard, source_ordinal, source_locator
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                to_sqlite_id(index.id())?,
+                entry.encoded_key.as_bytes(),
+                i64::from(shard),
+                to_sqlite_u64(source_ordinal, "source row ordinal")?,
+                &entry.encoded_locator,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
+fn refresh_unique_shard_snapshot(
+    storage: &Storage,
+    transaction: &Transaction<'_>,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+    cancellation: &CancellationToken,
+) -> EngineResult<()> {
+    transaction
+        .execute(
+            "DELETE FROM briskdb_global_index_entries
+             WHERE index_id = ?1 AND source_shard = ?2",
+            params![to_sqlite_id(index.id())?, i64::from(shard)],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "DELETE FROM briskdb_global_index_checkpoints
+             WHERE index_id = ?1 AND source_shard = ?2",
+            params![to_sqlite_id(index.id())?, i64::from(shard)],
+        )
+        .map_err(sqlite_error::storage)?;
+    let outcome = scan_source_shard_with_visitor(
+        storage,
+        index,
+        shard,
+        cancellation,
+        |source_ordinal, entry| {
+            insert_snapshot_entry(transaction, index, shard, source_ordinal, entry)
+        },
+    )?;
+    write_checkpoint(transaction, index.id(), shard, &outcome)?;
+    let indexed_rows = transaction
+        .query_row(
+            "SELECT COALESCE(SUM(indexed_rows), 0)
+             FROM briskdb_global_index_checkpoints WHERE index_id = ?1",
+            [to_sqlite_id(index.id())?],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "UPDATE briskdb_global_index_builds SET indexed_rows = ?1
+             WHERE index_id = ?2 AND build_state = ?3",
+            params![indexed_rows, to_sqlite_id(index.id())?, COMPLETE],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
 }
 
 fn delete_shard_rows(
@@ -3395,6 +3757,64 @@ fn scan_sql(index: &GlobalIndexMetadata, table: &str, locator: &SourceLocator) -
     sql
 }
 
+fn probe_unique_owner(
+    storage: &Storage,
+    index: &GlobalIndexMetadata,
+    owner: &GlobalIndexOwner,
+    cancellation: &CancellationToken,
+) -> EngineResult<Option<CanonicalIndexKey>> {
+    ensure_authority_not_cancelled(cancellation, "while probing an indexed write owner")?;
+    if owner.source_shard() >= storage.shard_count() {
+        return Err(corrupt(
+            "global unique owner points outside the shard layout",
+        ));
+    }
+    let source = storage.open_shard(owner.source_shard())?;
+    let table = storage
+        .catalog
+        .logical()
+        .table_by_id(index.table_id())
+        .ok_or_else(|| corrupt("global index references a missing table"))?;
+    let locator = inspect_source_locator(&source, table.name())?;
+    let parameters = decode_locator(owner.locator(), locator.expressions().len())?;
+    let expressions = index
+        .key_parts()
+        .iter()
+        .map(|part| match part.source() {
+            GlobalIndexKeySource::Column(column) => quote_identifier(column),
+            GlobalIndexKeySource::Expression(expression) => format!("({expression})"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!(
+        "SELECT {expressions} FROM main.{} WHERE ({})",
+        quote_identifier(table.name()),
+        locator.predicate_sql()
+    );
+    if let Some(predicate) = index.predicate() {
+        sql.push_str(" AND (");
+        sql.push_str(predicate);
+        sql.push(')');
+    }
+    let mut statement = source.prepare(&sql).map_err(sqlite_error::statement)?;
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(parameters))
+        .map_err(sqlite_error::statement)?;
+    let result = match rows.next().map_err(sqlite_error::statement)? {
+        Some(row) => {
+            let (key, reserves) = read_source_key(row, index, owner.source_shard())?;
+            if rows.next().map_err(sqlite_error::statement)?.is_some() {
+                return Err(corrupt(
+                    "global unique owner locator identifies multiple physical rows",
+                ));
+            }
+            reserves.then_some(key)
+        }
+        None => None,
+    };
+    Ok(result)
+}
+
 fn read_key_value(
     value: ValueRef<'_>,
     key_type: GlobalIndexKeyType,
@@ -3453,7 +3873,7 @@ fn read_key_value(
     }
 }
 
-fn encode_locator(values: &[ValueRef<'_>]) -> EngineResult<Vec<u8>> {
+pub(super) fn encode_locator(values: &[ValueRef<'_>]) -> EngineResult<Vec<u8>> {
     let count = u16::try_from(values.len()).map_err(|_| {
         EngineError::new(
             EngineErrorKind::LimitExceeded,
@@ -3486,6 +3906,101 @@ fn encode_locator(values: &[ValueRef<'_>]) -> EngineResult<Vec<u8>> {
         }
     }
     Ok(output)
+}
+
+fn decode_locator(input: &[u8], expected_count: usize) -> EngineResult<Vec<SqliteValue>> {
+    if input.len() < 10 || &input[..4] != LOCATOR_MAGIC {
+        return Err(corrupt(
+            "global-index owner has an invalid locator encoding",
+        ));
+    }
+    let version = u32::from_be_bytes(
+        input[4..8]
+            .try_into()
+            .map_err(|_| corrupt("global-index owner has a truncated locator version"))?,
+    );
+    if version != LOCATOR_VERSION {
+        return Err(corrupt(
+            "global-index owner has an incompatible locator version",
+        ));
+    }
+    let count =
+        usize::from(u16::from_be_bytes(input[8..10].try_into().map_err(
+            |_| corrupt("global-index owner has a truncated locator count"),
+        )?));
+    if count != expected_count {
+        return Err(corrupt(
+            "global-index owner locator does not match the physical table",
+        ));
+    }
+    let mut cursor = 10_usize;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        let tag = *input
+            .get(cursor)
+            .ok_or_else(|| corrupt("global-index owner has a truncated locator"))?;
+        cursor += 1;
+        let value = match tag {
+            0 => SqliteValue::Null,
+            1 => {
+                let end = cursor
+                    .checked_add(8)
+                    .ok_or_else(|| corrupt("global-index locator length overflowed"))?;
+                let bytes = input
+                    .get(cursor..end)
+                    .ok_or_else(|| corrupt("global-index owner has a truncated integer locator"))?;
+                cursor = end;
+                SqliteValue::Integer(i64::from_be_bytes(
+                    bytes.try_into().expect("checked integer locator length"),
+                ))
+            }
+            2 => {
+                let end = cursor
+                    .checked_add(8)
+                    .ok_or_else(|| corrupt("global-index locator length overflowed"))?;
+                let bytes = input
+                    .get(cursor..end)
+                    .ok_or_else(|| corrupt("global-index owner has a truncated real locator"))?;
+                cursor = end;
+                SqliteValue::Real(f64::from_bits(u64::from_be_bytes(
+                    bytes.try_into().expect("checked real locator length"),
+                )))
+            }
+            3 | 4 => {
+                let length_end = cursor
+                    .checked_add(4)
+                    .ok_or_else(|| corrupt("global-index locator length overflowed"))?;
+                let length_bytes = input
+                    .get(cursor..length_end)
+                    .ok_or_else(|| corrupt("global-index owner has a truncated locator length"))?;
+                let length = u32::from_be_bytes(
+                    length_bytes
+                        .try_into()
+                        .expect("checked locator length prefix"),
+                ) as usize;
+                let end = length_end
+                    .checked_add(length)
+                    .ok_or_else(|| corrupt("global-index locator length overflowed"))?;
+                let bytes = input
+                    .get(length_end..end)
+                    .ok_or_else(|| corrupt("global-index owner has a truncated locator value"))?;
+                cursor = end;
+                if tag == 3 {
+                    SqliteValue::Text(String::from_utf8(bytes.to_vec()).map_err(|_| {
+                        corrupt("global-index owner has an invalid UTF-8 text locator")
+                    })?)
+                } else {
+                    SqliteValue::Blob(bytes.to_vec())
+                }
+            }
+            _ => return Err(corrupt("global-index owner has an unknown locator tag")),
+        };
+        values.push(value);
+    }
+    if cursor != input.len() {
+        return Err(corrupt("global-index owner locator has trailing bytes"));
+    }
+    Ok(values)
 }
 
 fn valid_locator_encoding(input: &[u8]) -> bool {

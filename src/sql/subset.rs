@@ -161,7 +161,7 @@ fn validate_statement(
         AstStatement::CreateTable(table) => validate_create_table(table, dialect, statement_index),
         AstStatement::CreateIndex(index) => validate_create_index(index),
         AstStatement::Query(query) => validate_query(query, validation),
-        AstStatement::Insert(insert) => validate_insert(insert, validation),
+        AstStatement::Insert(insert) => validate_insert(insert, dialect, validation),
         AstStatement::Update(update) => validate_update(update, validation),
         AstStatement::Delete(delete) => validate_delete(delete, validation),
         AstStatement::StartTransaction {
@@ -684,7 +684,11 @@ fn validate_limit_clause(
     Ok(())
 }
 
-fn validate_insert(insert: &Insert, validation: &mut ValidationState) -> SubsetResult {
+fn validate_insert(
+    insert: &Insert,
+    dialect: SqlDialect,
+    validation: &mut ValidationState,
+) -> SubsetResult {
     let Insert {
         insert_token: _,
         optimizer_hints,
@@ -714,8 +718,9 @@ fn validate_insert(insert: &Insert, validation: &mut ValidationState) -> SubsetR
         multi_table_else_clause,
     } = insert;
 
+    let sqlite_conflict_clause = dialect == SqlDialect::Sqlite && or.is_some();
     if !optimizer_hints.is_empty()
-        || or.is_some()
+        || (or.is_some() && !sqlite_conflict_clause)
         || *ignore
         || !into
         || table_alias.is_some()
@@ -1476,7 +1481,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_requires_explicit_equal_width_values_without_modifiers() {
+    fn insert_requires_explicit_equal_width_values_and_bounded_sqlite_conflicts() {
         assert_supported(
             SqlDialect::PostgreSql,
             "INSERT INTO widgets(id, tenant_id) VALUES ($1, 1), (2, $2)",
@@ -1494,6 +1499,10 @@ mod tests {
         assert_unsupported(
             SqlDialect::Sqlite,
             "INSERT INTO widgets(id) VALUES (1) ON CONFLICT(id) DO NOTHING",
+        );
+        assert_supported(
+            SqlDialect::Sqlite,
+            "INSERT OR IGNORE INTO widgets(id) VALUES (1)",
         );
         assert_unsupported(
             SqlDialect::MySql,

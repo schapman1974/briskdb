@@ -24,6 +24,20 @@ class Record(Base):
 
 
 class PostgreSQLClientMatrix(unittest.TestCase):
+    def test_psycopg_autocommit_enforces_global_unique_index(self) -> None:
+        dsn = os.environ[DSN_ENV]
+        with psycopg.connect(dsn, autocommit=True) as connection:
+            connection.execute(
+                "INSERT INTO indexed_records (tenant_id, payload) VALUES (%s, %s)",
+                ("psycopg-index-a", "psycopg-global-key"),
+            )
+            with self.assertRaises(psycopg.errors.UniqueViolation):
+                connection.execute(
+                    "INSERT INTO indexed_records (tenant_id, payload) VALUES (%s, %s)",
+                    ("psycopg-index-b", "psycopg-global-key"),
+                )
+            self.assertEqual(connection.execute("SELECT 1").fetchone(), ("1",))
+
     def test_psycopg_transaction_error_recovery_and_reconnect(self) -> None:
         dsn = os.environ[DSN_ENV]
         with psycopg.connect(dsn) as connection:
