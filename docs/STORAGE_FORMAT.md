@@ -1317,14 +1317,14 @@ This routing format is intentionally distinct from the tagged, order-preserving
 [canonical global-index key format](INDEX_KEY_ENCODING.md). Version 13 records
 the codec version in every global-index definition but does not persist physical
 index entries or change shard placement. Physical entries live in the separate
-storage-version-1 `global-indexes/global.sqlite` authority, never in a shard.
+storage-version-2 `global-indexes/global.sqlite` authority, never in a shard.
 
-### Physical global-index storage version 1
+### Physical global-index storage version 2
 
 The selected `SharedSqliteV1` layout is one real regular file at
 `global-indexes/global.sqlite`. Its `application_id` is `0x42524749`, its
-`user_version` is `1`, its journal mode is `WAL`, and writers use
-`synchronous=FULL`. The exact five-table schema and ownership rules are listed
+`user_version` is `2`, its journal mode is `WAL`, and writers use
+`synchronous=FULL`. The build tables and ownership rules are listed
 in [offline global-index construction](GLOBAL_INDEX_BUILD.md).
 
 One build row binds the index ID to a BLAKE3 digest of its complete manifest
@@ -1335,6 +1335,14 @@ of canonical key plus versioned physical locator in locator order. Entries use
 `(index_id, encoded_key, source_shard, source_locator)` as their primary key and
 retain a unique per-shard scan ordinal so validation can replay digest order;
 unique reservations use `(index_id, encoded_key)`.
+
+Version 2 adds a shared operation journal, atomic unique-key locks and mutation
+records, per-index integer sequence heads, and irrevocable range leases.
+Sixteen-byte operation IDs plus request digests make exact retries idempotent.
+Unique reserve/finalize/rollback transactions and value lease state transitions
+are described in [global uniqueness and value authority](GLOBAL_INDEX_AUTHORITY.md).
+Startup upgrades version 1 in one transaction only after acquiring sole-process
+ownership.
 
 Source-shard entries and their checkpoint commit together. Resume re-hashes
 every completed prefix shard and restarts from zero if application data changed.

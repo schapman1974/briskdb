@@ -34,8 +34,8 @@ must stop every service and embedded process using the root, open one exclusive
 <data-root>/global-indexes/global.sqlite
 ```
 
-It is a separate, application-identified, storage-version-1 SQLite database in
-WAL mode with `synchronous=FULL`. It contains five BriskDB-owned tables:
+It is a separate, application-identified, storage-version-2 SQLite database in
+WAL mode with `synchronous=FULL`. It contains ten BriskDB-owned tables:
 
 | Table | Authority |
 | --- | --- |
@@ -44,6 +44,15 @@ WAL mode with `synchronous=FULL`. It contains five BriskDB-owned tables:
 | `briskdb_global_index_checkpoints` | One digest and row count for each completed source shard |
 | `briskdb_global_index_entries` | Canonical key to source shard, scan ordinal, and typed physical row locator |
 | `briskdb_global_index_unique_keys` | One reservation per key when the definition is unique |
+| `briskdb_global_operations` | Idempotent uniqueness/value operation state and request digest |
+| `briskdb_global_unique_mutations` | Old/new owner intent for a unique operation |
+| `briskdb_global_unique_reservations` | Active atomic locks on affected unique keys |
+| `briskdb_global_value_sequences` | Per-index positive integer head and fence token |
+| `briskdb_global_value_leases` | Irrevocable operation-bound value ranges |
+
+Storage version 1 is upgraded atomically during sole-process startup. The
+online state machines are documented in [global uniqueness and value
+authority](GLOBAL_INDEX_AUTHORITY.md).
 
 Rowid tables retain an unshadowed physical rowid locator. `WITHOUT ROWID`
 tables retain the complete ordered primary key. The locator is a typed,

@@ -410,7 +410,7 @@ requires an earlier dependency:
    - [x] [#229](https://github.com/schapman1974/briskdb/issues/229) — storage-topology prototype
    - [x] [#230](https://github.com/schapman1974/briskdb/issues/230) — offline index construction
    - [x] [#231](https://github.com/schapman1974/briskdb/issues/231) — validation, repair, and rebuild
-   - [ ] [#232](https://github.com/schapman1974/briskdb/issues/232) — unique reservations and global allocation
+   - [x] [#232](https://github.com/schapman1974/briskdb/issues/232) — unique reservations and global allocation
    - [ ] [#233](https://github.com/schapman1974/briskdb/issues/233) — authoritative write maintenance
    - [ ] [#234](https://github.com/schapman1974/briskdb/issues/234) — exact indexed routing
    - [ ] [#235](https://github.com/schapman1974/briskdb/issues/235) — candidate verification and repair

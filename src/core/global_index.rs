@@ -11,6 +11,8 @@ use super::{
 pub(crate) const MAX_GLOBAL_INDEXES: usize = 4_096;
 pub(crate) const MAX_GLOBAL_INDEX_PARTS: usize = 16;
 pub(crate) const MAX_GLOBAL_INDEX_SQL_BYTES: usize = 4_096;
+pub(crate) const MAX_GLOBAL_OWNER_LOCATOR_BYTES: usize = 4_096;
+pub(crate) const MAX_GLOBAL_VALUE_LEASE_COUNT: u32 = 65_536;
 const DEFAULT_MAX_REPORTED_VALIDATION_ISSUES: u16 = 128;
 const MAX_REPORTED_VALIDATION_ISSUES: u16 = 1_024;
 const MAX_VALIDATION_SAMPLES_PER_SHARD: u16 = 4_096;
@@ -50,6 +52,263 @@ impl GlobalIndexId {
 impl fmt::Display for GlobalIndexId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+/// Caller-owned, stable identity for one recoverable global authority operation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GlobalOperationId([u8; 16]);
+
+impl GlobalOperationId {
+    /// Validate a nonzero operation identity. Retrying with the same identity
+    /// and exact request returns the original durable result.
+    pub fn new(value: [u8; 16]) -> EngineResult<Self> {
+        if value == [0; 16] {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "global operation IDs must not be all zero",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for GlobalOperationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("GlobalOperationId")
+            .field(&format_args!("{:02x}{:02x}…", self.0[0], self.0[1]))
+            .finish()
+    }
+}
+
+/// Opaque physical owner recorded by the global uniqueness authority.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct GlobalIndexOwner {
+    source_shard: u16,
+    locator: Box<[u8]>,
+}
+
+impl GlobalIndexOwner {
+    pub fn new(source_shard: u16, locator: impl Into<Vec<u8>>) -> EngineResult<Self> {
+        let locator = locator.into();
+        if source_shard > 63 {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "global-index owner shards must be in 0..=63",
+            ));
+        }
+        if locator.is_empty() || locator.len() > MAX_GLOBAL_OWNER_LOCATOR_BYTES {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!(
+                    "global-index owner locators must contain 1..={MAX_GLOBAL_OWNER_LOCATOR_BYTES} bytes"
+                ),
+            ));
+        }
+        Ok(Self {
+            source_shard,
+            locator: locator.into_boxed_slice(),
+        })
+    }
+
+    pub const fn source_shard(&self) -> u16 {
+        self.source_shard
+    }
+
+    pub fn locator(&self) -> &[u8] {
+        &self.locator
+    }
+}
+
+impl fmt::Debug for GlobalIndexOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GlobalIndexOwner")
+            .field("source_shard", &self.source_shard)
+            .field("locator", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One atomic change to an authoritative global unique key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalUniqueMutation {
+    index_id: GlobalIndexId,
+    new: Option<(CanonicalIndexKey, GlobalIndexOwner)>,
+    previous: Option<(CanonicalIndexKey, GlobalIndexOwner)>,
+}
+
+impl GlobalUniqueMutation {
+    pub fn claim(index_id: GlobalIndexId, key: CanonicalIndexKey, owner: GlobalIndexOwner) -> Self {
+        Self {
+            index_id,
+            new: Some((key, owner)),
+            previous: None,
+        }
+    }
+
+    pub fn release(
+        index_id: GlobalIndexId,
+        key: CanonicalIndexKey,
+        owner: GlobalIndexOwner,
+    ) -> Self {
+        Self {
+            index_id,
+            new: None,
+            previous: Some((key, owner)),
+        }
+    }
+
+    pub fn replace(
+        index_id: GlobalIndexId,
+        previous_key: CanonicalIndexKey,
+        previous_owner: GlobalIndexOwner,
+        new_key: CanonicalIndexKey,
+        new_owner: GlobalIndexOwner,
+    ) -> Self {
+        Self {
+            index_id,
+            new: Some((new_key, new_owner)),
+            previous: Some((previous_key, previous_owner)),
+        }
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+
+    pub fn new_entry(&self) -> Option<(&CanonicalIndexKey, &GlobalIndexOwner)> {
+        self.new.as_ref().map(|(key, owner)| (key, owner))
+    }
+
+    pub fn previous_entry(&self) -> Option<(&CanonicalIndexKey, &GlobalIndexOwner)> {
+        self.previous.as_ref().map(|(key, owner)| (key, owner))
+    }
+}
+
+/// Durable lifecycle shared by uniqueness reservations and value leases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GlobalOperationState {
+    Active,
+    Finalized,
+    RolledBack,
+}
+
+impl GlobalOperationState {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Finalized => "finalized",
+            Self::RolledBack => "rolled_back",
+        }
+    }
+
+    pub(crate) fn from_validated(value: i64) -> Self {
+        match value {
+            1 => Self::Active,
+            2 => Self::Finalized,
+            3 => Self::RolledBack,
+            _ => unreachable!("validated global operation state"),
+        }
+    }
+}
+
+/// Durable result of reserving, finalizing, or rolling back one unique mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalUniqueReservation {
+    operation_id: GlobalOperationId,
+    index_id: GlobalIndexId,
+    state: GlobalOperationState,
+}
+
+impl GlobalUniqueReservation {
+    pub(crate) const fn from_validated(
+        operation_id: GlobalOperationId,
+        index_id: GlobalIndexId,
+        state: GlobalOperationState,
+    ) -> Self {
+        Self {
+            operation_id,
+            index_id,
+            state,
+        }
+    }
+
+    pub const fn operation_id(&self) -> GlobalOperationId {
+        self.operation_id
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+
+    pub const fn state(&self) -> GlobalOperationState {
+        self.state
+    }
+}
+
+/// One collision-free, irrevocable range of positive global integer values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalValueLease {
+    operation_id: GlobalOperationId,
+    index_id: GlobalIndexId,
+    state: GlobalOperationState,
+    first: u64,
+    last: u64,
+    fence_token: u64,
+}
+
+impl GlobalValueLease {
+    pub(crate) const fn from_validated(
+        operation_id: GlobalOperationId,
+        index_id: GlobalIndexId,
+        state: GlobalOperationState,
+        first: u64,
+        last: u64,
+        fence_token: u64,
+    ) -> Self {
+        Self {
+            operation_id,
+            index_id,
+            state,
+            first,
+            last,
+            fence_token,
+        }
+    }
+
+    pub const fn operation_id(&self) -> GlobalOperationId {
+        self.operation_id
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+
+    pub const fn state(&self) -> GlobalOperationState {
+        self.state
+    }
+
+    pub const fn first(&self) -> u64 {
+        self.first
+    }
+
+    pub const fn last(&self) -> u64 {
+        self.last
+    }
+
+    pub const fn count(&self) -> u64 {
+        self.last - self.first + 1
+    }
+
+    pub const fn fence_token(&self) -> u64 {
+        self.fence_token
     }
 }
 
@@ -574,6 +833,7 @@ pub enum GlobalIndexValidationIssueKind {
     MissingUniqueReservation,
     DanglingUniqueReservation,
     MismatchedUniqueReservation,
+    ActiveUniqueReservation,
 }
 
 impl GlobalIndexValidationIssueKind {
@@ -597,6 +857,7 @@ impl GlobalIndexValidationIssueKind {
             Self::MissingUniqueReservation => "missing_unique_reservation",
             Self::DanglingUniqueReservation => "dangling_unique_reservation",
             Self::MismatchedUniqueReservation => "mismatched_unique_reservation",
+            Self::ActiveUniqueReservation => "active_unique_reservation",
         }
     }
 }
@@ -954,5 +1215,34 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn authority_types_are_bounded_owned_and_redact_locators() {
+        assert!(GlobalOperationId::new([0; 16]).is_err());
+        let operation = GlobalOperationId::new([9; 16]).unwrap();
+        assert_eq!(operation.as_bytes(), [9; 16]);
+        assert!(!format!("{operation:?}").contains("09090909"));
+
+        assert!(GlobalIndexOwner::new(64, vec![1]).is_err());
+        assert!(GlobalIndexOwner::new(0, Vec::new()).is_err());
+        assert!(GlobalIndexOwner::new(0, vec![1; MAX_GLOBAL_OWNER_LOCATOR_BYTES + 1]).is_err());
+        let owner = GlobalIndexOwner::new(7, b"secret-row".to_vec()).unwrap();
+        assert_eq!(owner.source_shard(), 7);
+        assert_eq!(owner.locator(), b"secret-row");
+        assert!(!format!("{owner:?}").contains("secret-row"));
+
+        let index_id = GlobalIndexId::new(3).unwrap();
+        let key = CanonicalIndexKey::encode_values(&["key".into()]).unwrap();
+        let mutation = GlobalUniqueMutation::replace(
+            index_id,
+            key.clone(),
+            owner.clone(),
+            key,
+            GlobalIndexOwner::new(6, b"new-row".to_vec()).unwrap(),
+        );
+        assert_eq!(mutation.index_id(), index_id);
+        assert!(mutation.previous_entry().is_some());
+        assert!(mutation.new_entry().is_some());
     }
 }

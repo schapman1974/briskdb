@@ -39,12 +39,15 @@ pub(crate) use generated_id::AllocationOwnerMap;
 pub use global_index::{
     GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart,
     GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata,
-    GlobalIndexRepairReport, GlobalIndexStorageTopology, GlobalIndexValidationIssue,
-    GlobalIndexValidationIssueKind, GlobalIndexValidationMode, GlobalIndexValidationOptions,
-    GlobalIndexValidationReport, HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1,
+    GlobalIndexOwner, GlobalIndexRepairReport, GlobalIndexStorageTopology,
+    GlobalIndexValidationIssue, GlobalIndexValidationIssueKind, GlobalIndexValidationMode,
+    GlobalIndexValidationOptions, GlobalIndexValidationReport, GlobalOperationId,
+    GlobalOperationState, GlobalUniqueMutation, GlobalUniqueReservation, GlobalValueLease,
+    HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1,
 };
 pub(crate) use global_index::{
     MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_SQL_BYTES, MAX_GLOBAL_INDEXES,
+    MAX_GLOBAL_VALUE_LEASE_COUNT,
 };
 pub use index_key::{
     CanonicalIndexKey, DecodedIndexKeyPart, INDEX_KEY_ENCODING_VERSION, IndexKeyCollation,
@@ -325,6 +328,125 @@ impl Database {
         cancellation: &CancellationToken,
     ) -> EngineResult<GlobalIndexRepairReport> {
         self.storage.repair_global_index(index_id, cancellation)
+    }
+
+    /// Durably reserve one unique-key mutation before its shard write commits.
+    pub fn reserve_global_unique(
+        &self,
+        operation_id: GlobalOperationId,
+        mutation: &GlobalUniqueMutation,
+    ) -> EngineResult<GlobalUniqueReservation> {
+        self.reserve_global_unique_with_cancellation(
+            operation_id,
+            mutation,
+            &CancellationToken::new(),
+        )
+    }
+
+    pub fn reserve_global_unique_with_cancellation(
+        &self,
+        operation_id: GlobalOperationId,
+        mutation: &GlobalUniqueMutation,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalUniqueReservation> {
+        self.storage
+            .reserve_global_unique(operation_id, mutation, cancellation)
+    }
+
+    /// Publish the reserved owner after the corresponding shard write commits.
+    pub fn finalize_global_unique(
+        &self,
+        operation_id: GlobalOperationId,
+    ) -> EngineResult<GlobalUniqueReservation> {
+        self.storage
+            .finalize_global_unique(operation_id, &CancellationToken::new())
+    }
+
+    pub fn finalize_global_unique_with_cancellation(
+        &self,
+        operation_id: GlobalOperationId,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalUniqueReservation> {
+        self.storage
+            .finalize_global_unique(operation_id, cancellation)
+    }
+
+    /// Release an active reservation when its corresponding shard write fails.
+    pub fn rollback_global_unique(
+        &self,
+        operation_id: GlobalOperationId,
+    ) -> EngineResult<GlobalUniqueReservation> {
+        self.storage
+            .rollback_global_unique(operation_id, &CancellationToken::new())
+    }
+
+    pub fn rollback_global_unique_with_cancellation(
+        &self,
+        operation_id: GlobalOperationId,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalUniqueReservation> {
+        self.storage
+            .rollback_global_unique(operation_id, cancellation)
+    }
+
+    /// Irrevocably lease a disjoint range of positive global integer values.
+    pub fn lease_global_values(
+        &self,
+        operation_id: GlobalOperationId,
+        index_id: GlobalIndexId,
+        count: u32,
+    ) -> EngineResult<GlobalValueLease> {
+        self.lease_global_values_with_cancellation(
+            operation_id,
+            index_id,
+            count,
+            &CancellationToken::new(),
+        )
+    }
+
+    pub fn lease_global_values_with_cancellation(
+        &self,
+        operation_id: GlobalOperationId,
+        index_id: GlobalIndexId,
+        count: u32,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalValueLease> {
+        self.storage
+            .lease_global_values(operation_id, index_id, count, cancellation)
+    }
+
+    /// Mark an irrevocable range as successfully consumed.
+    pub fn finalize_global_value_lease(
+        &self,
+        operation_id: GlobalOperationId,
+    ) -> EngineResult<GlobalValueLease> {
+        self.finalize_global_value_lease_with_cancellation(operation_id, &CancellationToken::new())
+    }
+
+    pub fn finalize_global_value_lease_with_cancellation(
+        &self,
+        operation_id: GlobalOperationId,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalValueLease> {
+        self.storage
+            .transition_global_value_lease(operation_id, true, cancellation)
+    }
+
+    /// Abandon an irrevocable range. Its values remain gaps and are never reused.
+    pub fn abandon_global_value_lease(
+        &self,
+        operation_id: GlobalOperationId,
+    ) -> EngineResult<GlobalValueLease> {
+        self.abandon_global_value_lease_with_cancellation(operation_id, &CancellationToken::new())
+    }
+
+    pub fn abandon_global_value_lease_with_cancellation(
+        &self,
+        operation_id: GlobalOperationId,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalValueLease> {
+        self.storage
+            .transition_global_value_lease(operation_id, false, cancellation)
     }
 
     /// Atomically apply one legal non-publication global-index lifecycle transition.
