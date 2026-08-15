@@ -3927,6 +3927,17 @@ pub(super) fn read_captured_unique_key(
     Ok(reserves.then_some(key))
 }
 
+/// Encode one qualifying captured source row with the exact key semantics used
+/// by offline builds. Rows excluded by a partial predicate never reach this
+/// helper.
+pub(super) fn read_captured_index_key(
+    row: &rusqlite::Row<'_>,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+) -> EngineResult<CanonicalIndexKey> {
+    read_source_key(row, index, shard).map(|(key, _)| key)
+}
+
 fn insert_entry(
     transaction: &Transaction<'_>,
     index: &GlobalIndexMetadata,

@@ -395,7 +395,14 @@ pub(super) fn calculate_schema_digest(
         if is_sqlite_schema_name(&name) {
             continue;
         }
-        if is_exact_metadata_schema_object(&object_type, &name, &table_name, sql.as_deref()) {
+        if is_exact_metadata_schema_object(&object_type, &name, &table_name, sql.as_deref())
+            || super::index_outbox::is_exact_schema_object(
+                &object_type,
+                &name,
+                &table_name,
+                sql.as_deref(),
+            )
+        {
             continue;
         }
         if is_reserved_name(&name) || is_reserved_name(&table_name) {
@@ -1822,7 +1829,7 @@ fn validate_authoritative_unique_constraints(
 pub(super) fn validate_stateless_catalog_schema(connection: &Connection) -> EngineResult<()> {
     let mut statement = connection
         .prepare(
-            "SELECT type, name, sql
+            "SELECT type, name, tbl_name, sql
              FROM main.sqlite_schema
              WHERE type IN ('table', 'index') AND sql IS NOT NULL
                AND name NOT GLOB 'sqlite_*'
@@ -1835,13 +1842,18 @@ pub(super) fn validate_stateless_catalog_schema(connection: &Connection) -> Engi
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })
         .map_err(sqlite_error::storage)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(sqlite_error::storage)?;
 
-    for (object_type, name, sql) in objects {
+    for (object_type, name, table_name, sql) in objects {
+        if super::index_outbox::is_exact_schema_object(&object_type, &name, &table_name, Some(&sql))
+        {
+            continue;
+        }
         crate::sql::validate_stateless_catalog_schema_sql(&sql).map_err(|error| {
             EngineError::from_source(
                 EngineErrorKind::FailedPrecondition,
@@ -2082,6 +2094,7 @@ fn application_table_names(connection: &Connection) -> EngineResult<BTreeSet<Str
              WHERE schema = 'main' AND type IN ('table', 'virtual')
                AND name NOT GLOB 'sqlite_*'
                AND name <> 'briskdb_shard_metadata'
+               AND name NOT GLOB 'briskdb_global_index_outbox_*'
              ORDER BY name COLLATE BINARY",
         )
         .map_err(sqlite_error::storage)?;
@@ -3148,7 +3161,9 @@ fn validate_exact_shard(
         ));
     }
     require_wal(connection, path)?;
-    validate_metadata(connection, shard_id, layout.layout_id())
+    validate_metadata(connection, shard_id, layout.layout_id())?;
+    super::index_outbox::validate_optional_schema(connection)?;
+    Ok(())
 }
 
 fn read_identity(connection: &Connection) -> EngineResult<(i64, i64)> {
@@ -3579,7 +3594,7 @@ pub(super) fn denies_client_action(action: AuthAction<'_>) -> bool {
             pragma_value: Some(_),
         } => matches_persistent_pragma(pragma_name),
         AuthAction::Insert { table_name } | AuthAction::Delete { table_name } => {
-            is_metadata_table(table_name)
+            is_storage_owned_table(table_name)
         }
         AuthAction::Update {
             table_name,
@@ -3588,7 +3603,7 @@ pub(super) fn denies_client_action(action: AuthAction<'_>) -> bool {
         | AuthAction::Read {
             table_name,
             column_name: _,
-        } => is_metadata_table(table_name),
+        } => is_storage_owned_table(table_name),
         // Every persistent application-schema change must go through the
         // journaled migration connection. Temp objects remain connection-local
         // and are retired by the pool's hygiene boundary.
@@ -3607,24 +3622,24 @@ pub(super) fn denies_client_action(action: AuthAction<'_>) -> bool {
         AuthAction::CreateTempIndex {
             index_name,
             table_name,
-        } => is_reserved_name(index_name) || is_metadata_table(table_name),
+        } => is_reserved_name(index_name) || is_storage_owned_table(table_name),
         AuthAction::CreateTempTrigger {
             trigger_name,
             table_name,
-        } => is_reserved_name(trigger_name) || is_metadata_table(table_name),
+        } => is_reserved_name(trigger_name) || is_storage_owned_table(table_name),
         AuthAction::CreateTempView { view_name } => is_reserved_name(view_name),
         AuthAction::DropTempIndex {
             index_name,
             table_name,
-        } => is_reserved_name(index_name) || is_metadata_table(table_name),
+        } => is_reserved_name(index_name) || is_storage_owned_table(table_name),
         AuthAction::DropTempTrigger {
             trigger_name,
             table_name,
-        } => is_reserved_name(trigger_name) || is_metadata_table(table_name),
+        } => is_reserved_name(trigger_name) || is_storage_owned_table(table_name),
         AuthAction::DropTempTable { table_name } => is_reserved_name(table_name),
         AuthAction::DropTempView { view_name } => is_reserved_name(view_name),
         AuthAction::Reindex { index_name } => is_reserved_name(index_name),
-        AuthAction::Analyze { table_name } => is_metadata_table(table_name),
+        AuthAction::Analyze { table_name } => is_storage_owned_table(table_name),
         _ => false,
     }
 }
@@ -3643,6 +3658,14 @@ fn matches_persistent_pragma(name: &str) -> bool {
 
 fn is_metadata_table(name: &str) -> bool {
     name.eq_ignore_ascii_case(SHARD_METADATA_TABLE)
+}
+
+fn is_storage_owned_table(name: &str) -> bool {
+    is_metadata_table(name)
+        || name
+            .as_bytes()
+            .get(.."briskdb_global_index_outbox_".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"briskdb_global_index_outbox_"))
 }
 
 fn is_reserved_name(name: &str) -> bool {

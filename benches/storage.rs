@@ -3,10 +3,10 @@ mod support;
 use std::{cell::Cell, hint::black_box, sync::Arc, time::Duration};
 
 use briskdb::core::{
-    CanonicalIndexKey, Database, Engine, GlobalIndexDeclaration, GlobalIndexKeyPart,
+    CanonicalIndexKey, Database, Engine, EngineOptions, GlobalIndexDeclaration, GlobalIndexKeyPart,
     GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexOwner, GlobalIndexStorageTopology,
-    GlobalOperationId, GlobalUniqueMutation, LogicalDatabaseId, ShardKeyMetadata, ShardKeyType,
-    TableDeclaration, UniqueNullSemantics, Value,
+    GlobalOperationId, GlobalUniqueMutation, LogicalDatabaseId, Session, ShardKeyMetadata,
+    ShardKeyType, Statement, TableDeclaration, UniqueNullSemantics, Value,
 };
 
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
@@ -466,11 +466,140 @@ fn global_index_routing_benchmarks(criterion: &mut Criterion) {
     group.finish();
 }
 
+struct GlobalIndexOutboxWriteBenchmark {
+    _root: tempfile::TempDir,
+    engine: Engine,
+    session: Arc<Session>,
+    route: String,
+    next_value: Cell<bool>,
+}
+
+impl GlobalIndexOutboxWriteBenchmark {
+    fn new(runtime: &tokio::runtime::Runtime, indexed: bool, coordinator: bool) -> Self {
+        let root = tempfile::tempdir().expect("create outbox benchmark root");
+        let mut database = Database::open(root.path(), 4).expect("open outbox benchmark database");
+        database
+            .broadcast(
+                "CREATE TABLE outbox_benchmark (
+                     tenant_id TEXT PRIMARY KEY NOT NULL,
+                     email TEXT NOT NULL
+                 ) STRICT",
+            )
+            .expect("create outbox benchmark table");
+        let logical = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical,
+                    "outbox_benchmark",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .expect("register outbox benchmark table");
+        let route = "outbox-benchmark-tenant".to_owned();
+        database
+            .execute(
+                &route,
+                "INSERT INTO outbox_benchmark (tenant_id, email) VALUES (?1, ?2)",
+                &[route.clone().into(), "value-a@example.test".into()],
+            )
+            .expect("seed outbox benchmark row");
+        if indexed {
+            let table = database
+                .catalog()
+                .table("default", "outbox_benchmark")
+                .unwrap()
+                .unwrap()
+                .id();
+            let index = database
+                .create_global_index(
+                    GlobalIndexDeclaration::new(
+                        table,
+                        "outbox_benchmark_email",
+                        vec![GlobalIndexKeyPart::new(
+                            GlobalIndexKeySource::column("email").unwrap(),
+                            GlobalIndexKeyType::Text,
+                        )],
+                    )
+                    .unwrap()
+                    .with_topology(GlobalIndexStorageTopology::selected_v1()),
+                )
+                .expect("create outbox benchmark index");
+            database
+                .build_global_index(index)
+                .expect("build outbox benchmark index");
+        }
+        let engine = Engine::from_database_with_options(
+            Arc::new(database),
+            EngineOptions::default().with_experimental_vtab_writes(coordinator),
+        )
+        .expect("open outbox benchmark engine");
+        let session = Arc::new(engine.session());
+        runtime
+            .block_on(session.set_routing_key(&route))
+            .expect("route outbox benchmark session");
+        Self {
+            _root: root,
+            engine,
+            session,
+            route,
+            next_value: Cell::new(true),
+        }
+    }
+
+    fn update(&self, runtime: &tokio::runtime::Runtime) -> usize {
+        let next = !self.next_value.get();
+        self.next_value.set(next);
+        let email = if next {
+            "value-a@example.test"
+        } else {
+            "value-b@example.test"
+        };
+        runtime
+            .block_on(self.engine.execute(
+                &self.session,
+                Statement::new(
+                    "UPDATE outbox_benchmark SET email = ?1 WHERE tenant_id = ?2",
+                    vec![email.into(), self.route.clone().into()],
+                ),
+            ))
+            .expect("update outbox benchmark row")
+            .value
+    }
+}
+
+fn global_index_outbox_benchmarks(criterion: &mut Criterion) {
+    let runtime = engine_benchmark_runtime().expect("initialize outbox benchmark runtime");
+    let direct = GlobalIndexOutboxWriteBenchmark::new(&runtime, false, false);
+    let control = GlobalIndexOutboxWriteBenchmark::new(&runtime, false, true);
+    let indexed = GlobalIndexOutboxWriteBenchmark::new(&runtime, true, false);
+    assert_eq!(direct.update(&runtime), 1);
+    assert_eq!(control.update(&runtime), 1);
+    assert_eq!(indexed.update(&runtime), 1);
+
+    let mut group = criterion.benchmark_group("global_index_outbox");
+    group.sample_size(20);
+    group.sampling_mode(SamplingMode::Flat);
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("direct_unindexed_update_baseline", |bencher| {
+        bencher.iter(|| black_box(direct.update(&runtime)));
+    });
+    group.bench_function("coordinator_unindexed_update_control", |bencher| {
+        bencher.iter(|| black_box(control.update(&runtime)));
+    });
+    group.bench_function("transactional_outbox_update", |bencher| {
+        bencher.iter(|| black_box(indexed.update(&runtime)));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     storage_benchmarks,
     engine_benchmarks,
     global_authority_benchmarks,
-    global_index_routing_benchmarks
+    global_index_routing_benchmarks,
+    global_index_outbox_benchmarks
 );
 criterion_main!(benches);

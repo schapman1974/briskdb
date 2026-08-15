@@ -25,8 +25,9 @@ use super::{TestChildScanControl, TestChildScanGate};
 use crate::{
     core::{
         CancellationToken, CanonicalIndexKey, CanonicalShardKeyRef, EngineError, EngineErrorKind,
-        EngineResult, GeneratedIdPolicy, GeneratedKey, GlobalIndexId, GlobalIndexOwner,
-        GlobalUniqueMutation, OperationControl, TableId, Value, canonical_shard_key_bytes,
+        EngineResult, GeneratedIdPolicy, GeneratedKey, GlobalIndexId, GlobalIndexOutboxEventKind,
+        GlobalIndexOwner, GlobalOperationId, GlobalUniqueMutation, OperationControl, TableId,
+        Value, canonical_shard_key_bytes,
         generated_id::{
             AllocationOwnerSlot, GeneratedIdClassification, classify_generated_id,
             native_range_v1_sequence_ceiling, native_range_v1_sequence_floor,
@@ -35,7 +36,7 @@ use crate::{
     sqlite_error,
     storage::{
         CONNECTION_BUSY_TIMEOUT, GlobalWriteReservationGuard, SchemaOperationGuard, Storage,
-        global_index, hilo::HiloAllocation,
+        global_index, hilo::HiloAllocation, index_outbox,
     },
 };
 
@@ -213,8 +214,9 @@ fn touched_global_unique_indexes(
             )
         })?;
         touched.extend(
-            spec.global_unique_indexes
+            spec.global_indexes
                 .iter()
+                .filter(|index| index.metadata.is_unique())
                 .map(|index| index.metadata.id()),
         );
     }
@@ -252,7 +254,11 @@ fn plan_global_unique_mutations(
                 ),
             ));
         }
-        for index in &spec.global_unique_indexes {
+        for index in spec
+            .global_indexes
+            .iter()
+            .filter(|index| index.metadata.is_unique())
+        {
             let states = by_index.entry(index.metadata.id()).or_default();
             if let Some(old) = &change.old {
                 let owner = captured_global_owner(spec, shard, old)?;
@@ -418,7 +424,7 @@ fn captured_global_owner(
 
 fn evaluate_captured_unique_key(
     connection: &Connection,
-    index: &super::GlobalUniqueIndexSpec,
+    index: &super::GlobalIndexSpec,
     shard: u16,
     row: &CapturedPhysicalRow,
 ) -> EngineResult<Option<CanonicalIndexKey>> {
@@ -441,6 +447,137 @@ fn evaluate_captured_unique_key(
         ));
     }
     Ok(key)
+}
+
+fn evaluate_captured_index_key(
+    connection: &Connection,
+    index: &super::GlobalIndexSpec,
+    shard: u16,
+    row: &CapturedPhysicalRow,
+) -> EngineResult<Option<CanonicalIndexKey>> {
+    let mut statement = connection
+        .prepare_cached(&index.evaluation_sql)
+        .map_err(sqlite_error::statement)?;
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(&row.values))
+        .map_err(sqlite_error::statement)?;
+    let key = rows
+        .next()
+        .map_err(sqlite_error::statement)?
+        .map(|row| global_index::read_captured_index_key(row, &index.metadata, shard))
+        .transpose()?;
+    if rows.next().map_err(sqlite_error::statement)?.is_some() {
+        return Err(EngineError::new(
+            EngineErrorKind::Internal,
+            "captured global-index expression returned more than one row",
+        ));
+    }
+    Ok(key)
+}
+
+fn plan_global_nonunique_outbox_events(
+    registry: &Registry,
+    shard: u16,
+    connection: &Connection,
+    changes: &[CapturedPhysicalChange],
+) -> EngineResult<Vec<index_outbox::PendingGlobalIndexOutboxEvent>> {
+    let mut events = Vec::new();
+    for change in changes {
+        let spec = registry.table_named(&change.table).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "global-index capture references unregistered physical table {}",
+                    change.table
+                ),
+            )
+        })?;
+        if change
+            .old
+            .iter()
+            .chain(change.new.iter())
+            .any(|row| row.values.len() != spec.columns.len())
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "physical table {} changed column count during global-index capture",
+                    spec.name
+                ),
+            ));
+        }
+        for index in spec
+            .global_indexes
+            .iter()
+            .filter(|index| !index.metadata.is_unique())
+        {
+            let old = change
+                .old
+                .as_ref()
+                .map(|row| {
+                    Ok((
+                        evaluate_captured_index_key(connection, index, shard, row)?,
+                        captured_global_owner(spec, shard, row)?,
+                    ))
+                })
+                .transpose()?;
+            let new = change
+                .new
+                .as_ref()
+                .map(|row| {
+                    Ok((
+                        evaluate_captured_index_key(connection, index, shard, row)?,
+                        captured_global_owner(spec, shard, row)?,
+                    ))
+                })
+                .transpose()?;
+            let (kind, old_key, old_owner, new_key, new_owner) = match (old, new) {
+                (None | Some((None, _)), None | Some((None, _))) => continue,
+                (None | Some((None, _)), Some((Some(key), owner))) => (
+                    GlobalIndexOutboxEventKind::Insert,
+                    None,
+                    None,
+                    Some(key),
+                    Some(owner),
+                ),
+                (Some((Some(key), owner)), None) => (
+                    GlobalIndexOutboxEventKind::Delete,
+                    Some(key),
+                    Some(owner),
+                    None,
+                    None,
+                ),
+                (Some((Some(key), owner)), Some((None, _))) => (
+                    GlobalIndexOutboxEventKind::Tombstone,
+                    Some(key),
+                    Some(owner),
+                    None,
+                    None,
+                ),
+                (Some((Some(old_key), old_owner)), Some((Some(new_key), new_owner))) => {
+                    if old_key == new_key && old_owner == new_owner {
+                        continue;
+                    }
+                    (
+                        GlobalIndexOutboxEventKind::Update,
+                        Some(old_key),
+                        Some(old_owner),
+                        Some(new_key),
+                        Some(new_owner),
+                    )
+                }
+            };
+            events.push(index_outbox::PendingGlobalIndexOutboxEvent {
+                index_id: index.metadata.id(),
+                kind,
+                old_key,
+                new_key,
+                old_owner,
+                new_owner,
+            });
+        }
+    }
+    Ok(events)
 }
 
 fn validate_allocation_sequence_capacity(
@@ -2521,6 +2658,7 @@ struct WriteTransaction {
     global_reservations: Vec<GlobalWriteReservationGuard>,
     global_reserved_indexes: Vec<GlobalIndexId>,
     global_snapshot_indexes: Vec<GlobalIndexId>,
+    outbox_events_staged: usize,
     global_authority_prepared: bool,
 }
 
@@ -2556,6 +2694,7 @@ impl WriteTransaction {
             global_reservations: Vec::new(),
             global_reserved_indexes: Vec::new(),
             global_snapshot_indexes: Vec::new(),
+            outbox_events_staged: 0,
             global_authority_prepared: false,
         }
     }
@@ -2596,10 +2735,40 @@ impl WriteTransaction {
             return Err(cancelled_error());
         }
 
+        let outbox_events = plan_global_nonunique_outbox_events(
+            registry,
+            child.shard,
+            &child.connection,
+            &changes,
+        )?;
+        if !outbox_events.is_empty() {
+            let mut bytes = [0_u8; 16];
+            getrandom::fill(&mut bytes).map_err(|error| {
+                EngineError::from_source(
+                    EngineErrorKind::StorageUnavailable,
+                    "could not generate a global-index outbox operation ID",
+                    error,
+                )
+            })?;
+            if bytes == [0; 16] {
+                bytes[0] = 1;
+            }
+            let operation_id = GlobalOperationId::new(bytes)?;
+            self.outbox_events_staged = index_outbox::append_events(
+                &child.connection,
+                child.shard,
+                operation_id,
+                &outbox_events,
+            )?;
+        }
+        self.global_snapshot_indexes = touched_global_unique_indexes(registry, &changes)?;
+        if self.global_snapshot_indexes.is_empty() {
+            self.global_authority_prepared = true;
+            return Ok(());
+        }
         registry
             .storage
             .recover_global_unique_writes(&self.authority_cancellation)?;
-        self.global_snapshot_indexes = touched_global_unique_indexes(registry, &changes)?;
         let mutations =
             plan_global_unique_mutations(registry, child.shard, &child.connection, &changes)?;
         let mut reservations = Vec::new();
@@ -2635,6 +2804,7 @@ impl WriteTransaction {
                         self.explicit_key = None;
                         self.generated_key = None;
                         self.global_snapshot_indexes.clear();
+                        self.outbox_events_staged = 0;
                         self.global_authority_prepared = true;
                         return Ok(());
                     }
@@ -2809,7 +2979,7 @@ impl WriteTransaction {
             let indexed_tables = registry
                 .tables
                 .values()
-                .filter(|spec| !spec.global_unique_indexes.is_empty())
+                .filter(|spec| !spec.global_indexes.is_empty())
                 .map(|spec| spec.name.clone())
                 .collect::<BTreeSet<_>>();
             let mutation_capture = Arc::new(Mutex::new(GlobalMutationCapture::default()));
@@ -3636,6 +3806,9 @@ impl WriteTransaction {
             ));
         }
         if let Some(child) = self.child.take() {
+            if self.outbox_events_staged != 0 {
+                index_outbox::abort_at_test_boundary("outbox-physical-before-commit");
+            }
             if !self.global_snapshot_indexes.is_empty() {
                 abort_at_global_write_test_boundary("unique-write-physical-before-commit");
             }
@@ -3653,7 +3826,11 @@ impl WriteTransaction {
             if !self.global_snapshot_indexes.is_empty() {
                 abort_at_global_write_test_boundary("unique-write-physical-after-commit");
             }
+            if self.outbox_events_staged != 0 {
+                index_outbox::abort_at_test_boundary("outbox-physical-after-commit");
+            }
         }
+        self.outbox_events_staged = 0;
         // Once the physical shard commits, cancellation can no longer roll
         // the row back. Complete authority with a fresh token so a deadline
         // racing this boundary cannot leave a live process holding an active
@@ -3696,6 +3873,7 @@ impl WriteTransaction {
                 }
             }
         }
+        self.outbox_events_staged = 0;
         self.rollback_global_reservations();
         physical_error.map_or(Ok(()), Err)
     }

@@ -553,17 +553,15 @@ impl Engine {
     }
 
     #[cfg(feature = "experimental-vtab")]
-    fn table_requires_global_unique_maintenance(&self, table: Option<super::TableId>) -> bool {
+    fn table_requires_global_index_maintenance(&self, table: Option<super::TableId>) -> bool {
         let Some(table) = table else {
             return false;
         };
         self.catalog().global_indexes().iter().any(|index| {
             index.table_id() == table
-                && index.is_unique()
-                && matches!(
-                    index.lifecycle(),
-                    super::GlobalIndexLifecycle::Ready | super::GlobalIndexLifecycle::Invalid
-                )
+                && (index.lifecycle() == super::GlobalIndexLifecycle::Ready
+                    || (index.is_unique()
+                        && index.lifecycle() == super::GlobalIndexLifecycle::Invalid))
         })
     }
 
@@ -1316,11 +1314,11 @@ impl Engine {
             }
         };
         #[cfg(feature = "experimental-vtab")]
-        let global_unique_maintenance = matches!(
+        let global_index_maintenance = matches!(
             template.description().behavior(),
             sql::StatementBehavior::Write(_)
         ) && self
-            .table_requires_global_unique_maintenance(plan.inference().table_id());
+            .table_requires_global_index_maintenance(plan.inference().table_id());
         let sqlite_sql = template.translated().sqlite_sql().to_owned();
         let owner = ConnectionOwner::new(session.id().get());
         if guard.state() == super::SessionState::InTransaction && plan.generated_insert().is_some()
@@ -1381,7 +1379,7 @@ impl Engine {
         let behavior = plan.behavior();
         let result_limits = operation.result_limits;
         #[cfg(feature = "experimental-vtab")]
-        if global_unique_maintenance {
+        if global_index_maintenance {
             if guard.state() == super::SessionState::InTransaction {
                 let mut guard = guard;
                 guard.fail_transaction();
@@ -1534,11 +1532,11 @@ impl Engine {
             }
         };
         #[cfg(feature = "experimental-vtab")]
-        let global_unique_maintenance = matches!(
+        let global_index_maintenance = matches!(
             template.description().behavior(),
             sql::StatementBehavior::Write(_)
         ) && self
-            .table_requires_global_unique_maintenance(plan.inference().table_id());
+            .table_requires_global_index_maintenance(plan.inference().table_id());
         let sqlite_sql = template.translated().sqlite_sql().to_owned();
         let owner = ConnectionOwner::new(session.id().get());
         if guard.state() == super::SessionState::InTransaction && plan.generated_insert().is_some()
@@ -1599,7 +1597,7 @@ impl Engine {
         let behavior = plan.behavior();
         let result_limits = operation.result_limits;
         #[cfg(feature = "experimental-vtab")]
-        if global_unique_maintenance {
+        if global_index_maintenance {
             if guard.state() == super::SessionState::InTransaction {
                 let mut guard = guard;
                 guard.fail_transaction();
@@ -1608,7 +1606,7 @@ impl Engine {
             if shards.len() != 1 {
                 return operation.finish(Err(EngineError::new(
                     EngineErrorKind::Unsupported,
-                    "authoritative global-index writes require one planned physical shard",
+                    "global-index-maintained writes require one planned physical shard",
                 )));
             }
             let shard = shards[0];
@@ -2292,9 +2290,9 @@ impl Engine {
         };
         let catalog_authoritative = plan.is_some();
         #[cfg(feature = "experimental-vtab")]
-        let global_unique_maintenance = plan
+        let global_index_maintenance = plan
             .as_ref()
-            .is_some_and(|plan| self.table_requires_global_unique_maintenance(plan.table_id));
+            .is_some_and(|plan| self.table_requires_global_index_maintenance(plan.table_id));
         let owner = match (owner_policy, plan.is_some()) {
             (ExecuteOwnerPolicy::ReuseValidatedCatalogWrite, true) => {
                 ConnectionOwner::stateless_catalog_write()
@@ -2361,7 +2359,7 @@ impl Engine {
 
         #[cfg(feature = "experimental-vtab")]
         if catalog_authoritative
-            && (self.inner.options.experimental_vtab_writes() || global_unique_maintenance)
+            && (self.inner.options.experimental_vtab_writes() || global_index_maintenance)
         {
             let value = self
                 .run_coordinator_write(
@@ -4067,7 +4065,7 @@ fn explicit_generated_write_unsupported() -> EngineError {
 fn indexed_explicit_transaction_unsupported() -> EngineError {
     EngineError::new(
         EngineErrorKind::Unsupported,
-        "explicit transactions on a table with an authoritative global unique index are not yet supported",
+        "explicit transactions on a table with a maintained global index are not yet supported",
     )
 }
 

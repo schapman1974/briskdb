@@ -39,11 +39,14 @@ pub(crate) use generated_id::AllocationOwnerMap;
 pub use global_index::{
     GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart,
     GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata,
+    GlobalIndexOutboxBatch, GlobalIndexOutboxCursor, GlobalIndexOutboxEvent,
+    GlobalIndexOutboxEventKind, GlobalIndexOutboxPruneReport, GlobalIndexOutboxShardStatus,
     GlobalIndexOwner, GlobalIndexRepairReport, GlobalIndexStorageTopology,
     GlobalIndexValidationIssue, GlobalIndexValidationIssueKind, GlobalIndexValidationMode,
     GlobalIndexValidationOptions, GlobalIndexValidationReport, GlobalOperationId,
     GlobalOperationState, GlobalUniqueMutation, GlobalUniqueReservation, GlobalValueLease,
-    HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1,
+    HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1, MAX_GLOBAL_INDEX_OUTBOX_BATCH_EVENTS,
+    MAX_GLOBAL_INDEX_OUTBOX_BYTES_PER_SHARD, MAX_GLOBAL_INDEX_OUTBOX_EVENTS_PER_SHARD,
 };
 pub(crate) use global_index::{
     GlobalIndexReadResolution, MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_READ_CANDIDATES,
@@ -333,6 +336,85 @@ impl Database {
         cancellation: &CancellationToken,
     ) -> EngineResult<GlobalIndexRepairReport> {
         self.storage.repair_global_index(index_id, cancellation)
+    }
+
+    /// Inspect shard-local non-unique global-index event retention and lag.
+    pub fn global_index_outbox_status(&self) -> EngineResult<Vec<GlobalIndexOutboxShardStatus>> {
+        self.storage.global_index_outbox_status()
+    }
+
+    /// Replay a bounded batch after one durable shard cursor.
+    pub fn read_global_index_outbox(
+        &self,
+        index_id: GlobalIndexId,
+        shard: u16,
+        after: GlobalIndexOutboxCursor,
+        limit: usize,
+    ) -> EngineResult<GlobalIndexOutboxBatch> {
+        self.read_global_index_outbox_with_cancellation(
+            index_id,
+            shard,
+            after,
+            limit,
+            &CancellationToken::new(),
+        )
+    }
+
+    pub fn read_global_index_outbox_with_cancellation(
+        &self,
+        index_id: GlobalIndexId,
+        shard: u16,
+        after: GlobalIndexOutboxCursor,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalIndexOutboxBatch> {
+        self.storage
+            .read_global_index_outbox(index_id, shard, after, limit, cancellation)
+    }
+
+    /// Persist one non-unique index consumer's replay position.
+    pub fn advance_global_index_outbox(
+        &self,
+        index_id: GlobalIndexId,
+        shard: u16,
+        cursor: GlobalIndexOutboxCursor,
+    ) -> EngineResult<GlobalIndexOutboxShardStatus> {
+        self.advance_global_index_outbox_with_cancellation(
+            index_id,
+            shard,
+            cursor,
+            &CancellationToken::new(),
+        )
+    }
+
+    pub fn advance_global_index_outbox_with_cancellation(
+        &self,
+        index_id: GlobalIndexId,
+        shard: u16,
+        cursor: GlobalIndexOutboxCursor,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalIndexOutboxShardStatus> {
+        self.storage
+            .advance_global_index_outbox(index_id, shard, cursor, cancellation)
+    }
+
+    /// Delete a bounded prefix acknowledged by every active shard consumer.
+    pub fn prune_global_index_outbox(
+        &self,
+        shard: u16,
+        limit: usize,
+    ) -> EngineResult<GlobalIndexOutboxPruneReport> {
+        self.prune_global_index_outbox_with_cancellation(shard, limit, &CancellationToken::new())
+    }
+
+    pub fn prune_global_index_outbox_with_cancellation(
+        &self,
+        shard: u16,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalIndexOutboxPruneReport> {
+        self.storage
+            .prune_global_index_outbox(shard, limit, cancellation)
     }
 
     /// Durably reserve one unique-key mutation before its shard write commits.

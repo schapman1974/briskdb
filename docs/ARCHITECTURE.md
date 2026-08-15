@@ -990,6 +990,18 @@ The public bound plan carries redaction-safe explain metadata. Any unsupported
 definition or predicate, excessive expansion/candidates, invalid lifecycle, or
 authority/verification failure retains the ordinary correct route.
 
+Ready non-unique indexes also opt their table's autocommit writes into the
+writable coordinator even when the general experimental write gate is off.
+SQLite's pre-update hook evaluates the exact persisted predicate and key
+expressions for each physical old/new row. A version-1 insert, update, delete,
+or tombstone event is appended to a private shard-local outbox before the child
+`COMMIT`; the row and event therefore share one WAL transaction and durability
+decision. Rollback removes both. One shard-wide cursor supplies replay order
+across processes, while per-index durable consumer cursors bound safe prefix
+pruning. Hard event/byte limits turn retention exhaustion into retryable `Busy`
+before the row commits. Issue #237 consumes these events into non-unique global
+index storage and publishes the freshness watermarks needed for shard pruning.
+
 Each PostgreSQL connection also owns a random, in-memory backend PID/secret pair.
 The adapter registers a fresh core cancellation token only for the command that
 is currently running. A separate exact-key `CancelRequest` cancels that token;

@@ -10,6 +10,7 @@ Python wheel use the same locks and SQLite WAL files.
 | --- | --- |
 | Reads and autocommit writes | Supported; normal SQLite writer contention can return retryable `Busy` |
 | Generated IDs | Supported; native ranges and manifest-leased hi/lo blocks remain unique |
+| Non-unique global-index outbox writes | Supported; row and event share one shard transaction, and each shard cursor follows WAL commit order |
 | Passive checkpoints | Supported; a competing checkpoint can report `busy` with unavailable frame counts |
 | Read-only global-index catalog inspection | Supported; readers observe one complete old or new checksummed snapshot |
 | Opening a current `Ready`/`Degraded` root | Supported; startup inspection is serialized |
@@ -99,7 +100,8 @@ directory. See [offline backup](OFFLINE_BACKUP.md) and the
 
 `tests/multiprocess_shared_root.rs` covers overlapping same- and cross-shard
 traffic, pooled handles, checkpoints, generated IDs, retryable contention,
-global-index writer fencing and atomic read-only catalog snapshots, abrupt
-termination, reopen/integrity validation, and one service plus one embedder.
+global-index writer fencing, ordered outbox writers and atomic read-only
+catalog snapshots, abrupt termination, reopen/integrity validation, and one
+service plus one embedder.
 `python/tests/test_multiprocess.py` repeats the public wheel contract with
 independently spawned interpreters.
