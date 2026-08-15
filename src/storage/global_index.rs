@@ -5,6 +5,7 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     str,
+    time::Instant,
 };
 
 use rusqlite::{
@@ -16,12 +17,13 @@ use crate::{
     core::{
         CancellationToken, CanonicalIndexKey, EngineError, EngineErrorKind, EngineResult,
         GlobalIndexBuildReport, GlobalIndexId, GlobalIndexKeySource, GlobalIndexKeyType,
-        GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexOwner, GlobalIndexStorageTopology,
-        GlobalIndexValidationIssue, GlobalIndexValidationIssueKind, GlobalIndexValidationMode,
-        GlobalIndexValidationOptions, GlobalIndexValidationReport, GlobalOperationId,
-        GlobalOperationState, GlobalUniqueMutation, GlobalUniqueReservation, GlobalValueLease,
-        INDEX_KEY_ENCODING_VERSION, IndexKeyOrder, IndexKeyPart, IndexKeyValue,
-        MAX_GLOBAL_VALUE_LEASE_COUNT, UniqueNullSemantics,
+        GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexOwner, GlobalIndexReadResolution,
+        GlobalIndexStorageTopology, GlobalIndexValidationIssue, GlobalIndexValidationIssueKind,
+        GlobalIndexValidationMode, GlobalIndexValidationOptions, GlobalIndexValidationReport,
+        GlobalOperationId, GlobalOperationState, GlobalUniqueMutation, GlobalUniqueReservation,
+        GlobalValueLease, INDEX_KEY_ENCODING_VERSION, IndexKeyOrder, IndexKeyPart, IndexKeyValue,
+        MAX_GLOBAL_INDEX_READ_CANDIDATES, MAX_GLOBAL_INDEX_READ_REPAIRS,
+        MAX_GLOBAL_VALUE_LEASE_COUNT, UniqueNullSemantics, Value,
     },
     sqlite_error,
 };
@@ -31,7 +33,7 @@ use super::{CONNECTION_BUSY_TIMEOUT, Storage};
 const DIRECTORY_NAME: &str = "global-indexes";
 const SHARED_FILE_NAME: &str = "global.sqlite";
 const APPLICATION_ID: i32 = 0x4252_4749;
-const STORAGE_VERSION: u32 = 2;
+const STORAGE_VERSION: u32 = 3;
 const BUILDING: i64 = 1;
 const COMPLETE: i64 = 2;
 const DEFINITION_DIGEST_DOMAIN: &[u8] = b"briskdb.global-index.definition.v1\0";
@@ -49,7 +51,7 @@ const VALUE_REQUEST_DIGEST_DOMAIN: &[u8] = b"briskdb.global-index.value-operatio
 const SCHEMA_SQL: &str = "
 CREATE TABLE briskdb_global_index_storage (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    storage_version INTEGER NOT NULL CHECK (storage_version = 2),
+    storage_version INTEGER NOT NULL CHECK (storage_version = 3),
     key_encoding_version INTEGER NOT NULL CHECK (key_encoding_version = 1)
 ) STRICT;
 
@@ -97,7 +99,7 @@ CREATE TABLE briskdb_global_index_unique_keys (
 
 INSERT INTO briskdb_global_index_storage (
     singleton, storage_version, key_encoding_version
-) VALUES (1, 2, 1);
+) VALUES (1, 3, 1);
 ";
 
 const AUTHORITY_SCHEMA_SQL: &str = "
@@ -164,6 +166,24 @@ CREATE TABLE briskdb_global_value_leases (
 ) STRICT, WITHOUT ROWID;
 ";
 
+const READ_REPAIR_SCHEMA_SQL: &str = "
+CREATE TABLE briskdb_global_index_read_repairs (
+    index_id INTEGER NOT NULL CHECK (index_id > 0),
+    encoded_key BLOB NOT NULL,
+    source_shard INTEGER NOT NULL CHECK (source_shard BETWEEN 0 AND 63),
+    source_locator BLOB NOT NULL,
+    repair_kind INTEGER NOT NULL CHECK (repair_kind IN (1, 2, 3)),
+    repair_state INTEGER NOT NULL CHECK (repair_state IN (1, 2)),
+    observation_count INTEGER NOT NULL CHECK (observation_count > 0),
+    PRIMARY KEY (index_id, encoded_key, source_shard, source_locator),
+    FOREIGN KEY (index_id) REFERENCES briskdb_global_index_builds (index_id)
+        ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX briskdb_global_index_read_repairs_state
+    ON briskdb_global_index_read_repairs (repair_state, index_id);
+";
+
 const UPGRADE_V1_TO_V2_SQL: &str = "
 ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v1;
 CREATE TABLE briskdb_global_index_storage (
@@ -178,6 +198,20 @@ DROP TABLE briskdb_global_index_storage_v1;
 PRAGMA user_version = 2;
 ";
 
+const UPGRADE_V2_TO_V3_SQL: &str = "
+ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v2;
+CREATE TABLE briskdb_global_index_storage (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    storage_version INTEGER NOT NULL CHECK (storage_version = 3),
+    key_encoding_version INTEGER NOT NULL CHECK (key_encoding_version = 1)
+) STRICT;
+INSERT INTO briskdb_global_index_storage (
+    singleton, storage_version, key_encoding_version
+) VALUES (1, 3, 1);
+DROP TABLE briskdb_global_index_storage_v2;
+PRAGMA user_version = 3;
+";
+
 const EXPECTED_OBJECTS_V1: &[&str] = &[
     "briskdb_global_index_builds",
     "briskdb_global_index_checkpoints",
@@ -186,10 +220,26 @@ const EXPECTED_OBJECTS_V1: &[&str] = &[
     "briskdb_global_index_unique_keys",
 ];
 
+const EXPECTED_OBJECTS_V2: &[&str] = &[
+    "briskdb_global_index_builds",
+    "briskdb_global_index_checkpoints",
+    "briskdb_global_index_entries",
+    "briskdb_global_index_storage",
+    "briskdb_global_index_unique_keys",
+    "briskdb_global_operations",
+    "briskdb_global_unique_mutations",
+    "briskdb_global_unique_reservations",
+    "briskdb_global_unique_reservations_operation",
+    "briskdb_global_value_leases",
+    "briskdb_global_value_sequences",
+];
+
 const EXPECTED_OBJECTS: &[&str] = &[
     "briskdb_global_index_builds",
     "briskdb_global_index_checkpoints",
     "briskdb_global_index_entries",
+    "briskdb_global_index_read_repairs",
+    "briskdb_global_index_read_repairs_state",
     "briskdb_global_index_storage",
     "briskdb_global_index_unique_keys",
     "briskdb_global_operations",
@@ -232,12 +282,18 @@ impl SourceLocator {
     }
 
     fn predicate_sql(&self) -> String {
+        self.predicate_sql_with_offset(0)
+    }
+
+    fn predicate_sql_with_offset(&self, offset: usize) -> String {
         match self {
-            Self::RowId(name) => format!("{} = ?1", quote_identifier(name)),
+            Self::RowId(name) => format!("{} = ?{}", quote_identifier(name), offset + 1),
             Self::PrimaryKey(columns) => columns
                 .iter()
                 .enumerate()
-                .map(|(offset, column)| format!("{} IS ?{}", quote_identifier(column), offset + 1))
+                .map(|(index, column)| {
+                    format!("{} IS ?{}", quote_identifier(column), offset + index + 1)
+                })
                 .collect::<Vec<_>>()
                 .join(" AND "),
         }
@@ -264,6 +320,35 @@ struct PhysicalEntry {
     source_ordinal: u64,
     encoded_key: Vec<u8>,
     source_locator: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct ReadCandidate {
+    key: CanonicalIndexKey,
+    owner: GlobalIndexOwner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadRepairKind {
+    MissingRow,
+    MismatchedKey,
+    InvalidLocator,
+}
+
+impl ReadRepairKind {
+    const fn code(self) -> i64 {
+        match self {
+            Self::MissingRow => 1,
+            Self::MismatchedKey => 2,
+            Self::InvalidLocator => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StaleReadCandidate {
+    candidate: ReadCandidate,
+    kind: ReadRepairKind,
 }
 
 #[derive(Debug)]
@@ -319,7 +404,7 @@ pub(super) fn startup_requires_upgrade(root: &Path) -> EngineResult<bool> {
         .map_err(sqlite_error::storage)?;
     match version {
         STORAGE_VERSION => Ok(false),
-        1 => Ok(true),
+        1 | 2 => Ok(true),
         version if version > STORAGE_VERSION => Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             format!("global-index storage version {version} is newer than this build"),
@@ -343,15 +428,30 @@ pub(super) fn upgrade_if_needed(root: &Path) -> EngineResult<()> {
     )
     .map_err(sqlite_error::storage)?;
     configure(&connection)?;
-    validate_storage_contents(&connection, 1, EXPECTED_OBJECTS_V1)?;
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(sqlite_error::storage)?;
+    match version {
+        1 => validate_storage_contents(&connection, 1, EXPECTED_OBJECTS_V1)?,
+        2 => validate_storage_contents(&connection, 2, EXPECTED_OBJECTS_V2)?,
+        _ => return validate(&connection),
+    }
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error::storage)?;
+    if version == 1 {
+        transaction
+            .execute_batch(UPGRADE_V1_TO_V2_SQL)
+            .map_err(sqlite_error::storage)?;
+        transaction
+            .execute_batch(AUTHORITY_SCHEMA_SQL)
+            .map_err(sqlite_error::storage)?;
+    }
     transaction
-        .execute_batch(UPGRADE_V1_TO_V2_SQL)
+        .execute_batch(UPGRADE_V2_TO_V3_SQL)
         .map_err(sqlite_error::storage)?;
     transaction
-        .execute_batch(AUTHORITY_SCHEMA_SQL)
+        .execute_batch(READ_REPAIR_SCHEMA_SQL)
         .map_err(sqlite_error::storage)?;
     abort_at_authority_test_boundary("upgrade-before-commit");
     transaction.commit().map_err(sqlite_error::storage)?;
@@ -367,12 +467,13 @@ pub(super) fn downgrade_to_v1_for_test(root: &Path) {
     connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
+             DROP TABLE briskdb_global_index_read_repairs;
              DROP TABLE briskdb_global_unique_reservations;
              DROP TABLE briskdb_global_unique_mutations;
              DROP TABLE briskdb_global_value_leases;
              DROP TABLE briskdb_global_value_sequences;
              DROP TABLE briskdb_global_operations;
-             ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v2;
+             ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v3;
              CREATE TABLE briskdb_global_index_storage (
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                  storage_version INTEGER NOT NULL CHECK (storage_version = 1),
@@ -381,8 +482,32 @@ pub(super) fn downgrade_to_v1_for_test(root: &Path) {
              INSERT INTO briskdb_global_index_storage (
                  singleton, storage_version, key_encoding_version
              ) VALUES (1, 1, 1);
-             DROP TABLE briskdb_global_index_storage_v2;
+             DROP TABLE briskdb_global_index_storage_v3;
              PRAGMA user_version = 1;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+}
+
+#[cfg(test)]
+pub(super) fn downgrade_to_v2_for_test(root: &Path) {
+    let path = root.join(DIRECTORY_NAME).join(SHARED_FILE_NAME);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE briskdb_global_index_read_repairs;
+             ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v3;
+             CREATE TABLE briskdb_global_index_storage (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 storage_version INTEGER NOT NULL CHECK (storage_version = 2),
+                 key_encoding_version INTEGER NOT NULL CHECK (key_encoding_version = 1)
+             ) STRICT;
+             INSERT INTO briskdb_global_index_storage (
+                 singleton, storage_version, key_encoding_version
+             ) VALUES (1, 2, 1);
+             DROP TABLE briskdb_global_index_storage_v3;
+             PRAGMA user_version = 2;
              PRAGMA wal_checkpoint(TRUNCATE);",
         )
         .unwrap();
@@ -658,6 +783,367 @@ pub(super) fn lookup_authoritative_owners(
             .then_with(|| left.locator().cmp(right.locator()))
     });
     Ok(owners)
+}
+
+/// Verify bounded non-unique index candidates against their physical row
+/// identity and the caller's complete predicate. The result deliberately
+/// remains incomplete until #237 freshness watermarks prove which shards can
+/// be excluded. Stale observations enqueue idempotent durable tombstones;
+/// those records never alter unique authority or base index entries.
+pub(super) fn verify_nonunique_candidates(
+    storage: &Storage,
+    index: &GlobalIndexMetadata,
+    keys: &[CanonicalIndexKey],
+    query_predicate_sql: &str,
+    query_table_alias: Option<&str>,
+    parameters: &[Value],
+    read_control: (&CancellationToken, Option<Instant>),
+) -> EngineResult<GlobalIndexReadResolution> {
+    let (cancellation, deadline) = read_control;
+    ensure_read_control(
+        cancellation,
+        deadline,
+        "before reading global-index candidates",
+    )?;
+    if keys.is_empty() {
+        return Ok(GlobalIndexReadResolution::candidates(
+            Vec::new(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ));
+    }
+    let (connection, _) = open_existing(&storage.root)?
+        .ok_or_else(|| corrupt("ready global index has no physical storage"))?;
+    connection
+        .busy_timeout(std::time::Duration::ZERO)
+        .map_err(sqlite_error::storage)?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(sqlite_error::storage)?;
+    validate_physical_authority(&transaction, index, storage.shard_count())?;
+    let candidates =
+        read_nonunique_candidates(&transaction, index.id(), keys, storage.shard_count())?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+    let Some(candidates) = candidates else {
+        return Ok(GlobalIndexReadResolution::candidate_limit_exceeded(
+            MAX_GLOBAL_INDEX_READ_CANDIDATES + 1,
+        ));
+    };
+    let candidate_count = candidates.len();
+
+    let table = storage
+        .catalog
+        .logical()
+        .table_by_id(index.table_id())
+        .ok_or_else(|| corrupt("global index references a missing table"))?;
+    let locator_connection = storage.open_shard(0)?;
+    let locator = inspect_source_locator(&locator_connection, table.name())?;
+    drop(locator_connection);
+    let locator_offset = parameters.len();
+    let key_expressions = index
+        .key_parts()
+        .iter()
+        .map(|part| match part.source() {
+            GlobalIndexKeySource::Column(column) => quote_identifier(column),
+            GlobalIndexKeySource::Expression(expression) => format!("({expression})"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let alias = query_table_alias
+        .map(|alias| format!(" AS {}", quote_identifier(alias)))
+        .unwrap_or_default();
+    let verification_sql = format!(
+        "SELECT {key_expressions}, CASE WHEN ({query_predicate_sql}) THEN 1 ELSE 0 END
+         FROM main.{}{alias} WHERE ({})",
+        quote_identifier(table.name()),
+        locator.predicate_sql_with_offset(locator_offset),
+    );
+    let query_parameters = crate::sql::sqlite_parameters(parameters)?;
+    let mut candidates_by_shard = BTreeMap::<u16, Vec<&ReadCandidate>>::new();
+    for candidate in &candidates {
+        candidates_by_shard
+            .entry(candidate.owner.source_shard())
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut verified = Vec::new();
+    let mut rejected_count = 0_usize;
+    let mut stale = Vec::new();
+    for (shard, shard_candidates) in candidates_by_shard {
+        ensure_read_control(
+            cancellation,
+            deadline,
+            "while verifying global-index candidates",
+        )?;
+        let source = storage.open_shard(shard)?;
+        let mut statement = source
+            .prepare_cached(&verification_sql)
+            .map_err(sqlite_error::statement)?;
+        for candidate in shard_candidates {
+            ensure_read_control(
+                cancellation,
+                deadline,
+                "while verifying a global-index candidate",
+            )?;
+            let locator_values =
+                match decode_locator(candidate.owner.locator(), locator.expressions().len()) {
+                    Ok(values) => values,
+                    Err(error) if error.kind() == EngineErrorKind::DataCorruption => {
+                        stale.push(StaleReadCandidate {
+                            candidate: candidate.clone(),
+                            kind: ReadRepairKind::InvalidLocator,
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+            let mut bound = query_parameters.clone();
+            bound.extend(locator_values);
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(bound))
+                .map_err(sqlite_error::statement)?;
+            let Some(row) = rows.next().map_err(sqlite_error::statement)? else {
+                stale.push(StaleReadCandidate {
+                    candidate: candidate.clone(),
+                    kind: ReadRepairKind::MissingRow,
+                });
+                continue;
+            };
+            let (observed_key, _) = read_source_key(row, index, shard)?;
+            let matches_query = row
+                .get::<_, i64>(index.key_parts().len())
+                .map_err(sqlite_error::statement)?
+                == 1;
+            if rows.next().map_err(sqlite_error::statement)?.is_some() {
+                return Err(corrupt(
+                    "global-index candidate locator identifies multiple physical rows",
+                ));
+            }
+            if observed_key != candidate.key {
+                stale.push(StaleReadCandidate {
+                    candidate: candidate.clone(),
+                    kind: ReadRepairKind::MismatchedKey,
+                });
+            } else if matches_query {
+                verified.push(candidate.owner.clone());
+            } else {
+                rejected_count += 1;
+            }
+        }
+    }
+
+    ensure_read_control(
+        cancellation,
+        deadline,
+        "before queuing global-index read repair",
+    )?;
+    let stale_count = stale.len();
+    let (repairs_queued, repairs_applied, repairs_deferred) =
+        match queue_and_apply_read_repairs(storage, index, &stale, cancellation, deadline) {
+            Ok(counts) => counts,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    EngineErrorKind::Cancelled | EngineErrorKind::DeadlineExceeded
+                ) =>
+            {
+                return Err(error);
+            }
+            Err(_) => (0, 0, stale_count),
+        };
+    Ok(GlobalIndexReadResolution::candidates(
+        verified,
+        candidate_count,
+        candidate_count - rejected_count - stale_count,
+        rejected_count,
+        stale_count,
+        repairs_queued,
+        repairs_applied,
+        repairs_deferred,
+    ))
+}
+
+fn read_nonunique_candidates(
+    transaction: &Transaction<'_>,
+    index_id: GlobalIndexId,
+    keys: &[CanonicalIndexKey],
+    shard_count: u16,
+) -> EngineResult<Option<Vec<ReadCandidate>>> {
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT entries.source_shard, entries.source_locator
+             FROM briskdb_global_index_entries AS entries
+             WHERE entries.index_id = ?1 AND entries.encoded_key = ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM briskdb_global_index_read_repairs AS repairs
+                   WHERE repairs.index_id = entries.index_id
+                     AND repairs.encoded_key = entries.encoded_key
+                     AND repairs.source_shard = entries.source_shard
+                     AND repairs.source_locator = entries.source_locator
+                     AND repairs.repair_state = 2
+               )
+             ORDER BY entries.source_shard, entries.source_locator",
+        )
+        .map_err(sqlite_error::storage)?;
+    let mut candidates = Vec::new();
+    for key in keys {
+        let mut rows = statement
+            .query(params![to_sqlite_id(index_id)?, key.as_bytes()])
+            .map_err(sqlite_error::storage)?;
+        while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
+            if candidates.len() == MAX_GLOBAL_INDEX_READ_CANDIDATES {
+                return Ok(None);
+            }
+            candidates.push(ReadCandidate {
+                key: key.clone(),
+                owner: read_lookup_owner(row, shard_count)?,
+            });
+        }
+    }
+    Ok(Some(candidates))
+}
+
+fn queue_and_apply_read_repairs(
+    storage: &Storage,
+    index: &GlobalIndexMetadata,
+    stale: &[StaleReadCandidate],
+    cancellation: &CancellationToken,
+    deadline: Option<Instant>,
+) -> EngineResult<(usize, usize, usize)> {
+    let bounded = stale
+        .iter()
+        .take(MAX_GLOBAL_INDEX_READ_REPAIRS)
+        .collect::<Vec<_>>();
+    let overflow = stale.len().saturating_sub(bounded.len());
+    if bounded.is_empty() {
+        return Ok((0, 0, overflow));
+    }
+    let (mut connection, _) = open_existing(&storage.root)?
+        .ok_or_else(|| corrupt("ready global index has no physical storage"))?;
+    connection
+        .busy_timeout(std::time::Duration::ZERO)
+        .map_err(sqlite_error::storage)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    validate_physical_authority(&transaction, index, storage.shard_count())?;
+    let mut queued = Vec::new();
+    for repair in bounded {
+        ensure_read_control(
+            cancellation,
+            deadline,
+            "while queuing global-index read repair",
+        )?;
+        let candidate = &repair.candidate;
+        transaction
+            .execute(
+                "INSERT INTO briskdb_global_index_read_repairs (
+                     index_id, encoded_key, source_shard, source_locator,
+                     repair_kind, repair_state, observation_count
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1, 1)
+                 ON CONFLICT (index_id, encoded_key, source_shard, source_locator)
+                 DO UPDATE SET
+                     repair_kind = excluded.repair_kind,
+                     observation_count = CASE
+                         WHEN observation_count < 9223372036854775807
+                         THEN observation_count + 1
+                         ELSE observation_count
+                     END",
+                params![
+                    to_sqlite_id(index.id())?,
+                    candidate.key.as_bytes(),
+                    i64::from(candidate.owner.source_shard()),
+                    candidate.owner.locator(),
+                    repair.kind.code(),
+                ],
+            )
+            .map_err(sqlite_error::storage)?;
+        let state = transaction
+            .query_row(
+                "SELECT repair_state FROM briskdb_global_index_read_repairs
+                 WHERE index_id = ?1 AND encoded_key = ?2
+                   AND source_shard = ?3 AND source_locator = ?4",
+                params![
+                    to_sqlite_id(index.id())?,
+                    candidate.key.as_bytes(),
+                    i64::from(candidate.owner.source_shard()),
+                    candidate.owner.locator(),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sqlite_error::storage)?;
+        if state == 1 {
+            queued.push((*repair).clone());
+        }
+    }
+    abort_at_authority_test_boundary("read-repair-before-enqueue-commit");
+    transaction.commit().map_err(sqlite_error::storage)?;
+    abort_at_authority_test_boundary("read-repair-after-enqueue-commit");
+    if queued.is_empty() {
+        return Ok((0, 0, overflow));
+    }
+
+    ensure_read_control(
+        cancellation,
+        deadline,
+        "before applying global-index read repair",
+    )?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    let mut applied = 0_usize;
+    for repair in &queued {
+        ensure_read_control(
+            cancellation,
+            deadline,
+            "while applying global-index read repair",
+        )?;
+        let candidate = &repair.candidate;
+        applied += transaction
+            .execute(
+                "UPDATE briskdb_global_index_read_repairs SET repair_state = 2
+                 WHERE index_id = ?1 AND encoded_key = ?2
+                   AND source_shard = ?3 AND source_locator = ?4
+                   AND repair_state = 1",
+                params![
+                    to_sqlite_id(index.id())?,
+                    candidate.key.as_bytes(),
+                    i64::from(candidate.owner.source_shard()),
+                    candidate.owner.locator(),
+                ],
+            )
+            .map_err(sqlite_error::storage)?;
+    }
+    abort_at_authority_test_boundary("read-repair-before-apply-commit");
+    transaction.commit().map_err(sqlite_error::storage)?;
+    abort_at_authority_test_boundary("read-repair-after-apply-commit");
+    Ok((queued.len(), applied, overflow))
+}
+
+fn ensure_read_control(
+    cancellation: &CancellationToken,
+    deadline: Option<Instant>,
+    context: &str,
+) -> EngineResult<()> {
+    if cancellation.is_cancelled() {
+        return Err(EngineError::new(
+            EngineErrorKind::Cancelled,
+            format!("global-index read was cancelled {context}"),
+        ));
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(EngineError::new(
+            EngineErrorKind::DeadlineExceeded,
+            format!("global-index read deadline elapsed {context}"),
+        ));
+    }
+    Ok(())
 }
 
 fn read_lookup_owner(row: &rusqlite::Row<'_>, shard_count: u16) -> EngineResult<GlobalIndexOwner> {
@@ -2240,6 +2726,7 @@ pub(super) fn repair_non_unique(
         "briskdb_global_index_unique_keys",
         "briskdb_global_index_entries",
         "briskdb_global_index_checkpoints",
+        "briskdb_global_index_read_repairs",
     ] {
         transaction
             .execute(
@@ -4361,6 +4848,9 @@ fn initialize(connection: &Connection) -> EngineResult<()> {
         .map_err(sqlite_error::storage)?;
     connection
         .execute_batch(AUTHORITY_SCHEMA_SQL)
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(READ_REPAIR_SCHEMA_SQL)
         .map_err(sqlite_error::storage)?;
     validate(connection)
 }

@@ -10,8 +10,8 @@ use crate::sql::{
 
 use super::{
     AllocationOwnerMap, CanonicalIndexKey, Catalog, EngineError, EngineErrorKind, EngineResult,
-    GeneratedIdPolicy, GlobalIndexId, GlobalIndexOwner, LogicalDatabaseId, TableId, TableMetadata,
-    TablePlacement, Value,
+    GeneratedIdPolicy, GlobalIndexId, GlobalIndexOwner, GlobalIndexReadResolution,
+    LogicalDatabaseId, TableId, TableMetadata, TablePlacement, Value,
     generated_id::{
         GeneratedIdClassification, HILO_V1_FORMAT_MARKER, classify_caller_generated_id,
     },
@@ -92,7 +92,7 @@ pub enum GlobalIndexRoutingKind {
     Fallback,
 }
 
-/// Stable reason an authoritative index was not used.
+/// Stable reason a global index was not used to exclude every other shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum GlobalIndexRoutingFallback {
@@ -100,7 +100,10 @@ pub enum GlobalIndexRoutingFallback {
     UnsupportedIndexDefinition,
     PredicateNotExact,
     TooManyKeys,
+    TooManyCandidates,
     IndexUnavailable,
+    CandidateVerificationFailed,
+    FreshnessUnproven,
 }
 
 impl GlobalIndexRoutingFallback {
@@ -111,7 +114,10 @@ impl GlobalIndexRoutingFallback {
             Self::UnsupportedIndexDefinition => "unsupported_index_definition",
             Self::PredicateNotExact => "predicate_not_exact",
             Self::TooManyKeys => "too_many_exact_keys",
+            Self::TooManyCandidates => "too_many_index_candidates",
             Self::IndexUnavailable => "index_unavailable",
+            Self::CandidateVerificationFailed => "candidate_verification_failed",
+            Self::FreshnessUnproven => "freshness_unproven",
         }
     }
 }
@@ -122,8 +128,16 @@ pub struct GlobalIndexRoutingPlan {
     kind: GlobalIndexRoutingKind,
     index_id: Option<GlobalIndexId>,
     index_name: Option<Arc<str>>,
+    authoritative: bool,
     lookup_key_count: usize,
     candidate_count: usize,
+    verified_candidate_count: usize,
+    rejected_candidate_count: usize,
+    stale_candidate_count: usize,
+    repairs_queued: usize,
+    repairs_applied: usize,
+    repairs_deferred: usize,
+    candidate_shards: Vec<u16>,
     target_shards: Vec<u16>,
     fallback: Option<GlobalIndexRoutingFallback>,
 }
@@ -134,8 +148,16 @@ impl GlobalIndexRoutingPlan {
             kind: GlobalIndexRoutingKind::NotApplicable,
             index_id: None,
             index_name: None,
+            authoritative: false,
             lookup_key_count: 0,
             candidate_count: 0,
+            verified_candidate_count: 0,
+            rejected_candidate_count: 0,
+            stale_candidate_count: 0,
+            repairs_queued: 0,
+            repairs_applied: 0,
+            repairs_deferred: 0,
+            candidate_shards: Vec::new(),
             target_shards: Vec::new(),
             fallback: None,
         }
@@ -165,6 +187,11 @@ impl GlobalIndexRoutingPlan {
         self.index_name.as_deref()
     }
 
+    /// Return whether the selected index is synchronously authoritative.
+    pub const fn authoritative(&self) -> bool {
+        self.authoritative
+    }
+
     /// Return the number of distinct canonical keys probed.
     pub const fn lookup_key_count(&self) -> usize {
         self.lookup_key_count
@@ -173,6 +200,42 @@ impl GlobalIndexRoutingPlan {
     /// Return the owner candidates read before shard deduplication/intersection.
     pub const fn candidate_count(&self) -> usize {
         self.candidate_count
+    }
+
+    /// Return how many non-unique candidates still matched the bound query.
+    pub const fn verified_candidate_count(&self) -> usize {
+        self.verified_candidate_count
+    }
+
+    /// Return how many healthy index candidates failed another query filter.
+    pub const fn rejected_candidate_count(&self) -> usize {
+        self.rejected_candidate_count
+    }
+
+    /// Return how many candidate entries were stale at verification time.
+    pub const fn stale_candidate_count(&self) -> usize {
+        self.stale_candidate_count
+    }
+
+    /// Return the number of bounded repair tombstones queued by this plan.
+    pub const fn repairs_queued(&self) -> usize {
+        self.repairs_queued
+    }
+
+    /// Return the number of queued repair tombstones durably applied.
+    pub const fn repairs_applied(&self) -> usize {
+        self.repairs_applied
+    }
+
+    /// Return repair observations left for a later retry.
+    pub const fn repairs_deferred(&self) -> usize {
+        self.repairs_deferred
+    }
+
+    /// Return shards containing physically verified query candidates. These
+    /// are diagnostic until freshness watermarks can prove completeness.
+    pub fn candidate_shards(&self) -> &[u16] {
+        &self.candidate_shards
     }
 
     /// Return the exact logical shard target set. An empty set is executed on
@@ -194,8 +257,16 @@ impl fmt::Debug for GlobalIndexRoutingPlan {
             .field("kind", &self.kind)
             .field("index_id", &self.index_id)
             .field("index_name", &self.index_name)
+            .field("authoritative", &self.authoritative)
             .field("lookup_key_count", &self.lookup_key_count)
             .field("candidate_count", &self.candidate_count)
+            .field("verified_candidate_count", &self.verified_candidate_count)
+            .field("rejected_candidate_count", &self.rejected_candidate_count)
+            .field("stale_candidate_count", &self.stale_candidate_count)
+            .field("repairs_queued", &self.repairs_queued)
+            .field("repairs_applied", &self.repairs_applied)
+            .field("repairs_deferred", &self.repairs_deferred)
+            .field("candidate_shards", &self.candidate_shards)
             .field("target_shards", &self.target_shards)
             .field("fallback", &self.fallback)
             .finish()
@@ -547,7 +618,13 @@ pub(super) fn apply_global_index_routing<F>(
     mut resolve: F,
 ) -> EngineResult<()>
 where
-    F: FnMut(GlobalIndexId, &[CanonicalIndexKey]) -> EngineResult<Vec<GlobalIndexOwner>>,
+    F: FnMut(
+        GlobalIndexId,
+        &[CanonicalIndexKey],
+        &str,
+        Option<&str>,
+        &[Value],
+    ) -> EngineResult<GlobalIndexReadResolution>,
 {
     if plan.behavior != StatementBehavior::Read {
         return Ok(());
@@ -601,36 +678,64 @@ where
             kind: GlobalIndexRoutingKind::Empty,
             index_id: Some(index_id),
             index_name: Some(index_name),
+            authoritative: candidate.is_unique(),
             lookup_key_count,
             candidate_count: 0,
+            verified_candidate_count: 0,
+            rejected_candidate_count: 0,
+            stale_candidate_count: 0,
+            repairs_queued: 0,
+            repairs_applied: 0,
+            repairs_deferred: 0,
+            candidate_shards: Vec::new(),
             target_shards: Vec::new(),
             fallback: None,
         };
         return Ok(());
     }
 
-    let owners = match resolve(index_id, candidate.keys()) {
-        Ok(owners) => owners,
+    let resolution = match resolve(
+        index_id,
+        candidate.keys(),
+        candidate.query_predicate_sql(),
+        candidate.query_table_alias(),
+        parameters,
+    ) {
+        Ok(resolution) => resolution,
+        Err(error)
+            if matches!(
+                error.kind(),
+                EngineErrorKind::Cancelled | EngineErrorKind::DeadlineExceeded
+            ) =>
+        {
+            return Err(error);
+        }
         Err(_) => {
             plan.global_index_routing = GlobalIndexRoutingPlan {
                 index_id: Some(index_id),
                 index_name: Some(index_name),
+                authoritative: candidate.is_unique(),
                 lookup_key_count,
                 ..GlobalIndexRoutingPlan::fallback(
-                    GlobalIndexRoutingFallback::IndexUnavailable,
+                    if candidate.is_unique() {
+                        GlobalIndexRoutingFallback::IndexUnavailable
+                    } else {
+                        GlobalIndexRoutingFallback::CandidateVerificationFailed
+                    },
                     fallback_targets,
                 )
             };
             return Ok(());
         }
     };
-    let candidate_count = owners.len();
-    let mut target_shards = owners
+    let candidate_count = resolution.candidate_count();
+    let mut candidate_shards = resolution
+        .owners()
         .iter()
         .map(GlobalIndexOwner::source_shard)
         .collect::<Vec<_>>();
-    target_shards.sort_unstable();
-    target_shards.dedup();
+    candidate_shards.sort_unstable();
+    candidate_shards.dedup();
 
     match plan.inference.kind() {
         ShardKeyInferenceKind::Exact | ShardKeyInferenceKind::Multiple => {
@@ -641,26 +746,48 @@ where
                 .collect::<Vec<_>>();
             routed.sort_unstable();
             routed.dedup();
-            target_shards.retain(|shard| routed.binary_search(shard).is_ok());
+            candidate_shards.retain(|shard| routed.binary_search(shard).is_ok());
         }
-        ShardKeyInferenceKind::Contradiction => target_shards.clear(),
+        ShardKeyInferenceKind::Contradiction => candidate_shards.clear(),
         ShardKeyInferenceKind::Unconstrained => {}
         ShardKeyInferenceKind::NotApplicable | ShardKeyInferenceKind::NotSharded => {
             return Err(planning_invariant());
         }
     }
+    let fallback = if resolution.is_candidate_limit_exceeded() {
+        Some(GlobalIndexRoutingFallback::TooManyCandidates)
+    } else if resolution.is_complete() {
+        None
+    } else {
+        Some(GlobalIndexRoutingFallback::FreshnessUnproven)
+    };
+    let target_shards = if fallback.is_some() {
+        fallback_targets
+    } else {
+        candidate_shards.clone()
+    };
     plan.global_index_routing = GlobalIndexRoutingPlan {
-        kind: if target_shards.is_empty() {
+        kind: if fallback.is_some() {
+            GlobalIndexRoutingKind::Fallback
+        } else if target_shards.is_empty() {
             GlobalIndexRoutingKind::Empty
         } else {
             GlobalIndexRoutingKind::Routed
         },
         index_id: Some(index_id),
         index_name: Some(index_name),
+        authoritative: candidate.is_unique(),
         lookup_key_count,
         candidate_count,
+        verified_candidate_count: resolution.verified_count(),
+        rejected_candidate_count: resolution.rejected_count(),
+        stale_candidate_count: resolution.stale_count(),
+        repairs_queued: resolution.repairs_queued(),
+        repairs_applied: resolution.repairs_applied(),
+        repairs_deferred: resolution.repairs_deferred(),
+        candidate_shards,
         target_shards,
-        fallback: None,
+        fallback,
     };
     Ok(())
 }

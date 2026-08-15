@@ -36,7 +36,8 @@ HTTP and PostgreSQL. Native MongoDB, MySQL, and serverless use are on the roadma
   leases allocate collision-free values across processes. Successful
   single-shard `INSERT`, `UPDATE`, and `DELETE` statements now maintain ready
   global unique indexes automatically, and exact indexed reads skip shards
-  that cannot own a match.
+  that cannot own a match. Non-unique index hits are physically rechecked and
+  stale entries are repaired without trusting them as authority.
 - **Bring the client you already have.** HTTP and PostgreSQL are available now;
   MongoDB and MySQL wire compatibility are being built over the same engine.
 - **Files remain files.** The layout is a manifest plus normal SQLite databases,
@@ -117,7 +118,7 @@ experimental and opt-in; the exact contract lives in
 | PostgreSQL wire protocol | TLS/SCRAM, backpressured row streaming, SQLite-interrupt cancellation, text/binary CRUD, real single-shard transactions, and a live psql/tokio-postgres/psycopg/SQLAlchemy matrix |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
-| Cross-shard unique indexes and global value leases | Automatic autocommit maintenance plus equality/`IN` shard pruning works across the shared engine; candidate verification and richer index shapes are next |
+| Cross-shard indexes and global value leases | Unique equality/`IN` reads prune shards; non-unique candidates are physically verified with bounded durable repair, then safely scatter until freshness watermarks land |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working |

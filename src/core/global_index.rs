@@ -12,6 +12,8 @@ pub(crate) const MAX_GLOBAL_INDEXES: usize = 4_096;
 pub(crate) const MAX_GLOBAL_INDEX_PARTS: usize = 16;
 pub(crate) const MAX_GLOBAL_INDEX_SQL_BYTES: usize = 4_096;
 pub(crate) const MAX_GLOBAL_OWNER_LOCATOR_BYTES: usize = 4_096;
+pub(crate) const MAX_GLOBAL_INDEX_READ_CANDIDATES: usize = 4_096;
+pub(crate) const MAX_GLOBAL_INDEX_READ_REPAIRS: usize = 64;
 pub(crate) const MAX_GLOBAL_VALUE_LEASE_COUNT: u32 = 65_536;
 const DEFAULT_MAX_REPORTED_VALIDATION_ISSUES: u16 = 128;
 const MAX_REPORTED_VALIDATION_ISSUES: u16 = 1_024;
@@ -132,6 +134,121 @@ impl fmt::Debug for GlobalIndexOwner {
             .field("source_shard", &self.source_shard)
             .field("locator", &"<redacted>")
             .finish()
+    }
+}
+
+/// Storage result consumed by protocol-neutral global-index read planning.
+/// Non-unique results remain incomplete until asynchronous freshness
+/// watermarks prove which source shards may be excluded.
+#[derive(Debug)]
+pub(crate) struct GlobalIndexReadResolution {
+    owners: Vec<GlobalIndexOwner>,
+    candidate_count: usize,
+    verified_count: usize,
+    rejected_count: usize,
+    stale_count: usize,
+    repairs_queued: usize,
+    repairs_applied: usize,
+    repairs_deferred: usize,
+    complete: bool,
+    candidate_limit_exceeded: bool,
+}
+
+impl GlobalIndexReadResolution {
+    pub(crate) fn authoritative(owners: Vec<GlobalIndexOwner>) -> Self {
+        let candidate_count = owners.len();
+        Self {
+            owners,
+            candidate_count,
+            verified_count: 0,
+            rejected_count: 0,
+            stale_count: 0,
+            repairs_queued: 0,
+            repairs_applied: 0,
+            repairs_deferred: 0,
+            complete: true,
+            candidate_limit_exceeded: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn candidates(
+        owners: Vec<GlobalIndexOwner>,
+        candidate_count: usize,
+        verified_count: usize,
+        rejected_count: usize,
+        stale_count: usize,
+        repairs_queued: usize,
+        repairs_applied: usize,
+        repairs_deferred: usize,
+    ) -> Self {
+        Self {
+            owners,
+            candidate_count,
+            verified_count,
+            rejected_count,
+            stale_count,
+            repairs_queued,
+            repairs_applied,
+            repairs_deferred,
+            complete: false,
+            candidate_limit_exceeded: false,
+        }
+    }
+
+    pub(crate) const fn candidate_limit_exceeded(candidate_count: usize) -> Self {
+        Self {
+            owners: Vec::new(),
+            candidate_count,
+            verified_count: 0,
+            rejected_count: 0,
+            stale_count: 0,
+            repairs_queued: 0,
+            repairs_applied: 0,
+            repairs_deferred: 0,
+            complete: false,
+            candidate_limit_exceeded: true,
+        }
+    }
+
+    pub(crate) fn owners(&self) -> &[GlobalIndexOwner] {
+        &self.owners
+    }
+
+    pub(crate) const fn candidate_count(&self) -> usize {
+        self.candidate_count
+    }
+
+    pub(crate) const fn verified_count(&self) -> usize {
+        self.verified_count
+    }
+
+    pub(crate) const fn rejected_count(&self) -> usize {
+        self.rejected_count
+    }
+
+    pub(crate) const fn stale_count(&self) -> usize {
+        self.stale_count
+    }
+
+    pub(crate) const fn repairs_queued(&self) -> usize {
+        self.repairs_queued
+    }
+
+    pub(crate) const fn repairs_applied(&self) -> usize {
+        self.repairs_applied
+    }
+
+    pub(crate) const fn repairs_deferred(&self) -> usize {
+        self.repairs_deferred
+    }
+
+    pub(crate) const fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(crate) const fn is_candidate_limit_exceeded(&self) -> bool {
+        self.candidate_limit_exceeded
     }
 }
 

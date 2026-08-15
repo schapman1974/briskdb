@@ -355,6 +355,14 @@ across retries and process loss. Key locks and finalized owners change in single
 SQLite transactions, so no protocol needs an unsafe scan-then-insert check.
 Automatic DML coordination remains the separate #233 write-path stage.
 
+Storage version 3 adds bounded non-unique candidate repair. A candidate is
+looked up by its stable row locator, its canonical key is recomputed, and the
+complete bound predicate is evaluated by SQLite on the owning shard. Stale
+observations become idempotent tombstones without changing unique authority or
+the immutable build snapshot. Until freshness watermarks prove completeness,
+verified candidate shards remain explain data and execution keeps the safe
+ordinary scatter target.
+
 ### Bound statement-planning boundary
 
 Synchronous `Engine::plan_bound_statement` accepts a `NormalizedSql` batch, one
@@ -970,16 +978,17 @@ therefore reject generated-key writes before allocation. HTTP still creates a
 fresh Session per request; PostgreSQL sessions support retained single-shard
 transactions through the ordinary prepared execution path.
 
-Ready unique global indexes also participate in protocol-neutral read
-planning. The structural analyzer recognizes exact equality and non-negated
+Ready global indexes also participate in protocol-neutral read planning. The
+structural analyzer recognizes exact equality and non-negated
 `IN` constraints on column key parts, constructs bounded canonical compound
-keys, and asks storage for both finalized entries and the old/new owners of
-active mutations in one SQLite snapshot. It deduplicates those owners and
-intersects them with any shard-key inference before the unchanged query runs on
-the remaining children. The public bound plan carries redaction-safe explain
-metadata. Any partial/expression definition, non-exact predicate, invalid
-lifecycle, excessive expansion, or authority-open/read failure retains the
-ordinary correct shard route or scatter path.
+keys, and asks storage for candidate owners. Unique indexes include both
+finalized entries and old/new active-mutation owners in one snapshot, then
+authoritatively prune shards. Non-unique candidates are physically rechecked
+against their row locator, canonical key, and complete predicate; bounded stale
+entries are tombstoned, but execution still scatters until freshness is proven.
+The public bound plan carries redaction-safe explain metadata. Any unsupported
+definition or predicate, excessive expansion/candidates, invalid lifecycle, or
+authority/verification failure retains the ordinary correct route.
 
 Each PostgreSQL connection also owns a random, in-memory backend PID/secret pair.
 The adapter registers a fresh core cancellation token only for the command that
