@@ -3,13 +3,19 @@
 use std::fmt;
 
 use super::{
-    EngineError, EngineErrorKind, EngineResult, INDEX_KEY_ENCODING_VERSION, IndexKeyCollation,
-    IndexKeyOrder, IndexNullOrder, TableId, UniqueNullSemantics, validate_catalog_identifier,
+    CanonicalIndexKey, EngineError, EngineErrorKind, EngineResult, INDEX_KEY_ENCODING_VERSION,
+    IndexKeyCollation, IndexKeyOrder, IndexNullOrder, TableId, UniqueNullSemantics,
+    validate_catalog_identifier,
 };
 
 pub(crate) const MAX_GLOBAL_INDEXES: usize = 4_096;
 pub(crate) const MAX_GLOBAL_INDEX_PARTS: usize = 16;
 pub(crate) const MAX_GLOBAL_INDEX_SQL_BYTES: usize = 4_096;
+
+/// Version-1 comparison and migration target for hash-partitioned index storage.
+pub const HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1: u16 = 16;
+
+const PARTITION_ROUTING_DOMAIN_V1: &[u8] = b"briskdb.global-index.partition.v1\0";
 
 /// Stable identity of one durable global index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -95,6 +101,11 @@ pub enum GlobalIndexStorageTopology {
 }
 
 impl GlobalIndexStorageTopology {
+    /// Return the selected initial topology.
+    pub const fn selected_v1() -> Self {
+        Self::SharedSqliteV1
+    }
+
     /// Construct a validated version-1 hash-partitioned topology.
     pub fn hash_partitioned_sqlite_v1(partitions: u16) -> EngineResult<Self> {
         if !(2..=256).contains(&partitions) || !partitions.is_power_of_two() {
@@ -122,6 +133,47 @@ impl GlobalIndexStorageTopology {
             Self::Unassigned => (0, 0, 0),
             Self::SharedSqliteV1 => (1, 1, 1),
             Self::HashPartitionedSqliteV1 { partitions } => (2, 1, partitions as i64),
+        }
+    }
+
+    /// Return the number of physical index databases in this topology.
+    pub const fn partition_count(self) -> u16 {
+        match self {
+            Self::Unassigned => 0,
+            Self::SharedSqliteV1 => 1,
+            Self::HashPartitionedSqliteV1 { partitions } => partitions,
+        }
+    }
+
+    /// Route a canonical key to its one authoritative index partition.
+    ///
+    /// Version 1 hashes the stable index ID and exact canonical key bytes with
+    /// a domain-separated BLAKE3 digest, then masks the low 64-bit word. The
+    /// partition count is constrained to a power of two, so this mapping is
+    /// deterministic on every supported architecture.
+    pub fn partition_for_key(
+        self,
+        index_id: GlobalIndexId,
+        key: &CanonicalIndexKey,
+    ) -> EngineResult<u16> {
+        match self {
+            Self::Unassigned => Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "global-index storage topology is not assigned",
+            )),
+            Self::SharedSqliteV1 => Ok(0),
+            Self::HashPartitionedSqliteV1 { partitions } => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(PARTITION_ROUTING_DOMAIN_V1);
+                hasher.update(&index_id.get().to_le_bytes());
+                hasher.update(key.as_bytes());
+                let word = u64::from_le_bytes(
+                    hasher.finalize().as_bytes()[..size_of::<u64>()]
+                        .try_into()
+                        .expect("BLAKE3 digest contains one routing word"),
+                );
+                Ok((word & u64::from(partitions - 1)) as u16)
+            }
         }
     }
 }
@@ -513,5 +565,44 @@ mod tests {
         assert!(GlobalIndexKeySource::expression("\0").is_err());
         assert!(GlobalIndexStorageTopology::hash_partitioned_sqlite_v1(3).is_err());
         assert!(GlobalIndexStorageTopology::hash_partitioned_sqlite_v1(16).is_ok());
+    }
+
+    #[test]
+    fn partition_routing_has_frozen_cross_architecture_vectors() {
+        let topology = GlobalIndexStorageTopology::HashPartitionedSqliteV1 {
+            partitions: HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1,
+        };
+        let vectors = [
+            (1, "alpha", 0_u16),
+            (1, "beta", 0_u16),
+            (7, "alpha", 0_u16),
+            (u64::MAX, "", 0_u16),
+        ];
+        let observed = vectors
+            .into_iter()
+            .map(|(id, value, _)| {
+                let key = CanonicalIndexKey::encode_values(&[value.into()]).unwrap();
+                topology
+                    .partition_for_key(GlobalIndexId::new(id).unwrap(), &key)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed, [2, 5, 1, 12]);
+        assert_eq!(
+            topology.partition_count(),
+            HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1
+        );
+        assert_eq!(
+            GlobalIndexStorageTopology::selected_v1(),
+            GlobalIndexStorageTopology::SharedSqliteV1
+        );
+        assert!(
+            GlobalIndexStorageTopology::Unassigned
+                .partition_for_key(
+                    GlobalIndexId::new(1).unwrap(),
+                    &CanonicalIndexKey::encode_values(&["alpha".into()]).unwrap(),
+                )
+                .is_err()
+        );
     }
 }

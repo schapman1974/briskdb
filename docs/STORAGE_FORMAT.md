@@ -602,9 +602,11 @@ reseals the semantic root before commit. The existing process mutation fence
 requires sole-process ownership for writers. `Database::inspect_global_indexes`
 opens the manifest read-only, performs full version/checksum/catalog validation,
 and neither initializes nor upgrades storage; concurrent readers therefore see
-only the complete old or complete new snapshot. This issue stores metadata
-only—physical index files, construction, maintenance, and query routing begin
-in issues #229 and later.
+only the complete old or complete new snapshot. Version 13 stores metadata
+only. The measured initial physical choice is `SharedSqliteV1`, with one
+partition and every key routed to partition zero; the exact comparison and
+migration option are documented in the [topology decision](GLOBAL_INDEX_TOPOLOGY.md).
+Physical index files and construction begin in issue #230.
 
 Table placement and shard-key type use stable numeric codes:
 

@@ -22,11 +22,12 @@ pub use core::{
     EngineOptions, EngineResult, EngineState, EngineStatus, Executed, GeneratedKey,
     GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart, GlobalIndexKeySource,
     GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexStorageTopology,
-    INDEX_KEY_ENCODING_VERSION, IndexKeyCollation, IndexKeyOrder, IndexKeyPart, IndexKeyValue,
-    IndexKeyValueRef, IndexNullOrder, ParseDecimalError, PortalId, PrepareRequest,
-    PreparedExecution, PreparedStatementDescription, PreparedStatementId, PreparedStatementLimits,
-    RequestContext, ResultLimits, ResultSet, ResultSetShapeError, Routed, Row, Session, SessionId,
-    SessionState, ShutdownReport, Statement, UniqueNullSemantics, Value, WriteResult,
+    HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1, INDEX_KEY_ENCODING_VERSION, IndexKeyCollation,
+    IndexKeyOrder, IndexKeyPart, IndexKeyValue, IndexKeyValueRef, IndexNullOrder,
+    ParseDecimalError, PortalId, PrepareRequest, PreparedExecution, PreparedStatementDescription,
+    PreparedStatementId, PreparedStatementLimits, RequestContext, ResultLimits, ResultSet,
+    ResultSetShapeError, Routed, Row, Session, SessionId, SessionState, ShutdownReport, Statement,
+    UniqueNullSemantics, Value, WriteResult,
 };
 #[cfg(feature = "embedded")]
 pub use embedded::{

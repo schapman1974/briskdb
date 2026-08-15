@@ -39,6 +39,7 @@ pub(crate) use generated_id::AllocationOwnerMap;
 pub use global_index::{
     GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart, GlobalIndexKeySource,
     GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexStorageTopology,
+    HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1,
 };
 pub(crate) use global_index::{
     MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_SQL_BYTES, MAX_GLOBAL_INDEXES,
