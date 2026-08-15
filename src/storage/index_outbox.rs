@@ -452,6 +452,91 @@ pub(super) fn inspect(storage: &Storage) -> EngineResult<Vec<GlobalIndexOutboxSh
         .collect()
 }
 
+pub(super) fn snapshot_high_waters(storage: &Storage) -> EngineResult<Vec<u64>> {
+    inspect(storage).map(|statuses| {
+        statuses
+            .into_iter()
+            .map(|status| status.high_water().get())
+            .collect()
+    })
+}
+
+pub(super) fn consumer_cursor(
+    storage: &Storage,
+    index_id: GlobalIndexId,
+    shard: u16,
+) -> EngineResult<Option<u64>> {
+    let connection = storage.open_shard(shard)?;
+    with_internal_authorizer(&connection, || {
+        if !validate_optional_schema(&connection)? {
+            return Ok(None);
+        }
+        connection
+            .query_row(
+                "SELECT durable_cursor FROM briskdb_global_index_outbox_consumers
+                 WHERE index_id = ?1 AND active = 1",
+                [to_sqlite_id(index_id)?],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(sqlite_error::storage)?
+            .map(|cursor| checked_u64(cursor, "consumer cursor"))
+            .transpose()
+    })
+}
+
+pub(super) fn activate_index(
+    storage: &Storage,
+    index_id: GlobalIndexId,
+    cursors: &[u64],
+) -> EngineResult<()> {
+    if cursors.len() != usize::from(storage.shard_count()) {
+        return Err(corrupt(
+            "global-index outbox activation has the wrong shard count",
+        ));
+    }
+    for (shard, cursor) in cursors.iter().copied().enumerate() {
+        let mut connection = storage.open_shard(
+            u16::try_from(shard).map_err(|_| corrupt("outbox activation shard overflowed"))?,
+        )?;
+        with_internal_authorizer_mut(&mut connection, |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sqlite_error::storage)?;
+            if !validate_optional_schema(&transaction)? {
+                transaction
+                    .execute_batch(SCHEMA_SQL)
+                    .map_err(sqlite_error::storage)?;
+            }
+            let high_water = transaction
+                .query_row(
+                    "SELECT last_cursor FROM briskdb_global_index_outbox_state WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(sqlite_error::storage)?;
+            if checked_u64(high_water, "outbox high-water cursor")? != cursor {
+                return Err(EngineError::new(
+                    EngineErrorKind::Busy,
+                    "global-index outbox changed during consumer activation",
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO briskdb_global_index_outbox_consumers (
+                         index_id, durable_cursor, active
+                     ) VALUES (?1, ?2, 1)
+                     ON CONFLICT (index_id) DO UPDATE SET
+                         durable_cursor = excluded.durable_cursor, active = 1",
+                    params![to_sqlite_id(index_id)?, to_sqlite_u64(cursor, "cursor")?],
+                )
+                .map_err(sqlite_error::storage)?;
+            transaction.commit().map_err(sqlite_error::storage)
+        })?;
+    }
+    Ok(())
+}
+
 fn inspect_shard(storage: &Storage, shard: u16) -> EngineResult<GlobalIndexOutboxShardStatus> {
     let connection = storage.open_shard(shard)?;
     with_internal_authorizer(&connection, || {

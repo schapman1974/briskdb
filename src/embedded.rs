@@ -13,9 +13,10 @@ use std::{
 
 use crate::core::{
     CancellationToken, Catalog, CheckpointReport, DescribeTarget, Engine, EngineOptions,
-    EngineResult, EngineState, EngineStatus, Executed, PortalId, PrepareRequest, PreparedExecution,
-    PreparedStatementDescription, PreparedStatementId, RequestContext, ResultSet, Routed, Session,
-    SessionId, SessionState, ShutdownReport, Statement, Value, WriteResult,
+    EngineResult, EngineState, EngineStatus, Executed, GlobalIndexAsyncOptions, GlobalIndexWorker,
+    PortalId, PrepareRequest, PreparedExecution, PreparedStatementDescription, PreparedStatementId,
+    RequestContext, ResultSet, Routed, Session, SessionId, SessionState, ShutdownReport, Statement,
+    Value, WriteResult,
 };
 use crate::{EngineError, EngineErrorKind};
 
@@ -241,6 +242,14 @@ impl BriskDb {
     /// Return the immutable engine resource and lifecycle options.
     pub fn options(&self) -> EngineOptions {
         self.engine.options()
+    }
+
+    /// Start a caller-owned background consumer for ready non-unique indexes.
+    pub fn start_global_index_worker(
+        &self,
+        options: GlobalIndexAsyncOptions,
+    ) -> EngineResult<GlobalIndexWorker> {
+        self.engine.start_global_index_worker(options)
     }
 
     /// Create an independent frontend session owned by this database.

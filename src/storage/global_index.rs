@@ -33,7 +33,7 @@ use super::{CONNECTION_BUSY_TIMEOUT, Storage};
 const DIRECTORY_NAME: &str = "global-indexes";
 const SHARED_FILE_NAME: &str = "global.sqlite";
 const APPLICATION_ID: i32 = 0x4252_4749;
-const STORAGE_VERSION: u32 = 3;
+pub(super) const STORAGE_VERSION: u32 = 4;
 const BUILDING: i64 = 1;
 const COMPLETE: i64 = 2;
 const DEFINITION_DIGEST_DOMAIN: &[u8] = b"briskdb.global-index.definition.v1\0";
@@ -51,7 +51,7 @@ const VALUE_REQUEST_DIGEST_DOMAIN: &[u8] = b"briskdb.global-index.value-operatio
 const SCHEMA_SQL: &str = "
 CREATE TABLE briskdb_global_index_storage (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    storage_version INTEGER NOT NULL CHECK (storage_version = 3),
+    storage_version INTEGER NOT NULL CHECK (storage_version = 4),
     key_encoding_version INTEGER NOT NULL CHECK (key_encoding_version = 1)
 ) STRICT;
 
@@ -99,7 +99,7 @@ CREATE TABLE briskdb_global_index_unique_keys (
 
 INSERT INTO briskdb_global_index_storage (
     singleton, storage_version, key_encoding_version
-) VALUES (1, 3, 1);
+) VALUES (1, 4, 1);
 ";
 
 const AUTHORITY_SCHEMA_SQL: &str = "
@@ -184,6 +184,44 @@ CREATE INDEX briskdb_global_index_read_repairs_state
     ON briskdb_global_index_read_repairs (repair_state, index_id);
 ";
 
+pub(super) const ASYNC_INDEX_SCHEMA_SQL: &str = "
+CREATE TABLE briskdb_global_index_async_controls (
+    index_id INTEGER PRIMARY KEY CHECK (index_id > 0),
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    rebuild_required INTEGER NOT NULL CHECK (rebuild_required IN (0, 1)),
+    FOREIGN KEY (index_id) REFERENCES briskdb_global_index_builds (index_id)
+        ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE briskdb_global_index_async_watermarks (
+    index_id INTEGER NOT NULL CHECK (index_id > 0),
+    source_shard INTEGER NOT NULL CHECK (source_shard BETWEEN 0 AND 63),
+    applied_cursor INTEGER NOT NULL CHECK (applied_cursor >= 0),
+    applied_events INTEGER NOT NULL CHECK (applied_events >= 0),
+    failure_count INTEGER NOT NULL CHECK (failure_count >= 0),
+    last_batch_events INTEGER NOT NULL CHECK (last_batch_events >= 0),
+    last_batch_micros INTEGER NOT NULL CHECK (last_batch_micros >= 0),
+    last_applied_unix_ms INTEGER,
+    poison_cursor INTEGER CHECK (poison_cursor > 0),
+    poison_code INTEGER CHECK (poison_code > 0),
+    CHECK ((poison_cursor IS NULL) = (poison_code IS NULL)),
+    PRIMARY KEY (index_id, source_shard),
+    FOREIGN KEY (index_id) REFERENCES briskdb_global_index_builds (index_id)
+        ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE briskdb_global_index_async_leases (
+    index_id INTEGER NOT NULL CHECK (index_id > 0),
+    source_shard INTEGER NOT NULL CHECK (source_shard BETWEEN 0 AND 63),
+    owner_id BLOB NOT NULL CHECK (typeof(owner_id) = 'blob' AND length(owner_id) = 16),
+    fence_token INTEGER NOT NULL CHECK (fence_token > 0),
+    expires_unix_ms INTEGER NOT NULL CHECK (expires_unix_ms > 0),
+    PRIMARY KEY (index_id, source_shard),
+    FOREIGN KEY (index_id) REFERENCES briskdb_global_index_builds (index_id)
+        ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+";
+
 const UPGRADE_V1_TO_V2_SQL: &str = "
 ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v1;
 CREATE TABLE briskdb_global_index_storage (
@@ -212,6 +250,20 @@ DROP TABLE briskdb_global_index_storage_v2;
 PRAGMA user_version = 3;
 ";
 
+const UPGRADE_V3_TO_V4_SQL: &str = "
+ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v3;
+CREATE TABLE briskdb_global_index_storage (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    storage_version INTEGER NOT NULL CHECK (storage_version = 4),
+    key_encoding_version INTEGER NOT NULL CHECK (key_encoding_version = 1)
+) STRICT;
+INSERT INTO briskdb_global_index_storage (
+    singleton, storage_version, key_encoding_version
+) VALUES (1, 4, 1);
+DROP TABLE briskdb_global_index_storage_v3;
+PRAGMA user_version = 4;
+";
+
 const EXPECTED_OBJECTS_V1: &[&str] = &[
     "briskdb_global_index_builds",
     "briskdb_global_index_checkpoints",
@@ -234,7 +286,26 @@ const EXPECTED_OBJECTS_V2: &[&str] = &[
     "briskdb_global_value_sequences",
 ];
 
+const EXPECTED_OBJECTS_V3: &[&str] = &[
+    "briskdb_global_index_builds",
+    "briskdb_global_index_checkpoints",
+    "briskdb_global_index_entries",
+    "briskdb_global_index_read_repairs",
+    "briskdb_global_index_read_repairs_state",
+    "briskdb_global_index_storage",
+    "briskdb_global_index_unique_keys",
+    "briskdb_global_operations",
+    "briskdb_global_unique_mutations",
+    "briskdb_global_unique_reservations",
+    "briskdb_global_unique_reservations_operation",
+    "briskdb_global_value_leases",
+    "briskdb_global_value_sequences",
+];
+
 const EXPECTED_OBJECTS: &[&str] = &[
+    "briskdb_global_index_async_controls",
+    "briskdb_global_index_async_leases",
+    "briskdb_global_index_async_watermarks",
     "briskdb_global_index_builds",
     "briskdb_global_index_checkpoints",
     "briskdb_global_index_entries",
@@ -404,7 +475,7 @@ pub(super) fn startup_requires_upgrade(root: &Path) -> EngineResult<bool> {
         .map_err(sqlite_error::storage)?;
     match version {
         STORAGE_VERSION => Ok(false),
-        1 | 2 => Ok(true),
+        1..=3 => Ok(true),
         version if version > STORAGE_VERSION => Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             format!("global-index storage version {version} is newer than this build"),
@@ -434,6 +505,7 @@ pub(super) fn upgrade_if_needed(root: &Path) -> EngineResult<()> {
     match version {
         1 => validate_storage_contents(&connection, 1, EXPECTED_OBJECTS_V1)?,
         2 => validate_storage_contents(&connection, 2, EXPECTED_OBJECTS_V2)?,
+        3 => validate_storage_contents(&connection, 3, EXPECTED_OBJECTS_V3)?,
         _ => return validate(&connection),
     }
     let transaction = connection
@@ -447,11 +519,19 @@ pub(super) fn upgrade_if_needed(root: &Path) -> EngineResult<()> {
             .execute_batch(AUTHORITY_SCHEMA_SQL)
             .map_err(sqlite_error::storage)?;
     }
+    if version <= 2 {
+        transaction
+            .execute_batch(UPGRADE_V2_TO_V3_SQL)
+            .map_err(sqlite_error::storage)?;
+        transaction
+            .execute_batch(READ_REPAIR_SCHEMA_SQL)
+            .map_err(sqlite_error::storage)?;
+    }
     transaction
-        .execute_batch(UPGRADE_V2_TO_V3_SQL)
+        .execute_batch(UPGRADE_V3_TO_V4_SQL)
         .map_err(sqlite_error::storage)?;
     transaction
-        .execute_batch(READ_REPAIR_SCHEMA_SQL)
+        .execute_batch(ASYNC_INDEX_SCHEMA_SQL)
         .map_err(sqlite_error::storage)?;
     abort_at_authority_test_boundary("upgrade-before-commit");
     transaction.commit().map_err(sqlite_error::storage)?;
@@ -468,12 +548,15 @@ pub(super) fn downgrade_to_v1_for_test(root: &Path) {
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
              DROP TABLE briskdb_global_index_read_repairs;
+             DROP TABLE briskdb_global_index_async_leases;
+             DROP TABLE briskdb_global_index_async_watermarks;
+             DROP TABLE briskdb_global_index_async_controls;
              DROP TABLE briskdb_global_unique_reservations;
              DROP TABLE briskdb_global_unique_mutations;
              DROP TABLE briskdb_global_value_leases;
              DROP TABLE briskdb_global_value_sequences;
              DROP TABLE briskdb_global_operations;
-             ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v3;
+             ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v4;
              CREATE TABLE briskdb_global_index_storage (
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                  storage_version INTEGER NOT NULL CHECK (storage_version = 1),
@@ -482,7 +565,7 @@ pub(super) fn downgrade_to_v1_for_test(root: &Path) {
              INSERT INTO briskdb_global_index_storage (
                  singleton, storage_version, key_encoding_version
              ) VALUES (1, 1, 1);
-             DROP TABLE briskdb_global_index_storage_v3;
+             DROP TABLE briskdb_global_index_storage_v4;
              PRAGMA user_version = 1;
              PRAGMA wal_checkpoint(TRUNCATE);",
         )
@@ -497,7 +580,10 @@ pub(super) fn downgrade_to_v2_for_test(root: &Path) {
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
              DROP TABLE briskdb_global_index_read_repairs;
-             ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v3;
+             DROP TABLE briskdb_global_index_async_leases;
+             DROP TABLE briskdb_global_index_async_watermarks;
+             DROP TABLE briskdb_global_index_async_controls;
+             ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v4;
              CREATE TABLE briskdb_global_index_storage (
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                  storage_version INTEGER NOT NULL CHECK (storage_version = 2),
@@ -506,8 +592,34 @@ pub(super) fn downgrade_to_v2_for_test(root: &Path) {
              INSERT INTO briskdb_global_index_storage (
                  singleton, storage_version, key_encoding_version
              ) VALUES (1, 2, 1);
-             DROP TABLE briskdb_global_index_storage_v3;
+             DROP TABLE briskdb_global_index_storage_v4;
              PRAGMA user_version = 2;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+}
+
+#[cfg(test)]
+pub(super) fn downgrade_to_v3_for_test(root: &Path) {
+    let path = root.join(DIRECTORY_NAME).join(SHARED_FILE_NAME);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE briskdb_global_index_async_leases;
+             DROP TABLE briskdb_global_index_async_watermarks;
+             DROP TABLE briskdb_global_index_async_controls;
+             ALTER TABLE briskdb_global_index_storage RENAME TO briskdb_global_index_storage_v4;
+             CREATE TABLE briskdb_global_index_storage (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 storage_version INTEGER NOT NULL CHECK (storage_version = 3),
+                 key_encoding_version INTEGER NOT NULL CHECK (key_encoding_version = 1)
+             ) STRICT;
+             INSERT INTO briskdb_global_index_storage (
+                 singleton, storage_version, key_encoding_version
+             ) VALUES (1, 3, 1);
+             DROP TABLE briskdb_global_index_storage_v4;
+             PRAGMA user_version = 3;
              PRAGMA wal_checkpoint(TRUNCATE);",
         )
         .unwrap();
@@ -815,8 +927,13 @@ pub(super) fn verify_nonunique_candidates(
             0,
             0,
             0,
+            Vec::new(),
         ));
     }
+    // The outbox high-water vector is the query's freshness requirement. A
+    // later row commit may be linearized after this planning snapshot; shards
+    // at or beyond these cursors are safe to prune for this read.
+    let freshness_requirements = super::index_outbox::snapshot_high_waters(storage)?;
     let (connection, _) = open_existing(&storage.root)?
         .ok_or_else(|| corrupt("ready global index has no physical storage"))?;
     connection
@@ -826,6 +943,24 @@ pub(super) fn verify_nonunique_candidates(
         .unchecked_transaction()
         .map_err(sqlite_error::storage)?;
     validate_physical_authority(&transaction, index, storage.shard_count())?;
+    let mut uncertain_shards = super::global_index_async::uncertain_shards(
+        &transaction,
+        index.id(),
+        &freshness_requirements,
+    )?;
+    let has_read_repairs = transaction
+        .query_row(
+            "SELECT 1 FROM briskdb_global_index_read_repairs
+             WHERE index_id = ?1 LIMIT 1",
+            [to_sqlite_id(index.id())?],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?
+        .is_some();
+    if has_read_repairs {
+        uncertain_shards = (0..storage.shard_count()).collect();
+    }
     let candidates =
         read_nonunique_candidates(&transaction, index.id(), keys, storage.shard_count())?;
     transaction.commit().map_err(sqlite_error::storage)?;
@@ -957,6 +1092,9 @@ pub(super) fn verify_nonunique_candidates(
             }
             Err(_) => (0, 0, stale_count),
         };
+    if stale_count != 0 {
+        uncertain_shards = (0..storage.shard_count()).collect();
+    }
     Ok(GlobalIndexReadResolution::candidates(
         verified,
         candidate_count,
@@ -966,6 +1104,7 @@ pub(super) fn verify_nonunique_candidates(
         repairs_queued,
         repairs_applied,
         repairs_deferred,
+        uncertain_shards,
     ))
 }
 
@@ -2012,7 +2151,7 @@ fn validate_physical_build_complete(
     }
 }
 
-fn validate_physical_authority(
+pub(super) fn validate_physical_authority(
     transaction: &Transaction<'_>,
     index: &GlobalIndexMetadata,
     shard_count: u16,
@@ -2441,6 +2580,10 @@ fn build_inner(
         })
     })?;
     validate_physical_contents(&connection, index, &checkpoints, indexed_rows, unique_rows)?;
+    let async_high_waters = super::index_outbox::snapshot_high_waters(storage)?;
+    if !index.is_unique() {
+        super::index_outbox::activate_index(storage, index.id(), &async_high_waters)?;
+    }
 
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2457,6 +2600,7 @@ fn build_inner(
             ],
         )
         .map_err(sqlite_error::storage)?;
+    super::global_index_async::initialize_index(&transaction, index, &async_high_waters)?;
     ensure_not_cancelled(
         cancellation,
         "before completing physical global-index storage",
@@ -2771,6 +2915,8 @@ pub(super) fn repair_non_unique(
         })
     })?;
     validate_physical_contents(&connection, index, &checkpoints, indexed_rows, 0)?;
+    let async_high_waters = super::index_outbox::snapshot_high_waters(storage)?;
+    super::index_outbox::activate_index(storage, index.id(), &async_high_waters)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error::storage)?;
@@ -2785,6 +2931,7 @@ pub(super) fn repair_non_unique(
             ],
         )
         .map_err(sqlite_error::storage)?;
+    super::global_index_async::initialize_index(&transaction, index, &async_high_waters)?;
     ensure_not_cancelled(cancellation, "before completing global-index repair")?;
     abort_at_recovery_test_boundary("repair-complete-before-commit");
     transaction.commit().map_err(sqlite_error::storage)?;
@@ -4783,7 +4930,7 @@ fn open_or_create(root: &Path) -> EngineResult<(Connection, PathBuf)> {
     Ok((connection, path))
 }
 
-fn open_existing(root: &Path) -> EngineResult<Option<(Connection, PathBuf)>> {
+pub(super) fn open_existing(root: &Path) -> EngineResult<Option<(Connection, PathBuf)>> {
     let directory = root.join(DIRECTORY_NAME);
     match fs::symlink_metadata(&directory) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -4862,6 +5009,9 @@ fn initialize(connection: &Connection) -> EngineResult<()> {
         .map_err(sqlite_error::storage)?;
     connection
         .execute_batch(READ_REPAIR_SCHEMA_SQL)
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(ASYNC_INDEX_SCHEMA_SQL)
         .map_err(sqlite_error::storage)?;
     validate(connection)
 }
@@ -5033,7 +5183,7 @@ fn ensure_not_cancelled(cancellation: &CancellationToken, context: &str) -> Engi
     }
 }
 
-fn to_sqlite_id(index_id: GlobalIndexId) -> EngineResult<i64> {
+pub(super) fn to_sqlite_id(index_id: GlobalIndexId) -> EngineResult<i64> {
     i64::try_from(index_id.get()).map_err(|error| {
         EngineError::from_source(
             EngineErrorKind::NumericOutOfRange,
@@ -5043,7 +5193,7 @@ fn to_sqlite_id(index_id: GlobalIndexId) -> EngineResult<i64> {
     })
 }
 
-fn to_sqlite_u64(value: u64, description: &str) -> EngineResult<i64> {
+pub(super) fn to_sqlite_u64(value: u64, description: &str) -> EngineResult<i64> {
     i64::try_from(value).map_err(|error| {
         EngineError::from_source(
             EngineErrorKind::NumericOutOfRange,
@@ -5053,7 +5203,7 @@ fn to_sqlite_u64(value: u64, description: &str) -> EngineResult<i64> {
     })
 }
 
-fn from_sqlite_u64(value: i64, description: &str) -> EngineResult<u64> {
+pub(super) fn from_sqlite_u64(value: i64, description: &str) -> EngineResult<u64> {
     u64::try_from(value).map_err(|_| corrupt(format!("{description} is negative")))
 }
 
@@ -5075,7 +5225,7 @@ fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-fn corrupt(diagnostic: impl Into<String>) -> EngineError {
+pub(super) fn corrupt(diagnostic: impl Into<String>) -> EngineError {
     EngineError::new(EngineErrorKind::DataCorruption, diagnostic)
 }
 

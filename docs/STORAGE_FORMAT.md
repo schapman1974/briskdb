@@ -1317,7 +1317,7 @@ This routing format is intentionally distinct from the tagged, order-preserving
 [canonical global-index key format](INDEX_KEY_ENCODING.md). Version 13 records
 the codec version in every global-index definition but does not persist physical
 index entries or change shard placement. Physical entries live in the separate
-storage-version-3 `global-indexes/global.sqlite` authority, never in a shard.
+storage-version-4 `global-indexes/global.sqlite` authority, never in a shard.
 
 ### Optional shard-local global-index outbox version 1
 
@@ -1347,11 +1347,11 @@ shard WAL transaction. Consumer advancement and pruning use separate immediate
 transactions; pruning stops at the minimum active durable cursor. A consumer
 behind `pruned_through` must rebuild rather than silently skip history.
 
-### Physical global-index storage version 3
+### Physical global-index storage version 4
 
 The selected `SharedSqliteV1` layout is one real regular file at
 `global-indexes/global.sqlite`. Its `application_id` is `0x42524749`, its
-`user_version` is `3`, its journal mode is `WAL`, and writers use
+`user_version` is `4`, its journal mode is `WAL`, and writers use
 `synchronous=FULL`. The build tables and ownership rules are listed
 in [offline global-index construction](GLOBAL_INDEX_BUILD.md).
 
@@ -1381,6 +1381,26 @@ tombstones hide only matching non-unique candidate entries. They never alter
 unique-key ownership or the base build/checkpoint digest. One plan reads at
 most 4,096 candidates and queues at most 64 repairs. Startup upgrades either
 version 1 or 2 under the same sole-process fence.
+
+Version 4 adds three exact STRICT objects:
+
+- `briskdb_global_index_async_controls` stores per-index pause and mandatory
+  rebuild fences;
+- `briskdb_global_index_async_watermarks` stores one source-shard cursor,
+  applied/failure counters, last-batch event count and duration, last-apply
+  time, and optional poison cursor/code per non-unique index;
+- `briskdb_global_index_async_leases` stores the opaque 16-byte worker owner,
+  monotonic fence token, and Unix-millisecond expiry for one index/shard pair.
+
+The source entry mutation and watermark advance commit in the same authority
+transaction. A lease owner and fence are revalidated inside that transaction.
+The shard-local consumer cursor advances only after the authority commit, so a
+crash can repeat acknowledgement but cannot double-apply entries. A replacement
+build recreates every watermark at its captured shard high-water, clears leases
+and poison state, and reactivates the shard consumer at the same cursor.
+Versions 1 through 3 upgrade atomically under sole-process ownership. Existing
+version-3 indexes retain their entries but have no provable initial watermark;
+they scan safely and report `rebuild_required` until rebuilt.
 
 Source-shard entries and their checkpoint commit together. Resume re-hashes
 every completed prefix shard and restarts from zero if application data changed.

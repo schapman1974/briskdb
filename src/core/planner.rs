@@ -138,6 +138,7 @@ pub struct GlobalIndexRoutingPlan {
     repairs_applied: usize,
     repairs_deferred: usize,
     candidate_shards: Vec<u16>,
+    uncertain_shards: Vec<u16>,
     target_shards: Vec<u16>,
     fallback: Option<GlobalIndexRoutingFallback>,
 }
@@ -158,6 +159,7 @@ impl GlobalIndexRoutingPlan {
             repairs_applied: 0,
             repairs_deferred: 0,
             candidate_shards: Vec::new(),
+            uncertain_shards: Vec::new(),
             target_shards: Vec::new(),
             fallback: None,
         }
@@ -238,6 +240,11 @@ impl GlobalIndexRoutingPlan {
         &self.candidate_shards
     }
 
+    /// Return lagging shards retained for correctness beside index candidates.
+    pub fn uncertain_shards(&self) -> &[u16] {
+        &self.uncertain_shards
+    }
+
     /// Return the exact logical shard target set. An empty set is executed on
     /// a harmless sentinel shard only to preserve SQLite result metadata.
     pub fn target_shards(&self) -> &[u16] {
@@ -267,6 +274,7 @@ impl fmt::Debug for GlobalIndexRoutingPlan {
             .field("repairs_applied", &self.repairs_applied)
             .field("repairs_deferred", &self.repairs_deferred)
             .field("candidate_shards", &self.candidate_shards)
+            .field("uncertain_shards", &self.uncertain_shards)
             .field("target_shards", &self.target_shards)
             .field("fallback", &self.fallback)
             .finish()
@@ -688,6 +696,7 @@ where
             repairs_applied: 0,
             repairs_deferred: 0,
             candidate_shards: Vec::new(),
+            uncertain_shards: Vec::new(),
             target_shards: Vec::new(),
             fallback: None,
         };
@@ -754,20 +763,45 @@ where
             return Err(planning_invariant());
         }
     }
+    let mut uncertain_shards = resolution.uncertain_shards().to_vec();
+    match plan.inference.kind() {
+        ShardKeyInferenceKind::Exact | ShardKeyInferenceKind::Multiple => {
+            let mut routed = plan
+                .inferred_routes
+                .iter()
+                .map(PlannedRoute::shard)
+                .collect::<Vec<_>>();
+            routed.sort_unstable();
+            routed.dedup();
+            uncertain_shards.retain(|shard| routed.binary_search(shard).is_ok());
+        }
+        ShardKeyInferenceKind::Contradiction => uncertain_shards.clear(),
+        ShardKeyInferenceKind::Unconstrained => {}
+        ShardKeyInferenceKind::NotApplicable | ShardKeyInferenceKind::NotSharded => {
+            return Err(planning_invariant());
+        }
+    }
+    uncertain_shards.sort_unstable();
+    uncertain_shards.dedup();
     let fallback = if resolution.is_candidate_limit_exceeded() {
         Some(GlobalIndexRoutingFallback::TooManyCandidates)
-    } else if resolution.is_complete() {
+    } else if resolution.is_complete() || uncertain_shards.is_empty() {
         None
     } else {
         Some(GlobalIndexRoutingFallback::FreshnessUnproven)
     };
-    let target_shards = if fallback.is_some() {
-        fallback_targets
+    let target_shards = if resolution.is_candidate_limit_exceeded() {
+        fallback_targets.clone()
     } else {
-        candidate_shards.clone()
+        let mut targets = candidate_shards.clone();
+        targets.extend_from_slice(&uncertain_shards);
+        targets.sort_unstable();
+        targets.dedup();
+        targets
     };
+    let retained_full_fallback = fallback.is_some() && target_shards == fallback_targets;
     plan.global_index_routing = GlobalIndexRoutingPlan {
-        kind: if fallback.is_some() {
+        kind: if resolution.is_candidate_limit_exceeded() || retained_full_fallback {
             GlobalIndexRoutingKind::Fallback
         } else if target_shards.is_empty() {
             GlobalIndexRoutingKind::Empty
@@ -786,6 +820,7 @@ where
         repairs_applied: resolution.repairs_applied(),
         repairs_deferred: resolution.repairs_deferred(),
         candidate_shards,
+        uncertain_shards,
         target_shards,
         fallback,
     };

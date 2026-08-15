@@ -17,6 +17,9 @@ pub(crate) const MAX_GLOBAL_INDEX_READ_REPAIRS: usize = 64;
 pub const MAX_GLOBAL_INDEX_OUTBOX_BATCH_EVENTS: usize = 4_096;
 pub const MAX_GLOBAL_INDEX_OUTBOX_EVENTS_PER_SHARD: u64 = 1_000_000;
 pub const MAX_GLOBAL_INDEX_OUTBOX_BYTES_PER_SHARD: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_GLOBAL_INDEX_ASYNC_BATCH_EVENTS: usize = 1_024;
+pub const DEFAULT_GLOBAL_INDEX_ASYNC_LEASE_MS: u64 = 5_000;
+pub const DEFAULT_GLOBAL_INDEX_ASYNC_POLL_MS: u64 = 25;
 pub(crate) const MAX_GLOBAL_VALUE_LEASE_COUNT: u32 = 65_536;
 const DEFAULT_MAX_REPORTED_VALIDATION_ISSUES: u16 = 128;
 const MAX_REPORTED_VALIDATION_ISSUES: u16 = 1_024;
@@ -445,6 +448,295 @@ impl GlobalIndexOutboxPruneReport {
     }
 }
 
+/// Configuration for a managed non-unique global-index consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalIndexAsyncOptions {
+    batch_events: usize,
+    lease_ms: u64,
+    poll_ms: u64,
+}
+
+impl GlobalIndexAsyncOptions {
+    pub fn new(batch_events: usize, lease_ms: u64, poll_ms: u64) -> EngineResult<Self> {
+        if batch_events == 0 || batch_events > MAX_GLOBAL_INDEX_OUTBOX_BATCH_EVENTS {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                format!(
+                    "global-index async batches must contain 1..={MAX_GLOBAL_INDEX_OUTBOX_BATCH_EVENTS} events"
+                ),
+            ));
+        }
+        if !(100..=60_000).contains(&lease_ms) {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "global-index async leases must be between 100 and 60000 milliseconds",
+            ));
+        }
+        if !(1..=60_000).contains(&poll_ms) {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "global-index async polling must be between 1 and 60000 milliseconds",
+            ));
+        }
+        Ok(Self {
+            batch_events,
+            lease_ms,
+            poll_ms,
+        })
+    }
+
+    pub const fn batch_events(self) -> usize {
+        self.batch_events
+    }
+
+    pub const fn lease_ms(self) -> u64 {
+        self.lease_ms
+    }
+
+    pub const fn poll_ms(self) -> u64 {
+        self.poll_ms
+    }
+}
+
+impl Default for GlobalIndexAsyncOptions {
+    fn default() -> Self {
+        Self {
+            batch_events: DEFAULT_GLOBAL_INDEX_ASYNC_BATCH_EVENTS,
+            lease_ms: DEFAULT_GLOBAL_INDEX_ASYNC_LEASE_MS,
+            poll_ms: DEFAULT_GLOBAL_INDEX_ASYNC_POLL_MS,
+        }
+    }
+}
+
+/// Outcome of one shard in a bounded asynchronous indexing pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GlobalIndexAsyncShardOutcome {
+    Applied,
+    Current,
+    LeasedElsewhere,
+    Paused,
+    Poisoned,
+    RebuildRequired,
+}
+
+/// Work completed for one source shard in a bounded indexing pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexAsyncShardReport {
+    shard: u16,
+    outcome: GlobalIndexAsyncShardOutcome,
+    from: GlobalIndexOutboxCursor,
+    through: GlobalIndexOutboxCursor,
+    applied_events: u64,
+}
+
+impl GlobalIndexAsyncShardReport {
+    pub(crate) const fn new(
+        shard: u16,
+        outcome: GlobalIndexAsyncShardOutcome,
+        from: u64,
+        through: u64,
+        applied_events: u64,
+    ) -> Self {
+        Self {
+            shard,
+            outcome,
+            from: GlobalIndexOutboxCursor::new(from),
+            through: GlobalIndexOutboxCursor::new(through),
+            applied_events,
+        }
+    }
+
+    pub const fn shard(&self) -> u16 {
+        self.shard
+    }
+
+    pub const fn outcome(&self) -> GlobalIndexAsyncShardOutcome {
+        self.outcome
+    }
+
+    pub const fn from(&self) -> GlobalIndexOutboxCursor {
+        self.from
+    }
+
+    pub const fn through(&self) -> GlobalIndexOutboxCursor {
+        self.through
+    }
+
+    pub const fn applied_events(&self) -> u64 {
+        self.applied_events
+    }
+}
+
+/// Result of one bounded pass over every source shard for an index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexAsyncProcessReport {
+    index_id: GlobalIndexId,
+    shards: Box<[GlobalIndexAsyncShardReport]>,
+}
+
+impl GlobalIndexAsyncProcessReport {
+    pub(crate) fn new(index_id: GlobalIndexId, shards: Vec<GlobalIndexAsyncShardReport>) -> Self {
+        Self {
+            index_id,
+            shards: shards.into_boxed_slice(),
+        }
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+
+    pub fn shards(&self) -> &[GlobalIndexAsyncShardReport] {
+        &self.shards
+    }
+
+    pub fn applied_events(&self) -> u64 {
+        self.shards.iter().map(|shard| shard.applied_events).sum()
+    }
+}
+
+/// Durable freshness and health for one index/source-shard pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexAsyncShardStatus {
+    shard: u16,
+    applied: GlobalIndexOutboxCursor,
+    high_water: GlobalIndexOutboxCursor,
+    applied_events: u64,
+    failure_count: u64,
+    last_batch_events: u64,
+    last_batch_micros: u64,
+    poison_cursor: Option<GlobalIndexOutboxCursor>,
+    lease_fence: u64,
+    leased: bool,
+}
+
+impl GlobalIndexAsyncShardStatus {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        shard: u16,
+        applied: u64,
+        high_water: u64,
+        applied_events: u64,
+        failure_count: u64,
+        last_batch_events: u64,
+        last_batch_micros: u64,
+        poison_cursor: Option<u64>,
+        lease_fence: u64,
+        leased: bool,
+    ) -> Self {
+        Self {
+            shard,
+            applied: GlobalIndexOutboxCursor::new(applied),
+            high_water: GlobalIndexOutboxCursor::new(high_water),
+            applied_events,
+            failure_count,
+            last_batch_events,
+            last_batch_micros,
+            poison_cursor: poison_cursor.map(GlobalIndexOutboxCursor::new),
+            lease_fence,
+            leased,
+        }
+    }
+
+    pub const fn shard(&self) -> u16 {
+        self.shard
+    }
+    pub const fn applied(&self) -> GlobalIndexOutboxCursor {
+        self.applied
+    }
+    pub const fn high_water(&self) -> GlobalIndexOutboxCursor {
+        self.high_water
+    }
+    pub const fn lag(&self) -> u64 {
+        self.high_water.get().saturating_sub(self.applied.get())
+    }
+    pub const fn applied_events(&self) -> u64 {
+        self.applied_events
+    }
+    pub const fn failure_count(&self) -> u64 {
+        self.failure_count
+    }
+    pub const fn last_batch_events(&self) -> u64 {
+        self.last_batch_events
+    }
+    pub const fn last_batch_micros(&self) -> u64 {
+        self.last_batch_micros
+    }
+    pub fn last_batch_events_per_second(&self) -> u64 {
+        if self.last_batch_micros == 0 {
+            return 0;
+        }
+        let rate =
+            u128::from(self.last_batch_events) * 1_000_000 / u128::from(self.last_batch_micros);
+        u64::try_from(rate).unwrap_or(u64::MAX)
+    }
+    pub const fn poison_cursor(&self) -> Option<GlobalIndexOutboxCursor> {
+        self.poison_cursor
+    }
+    pub const fn lease_fence(&self) -> u64 {
+        self.lease_fence
+    }
+    pub const fn is_leased(&self) -> bool {
+        self.leased
+    }
+    pub const fn is_fresh(&self) -> bool {
+        self.poison_cursor.is_none() && self.applied.get() >= self.high_water.get()
+    }
+}
+
+/// Redaction-safe operator status for one asynchronous global index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexAsyncStatus {
+    index_id: GlobalIndexId,
+    paused: bool,
+    rebuild_required: bool,
+    shards: Box<[GlobalIndexAsyncShardStatus]>,
+}
+
+impl GlobalIndexAsyncStatus {
+    pub(crate) fn new(
+        index_id: GlobalIndexId,
+        paused: bool,
+        rebuild_required: bool,
+        shards: Vec<GlobalIndexAsyncShardStatus>,
+    ) -> Self {
+        Self {
+            index_id,
+            paused,
+            rebuild_required,
+            shards: shards.into_boxed_slice(),
+        }
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+    pub const fn is_paused(&self) -> bool {
+        self.paused
+    }
+    pub const fn rebuild_required(&self) -> bool {
+        self.rebuild_required
+    }
+    pub fn shards(&self) -> &[GlobalIndexAsyncShardStatus] {
+        &self.shards
+    }
+    pub fn lag(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(GlobalIndexAsyncShardStatus::lag)
+            .sum()
+    }
+    pub fn is_fresh(&self) -> bool {
+        !self.paused
+            && !self.rebuild_required
+            && self
+                .shards
+                .iter()
+                .all(GlobalIndexAsyncShardStatus::is_fresh)
+    }
+}
+
 /// Storage result consumed by protocol-neutral global-index read planning.
 /// Non-unique results remain incomplete until asynchronous freshness
 /// watermarks prove which source shards may be excluded.
@@ -460,6 +752,7 @@ pub(crate) struct GlobalIndexReadResolution {
     repairs_deferred: usize,
     complete: bool,
     candidate_limit_exceeded: bool,
+    uncertain_shards: Vec<u16>,
 }
 
 impl GlobalIndexReadResolution {
@@ -476,6 +769,7 @@ impl GlobalIndexReadResolution {
             repairs_deferred: 0,
             complete: true,
             candidate_limit_exceeded: false,
+            uncertain_shards: Vec::new(),
         }
     }
 
@@ -489,6 +783,7 @@ impl GlobalIndexReadResolution {
         repairs_queued: usize,
         repairs_applied: usize,
         repairs_deferred: usize,
+        uncertain_shards: Vec<u16>,
     ) -> Self {
         Self {
             owners,
@@ -501,6 +796,7 @@ impl GlobalIndexReadResolution {
             repairs_deferred,
             complete: false,
             candidate_limit_exceeded: false,
+            uncertain_shards,
         }
     }
 
@@ -516,6 +812,7 @@ impl GlobalIndexReadResolution {
             repairs_deferred: 0,
             complete: false,
             candidate_limit_exceeded: true,
+            uncertain_shards: Vec::new(),
         }
     }
 
@@ -557,6 +854,10 @@ impl GlobalIndexReadResolution {
 
     pub(crate) const fn is_candidate_limit_exceeded(&self) -> bool {
         self.candidate_limit_exceeded
+    }
+
+    pub(crate) fn uncertain_shards(&self) -> &[u16] {
+        &self.uncertain_shards
     }
 }
 
@@ -1713,5 +2014,28 @@ mod tests {
         assert_eq!(report.deleted_events(), 3);
         assert_eq!(report.deleted_bytes(), 192);
         assert_eq!(report.pruned_through().get(), 6);
+    }
+
+    #[test]
+    fn async_options_and_status_are_bounded_owned_and_redaction_safe() {
+        assert!(GlobalIndexAsyncOptions::new(0, 5_000, 25).is_err());
+        assert!(GlobalIndexAsyncOptions::new(4_097, 5_000, 25).is_err());
+        assert!(GlobalIndexAsyncOptions::new(1, 99, 25).is_err());
+        assert!(GlobalIndexAsyncOptions::new(1, 5_000, 0).is_err());
+        let options = GlobalIndexAsyncOptions::new(64, 1_000, 10).unwrap();
+        assert_eq!(options.batch_events(), 64);
+        assert_eq!(options.lease_ms(), 1_000);
+        assert_eq!(options.poll_ms(), 10);
+
+        let shard = GlobalIndexAsyncShardStatus::new(2, 7, 11, 9, 1, 3, 250, Some(8), 4, true);
+        assert_eq!(shard.lag(), 4);
+        assert_eq!(shard.last_batch_events_per_second(), 12_000);
+        assert_eq!(shard.poison_cursor().unwrap().get(), 8);
+        assert!(!shard.is_fresh());
+        let status =
+            GlobalIndexAsyncStatus::new(GlobalIndexId::new(1).unwrap(), false, false, vec![shard]);
+        assert_eq!(status.lag(), 4);
+        assert!(!status.is_fresh());
+        assert!(!format!("{status:?}").contains("secret"));
     }
 }
