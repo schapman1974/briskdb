@@ -39,7 +39,9 @@ pub(crate) use generated_id::AllocationOwnerMap;
 pub use global_index::{
     GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart,
     GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata,
-    GlobalIndexStorageTopology, HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1,
+    GlobalIndexRepairReport, GlobalIndexStorageTopology, GlobalIndexValidationIssue,
+    GlobalIndexValidationIssueKind, GlobalIndexValidationMode, GlobalIndexValidationOptions,
+    GlobalIndexValidationReport, HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1,
 };
 pub(crate) use global_index::{
     MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_SQL_BYTES, MAX_GLOBAL_INDEXES,
@@ -259,6 +261,70 @@ impl Database {
         cancellation: &CancellationToken,
     ) -> EngineResult<GlobalIndexBuildReport> {
         self.storage.build_global_index(index_id, cancellation)
+    }
+
+    /// Fully validate one global index against every qualifying source row.
+    ///
+    /// Validation is an offline maintenance operation. It fences the index out
+    /// of `Ready` before scanning and publishes either `Ready` or `Invalid`
+    /// after the machine-readable result is durable.
+    pub fn validate_global_index(
+        &mut self,
+        index_id: GlobalIndexId,
+    ) -> EngineResult<GlobalIndexValidationReport> {
+        self.validate_global_index_with_cancellation(
+            index_id,
+            GlobalIndexValidationOptions::full(),
+            &CancellationToken::new(),
+        )
+    }
+
+    /// Validate one global index with explicit full/sample bounds and cancellation.
+    pub fn validate_global_index_with_cancellation(
+        &mut self,
+        index_id: GlobalIndexId,
+        options: GlobalIndexValidationOptions,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalIndexValidationReport> {
+        self.storage
+            .validate_global_index(index_id, options, cancellation)
+    }
+
+    /// Rebuild a `Ready`, `Invalid`, or interrupted `Rebuilding` index offline.
+    pub fn rebuild_global_index(
+        &mut self,
+        index_id: GlobalIndexId,
+    ) -> EngineResult<GlobalIndexBuildReport> {
+        self.rebuild_global_index_with_cancellation(index_id, &CancellationToken::new())
+    }
+
+    /// Rebuild one index with a caller-owned sticky cancellation signal.
+    pub fn rebuild_global_index_with_cancellation(
+        &mut self,
+        index_id: GlobalIndexId,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalIndexBuildReport> {
+        self.storage.rebuild_global_index(index_id, cancellation)
+    }
+
+    /// Repair stale non-unique physical state one affected shard at a time.
+    ///
+    /// Unique indexes deliberately reject this path because authoritative
+    /// uniqueness must be reconstructed from source through a full rebuild.
+    pub fn repair_global_index(
+        &mut self,
+        index_id: GlobalIndexId,
+    ) -> EngineResult<GlobalIndexRepairReport> {
+        self.repair_global_index_with_cancellation(index_id, &CancellationToken::new())
+    }
+
+    /// Repair a non-unique index with caller-owned cancellation.
+    pub fn repair_global_index_with_cancellation(
+        &mut self,
+        index_id: GlobalIndexId,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalIndexRepairReport> {
+        self.storage.repair_global_index(index_id, cancellation)
     }
 
     /// Atomically apply one legal non-publication global-index lifecycle transition.

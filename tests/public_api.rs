@@ -229,8 +229,13 @@ fn global_index_catalog_is_read_only_reopenable_and_lifecycle_fenced() {
         .unwrap();
     assert_eq!(
         database.build_global_index(index_id).unwrap_err().kind(),
-        core::EngineErrorKind::Unsupported
+        core::EngineErrorKind::FailedPrecondition
     );
+    assert_eq!(
+        database.rebuild_global_index(index_id).unwrap().index_id(),
+        index_id
+    );
+    assert!(database.validate_global_index(index_id).unwrap().is_valid());
     database
         .transition_global_index(index_id, core::GlobalIndexLifecycle::Invalid)
         .unwrap();

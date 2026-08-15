@@ -667,6 +667,52 @@ fn global_index_catalog_serializes_writers_and_readers_see_only_complete_snapsho
     assert_root_integrity(temp.path());
 }
 
+#[test]
+fn global_index_recovery_is_fenced_while_an_independent_process_uses_the_root() {
+    let temp = tempfile::tempdir().expect("create global-index recovery root");
+    setup_events(temp.path());
+    let mut database = Database::open(temp.path(), SHARDS).expect("open global-index owner");
+    let id = database
+        .create_global_index(global_index_declaration(
+            &database,
+            "events_payload_recovery",
+        ))
+        .expect("create global index");
+    database.build_global_index(id).expect("build global index");
+
+    let ready = temp.path().join("recovery-holder-ready");
+    let go = temp.path().join("recovery-holder-go");
+    let output = temp.path().join("recovery-holder-output");
+    let mut holder = spawn_test_child(temp.path(), "index-holder", 0, None, &ready, &go, &output);
+    wait_for_path(&ready);
+
+    for error in [
+        database.validate_global_index(id).unwrap_err(),
+        database.rebuild_global_index(id).unwrap_err(),
+        database.repair_global_index(id).unwrap_err(),
+    ] {
+        assert_eq!(error.kind(), EngineErrorKind::Busy);
+        assert!(error.is_retryable());
+    }
+    assert_eq!(
+        database
+            .catalog()
+            .global_index_by_id(id)
+            .unwrap()
+            .lifecycle(),
+        briskdb::core::GlobalIndexLifecycle::Ready
+    );
+
+    fs::write(&go, b"release").expect("release root holder");
+    holder.wait_success();
+    assert!(
+        database
+            .validate_global_index(id)
+            .expect("retry validation after peer closes")
+            .is_valid()
+    );
+}
+
 #[cfg(feature = "experimental-vtab")]
 #[test]
 fn independent_processes_reserve_disjoint_hilo_ids_and_persist_every_row() {

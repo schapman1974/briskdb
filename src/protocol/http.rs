@@ -42,6 +42,7 @@ pub fn router_with_engine(engine: Engine) -> Router {
         .route("/v1/execute", post(execute))
         .route("/v1/query", post(query))
         .route("/v1/admin/broadcast", post(broadcast))
+        .route("/v1/admin/global-indexes", get(global_indexes))
         .merge(admin::routes(state.clone()))
         .with_state(state)
 }
@@ -86,6 +87,21 @@ struct QueryRequest {
 #[derive(Debug, Deserialize)]
 struct BroadcastRequest {
     sql: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GlobalIndexesResponse {
+    indexes: Vec<GlobalIndexStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct GlobalIndexStatus {
+    id: String,
+    name: String,
+    unique: bool,
+    lifecycle: &'static str,
+    available: bool,
+    recovery: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -205,6 +221,35 @@ async fn broadcast(
     let session = engine.session();
     let shards = engine.broadcast(&session, request.sql).await?;
     Ok(Json(json!({"completed_shards": shards})))
+}
+
+async fn global_indexes(State(state): State<HttpState>) -> Json<GlobalIndexesResponse> {
+    let indexes = state
+        .engine
+        .catalog()
+        .global_indexes()
+        .iter()
+        .map(|index| {
+            let (lifecycle, available, recovery) = match index.lifecycle() {
+                crate::core::GlobalIndexLifecycle::Creating => ("creating", false, "build"),
+                crate::core::GlobalIndexLifecycle::Ready => ("ready", true, "none"),
+                crate::core::GlobalIndexLifecycle::Invalid => ("invalid", false, "rebuild"),
+                crate::core::GlobalIndexLifecycle::Rebuilding => {
+                    ("rebuilding", false, "resume_rebuild")
+                }
+                crate::core::GlobalIndexLifecycle::Dropping => ("dropping", false, "none"),
+            };
+            GlobalIndexStatus {
+                id: index.id().to_string(),
+                name: index.name().to_owned(),
+                unique: index.is_unique(),
+                lifecycle,
+                available,
+                recovery,
+            }
+        })
+        .collect();
+    Json(GlobalIndexesResponse { indexes })
 }
 
 fn json_to_value(value: JsonValue) -> Value {
@@ -347,8 +392,10 @@ mod tests {
     use super::*;
     use crate::{
         core::{
-            Column, DataType, EngineErrorKind, EngineOptions, ResultLimits, Row, ShardKeyMetadata,
-            ShardKeyType, TableDeclaration,
+            Column, DataType, EngineErrorKind, EngineOptions, GlobalIndexDeclaration,
+            GlobalIndexKeyPart, GlobalIndexKeySource, GlobalIndexKeyType,
+            GlobalIndexStorageTopology, ResultLimits, Row, ShardKeyMetadata, ShardKeyType,
+            TableDeclaration,
         },
         sql::{
             MAX_PARSED_SQL_BYTES, SqlDialect, normalize_placeholders, parse, validate_common_subset,
@@ -478,6 +525,65 @@ mod tests {
                         {"name": "name", "data_type": "text"}
                     ],
                     "rows": [["widget-1", "First widget"]]
+                }),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn global_index_status_is_machine_readable_for_service_callers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 4).unwrap();
+        database
+            .broadcast("CREATE TABLE events (tenant_id TEXT NOT NULL, email TEXT NOT NULL)")
+            .unwrap();
+        let logical = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical,
+                    "events",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let table = database
+            .catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap()
+            .id();
+        let index_id = database
+            .create_global_index(
+                GlobalIndexDeclaration::new(
+                    table,
+                    "events_email_lookup",
+                    vec![GlobalIndexKeyPart::new(
+                        GlobalIndexKeySource::column("email").unwrap(),
+                        GlobalIndexKeyType::Text,
+                    )],
+                )
+                .unwrap()
+                .with_topology(GlobalIndexStorageTopology::selected_v1()),
+            )
+            .unwrap();
+        database.build_global_index(index_id).unwrap();
+
+        let application = engine_router(Arc::new(database));
+        assert_eq!(
+            request_json(&application, Method::GET, "/v1/admin/global-indexes", None,).await,
+            (
+                StatusCode::OK,
+                json!({
+                    "indexes": [{
+                        "id": index_id.to_string(),
+                        "name": "events_email_lookup",
+                        "unique": false,
+                        "lifecycle": "ready",
+                        "available": true,
+                        "recovery": "none"
+                    }]
                 }),
             )
         );

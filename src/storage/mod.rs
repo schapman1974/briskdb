@@ -46,8 +46,9 @@ use crate::{
     core::{
         Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
         GeneratedTableDdlReceipt, GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId,
-        GlobalIndexLifecycle, GlobalIndexMetadata, MAX_TABLES, ShardKeyType, TableDeclaration,
-        TablePlacement,
+        GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexRepairReport,
+        GlobalIndexValidationMode, GlobalIndexValidationOptions, GlobalIndexValidationReport,
+        MAX_TABLES, ShardKeyType, TableDeclaration, TablePlacement,
         generated_id::{
             NATIVE_RANGE_V1_FORMAT_MARKER, native_range_v1_sequence_ceiling,
             native_range_v1_sequence_floor,
@@ -448,6 +449,16 @@ fn abort_generated_table_ddl_at_test_boundary(boundary: &str) {
         std::process::abort();
     }
 }
+
+#[cfg(test)]
+fn abort_global_index_recovery_at_test_boundary(boundary: &str) {
+    if std::env::var("BRISKDB_GLOBAL_INDEX_RECOVERY_ABORT_POINT").as_deref() == Ok(boundary) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(test))]
+fn abort_global_index_recovery_at_test_boundary(_boundary: &str) {}
 
 fn validate_schema_migration_checksum_prefix(
     shards_dir: &Path,
@@ -1374,6 +1385,268 @@ impl Storage {
         self.catalog = replacement_guard.publish(&self.catalog, replacement)?;
         mutation.publish_ready()?;
         Ok(report)
+    }
+
+    pub(crate) fn validate_global_index(
+        &mut self,
+        index_id: GlobalIndexId,
+        options: GlobalIndexValidationOptions,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexValidationReport> {
+        let result = self.validate_global_index_inner(index_id, options, cancellation);
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn validate_global_index_inner(
+        &mut self,
+        index_id: GlobalIndexId,
+        options: GlobalIndexValidationOptions,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexValidationReport> {
+        let mut mutation =
+            SchemaMigrationGuard::new(self.schema_coordination.gate.begin_new_migration()?);
+        mutation.wait_for_quiescence_blocking();
+        mutation.acquire_process_ownership(&self.schema_coordination.process_lease)?;
+        let original = self.global_index_metadata(index_id)?;
+        match original.lifecycle() {
+            GlobalIndexLifecycle::Ready | GlobalIndexLifecycle::Invalid => {
+                self.publish_global_index_lifecycle(
+                    index_id,
+                    GlobalIndexLifecycle::Rebuilding,
+                    &mut mutation,
+                )?;
+            }
+            GlobalIndexLifecycle::Rebuilding => {}
+            lifecycle => {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "global index {index_id} cannot be validated while its lifecycle is {lifecycle:?}"
+                    ),
+                ));
+            }
+        }
+        abort_global_index_recovery_at_test_boundary("validation-fenced");
+        let fenced = self.global_index_metadata(index_id)?;
+        let outcome = match global_index::validate_index(self, &fenced, cancellation, options) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                mutation.publish_ready()?;
+                return Err(error);
+            }
+        };
+        abort_global_index_recovery_at_test_boundary("validation-complete");
+        let can_publish_ready = outcome.is_valid()
+            && (original.lifecycle() == GlobalIndexLifecycle::Ready
+                || (options.mode() == GlobalIndexValidationMode::Full
+                    && (original.lifecycle() == GlobalIndexLifecycle::Rebuilding
+                        || !original.is_unique())));
+        let lifecycle_after = if can_publish_ready {
+            GlobalIndexLifecycle::Ready
+        } else {
+            GlobalIndexLifecycle::Invalid
+        };
+        self.publish_global_index_lifecycle(index_id, lifecycle_after, &mut mutation)?;
+        abort_global_index_recovery_at_test_boundary("validation-published");
+        mutation.publish_ready()?;
+        Ok(outcome.into_report(index_id, original.lifecycle(), lifecycle_after))
+    }
+
+    pub(crate) fn rebuild_global_index(
+        &mut self,
+        index_id: GlobalIndexId,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexBuildReport> {
+        let result = self.rebuild_global_index_inner(index_id, cancellation);
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn rebuild_global_index_inner(
+        &mut self,
+        index_id: GlobalIndexId,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexBuildReport> {
+        let mut mutation =
+            SchemaMigrationGuard::new(self.schema_coordination.gate.begin_new_migration()?);
+        mutation.wait_for_quiescence_blocking();
+        mutation.acquire_process_ownership(&self.schema_coordination.process_lease)?;
+        let original = self.global_index_metadata(index_id)?;
+        match original.lifecycle() {
+            GlobalIndexLifecycle::Ready | GlobalIndexLifecycle::Invalid => {
+                self.publish_global_index_lifecycle(
+                    index_id,
+                    GlobalIndexLifecycle::Rebuilding,
+                    &mut mutation,
+                )?;
+            }
+            GlobalIndexLifecycle::Rebuilding => {}
+            lifecycle => {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "global index {index_id} cannot be rebuilt while its lifecycle is {lifecycle:?}"
+                    ),
+                ));
+            }
+        }
+        abort_global_index_recovery_at_test_boundary("rebuild-fenced");
+        let fenced = self.global_index_metadata(index_id)?;
+        let report = match global_index::rebuild(self, &fenced, cancellation) {
+            Ok(report) => report,
+            Err(error) => {
+                mutation.publish_ready()?;
+                return Err(error);
+            }
+        };
+        if cancellation.is_cancelled() {
+            mutation.publish_ready()?;
+            return Err(EngineError::new(
+                EngineErrorKind::Cancelled,
+                format!("global-index rebuild {index_id} was cancelled before publication"),
+            ));
+        }
+        abort_global_index_recovery_at_test_boundary("rebuild-complete");
+        self.publish_global_index_lifecycle(index_id, GlobalIndexLifecycle::Ready, &mut mutation)?;
+        abort_global_index_recovery_at_test_boundary("rebuild-published");
+        mutation.publish_ready()?;
+        Ok(report)
+    }
+
+    pub(crate) fn repair_global_index(
+        &mut self,
+        index_id: GlobalIndexId,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexRepairReport> {
+        let result = self.repair_global_index_inner(index_id, cancellation);
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn repair_global_index_inner(
+        &mut self,
+        index_id: GlobalIndexId,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexRepairReport> {
+        let mut mutation =
+            SchemaMigrationGuard::new(self.schema_coordination.gate.begin_new_migration()?);
+        mutation.wait_for_quiescence_blocking();
+        mutation.acquire_process_ownership(&self.schema_coordination.process_lease)?;
+        let original = self.global_index_metadata(index_id)?;
+        if original.is_unique() {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!(
+                    "global index {index_id} is authoritative for uniqueness and must be rebuilt"
+                ),
+            ));
+        }
+        match original.lifecycle() {
+            GlobalIndexLifecycle::Ready | GlobalIndexLifecycle::Invalid => {
+                self.publish_global_index_lifecycle(
+                    index_id,
+                    GlobalIndexLifecycle::Rebuilding,
+                    &mut mutation,
+                )?;
+            }
+            GlobalIndexLifecycle::Rebuilding => {}
+            lifecycle => {
+                return Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    format!(
+                        "global index {index_id} cannot be repaired while its lifecycle is {lifecycle:?}"
+                    ),
+                ));
+            }
+        }
+        abort_global_index_recovery_at_test_boundary("repair-fenced");
+        let fenced = self.global_index_metadata(index_id)?;
+        let initial = match global_index::validate_index(
+            self,
+            &fenced,
+            cancellation,
+            GlobalIndexValidationOptions::full(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                mutation.publish_ready()?;
+                return Err(error);
+            }
+        };
+        let repair_shards = initial.repair_shards(self.shard_count());
+        let (repaired_shards, indexed_rows) = if initial.is_valid() {
+            let report = global_index::validate_ready(self, &fenced, cancellation)?;
+            (Vec::new(), report.indexed_rows())
+        } else {
+            match global_index::repair_non_unique(self, &fenced, cancellation, repair_shards) {
+                Ok(report) => report,
+                Err(error) => {
+                    mutation.publish_ready()?;
+                    return Err(error);
+                }
+            }
+        };
+        abort_global_index_recovery_at_test_boundary("repair-complete");
+        let final_outcome = match global_index::validate_index(
+            self,
+            &fenced,
+            cancellation,
+            GlobalIndexValidationOptions::full(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                mutation.publish_ready()?;
+                return Err(error);
+            }
+        };
+        let lifecycle_after = if final_outcome.is_valid() {
+            GlobalIndexLifecycle::Ready
+        } else {
+            GlobalIndexLifecycle::Invalid
+        };
+        self.publish_global_index_lifecycle(index_id, lifecycle_after, &mut mutation)?;
+        abort_global_index_recovery_at_test_boundary("repair-published");
+        mutation.publish_ready()?;
+        let validation = final_outcome.into_report(index_id, original.lifecycle(), lifecycle_after);
+        Ok(GlobalIndexRepairReport::from_validated(
+            index_id,
+            repaired_shards,
+            indexed_rows,
+            validation,
+        ))
+    }
+
+    fn global_index_metadata(&self, index_id: GlobalIndexId) -> EngineResult<GlobalIndexMetadata> {
+        self.catalog
+            .logical()
+            .global_index_by_id(index_id)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!("global index {index_id} does not exist"),
+                )
+            })
+    }
+
+    fn publish_global_index_lifecycle(
+        &mut self,
+        index_id: GlobalIndexId,
+        target: GlobalIndexLifecycle,
+        mutation: &mut SchemaMigrationGuard,
+    ) -> EngineResult<()> {
+        let replacement_guard = self
+            .schema_coordination
+            .reserve_catalog_replacement(&self.catalog)?;
+        let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+        configure_manifest_connection(&manifest_connection)?;
+        let replacement = manifest::transition_global_index(
+            &mut manifest_connection,
+            self.shard_count(),
+            index_id,
+            target,
+            || mutation.mark_pending_on_drop(),
+        )?;
+        self.catalog = replacement_guard.publish(&self.catalog, replacement)?;
+        Ok(())
     }
 
     fn transition_global_index_inner(
@@ -6021,6 +6294,36 @@ mod tests {
                 .unwrap();
                 database.build_global_index(id).map(|_| ())
             }
+            "validate" => {
+                let id = GlobalIndexId::new(
+                    std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_ID")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+                .unwrap();
+                database.validate_global_index(id).map(|_| ())
+            }
+            "rebuild" => {
+                let id = GlobalIndexId::new(
+                    std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_ID")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+                .unwrap();
+                database.rebuild_global_index(id).map(|_| ())
+            }
+            "repair" => {
+                let id = GlobalIndexId::new(
+                    std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_ID")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+                .unwrap();
+                database.repair_global_index(id).map(|_| ())
+            }
             unexpected => panic!("unexpected global-index crash mode: {unexpected}"),
         };
         panic!("child did not reach requested global-index boundary: {result:?}");
@@ -6195,6 +6498,111 @@ mod tests {
                     .unwrap(),
                 "ok",
                 "boundary {boundary}"
+            );
+        }
+    }
+
+    fn setup_recovery_global_index(root: &Path) -> GlobalIndexId {
+        let mut database = setup_global_index_root(root);
+        for shard in 0..2_u16 {
+            let tenant = (0..10_000)
+                .map(|candidate| format!("recovery-tenant-{shard}-{candidate}"))
+                .find(|candidate| database.shard_for_key(candidate.as_bytes()) == shard)
+                .unwrap();
+            database
+                .execute(
+                    &tenant,
+                    "INSERT INTO events (id, tenant_id, payload) VALUES (?1, ?2, ?3)",
+                    &[
+                        crate::core::Value::from(i64::from(shard)),
+                        crate::core::Value::from(tenant.as_str()),
+                        crate::core::Value::from(format!("recovery-payload-{shard}").into_bytes()),
+                    ],
+                )
+                .unwrap();
+        }
+        let id = database
+            .create_global_index(global_index_test_declaration(&database))
+            .unwrap();
+        database.build_global_index(id).unwrap();
+        id
+    }
+
+    fn abort_global_index_recovery_child(
+        root: &Path,
+        mode: &str,
+        boundary: &str,
+        id: GlobalIndexId,
+    ) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("storage::tests::global_index_catalog_crash_child")
+            .arg("--nocapture")
+            .env("BRISKDB_GLOBAL_INDEX_ABORT_ROOT", root)
+            .env("BRISKDB_GLOBAL_INDEX_ABORT_MODE", mode)
+            .env("BRISKDB_GLOBAL_INDEX_ABORT_ID", id.get().to_string())
+            .env("BRISKDB_GLOBAL_INDEX_RECOVERY_ABORT_POINT", boundary)
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "child did not abort at {mode}:{boundary}"
+        );
+    }
+
+    #[test]
+    fn global_index_recovery_survives_real_process_abort_without_partial_publication() {
+        for (mode, boundary) in [
+            ("validate", "validation-fenced"),
+            ("validate", "validation-complete"),
+            ("validate", "validation-published"),
+            ("rebuild", "rebuild-fenced"),
+            ("rebuild", "rebuild-complete"),
+            ("rebuild", "rebuild-published"),
+            ("repair", "repair-fenced"),
+            ("repair", "repair-shard-0-before-commit"),
+            ("repair", "repair-shard-0-after-commit"),
+            ("repair", "repair-complete"),
+            ("repair", "repair-published"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let id = setup_recovery_global_index(temp.path());
+            if mode == "repair" {
+                Connection::open(temp.path().join("global-indexes/global.sqlite"))
+                    .unwrap()
+                    .execute(
+                        "DELETE FROM briskdb_global_index_entries
+                         WHERE index_id = ?1 AND source_shard = 0",
+                        [i64::try_from(id.get()).unwrap()],
+                    )
+                    .unwrap();
+            }
+
+            abort_global_index_recovery_child(temp.path(), mode, boundary, id);
+
+            let mut reopened = Database::open(temp.path(), 2).unwrap();
+            match mode {
+                "validate" => {
+                    reopened.validate_global_index(id).unwrap();
+                }
+                "rebuild" => {
+                    reopened.rebuild_global_index(id).unwrap();
+                }
+                "repair" => {
+                    reopened.repair_global_index(id).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let report = reopened.validate_global_index(id).unwrap();
+            assert!(report.is_valid(), "recovery failed after {mode}:{boundary}");
+            assert_eq!(report.physical_entries_examined(), 2);
+            assert_eq!(
+                reopened
+                    .catalog()
+                    .global_index_by_id(id)
+                    .unwrap()
+                    .lifecycle(),
+                GlobalIndexLifecycle::Ready
             );
         }
     }

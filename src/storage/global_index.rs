@@ -1,7 +1,7 @@
 //! Offline construction and durable storage for global indexes.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     path::{Path, PathBuf},
     str,
@@ -17,8 +17,9 @@ use crate::{
         CancellationToken, CanonicalIndexKey, EngineError, EngineErrorKind, EngineResult,
         GlobalIndexBuildReport, GlobalIndexId, GlobalIndexKeySource, GlobalIndexKeyType,
         GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexStorageTopology,
-        INDEX_KEY_ENCODING_VERSION, IndexKeyOrder, IndexKeyPart, IndexKeyValue,
-        UniqueNullSemantics,
+        GlobalIndexValidationIssue, GlobalIndexValidationIssueKind, GlobalIndexValidationMode,
+        GlobalIndexValidationOptions, GlobalIndexValidationReport, INDEX_KEY_ENCODING_VERSION,
+        IndexKeyOrder, IndexKeyPart, IndexKeyValue, UniqueNullSemantics,
     },
     sqlite_error,
 };
@@ -137,10 +138,171 @@ struct ScanOutcome {
     unique_rows: u64,
 }
 
+#[derive(Debug)]
+struct SourceEntry {
+    encoded_key: CanonicalIndexKey,
+    encoded_locator: Vec<u8>,
+    reserves_unique_key: bool,
+}
+
+#[derive(Debug)]
+struct PhysicalEntry {
+    source_shard: u16,
+    source_ordinal: u64,
+    encoded_key: Vec<u8>,
+    source_locator: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct UniqueReservation {
+    encoded_key: Vec<u8>,
+    source_shard: u16,
+    source_locator: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ValidationAccumulator {
+    mode: GlobalIndexValidationMode,
+    samples_per_shard: u16,
+    max_reported_issues: usize,
+    source_rows_examined: u64,
+    physical_entries_examined: u64,
+    total_issues: u64,
+    issues: Vec<GlobalIndexValidationIssue>,
+    affected_shards: BTreeSet<u16>,
+    repair_all_shards: bool,
+}
+
+impl ValidationAccumulator {
+    fn new(options: GlobalIndexValidationOptions) -> Self {
+        Self {
+            mode: options.mode(),
+            samples_per_shard: options.samples_per_shard(),
+            max_reported_issues: usize::from(options.max_reported_issues()),
+            source_rows_examined: 0,
+            physical_entries_examined: 0,
+            total_issues: 0,
+            issues: Vec::with_capacity(usize::from(options.max_reported_issues())),
+            affected_shards: BTreeSet::new(),
+            repair_all_shards: false,
+        }
+    }
+
+    fn record(
+        &mut self,
+        kind: GlobalIndexValidationIssueKind,
+        source_shard: Option<u16>,
+        key: Option<&[u8]>,
+        locator: Option<&[u8]>,
+    ) -> EngineResult<()> {
+        self.total_issues = self.total_issues.checked_add(1).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::NumericOutOfRange,
+                "global-index validation issue count overflowed",
+            )
+        })?;
+        if let Some(shard) = source_shard {
+            self.affected_shards.insert(shard);
+        } else {
+            self.repair_all_shards = true;
+        }
+        if self.issues.len() < self.max_reported_issues {
+            self.issues.push(GlobalIndexValidationIssue::from_validated(
+                kind,
+                source_shard,
+                key.map(fingerprint),
+                locator.map(fingerprint),
+            ));
+        }
+        Ok(())
+    }
+
+    fn source_examined(&mut self) -> EngineResult<()> {
+        self.source_rows_examined = self.source_rows_examined.checked_add(1).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::NumericOutOfRange,
+                "global-index validation source-row count overflowed",
+            )
+        })?;
+        Ok(())
+    }
+
+    fn physical_examined(&mut self) -> EngineResult<()> {
+        self.physical_entries_examined =
+            self.physical_entries_examined
+                .checked_add(1)
+                .ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::NumericOutOfRange,
+                        "global-index validation physical-entry count overflowed",
+                    )
+                })?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ValidationOutcome {
+    accumulator: ValidationAccumulator,
+}
+
+impl ValidationOutcome {
+    pub(super) fn is_valid(&self) -> bool {
+        self.accumulator.total_issues == 0
+    }
+
+    pub(super) fn repair_shards(&self, shard_count: u16) -> Vec<u16> {
+        if self.accumulator.repair_all_shards {
+            return (0..shard_count).collect();
+        }
+        self.accumulator
+            .affected_shards
+            .iter()
+            .copied()
+            .filter(|shard| *shard < shard_count)
+            .collect()
+    }
+
+    pub(super) fn into_report(
+        self,
+        index_id: GlobalIndexId,
+        lifecycle_before: GlobalIndexLifecycle,
+        lifecycle_after: GlobalIndexLifecycle,
+    ) -> GlobalIndexValidationReport {
+        GlobalIndexValidationReport::from_validated(
+            index_id,
+            self.accumulator.mode,
+            lifecycle_before,
+            lifecycle_after,
+            self.accumulator.source_rows_examined,
+            self.accumulator.physical_entries_examined,
+            self.accumulator.total_issues,
+            self.accumulator.issues,
+        )
+    }
+}
+
 pub(super) fn build(
     storage: &Storage,
     index: &GlobalIndexMetadata,
     cancellation: &CancellationToken,
+) -> EngineResult<GlobalIndexBuildReport> {
+    build_inner(storage, index, cancellation, false)
+}
+
+pub(super) fn rebuild(
+    storage: &Storage,
+    index: &GlobalIndexMetadata,
+    cancellation: &CancellationToken,
+) -> EngineResult<GlobalIndexBuildReport> {
+    build_inner(storage, index, cancellation, true)
+}
+
+fn build_inner(
+    storage: &Storage,
+    index: &GlobalIndexMetadata,
+    cancellation: &CancellationToken,
+    replacement: bool,
 ) -> EngineResult<GlobalIndexBuildReport> {
     ensure_not_cancelled(cancellation, "before global-index construction")?;
     if index.topology() != GlobalIndexStorageTopology::SharedSqliteV1 {
@@ -153,23 +315,17 @@ pub(super) fn build(
             ),
         ));
     }
-    match index.lifecycle() {
-        GlobalIndexLifecycle::Creating | GlobalIndexLifecycle::Ready => {}
-        GlobalIndexLifecycle::Rebuilding => {
-            return Err(EngineError::new(
-                EngineErrorKind::Unsupported,
-                format!(
-                    "global index {} replacement construction belongs to the validation and rebuild workflow",
-                    index.id()
-                ),
-            ));
-        }
+    match (replacement, index.lifecycle()) {
+        (false, GlobalIndexLifecycle::Creating | GlobalIndexLifecycle::Ready)
+        | (true, GlobalIndexLifecycle::Rebuilding) => {}
         lifecycle => {
             return Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
                 format!(
-                    "global index {} cannot be built while its lifecycle is {lifecycle:?}",
-                    index.id()
+                    "global index {} cannot be {} while its lifecycle is {:?}",
+                    index.id(),
+                    if replacement { "rebuilt" } else { "built" },
+                    lifecycle.1
                 ),
             ));
         }
@@ -178,15 +334,36 @@ pub(super) fn build(
     let (mut connection, path) = open_or_create(&storage.root)?;
     cleanup_abandoned(&mut connection, storage.catalog.logical().global_indexes())?;
     let definition_digest = definition_digest(index);
-    prepare_build(
-        &mut connection,
-        index,
-        storage.shard_count(),
-        &definition_digest,
-    )?;
+    if replacement {
+        prepare_rebuild(
+            &mut connection,
+            index,
+            storage.shard_count(),
+            &definition_digest,
+        )?;
+    } else {
+        prepare_build(
+            &mut connection,
+            index,
+            storage.shard_count(),
+            &definition_digest,
+        )?;
+    }
     abort_at_test_boundary("initialized");
 
-    let checkpoints = load_checkpoints(&connection, index.id(), storage.shard_count())?;
+    let checkpoints = match load_checkpoints(&connection, index.id(), storage.shard_count()) {
+        Ok(checkpoints) => checkpoints,
+        Err(error) if replacement && error.kind() == EngineErrorKind::DataCorruption => {
+            reset_build(
+                &mut connection,
+                index,
+                storage.shard_count(),
+                &definition_digest,
+            )?;
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
     let mut resumed_from_shard = checkpoints.len() as u16;
     for checkpoint in &checkpoints {
         ensure_not_cancelled(cancellation, "while revalidating a build checkpoint")?;
@@ -328,6 +505,873 @@ pub(super) fn validate_ready(
     ))
 }
 
+pub(super) fn validate_index(
+    storage: &Storage,
+    index: &GlobalIndexMetadata,
+    cancellation: &CancellationToken,
+    options: GlobalIndexValidationOptions,
+) -> EngineResult<ValidationOutcome> {
+    ensure_not_cancelled(cancellation, "before global-index validation")?;
+    let mut accumulator = ValidationAccumulator::new(options);
+    let Some((connection, _)) = open_existing(&storage.root)? else {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::MissingPhysicalStorage,
+            None,
+            None,
+            None,
+        )?;
+        return Ok(ValidationOutcome { accumulator });
+    };
+    let index_id = to_sqlite_id(index.id())?;
+    let expected_digest = definition_digest(index);
+    let build = connection
+        .query_row(
+            "SELECT definition_digest, schema_generation, shard_count, build_state, indexed_rows
+             FROM briskdb_global_index_builds WHERE index_id = ?1",
+            [index_id],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?;
+    let build_indexed_rows = match build {
+        None => {
+            accumulator.record(
+                GlobalIndexValidationIssueKind::MissingBuildRecord,
+                None,
+                None,
+                None,
+            )?;
+            None
+        }
+        Some((digest, generation, shards, state, indexed_rows)) => {
+            if digest.as_slice() != expected_digest
+                || generation != to_sqlite_u64(index.schema_generation(), "schema generation")?
+                || shards != i64::from(storage.shard_count())
+            {
+                accumulator.record(
+                    GlobalIndexValidationIssueKind::DefinitionMismatch,
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+            if state != COMPLETE {
+                accumulator.record(
+                    GlobalIndexValidationIssueKind::IncompleteBuild,
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+            Some(from_sqlite_u64(indexed_rows, "global-index row count")?)
+        }
+    };
+
+    let checkpoints =
+        load_validation_checkpoints(&connection, index, storage.shard_count(), &mut accumulator)?;
+    detect_bad_shard_targets(&connection, index, storage.shard_count(), &mut accumulator)?;
+
+    for shard in 0..storage.shard_count() {
+        ensure_not_cancelled(cancellation, "while validating a global-index shard")?;
+        let checkpoint = checkpoints.get(&shard);
+        if checkpoint.is_none() {
+            accumulator.record(
+                GlobalIndexValidationIssueKind::MissingCheckpoint,
+                Some(shard),
+                None,
+                None,
+            )?;
+        }
+        match options.mode() {
+            GlobalIndexValidationMode::Full => validate_full_shard(
+                storage,
+                &connection,
+                index,
+                shard,
+                checkpoint,
+                cancellation,
+                &mut accumulator,
+            )?,
+            GlobalIndexValidationMode::Sampled => validate_sampled_shard(
+                storage,
+                &connection,
+                index,
+                shard,
+                checkpoint,
+                cancellation,
+                &mut accumulator,
+            )?,
+        }
+    }
+
+    let checkpoint_rows = checkpoints.values().try_fold(0_u64, |total, checkpoint| {
+        total.checked_add(checkpoint.indexed_rows).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::NumericOutOfRange,
+                "global-index checkpoint row count overflowed",
+            )
+        })
+    })?;
+    if build_indexed_rows.is_some_and(|rows| rows != checkpoint_rows) {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::CheckpointMismatch,
+            None,
+            None,
+            None,
+        )?;
+    }
+    validate_unique_state(
+        &connection,
+        index,
+        &checkpoints,
+        options.mode(),
+        &mut accumulator,
+    )?;
+    Ok(ValidationOutcome { accumulator })
+}
+
+pub(super) fn repair_non_unique(
+    storage: &Storage,
+    index: &GlobalIndexMetadata,
+    cancellation: &CancellationToken,
+    repaired_shards: Vec<u16>,
+) -> EngineResult<(Vec<u16>, u64)> {
+    if index.is_unique() {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "global index {} is authoritative for uniqueness and must be rebuilt, not repaired",
+                index.id()
+            ),
+        ));
+    }
+    if index.lifecycle() != GlobalIndexLifecycle::Rebuilding {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "global index {} must be fenced in Rebuilding before repair",
+                index.id()
+            ),
+        ));
+    }
+    ensure_not_cancelled(cancellation, "before global-index repair")?;
+    let (mut connection, path) = open_or_create(&storage.root)?;
+    cleanup_abandoned(&mut connection, storage.catalog.logical().global_indexes())?;
+    let digest = definition_digest(index);
+    prepare_build(&mut connection, index, storage.shard_count(), &digest)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    for table in [
+        "briskdb_global_index_unique_keys",
+        "briskdb_global_index_entries",
+        "briskdb_global_index_checkpoints",
+    ] {
+        transaction
+            .execute(
+                &format!("DELETE FROM {table} WHERE index_id = ?1 AND source_shard >= ?2"),
+                params![to_sqlite_id(index.id())?, i64::from(storage.shard_count())],
+            )
+            .map_err(sqlite_error::storage)?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM briskdb_global_index_unique_keys WHERE index_id = ?1",
+            [to_sqlite_id(index.id())?],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+
+    for shard in &repaired_shards {
+        ensure_not_cancelled(cancellation, "before repairing a global-index shard")?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error::storage)?;
+        delete_shard_rows(&transaction, index.id(), *shard)?;
+        let outcome = scan_source_shard(storage, index, *shard, cancellation, Some(&transaction))?;
+        write_checkpoint(&transaction, index.id(), *shard, &outcome)?;
+        ensure_not_cancelled(
+            cancellation,
+            "before committing a global-index repair shard",
+        )?;
+        abort_at_recovery_test_boundary(&format!("repair-shard-{shard}-before-commit"));
+        transaction.commit().map_err(sqlite_error::storage)?;
+        abort_at_recovery_test_boundary(&format!("repair-shard-{shard}-after-commit"));
+    }
+
+    let checkpoints = load_checkpoints(&connection, index.id(), storage.shard_count())?;
+    verify_checkpoint_sources(storage, index, cancellation, &checkpoints)?;
+    let indexed_rows = checkpoints.iter().try_fold(0_u64, |total, checkpoint| {
+        total.checked_add(checkpoint.indexed_rows).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::NumericOutOfRange,
+                "global-index repaired row count overflowed",
+            )
+        })
+    })?;
+    validate_physical_contents(&connection, index, &checkpoints, indexed_rows, 0)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "UPDATE briskdb_global_index_builds
+             SET build_state = ?1, indexed_rows = ?2 WHERE index_id = ?3",
+            params![
+                COMPLETE,
+                to_sqlite_u64(indexed_rows, "global-index repaired row count")?,
+                to_sqlite_id(index.id())?,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    ensure_not_cancelled(cancellation, "before completing global-index repair")?;
+    abort_at_recovery_test_boundary("repair-complete-before-commit");
+    transaction.commit().map_err(sqlite_error::storage)?;
+    abort_at_recovery_test_boundary("repair-complete-after-commit");
+    checkpoint_and_sync(&connection, &path)?;
+    Ok((repaired_shards, indexed_rows))
+}
+
+fn load_validation_checkpoints(
+    connection: &Connection,
+    index: &GlobalIndexMetadata,
+    shard_count: u16,
+    accumulator: &mut ValidationAccumulator,
+) -> EngineResult<BTreeMap<u16, Checkpoint>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT source_shard, source_digest, indexed_rows, unique_rows
+             FROM briskdb_global_index_checkpoints
+             WHERE index_id = ?1 ORDER BY source_shard",
+        )
+        .map_err(sqlite_error::storage)?;
+    let mut rows = statement
+        .query([to_sqlite_id(index.id())?])
+        .map_err(sqlite_error::storage)?;
+    let mut checkpoints = BTreeMap::new();
+    while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
+        let raw_shard = row.get::<_, i64>(0).map_err(sqlite_error::storage)?;
+        let shard = u16::try_from(raw_shard).ok();
+        if shard.is_none_or(|shard| shard >= shard_count) {
+            accumulator.record(
+                GlobalIndexValidationIssueKind::UnexpectedCheckpoint,
+                shard,
+                None,
+                None,
+            )?;
+            continue;
+        }
+        let shard = shard.expect("validated checkpoint shard");
+        let digest = row.get::<_, Vec<u8>>(1).map_err(sqlite_error::storage)?;
+        let source_digest: [u8; 32] = match digest.try_into() {
+            Ok(digest) => digest,
+            Err(_) => {
+                accumulator.record(
+                    GlobalIndexValidationIssueKind::CheckpointMismatch,
+                    Some(shard),
+                    None,
+                    None,
+                )?;
+                [0; 32]
+            }
+        };
+        checkpoints.insert(
+            shard,
+            Checkpoint {
+                source_shard: shard,
+                source_digest,
+                indexed_rows: from_sqlite_u64(
+                    row.get::<_, i64>(2).map_err(sqlite_error::storage)?,
+                    "checkpoint row count",
+                )?,
+                unique_rows: from_sqlite_u64(
+                    row.get::<_, i64>(3).map_err(sqlite_error::storage)?,
+                    "checkpoint unique row count",
+                )?,
+            },
+        );
+    }
+    Ok(checkpoints)
+}
+
+fn detect_bad_shard_targets(
+    connection: &Connection,
+    index: &GlobalIndexMetadata,
+    shard_count: u16,
+    accumulator: &mut ValidationAccumulator,
+) -> EngineResult<()> {
+    for table in [
+        "briskdb_global_index_entries",
+        "briskdb_global_index_unique_keys",
+    ] {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT source_shard, encoded_key, source_locator FROM {table}
+                 WHERE index_id = ?1 AND source_shard >= ?2
+                 ORDER BY source_shard, encoded_key, source_locator"
+            ))
+            .map_err(sqlite_error::storage)?;
+        let mut rows = statement
+            .query(params![to_sqlite_id(index.id())?, i64::from(shard_count)])
+            .map_err(sqlite_error::storage)?;
+        while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
+            let shard = row
+                .get::<_, i64>(0)
+                .map_err(sqlite_error::storage)
+                .ok()
+                .and_then(|value| u16::try_from(value).ok());
+            let key = row.get::<_, Vec<u8>>(1).map_err(sqlite_error::storage)?;
+            let locator = row.get::<_, Vec<u8>>(2).map_err(sqlite_error::storage)?;
+            accumulator.record(
+                GlobalIndexValidationIssueKind::BadShardTarget,
+                shard,
+                Some(&key),
+                Some(&locator),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_full_shard(
+    storage: &Storage,
+    connection: &Connection,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+    checkpoint: Option<&Checkpoint>,
+    cancellation: &CancellationToken,
+    accumulator: &mut ValidationAccumulator,
+) -> EngineResult<()> {
+    let mut statement = connection
+        .prepare(
+            "SELECT source_shard, source_ordinal, encoded_key, source_locator
+             FROM briskdb_global_index_entries
+             WHERE index_id = ?1 AND source_shard = ?2 ORDER BY source_ordinal",
+        )
+        .map_err(sqlite_error::storage)?;
+    let mut rows = statement
+        .query(params![to_sqlite_id(index.id())?, i64::from(shard)])
+        .map_err(sqlite_error::storage)?;
+    let mut physical = next_physical_entry(&mut rows)?;
+    let outcome = scan_source_shard_with_visitor(
+        storage,
+        index,
+        shard,
+        cancellation,
+        |source_ordinal, source| {
+            accumulator.source_examined()?;
+            while physical
+                .as_ref()
+                .is_some_and(|entry| entry.source_ordinal < source_ordinal)
+            {
+                let dangling = physical.take().expect("checked physical entry");
+                inspect_physical_entry(&dangling, accumulator)?;
+                accumulator.record(
+                    GlobalIndexValidationIssueKind::DanglingEntry,
+                    Some(shard),
+                    Some(&dangling.encoded_key),
+                    Some(&dangling.source_locator),
+                )?;
+                physical = next_physical_entry(&mut rows)?;
+            }
+            match physical.take() {
+                Some(observed) if observed.source_ordinal == source_ordinal => {
+                    inspect_physical_entry(&observed, accumulator)?;
+                    compare_entries(shard, source, &observed, accumulator)?;
+                    physical = next_physical_entry(&mut rows)?;
+                }
+                Some(observed) => {
+                    accumulator.record(
+                        GlobalIndexValidationIssueKind::MissingEntry,
+                        Some(shard),
+                        Some(source.encoded_key.as_bytes()),
+                        Some(&source.encoded_locator),
+                    )?;
+                    physical = Some(observed);
+                }
+                None => accumulator.record(
+                    GlobalIndexValidationIssueKind::MissingEntry,
+                    Some(shard),
+                    Some(source.encoded_key.as_bytes()),
+                    Some(&source.encoded_locator),
+                )?,
+            }
+            Ok(())
+        },
+    )?;
+    while let Some(dangling) = physical.take() {
+        inspect_physical_entry(&dangling, accumulator)?;
+        accumulator.record(
+            GlobalIndexValidationIssueKind::DanglingEntry,
+            Some(shard),
+            Some(&dangling.encoded_key),
+            Some(&dangling.source_locator),
+        )?;
+        physical = next_physical_entry(&mut rows)?;
+    }
+    if checkpoint.is_none_or(|checkpoint| {
+        checkpoint.indexed_rows != outcome.indexed_rows
+            || checkpoint.unique_rows != outcome.unique_rows
+            || checkpoint.source_digest != outcome.source_digest
+    }) {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::CheckpointMismatch,
+            Some(shard),
+            None,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_sampled_shard(
+    storage: &Storage,
+    connection: &Connection,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+    checkpoint: Option<&Checkpoint>,
+    cancellation: &CancellationToken,
+    accumulator: &mut ValidationAccumulator,
+) -> EngineResult<()> {
+    let samples_per_shard = accumulator.samples_per_shard;
+    let source = storage.open_shard(shard)?;
+    let progress_cancellation = cancellation.clone();
+    source
+        .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
+        .map_err(sqlite_error::storage)?;
+    source
+        .execute_batch("BEGIN DEFERRED TRANSACTION")
+        .map_err(sqlite_error::storage)?;
+    let table = storage
+        .catalog
+        .logical()
+        .table_by_id(index.table_id())
+        .ok_or_else(|| {
+            corrupt(format!(
+                "global index {} references a missing table",
+                index.id()
+            ))
+        })?;
+    let locator = inspect_source_locator(&source, table.name())?;
+    let mut count_sql = format!("SELECT COUNT(*) FROM {}", quote_identifier(table.name()));
+    if let Some(predicate) = index.predicate() {
+        count_sql.push_str(" WHERE (");
+        count_sql.push_str(predicate);
+        count_sql.push(')');
+    }
+    let source_rows = from_sqlite_u64(
+        source
+            .query_row(&count_sql, [], |row| row.get::<_, i64>(0))
+            .map_err(sqlite_error::statement)?,
+        "sampled source row count",
+    )?;
+    let physical_rows = from_sqlite_u64(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM briskdb_global_index_entries
+                 WHERE index_id = ?1 AND source_shard = ?2",
+                params![to_sqlite_id(index.id())?, i64::from(shard)],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sqlite_error::storage)?,
+        "sampled physical row count",
+    )?;
+    if checkpoint.is_none_or(|checkpoint| checkpoint.indexed_rows != source_rows) {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::CheckpointMismatch,
+            Some(shard),
+            None,
+            None,
+        )?;
+    }
+    if source_rows > physical_rows {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::MissingEntry,
+            Some(shard),
+            None,
+            None,
+        )?;
+    } else if physical_rows > source_rows {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::DanglingEntry,
+            Some(shard),
+            None,
+            None,
+        )?;
+    }
+    let total = source_rows.max(physical_rows);
+    let sql = format!(
+        "{} LIMIT 1 OFFSET ?1",
+        scan_sql(index, table.name(), &locator)
+    );
+    let mut source_statement = source.prepare(&sql).map_err(sqlite_error::statement)?;
+    let locator_count = locator.expressions().len();
+    for ordinal in sample_ordinals(total, samples_per_shard) {
+        ensure_not_cancelled(cancellation, "while sampling a global-index shard")?;
+        let source_entry = {
+            let mut rows = source_statement
+                .query([to_sqlite_u64(ordinal, "sample source ordinal")?])
+                .map_err(sqlite_error::statement)?;
+            rows.next()
+                .map_err(sqlite_error::statement)?
+                .map(|row| read_source_entry(row, index, shard, locator_count))
+                .transpose()?
+        };
+        let physical_entry = physical_entry_at(connection, index.id(), shard, ordinal)?;
+        if source_entry.is_some() {
+            accumulator.source_examined()?;
+        }
+        if let Some(observed) = &physical_entry {
+            inspect_physical_entry(observed, accumulator)?;
+        }
+        match (source_entry.as_ref(), physical_entry.as_ref()) {
+            (Some(expected), Some(observed)) => {
+                compare_entries(shard, expected, observed, accumulator)?
+            }
+            (Some(expected), None) => accumulator.record(
+                GlobalIndexValidationIssueKind::MissingEntry,
+                Some(shard),
+                Some(expected.encoded_key.as_bytes()),
+                Some(&expected.encoded_locator),
+            )?,
+            (None, Some(observed)) => accumulator.record(
+                GlobalIndexValidationIssueKind::DanglingEntry,
+                Some(shard),
+                Some(&observed.encoded_key),
+                Some(&observed.source_locator),
+            )?,
+            (None, None) => {}
+        }
+    }
+    drop(source_statement);
+    source
+        .execute_batch("COMMIT")
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
+fn next_physical_entry(rows: &mut rusqlite::Rows<'_>) -> EngineResult<Option<PhysicalEntry>> {
+    rows.next()
+        .map_err(sqlite_error::storage)?
+        .map(read_physical_entry)
+        .transpose()
+}
+
+fn read_physical_entry(row: &rusqlite::Row<'_>) -> EngineResult<PhysicalEntry> {
+    Ok(PhysicalEntry {
+        source_shard: u16::try_from(row.get::<_, i64>(0).map_err(sqlite_error::storage)?)
+            .map_err(|_| corrupt("global-index entry has an invalid source shard"))?,
+        source_ordinal: from_sqlite_u64(
+            row.get::<_, i64>(1).map_err(sqlite_error::storage)?,
+            "global-index source ordinal",
+        )?,
+        encoded_key: row.get::<_, Vec<u8>>(2).map_err(sqlite_error::storage)?,
+        source_locator: row.get::<_, Vec<u8>>(3).map_err(sqlite_error::storage)?,
+    })
+}
+
+fn physical_entry_at(
+    connection: &Connection,
+    index_id: GlobalIndexId,
+    shard: u16,
+    ordinal: u64,
+) -> EngineResult<Option<PhysicalEntry>> {
+    connection
+        .query_row(
+            "SELECT source_shard, source_ordinal, encoded_key, source_locator
+             FROM briskdb_global_index_entries
+             WHERE index_id = ?1 AND source_shard = ?2 AND source_ordinal = ?3",
+            params![
+                to_sqlite_id(index_id)?,
+                i64::from(shard),
+                to_sqlite_u64(ordinal, "sample physical ordinal")?,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?
+        .map(
+            |(source_shard, source_ordinal, encoded_key, source_locator)| {
+                Ok(PhysicalEntry {
+                    source_shard: u16::try_from(source_shard)
+                        .map_err(|_| corrupt("global-index entry has an invalid source shard"))?,
+                    source_ordinal: from_sqlite_u64(source_ordinal, "global-index source ordinal")?,
+                    encoded_key,
+                    source_locator,
+                })
+            },
+        )
+        .transpose()
+}
+
+fn inspect_physical_entry(
+    entry: &PhysicalEntry,
+    accumulator: &mut ValidationAccumulator,
+) -> EngineResult<()> {
+    accumulator.physical_examined()?;
+    if CanonicalIndexKey::from_bytes(&entry.encoded_key).is_err() {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::IncompatibleKeyEncoding,
+            Some(entry.source_shard),
+            Some(&entry.encoded_key),
+            Some(&entry.source_locator),
+        )?;
+    }
+    if !valid_locator_encoding(&entry.source_locator) {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::IncompatibleLocatorEncoding,
+            Some(entry.source_shard),
+            Some(&entry.encoded_key),
+            Some(&entry.source_locator),
+        )?;
+    }
+    Ok(())
+}
+
+fn compare_entries(
+    shard: u16,
+    expected: &SourceEntry,
+    observed: &PhysicalEntry,
+    accumulator: &mut ValidationAccumulator,
+) -> EngineResult<()> {
+    if expected.encoded_locator != observed.source_locator {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::MissingEntry,
+            Some(shard),
+            Some(expected.encoded_key.as_bytes()),
+            Some(&expected.encoded_locator),
+        )?;
+        accumulator.record(
+            GlobalIndexValidationIssueKind::DanglingEntry,
+            Some(shard),
+            Some(&observed.encoded_key),
+            Some(&observed.source_locator),
+        )?;
+    } else if expected.encoded_key.as_bytes() != observed.encoded_key {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::StaleEntry,
+            Some(shard),
+            Some(&observed.encoded_key),
+            Some(&observed.source_locator),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_unique_state(
+    connection: &Connection,
+    index: &GlobalIndexMetadata,
+    checkpoints: &BTreeMap<u16, Checkpoint>,
+    mode: GlobalIndexValidationMode,
+    accumulator: &mut ValidationAccumulator,
+) -> EngineResult<()> {
+    let reservations = from_sqlite_u64(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM briskdb_global_index_unique_keys WHERE index_id = ?1",
+                [to_sqlite_id(index.id())?],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sqlite_error::storage)?,
+        "physical unique reservation count",
+    )?;
+    if !index.is_unique() {
+        if reservations != 0 {
+            accumulator.record(
+                GlobalIndexValidationIssueKind::DanglingUniqueReservation,
+                None,
+                None,
+                None,
+            )?;
+        }
+        return Ok(());
+    }
+    let expected = checkpoints.values().try_fold(0_u64, |total, checkpoint| {
+        total.checked_add(checkpoint.unique_rows).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::NumericOutOfRange,
+                "global-index unique checkpoint count overflowed",
+            )
+        })
+    })?;
+    if reservations < expected {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::MissingUniqueReservation,
+            None,
+            None,
+            None,
+        )?;
+    } else if reservations > expected {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::DanglingUniqueReservation,
+            None,
+            None,
+            None,
+        )?;
+    }
+    if mode == GlobalIndexValidationMode::Sampled {
+        return Ok(());
+    }
+    validate_full_unique_state(connection, index, accumulator)
+}
+
+fn validate_full_unique_state(
+    connection: &Connection,
+    index: &GlobalIndexMetadata,
+    accumulator: &mut ValidationAccumulator,
+) -> EngineResult<()> {
+    let index_id = to_sqlite_id(index.id())?;
+    let mut entry_statement = connection
+        .prepare(
+            "SELECT encoded_key, source_shard, source_locator
+             FROM briskdb_global_index_entries
+             WHERE index_id = ?1 ORDER BY encoded_key, source_shard, source_locator",
+        )
+        .map_err(sqlite_error::storage)?;
+    let mut reservation_statement = connection
+        .prepare(
+            "SELECT encoded_key, source_shard, source_locator
+             FROM briskdb_global_index_unique_keys
+             WHERE index_id = ?1 ORDER BY encoded_key",
+        )
+        .map_err(sqlite_error::storage)?;
+    let mut entries = entry_statement
+        .query([index_id])
+        .map_err(sqlite_error::storage)?;
+    let mut reservations = reservation_statement
+        .query([index_id])
+        .map_err(sqlite_error::storage)?;
+    let mut reservation = next_unique_row(&mut reservations)?;
+    let mut previous_reserved_key: Option<Vec<u8>> = None;
+    while let Some(entry) = entries.next().map_err(sqlite_error::storage)? {
+        let key = entry.get::<_, Vec<u8>>(0).map_err(sqlite_error::storage)?;
+        let shard = u16::try_from(entry.get::<_, i64>(1).map_err(sqlite_error::storage)?)
+            .map_err(|_| corrupt("unique entry has an invalid source shard"))?;
+        let locator = entry.get::<_, Vec<u8>>(2).map_err(sqlite_error::storage)?;
+        let canonical = match CanonicalIndexKey::from_bytes(&key) {
+            Ok(canonical) => canonical,
+            Err(_) => continue,
+        };
+        let contains_null = canonical
+            .decode()?
+            .iter()
+            .any(|part| matches!(part.value(), IndexKeyValue::Null));
+        if index.null_semantics() == UniqueNullSemantics::Distinct && contains_null {
+            continue;
+        }
+        if previous_reserved_key.as_deref() == Some(key.as_slice()) {
+            accumulator.record(
+                GlobalIndexValidationIssueKind::DuplicateAuthoritativeKey,
+                Some(shard),
+                Some(&key),
+                Some(&locator),
+            )?;
+            continue;
+        }
+        previous_reserved_key = Some(key.clone());
+        while reservation
+            .as_ref()
+            .is_some_and(|current| current.encoded_key.as_slice() < key.as_slice())
+        {
+            let dangling = reservation.take().expect("checked unique reservation");
+            accumulator.record(
+                GlobalIndexValidationIssueKind::DanglingUniqueReservation,
+                Some(dangling.source_shard),
+                Some(&dangling.encoded_key),
+                Some(&dangling.source_locator),
+            )?;
+            reservation = next_unique_row(&mut reservations)?;
+        }
+        match reservation.take() {
+            Some(current) if current.encoded_key == key => {
+                if current.source_shard != shard || current.source_locator != locator {
+                    accumulator.record(
+                        GlobalIndexValidationIssueKind::MismatchedUniqueReservation,
+                        Some(shard),
+                        Some(&key),
+                        Some(&locator),
+                    )?;
+                }
+                reservation = next_unique_row(&mut reservations)?;
+            }
+            Some(current) => {
+                accumulator.record(
+                    GlobalIndexValidationIssueKind::MissingUniqueReservation,
+                    Some(shard),
+                    Some(&key),
+                    Some(&locator),
+                )?;
+                reservation = Some(current);
+            }
+            None => accumulator.record(
+                GlobalIndexValidationIssueKind::MissingUniqueReservation,
+                Some(shard),
+                Some(&key),
+                Some(&locator),
+            )?,
+        }
+    }
+    while let Some(dangling) = reservation.take() {
+        accumulator.record(
+            GlobalIndexValidationIssueKind::DanglingUniqueReservation,
+            Some(dangling.source_shard),
+            Some(&dangling.encoded_key),
+            Some(&dangling.source_locator),
+        )?;
+        reservation = next_unique_row(&mut reservations)?;
+    }
+    Ok(())
+}
+
+fn next_unique_row(rows: &mut rusqlite::Rows<'_>) -> EngineResult<Option<UniqueReservation>> {
+    rows.next()
+        .map_err(sqlite_error::storage)?
+        .map(|row| {
+            Ok(UniqueReservation {
+                encoded_key: row.get::<_, Vec<u8>>(0).map_err(sqlite_error::storage)?,
+                source_shard: u16::try_from(row.get::<_, i64>(1).map_err(sqlite_error::storage)?)
+                    .map_err(|_| {
+                    corrupt("unique reservation has an invalid source shard")
+                })?,
+                source_locator: row.get::<_, Vec<u8>>(2).map_err(sqlite_error::storage)?,
+            })
+        })
+        .transpose()
+}
+
+fn sample_ordinals(total: u64, maximum: u16) -> Vec<u64> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let maximum = u64::from(maximum);
+    if total <= maximum {
+        return (0..total).collect();
+    }
+    if maximum == 1 {
+        return vec![0];
+    }
+    (0..maximum)
+        .map(|sample| {
+            ((u128::from(sample) * u128::from(total - 1)) / u128::from(maximum - 1)) as u64
+        })
+        .collect()
+}
+
 pub(super) fn remove_artifacts(root: &Path, index_id: GlobalIndexId) -> EngineResult<()> {
     let Some((mut connection, path)) = open_existing(root)? else {
         return Ok(());
@@ -401,6 +1445,20 @@ fn prepare_build(
         )
         .map_err(sqlite_error::storage)?;
     transaction.commit().map_err(sqlite_error::storage)
+}
+
+fn prepare_rebuild(
+    connection: &mut Connection,
+    index: &GlobalIndexMetadata,
+    shard_count: u16,
+    definition_digest: &[u8; 32],
+) -> EngineResult<()> {
+    let resumable = load_build_state(connection, index.id(), shard_count, definition_digest)?
+        .is_some_and(|state| state.state == BUILDING);
+    if resumable {
+        return Ok(());
+    }
+    reset_build(connection, index, shard_count, definition_digest)
 }
 
 fn reset_build(
@@ -603,6 +1661,30 @@ fn scan_source_shard(
     cancellation: &CancellationToken,
     target: Option<&Transaction<'_>>,
 ) -> EngineResult<ScanOutcome> {
+    scan_source_shard_with_visitor(
+        storage,
+        index,
+        shard,
+        cancellation,
+        |source_ordinal, entry| {
+            if let Some(target) = target {
+                insert_entry(target, index, shard, source_ordinal, entry)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+fn scan_source_shard_with_visitor<F>(
+    storage: &Storage,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+    cancellation: &CancellationToken,
+    mut visitor: F,
+) -> EngineResult<ScanOutcome>
+where
+    F: FnMut(u64, &SourceEntry) -> EngineResult<()>,
+{
     let source = storage.open_shard(shard)?;
     let progress_cancellation = cancellation.clone();
     source
@@ -634,66 +1716,17 @@ fn scan_source_shard(
     let mut unique_rows = 0_u64;
     while let Some(row) = rows.next().map_err(sqlite_error::statement)? {
         ensure_not_cancelled(cancellation, "while scanning a source shard")?;
-        let values = index
-            .key_parts()
-            .iter()
-            .enumerate()
-            .map(|(ordinal, part)| {
-                read_key_value(
-                    row.get_ref(ordinal).map_err(sqlite_error::statement)?,
-                    part.key_type(),
-                    index,
-                    shard,
-                    ordinal,
-                )
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
-        let parts = values
-            .iter()
-            .zip(index.key_parts())
-            .map(|(value, metadata)| {
-                let part = match metadata.order() {
-                    IndexKeyOrder::Ascending => IndexKeyPart::ascending(value.as_ref()),
-                    IndexKeyOrder::Descending => IndexKeyPart::descending(value.as_ref()),
-                };
-                part.with_null_order(metadata.null_order())
-                    .with_collation(metadata.collation())
-            })
-            .collect::<Vec<_>>();
-        let encoded_key = CanonicalIndexKey::encode(&parts)?;
-        let locator_values = (0..locator_count)
-            .map(|offset| {
-                row.get_ref(index.key_parts().len() + offset)
-                    .map_err(sqlite_error::statement)
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
-        let encoded_locator = encode_locator(&locator_values)?;
-        update_framed(&mut hasher, encoded_key.as_bytes());
-        update_framed(&mut hasher, &encoded_locator);
-
-        if let Some(target) = target {
-            insert_entry(
-                target,
-                index,
-                shard,
-                indexed_rows,
-                &encoded_key,
-                &encoded_locator,
-                &parts,
-            )?;
-        }
+        let entry = read_source_entry(row, index, shard, locator_count)?;
+        update_framed(&mut hasher, entry.encoded_key.as_bytes());
+        update_framed(&mut hasher, &entry.encoded_locator);
+        visitor(indexed_rows, &entry)?;
         indexed_rows = indexed_rows.checked_add(1).ok_or_else(|| {
             EngineError::new(
                 EngineErrorKind::NumericOutOfRange,
                 "global-index row count overflowed",
             )
         })?;
-        if index.is_unique()
-            && !(index.null_semantics() == UniqueNullSemantics::Distinct
-                && values
-                    .iter()
-                    .any(|value| matches!(value, IndexKeyValue::Null)))
-        {
+        if entry.reserves_unique_key {
             unique_rows = unique_rows.checked_add(1).ok_or_else(|| {
                 EngineError::new(
                     EngineErrorKind::NumericOutOfRange,
@@ -712,14 +1745,61 @@ fn scan_source_shard(
     })
 }
 
+fn read_source_entry(
+    row: &rusqlite::Row<'_>,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+    locator_count: usize,
+) -> EngineResult<SourceEntry> {
+    let values = index
+        .key_parts()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, part)| {
+            read_key_value(
+                row.get_ref(ordinal).map_err(sqlite_error::statement)?,
+                part.key_type(),
+                index,
+                shard,
+                ordinal,
+            )
+        })
+        .collect::<EngineResult<Vec<_>>>()?;
+    let parts = values
+        .iter()
+        .zip(index.key_parts())
+        .map(|(value, metadata)| {
+            let part = match metadata.order() {
+                IndexKeyOrder::Ascending => IndexKeyPart::ascending(value.as_ref()),
+                IndexKeyOrder::Descending => IndexKeyPart::descending(value.as_ref()),
+            };
+            part.with_null_order(metadata.null_order())
+                .with_collation(metadata.collation())
+        })
+        .collect::<Vec<_>>();
+    let encoded_key = CanonicalIndexKey::encode(&parts)?;
+    let locator_values = (0..locator_count)
+        .map(|offset| {
+            row.get_ref(index.key_parts().len() + offset)
+                .map_err(sqlite_error::statement)
+        })
+        .collect::<EngineResult<Vec<_>>>()?;
+    let encoded_locator = encode_locator(&locator_values)?;
+    let reserves_unique_key = index.is_unique()
+        && CanonicalIndexKey::encode_unique(&parts, index.null_semantics())?.is_some();
+    Ok(SourceEntry {
+        encoded_key,
+        encoded_locator,
+        reserves_unique_key,
+    })
+}
+
 fn insert_entry(
     transaction: &Transaction<'_>,
     index: &GlobalIndexMetadata,
     shard: u16,
     source_ordinal: u64,
-    encoded_key: &CanonicalIndexKey,
-    encoded_locator: &[u8],
-    parts: &[IndexKeyPart<'_>],
+    entry: &SourceEntry,
 ) -> EngineResult<()> {
     let index_id = to_sqlite_id(index.id())?;
     transaction
@@ -729,16 +1809,14 @@ fn insert_entry(
              ) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 index_id,
-                encoded_key.as_bytes(),
+                entry.encoded_key.as_bytes(),
                 i64::from(shard),
                 to_sqlite_u64(source_ordinal, "source row ordinal")?,
-                encoded_locator,
+                &entry.encoded_locator,
             ],
         )
         .map_err(sqlite_error::storage)?;
-    if !index.is_unique()
-        || CanonicalIndexKey::encode_unique(parts, index.null_semantics())?.is_none()
-    {
+    if !entry.reserves_unique_key {
         return Ok(());
     }
     let inserted = transaction
@@ -748,9 +1826,9 @@ fn insert_entry(
              ) VALUES (?1, ?2, ?3, ?4)",
             params![
                 index_id,
-                encoded_key.as_bytes(),
+                entry.encoded_key.as_bytes(),
                 i64::from(shard),
-                encoded_locator,
+                &entry.encoded_locator,
             ],
         )
         .map_err(sqlite_error::storage)?;
@@ -762,7 +1840,7 @@ fn insert_entry(
             "SELECT source_shard, source_locator
              FROM briskdb_global_index_unique_keys
              WHERE index_id = ?1 AND encoded_key = ?2",
-            params![index_id, encoded_key.as_bytes()],
+            params![index_id, entry.encoded_key.as_bytes()],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .map_err(sqlite_error::storage)?;
@@ -775,7 +1853,7 @@ fn insert_entry(
             existing_shard,
             locator_label(&existing_locator),
             shard,
-            locator_label(encoded_locator),
+            locator_label(&entry.encoded_locator),
         ),
     ))
 }
@@ -1178,6 +2256,63 @@ fn encode_locator(values: &[ValueRef<'_>]) -> EngineResult<Vec<u8>> {
     Ok(output)
 }
 
+fn valid_locator_encoding(input: &[u8]) -> bool {
+    if input.len() < 10 || &input[..4] != LOCATOR_MAGIC {
+        return false;
+    }
+    let version = u32::from_be_bytes(match input[4..8].try_into() {
+        Ok(version) => version,
+        Err(_) => return false,
+    });
+    if version != LOCATOR_VERSION {
+        return false;
+    }
+    let count = usize::from(u16::from_be_bytes(match input[8..10].try_into() {
+        Ok(count) => count,
+        Err(_) => return false,
+    }));
+    let mut cursor = 10_usize;
+    for _ in 0..count {
+        let Some(tag) = input.get(cursor).copied() else {
+            return false;
+        };
+        cursor += 1;
+        match tag {
+            0 => {}
+            1 | 2 => {
+                let Some(next) = cursor.checked_add(8) else {
+                    return false;
+                };
+                if next > input.len() {
+                    return false;
+                }
+                cursor = next;
+            }
+            3 | 4 => {
+                let Some(length_end) = cursor.checked_add(4) else {
+                    return false;
+                };
+                let Some(length_bytes) = input.get(cursor..length_end) else {
+                    return false;
+                };
+                let length = u32::from_be_bytes(match length_bytes.try_into() {
+                    Ok(length) => length,
+                    Err(_) => return false,
+                }) as usize;
+                let Some(next) = length_end.checked_add(length) else {
+                    return false;
+                };
+                if next > input.len() {
+                    return false;
+                }
+                cursor = next;
+            }
+            _ => return false,
+        }
+    }
+    cursor == input.len()
+}
+
 fn append_locator_bytes(output: &mut Vec<u8>, value: &[u8]) -> EngineResult<()> {
     let length = u32::try_from(value.len()).map_err(|_| {
         EngineError::new(
@@ -1546,6 +2681,12 @@ fn locator_label(locator: &[u8]) -> String {
         .collect()
 }
 
+fn fingerprint(value: &[u8]) -> [u8; 8] {
+    blake3::hash(value).as_bytes()[..8]
+        .try_into()
+        .expect("BLAKE3 digest contains an eight-byte fingerprint")
+}
+
 fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -1563,6 +2704,16 @@ fn abort_at_test_boundary(boundary: &str) {
 
 #[cfg(not(test))]
 fn abort_at_test_boundary(_boundary: &str) {}
+
+#[cfg(test)]
+fn abort_at_recovery_test_boundary(boundary: &str) {
+    if std::env::var("BRISKDB_GLOBAL_INDEX_RECOVERY_ABORT_POINT").as_deref() == Ok(boundary) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(test))]
+fn abort_at_recovery_test_boundary(_boundary: &str) {}
 
 #[cfg(test)]
 mod tests {
@@ -1648,10 +2799,19 @@ mod tests {
         let key = CanonicalIndexKey::encode(&parts).unwrap();
         let first_locator = encode_locator(&[ValueRef::Integer(1)]).unwrap();
         let second_locator = encode_locator(&[ValueRef::Integer(2)]).unwrap();
+        let first = SourceEntry {
+            encoded_key: key.clone(),
+            encoded_locator: first_locator,
+            reserves_unique_key: true,
+        };
+        let second = SourceEntry {
+            encoded_key: key,
+            encoded_locator: second_locator,
+            reserves_unique_key: true,
+        };
         let transaction = connection.transaction().unwrap();
-        insert_entry(&transaction, &index, 0, 0, &key, &first_locator, &parts).unwrap();
-        let error =
-            insert_entry(&transaction, &index, 1, 0, &key, &second_locator, &parts).unwrap_err();
+        insert_entry(&transaction, &index, 0, 0, &first).unwrap();
+        let error = insert_entry(&transaction, &index, 1, 0, &second).unwrap_err();
         assert_eq!(error.kind(), EngineErrorKind::UniqueViolation);
         assert!(error.diagnostic().contains("shard 0"));
         assert!(error.diagnostic().contains("shard 1"));

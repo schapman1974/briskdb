@@ -1345,6 +1345,17 @@ checksummed transaction. Thus physical completion always precedes visibility.
 Removal is legal only after `Dropping` and deletes physical rows before removing
 the unavailable manifest definition.
 
+Validation first commits manifest lifecycle `Rebuilding`, then compares source
+rows with physical entries in bounded memory. Full validation streams both
+sides in source-ordinal order; sampled validation uses deterministic,
+evenly-distributed ordinals per shard. Findings publish `Invalid`. Non-unique
+repair replaces complete affected-shard entry/checkpoint sets transactionally.
+Unique indexes reject repair and require a replacement build, so authoritative
+ownership is never inferred. Physical completion and synchronization precede
+the final manifest publication to `Ready`; cancellation or process loss leaves
+`Rebuilding` and no partial index is eligible for use. The operational contract
+is documented in [global-index recovery](GLOBAL_INDEX_RECOVERY.md).
+
 Bucket algorithm version 1 deliberately preserves legacy placement even when
 `N` does not divide 4,096. Given the version-1 64-bit hash `H`:
 
