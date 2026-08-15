@@ -209,9 +209,14 @@ fn global_index_catalog_is_read_only_reopenable_and_lifecycle_fenced() {
     );
 
     let mut database = core::Database::open(temp.path(), 2).unwrap();
-    database
-        .transition_global_index(index_id, core::GlobalIndexLifecycle::Ready)
-        .unwrap();
+    assert_eq!(
+        database
+            .transition_global_index(index_id, core::GlobalIndexLifecycle::Ready)
+            .unwrap_err()
+            .kind(),
+        core::EngineErrorKind::FailedPrecondition
+    );
+    database.build_global_index(index_id).unwrap();
     assert_eq!(
         database
             .transition_global_index(index_id, core::GlobalIndexLifecycle::Creating)
@@ -222,8 +227,12 @@ fn global_index_catalog_is_read_only_reopenable_and_lifecycle_fenced() {
     database
         .transition_global_index(index_id, core::GlobalIndexLifecycle::Rebuilding)
         .unwrap();
+    assert_eq!(
+        database.build_global_index(index_id).unwrap_err().kind(),
+        core::EngineErrorKind::Unsupported
+    );
     database
-        .transition_global_index(index_id, core::GlobalIndexLifecycle::Ready)
+        .transition_global_index(index_id, core::GlobalIndexLifecycle::Invalid)
         .unwrap();
     database
         .transition_global_index(index_id, core::GlobalIndexLifecycle::Dropping)

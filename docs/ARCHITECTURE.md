@@ -330,8 +330,16 @@ semantics, predicate, schema generation, lifecycle, and selected topology.
 The measured initial topology is one shared WAL-mode SQLite database: every key
 routes to partition zero. A domain-separated `(index ID, canonical key)` BLAKE3
 mapping remains frozen for a possible 16-file rebuild, but is not the initial
-default. See the [topology decision](GLOBAL_INDEX_TOPOLOGY.md). Physical files
-are first created by the offline builder in #230.
+default. See the [topology decision](GLOBAL_INDEX_TOPOLOGY.md).
+
+The [offline builder](GLOBAL_INDEX_BUILD.md) materializes `SharedSqliteV1` in
+`global-indexes/global.sqlite`. It holds sole-process maintenance ownership,
+scans every shard in physical-locator order, checkpoints a canonical-key/source
+digest per completed shard, and revalidates resumable checkpoints before use.
+Unique definitions reserve one canonical key across every shard. The physical
+file is fully checked, checkpointed, and synchronized before the checksummed
+manifest alone publishes `Creating` to `Ready`; the public lifecycle API cannot
+bypass this boundary.
 
 ### Bound statement-planning boundary
 
@@ -546,7 +554,11 @@ Writers use the existing sole-process mutation fence, while concurrent readers
 see only complete SQLite snapshots. The v12-to-v13 migration creates empty
 catalog tables and changes no shard. Issue #229 selects the one-file
 `SharedSqliteV1` layout after comparing it with 16 hash-partitioned files;
-physical construction starts in #230.
+issue #230 adds its offline, resumable physical construction. The builder uses
+the same local schema gate and sole-process lease as schema mutation, so another
+service or embedded process receives retryable `Busy`. Cancellation restores
+ordinary admission while retaining only complete shard checkpoints. Online and
+replacement construction remain later work.
 
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4

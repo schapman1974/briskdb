@@ -37,9 +37,9 @@ pub use engine::{CheckpointReport, CheckpointShardReport, Engine, EngineStatus, 
 pub use error::{EngineError, EngineErrorKind, EngineResult};
 pub(crate) use generated_id::AllocationOwnerMap;
 pub use global_index::{
-    GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart, GlobalIndexKeySource,
-    GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexStorageTopology,
-    HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1,
+    GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart,
+    GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata,
+    GlobalIndexStorageTopology, HASH_PARTITIONED_GLOBAL_INDEX_PARTITIONS_V1,
 };
 pub(crate) use global_index::{
     MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_SQL_BYTES, MAX_GLOBAL_INDEXES,
@@ -235,10 +235,36 @@ impl Database {
         self.storage.create_global_index(declaration)
     }
 
-    /// Atomically apply one legal global-index lifecycle transition.
+    /// Build one declared global index while holding exclusive maintenance-mode
+    /// ownership of the data directory.
     ///
-    /// Callers must not publish `Ready` until the declared physical topology is
-    /// complete and validated.
+    /// Construction scans every physical shard, checkpoints only complete
+    /// shard transactions, revalidates resumed checkpoints against the source,
+    /// and publishes `Ready` only after the physical SQLite authority is fully
+    /// durable. A cancelled build remains in `Creating` and can be resumed by
+    /// calling this method again.
+    pub fn build_global_index(
+        &mut self,
+        index_id: GlobalIndexId,
+    ) -> EngineResult<GlobalIndexBuildReport> {
+        self.storage
+            .build_global_index(index_id, &CancellationToken::new())
+    }
+
+    /// Build one declared global index with a caller-owned sticky cancellation
+    /// signal.
+    pub fn build_global_index_with_cancellation(
+        &mut self,
+        index_id: GlobalIndexId,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<GlobalIndexBuildReport> {
+        self.storage.build_global_index(index_id, cancellation)
+    }
+
+    /// Atomically apply one legal non-publication global-index lifecycle transition.
+    ///
+    /// `Ready` is reserved for [`Self::build_global_index`], which proves that
+    /// physical storage is complete before atomically publishing the catalog.
     pub fn transition_global_index(
         &mut self,
         index_id: GlobalIndexId,

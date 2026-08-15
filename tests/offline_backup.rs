@@ -1,6 +1,10 @@
 use std::{fs, path::Path};
 
-use briskdb::core::{Database, Engine, Statement, Value};
+use briskdb::core::{
+    Database, Engine, GlobalIndexDeclaration, GlobalIndexKeyPart, GlobalIndexKeySource,
+    GlobalIndexKeyType, GlobalIndexStorageTopology, ShardKeyMetadata, ShardKeyType, Statement,
+    TableDeclaration, Value,
+};
 
 const SHARDS: u16 = 4;
 
@@ -38,14 +42,25 @@ async fn stopped_server_backup_restores_schema_and_rows_from_every_shard() {
     let backup = directory.path().join("backup");
     let restored = directory.path().join("restored");
 
-    let database = Database::open(&live, SHARDS).unwrap();
+    let mut database = Database::open(&live, SHARDS).unwrap();
     database
         .broadcast(
             "CREATE TABLE backup_items (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL PRIMARY KEY,
                 shard_number INTEGER NOT NULL
              )",
         )
+        .unwrap();
+    let logical = database.catalog().default_database().id();
+    database
+        .register_tables(vec![
+            TableDeclaration::sharded(
+                logical,
+                "backup_items",
+                ShardKeyMetadata::new("id", ShardKeyType::Text).unwrap(),
+            )
+            .unwrap(),
+        ])
         .unwrap();
     let keys = one_key_per_shard(&database);
     drop(database);
@@ -70,9 +85,45 @@ async fn stopped_server_backup_restores_schema_and_rows_from_every_shard() {
     engine.shutdown().await.unwrap();
     drop(engine);
 
+    let mut database = Database::open(&live, SHARDS).unwrap();
+    let table_id = database
+        .catalog()
+        .table("default", "backup_items")
+        .unwrap()
+        .unwrap()
+        .id();
+    let declaration = GlobalIndexDeclaration::new(
+        table_id,
+        "backup_items_id_global",
+        vec![GlobalIndexKeyPart::new(
+            GlobalIndexKeySource::column("id").unwrap(),
+            GlobalIndexKeyType::Text,
+        )],
+    )
+    .unwrap()
+    .with_topology(GlobalIndexStorageTopology::selected_v1());
+    let index_id = database.create_global_index(declaration).unwrap();
+    assert_eq!(
+        database
+            .build_global_index(index_id)
+            .unwrap()
+            .indexed_rows(),
+        u64::from(SHARDS)
+    );
+    drop(database);
+
     copy_directory(&live, &backup);
     copy_directory(&backup, &restored);
 
+    let mut restored_database = Database::open(&restored, SHARDS).unwrap();
+    assert_eq!(
+        restored_database
+            .build_global_index(index_id)
+            .unwrap()
+            .indexed_rows(),
+        u64::from(SHARDS)
+    );
+    drop(restored_database);
     let restored_engine = Engine::open(&restored, SHARDS).await.unwrap();
     assert_eq!(restored_engine.catalog().schema_generation(), 1);
     for (expected_shard, key) in keys.iter().enumerate() {

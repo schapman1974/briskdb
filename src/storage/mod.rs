@@ -1,5 +1,6 @@
 //! SQLite file layout, versioned manifest management, and connection configuration.
 
+mod global_index;
 mod hilo;
 mod manifest;
 mod migration;
@@ -44,8 +45,9 @@ use crate::core::TableId;
 use crate::{
     core::{
         Catalog, CatalogSnapshot, EngineError, EngineErrorKind, EngineResult, GeneratedIdPolicy,
-        GeneratedTableDdlReceipt, GlobalIndexDeclaration, GlobalIndexId, GlobalIndexLifecycle,
-        GlobalIndexMetadata, MAX_TABLES, ShardKeyType, TableDeclaration, TablePlacement,
+        GeneratedTableDdlReceipt, GlobalIndexBuildReport, GlobalIndexDeclaration, GlobalIndexId,
+        GlobalIndexLifecycle, GlobalIndexMetadata, MAX_TABLES, ShardKeyType, TableDeclaration,
+        TablePlacement,
         generated_id::{
             NATIVE_RANGE_V1_FORMAT_MARKER, native_range_v1_sequence_ceiling,
             native_range_v1_sequence_floor,
@@ -1304,8 +1306,74 @@ impl Storage {
         index_id: GlobalIndexId,
         target: GlobalIndexLifecycle,
     ) -> EngineResult<()> {
+        if target == GlobalIndexLifecycle::Ready {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!("global index {index_id} can become Ready only through build_global_index"),
+            ));
+        }
         let result = self.transition_global_index_inner(index_id, target);
         self.fail_closed_on_corruption(result)
+    }
+
+    pub(crate) fn build_global_index(
+        &mut self,
+        index_id: GlobalIndexId,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexBuildReport> {
+        let result = self.build_global_index_inner(index_id, cancellation);
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn build_global_index_inner(
+        &mut self,
+        index_id: GlobalIndexId,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<GlobalIndexBuildReport> {
+        let mut mutation =
+            SchemaMigrationGuard::new(self.schema_coordination.gate.begin_new_migration()?);
+        mutation.wait_for_quiescence_blocking();
+        mutation.acquire_process_ownership(&self.schema_coordination.process_lease)?;
+        let index = self
+            .catalog
+            .logical()
+            .global_index_by_id(index_id)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!("global index {index_id} does not exist"),
+                )
+            })?;
+
+        if index.lifecycle() == GlobalIndexLifecycle::Ready {
+            let report = global_index::validate_ready(self, &index, cancellation)?;
+            mutation.publish_ready()?;
+            return Ok(report);
+        }
+
+        let replacement_guard = self
+            .schema_coordination
+            .reserve_catalog_replacement(&self.catalog)?;
+        let report = global_index::build(self, &index, cancellation)?;
+        if cancellation.is_cancelled() {
+            return Err(EngineError::new(
+                EngineErrorKind::Cancelled,
+                format!("global-index build {index_id} was cancelled before publication"),
+            ));
+        }
+        let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+        configure_manifest_connection(&manifest_connection)?;
+        let replacement = manifest::transition_global_index(
+            &mut manifest_connection,
+            self.shard_count(),
+            index_id,
+            GlobalIndexLifecycle::Ready,
+            || mutation.mark_pending_on_drop(),
+        )?;
+        self.catalog = replacement_guard.publish(&self.catalog, replacement)?;
+        mutation.publish_ready()?;
+        Ok(report)
     }
 
     fn transition_global_index_inner(
@@ -1346,6 +1414,23 @@ impl Storage {
         let replacement_guard = self
             .schema_coordination
             .reserve_catalog_replacement(&self.catalog)?;
+        let index = self
+            .catalog
+            .logical()
+            .global_index_by_id(index_id)
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!("global index {index_id} does not exist"),
+                )
+            })?;
+        if index.lifecycle() != GlobalIndexLifecycle::Dropping {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                format!("global index {index_id} must enter Dropping before removal"),
+            ));
+        }
+        global_index::remove_artifacts(&self.root, index_id)?;
         let mut manifest_connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
         configure_manifest_connection(&manifest_connection)?;
         let replacement = manifest::remove_global_index(
@@ -5914,7 +5999,7 @@ mod tests {
                         .unwrap(),
                 )
                 .unwrap();
-                database.transition_global_index(id, GlobalIndexLifecycle::Ready)
+                database.transition_global_index(id, GlobalIndexLifecycle::Invalid)
             }
             "remove" => {
                 let id = GlobalIndexId::new(
@@ -5925,6 +6010,16 @@ mod tests {
                 )
                 .unwrap();
                 database.remove_global_index(id)
+            }
+            "build" => {
+                let id = GlobalIndexId::new(
+                    std::env::var("BRISKDB_GLOBAL_INDEX_ABORT_ID")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+                .unwrap();
+                database.build_global_index(id).map(|_| ())
             }
             unexpected => panic!("unexpected global-index crash mode: {unexpected}"),
         };
@@ -5969,7 +6064,7 @@ mod tests {
 
         for (boundary, expected) in [
             ("transition-before-commit", GlobalIndexLifecycle::Creating),
-            ("transition-after-commit", GlobalIndexLifecycle::Ready),
+            ("transition-after-commit", GlobalIndexLifecycle::Invalid),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let mut database = setup_global_index_root(temp.path());
@@ -6003,6 +6098,160 @@ mod tests {
             );
             drop(Database::open(temp.path(), 2).unwrap());
         }
+    }
+
+    #[test]
+    fn global_index_build_resumes_after_real_process_abort_at_every_durable_phase() {
+        let boundaries = [
+            ("initialized", 0_u16, false),
+            ("shard-0-before-commit", 0, false),
+            ("shard-0-after-commit", 1, false),
+            ("shard-1-before-commit", 1, false),
+            ("shard-1-after-commit", 2, false),
+            ("complete-before-commit", 2, false),
+            ("complete-after-commit", 2, false),
+            ("transition-before-commit", 2, true),
+            ("transition-after-commit", 2, true),
+        ];
+        for (boundary, expected_resume, manifest_boundary) in boundaries {
+            let temp = tempfile::tempdir().unwrap();
+            let mut database = setup_global_index_root(temp.path());
+            for shard in 0..2_u16 {
+                for row in 0..2_i64 {
+                    let tenant = (0..10_000)
+                        .map(|candidate| format!("tenant-{shard}-{candidate}"))
+                        .find(|candidate| database.shard_for_key(candidate.as_bytes()) == shard)
+                        .unwrap();
+                    database
+                        .execute(
+                            &tenant,
+                            "INSERT INTO events (id, tenant_id, payload)
+                             VALUES (?1, ?2, ?3)",
+                            &[
+                                crate::core::Value::from(i64::from(shard) * 10 + row),
+                                crate::core::Value::from(tenant.as_str()),
+                                crate::core::Value::from(
+                                    format!("payload-{shard}-{row}").into_bytes(),
+                                ),
+                            ],
+                        )
+                        .unwrap();
+                }
+            }
+            let declaration = global_index_test_declaration(&database);
+            let id = database.create_global_index(declaration).unwrap();
+            drop(database);
+
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("storage::tests::global_index_catalog_crash_child")
+                .arg("--nocapture")
+                .env("BRISKDB_GLOBAL_INDEX_ABORT_ROOT", temp.path())
+                .env("BRISKDB_GLOBAL_INDEX_ABORT_MODE", "build")
+                .env("BRISKDB_GLOBAL_INDEX_ABORT_ID", id.get().to_string());
+            if manifest_boundary {
+                command.env("BRISKDB_GLOBAL_INDEX_ABORT_POINT", boundary);
+            } else {
+                command.env("BRISKDB_GLOBAL_INDEX_BUILD_ABORT_POINT", boundary);
+            }
+            let status = command.status().unwrap();
+            assert!(!status.success(), "child did not abort at {boundary}");
+
+            let mut reopened = Database::open(temp.path(), 2).unwrap();
+            let report = reopened.build_global_index(id).unwrap();
+            assert_eq!(
+                report.resumed_from_shard(),
+                expected_resume,
+                "boundary {boundary}"
+            );
+            assert_eq!(report.indexed_rows(), 4, "boundary {boundary}");
+            assert_eq!(
+                reopened
+                    .catalog()
+                    .global_index_by_id(id)
+                    .unwrap()
+                    .lifecycle(),
+                GlobalIndexLifecycle::Ready,
+                "boundary {boundary}"
+            );
+            let physical =
+                Connection::open(temp.path().join("global-indexes").join("global.sqlite")).unwrap();
+            assert_eq!(
+                physical
+                    .query_row(
+                        "SELECT COUNT(*) FROM briskdb_global_index_entries
+                         WHERE index_id = ?1",
+                        [i64::try_from(id.get()).unwrap()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                4,
+                "boundary {boundary}"
+            );
+            assert_eq!(
+                physical
+                    .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok",
+                "boundary {boundary}"
+            );
+        }
+    }
+
+    #[test]
+    fn global_index_resume_restarts_if_a_checkpointed_source_shard_changed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = setup_global_index_root(temp.path());
+        let tenant = (0..10_000)
+            .map(|candidate| format!("checkpoint-tenant-{candidate}"))
+            .find(|candidate| database.shard_for_key(candidate.as_bytes()) == 0)
+            .unwrap();
+        database
+            .execute(
+                &tenant,
+                "INSERT INTO events (id, tenant_id, payload) VALUES (?1, ?2, ?3)",
+                &[
+                    crate::core::Value::from(1_i64),
+                    crate::core::Value::from(tenant.as_str()),
+                    crate::core::Value::from(b"old".to_vec()),
+                ],
+            )
+            .unwrap();
+        let declaration = global_index_test_declaration(&database);
+        let id = database.create_global_index(declaration).unwrap();
+        drop(database);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("storage::tests::global_index_catalog_crash_child")
+            .arg("--nocapture")
+            .env("BRISKDB_GLOBAL_INDEX_ABORT_ROOT", temp.path())
+            .env("BRISKDB_GLOBAL_INDEX_ABORT_MODE", "build")
+            .env("BRISKDB_GLOBAL_INDEX_ABORT_ID", id.get().to_string())
+            .env(
+                "BRISKDB_GLOBAL_INDEX_BUILD_ABORT_POINT",
+                "shard-0-after-commit",
+            )
+            .status()
+            .unwrap();
+        assert!(!status.success());
+
+        let mut reopened = Database::open(temp.path(), 2).unwrap();
+        reopened
+            .execute(
+                &tenant,
+                "INSERT INTO events (id, tenant_id, payload) VALUES (?1, ?2, ?3)",
+                &[
+                    crate::core::Value::from(2_i64),
+                    crate::core::Value::from(tenant.as_str()),
+                    crate::core::Value::from(b"new".to_vec()),
+                ],
+            )
+            .unwrap();
+        let report = reopened.build_global_index(id).unwrap();
+        assert_eq!(report.resumed_from_shard(), 0);
+        assert_eq!(report.indexed_rows(), 2);
     }
 
     const GENERATED_DDL_CRASH_SOURCE: &str =

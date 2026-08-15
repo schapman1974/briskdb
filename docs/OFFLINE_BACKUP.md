@@ -3,7 +3,8 @@
 BriskDB's supported alpha backup is a complete copy made while every BriskDB
 process using the data directory is stopped. This procedure preserves one
 consistent manifest, shard set, schema generation, routing map, generated-ID
-allocator state, and any SQLite sidecar files as a unit.
+allocator state, physical global-index storage, and any SQLite sidecar files as
+a unit.
 
 This is not an online backup. Do not copy a live data directory, even when no
 application writes are expected. Coordinated online backup remains tracked by
@@ -17,11 +18,12 @@ issue #67.
    to exit. A service manager must report its service stopped before copying.
 3. Verify that no other BriskDB process or embedder is using the directory.
 4. Copy the complete data directory into a new backup directory. Include
-   `manifest.sqlite`, the entire `shards` directory, the import receipt when
-   present, `.briskdb-process.lock`, `.briskdb-startup.lock`, and every SQLite
-   `-wal`, `-shm`, or journal sidecar that exists. The lock files contain no
-   persistent ownership, but a complete-directory copy includes them. Do not
-   select individual database files.
+   `manifest.sqlite`, the entire `shards` directory, the entire
+   `global-indexes` directory when present, the import receipt when present,
+   `.briskdb-process.lock`, `.briskdb-startup.lock`, and every SQLite `-wal`,
+   `-shm`, or journal sidecar that exists. The lock files contain no persistent
+   ownership, but a complete-directory copy includes them. Do not select
+   individual database files.
 5. Make the backup durable using the snapshot, archive, or copy tool's normal
    completion and sync guarantees. Retain the recorded BriskDB version and
    shard count with the backup.
@@ -70,8 +72,9 @@ For release upgrades and rollback, follow the additional requirements in the
 ## Automated evidence
 
 `tests/offline_backup.rs` creates schema and one routed row on every shard,
-performs explicit engine shutdown, copies the complete layout through a backup
-directory into a new root, reopens it, and verifies the schema generation,
-physical route, and row value for every shard. The test freezes the stopped-copy
-contract but does not claim online snapshot safety or certify a particular
-third-party backup product.
+builds and validates a global index, performs explicit engine shutdown, copies
+the complete layout through a backup directory into a new root, reopens it, and
+verifies the schema generation, global-index authority, physical route, and row
+value for every shard. The test freezes the stopped-copy contract but does not
+claim online snapshot safety or certify a particular third-party backup
+product.
