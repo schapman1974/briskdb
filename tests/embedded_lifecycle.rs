@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use briskdb::{BriskDb, CancellationToken, EngineErrorKind, EngineState, Statement, Value};
+use briskdb::{
+    BriskDb, CancellationToken, CheckpointDatabase, EngineErrorKind, EngineState, Statement, Value,
+};
 
 async fn open_two_shards(path: &std::path::Path) -> BriskDb {
     BriskDb::builder(path)
@@ -102,9 +104,19 @@ async fn passive_checkpoint_is_ordered_bounded_and_host_cancellable() {
             shard.checkpointed_frames() == shard.wal_frames()
         );
     }
+    assert_eq!(report.databases().len(), 1);
+    assert_eq!(
+        report.databases()[0].database(),
+        CheckpointDatabase::Manifest
+    );
+    assert!(report.databases()[0].counts_available());
     assert_eq!(
         report.complete(),
         report.shards().iter().all(|s| s.complete())
+            && report
+                .databases()
+                .iter()
+                .all(|database| database.complete())
     );
 
     let cancelled = CancellationToken::new();

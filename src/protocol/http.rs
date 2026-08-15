@@ -2,7 +2,7 @@
 
 mod admin;
 
-use std::sync::Arc;
+use std::{fmt::Write as _, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -17,7 +17,8 @@ use serde_json::{Value as JsonValue, json};
 use crate::{
     core::{
         DataType, Database, Engine, EngineError, EngineErrorKind, Executed, GeneratedKey,
-        ResultSet, Routed, Statement, Value,
+        GlobalIndexHealthState, GlobalIndexLifecycle, GlobalIndexOperationalReport,
+        GlobalIndexOperationalStatus, ResultSet, Routed, Statement, Value,
     },
     protocol::error::http_error,
 };
@@ -39,6 +40,7 @@ pub fn router_with_engine(engine: Engine) -> Router {
     };
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/execute", post(execute))
         .route("/v1/query", post(query))
         .route("/v1/admin/broadcast", post(broadcast))
@@ -57,11 +59,49 @@ async fn health(State(state): State<HttpState>) -> Result<Json<JsonValue>, ApiEr
     let engine = state.engine;
     let session = engine.session();
     let status = engine.status(&session).await?;
+    let indexes = engine.global_index_operational_report().await?;
+    let service_status = if indexes.state() == GlobalIndexHealthState::Healthy {
+        "ok"
+    } else {
+        "degraded"
+    };
+    tracing::debug!(
+        global_index_state = indexes.state().code(),
+        global_indexes = indexes.indexes().len(),
+        degraded_global_indexes = indexes.degraded_indexes(),
+        unavailable_global_indexes = indexes.unavailable_indexes(),
+        global_index_async_lag = indexes.async_lag(),
+        global_index_outbox_events = indexes.retained_outbox_events(),
+        global_index_outbox_bytes = indexes.retained_outbox_bytes(),
+        global_index_backpressured_shards = indexes.backpressured_outbox_shards(),
+        "global-index operational health"
+    );
 
     Ok(Json(json!({
-        "status": "ok",
+        "status": service_status,
         "shards": status.shard_count(),
+        "global_indexes": {
+            "state": indexes.state().code(),
+            "total": indexes.indexes().len(),
+            "healthy": indexes.healthy_indexes(),
+            "degraded": indexes.degraded_indexes(),
+            "unavailable": indexes.unavailable_indexes(),
+            "async_lag": indexes.async_lag(),
+            "retained_outbox_events": indexes.retained_outbox_events(),
+            "retained_outbox_bytes": indexes.retained_outbox_bytes(),
+            "backpressured_outbox_shards": indexes.backpressured_outbox_shards(),
+        },
     })))
+}
+
+async fn metrics(State(state): State<HttpState>) -> Result<Response, ApiError> {
+    let report = state.engine.global_index_operational_report().await?;
+    let mut response = prometheus_metrics(&report).into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +131,10 @@ struct BroadcastRequest {
 
 #[derive(Debug, Serialize)]
 struct GlobalIndexesResponse {
+    state: &'static str,
+    retained_outbox_events: u64,
+    retained_outbox_bytes: u64,
+    backpressured_outbox_shards: u16,
     indexes: Vec<GlobalIndexStatus>,
 }
 
@@ -100,8 +144,25 @@ struct GlobalIndexStatus {
     name: String,
     unique: bool,
     lifecycle: &'static str,
+    health: &'static str,
     available: bool,
     recovery: &'static str,
+    authority_entries: u64,
+    unique_keys: u64,
+    active_operations: u64,
+    active_unique_reservations: u64,
+    active_value_leases: u64,
+    pending_read_repairs: u64,
+    applied_read_repairs: u64,
+    async_lag: u64,
+    async_failures: u64,
+    poisoned_shards: u16,
+    leased_shards: u16,
+    async_paused: bool,
+    rebuild_required: bool,
+    summary_ready_shards: u16,
+    summary_degraded_shards: u16,
+    summary_saturated_shards: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,33 +284,165 @@ async fn broadcast(
     Ok(Json(json!({"completed_shards": shards})))
 }
 
-async fn global_indexes(State(state): State<HttpState>) -> Json<GlobalIndexesResponse> {
-    let indexes = state
-        .engine
-        .catalog()
-        .global_indexes()
+async fn global_indexes(
+    State(state): State<HttpState>,
+) -> Result<Json<GlobalIndexesResponse>, ApiError> {
+    let report = state.engine.global_index_operational_report().await?;
+    let indexes = report
+        .indexes()
         .iter()
-        .map(|index| {
-            let (lifecycle, available, recovery) = match index.lifecycle() {
-                crate::core::GlobalIndexLifecycle::Creating => ("creating", false, "build"),
-                crate::core::GlobalIndexLifecycle::Ready => ("ready", true, "none"),
-                crate::core::GlobalIndexLifecycle::Invalid => ("invalid", false, "rebuild"),
-                crate::core::GlobalIndexLifecycle::Rebuilding => {
-                    ("rebuilding", false, "resume_rebuild")
-                }
-                crate::core::GlobalIndexLifecycle::Dropping => ("dropping", false, "none"),
-            };
-            GlobalIndexStatus {
-                id: index.id().to_string(),
-                name: index.name().to_owned(),
-                unique: index.is_unique(),
+        .map(|status| {
+            let metadata = state
+                .engine
+                .catalog()
+                .global_indexes()
+                .iter()
+                .find(|index| index.id() == status.index_id())
+                .ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "global-index operational report does not match the catalog",
+                    )
+                })?;
+            let (lifecycle, available, recovery) = lifecycle_status(status.lifecycle());
+            Ok(GlobalIndexStatus {
+                id: status.index_id().to_string(),
+                name: metadata.name().to_owned(),
+                unique: status.is_unique(),
                 lifecycle,
+                health: status.state().code(),
                 available,
                 recovery,
-            }
+                authority_entries: status.authority_entries(),
+                unique_keys: status.unique_keys(),
+                active_operations: status.active_operations(),
+                active_unique_reservations: status.active_unique_reservations(),
+                active_value_leases: status.active_value_leases(),
+                pending_read_repairs: status.pending_read_repairs(),
+                applied_read_repairs: status.applied_read_repairs(),
+                async_lag: status.async_lag(),
+                async_failures: status.async_failures(),
+                poisoned_shards: status.poisoned_shards(),
+                leased_shards: status.leased_shards(),
+                async_paused: status.async_paused(),
+                rebuild_required: status.rebuild_required(),
+                summary_ready_shards: status.summary_ready_shards(),
+                summary_degraded_shards: status.summary_degraded_shards(),
+                summary_saturated_shards: status.summary_saturated_shards(),
+            })
         })
-        .collect();
-    Json(GlobalIndexesResponse { indexes })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    Ok(Json(GlobalIndexesResponse {
+        state: report.state().code(),
+        retained_outbox_events: report.retained_outbox_events(),
+        retained_outbox_bytes: report.retained_outbox_bytes(),
+        backpressured_outbox_shards: report.backpressured_outbox_shards(),
+        indexes,
+    }))
+}
+
+fn lifecycle_status(lifecycle: GlobalIndexLifecycle) -> (&'static str, bool, &'static str) {
+    match lifecycle {
+        GlobalIndexLifecycle::Creating => ("creating", false, "build"),
+        GlobalIndexLifecycle::Ready => ("ready", true, "none"),
+        GlobalIndexLifecycle::Invalid => ("invalid", false, "rebuild"),
+        GlobalIndexLifecycle::Rebuilding => ("rebuilding", false, "resume_rebuild"),
+        GlobalIndexLifecycle::Dropping => ("dropping", false, "none"),
+    }
+}
+
+fn prometheus_metrics(report: &GlobalIndexOperationalReport) -> String {
+    let mut output = String::from(
+        "# HELP briskdb_global_indexes Global indexes by operational state.\n\
+         # TYPE briskdb_global_indexes gauge\n",
+    );
+    for state in [
+        GlobalIndexHealthState::Healthy,
+        GlobalIndexHealthState::Degraded,
+        GlobalIndexHealthState::Unavailable,
+    ] {
+        let value = report
+            .indexes()
+            .iter()
+            .filter(|index| index.state() == state)
+            .count();
+        let _ = writeln!(
+            output,
+            "briskdb_global_indexes{{state=\"{}\"}} {value}",
+            state.code()
+        );
+    }
+    let _ = writeln!(
+        output,
+        "briskdb_global_index_outbox_retained_events {}",
+        report.retained_outbox_events()
+    );
+    let _ = writeln!(
+        output,
+        "briskdb_global_index_outbox_retained_bytes {}",
+        report.retained_outbox_bytes()
+    );
+    let _ = writeln!(
+        output,
+        "briskdb_global_index_outbox_backpressured_shards {}",
+        report.backpressured_outbox_shards()
+    );
+    for index in report.indexes() {
+        write_index_metrics(&mut output, index);
+    }
+    output
+}
+
+fn write_index_metrics(output: &mut String, index: &GlobalIndexOperationalStatus) {
+    let id = index.index_id();
+    for (name, value) in [
+        ("authority_entries", index.authority_entries()),
+        ("unique_keys", index.unique_keys()),
+        ("active_operations", index.active_operations()),
+        (
+            "active_unique_reservations",
+            index.active_unique_reservations(),
+        ),
+        ("active_value_leases", index.active_value_leases()),
+        ("pending_read_repairs", index.pending_read_repairs()),
+        ("applied_read_repairs", index.applied_read_repairs()),
+        ("async_lag", index.async_lag()),
+        ("async_failures", index.async_failures()),
+        ("poisoned_shards", u64::from(index.poisoned_shards())),
+        ("leased_shards", u64::from(index.leased_shards())),
+        (
+            "summary_ready_shards",
+            u64::from(index.summary_ready_shards()),
+        ),
+        (
+            "summary_degraded_shards",
+            u64::from(index.summary_degraded_shards()),
+        ),
+        (
+            "summary_saturated_shards",
+            u64::from(index.summary_saturated_shards()),
+        ),
+    ] {
+        let _ = writeln!(
+            output,
+            "briskdb_global_index_{name}{{index_id=\"{id}\"}} {value}"
+        );
+    }
+    for (name, value) in [
+        ("async_paused", index.async_paused()),
+        ("rebuild_required", index.rebuild_required()),
+    ] {
+        let _ = writeln!(
+            output,
+            "briskdb_global_index_{name}{{index_id=\"{id}\"}} {}",
+            u8::from(value)
+        );
+    }
+    let _ = writeln!(
+        output,
+        "briskdb_global_index_state{{index_id=\"{id}\",state=\"{}\"}} 1",
+        index.state().code()
+    );
 }
 
 fn json_to_value(value: JsonValue) -> Value {
@@ -406,6 +599,24 @@ mod tests {
         router_with_engine(Engine::from_database(database))
     }
 
+    fn healthy_without_global_indexes(shards: u16) -> JsonValue {
+        json!({
+            "status": "ok",
+            "shards": shards,
+            "global_indexes": {
+                "state": "healthy",
+                "total": 0,
+                "healthy": 0,
+                "degraded": 0,
+                "unavailable": 0,
+                "async_lag": 0,
+                "retained_outbox_events": 0,
+                "retained_outbox_bytes": 0,
+                "backpressured_outbox_shards": 0
+            }
+        })
+    }
+
     async fn send_json(
         router: &Router,
         method: Method,
@@ -451,7 +662,7 @@ mod tests {
 
         assert_eq!(
             request_json(&application, Method::GET, "/health", None).await,
-            (StatusCode::OK, json!({"status": "ok", "shards": 4}))
+            (StatusCode::OK, healthy_without_global_indexes(4))
         );
         assert_eq!(
             request_json(
@@ -570,23 +781,89 @@ mod tests {
             .unwrap();
         database.build_global_index(index_id).unwrap();
 
-        let application = engine_router(Arc::new(database));
+        let engine = Engine::from_database(Arc::new(database));
+        let application = router_with_engine(engine.clone());
         assert_eq!(
             request_json(&application, Method::GET, "/v1/admin/global-indexes", None,).await,
             (
                 StatusCode::OK,
                 json!({
+                    "state": "healthy",
+                    "retained_outbox_events": 0,
+                    "retained_outbox_bytes": 0,
+                    "backpressured_outbox_shards": 0,
                     "indexes": [{
                         "id": index_id.to_string(),
                         "name": "events_email_lookup",
                         "unique": false,
                         "lifecycle": "ready",
+                        "health": "healthy",
                         "available": true,
-                        "recovery": "none"
+                        "recovery": "none",
+                        "authority_entries": 0,
+                        "unique_keys": 0,
+                        "active_operations": 0,
+                        "active_unique_reservations": 0,
+                        "active_value_leases": 0,
+                        "pending_read_repairs": 0,
+                        "applied_read_repairs": 0,
+                        "async_lag": 0,
+                        "async_failures": 0,
+                        "poisoned_shards": 0,
+                        "leased_shards": 0,
+                        "async_paused": false,
+                        "rebuild_required": false,
+                        "summary_ready_shards": 4,
+                        "summary_degraded_shards": 0,
+                        "summary_saturated_shards": 0
                     }]
                 }),
             )
         );
+
+        let metrics = send_json(&application, Method::GET, "/metrics", None).await;
+        assert_eq!(metrics.status(), StatusCode::OK);
+        assert_eq!(
+            metrics.headers()[CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = String::from_utf8(
+            to_bytes(metrics.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("briskdb_global_indexes{state=\"healthy\"} 1"));
+        assert!(body.contains(&format!(
+            "briskdb_global_index_summary_ready_shards{{index_id=\"{index_id}\"}} 4"
+        )));
+
+        let session = engine.session();
+        session.set_routing_key("http-lag").await.unwrap();
+        engine
+            .execute_write(
+                &session,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, email) VALUES (?1, ?2)",
+                    vec!["http-lag".into(), "lag@example.test".into()],
+                ),
+            )
+            .await
+            .unwrap();
+        let (health_status, health) =
+            request_json(&application, Method::GET, "/health", None).await;
+        assert_eq!(health_status, StatusCode::OK);
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["global_indexes"]["state"], "degraded");
+        assert_eq!(health["global_indexes"]["degraded"], 1);
+        assert_eq!(health["global_indexes"]["async_lag"], 1);
+        assert_eq!(health["global_indexes"]["retained_outbox_events"], 1);
+        let (_, admin) =
+            request_json(&application, Method::GET, "/v1/admin/global-indexes", None).await;
+        assert_eq!(admin["state"], "degraded");
+        assert_eq!(admin["indexes"][0]["health"], "degraded");
+        assert_eq!(admin["indexes"][0]["async_lag"], 1);
     }
 
     #[tokio::test]
@@ -1335,7 +1612,7 @@ mod tests {
 
         assert_eq!(
             request_json(&application, Method::GET, "/health", None).await,
-            (StatusCode::OK, json!({"status": "ok", "shards": 4}))
+            (StatusCode::OK, healthy_without_global_indexes(4))
         );
         let (status, body) = request_json(
             &application,

@@ -154,6 +154,13 @@ jobs:
           global_index_baseline_smoke --
           --ignored --exact --test-threads=1
 
+      - name: Run global-index release-gate correctness smoke
+        if: matrix.rust == 'stable'
+        run: >-
+          cargo test --locked --test global_index_baseline
+          global_index_release_gate_smoke --
+          --ignored --exact --test-threads=1
+
       - name: Run global-index topology correctness smoke
         if: matrix.rust == 'stable'
         run: >-

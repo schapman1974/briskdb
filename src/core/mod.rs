@@ -33,7 +33,10 @@ pub(crate) use control::{
     CancelOnDrop, CancellationReason, OperationControl, wait_for_cancellation, wait_pending,
 };
 pub use control::{CancellationToken, RequestContext};
-pub use engine::{CheckpointReport, CheckpointShardReport, Engine, EngineStatus, Statement};
+pub use engine::{
+    CheckpointDatabase, CheckpointDatabaseReport, CheckpointReport, CheckpointShardReport, Engine,
+    EngineStatus, Statement,
+};
 pub use error::{EngineError, EngineErrorKind, EngineResult};
 pub(crate) use generated_id::AllocationOwnerMap;
 pub use global_index::{
@@ -42,8 +45,9 @@ pub use global_index::{
     GLOBAL_INDEX_SHARD_SUMMARY_FORMAT_VERSION, GlobalIndexAsyncOptions,
     GlobalIndexAsyncProcessReport, GlobalIndexAsyncShardOutcome, GlobalIndexAsyncShardReport,
     GlobalIndexAsyncShardStatus, GlobalIndexAsyncStatus, GlobalIndexBuildReport,
-    GlobalIndexDeclaration, GlobalIndexId, GlobalIndexKeyPart, GlobalIndexKeySource,
-    GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata, GlobalIndexOutboxBatch,
+    GlobalIndexDeclaration, GlobalIndexHealthState, GlobalIndexId, GlobalIndexKeyPart,
+    GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexLifecycle, GlobalIndexMetadata,
+    GlobalIndexOperationalReport, GlobalIndexOperationalStatus, GlobalIndexOutboxBatch,
     GlobalIndexOutboxCursor, GlobalIndexOutboxEvent, GlobalIndexOutboxEventKind,
     GlobalIndexOutboxPruneReport, GlobalIndexOutboxShardStatus, GlobalIndexOwner,
     GlobalIndexRepairReport, GlobalIndexShardSummaryRebuildReport,
@@ -293,6 +297,11 @@ impl Database {
         index_id: GlobalIndexId,
     ) -> EngineResult<GlobalIndexAsyncStatus> {
         self.storage.global_index_async_status(index_id)
+    }
+
+    /// Inspect redaction-safe global-index health, lag, contention, and repair counters.
+    pub fn global_index_operational_report(&self) -> EngineResult<GlobalIndexOperationalReport> {
+        self.storage.global_index_operational_report()
     }
 
     /// Inspect compact Bloom/min-max state without exposing indexed values.

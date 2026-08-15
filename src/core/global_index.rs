@@ -741,6 +741,257 @@ impl GlobalIndexAsyncStatus {
     }
 }
 
+/// Redaction-safe health classification for global-index operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GlobalIndexHealthState {
+    /// The index is ready and all optional acceleration state is usable.
+    Healthy,
+    /// Correctness is preserved, but freshness, pruning, or retention needs attention.
+    Degraded,
+    /// The index lifecycle does not currently permit normal use.
+    Unavailable,
+}
+
+impl GlobalIndexHealthState {
+    /// Return the stable machine-readable representation.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Redaction-safe operational counters for one global index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexOperationalStatus {
+    index_id: GlobalIndexId,
+    unique: bool,
+    lifecycle: GlobalIndexLifecycle,
+    state: GlobalIndexHealthState,
+    authority_entries: u64,
+    unique_keys: u64,
+    active_operations: u64,
+    active_unique_reservations: u64,
+    active_value_leases: u64,
+    pending_read_repairs: u64,
+    applied_read_repairs: u64,
+    async_lag: u64,
+    async_failures: u64,
+    poisoned_shards: u16,
+    leased_shards: u16,
+    async_paused: bool,
+    rebuild_required: bool,
+    summary_ready_shards: u16,
+    summary_degraded_shards: u16,
+    summary_saturated_shards: u16,
+}
+
+impl GlobalIndexOperationalStatus {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        index_id: GlobalIndexId,
+        unique: bool,
+        lifecycle: GlobalIndexLifecycle,
+        authority_entries: u64,
+        unique_keys: u64,
+        active_operations: u64,
+        active_unique_reservations: u64,
+        active_value_leases: u64,
+        pending_read_repairs: u64,
+        applied_read_repairs: u64,
+        async_lag: u64,
+        async_failures: u64,
+        poisoned_shards: u16,
+        leased_shards: u16,
+        async_paused: bool,
+        rebuild_required: bool,
+        summary_ready_shards: u16,
+        summary_degraded_shards: u16,
+        summary_saturated_shards: u16,
+    ) -> Self {
+        let state = if lifecycle != GlobalIndexLifecycle::Ready {
+            GlobalIndexHealthState::Unavailable
+        } else if async_lag != 0
+            || poisoned_shards != 0
+            || async_paused
+            || rebuild_required
+            || summary_degraded_shards != 0
+            || summary_saturated_shards != 0
+        {
+            GlobalIndexHealthState::Degraded
+        } else {
+            GlobalIndexHealthState::Healthy
+        };
+        Self {
+            index_id,
+            unique,
+            lifecycle,
+            state,
+            authority_entries,
+            unique_keys,
+            active_operations,
+            active_unique_reservations,
+            active_value_leases,
+            pending_read_repairs,
+            applied_read_repairs,
+            async_lag,
+            async_failures,
+            poisoned_shards,
+            leased_shards,
+            async_paused,
+            rebuild_required,
+            summary_ready_shards,
+            summary_degraded_shards,
+            summary_saturated_shards,
+        }
+    }
+
+    pub const fn index_id(&self) -> GlobalIndexId {
+        self.index_id
+    }
+    pub const fn is_unique(&self) -> bool {
+        self.unique
+    }
+    pub const fn lifecycle(&self) -> GlobalIndexLifecycle {
+        self.lifecycle
+    }
+    pub const fn state(&self) -> GlobalIndexHealthState {
+        self.state
+    }
+    pub const fn authority_entries(&self) -> u64 {
+        self.authority_entries
+    }
+    pub const fn unique_keys(&self) -> u64 {
+        self.unique_keys
+    }
+    pub const fn active_operations(&self) -> u64 {
+        self.active_operations
+    }
+    pub const fn active_unique_reservations(&self) -> u64 {
+        self.active_unique_reservations
+    }
+    pub const fn active_value_leases(&self) -> u64 {
+        self.active_value_leases
+    }
+    pub const fn pending_read_repairs(&self) -> u64 {
+        self.pending_read_repairs
+    }
+    pub const fn applied_read_repairs(&self) -> u64 {
+        self.applied_read_repairs
+    }
+    pub const fn async_lag(&self) -> u64 {
+        self.async_lag
+    }
+    pub const fn async_failures(&self) -> u64 {
+        self.async_failures
+    }
+    pub const fn poisoned_shards(&self) -> u16 {
+        self.poisoned_shards
+    }
+    pub const fn leased_shards(&self) -> u16 {
+        self.leased_shards
+    }
+    pub const fn async_paused(&self) -> bool {
+        self.async_paused
+    }
+    pub const fn rebuild_required(&self) -> bool {
+        self.rebuild_required
+    }
+    pub const fn summary_ready_shards(&self) -> u16 {
+        self.summary_ready_shards
+    }
+    pub const fn summary_degraded_shards(&self) -> u16 {
+        self.summary_degraded_shards
+    }
+    pub const fn summary_saturated_shards(&self) -> u16 {
+        self.summary_saturated_shards
+    }
+}
+
+/// Aggregate operational status for global indexes and their shard outboxes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalIndexOperationalReport {
+    state: GlobalIndexHealthState,
+    indexes: Box<[GlobalIndexOperationalStatus]>,
+    retained_outbox_events: u64,
+    retained_outbox_bytes: u64,
+    backpressured_outbox_shards: u16,
+}
+
+impl GlobalIndexOperationalReport {
+    pub(crate) fn new(
+        indexes: Vec<GlobalIndexOperationalStatus>,
+        retained_outbox_events: u64,
+        retained_outbox_bytes: u64,
+        backpressured_outbox_shards: u16,
+    ) -> Self {
+        let state = if indexes
+            .iter()
+            .any(|index| index.state() == GlobalIndexHealthState::Unavailable)
+        {
+            GlobalIndexHealthState::Unavailable
+        } else if backpressured_outbox_shards != 0
+            || indexes
+                .iter()
+                .any(|index| index.state() == GlobalIndexHealthState::Degraded)
+        {
+            GlobalIndexHealthState::Degraded
+        } else {
+            GlobalIndexHealthState::Healthy
+        };
+        Self {
+            state,
+            indexes: indexes.into_boxed_slice(),
+            retained_outbox_events,
+            retained_outbox_bytes,
+            backpressured_outbox_shards,
+        }
+    }
+
+    pub const fn state(&self) -> GlobalIndexHealthState {
+        self.state
+    }
+    pub fn indexes(&self) -> &[GlobalIndexOperationalStatus] {
+        &self.indexes
+    }
+    pub fn healthy_indexes(&self) -> usize {
+        self.indexes
+            .iter()
+            .filter(|index| index.state() == GlobalIndexHealthState::Healthy)
+            .count()
+    }
+    pub fn degraded_indexes(&self) -> usize {
+        self.indexes
+            .iter()
+            .filter(|index| index.state() == GlobalIndexHealthState::Degraded)
+            .count()
+    }
+    pub fn unavailable_indexes(&self) -> usize {
+        self.indexes
+            .iter()
+            .filter(|index| index.state() == GlobalIndexHealthState::Unavailable)
+            .count()
+    }
+    pub fn async_lag(&self) -> u64 {
+        self.indexes
+            .iter()
+            .map(GlobalIndexOperationalStatus::async_lag)
+            .sum()
+    }
+    pub const fn retained_outbox_events(&self) -> u64 {
+        self.retained_outbox_events
+    }
+    pub const fn retained_outbox_bytes(&self) -> u64 {
+        self.retained_outbox_bytes
+    }
+    pub const fn backpressured_outbox_shards(&self) -> u16 {
+        self.backpressured_outbox_shards
+    }
+}
+
 /// Durable state of one shard-local Bloom/min-max summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]

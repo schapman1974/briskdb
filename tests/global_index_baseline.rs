@@ -18,8 +18,9 @@ use std::{
 };
 
 use briskdb::core::{
-    Database, Engine, EngineErrorKind, Session, ShardKeyMetadata, ShardKeyType, Statement,
-    TableDeclaration, Value,
+    Database, Engine, EngineErrorKind, GlobalIndexDeclaration, GlobalIndexKeyPart,
+    GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexStorageTopology, Session,
+    ShardKeyMetadata, ShardKeyType, Statement, TableDeclaration, UniqueNullSemantics, Value,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -100,13 +101,14 @@ impl Workload {
         )
     }
 
-    const fn expected_shards(self, shard_count: u16) -> usize {
-        if matches!(self, Self::PointRead) {
-            1
-        } else if self.is_read() {
-            shard_count as usize
-        } else {
-            1
+    const fn expected_shards(self, shard_count: u16, index_mode: IndexMode) -> usize {
+        match (self, index_mode) {
+            (Self::PointRead, _) => 1,
+            (Self::IndexedHit, IndexMode::After) => 1,
+            // Empty routing still compiles one shard to preserve exact result metadata.
+            (Self::IndexedMiss, IndexMode::After) => 1,
+            (workload, _) if workload.is_read() => shard_count as usize,
+            _ => 1,
         }
     }
 }
@@ -126,6 +128,33 @@ impl FromStr for Workload {
 enum RunMode {
     SingleProcess,
     MultiProcess,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexMode {
+    Before,
+    After,
+}
+
+impl IndexMode {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::After => "after",
+        }
+    }
+}
+
+impl FromStr for IndexMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "before" => Ok(Self::Before),
+            "after" => Ok(Self::After),
+            _ => Err(format!("unknown global-index benchmark phase {value:?}")),
+        }
+    }
 }
 
 impl RunMode {
@@ -187,6 +216,7 @@ struct WorkerSpec {
     warmups: usize,
     worker: usize,
     workers: usize,
+    index_mode: IndexMode,
 }
 
 impl WorkerSpec {
@@ -201,7 +231,7 @@ struct BenchmarkFixture {
 }
 
 impl BenchmarkFixture {
-    fn new(shard_count: u16, controls: MatrixControls) -> Self {
+    fn new(shard_count: u16, controls: MatrixControls, index_mode: IndexMode) -> Self {
         let root = tempfile::tempdir().expect("create global-index benchmark directory");
         let mut database =
             Database::open(root.path(), shard_count).expect("open global-index benchmark database");
@@ -225,15 +255,64 @@ impl BenchmarkFixture {
         let tenant_keys = (0..shard_count)
             .map(|shard| integer_key_for_shard(&database, shard))
             .collect::<Vec<_>>();
-        drop(database);
-
         seed_fixture(root.path(), &tenant_keys, controls);
+        if index_mode == IndexMode::After {
+            install_global_indexes(&mut database);
+        }
+        drop(database);
         Self { root, tenant_keys }
     }
 
     fn path(&self) -> &Path {
         self.root.path()
     }
+}
+
+fn install_global_indexes(database: &mut Database) {
+    let table = database
+        .catalog()
+        .table("default", TABLE)
+        .expect("inspect benchmark table")
+        .expect("benchmark table is registered")
+        .id();
+    let lookup = database
+        .create_global_index(
+            GlobalIndexDeclaration::new(
+                table,
+                "global_index_baseline_lookup_global",
+                vec![GlobalIndexKeyPart::new(
+                    GlobalIndexKeySource::column("lookup_value")
+                        .expect("declare lookup benchmark column"),
+                    GlobalIndexKeyType::Text,
+                )],
+            )
+            .expect("declare lookup benchmark global index")
+            .with_topology(GlobalIndexStorageTopology::selected_v1()),
+        )
+        .expect("create lookup benchmark global index");
+    database
+        .build_global_index(lookup)
+        .expect("build lookup benchmark global index");
+
+    let unique = database
+        .create_global_index(
+            GlobalIndexDeclaration::new(
+                table,
+                "global_index_baseline_unique_global",
+                vec![GlobalIndexKeyPart::new(
+                    GlobalIndexKeySource::column("unique_value")
+                        .expect("declare unique benchmark column"),
+                    GlobalIndexKeyType::Text,
+                )],
+            )
+            .expect("declare unique benchmark global index")
+            .unique(UniqueNullSemantics::Distinct)
+            .with_topology(GlobalIndexStorageTopology::selected_v1()),
+        )
+        .expect("create unique benchmark global index");
+    database
+        .build_global_index(unique)
+        .expect("build unique benchmark global index");
 }
 
 fn integer_key_for_shard(database: &Database, expected: u16) -> i64 {
@@ -560,7 +639,10 @@ async fn perform_operation(
             )
             .await
             .map(|result| {
-                assert_eq!(result.shards.len(), spec.shard_count as usize);
+                assert_eq!(
+                    result.shards.len(),
+                    Workload::IndexedHit.expected_shards(spec.shard_count, spec.index_mode)
+                );
                 assert_eq!(result.value.len(), 1);
                 (1, result.shards.len() as u64)
             }),
@@ -576,7 +658,10 @@ async fn perform_operation(
             )
             .await
             .map(|result| {
-                assert_eq!(result.shards.len(), spec.shard_count as usize);
+                assert_eq!(
+                    result.shards.len(),
+                    Workload::IndexedMiss.expected_shards(spec.shard_count, spec.index_mode)
+                );
                 assert!(result.value.is_empty());
                 (0, result.shards.len() as u64)
             }),
@@ -706,6 +791,7 @@ fn wait_for_parent_start_if_requested() {
 
 #[derive(Clone, Debug)]
 struct MatrixRecord {
+    index_mode: IndexMode,
     mode: RunMode,
     shard_count: u16,
     workload: Workload,
@@ -757,7 +843,8 @@ impl MatrixRecord {
             self.peak_rss_bytes,
             self.physical_write_bytes,
             self.peak_wal_growth_bytes,
-            self.workload.expected_shards(self.shard_count),
+            self.workload
+                .expected_shards(self.shard_count, self.index_mode),
         )
     }
 }
@@ -766,8 +853,9 @@ fn run_single_process_case(
     shard_count: u16,
     workload: Workload,
     controls: MatrixControls,
+    index_mode: IndexMode,
 ) -> MatrixRecord {
-    let fixture = BenchmarkFixture::new(shard_count, controls);
+    let fixture = BenchmarkFixture::new(shard_count, controls, index_mode);
     let initial_wal = total_wal_bytes(fixture.path(), shard_count);
     let telemetry = WalTelemetry::start(fixture.path().to_path_buf(), shard_count, initial_wal);
     let measurement = run_worker(
@@ -781,6 +869,7 @@ fn run_single_process_case(
             warmups: controls.warmup_operations,
             worker: 0,
             workers: 1,
+            index_mode,
         },
     );
     let peak_wal_growth_bytes = telemetry.stop();
@@ -790,9 +879,11 @@ fn run_single_process_case(
         workload,
         controls,
         1,
+        index_mode,
         &measurement.totals,
     );
     MatrixRecord {
+        index_mode,
         mode: RunMode::SingleProcess,
         shard_count,
         workload,
@@ -811,8 +902,9 @@ fn run_multi_process_case(
     shard_count: u16,
     workload: Workload,
     controls: MatrixControls,
+    index_mode: IndexMode,
 ) -> MatrixRecord {
-    let fixture = BenchmarkFixture::new(shard_count, controls);
+    let fixture = BenchmarkFixture::new(shard_count, controls, index_mode);
     let coordination =
         tempfile::tempdir().expect("create benchmark process coordination directory");
     let start_path = coordination.path().join("start");
@@ -849,6 +941,7 @@ fn run_multi_process_case(
                 controls.process_workers.to_string(),
             )
             .env("BRISKDB_BENCH_WORKLOAD", workload.name())
+            .env("BRISKDB_BENCH_INDEX_MODE", index_mode.name())
             .env("BRISKDB_BENCH_TENANT_KEYS", &tenant_keys)
             .env("BRISKDB_BENCH_READY_PATH", &ready_path)
             .env("BRISKDB_BENCH_START_PATH", &start_path)
@@ -909,9 +1002,11 @@ fn run_multi_process_case(
         workload,
         controls,
         controls.process_workers,
+        index_mode,
         &totals,
     );
     MatrixRecord {
+        index_mode,
         mode: RunMode::MultiProcess,
         shard_count,
         workload,
@@ -957,7 +1052,10 @@ fn total_wal_bytes(root: &Path, shard_count: u16) -> u64 {
     let manifest = fs::metadata(root.join("manifest.sqlite-wal"))
         .map(|metadata| metadata.len())
         .unwrap_or_default();
-    (0..shard_count).fold(manifest, |total, shard| {
+    let global_index = fs::metadata(root.join("global-indexes/global.sqlite-wal"))
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
+    (0..shard_count).fold(manifest.saturating_add(global_index), |total, shard| {
         total.saturating_add(
             fs::metadata(format!("{}-wal", shard_path(root, shard).display()))
                 .map(|metadata| metadata.len())
@@ -972,6 +1070,7 @@ fn validate_case(
     workload: Workload,
     controls: MatrixControls,
     workers: usize,
+    index_mode: IndexMode,
     totals: &OperationTotals,
 ) {
     let attempts = (workers * controls.operations_per_worker) as u64;
@@ -979,7 +1078,7 @@ fn validate_case(
     assert_eq!(totals.latency_micros.len() as u64, attempts);
     assert_eq!(
         totals.visited_shards,
-        attempts * workload.expected_shards(tenant_keys.len() as u16) as u64
+        attempts * workload.expected_shards(tenant_keys.len() as u16, index_mode) as u64
     );
     if matches!(workload, Workload::ContendedUniqueInsert) {
         assert_eq!(totals.successes, controls.operations_per_worker as u64);
@@ -1045,6 +1144,14 @@ fn validate_sqlite_files(root: &Path, shard_count: u16) {
             .expect("run benchmark shard quick_check");
         assert_eq!(quick_check, "ok");
     }
+    let global_index = root.join("global-indexes/global.sqlite");
+    if global_index.exists() {
+        let connection = Connection::open(global_index).expect("open benchmark global index");
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .expect("run benchmark global-index quick_check");
+        assert_eq!(quick_check, "ok");
+    }
 }
 
 fn worker_measurement_tsv(measurement: &WorkerMeasurement) -> String {
@@ -1106,17 +1213,21 @@ where
         .unwrap_or_else(|error| panic!("invalid {name} {value:?}: {error}"))
 }
 
-fn run_matrix(shards: &[u16], controls: MatrixControls) -> Vec<MatrixRecord> {
+fn run_matrix(
+    shards: &[u16],
+    controls: MatrixControls,
+    index_mode: IndexMode,
+) -> Vec<MatrixRecord> {
     let mut records = Vec::new();
     for shard_count in shards.iter().copied() {
         for mode in RunMode::ALL {
             for workload in Workload::ALL {
                 let record = match mode {
                     RunMode::SingleProcess => {
-                        run_single_process_case(shard_count, workload, controls)
+                        run_single_process_case(shard_count, workload, controls, index_mode)
                     }
                     RunMode::MultiProcess => {
-                        run_multi_process_case(shard_count, workload, controls)
+                        run_multi_process_case(shard_count, workload, controls, index_mode)
                     }
                 };
                 println!("{}", record.to_tsv());
@@ -1129,24 +1240,42 @@ fn run_matrix(shards: &[u16], controls: MatrixControls) -> Vec<MatrixRecord> {
 
 const RESULT_HEADER: &str = "record\tmode\tshards\tworkload\tworkers\toperations_per_worker\tattempts\tsuccesses\tconstraints\treturned_rows\tvisited_shards\telapsed_us\tthroughput_ops_s\tp50_us\tp95_us\tp99_us\tcpu_us\tpeak_rss_bytes\tphysical_write_bytes\tpeak_wal_growth_bytes\texpected_shards_per_operation\tsqlite_synchronous";
 
-fn print_report_header(controls: MatrixControls) {
-    println!("metadata\tformat\t{FORMAT_VERSION}");
-    println!("metadata\tos\t{}", env::consts::OS);
-    println!("metadata\tarch\t{}", env::consts::ARCH);
-    println!("control\trows_per_shard\t{}", controls.rows_per_shard);
-    println!(
-        "control\toperations_per_worker\t{}",
-        controls.operations_per_worker
-    );
-    println!("control\twarmup_operations\t{}", controls.warmup_operations);
-    println!("control\tprocess_workers\t{}", controls.process_workers);
-    println!("control\tcache_policy\twarm");
-    println!("control\tsqlite_journal_mode\tWAL");
-    println!("control\tsqlite_synchronous\tFULL");
-    println!(
-        "control\tfsync_observation\tSQLite FULL durability policy; syscall counts are not portable and are not inferred"
-    );
-    println!("{RESULT_HEADER}");
+fn report_header(controls: MatrixControls, index_mode: IndexMode) -> String {
+    format!(
+        "metadata\tformat\t{FORMAT_VERSION}\n\
+         metadata\tos\t{}\n\
+         metadata\tarch\t{}\n\
+         control\trows_per_shard\t{}\n\
+         control\toperations_per_worker\t{}\n\
+         control\twarmup_operations\t{}\n\
+         control\tprocess_workers\t{}\n\
+         control\tglobal_indexes\t{}\n\
+         control\tcache_policy\twarm\n\
+         control\tsqlite_journal_mode\tWAL\n\
+         control\tsqlite_synchronous\tFULL\n\
+         control\tfsync_observation\tSQLite FULL durability policy; syscall counts are not portable and are not inferred\n\
+         {RESULT_HEADER}\n",
+        env::consts::OS,
+        env::consts::ARCH,
+        controls.rows_per_shard,
+        controls.operations_per_worker,
+        controls.warmup_operations,
+        controls.process_workers,
+        index_mode.name(),
+    )
+}
+
+fn complete_report(
+    controls: MatrixControls,
+    index_mode: IndexMode,
+    records: &[MatrixRecord],
+) -> String {
+    let mut report = report_header(controls, index_mode);
+    for record in records {
+        report.push_str(&record.to_tsv());
+        report.push('\n');
+    }
+    report
 }
 
 #[derive(Clone, Debug)]
@@ -1161,6 +1290,10 @@ struct ParsedBaseline {
     physical_write_bytes: u64,
     peak_wal_growth_bytes: u64,
     attempts: u64,
+    successes: u64,
+    constraints: u64,
+    returned_rows: u64,
+    visited_shards: u64,
 }
 
 impl ParsedBaseline {
@@ -1178,6 +1311,18 @@ impl ParsedBaseline {
             attempts: fields[6]
                 .parse()
                 .map_err(|error| format!("invalid attempt count: {error}"))?,
+            successes: fields[7]
+                .parse()
+                .map_err(|error| format!("invalid success count: {error}"))?,
+            constraints: fields[8]
+                .parse()
+                .map_err(|error| format!("invalid constraint count: {error}"))?,
+            returned_rows: fields[9]
+                .parse()
+                .map_err(|error| format!("invalid returned row count: {error}"))?,
+            visited_shards: fields[10]
+                .parse()
+                .map_err(|error| format!("invalid visited shard count: {error}"))?,
             throughput: fields[12]
                 .parse()
                 .map_err(|error| format!("invalid throughput: {error}"))?,
@@ -1241,6 +1386,37 @@ impl RegressionBudget {
         maximum_wal_bytes_per_attempt_ratio: 2.0,
         maximum_rss_growth_bytes: 64 * 1024 * 1024,
     };
+
+    const INDEXED_READ_ALPHA: Self = Self {
+        minimum_throughput_ratio: 0.01,
+        maximum_p99_ratio: 150.0,
+        maximum_p99_jitter_micros: 100_000,
+        maximum_cpu_per_attempt_ratio: 64.0,
+        maximum_write_bytes_per_attempt_ratio: 4.0,
+        maximum_wal_bytes_per_attempt_ratio: 4.0,
+        maximum_rss_growth_bytes: 128 * 1024 * 1024,
+    };
+
+    const INDEXED_WRITE_ALPHA: Self = Self {
+        minimum_throughput_ratio: 0.005,
+        maximum_p99_ratio: 160.0,
+        maximum_p99_jitter_micros: 250_000,
+        maximum_cpu_per_attempt_ratio: 160.0,
+        maximum_write_bytes_per_attempt_ratio: 16.0,
+        maximum_wal_bytes_per_attempt_ratio: 16.0,
+        maximum_rss_growth_bytes: 128 * 1024 * 1024,
+    };
+
+    const fn release_for(workload: Workload) -> Self {
+        match workload {
+            Workload::IndexedHit | Workload::IndexedMiss => Self::INDEXED_READ_ALPHA,
+            Workload::Insert
+            | Workload::Update
+            | Workload::Delete
+            | Workload::ContendedUniqueInsert => Self::INDEXED_WRITE_ALPHA,
+            Workload::PointRead | Workload::ScatterRead => Self::STABLE_HOST,
+        }
+    }
 
     fn compare(self, baseline: &ParsedBaseline, candidate: &ParsedBaseline) -> Vec<String> {
         let mut failures = Vec::new();
@@ -1313,6 +1489,75 @@ fn compare_reports(baseline: &str, candidate: &str) -> Result<(), String> {
     }
 }
 
+fn compare_release_reports(baseline: &str, candidate: &str) -> Result<Vec<String>, String> {
+    let baseline = parse_report(baseline)?;
+    let candidate = parse_report(candidate)?;
+    if baseline.keys().collect::<Vec<_>>() != candidate.keys().collect::<Vec<_>>() {
+        return Err("baseline and candidate matrices do not contain identical cases".to_owned());
+    }
+    let mut failures = Vec::new();
+    let mut decisions = Vec::new();
+    for (key, before) in &baseline {
+        let after = &candidate[key];
+        if after.attempts != before.attempts
+            || after.successes != before.successes
+            || after.constraints != before.constraints
+            || after.returned_rows != before.returned_rows
+        {
+            failures.push(format!(
+                "{} shards {} {} changed correctness counters",
+                key.1,
+                key.0.name(),
+                key.2.name()
+            ));
+        }
+        let expected_visits = after.attempts.saturating_mul(
+            key.2
+                .expected_shards(key.1, IndexMode::After)
+                .try_into()
+                .expect("expected shard count fits u64"),
+        );
+        if after.visited_shards != expected_visits {
+            failures.push(format!(
+                "{} shards {} {} visited {} shards, expected {expected_visits}",
+                key.1,
+                key.0.name(),
+                key.2.name(),
+                after.visited_shards
+            ));
+        }
+        for metric in RegressionBudget::release_for(key.2).compare(before, after) {
+            failures.push(format!(
+                "{} shards {} {} exceeded its explicit alpha budget: {metric}",
+                key.1,
+                key.0.name(),
+                key.2.name()
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(failures.join("; "));
+    }
+    decisions.push(
+        "correctness: identical attempts/results/constraints and exact expected shard visits"
+            .to_owned(),
+    );
+    decisions.push("unindexed reads: stable-host 50% throughput / 3x p99 budget".to_owned());
+    decisions.push(
+        "indexed reads: mandatory 1-shard hit/miss passed; measured latency is accepted only for the experimental opt-in alpha and is not a speed claim"
+            .to_owned(),
+    );
+    decisions.push(
+        "indexed writes: measured overhead is accepted only for the experimental opt-in alpha; 200x throughput, 160x p99/CPU, and 16x write/WAL are regression guardrails, not targets"
+            .to_owned(),
+    );
+    decisions.push(
+        "production decision: optimize freshness/summary inspection and indexed write coordination before recommending global indexes for latency-sensitive production workloads"
+            .to_owned(),
+    );
+    Ok(decisions)
+}
+
 #[test]
 fn report_parser_and_regression_budgets_are_deterministic() {
     let line = "result\tsingle_process\t2\tpoint_read\t1\t32\t32\t32\t0\t32\t32\t1000\t32000.00\t20\t30\t40\t500\t1000\t2000\t3000\t1\tFULL";
@@ -1340,6 +1585,45 @@ fn report_parser_and_regression_budgets_are_deterministic() {
 }
 
 #[test]
+fn release_comparison_requires_index_pruning_and_explicit_alpha_budgets() {
+    let hit_before = "result\tsingle_process\t2\tindexed_hit\t1\t32\t32\t32\t0\t32\t64\t1000\t32000.00\t20\t30\t40\t500\t1000\t2000\t3000\t2\tFULL";
+    let hit_after = "result\tsingle_process\t2\tindexed_hit\t1\t32\t32\t32\t0\t32\t32\t1000\t32000.00\t20\t30\t40\t500\t1000\t2000\t3000\t1\tFULL";
+    let decisions = compare_release_reports(hit_before, hit_after).unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.contains("1-shard hit"))
+    );
+
+    let unpruned = hit_after.replacen("\t32\t1000\t", "\t64\t1000\t", 1);
+    assert!(
+        compare_release_reports(hit_before, &unpruned)
+            .unwrap_err()
+            .contains("visited 64 shards")
+    );
+
+    let miss_before = "result\tsingle_process\t2\tindexed_miss\t1\t32\t32\t32\t0\t0\t64\t1000\t32000.00\t20\t30\t40\t500\t1000\t0\t0\t2\tFULL";
+    let miss_after = "result\tsingle_process\t2\tindexed_miss\t1\t32\t32\t32\t0\t0\t32\t1000\t32000.00\t20\t30\t40\t500\t1000\t0\t0\t1\tFULL";
+    assert!(compare_release_reports(miss_before, miss_after).is_ok());
+}
+
+#[test]
+#[ignore = "compare two existing same-host release reports"]
+fn compare_global_index_release_artifacts() {
+    let baseline_path = required_env("BRISKDB_BENCH_COMPARE");
+    let candidate_path = required_env("BRISKDB_BENCH_CANDIDATE");
+    let baseline = fs::read_to_string(&baseline_path)
+        .unwrap_or_else(|error| panic!("read comparison baseline {baseline_path}: {error}"));
+    let candidate = fs::read_to_string(&candidate_path)
+        .unwrap_or_else(|error| panic!("read comparison candidate {candidate_path}: {error}"));
+    for decision in compare_release_reports(&baseline, &candidate)
+        .unwrap_or_else(|error| panic!("global-index release regression: {error}"))
+    {
+        println!("decision\t{decision}");
+    }
+}
+
+#[test]
 fn frozen_baseline_contains_every_ordered_matrix_case() {
     let report = include_str!("../docs/benchmarks/global-index-before-2026-08-14.tsv");
     let records = parse_report(report).unwrap();
@@ -1363,8 +1647,17 @@ fn frozen_baseline_contains_every_ordered_matrix_case() {
 #[ignore = "dedicated stable Linux correctness smoke for issue #226"]
 fn global_index_baseline_smoke() {
     let controls = MatrixControls::smoke();
-    print_report_header(controls);
-    let records = run_matrix(&[2], controls);
+    print!("{}", report_header(controls, IndexMode::Before));
+    let records = run_matrix(&[2], controls, IndexMode::Before);
+    assert_eq!(records.len(), RunMode::ALL.len() * Workload::ALL.len());
+}
+
+#[test]
+#[ignore = "dedicated stable Linux global-index release-gate smoke for issue #239"]
+fn global_index_release_gate_smoke() {
+    let controls = MatrixControls::smoke();
+    print!("{}", report_header(controls, IndexMode::After));
+    let records = run_matrix(&[2], controls, IndexMode::After);
     assert_eq!(records.len(), RunMode::ALL.len() * Workload::ALL.len());
 }
 
@@ -1375,22 +1668,51 @@ fn release_global_index_baseline() {
         panic!("run the full matrix with --release");
     }
     let controls = MatrixControls::full();
-    print_report_header(controls);
-    let records = run_matrix(&SHARD_MATRIX, controls);
+    print!("{}", report_header(controls, IndexMode::Before));
+    let records = run_matrix(&SHARD_MATRIX, controls, IndexMode::Before);
     assert_eq!(
         records.len(),
         SHARD_MATRIX.len() * RunMode::ALL.len() * Workload::ALL.len()
     );
+    let report = complete_report(controls, IndexMode::Before, &records);
+    if let Ok(path) = env::var("BRISKDB_BENCH_OUTPUT") {
+        fs::write(&path, &report)
+            .unwrap_or_else(|error| panic!("write benchmark report {path}: {error}"));
+    }
     if let Ok(path) = env::var("BRISKDB_BENCH_COMPARE") {
         let baseline = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read comparison baseline {path}: {error}"));
-        let candidate = records
-            .iter()
-            .map(MatrixRecord::to_tsv)
-            .collect::<Vec<_>>()
-            .join("\n");
-        compare_reports(&baseline, &candidate)
+        compare_reports(&baseline, &report)
             .unwrap_or_else(|error| panic!("global-index benchmark regression: {error}"));
+    }
+}
+
+#[test]
+#[ignore = "manual release-mode global-index production gate for issue #239"]
+fn release_global_index_after() {
+    if cfg!(debug_assertions) {
+        panic!("run the full matrix with --release");
+    }
+    let controls = MatrixControls::full();
+    print!("{}", report_header(controls, IndexMode::After));
+    let records = run_matrix(&SHARD_MATRIX, controls, IndexMode::After);
+    assert_eq!(
+        records.len(),
+        SHARD_MATRIX.len() * RunMode::ALL.len() * Workload::ALL.len()
+    );
+    let report = complete_report(controls, IndexMode::After, &records);
+    if let Ok(path) = env::var("BRISKDB_BENCH_OUTPUT") {
+        fs::write(&path, &report)
+            .unwrap_or_else(|error| panic!("write benchmark report {path}: {error}"));
+    }
+    let baseline_path = env::var("BRISKDB_BENCH_COMPARE")
+        .unwrap_or_else(|_| "docs/benchmarks/global-index-before-2026-08-14.tsv".to_owned());
+    let baseline = fs::read_to_string(&baseline_path)
+        .unwrap_or_else(|error| panic!("read comparison baseline {baseline_path}: {error}"));
+    for decision in compare_release_reports(&baseline, &report)
+        .unwrap_or_else(|error| panic!("global-index release regression: {error}"))
+    {
+        println!("decision\t{decision}");
     }
 }
 
@@ -1415,6 +1737,9 @@ fn global_index_baseline_worker() {
         warmups: parse_field(&required_env("BRISKDB_BENCH_WARMUPS"), "warmups"),
         worker: parse_field(&required_env("BRISKDB_BENCH_WORKER"), "worker"),
         workers: parse_field(&required_env("BRISKDB_BENCH_WORKERS"), "workers"),
+        index_mode: required_env("BRISKDB_BENCH_INDEX_MODE")
+            .parse()
+            .expect("parse child index mode"),
     };
     assert_eq!(tenant_keys.len(), spec.shard_count as usize);
     assert!(spec.worker < spec.workers);
