@@ -620,7 +620,9 @@ impl Engine {
     /// optional explicit fallback, applies single-shard write policy, and
     /// returns the assigned physical shard when one is valid. Finite inferred
     /// routes and an explicit route must select the same physical shard.
-    /// Planning remains synchronous and does not prepare or execute SQL.
+    /// Planning remains synchronous and does not prepare or execute application
+    /// SQL. Eligible global-index reads may perform a bounded authority lookup;
+    /// an unavailable authority falls back to ordinary correct routing.
     pub fn plan_bound_statement(
         &self,
         database: LogicalDatabaseId,
@@ -649,7 +651,7 @@ impl Engine {
     ) -> EngineResult<BoundStatementPlan> {
         let (hash_version, key_encoding_version, bucket_algorithm_version, map_generation) =
             self.inner.database.routing_provenance();
-        super::planner::plan_bound_statement(
+        let mut plan = super::planner::plan_bound_statement(
             super::planner::BoundStatementPlanInput::new(
                 self.catalog(),
                 database,
@@ -666,7 +668,21 @@ impl Engine {
                 map_generation,
             ),
             |key| self.inner.database.shard_for_key(key),
-        )
+        )?;
+        super::planner::apply_global_index_routing(
+            &mut plan,
+            self.catalog(),
+            normalized,
+            parameters,
+            self.shard_count(),
+            |index_id, keys| {
+                self.inner
+                    .database
+                    .storage
+                    .global_index_read_candidates(index_id, keys)
+            },
+        )?;
+        Ok(plan)
     }
 
     fn logical_raw_query_plan(
@@ -3857,6 +3873,19 @@ fn prepared_execution_shard(
 
     match plan.behavior() {
         sql::StatementBehavior::Read => {
+            match plan.global_index_routing().kind() {
+                super::GlobalIndexRoutingKind::Empty => return Ok(0),
+                super::GlobalIndexRoutingKind::Routed
+                    if plan.global_index_routing().target_shards().len() == 1 =>
+                {
+                    return Ok(plan.global_index_routing().target_shards()[0]);
+                }
+                super::GlobalIndexRoutingKind::Routed => {
+                    return Err(unassigned_prepared_statement());
+                }
+                super::GlobalIndexRoutingKind::NotApplicable
+                | super::GlobalIndexRoutingKind::Fallback => {}
+            }
             if let Some(shard) = plan.assigned_shard() {
                 return Ok(shard);
             }
@@ -3941,6 +3970,14 @@ fn prepared_execution_shards(
                     ));
                 }
             };
+            match plan.global_index_routing().kind() {
+                super::GlobalIndexRoutingKind::Routed => {
+                    shards = plan.global_index_routing().target_shards().to_vec();
+                }
+                super::GlobalIndexRoutingKind::Empty => shards = vec![0],
+                super::GlobalIndexRoutingKind::NotApplicable
+                | super::GlobalIndexRoutingKind::Fallback => {}
+            }
             shards.sort_unstable();
             shards.dedup();
             if shards.is_empty() || shards.iter().any(|&shard| shard >= shard_count) {

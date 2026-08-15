@@ -12,6 +12,7 @@
 mod classifier;
 mod dml;
 mod generated;
+mod global_index;
 mod inference;
 mod normalizer;
 mod parser;
@@ -27,6 +28,7 @@ pub use classifier::{
     WriteBehavior, classify_statements,
 };
 pub use generated::{GeneratedIdPolicyIntent, GeneratedTableIntent};
+pub(crate) use global_index::{GlobalIndexInferenceFallback, infer_global_index_lookup};
 pub use inference::{ShardKeyInference, ShardKeyInferenceKind, ShardKeyValue, infer_shard_keys};
 pub use normalizer::{
     MAX_SQL_PARAMETERS, NormalizedSql, StatementParameters, normalize_placeholders,

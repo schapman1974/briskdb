@@ -70,6 +70,19 @@ results. The local SQLite secondary index makes individual child lookups cheap,
 but `indexed_hit` and `indexed_miss` still visit 2/4/10/64 shards respectively;
 future gains therefore cannot be mistaken for cache-only improvements.
 
+The Criterion `global_index_routing/*` group records the new authority-planning
+cost for a rotating hit, a miss, a repeated hot key, and a four-key `IN`
+lookup:
+
+```bash
+cargo bench --locked --bench storage -- global_index_routing
+```
+
+Each timed iteration includes bound predicate inference, canonical encoding,
+one consistent authority snapshot, active-mutation coverage, shard
+deduplication, and shard-key intersection. Database creation, index build, and
+seed writes remain outside measurement.
+
 ## Workload contract
 
 Every benchmark creates a fresh temporary BriskDB database with exactly four

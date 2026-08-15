@@ -39,8 +39,35 @@ snapshot before acknowledging the write. This favors correctness over write
 throughput in the alpha; the outbox and asynchronous-index stages tracked by
 [#236](https://github.com/schapman1974/briskdb/issues/236) and
 [#237](https://github.com/schapman1974/briskdb/issues/237) are the planned
-throughput path. Global-index query routing begins in
-[#234](https://github.com/schapman1974/briskdb/issues/234).
+throughput path.
+
+## Exact indexed reads
+
+Ready unique indexes now route eligible equality and `IN` reads to the exact
+owner shard set. Compound indexes require a finite value set for every key
+part; those sets are expanded under a 1,024-key planning bound. Existing
+shard-key routes are intersected with index owners, and the original SQL still
+runs on each selected SQLite shard, so the index never substitutes for SQLite's
+row filtering.
+
+```mermaid
+flowchart LR
+    SQL[Bound SELECT] --> INFER[Infer exact global-index keys]
+    INFER --> AUTH[Read finalized entries + active mutations]
+    AUTH --> OWNERS[Deduplicate owner shards]
+    OWNERS --> INTERSECT[Intersect shard-key targets]
+    INTERSECT --> SQLITE[Run original SQL only on possible shards]
+    INFER -. unsupported .-> SCATTER[Safe ordinary routing / scatter]
+    AUTH -. unavailable .-> SCATTER
+```
+
+Only synchronously maintained, ready unique indexes are eligible today.
+Partial indexes, expression keys, non-unique indexes, unsupported predicate
+shapes/types, oversized key sets, invalid lifecycle state, and unavailable
+index storage fall back without omitting a shard. Active old and new mutation
+owners are included so the physical-commit/finalization window is conservative.
+`BoundStatementPlan::global_index_routing()` exposes the selected index,
+redaction-safe counts, exact target shards, and a stable fallback reason.
 
 ## Unique-key state machine
 

@@ -970,6 +970,17 @@ therefore reject generated-key writes before allocation. HTTP still creates a
 fresh Session per request; PostgreSQL sessions support retained single-shard
 transactions through the ordinary prepared execution path.
 
+Ready unique global indexes also participate in protocol-neutral read
+planning. The structural analyzer recognizes exact equality and non-negated
+`IN` constraints on column key parts, constructs bounded canonical compound
+keys, and asks storage for both finalized entries and the old/new owners of
+active mutations in one SQLite snapshot. It deduplicates those owners and
+intersects them with any shard-key inference before the unchanged query runs on
+the remaining children. The public bound plan carries redaction-safe explain
+metadata. Any partial/expression definition, non-exact predicate, invalid
+lifecycle, excessive expansion, or authority-open/read failure retains the
+ordinary correct shard route or scatter path.
+
 Each PostgreSQL connection also owns a random, in-memory backend PID/secret pair.
 The adapter registers a fresh core cancellation token only for the command that
 is currently running. A separate exact-key `CancelRequest` cancels that token;

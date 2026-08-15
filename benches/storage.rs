@@ -1,12 +1,12 @@
 mod support;
 
-use std::{cell::Cell, hint::black_box, time::Duration};
+use std::{cell::Cell, hint::black_box, sync::Arc, time::Duration};
 
 use briskdb::core::{
-    CanonicalIndexKey, Database, GlobalIndexDeclaration, GlobalIndexKeyPart, GlobalIndexKeySource,
-    GlobalIndexKeyType, GlobalIndexOwner, GlobalIndexStorageTopology, GlobalOperationId,
-    GlobalUniqueMutation, ShardKeyMetadata, ShardKeyType, TableDeclaration, UniqueNullSemantics,
-    Value,
+    CanonicalIndexKey, Database, Engine, GlobalIndexDeclaration, GlobalIndexKeyPart,
+    GlobalIndexKeySource, GlobalIndexKeyType, GlobalIndexOwner, GlobalIndexStorageTopology,
+    GlobalOperationId, GlobalUniqueMutation, LogicalDatabaseId, ShardKeyMetadata, ShardKeyType,
+    TableDeclaration, UniqueNullSemantics, Value,
 };
 
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
@@ -308,10 +308,169 @@ fn global_authority_benchmarks(criterion: &mut Criterion) {
     group.finish();
 }
 
+struct GlobalRoutingBenchmark {
+    _root: tempfile::TempDir,
+    engine: Engine,
+    database: LogicalDatabaseId,
+    equality: briskdb::sql::NormalizedSql,
+    multiple: briskdb::sql::NormalizedSql,
+    emails: Vec<Value>,
+}
+
+impl GlobalRoutingBenchmark {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("create global-routing benchmark root");
+        let mut database = Database::open(root.path(), 4).expect("open benchmark database");
+        database
+            .broadcast(
+                "CREATE TABLE routing_benchmark (
+                     tenant_id TEXT NOT NULL,
+                     email TEXT NOT NULL,
+                     payload INTEGER NOT NULL,
+                     PRIMARY KEY (tenant_id, email)
+                 ) STRICT",
+            )
+            .expect("create routing benchmark table");
+        let logical = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical,
+                    "routing_benchmark",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .expect("register routing benchmark table");
+        let mut routes = vec![None; 4];
+        for value in 0_u64..100_000 {
+            let route = format!("routing-tenant-{value}");
+            let shard = usize::from(database.shard_for_key(route.as_bytes()));
+            routes[shard].get_or_insert(route);
+            if routes.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let routes = routes
+            .into_iter()
+            .map(|route| route.expect("find benchmark route for every shard"))
+            .collect::<Vec<_>>();
+        let emails = (0..4)
+            .map(|shard| Value::from(format!("routing-{shard}@example.test")))
+            .collect::<Vec<_>>();
+        for (shard, route) in routes.iter().enumerate() {
+            database
+                .execute(
+                    route,
+                    "INSERT INTO routing_benchmark (tenant_id, email, payload)
+                     VALUES (?1, ?2, ?3)",
+                    &[
+                        route.clone().into(),
+                        emails[shard].clone(),
+                        Value::Int64(shard as i64),
+                    ],
+                )
+                .expect("insert routing benchmark row");
+        }
+        let table = database
+            .catalog()
+            .table("default", "routing_benchmark")
+            .unwrap()
+            .unwrap()
+            .id();
+        let index = database
+            .create_global_index(
+                GlobalIndexDeclaration::new(
+                    table,
+                    "routing_benchmark_email_unique",
+                    vec![GlobalIndexKeyPart::new(
+                        GlobalIndexKeySource::column("email").unwrap(),
+                        GlobalIndexKeyType::Text,
+                    )],
+                )
+                .unwrap()
+                .unique(UniqueNullSemantics::NotDistinct)
+                .with_topology(GlobalIndexStorageTopology::selected_v1()),
+            )
+            .expect("declare routing benchmark index");
+        database
+            .build_global_index(index)
+            .expect("build routing benchmark index");
+        let normalize = |source| {
+            briskdb::sql::normalize_placeholders(
+                briskdb::sql::validate_common_subset(
+                    briskdb::sql::parse(briskdb::SqlDialect::Sqlite, source).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        Self {
+            _root: root,
+            engine: Engine::from_database(Arc::new(database)),
+            database: logical,
+            equality: normalize("SELECT payload FROM routing_benchmark WHERE email = ?1"),
+            multiple: normalize(
+                "SELECT payload FROM routing_benchmark WHERE email IN (?1, ?2, ?3, ?4)",
+            ),
+            emails,
+        }
+    }
+
+    fn plan_equality(&self, value: Value) {
+        black_box(
+            self.engine
+                .plan_bound_statement(self.database, &self.equality, 0, &[value], None)
+                .unwrap(),
+        );
+    }
+}
+
+fn global_index_routing_benchmarks(criterion: &mut Criterion) {
+    let fixture = GlobalRoutingBenchmark::new();
+    let next = Cell::new(0_usize);
+    let mut group = criterion.benchmark_group("global_index_routing");
+    group.sample_size(20);
+    group.sampling_mode(SamplingMode::Flat);
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("hit", |bencher| {
+        bencher.iter(|| {
+            let index = next.get();
+            next.set((index + 1) % fixture.emails.len());
+            fixture.plan_equality(fixture.emails[index].clone());
+        });
+    });
+    group.bench_function("miss", |bencher| {
+        bencher.iter(|| fixture.plan_equality("routing-miss@example.test".into()));
+    });
+    group.bench_function("hot_key", |bencher| {
+        bencher.iter(|| fixture.plan_equality(fixture.emails[0].clone()));
+    });
+    group.throughput(Throughput::Elements(4));
+    group.bench_function("multi_key", |bencher| {
+        bencher.iter(|| {
+            black_box(
+                fixture
+                    .engine
+                    .plan_bound_statement(
+                        fixture.database,
+                        &fixture.multiple,
+                        0,
+                        &fixture.emails,
+                        None,
+                    )
+                    .unwrap(),
+            );
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     storage_benchmarks,
     engine_benchmarks,
-    global_authority_benchmarks
+    global_authority_benchmarks,
+    global_index_routing_benchmarks
 );
 criterion_main!(benches);
