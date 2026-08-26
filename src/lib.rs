@@ -44,11 +44,11 @@ pub use core::{
     RequestContext, ResultLimits, ResultSet, ResultSetShapeError, Routed, Row, Session, SessionId,
     SessionState, ShardSummaryPredicateKind, ShardSummaryPrunedShard, ShardSummaryPruningReason,
     ShardSummaryRoutingFallback, ShardSummaryRoutingPlan, ShutdownReport, Statement,
-    UniqueNullSemantics, Value, WriteResult,
+    TransactionExecution, UniqueNullSemantics, Value, WriteResult,
 };
 #[cfg(feature = "embedded")]
 pub use embedded::{
-    BriskDb, BriskDbBuilder, BriskSession, DEFAULT_EMBEDDED_SHARDS, DocumentSupport,
-    RuntimeBehavior,
+    BriskCursor, BriskDb, BriskDbBuilder, BriskSession, BriskTransaction, DEFAULT_EMBEDDED_SHARDS,
+    DocumentSupport, RuntimeBehavior,
 };
 pub use sql::{SqlDialect, SqlTranslationMode, StatementBehavior};

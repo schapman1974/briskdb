@@ -12,13 +12,14 @@ use std::{
 };
 
 use crate::core::{
-    CancellationToken, Catalog, CheckpointReport, DescribeTarget, Engine, EngineOptions,
+    CancellationToken, Catalog, CheckpointReport, Column, DescribeTarget, Engine, EngineOptions,
     EngineResult, EngineState, EngineStatus, Executed, GlobalIndexAsyncOptions, GlobalIndexWorker,
     PortalId, PrepareRequest, PreparedExecution, PreparedStatementDescription, PreparedStatementId,
-    RequestContext, ResultSet, Routed, Session, SessionId, SessionState, ShutdownReport, Statement,
-    Value, WriteResult,
+    RequestContext, ResultSet, Routed, Row, RowStream, Session, SessionId, SessionState,
+    ShutdownReport, Statement, TransactionExecution, Value, WriteResult,
 };
 use crate::{EngineError, EngineErrorKind};
+use crate::{SqlDialect, SqlTranslationMode};
 
 /// Recommended number of physical shards for small embedded deployments.
 ///
@@ -198,6 +199,31 @@ pub struct BriskSession {
     session: Arc<Session>,
 }
 
+/// An owned, single-session transaction for embedded applications.
+///
+/// The handle uses the same transaction state machine as every protocol
+/// adapter. Its first routed statement pins one physical shard, later work on
+/// another shard fails the transaction, and committing a failed transaction
+/// rolls it back. Dropping an unfinished handle drops its private session; pool
+/// hygiene then rolls back any pinned SQLite transaction before the connection
+/// can be reused.
+#[must_use = "an embedded transaction must be committed, rolled back, or dropped"]
+pub struct BriskTransaction {
+    session: BriskSession,
+}
+
+/// A bounded, asynchronous cursor returned by embedded prepared reads.
+///
+/// Dropping a cursor cancels its unfinished query and interrupts the leased
+/// SQLite connection. The prepared statement and portal remain owned by the
+/// session and can be closed with [`BriskSession::close_prepared`] or
+/// [`BriskSession::close_bound`].
+#[must_use = "dropping a cursor cancels its unfinished query"]
+pub struct BriskCursor {
+    shards: Vec<u16>,
+    stream: RowStream,
+}
+
 impl fmt::Debug for BriskSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -205,6 +231,26 @@ impl fmt::Debug for BriskSession {
             .field("id", &self.id())
             .field("database_state", &self.database.state())
             .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for BriskTransaction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BriskTransaction")
+            .field("session", &self.session.id())
+            .field("database_state", &self.session.database_state())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for BriskCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BriskCursor")
+            .field("shards", &self.shards)
+            .field("stream", &self.stream)
+            .finish()
     }
 }
 
@@ -266,6 +312,23 @@ impl BriskDb {
             database: self.clone(),
             session: Arc::new(self.session()),
         }
+    }
+
+    /// Begin an owned transaction on a new private embedded session.
+    pub async fn begin_transaction(&self) -> EngineResult<BriskTransaction> {
+        self.begin_transaction_with_context(RequestContext::new())
+            .await
+    }
+
+    /// Begin an owned transaction with host-supplied request controls.
+    pub async fn begin_transaction_with_context(
+        &self,
+        context: RequestContext,
+    ) -> EngineResult<BriskTransaction> {
+        let session = self.owned_session();
+        let outcome = session.transaction_control("BEGIN", context).await?;
+        debug_assert_eq!(outcome, TransactionExecution::Started);
+        Ok(BriskTransaction { session })
     }
 
     /// Return immutable engine and resource-limit status.
@@ -466,6 +529,33 @@ impl BriskDb {
             .await
     }
 
+    /// Stream one immutable read portal through logical point/scatter planning.
+    pub async fn stream_bound_logical(
+        &self,
+        session: &Session,
+        portal: PortalId,
+    ) -> EngineResult<BriskCursor> {
+        self.stream_bound_logical_with_context(session, portal, RequestContext::new())
+            .await
+    }
+
+    /// Stream one logical read portal with host-supplied request controls.
+    pub async fn stream_bound_logical_with_context(
+        &self,
+        session: &Session,
+        portal: PortalId,
+        context: RequestContext,
+    ) -> EngineResult<BriskCursor> {
+        let Executed { shards, value } = self
+            .engine
+            .stream_portal_logical_with_context(session, portal, context)
+            .await?;
+        Ok(BriskCursor {
+            shards,
+            stream: value,
+        })
+    }
+
     /// Close a prepared statement and every portal bound from it.
     pub async fn close_prepared(
         &self,
@@ -567,6 +657,56 @@ impl BriskDb {
 }
 
 impl BriskSession {
+    async fn execute_prepared_statement(
+        &self,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Executed<PreparedExecution>> {
+        let (sql, parameters) = statement.into_parts();
+        let request = PrepareRequest::new(
+            self.database.catalog().default_database().id(),
+            SqlDialect::Sqlite,
+            SqlTranslationMode::StrictSqlite,
+            sql,
+        );
+        let prepared = self.prepare_with_context(request, context.clone()).await?;
+        let portal = match self
+            .bind_with_context(prepared, parameters, context.clone())
+            .await
+        {
+            Ok(portal) => portal,
+            Err(error) => {
+                let _ = self.close_prepared(prepared).await;
+                return Err(error);
+            }
+        };
+        let execution = self
+            .execute_bound_logical_with_context(portal, context)
+            .await;
+        let cleanup = self.close_prepared(prepared).await;
+        let execution = execution?;
+        cleanup?;
+        Ok(execution)
+    }
+
+    async fn transaction_control(
+        &self,
+        sql: &'static str,
+        context: RequestContext,
+    ) -> EngineResult<TransactionExecution> {
+        let execution = self
+            .execute_prepared_statement(Statement::new(sql, Vec::new()), context)
+            .await;
+        let execution = execution?;
+        match execution.value {
+            PreparedExecution::Transaction(outcome) => Ok(outcome),
+            _ => Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "transaction control returned a non-transaction result",
+            )),
+        }
+    }
+
     /// Return the process-unique session identity.
     pub fn id(&self) -> SessionId {
         self.session.id()
@@ -736,6 +876,35 @@ impl BriskSession {
             .await
     }
 
+    /// Execute a logical bound portal with host-supplied request controls.
+    pub async fn execute_bound_logical_with_context(
+        &self,
+        portal: PortalId,
+        context: RequestContext,
+    ) -> EngineResult<Executed<PreparedExecution>> {
+        self.database
+            .execute_bound_logical_with_context(self.session.as_ref(), portal, context)
+            .await
+    }
+
+    /// Stream one immutable read portal through logical point/scatter planning.
+    pub async fn stream_bound_logical(&self, portal: PortalId) -> EngineResult<BriskCursor> {
+        self.database
+            .stream_bound_logical(self.session.as_ref(), portal)
+            .await
+    }
+
+    /// Stream one logical read portal with host-supplied request controls.
+    pub async fn stream_bound_logical_with_context(
+        &self,
+        portal: PortalId,
+        context: RequestContext,
+    ) -> EngineResult<BriskCursor> {
+        self.database
+            .stream_bound_logical_with_context(self.session.as_ref(), portal, context)
+            .await
+    }
+
     /// Close a prepared statement and every bound portal derived from it.
     pub async fn close_prepared(&self, statement: PreparedStatementId) -> EngineResult<bool> {
         self.database
@@ -772,5 +941,175 @@ impl BriskSession {
     /// database is draining and is deterministic and idempotent.
     pub async fn close(&self) -> EngineResult<()> {
         self.session.close().await
+    }
+}
+
+impl BriskTransaction {
+    /// Return the current transaction/session state.
+    pub async fn state(&self) -> SessionState {
+        self.session.state().await
+    }
+
+    /// Set the route used by subsequent statements until it is replaced.
+    pub async fn set_routing_key(&self, routing_key: impl Into<String>) -> EngineResult<()> {
+        self.session.set_routing_key(routing_key).await
+    }
+
+    /// Execute one routed write inside the transaction.
+    pub async fn execute_write(&self, statement: Statement) -> EngineResult<Executed<WriteResult>> {
+        self.execute_write_with_context(statement, RequestContext::new())
+            .await
+    }
+
+    /// Execute one routed write with host-supplied request controls.
+    pub async fn execute_write_with_context(
+        &self,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Executed<WriteResult>> {
+        let execution = self
+            .session
+            .execute_prepared_statement(statement, context)
+            .await?;
+        let value = match execution.value {
+            PreparedExecution::AffectedRows(rows) => WriteResult::without_generated_key(rows),
+            PreparedExecution::GeneratedWrite(write) => write,
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidQuery,
+                    "transaction write returned a non-write result",
+                ));
+            }
+        };
+        Ok(Executed {
+            shards: execution.shards,
+            value,
+        })
+    }
+
+    /// Query one routed physical owner inside the transaction.
+    pub async fn query(&self, statement: Statement) -> EngineResult<Executed<ResultSet>> {
+        self.query_with_context(statement, RequestContext::new())
+            .await
+    }
+
+    /// Query one routed owner with host-supplied request controls.
+    pub async fn query_with_context(
+        &self,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Executed<ResultSet>> {
+        let execution = self
+            .session
+            .execute_prepared_statement(statement, context)
+            .await?;
+        let PreparedExecution::Rows(value) = execution.value else {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidQuery,
+                "transaction query returned a non-row result",
+            ));
+        };
+        Ok(Executed {
+            shards: execution.shards,
+            value,
+        })
+    }
+
+    /// Compile one protocol-neutral prepared statement inside the transaction.
+    pub async fn prepare(&self, request: PrepareRequest) -> EngineResult<PreparedStatementId> {
+        self.session.prepare(request).await
+    }
+
+    /// Bind typed values and the transaction's current route into a portal.
+    pub async fn bind(
+        &self,
+        statement: PreparedStatementId,
+        parameters: Vec<Value>,
+    ) -> EngineResult<PortalId> {
+        self.session.bind(statement, parameters).await
+    }
+
+    /// Describe a prepared statement or bound portal.
+    pub async fn describe(
+        &self,
+        target: DescribeTarget,
+    ) -> EngineResult<PreparedStatementDescription> {
+        self.session.describe(target).await
+    }
+
+    /// Stream a prepared read inside the transaction.
+    pub async fn stream_bound_logical(&self, portal: PortalId) -> EngineResult<BriskCursor> {
+        self.session.stream_bound_logical(portal).await
+    }
+
+    /// Stream a prepared read with host-supplied request controls.
+    pub async fn stream_bound_logical_with_context(
+        &self,
+        portal: PortalId,
+        context: RequestContext,
+    ) -> EngineResult<BriskCursor> {
+        self.session
+            .stream_bound_logical_with_context(portal, context)
+            .await
+    }
+
+    /// Close a prepared statement and every portal derived from it.
+    pub async fn close_prepared(&self, statement: PreparedStatementId) -> EngineResult<bool> {
+        self.session.close_prepared(statement).await
+    }
+
+    /// Close one bound portal while retaining its prepared statement.
+    pub async fn close_bound(&self, portal: PortalId) -> EngineResult<bool> {
+        self.session.close_bound(portal).await
+    }
+
+    /// Commit the transaction and terminally close its private session.
+    pub async fn commit(self) -> EngineResult<TransactionExecution> {
+        self.commit_with_context(RequestContext::new()).await
+    }
+
+    /// Commit the transaction with host-supplied request controls.
+    pub async fn commit_with_context(
+        self,
+        context: RequestContext,
+    ) -> EngineResult<TransactionExecution> {
+        let outcome = self.session.transaction_control("COMMIT", context).await?;
+        self.session.close().await?;
+        Ok(outcome)
+    }
+
+    /// Roll back the transaction and terminally close its private session.
+    pub async fn rollback(self) -> EngineResult<TransactionExecution> {
+        self.rollback_with_context(RequestContext::new()).await
+    }
+
+    /// Roll back the transaction with host-supplied request controls.
+    pub async fn rollback_with_context(
+        self,
+        context: RequestContext,
+    ) -> EngineResult<TransactionExecution> {
+        let outcome = self
+            .session
+            .transaction_control("ROLLBACK", context)
+            .await?;
+        self.session.close().await?;
+        Ok(outcome)
+    }
+}
+
+impl BriskCursor {
+    /// Return the physical shards selected for this logical stream.
+    pub fn shards(&self) -> &[u16] {
+        &self.shards
+    }
+
+    /// Return stable column metadata published before the first row.
+    pub fn columns(&self) -> &[Column] {
+        self.stream.columns()
+    }
+
+    /// Wait for the next row, terminal query error, or clean end of stream.
+    pub async fn next_row(&mut self) -> Option<EngineResult<Row>> {
+        self.stream.next_row().await
     }
 }
