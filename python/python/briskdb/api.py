@@ -15,6 +15,7 @@ from ._briskdb import (
     Database,
     Server,
     Session,
+    Transaction,
     open as _native_open,
 )
 
@@ -54,7 +55,7 @@ async def _cancelable_call(
 
 
 class AsyncCursor(AsyncIterator[tuple[Any, ...]]):
-    """Async iteration over one already bounded native result."""
+    """Async iteration over one bounded native row stream."""
 
     def __init__(self, cursor: Cursor) -> None:
         self._cursor = cursor
@@ -70,10 +71,6 @@ class AsyncCursor(AsyncIterator[tuple[Any, ...]]):
     @property
     def closed(self) -> bool:
         return self._cursor.closed
-
-    @property
-    def remaining(self) -> int:
-        return self._cursor.remaining
 
     async def fetchone(self) -> Optional[tuple[Any, ...]]:
         return await asyncio.to_thread(self._cursor.fetchone)
@@ -248,6 +245,98 @@ class AsyncSession:
         return False
 
 
+class AsyncTransaction:
+    """Asyncio facade for one owned single-shard transaction."""
+
+    def __init__(self, transaction: Transaction) -> None:
+        self._transaction = transaction
+
+    @property
+    def native(self) -> Transaction:
+        return self._transaction
+
+    @property
+    def closed(self) -> bool:
+        return self._transaction.closed
+
+    async def get_state(self) -> str:
+        return await asyncio.to_thread(lambda: self._transaction.state)
+
+    async def set_routing_key(self, routing_key: str) -> None:
+        await asyncio.to_thread(self._transaction.set_routing_key, routing_key)
+
+    async def execute(
+        self,
+        sql: str,
+        params: Optional[Union[list[Any], tuple[Any, ...]]] = None,
+        *,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._transaction.execute,
+            sql,
+            params,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
+    async def query(
+        self,
+        sql: str,
+        params: Optional[Union[list[Any], tuple[Any, ...]]] = None,
+        *,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._transaction.query,
+            sql,
+            params,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
+    async def commit(
+        self,
+        *,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> str:
+        return await _cancelable_call(
+            self._transaction.commit,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
+    async def rollback(
+        self,
+        *,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> str:
+        return await _cancelable_call(
+            self._transaction.rollback,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
+    async def __aenter__(self) -> AsyncTransaction:
+        return self
+
+    async def __aexit__(
+        self,
+        exception_type: Optional[type[BaseException]],
+        _exception: Optional[BaseException],
+        _traceback: object,
+    ) -> bool:
+        if exception_type is None:
+            await self.commit()
+        else:
+            await self.rollback()
+        return False
+
+
 class AsyncDatabase:
     """Asyncio facade for one in-process native BriskDB database."""
 
@@ -279,6 +368,21 @@ class AsyncDatabase:
             self._database.session, routing_key=routing_key
         )
         return AsyncSession(session)
+
+    async def transaction(
+        self,
+        *,
+        routing_key: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> AsyncTransaction:
+        transaction = await _cancelable_call(
+            self._database.transaction,
+            routing_key=routing_key,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+        return AsyncTransaction(transaction)
 
     async def checkpoint(
         self,

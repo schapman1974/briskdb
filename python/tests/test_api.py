@@ -19,11 +19,18 @@ class SyncApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as data_dir:
             with briskdb.connect(data_dir, shards=2) as database:
                 with database.session(routing_key="cursor") as session:
+                    session.migrate(
+                        "CREATE TABLE cursor_values (value INTEGER NOT NULL)"
+                    )
+                    for value in (1, 2, 3):
+                        session.execute(
+                            "INSERT INTO cursor_values (value) VALUES (?1)", [value]
+                        )
                     cursor = session.cursor(
-                        "SELECT 1 AS value UNION ALL SELECT 2 UNION ALL SELECT 3",
+                        "SELECT value FROM cursor_values ORDER BY value",
                         batch_size=2,
                     )
-                    self.assertEqual(cursor.remaining, 3)
+                    self.assertFalse(cursor.closed)
                     self.assertEqual(cursor.fetchmany(), [(1,), (2,)])
                     self.assertEqual(list(cursor), [(3,)])
                     self.assertEqual(cursor.fetchall(), [])
@@ -35,6 +42,42 @@ class SyncApiTests(unittest.TestCase):
 
                 self.assertTrue(session.closed)
             self.assertTrue(database.closed)
+
+    def test_native_transactions_commit_and_roll_back_on_context_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as data_dir:
+            with briskdb.connect(data_dir, shards=2) as database:
+                with database.session(routing_key="python-transaction") as session:
+                    session.migrate(
+                        "CREATE TABLE transaction_notes "
+                        "(id INTEGER PRIMARY KEY, body TEXT NOT NULL)"
+                    )
+
+                with database.transaction(
+                    routing_key="python-transaction"
+                ) as transaction:
+                    transaction.execute(
+                        "INSERT INTO transaction_notes (id, body) VALUES (?1, ?2)",
+                        [1, "committed"],
+                    )
+                    self.assertEqual(transaction.state, "in_transaction")
+                self.assertTrue(transaction.closed)
+
+                with self.assertRaisesRegex(RuntimeError, "force rollback"):
+                    with database.transaction(
+                        routing_key="python-transaction"
+                    ) as transaction:
+                        transaction.execute(
+                            "INSERT INTO transaction_notes (id, body) VALUES (?1, ?2)",
+                            [2, "rolled back"],
+                        )
+                        raise RuntimeError("force rollback")
+                self.assertTrue(transaction.closed)
+
+                with database.session(routing_key="python-transaction") as session:
+                    result = session.query(
+                        "SELECT id, body FROM transaction_notes ORDER BY id"
+                    )
+                    self.assertEqual(result["rows"], [(1, "committed")])
 
     def test_deadline_and_explicit_cancellation_recover_the_session(self) -> None:
         with tempfile.TemporaryDirectory() as data_dir:
@@ -56,6 +99,20 @@ class SyncApiTests(unittest.TestCase):
                         with self.assertRaises(briskdb.CancelledError):
                             future.result(timeout=5)
 
+                    self.assertEqual(session.query("SELECT 1")["rows"], [(1,)])
+
+    def test_cursor_close_interrupts_an_active_sqlite_step(self) -> None:
+        with tempfile.TemporaryDirectory() as data_dir:
+            with briskdb.connect(data_dir, shards=2) as database:
+                with database.session(routing_key="cursor-cancel") as session:
+                    cursor = session.cursor(LONG_QUERY)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        fetch = pool.submit(cursor.fetchone)
+                        time.sleep(0.02)
+                        cursor.close()
+                        with self.assertRaises(briskdb.CancelledError):
+                            fetch.result(timeout=5)
+                    self.assertTrue(cursor.closed)
                     self.assertEqual(session.query("SELECT 1")["rows"], [(1,)])
 
     def test_shared_handles_are_safe_for_flask_style_worker_threads(self) -> None:
@@ -95,8 +152,16 @@ class AsyncApiTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(result["rows"], [("hello",)])
 
+                    await session.execute(
+                        "INSERT INTO async_notes (id, body) VALUES (?1, ?2)",
+                        [2, "second"],
+                    )
+                    await session.execute(
+                        "INSERT INTO async_notes (id, body) VALUES (?1, ?2)",
+                        [3, "third"],
+                    )
                     cursor = await session.cursor(
-                        "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3",
+                        "SELECT id FROM async_notes ORDER BY id",
                         batch_size=2,
                     )
                     async with cursor:
@@ -151,6 +216,46 @@ class AsyncApiTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(token.cancelled)
                     recovered = await asyncio.wait_for(session.query("SELECT 1"), 5)
                     self.assertEqual(recovered["rows"], [(1,)])
+
+    async def test_async_transaction_context_commits_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as data_dir:
+            async with await briskdb.open_async(data_dir, shards=2) as database:
+                async with await database.session(
+                    routing_key="async-transaction"
+                ) as session:
+                    await session.migrate(
+                        "CREATE TABLE async_transaction_notes "
+                        "(id INTEGER PRIMARY KEY, body TEXT NOT NULL)"
+                    )
+
+                async with await database.transaction(
+                    routing_key="async-transaction"
+                ) as transaction:
+                    await transaction.execute(
+                        "INSERT INTO async_transaction_notes (id, body) VALUES (?1, ?2)",
+                        [1, "committed"],
+                    )
+                    self.assertEqual(
+                        await transaction.get_state(), "in_transaction"
+                    )
+
+                with self.assertRaisesRegex(RuntimeError, "force rollback"):
+                    async with await database.transaction(
+                        routing_key="async-transaction"
+                    ) as transaction:
+                        await transaction.execute(
+                            "INSERT INTO async_transaction_notes (id, body) VALUES (?1, ?2)",
+                            [2, "rolled back"],
+                        )
+                        raise RuntimeError("force rollback")
+
+                async with await database.session(
+                    routing_key="async-transaction"
+                ) as session:
+                    result = await session.query(
+                        "SELECT id, body FROM async_transaction_notes ORDER BY id"
+                    )
+                    self.assertEqual(result["rows"], [(1, "committed")])
 
     async def test_fastapi_and_warm_handler_patterns_share_one_database(self) -> None:
         with tempfile.TemporaryDirectory() as data_dir:

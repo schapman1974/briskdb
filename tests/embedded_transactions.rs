@@ -192,3 +192,73 @@ async fn cursor_streams_metadata_and_rows_and_drop_does_not_block_shutdown() {
         .unwrap();
     assert!(!report.forced());
 }
+
+#[tokio::test]
+async fn routed_transactions_and_streams_support_ordinary_migrated_tables() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = BriskDb::builder(directory.path())
+        .with_shard_count(2)
+        .open()
+        .await
+        .unwrap();
+    let setup = database.owned_session();
+    setup
+        .migrate("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+        .await
+        .unwrap();
+    setup.close().await.unwrap();
+
+    let committed = database.begin_transaction().await.unwrap();
+    committed.set_routing_key("ordinary-table").await.unwrap();
+    committed
+        .execute_routed_write(Statement::new(
+            "INSERT INTO notes (id, body) VALUES (?1, ?2)",
+            vec![Value::from(1_i64), Value::from("committed")],
+        ))
+        .await
+        .unwrap();
+    committed.commit().await.unwrap();
+
+    let rolled_back = database.begin_transaction().await.unwrap();
+    rolled_back.set_routing_key("ordinary-table").await.unwrap();
+    rolled_back
+        .execute_routed_write(Statement::new(
+            "INSERT INTO notes (id, body) VALUES (?1, ?2)",
+            vec![Value::from(2_i64), Value::from("rolled back")],
+        ))
+        .await
+        .unwrap();
+    rolled_back.rollback().await.unwrap();
+
+    let session = database.owned_session();
+    session.set_routing_key("ordinary-table").await.unwrap();
+    let mut cursor = session
+        .stream(Statement::new(
+            "SELECT id, body FROM notes ORDER BY id",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cursor.columns().len(), 2);
+    let row = cursor.next_row().await.unwrap().unwrap();
+    assert_eq!(row.get(0), Some(&Value::from(1_i64)));
+    assert_eq!(row.get(1), Some(&Value::from("committed")));
+    assert!(cursor.next_row().await.is_none());
+
+    let mut cancelled = session
+        .stream(Statement::new(
+            "WITH RECURSIVE counter(x) AS (VALUES(0) UNION ALL SELECT x + 1 FROM counter WHERE x < 1000000) SELECT x FROM counter",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    assert!(cancelled.next_row().await.unwrap().is_ok());
+    drop(cancelled);
+    let recovered = session
+        .query(Statement::new("SELECT 1", vec![]))
+        .await
+        .unwrap();
+    assert_eq!(recovered.value.rows()[0].get(0), Some(&Value::from(1_i64)));
+    session.close().await.unwrap();
+    database.close().await.unwrap();
+}

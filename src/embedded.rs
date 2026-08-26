@@ -399,6 +399,33 @@ impl BriskDb {
             .await
     }
 
+    /// Stream one routed physical query with bounded row buffering.
+    pub async fn stream(
+        &self,
+        session: &Session,
+        statement: Statement,
+    ) -> EngineResult<BriskCursor> {
+        self.stream_with_context(session, statement, RequestContext::new())
+            .await
+    }
+
+    /// Stream one routed query with host-supplied request controls.
+    pub async fn stream_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<BriskCursor> {
+        let Routed { shard, value } = self
+            .engine
+            .stream_query_with_context(session, statement, context)
+            .await?;
+        Ok(BriskCursor {
+            shards: vec![shard],
+            stream: value,
+        })
+    }
+
     /// Query the logical table view selected by catalog metadata.
     pub async fn query_logical(
         &self,
@@ -418,6 +445,33 @@ impl BriskDb {
         self.engine
             .query_logical_with_context(session, statement, context)
             .await
+    }
+
+    /// Stream the logical table view selected by catalog metadata.
+    pub async fn stream_logical(
+        &self,
+        session: &Session,
+        statement: Statement,
+    ) -> EngineResult<BriskCursor> {
+        self.stream_logical_with_context(session, statement, RequestContext::new())
+            .await
+    }
+
+    /// Stream a logical table view with host-supplied request controls.
+    pub async fn stream_logical_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<BriskCursor> {
+        let Executed { shards, value } = self
+            .engine
+            .stream_query_logical_with_context(session, statement, context)
+            .await?;
+        Ok(BriskCursor {
+            shards,
+            stream: value,
+        })
     }
 
     /// Parse, validate, translate, and compile one prepared SQL statement.
@@ -794,6 +848,22 @@ impl BriskSession {
             .await
     }
 
+    /// Stream one routed physical query with bounded row buffering.
+    pub async fn stream(&self, statement: Statement) -> EngineResult<BriskCursor> {
+        self.database.stream(self.session.as_ref(), statement).await
+    }
+
+    /// Stream one routed query with host-supplied request controls.
+    pub async fn stream_with_context(
+        &self,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<BriskCursor> {
+        self.database
+            .stream_with_context(self.session.as_ref(), statement, context)
+            .await
+    }
+
     /// Query the logical table view through point/scatter planning.
     pub async fn query_logical(&self, statement: Statement) -> EngineResult<Executed<ResultSet>> {
         self.database
@@ -809,6 +879,24 @@ impl BriskSession {
     ) -> EngineResult<Executed<ResultSet>> {
         self.database
             .query_logical_with_context(self.session.as_ref(), statement, context)
+            .await
+    }
+
+    /// Stream the logical table view through point/scatter planning.
+    pub async fn stream_logical(&self, statement: Statement) -> EngineResult<BriskCursor> {
+        self.database
+            .stream_logical(self.session.as_ref(), statement)
+            .await
+    }
+
+    /// Stream a logical table view with host-supplied request controls.
+    pub async fn stream_logical_with_context(
+        &self,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<BriskCursor> {
+        self.database
+            .stream_logical_with_context(self.session.as_ref(), statement, context)
             .await
     }
 
@@ -953,6 +1041,41 @@ impl BriskTransaction {
     /// Set the route used by subsequent statements until it is replaced.
     pub async fn set_routing_key(&self, routing_key: impl Into<String>) -> EngineResult<()> {
         self.session.set_routing_key(routing_key).await
+    }
+
+    /// Execute a raw routed write inside the transaction.
+    pub async fn execute_routed_write(
+        &self,
+        statement: Statement,
+    ) -> EngineResult<Routed<WriteResult>> {
+        self.execute_routed_write_with_context(statement, RequestContext::new())
+            .await
+    }
+
+    /// Execute a raw routed write with host-supplied request controls.
+    pub async fn execute_routed_write_with_context(
+        &self,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<WriteResult>> {
+        self.session
+            .execute_write_with_context(statement, context)
+            .await
+    }
+
+    /// Query the transaction's routed physical owner.
+    pub async fn query_routed(&self, statement: Statement) -> EngineResult<Routed<ResultSet>> {
+        self.query_routed_with_context(statement, RequestContext::new())
+            .await
+    }
+
+    /// Query the routed owner with host-supplied request controls.
+    pub async fn query_routed_with_context(
+        &self,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<ResultSet>> {
+        self.session.query_with_context(statement, context).await
     }
 
     /// Execute one routed write inside the transaction.

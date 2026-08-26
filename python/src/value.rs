@@ -163,10 +163,18 @@ pub(crate) fn write_result_to_python(
     py: Python<'_>,
     result: Routed<WriteResult>,
 ) -> PyResult<Py<PyAny>> {
+    write_result_parts_to_python(py, result.shard, result.value)
+}
+
+fn write_result_parts_to_python(
+    py: Python<'_>,
+    shard: u16,
+    result: WriteResult,
+) -> PyResult<Py<PyAny>> {
     let output = PyDict::new(py);
-    output.set_item("shard", result.shard)?;
-    output.set_item("rows_affected", result.value.rows_affected)?;
-    match result.value.generated_key {
+    output.set_item("shard", shard)?;
+    output.set_item("rows_affected", result.rows_affected)?;
+    match result.generated_key {
         Some(key) => {
             let generated = PyDict::new(py);
             generated.set_item("column", key.column)?;

@@ -1962,19 +1962,45 @@ impl Engine {
                 return operation.finish(Err(error));
             }
         }
-        if guard.state() == super::SessionState::InTransaction
+        let owner = ConnectionOwner::new(session.id().get());
+        let sqlite_sql = template.translated().sqlite_sql().to_owned();
+        let parameters = portal_snapshot.parameters().to_vec();
+        self.start_row_stream(
+            operation,
+            owner,
+            schema_operation,
+            guard,
+            shards,
+            sqlite_sql,
+            parameters,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_row_stream(
+        &self,
+        mut operation: Operation,
+        owner: ConnectionOwner,
+        schema_operation: SchemaOperationGuard,
+        mut session: OwnedMutexGuard<SessionInner>,
+        shards: Vec<u16>,
+        sqlite_sql: String,
+        parameters: Vec<Value>,
+    ) -> EngineResult<Executed<RowStream>> {
+        if session.state() == super::SessionState::FailedTransaction {
+            return operation.finish(Err(transaction_aborted()));
+        }
+        if session.state() == super::SessionState::InTransaction
             && (shards.len() != 1
-                || guard
+                || session
                     .transaction_shard()
                     .is_some_and(|pinned| pinned != shards[0]))
         {
-            guard.fail_transaction();
+            session.fail_transaction();
             return operation.finish(Err(cross_shard_transaction()));
         }
 
-        let owner = ConnectionOwner::new(session.id().get());
-        let sqlite_sql: Arc<str> = Arc::from(template.translated().sqlite_sql());
-        let parameters: Arc<[Value]> = Arc::from(portal_snapshot.parameters().to_vec());
         let result_limits = operation.result_limits;
         let control = Arc::clone(&operation.control);
         let (mut stream, producer) = RowStream::channel(
@@ -1987,15 +2013,17 @@ impl Engine {
         let readiness = StreamReadiness::new(ready_tx);
         let engine = self.clone();
         let task_shards = shards.clone();
+        let sqlite_sql: Arc<str> = Arc::from(sqlite_sql);
+        let parameters: Arc<[Value]> = Arc::from(parameters);
         tokio::spawn(async move {
-            let result = if guard.state() == super::SessionState::InTransaction {
+            let result = if session.state() == super::SessionState::InTransaction {
                 engine
                     .produce_transaction_stream(
                         &mut operation,
                         task_shards[0],
                         owner,
                         schema_operation,
-                        guard,
+                        session,
                         sqlite_sql,
                         parameters,
                         result_limits,
@@ -2009,7 +2037,7 @@ impl Engine {
                         &mut operation,
                         owner,
                         schema_operation,
-                        guard,
+                        session,
                         task_shards,
                         sqlite_sql,
                         parameters,
@@ -2110,92 +2138,35 @@ impl Engine {
         shard: u16,
         owner: ConnectionOwner,
         schema_operation: SchemaOperationGuard,
-        mut session: OwnedMutexGuard<SessionInner>,
+        session: OwnedMutexGuard<SessionInner>,
         sqlite_sql: Arc<str>,
         parameters: Arc<[Value]>,
         result_limits: ResultLimits,
         readiness: Arc<StreamReadiness>,
         producer: RowProducer,
     ) -> EngineResult<()> {
-        let needs_connection = session
-            .transaction_mut()
-            .is_some_and(|transaction| transaction.connection.is_none());
-        let permit = if needs_connection {
-            Some(
-                operation
-                    .wait_pending(self.inner.connections.acquire_for_owner(shard, owner))
-                    .await?,
-            )
-        } else {
-            None
-        };
-        let worker = operation.wait_pending(self.inner.workers.acquire()).await?;
-        operation.check_before_start()?;
-        let worker_control = Arc::clone(&operation.control);
-        let storage = self.inner.database.storage.clone();
         let budget = sql::ScatterResultBudget::new(result_limits);
-        let join = worker.spawn(move || {
-            let _schema_operation = schema_operation;
-            let result = (|| {
-                let transaction = session.transaction_mut().ok_or_else(|| {
-                    EngineError::new(
-                        EngineErrorKind::Internal,
-                        "active session transaction state is missing",
+        self.run_transaction_on_shard(
+            operation,
+            shard,
+            owner,
+            schema_operation,
+            session,
+            move |connection, control| {
+                connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sqlite_sql)?;
+                connection.run_controlled(control, |connection| {
+                    sql::stream_query_with_budget(
+                        connection,
+                        &sqlite_sql,
+                        &parameters,
+                        &budget,
+                        |columns| readiness.publish(columns),
+                        |row| producer.send(row),
                     )
-                })?;
-                let first_statement = transaction.pinned_shard.is_none();
-                let mut connection = match transaction.connection.take() {
-                    Some(connection) => connection,
-                    None => permit
-                        .ok_or_else(|| {
-                            EngineError::new(
-                                EngineErrorKind::Internal,
-                                "a pinned transaction lost its SQLite connection",
-                            )
-                        })?
-                        .checkout_controlled(Arc::clone(&worker_control))?,
-                };
-                let result = (|| {
-                    if first_statement {
-                        connection.isolate_foreign_sql_controlled(
-                            Arc::clone(&worker_control),
-                            &sqlite_sql,
-                        )?;
-                        connection.run_controlled(Arc::clone(&worker_control), |connection| {
-                            connection.execute_batch("BEGIN DEFERRED").map_err(|error| {
-                                crate::sqlite_error::storage(error)
-                                    .context("failed to begin the pinned SQLite transaction")
-                            })
-                        })?;
-                        transaction.pinned_shard = Some(shard);
-                    }
-                    connection.run_controlled(Arc::clone(&worker_control), |connection| {
-                        sql::stream_query_with_budget(
-                            connection,
-                            &sqlite_sql,
-                            &parameters,
-                            &budget,
-                            |columns| readiness.publish(columns),
-                            |row| producer.send(row),
-                        )
-                    })
-                })();
-                retire_if_broken(&mut connection, &result);
-                transaction.connection = Some(connection);
-                result
-            })();
-            if result.is_err() {
-                session.fail_transaction();
-            }
-            if result
-                .as_ref()
-                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
-            {
-                storage.record_schema_degraded();
-            }
-            result
-        });
-        operation.wait_started(join).await
+                })
+            },
+        )
+        .await
     }
 
     /// Close a prepared statement and every portal bound from it.
@@ -2480,6 +2451,41 @@ impl Engine {
                 )
             }
         };
+
+        if guard.state() == super::SessionState::FailedTransaction {
+            return operation.finish(Err(transaction_aborted()));
+        }
+        if guard.state() == super::SessionState::InTransaction {
+            if catalog_authoritative {
+                return operation.finish(Err(EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    "catalog-authoritative transaction writes require prepared execution",
+                )));
+            }
+            let RawDataTarget::Exact(shard) = target else {
+                return operation.finish(Err(explicit_generated_write_unsupported()));
+            };
+            let value = self
+                .run_transaction_on_shard(
+                    &mut operation,
+                    shard,
+                    owner,
+                    schema_operation,
+                    guard,
+                    move |connection, control| {
+                        connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sql)?;
+                        connection.run_controlled(control, |connection| {
+                            sql::execute(connection, &sql, &params)
+                        })
+                    },
+                )
+                .await;
+            let value = operation.finish_started(value)?;
+            return Ok(Routed {
+                shard,
+                value: super::WriteResult::without_generated_key(value),
+            });
+        }
 
         #[cfg(feature = "experimental-vtab")]
         if let RawDataTarget::Generated(table) = target {
@@ -2860,9 +2866,27 @@ impl Engine {
                 sql,
             ),
         };
+        if guard.state() == super::SessionState::FailedTransaction {
+            return operation.finish(Err(transaction_aborted()));
+        }
         let limits = operation.result_limits;
-        let value = self
-            .run_on_shard(
+        let value = if guard.state() == super::SessionState::InTransaction {
+            self.run_transaction_on_shard(
+                &mut operation,
+                shard,
+                owner,
+                schema_operation,
+                guard,
+                move |connection, control| {
+                    connection.isolate_foreign_sql_controlled(Arc::clone(&control), &sql)?;
+                    connection.run_controlled(control, |connection| {
+                        sql::query_with_limits(connection, &sql, &params, limits)
+                    })
+                },
+            )
+            .await
+        } else {
+            self.run_on_shard(
                 &mut operation,
                 shard,
                 owner,
@@ -2875,9 +2899,84 @@ impl Engine {
                     })
                 },
             )
-            .await;
+            .await
+        };
         let value = operation.finish_started(value)?;
         Ok(Routed { shard, value })
+    }
+
+    /// Query one routed statement as a bounded protocol-neutral row stream.
+    pub async fn stream_query(
+        &self,
+        session: &Session,
+        statement: Statement,
+    ) -> EngineResult<Routed<RowStream>> {
+        self.stream_query_with_context(session, statement, RequestContext::new())
+            .await
+    }
+
+    /// Query one routed statement as a bounded row stream with explicit
+    /// cancellation, deadline, and result-budget controls.
+    pub async fn stream_query_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Routed<RowStream>> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let owner = ConnectionOwner::new(session.id().get());
+        let routing_key = match required_routing_key(&guard) {
+            Ok(key) => key.to_owned(),
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let (sql, parameters) = statement.into_parts();
+        let plan = match self.inner.database.raw_data_plan(
+            Some(&routing_key),
+            &sql,
+            &parameters,
+            RawDataOperation::Query,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let (shard, sql) = match plan {
+            Some(plan) => match plan.target {
+                RawDataTarget::Exact(shard) => (shard, plan.sqlite_sql),
+                RawDataTarget::Generated(_) => {
+                    return operation.finish(Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "stream planning unexpectedly produced a generated write",
+                    )));
+                }
+            },
+            None => (
+                self.inner.database.shard_for_key(routing_key.as_bytes()),
+                sql,
+            ),
+        };
+        let executed = self
+            .start_row_stream(
+                operation,
+                owner,
+                schema_operation,
+                guard,
+                vec![shard],
+                sql,
+                parameters,
+            )
+            .await?;
+        Ok(Routed {
+            shard,
+            value: executed.value,
+        })
     }
 
     /// Query one logical table view, visiting every physical shard selected by
@@ -2966,6 +3065,66 @@ impl Engine {
             .await;
         let value = operation.finish_started(value)?;
         Ok(Executed { shards, value })
+    }
+
+    /// Query one logical table view as a bounded row stream.
+    pub async fn stream_query_logical(
+        &self,
+        session: &Session,
+        statement: Statement,
+    ) -> EngineResult<Executed<RowStream>> {
+        self.stream_query_logical_with_context(session, statement, RequestContext::new())
+            .await
+    }
+
+    /// Query one logical table view as a bounded row stream with explicit
+    /// cancellation, deadline, and result-budget controls.
+    pub async fn stream_query_logical_with_context(
+        &self,
+        session: &Session,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<Executed<RowStream>> {
+        if self.catalog().tables().is_empty() {
+            return self
+                .stream_query_with_context(session, statement, context)
+                .await
+                .map(|routed| Executed {
+                    shards: vec![routed.shard],
+                    value: routed.value,
+                });
+        }
+
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let (sql, parameters) = statement.into_parts();
+        let (shards, sql) = match self.logical_raw_query_plan(
+            &sql,
+            &parameters,
+            &operation.cancellation,
+            operation.deadline,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let owner = ConnectionOwner::new(session.id().get());
+        self.start_row_stream(
+            operation,
+            owner,
+            schema_operation,
+            guard,
+            shards,
+            sql,
+            parameters,
+        )
+        .await
     }
 
     /// Run one read-only inspection statement on an explicit physical shard.
@@ -3743,6 +3902,108 @@ impl Engine {
                 // Query execution can surface corruption outside the schema
                 // fingerprint's coverage. Persist terminal Degraded state so a
                 // restart cannot reopen admission without a complete restore.
+                storage.record_schema_degraded();
+            }
+            worker_control.complete(result)
+        });
+        operation.wait_started(join).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_transaction_on_shard<T, F>(
+        &self,
+        operation: &mut Operation,
+        shard: u16,
+        owner: ConnectionOwner,
+        schema_operation: SchemaOperationGuard,
+        mut session: OwnedMutexGuard<SessionInner>,
+        work: F,
+    ) -> EngineResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut PooledConnection, Arc<OperationControl>) -> EngineResult<T> + Send + 'static,
+    {
+        if session
+            .transaction_shard()
+            .is_some_and(|pinned| pinned != shard)
+        {
+            session.fail_transaction();
+            return operation.control.complete(Err(cross_shard_transaction()));
+        }
+        let needs_connection = session
+            .transaction_mut()
+            .is_some_and(|transaction| transaction.connection.is_none());
+        let permit = if needs_connection {
+            match operation
+                .wait_pending(self.inner.connections.acquire_for_owner(shard, owner))
+                .await
+            {
+                Ok(permit) => Some(permit),
+                Err(error) => return operation.control.complete(Err(error)),
+            }
+        } else {
+            None
+        };
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => return operation.control.complete(Err(error)),
+        };
+        if let Err(error) = operation.check_before_start() {
+            return operation.control.complete(Err(error));
+        }
+        let lease = operation.take_lease();
+        let control = Arc::clone(&operation.control);
+        let worker_control = Arc::clone(&control);
+        let storage = self.inner.database.storage.clone();
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _schema_operation = schema_operation;
+            let result = (|| {
+                let transaction = session.transaction_mut().ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "active session transaction state is missing",
+                    )
+                })?;
+                let first_statement = transaction.pinned_shard.is_none();
+                let mut connection = match transaction.connection.take() {
+                    Some(connection) => connection,
+                    None => permit
+                        .ok_or_else(|| {
+                            EngineError::new(
+                                EngineErrorKind::Internal,
+                                "a pinned transaction lost its SQLite connection",
+                            )
+                        })?
+                        .checkout_controlled(Arc::clone(&worker_control))?,
+                };
+                let result = (|| {
+                    if first_statement {
+                        connection.isolate_foreign_sql_controlled(
+                            Arc::clone(&worker_control),
+                            "BEGIN DEFERRED",
+                        )?;
+                        connection.run_controlled(Arc::clone(&worker_control), |connection| {
+                            connection.execute_batch("BEGIN DEFERRED").map_err(|error| {
+                                crate::sqlite_error::storage(error)
+                                    .context("failed to begin the pinned SQLite transaction")
+                            })
+                        })?;
+                        transaction.pinned_shard = Some(shard);
+                    }
+                    work(&mut connection, Arc::clone(&worker_control))
+                })();
+                retire_if_broken(&mut connection, &result);
+                transaction.connection = Some(connection);
+                result
+            })();
+            if result.is_err() {
+                session.fail_transaction();
+            }
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
                 storage.record_schema_degraded();
             }
             worker_control.complete(result)

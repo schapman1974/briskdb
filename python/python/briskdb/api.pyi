@@ -16,6 +16,7 @@ from ._briskdb import (
     SqlParameter,
     SqlRow,
     Status,
+    Transaction,
     WriteResult,
 )
 
@@ -33,8 +34,6 @@ class AsyncCursor(AsyncIterator[SqlRow]):
     def shards(self) -> List[int]: ...
     @property
     def closed(self) -> bool: ...
-    @property
-    def remaining(self) -> int: ...
     async def fetchone(self) -> Optional[SqlRow]: ...
     async def fetchmany(self, size: Optional[int] = None) -> List[SqlRow]: ...
     async def fetchall(self) -> List[SqlRow]: ...
@@ -109,6 +108,44 @@ class AsyncSession:
     async def __aenter__(self) -> AsyncSession: ...
     async def __aexit__(self, *exception: object) -> bool: ...
 
+class AsyncTransaction:
+    @property
+    def native(self) -> Transaction: ...
+    @property
+    def closed(self) -> bool: ...
+    async def get_state(self) -> str: ...
+    async def set_routing_key(self, routing_key: str) -> None: ...
+    async def execute(
+        self,
+        sql: str,
+        params: Optional[Sequence[SqlParameter]] = None,
+        *,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> WriteResult: ...
+    async def query(
+        self,
+        sql: str,
+        params: Optional[Sequence[SqlParameter]] = None,
+        *,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> QueryResult: ...
+    async def commit(
+        self,
+        *,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> str: ...
+    async def rollback(
+        self,
+        *,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> str: ...
+    async def __aenter__(self) -> AsyncTransaction: ...
+    async def __aexit__(self, *exception: object) -> bool: ...
+
 class AsyncDatabase:
     @property
     def native(self) -> Database: ...
@@ -121,6 +158,13 @@ class AsyncDatabase:
     @property
     def state(self) -> str: ...
     async def session(self, *, routing_key: Optional[str] = None) -> AsyncSession: ...
+    async def transaction(
+        self,
+        *,
+        routing_key: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> AsyncTransaction: ...
     async def checkpoint(
         self,
         *,

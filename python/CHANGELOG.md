@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added owned synchronous and asyncio transaction handles with deterministic
+  commit/rollback context-manager behavior.
+- Python cursors now consume the engine's bounded SQLite row stream and cancel
+  unread work on close or drop instead of retaining a materialized result set.
 - Added host-controlled loopback HTTP and PostgreSQL listeners through
   synchronous and asyncio `Database.serve()` APIs.
 - Listener shutdown is deterministic and database shutdown closes every
