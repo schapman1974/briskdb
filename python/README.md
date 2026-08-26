@@ -80,8 +80,9 @@ async with await briskdb.open_async("./data") as db:
         rows = await session.query("SELECT body FROM notes WHERE id = ?1", [1])
 ```
 
-See [sync and asyncio usage](ASYNC_API.md) for cursors, deadlines, cancellation,
-thread/task safety, and the intentionally unclaimed DB-API transaction surface.
+See [sync and asyncio usage](ASYNC_API.md) for transactions, streaming cursors,
+deadlines, cancellation, thread/task safety, and the intentionally unclaimed
+DB-API compatibility surface.
 The [API reference](API.md), [platform matrix](COMPATIBILITY.md), and
 [serverless-shaped warm-handler example](SERVERLESS.md) define the supported
 package surface and its current boundaries.

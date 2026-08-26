@@ -124,8 +124,10 @@ cross-shard work fails the transaction, and committing a failed transaction
 rolls it back exactly as the protocol adapters do. `commit()` and `rollback()`
 consume the handle. Dropping an unfinished handle releases its private session
 and pool hygiene rolls back a pinned SQLite transaction before reusing that
-connection. Transaction commands use the catalog-aware prepared planner and
-therefore require cataloged tables.
+connection. `execute_routed_write()` and `query_routed()` retain the ordinary
+explicitly routed SQL behavior used for tables created with `migrate()`. The
+`execute_write()` and `query()` transaction methods use catalog-aware prepared
+planning for registered logical tables.
 
 Prepared reads can be opened with `stream_bound_logical()`. The returned
 `BriskCursor` publishes ordered column metadata before the first row, buffers
@@ -133,6 +135,9 @@ at most the engine's finite row-stream capacity, and exposes `next_row()` for
 asynchronous consumption. Dropping an unfinished cursor cancels all selected
 shard work and interrupts its active SQLite operation. Prepared portals remain
 session-owned and should be closed explicitly when the session will be reused.
+For direct SQL, `BriskSession::stream()` streams one explicitly routed physical
+owner and `stream_logical()` applies the same metadata-selected point/scatter
+planning as `query_logical()`.
 
 The public database, session, transaction, and cursor handles are `Send +
 Sync`. Autocommit commands, transactions, prepared portals, cursors,

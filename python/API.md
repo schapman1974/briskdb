@@ -20,14 +20,17 @@ always report the resolved count.
 
 ## Database and session
 
-`Database` exposes `session()`, `checkpoint()`, `serve()`, `close()`,
+`Database` exposes `session()`, `transaction()`, `checkpoint()`, `serve()`, `close()`,
 state/config properties, and a synchronous context manager. `Session` exposes
 routing-key state, `migrate()`, `execute()`, `query()`, `query_logical()`,
 `cursor()`, `logical_cursor()`, `status()`, `close()`, and a context manager.
 
-The `AsyncDatabase`, `AsyncSession`, and `AsyncCursor` facades provide the same
-lifecycle and SQL operations with `await`/`async with`. Cancelling a query task
-propagates a native `CancellationToken` into the exact Rust request.
+`Transaction` provides routed `execute()`/`query()`, explicit
+`commit()`/`rollback()`, and commit-on-success/rollback-on-exception context
+management. The `AsyncDatabase`, `AsyncSession`, `AsyncTransaction`, and
+`AsyncCursor` facades provide the same lifecycle and SQL operations with
+`await`/`async with`. Cancelling a task propagates a native
+`CancellationToken` into the exact Rust request.
 
 ## Attached listeners
 
@@ -46,12 +49,12 @@ BriskDB's documented bounded SQL subset.
 ## Results and errors
 
 Queries return `shards`, `columns`, and tuple `rows`. Writes return `shard`,
-`rows_affected`, and an optional `generated_key`. Cursors provide
-`fetchone()`, `fetchmany()`, `fetchall()`, iteration, and deterministic close.
+`rows_affected`, and an optional `generated_key`. Cursors provide bounded
+native streaming through `fetchone()`, `fetchmany()`, `fetchall()`, iteration,
+and deterministic cancellation on close.
 
 All native failures derive from `BriskDBError`; each has stable `code` and
 `retryable` class attributes. See [value and error conversions](VALUE_CONVERSIONS.md)
 and [sync/async lifecycle details](ASYNC_API.md).
 
-Transactions, retained SQLite streaming cursors, and document calls are not
-claimed until their engine dependencies land.
+Document calls are not claimed until their engine dependencies land.

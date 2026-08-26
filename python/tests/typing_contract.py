@@ -16,7 +16,9 @@ def sync_contract(path: str) -> None:
     rows: List[Tuple[object, ...]] = query_result["rows"]
     cursor: briskdb.Cursor = session.cursor("SELECT id FROM notes")
     row: Optional[Tuple[object, ...]] = cursor.fetchone()
-    print(affected, rows, row)
+    transaction: briskdb.Transaction = database.transaction(routing_key="typed")
+    outcome: str = transaction.rollback()
+    print(affected, rows, row, outcome)
 
 
 async def async_contract(path: str) -> None:
@@ -27,4 +29,8 @@ async def async_contract(path: str) -> None:
     session: briskdb.AsyncSession = await database.session(routing_key="typed")
     cursor: briskdb.AsyncCursor = await session.cursor("SELECT 1")
     rows: List[Tuple[object, ...]] = await cursor.fetchall()
-    print(address, rows)
+    transaction: briskdb.AsyncTransaction = await database.transaction(
+        routing_key="typed"
+    )
+    outcome: str = await transaction.rollback()
+    print(address, rows, outcome)

@@ -18,15 +18,16 @@ with briskdb.connect("./data", shards=4) as db:
                 print(row)
 ```
 
-`Database`, `Session`, and `Cursor` may be shared across threads. Session state
-changes and operations are serialized by the native engine; using one session
-per request is usually clearer and allows independent routing state.
+`Database`, `Session`, `Transaction`, and `Cursor` may be shared across threads.
+Session and transaction state changes are serialized by the native engine;
+using one handle per request is usually clearer and allows independent routing
+state.
 
-Every query is bounded by `Config.max_result_rows` and
-`Config.max_result_bytes`. The current `Cursor` batches an already bounded
-native result and releases unread rows on `close()`, context exit, or garbage
-collection. A true SQLite-streaming cursor depends on the retained cursor work
-in [#39](https://github.com/schapman1974/briskdb/issues/39).
+`Cursor` pulls from the engine's bounded SQLite row stream. `fetchmany()` limits
+the Python batch size while the native producer buffers only its fixed row
+capacity. `close()`, context exit, or garbage collection cancels unread work
+and interrupts the active SQLite operation. `fetchall()` intentionally
+materializes every remaining row requested by the caller.
 
 ## Asyncio use
 
@@ -72,16 +73,24 @@ Closing the database closes every attached server first. Remote PostgreSQL
 uses the same TLS certificate/key/user/password-file keyword arguments as the
 synchronous `Database.serve()` method.
 
-## Transaction and DB-API boundaries
+## Transactions and DB-API boundaries
 
-This package does not claim Python DB-API 2.0 compliance yet. BriskDB currently
-executes supported writes in autocommit mode, so it does not expose misleading
-`commit()` or `rollback()` methods. Native transaction handles are tracked by
-[#34](https://github.com/schapman1974/briskdb/issues/34); retained streaming
-cursors are tracked by #39.
+`Database.transaction()` returns an owned, single-shard transaction. Its first
+routed operation pins one shard; crossing to another shard fails the
+transaction. Successful context exit commits, exceptional exit rolls back, and
+explicit `commit()` or `rollback()` terminally closes the handle:
 
-Context-manager exit deterministically closes the handle. It does not imply a
-transaction commit or rollback. Mongo document CRUD/aggregation waits for the
-native document engine in [#160](https://github.com/schapman1974/briskdb/issues/160),
-and snapshot/fencing helpers for real serverless deployments remain in
+```python
+with db.transaction(routing_key="account-1") as transaction:
+    transaction.execute(
+        "INSERT INTO notes (id, body) VALUES (?1, ?2)",
+        [2, "committed on context exit"],
+    )
+```
+
+The asyncio equivalent is `async with await db.transaction(...)`. BriskDB does
+not claim Python DB-API 2.0 compliance; these are explicit native handles, not
+implicit connection transactions. Mongo document CRUD/aggregation waits for
+the native document engine in [#160](https://github.com/schapman1974/briskdb/issues/160),
+and snapshot/fencing helpers remain in
 [#194–#196](https://github.com/schapman1974/briskdb/issues/194).

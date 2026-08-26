@@ -43,17 +43,20 @@ close lifecycle through `prepare`, `bind`, `describe`, `execute_bound`, and
 typed values captured at bind time.
 
 Use `BriskDb::begin_transaction()` for an owned single-shard transaction. The
-handle provides direct typed writes and queries as well as prepare, bind,
-describe, and streaming operations. `commit()` and `rollback()` consume it;
-dropping it unfinished rolls back its private session. Transaction statements
-are compiled through the catalog-aware planner, so referenced tables must be
-registered in the logical catalog.
+handle provides explicitly routed writes and queries as well as catalog-aware
+prepared operations. `commit()` and `rollback()` consume it; dropping it
+unfinished rolls back its private session. Use `execute_routed_write()` and
+`query_routed()` for ordinary tables created through `migrate()`. The
+`execute_write()` and `query()` methods compile through the catalog-aware
+planner, so their referenced tables must be registered in the logical catalog.
 
 For a prepared read, `stream_bound_logical()` returns `BriskCursor`. Column
 metadata is ready immediately, `next_row()` advances asynchronously, and the
 engine retains only a bounded number of decoded rows ahead of the caller.
 Dropping the cursor cancels unfinished physical and scatter work. Close the
 portal or its prepared statement explicitly before long-term session reuse.
+Direct `stream()` and `stream_logical()` calls provide the same bounded cursor
+without requiring a prepared portal.
 
 `ResultSet` keeps columns and rows positional, including duplicate column
 names. Nulls, blobs, invalid UTF-8 text, integers, and floating-point values are
