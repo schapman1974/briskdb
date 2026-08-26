@@ -118,9 +118,23 @@ typed dedicated-runtime and document-support modes are reserved and fail with
 The host may install any tracing subscriber it wants; the library emits through
 the normal `tracing` facade and never configures global logging itself.
 
-An engine `Session` accepts `BEGIN`, `COMMIT`, and `ROLLBACK`, retains and pins
-the first exact one-shard connection, and exposes failed-transaction recovery.
-Streaming cursors are not yet part of the embedded contract and remain
-tracked by #39. Autocommit commands, prepared portals, cancellation, bounded
-queueing, and materialized result limits use the same engine semantics as
-protocol adapters.
+`BriskDb::begin_transaction()` returns an owned `BriskTransaction` backed by a
+private core session. Its first routed statement pins one physical shard;
+cross-shard work fails the transaction, and committing a failed transaction
+rolls it back exactly as the protocol adapters do. `commit()` and `rollback()`
+consume the handle. Dropping an unfinished handle releases its private session
+and pool hygiene rolls back a pinned SQLite transaction before reusing that
+connection. Transaction commands use the catalog-aware prepared planner and
+therefore require cataloged tables.
+
+Prepared reads can be opened with `stream_bound_logical()`. The returned
+`BriskCursor` publishes ordered column metadata before the first row, buffers
+at most the engine's finite row-stream capacity, and exposes `next_row()` for
+asynchronous consumption. Dropping an unfinished cursor cancels all selected
+shard work and interrupts its active SQLite operation. Prepared portals remain
+session-owned and should be closed explicitly when the session will be reused.
+
+The public database, session, transaction, and cursor handles are `Send +
+Sync`. Autocommit commands, transactions, prepared portals, cursors,
+cancellation, bounded queueing, and result limits use the same engine semantics
+as protocol adapters.
