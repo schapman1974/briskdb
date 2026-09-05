@@ -1,5 +1,14 @@
 # Unreleased
 
+HTTP now has an explicit version-1 contract, discovery at `/v1`, a versioned
+`/v1/health` alias, and `BriskDB-API-Version: 1` on v1 responses. Existing valid
+SQL requests and result encodings are preserved. Unknown or duplicate envelope
+fields now fail before execution; JSON decoding, body-limit, media-type,
+missing-route, and method errors use fixed, redacted problem details. Clients
+that relied on ignored fields or framework error text must migrate as described
+in [the HTTP API contract](docs/HTTP_API.md). This HTTP change does not alter
+storage or engine behavior. Lossless JSON value encoding remains issue #51.
+
 Global indexes now have a production/release gate: redaction-safe Rust health
 reports, richer `/health` and `/v1/admin/global-indexes` responses, Prometheus
 `/metrics`, complete shard/manifest/global-index checkpoint reporting, and a

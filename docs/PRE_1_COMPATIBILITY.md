@@ -6,6 +6,11 @@ contract, Rust API, accepted SQL subset, and on-disk format may change between
 by an older binary or that every future binary will migrate every historical
 prototype layout.
 
+The [versioned HTTP transport](HTTP_API.md) has its own compatibility boundary:
+breaking request/response or default value-encoding changes require a new API
+major version and a documented migration. This does not stabilize the alpha
+SQL subset, storage layout, browser API, or public Rust library.
+
 This policy is narrower than the stable storage-format commitment planned for
 1.0 in issue #77.
 

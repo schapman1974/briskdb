@@ -1,6 +1,7 @@
-//! Experimental HTTP adapter.
+//! Versioned HTTP adapter over the protocol-neutral engine.
 
 mod admin;
+mod v1;
 
 use std::{fmt::Write as _, sync::Arc};
 
@@ -9,10 +10,11 @@ use axum::{
     extract::State,
     http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
+use v1::{BroadcastRequest, SqlRequest as QueryRequest, SqlRequest as RoutedSqlRequest, V1Json};
 
 use crate::{
     core::{
@@ -41,10 +43,7 @@ pub fn router_with_engine(engine: Engine) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
-        .route("/v1/execute", post(execute))
-        .route("/v1/query", post(query))
-        .route("/v1/admin/broadcast", post(broadcast))
-        .route("/v1/admin/global-indexes", get(global_indexes))
+        .merge(v1::routes())
         .merge(admin::routes(state.clone()))
         .with_state(state)
 }
@@ -102,31 +101,6 @@ async fn metrics(State(state): State<HttpState>) -> Result<Response, ApiError> {
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
     Ok(response)
-}
-
-#[derive(Debug, Deserialize)]
-struct RoutedSqlRequest {
-    #[serde(default)]
-    shard_key: Option<String>,
-    sql: String,
-    #[serde(default)]
-    params: Vec<JsonValue>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QueryRequest {
-    /// Retained for empty-catalog compatibility. Registered-table reads are
-    /// routed from catalog metadata and SQL predicates instead.
-    #[serde(default)]
-    shard_key: Option<String>,
-    sql: String,
-    #[serde(default)]
-    params: Vec<JsonValue>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BroadcastRequest {
-    sql: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -198,7 +172,7 @@ struct QueryColumn {
 
 async fn execute(
     State(state): State<HttpState>,
-    Json(request): Json<RoutedSqlRequest>,
+    V1Json(request): V1Json<RoutedSqlRequest>,
 ) -> Result<Json<ExecuteResponse>, ApiError> {
     let engine = state.engine;
     let params = request
@@ -249,7 +223,7 @@ fn execute_generated_key(generated: GeneratedKey) -> Result<ExecuteGeneratedKey,
 
 async fn query(
     State(state): State<HttpState>,
-    Json(request): Json<QueryRequest>,
+    V1Json(request): V1Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let engine = state.engine;
     let params = request
@@ -276,7 +250,7 @@ async fn query(
 
 async fn broadcast(
     State(state): State<HttpState>,
-    Json(request): Json<BroadcastRequest>,
+    V1Json(request): V1Json<BroadcastRequest>,
 ) -> Result<Json<JsonValue>, ApiError> {
     let engine = state.engine;
     let session = engine.session();
@@ -551,25 +525,25 @@ impl IntoResponse for ApiError {
             error_code = self.0.code(),
             "engine request failed"
         );
-        let status = StatusCode::from_u16(mapping.status)
-            .expect("the exhaustive HTTP error mapping contains valid status codes");
-        let mut response = (
-            status,
-            Json(ProblemDetails {
-                problem_type: mapping.problem_type,
-                title: mapping.title,
-                status: mapping.status,
-                detail: mapping.detail,
-                code: self.0.code(),
-            }),
-        )
-            .into_response();
-        response.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/problem+json"),
-        );
-        response
+        problem_response(ProblemDetails {
+            problem_type: mapping.problem_type,
+            title: mapping.title,
+            status: mapping.status,
+            detail: mapping.detail,
+            code: self.0.code(),
+        })
     }
+}
+
+fn problem_response(problem: ProblemDetails) -> Response {
+    let status = StatusCode::from_u16(problem.status)
+        .expect("the HTTP contract contains valid status codes");
+    let mut response = (status, Json(problem)).into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/problem+json"),
+    );
+    response
 }
 
 #[cfg(test)]
@@ -631,11 +605,15 @@ mod tests {
             }
             None => Body::empty(),
         };
-        router
+        let response = router
             .clone()
             .oneshot(request.body(body).unwrap())
             .await
-            .unwrap()
+            .unwrap();
+        if uri.starts_with("/v1/") {
+            assert_eq!(response.headers()["briskdb-api-version"], "1");
+        }
+        response
     }
 
     async fn response_json(response: Response) -> (StatusCode, JsonValue) {
@@ -2201,6 +2179,7 @@ mod tests {
         let (production_source, _) = include_str!("http.rs")
             .split_once(&test_module_marker)
             .expect("the HTTP unit-test module has a cfg(test) boundary");
+        let production_source = [production_source, include_str!("http/v1.rs")].concat();
 
         assert_eq!(
             production_source.matches("Database").count(),

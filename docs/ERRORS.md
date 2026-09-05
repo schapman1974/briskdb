@@ -159,6 +159,12 @@ adapter decision.
 
 ## HTTP problem details
 
+The [HTTP v1 transport contract](HTTP_API.md#errors) also defines fixed problems
+for malformed envelopes, missing routes, wrong methods, oversized bodies, and
+non-JSON media types. These failures happen before engine execution and do not
+add protocol-specific kinds to `EngineErrorKind`. Every v1 error carries the
+`BriskDB-API-Version: 1` header.
+
 Engine failures returned by HTTP use
 [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457.html) and the
 `application/problem+json` media type. The response has `type`, `title`,
