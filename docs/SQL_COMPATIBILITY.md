@@ -343,6 +343,11 @@ is reconciled from the retained journal prefix.
 
 ### Current HTTP parameter and result conversion
 
+The [HTTP v1 contract](HTTP_API.md) versions the existing representation as
+`legacy-json-v1`. Request envelopes are strict and decoding failures use fixed
+problem details. Versioning this encoding does not make it lossless; the
+conversion rules and limitations below remain part of v1.
+
 Use SQLite positional placeholders such as `?1` and `?2`. Values are never
 interpolated into SQL text. The HTTP adapter converts JSON parameters into
 protocol-neutral BriskDB values; the SQL layer binds only those typed values.

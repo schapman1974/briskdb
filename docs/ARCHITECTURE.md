@@ -100,6 +100,12 @@ address or `None`.
 
 ## Listener boundary
 
+HTTP routes under `/v1` have an explicit transport contract in
+[HTTP_API.md](HTTP_API.md). `protocol::http::v1` owns version discovery, the
+shared strict SQL envelope, body extraction, version headers, and transport
+errors. Existing handlers still create core sessions and send typed statements
+through the shared engine; versioning adds no routing or SQLite implementation.
+
 The HTTP address remains `Config::listen`. The independent
 `Config::postgres_listen` is either a numeric socket address or disabled with
 `None`; the binary maps the exact `disabled` CLI/environment sentinel to that

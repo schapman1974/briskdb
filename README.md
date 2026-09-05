@@ -205,6 +205,9 @@ curl -X POST http://127.0.0.1:7654/v1/query \
   -d '{"sql":"SELECT id, name FROM widgets WHERE id = ?1","params":["widget-1"]}'
 ```
 
+The [versioned HTTP contract](docs/HTTP_API.md) defines requests, response
+shapes, value encodings, and errors. `GET /v1` reports the supported API version.
+
 Have an existing SQLite database? Use the offline
 [SQLite importer](docs/SQLITE_IMPORT.md). Linux releases also include `.deb`
 packages with a hardened systemd service.

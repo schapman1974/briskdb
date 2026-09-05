@@ -316,8 +316,10 @@ protocol-specific golden tests only for encoding and state-machine behavior.
   #110).
   This preview does not complete the versioned admin API, listener separation,
   authentication/role, pagination, or scatter/gather items below.
-- [ ] Replace the experimental endpoints with a versioned `/v1` contract built
-  on the shared session/engine types.
+- [x] Replace the experimental endpoints with a versioned `/v1` contract built
+  on the shared session/engine types, with discovery, strict envelopes, and
+  fixed transport errors; see [the HTTP contract](docs/HTTP_API.md). The default
+  `legacy-json-v1` value encoding is preserved; lossless encoding remains #51.
 - [ ] Return ordered columns and row arrays so duplicate names and binary values
   round-trip without loss; define JSON encodings for integers, decimals,
   timestamps, and blobs.
