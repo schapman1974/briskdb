@@ -116,6 +116,7 @@ jobs:
           - stable
         surface:
           - core
+          - documents
           - embedded
           - listeners
           - http
@@ -152,7 +153,7 @@ jobs:
         run: |
           forbidden_dependencies="$(
             cargo tree --locked --no-default-features --features embedded --edges normal --prefix none |
-              awk '$1 ~ /^(anyhow|axum|clap|hyper|hyper-util|pgwire|tokio-util|tower|tracing-subscriber)$/ { print $1 }' |
+              awk '$1 ~ /^(anyhow|axum|bson|clap|hyper|hyper-util|num-bigint|num-rational|num-traits|pgwire|time|tokio-util|tower|tracing-subscriber)$/ { print $1 }' |
               sort -u
           )"
           if [ -n "$forbidden_dependencies" ]; then
@@ -186,6 +187,9 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Compile BSON fuzz targets
+        run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
 
       - name: Verify publishable crate package
         run: cargo package --locked --allow-dirty

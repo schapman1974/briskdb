@@ -446,8 +446,9 @@ requires an earlier dependency:
     - [x] [#161](https://github.com/schapman1974/briskdb/issues/161) — freeze
       the TinyMongo v1.3.0 contract, capability inventory, reference results,
       and strict differential report
-    - [ ] [#164](https://github.com/schapman1974/briskdb/issues/164) — canonical
-      BSON model, codec, and ordering
+    - [x] [#164](https://github.com/schapman1974/briskdb/issues/164) — canonical
+      BSON model, codec, ordering, and versioned semantic keys; see
+      [`docs/BSON.md`](docs/BSON.md)
     - [ ] [#163](https://github.com/schapman1974/briskdb/issues/163) — document
       catalog and storage layout
     - [ ] [#162](https://github.com/schapman1974/briskdb/issues/162) —

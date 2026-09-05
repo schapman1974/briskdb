@@ -1,0 +1,32 @@
+[package]
+name = "briskdb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+briskdb = { path = "..", default-features = false, features = ["documents"] }
+
+[[bin]]
+name = "bson_codec"
+path = "fuzz_targets/bson_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bson_comparison"
+path = "fuzz_targets/bson_comparison.rs"
+test = false
+doc = false
+bench = false
+
+# Keep cargo-fuzz out of the repository's root workspace. Cargo invokes this
+# manifest directly (`cargo fuzz ...`) and uses this package's checked-in lock.
+[workspace]
+members = []

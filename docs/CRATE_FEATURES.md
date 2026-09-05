@@ -25,7 +25,7 @@ briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["em
 | `sqlite-import` | Offline SQLite import library | Alpha-supported |
 | `sqlite-import-cli` | `briskdb-import` binary | Process integration |
 | `experimental-vtab` | Sharded virtual-table prototype | Experimental |
-| `documents` | Reserved Mongo/document boundary | Reserved; no API yet |
+| `documents` | BSON values, codec, comparison, and canonical semantic keys; also selects `embedded` | Experimental foundation; no document engine or listener yet |
 | `mysql` | Reserved MySQL boundary | Reserved; no listener yet |
 | `tls` | Compatibility alias for the secure `postgres` surface | Alpha-supported; selected by `listeners` |
 
@@ -44,8 +44,13 @@ listener assembly.
 - The public `core`, `sql`, and `storage` modules expose implementation-facing
   building blocks used by current adapters. Prefer crate-root and `embedded`
   APIs unless implementing a BriskDB adapter.
-- The `documents` and `mysql` reserved features compile but intentionally
-  expose no claimed implementation.
+- The `documents` feature exposes the protocol-neutral BSON foundation
+  documented in [BSON value and codec contract](BSON.md). Its value, codec,
+  comparison, and key APIs are experimental while the document engine is built.
+  It does not yet expose collections, persistence, commands, or a MongoDB
+  listener.
+- The `mysql` reserved feature compiles but intentionally exposes no claimed
+  implementation.
 
 See [Pre-1.0 compatibility](PRE_1_COMPATIBILITY.md) for the versioning policy.
 

@@ -1,4 +1,6 @@
 pub mod core;
+#[cfg(feature = "documents")]
+pub mod document;
 #[cfg(feature = "embedded")]
 pub mod embedded;
 #[cfg(feature = "sqlite-import")]
