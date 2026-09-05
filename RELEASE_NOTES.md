@@ -1,5 +1,12 @@
 # Unreleased
 
+Mongo compatibility now has a versioned, source-locked TinyMongo v1.3.0
+contract. Its manifest inventories the supported document surface, 228 logical
+cases cover both sync and async APIs across a 3,192-execution backend matrix,
+and CI validates the checked-in corpus and publishes a readable parity report.
+The current report is reference-only; it does not claim BriskDB parity before a
+candidate endpoint is available and tested. See [the Mongo parity contract](docs/MONGO_PARITY.md).
+
 HTTP now has an explicit version-1 contract, discovery at `/v1`, a versioned
 `/v1/health` alias, and `BriskDB-API-Version: 1` on v1 responses. Existing valid
 SQL requests and result encodings are preserved. Unknown or duplicate envelope

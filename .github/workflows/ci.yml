@@ -21,6 +21,89 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  mongo-contract:
+    name: Mongo compatibility contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Python 3.9 replay environment
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          # The 3.9.6 harvest is preserved in the manifest. GitHub's Python
+          # toolcache does not publish that patch for Ubuntu 24.04.
+          python-version: "3.9.25"
+
+      - name: Check out locked TinyMongo oracle
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: schapman1974/tinymongo
+          ref: 53cbf44e98b8caa036163725d195fd29592e1cc0
+          path: target/tinymongo-source
+          persist-credentials: false
+
+      - name: Install contract-only oracle dependencies
+        run: |
+          python -m pip install -r compat/mongo/v1/runner/requirements.txt
+          python -m pip install --no-build-isolation --no-deps \
+            ./target/tinymongo-source
+
+      - name: Validate versioned Mongo contract
+        run: python scripts/mongo_parity.py validate
+
+      - name: Test Mongo contract harness
+        run: python -m unittest discover -s tests -p 'test_mongo*.py' -v
+
+      - name: Verify locked TinyMongo source
+        run: >-
+          python scripts/mongo_parity.py verify-source
+          --source-root target/tinymongo-source
+
+      - name: Execute owned fixtures against TinyMongo memory
+        run: |
+          mkdir -p target/mongo-parity
+          python -m pytest -q -p no:cacheprovider -c /dev/null \
+            compat/mongo/v1/runner/contracts \
+            --mongo-contract-target=tinymongo \
+            --mongo-contract-backend=memory \
+            --mongo-contract-require-target \
+            --junitxml=target/mongo-parity/tinymongo-memory.xml
+          python scripts/mongo_parity.py ingest \
+            --implementation tinymongo \
+            --junit target/mongo-parity/tinymongo-memory.xml \
+            --output target/mongo-parity/tinymongo-memory.json
+          cmp compat/mongo/v1/reference-results.json \
+            target/mongo-parity/tinymongo-memory.json
+
+      - name: Generate Mongo parity report
+        run: |
+          mkdir -p target/mongo-parity
+          python scripts/mongo_parity.py report \
+            --json-output target/mongo-parity/report.json \
+            --markdown-output target/mongo-parity/report.md
+
+      - name: Add Mongo parity report to summary
+        if: always()
+        run: |
+          if [ -f target/mongo-parity/report.md ]; then
+            cat target/mongo-parity/report.md >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Mongo parity report was not generated." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload Mongo parity report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mongo-parity-report
+          path: target/mongo-parity/*
+          if-no-files-found: ignore
+          retention-days: 14
+
   features:
     name: Features (${{ matrix.surface }}, Rust ${{ matrix.rust }})
     runs-on: ubuntu-24.04

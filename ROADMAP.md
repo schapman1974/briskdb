@@ -442,6 +442,22 @@ requires an earlier dependency:
     parity.** Build the document engine, BSON and wire layers, query and write
     semantics, indexes, aggregation, sharding behavior, and differential
     compatibility suites.
+
+    - [x] [#161](https://github.com/schapman1974/briskdb/issues/161) — freeze
+      the TinyMongo v1.3.0 contract, capability inventory, reference results,
+      and strict differential report
+    - [ ] [#164](https://github.com/schapman1974/briskdb/issues/164) — canonical
+      BSON model, codec, and ordering
+    - [ ] [#163](https://github.com/schapman1974/briskdb/issues/163) — document
+      catalog and storage layout
+    - [ ] [#162](https://github.com/schapman1974/briskdb/issues/162) —
+      protocol-neutral document engine
+    - [ ] [#191](https://github.com/schapman1974/briskdb/issues/191) — embedded
+      Rust document API
+    - [ ] [#198](https://github.com/schapman1974/briskdb/issues/198) — Python
+      BSON conversions and document API
+    - [ ] [#200](https://github.com/schapman1974/briskdb/issues/200) — release
+      wheels and Mongo smoke coverage
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.

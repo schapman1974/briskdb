@@ -1,0 +1,244 @@
+{
+  "adaptation": {
+    "excluded_upstream_files": [
+      {
+        "reason": "Replaced by the runner-specific README with neutral target commands.",
+        "upstream_git_blob": "b7f435d1d92ba5bc9831d7e0afbafbd32669fe17",
+        "upstream_path": "tests/contracts/README.md",
+        "upstream_sha256": "74416b17722036fb552e97703b763a6ea4f13959568920a60bf0cfe725cc3f87"
+      },
+      {
+        "reason": "Reference-only expected outcomes remain in the frozen parity metadata; the executable corpus preserves strict assertions.",
+        "upstream_git_blob": "25dda37fddf9d4f920fb470bdb5fc7d433f3d4c1",
+        "upstream_path": "tests/contracts/known_differences.py",
+        "upstream_sha256": "06f875b4e0c75337d83ff91f95767c14ef396362ece9b300475c529f38b5311a"
+      }
+    ],
+    "files": [
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/__init__.py",
+        "runner_sha256": "ce7185ce04b04dbce35c37a155ff35b26bf878939a3c188b66c8286f06db1999",
+        "status": "exact",
+        "upstream_git_blob": "fc8fe671710305f85b98e1fa1376fd64981ec0f0",
+        "upstream_path": "tests/contracts/__init__.py",
+        "upstream_sha256": "ce7185ce04b04dbce35c37a155ff35b26bf878939a3c188b66c8286f06db1999"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/conftest.py",
+        "runner_sha256": "b090e7ee63cd673819aa49419cccca626a29793bacfcc4030dad4a7441def4b0",
+        "status": "adapted",
+        "upstream_git_blob": "6c555a3a6d887a510b7b9403499815cd8cdb14d5",
+        "upstream_path": "tests/contracts/conftest.py",
+        "upstream_sha256": "002944603a433d408c1c2b9ce067a27195c6bf78753f27086a2a5b380d5b31d5"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/support.py",
+        "runner_sha256": "5e0e76fbef6829754fb1cc314fb4d9d4ab196883cadd15879b72fd763de41e72",
+        "status": "adapted",
+        "upstream_git_blob": "af2d610d31ad7eb490e68678052cc1d8830d630f",
+        "upstream_path": "tests/contracts/support.py",
+        "upstream_sha256": "822c4b9739243ab3885f3b4912deb9de8b9c22a1a2d11a9b9b725a9f57c39e5a"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_aggregation_basic_stages_contract.py",
+        "runner_sha256": "5549d7f226a278be17315b5cbb2847d564770cf5acb1ff0eb47bd467cb0ddf40",
+        "status": "exact",
+        "upstream_git_blob": "07a4f172d4278d7ad76360959ecddffa3da27fab",
+        "upstream_path": "tests/contracts/test_aggregation_basic_stages_contract.py",
+        "upstream_sha256": "5549d7f226a278be17315b5cbb2847d564770cf5acb1ff0eb47bd467cb0ddf40"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_aggregation_contract.py",
+        "runner_sha256": "2d4255f17629bf0c51489a7e334ff3087fb1c20800ff669ba58f3abe6c25940f",
+        "status": "exact",
+        "upstream_git_blob": "13f67cde5e4783462fd1375f77daae0b6df223ed",
+        "upstream_path": "tests/contracts/test_aggregation_contract.py",
+        "upstream_sha256": "2d4255f17629bf0c51489a7e334ff3087fb1c20800ff669ba58f3abe6c25940f"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_aggregation_projection_stages_contract.py",
+        "runner_sha256": "4ef68dcf01c60edf25bfe88978d32d5276d2a6076110c2eef62e8bfb3d7f4e5e",
+        "status": "exact",
+        "upstream_git_blob": "3fd4d4fc4f0816c89279089e40fa600f2bdf5086",
+        "upstream_path": "tests/contracts/test_aggregation_projection_stages_contract.py",
+        "upstream_sha256": "4ef68dcf01c60edf25bfe88978d32d5276d2a6076110c2eef62e8bfb3d7f4e5e"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_array_update_contract.py",
+        "runner_sha256": "082be9f4c040b773eff76610a3a10bb960a7f20e7219ae8cd27fe42f69eeb9bf",
+        "status": "adapted",
+        "upstream_git_blob": "a0a712a677f626f7429306a02fa2d6ec2ee8838c",
+        "upstream_path": "tests/contracts/test_array_update_contract.py",
+        "upstream_sha256": "0ff202cc19da7acc104f899225a73c0a77c476318784b57049ac65180978c8aa"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_beanie_odm_contract.py",
+        "runner_sha256": "9a08b0651be070d6353bf5d6481b99c0b1f6bdcd61b745cdade670919bb8c5b1",
+        "status": "exact",
+        "upstream_git_blob": "b85b370bb040540d2c3287b2af808d43069f1a3d",
+        "upstream_path": "tests/contracts/test_beanie_odm_contract.py",
+        "upstream_sha256": "9a08b0651be070d6353bf5d6481b99c0b1f6bdcd61b745cdade670919bb8c5b1"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_bson_comparison_contract.py",
+        "runner_sha256": "99b6064dd0177ad8fd6d1c07d1564e89d8a5b0ee24b3cc3beb981db6245d4e0e",
+        "status": "adapted",
+        "upstream_git_blob": "215e7523cf9130b69855a67c75c4a67a0cadb2dd",
+        "upstream_path": "tests/contracts/test_bson_comparison_contract.py",
+        "upstream_sha256": "8222a1292691b9440014f6272b16ec7c690b9d5b30fa94211ae2cfdfca1ac620"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_bson_value_types_contract.py",
+        "runner_sha256": "e9cba14c83d12e8735da92a7ee6c36879ff2d14ed861509c21572a3e7c67988d",
+        "status": "adapted",
+        "upstream_git_blob": "2f91d6c549b127cbc445549f3b1ab8bf8924ee59",
+        "upstream_path": "tests/contracts/test_bson_value_types_contract.py",
+        "upstream_sha256": "a6fc6f03a112edb2a28a3f52e565fe58b7fd0f2f0c370f70301742aa0ea1fcb0"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_client_read_fidelity_contract.py",
+        "runner_sha256": "db43c0924aba50237fedca0cdf75d23cab07e6f40998b2110abd40405b45fcee",
+        "status": "exact",
+        "upstream_git_blob": "ba844c72deb7f099a56c3e5dd413d4aa99f7ab6c",
+        "upstream_path": "tests/contracts/test_client_read_fidelity_contract.py",
+        "upstream_sha256": "db43c0924aba50237fedca0cdf75d23cab07e6f40998b2110abd40405b45fcee"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_crud_contract.py",
+        "runner_sha256": "fc86fa35854430bb274eb546dafb37c017546ebf9a6190968c6f1b3c42072a19",
+        "status": "adapted",
+        "upstream_git_blob": "6e7ba4097f0613043ec77caeedc0198de07c0a41",
+        "upstream_path": "tests/contracts/test_crud_contract.py",
+        "upstream_sha256": "de95254dfeaef9edcfa0a3fcb86badd993010dd555d2e0481916480339cb37a2"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_decimal128_contract.py",
+        "runner_sha256": "93af51d3142a90dc1ca01cb41c25a609631a5563567117592165ea4ee54f28e1",
+        "status": "adapted",
+        "upstream_git_blob": "0146f49757443c6eec420e91da1f6112f199c373",
+        "upstream_path": "tests/contracts/test_decimal128_contract.py",
+        "upstream_sha256": "05bdee5251731d81ed44070fadaccc83032ff07be0281b7894eb8e5933c67c86"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_group_accumulators_contract.py",
+        "runner_sha256": "878d1d22022c078b60352c06b974962dd5e34a3a0dd3d8589988bd60e77f351f",
+        "status": "adapted",
+        "upstream_git_blob": "e784932d6698f00eaacbe00e1f444edcde09d551",
+        "upstream_path": "tests/contracts/test_group_accumulators_contract.py",
+        "upstream_sha256": "50634de1ff2666915ce99913421eb9981d0099df9a0160387cc291bceb617e57"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_projection_contract.py",
+        "runner_sha256": "a08becc90d32497b16a93bdad1dc990cce597f4f7fb0e099c61a8ecf3c780b3a",
+        "status": "exact",
+        "upstream_git_blob": "7146c4cad8605204f44d82c8e184285975874677",
+        "upstream_path": "tests/contracts/test_projection_contract.py",
+        "upstream_sha256": "a08becc90d32497b16a93bdad1dc990cce597f4f7fb0e099c61a8ecf3c780b3a"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_query_operator_contract.py",
+        "runner_sha256": "5a722a514ae23ea8b6f3b9240eeb07cb56ca343d7e2bb1af4a44309c12fd278c",
+        "status": "adapted",
+        "upstream_git_blob": "b1b7b237afbf4516962c764731906c180372db14",
+        "upstream_path": "tests/contracts/test_query_operator_contract.py",
+        "upstream_sha256": "c8845833a1b6dd0257236508b52766c840ec0f643940bd120e2e1b5f55019851"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_talkpython_contract.py",
+        "runner_sha256": "146fcde2fc8c0ec546a2d236084f49f6a902c569ac3c11f719be65eed4055943",
+        "status": "adapted",
+        "upstream_git_blob": "672de437d8a1583d605095cfee795ab8c22fb063",
+        "upstream_path": "tests/contracts/test_talkpython_contract.py",
+        "upstream_sha256": "56ea087b75a6797d8bcb9557a39b73a5622514e95917fa7151c795d3531ec99a"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_update_operator_contract.py",
+        "runner_sha256": "f17fa5c18022d5828b1c0a7232dd95a2115656eb52db5c5b2299b419692d56c2",
+        "status": "adapted",
+        "upstream_git_blob": "d6705f8782594bcdb22d307ac01539e7adffced0",
+        "upstream_path": "tests/contracts/test_update_operator_contract.py",
+        "upstream_sha256": "72fc64be51f48eebe7eebda94e2cff4a0ab1a49baae38ec2b43ddc6b0938e669"
+      },
+      {
+        "runner_path": "compat/mongo/v1/runner/contracts/test_uuid_regex_contract.py",
+        "runner_sha256": "417feac57bd0a5c162d638319e454c0add904f2ffb9892c9e9be09c49011a27c",
+        "status": "adapted",
+        "upstream_git_blob": "f395cc801a004fd9b06944ee02c9c804a5409d5d",
+        "upstream_path": "tests/contracts/test_uuid_regex_contract.py",
+        "upstream_sha256": "a36ecde8854dadd1d3efa1700c6d72d84ba2f23726159234272d4b4921f8ec29"
+      }
+    ],
+    "patch": "compat/mongo/v1/runner/adaptation.patch",
+    "patch_sha256": "05309161733d39769c159f3ba07ef0afb97abd9804256df9cf9da3f8b6382291",
+    "rules": [
+      "Preserve test assertions, values, and parameter IDs.",
+      "Replace target-owned fixtures with a neutral adapter fixture.",
+      "Use public BSON and PyMongo error types in neutral contract modules.",
+      "Confine TinyMongo imports to adapters/tinymongo.py.",
+      "Record implementation identity separately from transport-specific behavior.",
+      "Emit canonical upstream contract IDs as JUnit properties."
+    ]
+  },
+  "corpus": "tinymongo-v1",
+  "inventory": {
+    "apis": [
+      "sync",
+      "async"
+    ],
+    "case_catalog": "compat/mongo/v1/corpus.json",
+    "expected_tinymongo_memory_executions": 456,
+    "logical_cases": 228
+  },
+  "reference_environment": {
+    "pymongo": "4.17.0",
+    "pytest": "8.4.2",
+    "python": "3.9.6",
+    "requirements": "compat/mongo/v1/runner/requirements.txt"
+  },
+  "runner_files": [
+    {
+      "path": "compat/mongo/v1/runner/__init__.py",
+      "sha256": "cd210a7e402cb23134d602ed811a1126385ab25c850e8d7558a7011f5e7fbe2e"
+    },
+    {
+      "path": "compat/mongo/v1/runner/README.md",
+      "sha256": "1f53bad86de1960149456bf2be968070bf50819ffc0c940c44ada82c92a4b684"
+    },
+    {
+      "path": "compat/mongo/v1/runner/requirements.txt",
+      "sha256": "69d187f01a8aff10c3fee3df076da2909793470d62939b581324badf2dddd626"
+    },
+    {
+      "path": "compat/mongo/v1/runner/adapters/__init__.py",
+      "sha256": "1ea573312526ef3398db494429eca74efb4d821b03a6de70507f43004d6d3c81"
+    },
+    {
+      "path": "compat/mongo/v1/runner/adapters/briskdb.py",
+      "sha256": "823d6bf0b443d210929c9438f1b4be2dbb8957890b296eae975dbe4a3759d3db"
+    },
+    {
+      "path": "compat/mongo/v1/runner/adapters/mongodb.py",
+      "sha256": "a6a75defaac2a81553af78da420254a1ba26f5a1390a92bf27f382302237d288"
+    },
+    {
+      "path": "compat/mongo/v1/runner/adapters/tinymongo.py",
+      "sha256": "d11e90bba4d6cf0a22418d7f79e18af33c4685d6cfef0128fdb2a79bf6cfe457"
+    }
+  ],
+  "schema_version": 1,
+  "source": {
+    "commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
+    "contract_git_tree": "6f671122ff5f76902cfe051e4558a2c57d161bc4",
+    "license": {
+      "runner_path": "compat/mongo/v1/runner/UPSTREAM_LICENSE.txt",
+      "runner_sha256": "60fa36a0e364df592e2db06ad8269242c082917031ab8291bad60ddafbf728fd",
+      "spdx": "MIT",
+      "upstream_git_blob": "0d9fa009e02c7a58019b420332d542a637f71be1",
+      "upstream_path": "LICENSE.txt",
+      "upstream_sha256": "60fa36a0e364df592e2db06ad8269242c082917031ab8291bad60ddafbf728fd"
+    },
+    "release": "v1.3.0",
+    "repository": "https://github.com/schapman1974/tinymongo",
+    "runtime_git_tree": "0c94915ea81697a5728f64dc04e3929bf1e036e8"
+  }
+}
