@@ -1,0 +1,78 @@
+{
+  "contract": "tinymongo-v1",
+  "schema_version": 1,
+  "variants": [
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "backend": "mongodb",
+      "backend_behavior": "A native Python regular expression is decoded as bson.Regex.",
+      "case_id": "tests.contracts.test_bson_value_types_contract::test_tm035_new_bson_values_round_trip_at_every_depth",
+      "dimension": "native-regex-result-type",
+      "issue": "https://github.com/schapman1974/briskdb/issues/161",
+      "reference_behavior": "Embedded TinyMongo backends retain the native compiled regular-expression type."
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "backend": "mongodb",
+      "backend_behavior": "A native Python regular expression is decoded as bson.Regex; predicate and identity behavior remains shared.",
+      "case_id": "tests.contracts.test_uuid_regex_contract::test_regex_predicates_and_exact_equality_follow_mongodb",
+      "dimension": "native-regex-result-type",
+      "issue": "https://github.com/schapman1974/briskdb/issues/161",
+      "reference_behavior": "Embedded TinyMongo backends retain the native compiled regular-expression type."
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "backend": "mongodb",
+      "backend_behavior": "MongoDB rejects Regex values in _id, so the frozen test records an ordinary skip for this TinyMongo extension.",
+      "case_id": "tests.contracts.test_uuid_regex_contract::test_local_regex_ids_use_exact_identity_for_duplicate_detection",
+      "dimension": "regex-id-support",
+      "issue": "https://github.com/schapman1974/briskdb/issues/161",
+      "reference_behavior": "Embedded TinyMongo backends accept Regex _id values and use exact BSON identity for duplicate detection."
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "backend": "mongodb",
+      "backend_behavior": "MongoDB creates the mixed index batch without TinyMongo degradation warnings.",
+      "case_id": "tests.contracts.test_talkpython_contract::test_create_indexes_accepts_the_real_mixed_batch_and_enforces_unique",
+      "dimension": "degraded-index-warnings",
+      "issue": "https://github.com/schapman1974/briskdb/issues/161",
+      "reference_behavior": "Embedded TinyMongo backends emit four TinyMongoUnsupportedWarning values: one for each of the two descending index specifications, one for hashed, and one for TTL. Compound indexes themselves are supported."
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "backend": "mongodb",
+      "backend_behavior": "MongoDB rejects the invalid document without TinyMongo's additional PyMongoError inheritance, document identity, and message-context guarantees.",
+      "case_id": "tests.contracts.test_talkpython_contract::test_invalid_document_has_a_bson_compatible_error",
+      "dimension": "invalid-document-details",
+      "issue": "https://github.com/schapman1974/briskdb/issues/161",
+      "reference_behavior": "Embedded TinyMongo backends expose PyMongoError inheritance, the original document, collection and field context; the sync path also avoids creating the collection."
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "backend": "mongodb",
+      "backend_behavior": "PyMongo rejects bytearray query values before sending them to MongoDB.",
+      "case_id": "tests.contracts.test_talkpython_contract::test_generic_binary_equality_matches_native_bytes_and_query_operators",
+      "dimension": "bytearray-query-convenience",
+      "issue": "https://github.com/schapman1974/briskdb/issues/161",
+      "reference_behavior": "Embedded TinyMongo backends accept bytearray query values and canonicalize them to generic BSON binary."
+    }
+  ]
+}

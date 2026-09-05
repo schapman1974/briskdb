@@ -1,0 +1,28 @@
+{
+  "contract": "tinymongo-v1",
+  "differences": [
+    {
+      "api": "async",
+      "candidate_fingerprint": "369a49b16ea483645a6c7aadd206f54ef216822d7b214feab1b2de009369822f",
+      "candidate_outcome": "skipped",
+      "case_id": "tests.contracts.test_uuid_regex_contract::test_local_regex_ids_use_exact_identity_for_duplicate_detection",
+      "issue": "https://github.com/schapman1974/briskdb/issues/161",
+      "reason": "MongoDB forbids Regex values in _id; the frozen TinyMongo fixture marks its local extension as an ordinary MongoDB skip.",
+      "reference_fingerprint": "826a3508ea8bc4f0accdfdd786c09ff35efa1d9fc3b73ac0cc5761b2c2ad0b19",
+      "reference_outcome": "passed",
+      "target": "mongodb-mongodb"
+    },
+    {
+      "api": "sync",
+      "candidate_fingerprint": "369a49b16ea483645a6c7aadd206f54ef216822d7b214feab1b2de009369822f",
+      "candidate_outcome": "skipped",
+      "case_id": "tests.contracts.test_uuid_regex_contract::test_local_regex_ids_use_exact_identity_for_duplicate_detection",
+      "issue": "https://github.com/schapman1974/briskdb/issues/161",
+      "reason": "MongoDB forbids Regex values in _id; the frozen TinyMongo fixture marks its local extension as an ordinary MongoDB skip.",
+      "reference_fingerprint": "826a3508ea8bc4f0accdfdd786c09ff35efa1d9fc3b73ac0cc5761b2c2ad0b19",
+      "reference_outcome": "passed",
+      "target": "mongodb-mongodb"
+    }
+  ],
+  "schema_version": 1
+}

@@ -1,0 +1,886 @@
+--- a/tests/contracts/conftest.py
++++ b/compat/mongo/v1/runner/contracts/conftest.py
+@@ -1,270 +1,160 @@
+-"""Factories that run one contract against every supported target."""
++"""Target-neutral fixture for the frozen TinyMongo v1 contract corpus."""
+ 
+-import asyncio
+-import inspect
+ import os
+-import time
+-from uuid import uuid4
++import re
+ 
+ import pytest
+-import tinymongo
+-from tinymongo.asyncio import AsyncMongoClient, AsyncTinyMongoClient
+ 
++from ..adapters import TargetUnavailable, open_target
+ from .support import ContractTarget
+ 
+ 
+ APIS = ("sync", "async")
+-BACKENDS = (
+-    "memory",
+-    "json",
+-    "sqlite",
+-    "sqlite-sharded",
+-    "duckdb",
+-    "parquet",
+-    "mongodb",
+-)
+-TARGETS = [
+-    pytest.param(
+-        (api, backend),
+-        id="{0}-{1}".format(api, backend),
+-        marks=(
+-            (pytest.mark.integration, pytest.mark.mongodb)
+-            if backend == "mongodb"
+-            else ()
+-        ),
+-    )
+-    for api in APIS
+-    for backend in BACKENDS
+-]
++TARGETS = ("tinymongo", "mongodb", "briskdb")
+ 
+ 
+-class _AsyncRunner:
+-    """Run one async target on a stable event loop from synchronous contracts."""
++def pytest_addoption(parser):
++    group = parser.getgroup("mongo-contract")
++    group.addoption(
++        "--mongo-contract-target",
++        choices=TARGETS,
++        default=os.environ.get("BRISKDB_MONGO_CONTRACT_TARGET", "tinymongo"),
++        help="implementation adapter used by the frozen Mongo contract",
++    )
++    group.addoption(
++        "--mongo-contract-api",
++        choices=("sync", "async", "both"),
++        default=os.environ.get("BRISKDB_MONGO_CONTRACT_API", "both"),
++        help="API flavor to execute (default: both)",
++    )
++    group.addoption(
++        "--mongo-contract-backend",
++        default=os.environ.get("BRISKDB_MONGO_CONTRACT_BACKEND", "memory"),
++        help="TinyMongo backend ID (default: memory)",
++    )
++    group.addoption(
++        "--mongo-contract-mongodb-uri",
++        default=os.environ.get("BRISKDB_MONGODB_URI"),
++        help="URI for the optional real MongoDB adapter",
++    )
++    group.addoption(
++        "--mongo-contract-briskdb-uri",
++        default=os.environ.get("BRISKDB_MONGO_PARITY_BRISKDB_URI"),
++        help="URI for the BriskDB Mongo-compatible candidate",
++    )
++    group.addoption(
++        "--mongo-contract-require-target",
++        action="store_true",
++        default=False,
++        help="turn an unavailable optional target into a test failure",
++    )
+ 
+-    def __init__(self):
+-        self.loop = asyncio.new_event_loop()
+ 
+-    def run(self, awaitable):
+-        return self.loop.run_until_complete(awaitable)
++def pytest_configure(config):
++    config.addinivalue_line("markers", "contract: frozen Mongo compatibility contract")
++    config.addinivalue_line(
++        "markers",
++        "client_options(**kwargs): constructor options required by one contract",
++    )
+ 
+-    def close(self):
+-        self.loop.close()
+ 
++def _backend_id(config):
++    target = config.getoption("--mongo-contract-target")
++    if target == "mongodb":
++        return "mongodb"
++    if target == "briskdb":
++        return "briskdb"
++    return config.getoption("--mongo-contract-backend")
+ 
+-class _AsyncCursorAdapter:
+-    """Expose async cursor behavior to the transport-neutral contract body."""
+ 
+-    def __init__(self, cursor, runner):
+-        self._cursor = cursor
+-        self._runner = runner
++def _target_uri(config, target):
++    if target == "briskdb":
++        return config.getoption("--mongo-contract-briskdb-uri")
++    return config.getoption("--mongo-contract-mongodb-uri")
+ 
+-    def sort(self, *args, **kwargs):
+-        self._cursor.sort(*args, **kwargs)
+-        return self
+ 
+-    def skip(self, *args, **kwargs):
+-        self._cursor.skip(*args, **kwargs)
+-        return self
+-
+-    def limit(self, *args, **kwargs):
+-        self._cursor.limit(*args, **kwargs)
+-        return self
+-
+-    def to_list(self, length=None):
+-        return self._runner.run(self._cursor.to_list(length=length))
+-
+-    def __iter__(self):
+-        return iter(self.to_list())
+-
+-
+-class _AsyncCollectionAdapter:
+-    """Await collection calls while preserving immediate cursor construction."""
+-
+-    def __init__(self, collection, runner):
+-        self._collection = collection
+-        self._runner = runner
+-
+-    def find(self, *args, **kwargs):
+-        return _AsyncCursorAdapter(self._collection.find(*args, **kwargs), self._runner)
+-
+-    def aggregate(self, *args, **kwargs):
+-        cursor = self._collection.aggregate(*args, **kwargs)
+-        if inspect.isawaitable(cursor):
+-            cursor = self._runner.run(cursor)
+-        return _AsyncCursorAdapter(cursor, self._runner)
+-
+-    def __getattr__(self, name):
+-        attribute = getattr(self._collection, name)
+-        if not callable(attribute):
+-            return attribute
+-
+-        def call(*args, **kwargs):
+-            result = attribute(*args, **kwargs)
+-            if inspect.isawaitable(result):
+-                return self._runner.run(result)
+-            return result
+-
+-        return call
+-
+-
+-def _mongo_client(uri, client_options=None):
+-    try:
+-        from pymongo import MongoClient
+-    except ImportError:  # pragma: no cover - guarded by dev requirements
+-        pytest.fail("Real MongoDB contracts require PyMongo; run `pip install pymongo`")
+-
+-    client = MongoClient(
+-        uri,
+-        serverSelectionTimeoutMS=1000,
+-        **dict(client_options or {}),
++def pytest_generate_tests(metafunc):
++    if "contract_target" not in metafunc.fixturenames:
++        return
++    requested = metafunc.config.getoption("--mongo-contract-api")
++    apis = APIS if requested == "both" else (requested,)
++    backend = _backend_id(metafunc.config)
++    metafunc.parametrize(
++        "contract_target",
++        [(api, backend) for api in apis],
++        indirect=True,
++        ids=["{0}-{1}".format(api, backend) for api in apis],
+     )
+-    deadline = time.monotonic() + 15
+-    last_error = None
+-    while time.monotonic() < deadline:
+-        try:
+-            client.admin.command("ping")
+-            return client
+-        except Exception as error:  # noqa: BLE001 - retry server startup
+-            last_error = error
+-            time.sleep(0.25)
+-    client.close()
+-    raise RuntimeError("MongoDB did not become ready: {0}".format(last_error))
+ 
+ 
+-def _async_mongo_client(uri, runner, client_options=None):
+-    try:
+-        from pymongo import AsyncMongoClient
+-    except ImportError:  # pragma: no cover - guarded by dev requirements
+-        pytest.fail("Real MongoDB contracts require PyMongo; run `pip install pymongo`")
+-
+-    client = AsyncMongoClient(
+-        uri,
+-        serverSelectionTimeoutMS=1000,
+-        **dict(client_options or {}),
+-    )
+-    deadline = time.monotonic() + 15
+-    last_error = None
+-    while time.monotonic() < deadline:
+-        try:
+-            runner.run(client.admin.command("ping"))
+-            return client
+-        except Exception as error:  # noqa: BLE001 - retry server startup
+-            last_error = error
+-            time.sleep(0.25)
+-    runner.run(client.close())
+-    raise RuntimeError("MongoDB did not become ready: {0}".format(last_error))
+-
+-
+ def _contract_suite(request):
+-    if "test_talkpython_contract.py" in request.node.nodeid:
++    filename = request.node.path.name
++    if filename == "test_talkpython_contract.py":
+         return "talkpython"
+-    if "test_bson_comparison_contract.py" in request.node.nodeid:
++    if filename == "test_bson_comparison_contract.py":
+         return "bson-comparison"
+-    if "test_client_read_fidelity_contract.py" in request.node.nodeid:
++    if filename == "test_client_read_fidelity_contract.py":
+         return "client-read-fidelity"
+     return "core"
+ 
+ 
+-@pytest.fixture(params=TARGETS)
+-def contract_target(request, tmp_path, monkeypatch):
+-    """Yield an isolated collection for a TinyMongo backend or real MongoDB."""
++def _upstream_case_id(request, api, backend):
++    name = request.node.name
++    match = re.search(r"\[([^][]*)\]$", name)
++    if match is not None:
++        parameters = match.group(1)
++        prefix = "{0}-{1}".format(api, backend)
++        if parameters != prefix and not parameters.startswith(prefix + "-"):
++            raise pytest.UsageError(
++                "contract parameter ID {0!r} does not begin with {1!r}".format(
++                    parameters, prefix
++                )
++            )
++        remaining = parameters[len(prefix) :].lstrip("-")
++        base = name[: match.start()]
++        name = "{0}[{1}]".format(base, remaining) if remaining else base
++    module = request.node.path.stem
++    return "tests.contracts.{0}::{1}".format(module, name)
+ 
+-    api, target_name = request.param
+-    options_marker = request.node.get_closest_marker("client_options")
+-    client_options = dict(options_marker.kwargs) if options_marker else {}
+-    database_name = "tinymongo_contract_{0}".format(uuid4().hex)
++
++@pytest.fixture
++def contract_target(request, tmp_path):
++    """Yield one sync-shaped target selected through a lazy adapter import."""
++
++    api, backend = request.param
++    target = request.config.getoption("--mongo-contract-target")
++    suite = _contract_suite(request)
+     request.node.user_properties.extend(
+         [
+             ("tinymongo.api", api),
+-            ("tinymongo.backend", target_name),
+-            ("tinymongo.suite", _contract_suite(request)),
++            ("tinymongo.backend", backend),
++            ("tinymongo.suite", suite),
++            ("tinymongo.contract_id", _upstream_case_id(request, api, backend)),
+         ]
+     )
+-
+-    if target_name == "mongodb":
+-        uri = os.environ.get("TINYMONGO_MONGODB_URI")
+-        required = os.environ.get("TINYMONGO_REQUIRE_MONGODB") == "1"
+-        if not uri:
+-            message = "Set TINYMONGO_MONGODB_URI to run real MongoDB contracts"
+-            if required:
+-                pytest.fail(message)
+-            pytest.skip(message)
+-        runner = None
+-        try:
+-            if api == "async":
+-                runner = _AsyncRunner()
+-                client = _async_mongo_client(uri, runner, client_options)
+-            else:
+-                client = _mongo_client(uri, client_options)
+-        except RuntimeError as error:
+-            if runner is not None:
+-                runner.close()
+-            if required:
+-                pytest.fail(str(error))
+-            pytest.skip(str(error))
+-        database = client[database_name]
+-        collection = database["items"]
+-        if runner is not None:
+-            collection = _AsyncCollectionAdapter(collection, runner)
+-        target = ContractTarget(
+-            name=target_name,
+-            api=api,
+-            client=client,
+-            database=database,
+-            collection=collection,
+-        )
+-        try:
+-            yield target
+-        finally:
+-            if runner is None:
+-                client.drop_database(database_name)
+-                client.close()
+-            else:
+-                runner.run(client.drop_database(database_name))
+-                runner.run(client.close())
+-                runner.close()
+-        return
+-
+-    backend = "tinydb" if target_name == "json" else target_name
+-    if backend in ("duckdb", "parquet"):
+-        pytest.importorskip("duckdb")
+-    if backend == "parquet":
+-        pytest.importorskip("pyarrow")
+-
+-    if backend == "memory":
+-        working_directory = tmp_path / "memory-cwd"
+-        working_directory.mkdir()
+-        monkeypatch.chdir(working_directory)
+-        arguments = ()
+-        options = {"backend": backend}
+-    else:
+-        arguments = (str(tmp_path / target_name),)
+-        options = {"backend": backend}
+-    runner = None
+-    if api == "async":
+-        runner = _AsyncRunner()
+-        client_class = AsyncMongoClient if client_options else AsyncTinyMongoClient
+-        client = client_class(*arguments, **options, **client_options)
+-    else:
+-        client_class = (
+-            tinymongo.MongoClient if client_options else tinymongo.TinyMongoClient
+-        )
+-        client = client_class(*arguments, **options, **client_options)
+-    database = client[database_name]
+-    collection = database["items"]
+-    if runner is not None:
+-        collection = _AsyncCollectionAdapter(collection, runner)
++    marker = request.node.get_closest_marker("client_options")
++    client_options = dict(marker.kwargs) if marker else {}
+     try:
+-        yield ContractTarget(
+-            name=target_name,
+-            api=api,
+-            client=client,
+-            database=database,
+-            collection=collection,
++        context = open_target(
++            target,
++            api,
++            tmp_path,
++            client_options,
++            backend=backend,
++            uri=_target_uri(request.config, target),
+         )
+-    finally:
+-        if runner is None:
+-            client.close()
+-        else:
+-            runner.run(client.close())
+-            runner.close()
++        with context as handles:
++            yield ContractTarget(
++                name=handles.name,
++                transport=handles.transport,
++                api=api,
++                client=handles.client,
++                database=handles.database,
++                collection=handles.collection,
++                unsupported_warning=handles.unsupported_warning,
++            )
++    except TargetUnavailable as error:
++        required = request.config.getoption("--mongo-contract-require-target")
++        if required or target != "mongodb":
++            pytest.fail(str(error), pytrace=False)
++        pytest.skip(str(error))
+--- a/tests/contracts/support.py
++++ b/compat/mongo/v1/runner/contracts/support.py
+@@ -1,19 +1,29 @@
+-"""Small reusable helpers for behavioral compatibility contracts."""
++"""Runtime-neutral helpers used by the frozen Mongo compatibility contracts.
+ 
++This module deliberately depends on PyMongo's public BSON and exception types,
++which form the compatibility surface, but never imports TinyMongo.  A target
++adapter is responsible for translating its failures to these public shapes.
++"""
++
+ from dataclasses import dataclass
++from datetime import datetime, timezone
++from decimal import Decimal
++import re
++from collections.abc import Mapping
+ from typing import Any, Callable, Optional
++from uuid import UUID
+ 
+-from tinymongo.errors import DuplicateKeyError as TinyMongoDuplicateKeyError
+-from tinymongo.errors import OperationFailure as TinyMongoOperationFailure
++from bson import Binary, Code, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
++from pymongo.errors import DuplicateKeyError, OperationFailure, WriteError
+ 
+-try:
+-    from pymongo.errors import DuplicateKeyError as PyMongoDuplicateKeyError
+-    from pymongo.errors import OperationFailure as PyMongoOperationFailure
+-except ImportError:  # pragma: no cover - development dependency guard
+-    PyMongoDuplicateKeyError = ()  # type: ignore[assignment,misc]
+-    PyMongoOperationFailure = ()  # type: ignore[assignment,misc]
+ 
++DUPLICATE_KEY_ERRORS = (DuplicateKeyError,)
++OPERATION_ERRORS = (OperationFailure,)
++WRITE_ERRORS = (WriteError,)
++UNSUPPORTED_ERRORS = (NotImplementedError,)
++QUERY_REJECTION_ERRORS = OPERATION_ERRORS + UNSUPPORTED_ERRORS
+ 
++
+ @dataclass(frozen=True)
+ class Outcome:
+     """Normalized result of one operation against a contract target."""
+@@ -27,24 +37,20 @@
+     """Objects and metadata exposed to each shared contract."""
+ 
+     name: str
++    transport: str
+     api: str
+     client: Any
+     database: Any
+     collection: Any
++    unsupported_warning: type
+ 
+ 
+ def error_category(error: Exception) -> str:
+-    """Map backend-specific exceptions to a small compatibility vocabulary."""
++    """Map adapter-specific failures to the contract vocabulary."""
+ 
+-    duplicate_errors = (TinyMongoDuplicateKeyError,)
+-    if PyMongoDuplicateKeyError:
+-        duplicate_errors = duplicate_errors + (PyMongoDuplicateKeyError,)
+-    if isinstance(error, duplicate_errors):
++    if isinstance(error, DuplicateKeyError):
+         return "duplicate_key"
+-    operation_errors = (TinyMongoOperationFailure,)
+-    if PyMongoOperationFailure:
+-        operation_errors = operation_errors + (PyMongoOperationFailure,)
+-    if isinstance(error, operation_errors):
++    if isinstance(error, OperationFailure):
+         return "operation_failure"
+     return "{0}.{1}".format(type(error).__module__, type(error).__name__)
+ 
+@@ -56,3 +62,120 @@
+         return Outcome(value=operation())
+     except Exception as error:  # noqa: BLE001 - exceptions are contract output
+         return Outcome(error=error_category(error))
++
++
++def regex_type():
++    """Return the public BSON regular-expression class."""
++
++    return Regex
++
++
++def _number_identity(value: Any):
++    if isinstance(value, Decimal128):
++        decimal_value = value.to_decimal()
++    elif isinstance(value, int) and not isinstance(value, bool):
++        decimal_value = Decimal(value)
++    elif isinstance(value, float):
++        decimal_value = Decimal.from_float(value)
++    else:
++        raise TypeError("value is not a BSON number")
++    if decimal_value.is_nan():
++        return "nan"
++    if decimal_value.is_infinite():
++        return "-infinity" if decimal_value.is_signed() else "infinity"
++    return decimal_value.as_integer_ratio()
++
++
++def _regex_options(flags: Any) -> str:
++    if isinstance(flags, str):
++        return "".join(letter for letter in "ilmsux" if letter in flags)
++    return "".join(
++        letter
++        for letter, flag in (
++            ("i", re.IGNORECASE),
++            ("l", re.LOCALE),
++            ("m", re.MULTILINE),
++            ("s", re.DOTALL),
++            ("u", re.UNICODE),
++            ("x", re.VERBOSE),
++        )
++        if int(flags) & int(flag)
++    )
++
++
++def _datetime_milliseconds(value: datetime) -> int:
++    normalized = (
++        value.replace(tzinfo=timezone.utc)
++        if value.utcoffset() is None
++        else value.astimezone(timezone.utc)
++    )
++    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
++    delta = normalized - epoch
++    return (
++        delta.days * 86_400_000
++        + delta.seconds * 1_000
++        + delta.microseconds // 1_000
++    )
++
++
++def bson_identity_key(value: Any):
++    """Return the scalar BSON equality identity used by the frozen assertions."""
++
++    if value is None:
++        return "null", None
++    if type(value) is bool:
++        return "boolean", value
++    if isinstance(value, (int, float, Decimal128)) and not isinstance(value, bool):
++        return "number", _number_identity(value)
++    if isinstance(value, UUID):
++        return "binary", (4, value.bytes)
++    if isinstance(value, Binary):
++        return "binary", (int(value.subtype), bytes(value))
++    if type(value) in (bytes, bytearray):
++        return "binary", (0, bytes(value))
++    if isinstance(value, Code):
++        scope = None if value.scope is None else bson_value_identity_key(value.scope)
++        return "code", (str(value), scope)
++    if isinstance(value, str):
++        return "string", value
++    if isinstance(value, ObjectId):
++        return "objectId", value.binary
++    if isinstance(value, datetime):
++        return "date", _datetime_milliseconds(value)
++    if isinstance(value, Timestamp):
++        return "timestamp", (value.time, value.inc)
++    if isinstance(value, (Regex, type(re.compile("")))):
++        pattern = value.pattern
++        if isinstance(pattern, bytes):
++            pattern = pattern.decode("utf-8")
++        return "regex", (pattern, _regex_options(value.flags))
++    if isinstance(value, MinKey):
++        return "minKey", None
++    if isinstance(value, MaxKey):
++        return "maxKey", None
++    return None
++
++
++def bson_value_identity_key(value: Any):
++    """Return a recursive, ordered and hashable BSON equality identity."""
++
++    scalar = bson_identity_key(value)
++    if scalar is not None:
++        return scalar
++    if isinstance(value, Mapping):
++        items = []
++        for key, item in value.items():
++            item_key = bson_value_identity_key(item)
++            if item_key is None:
++                return None
++            items.append((key, item_key))
++        return "object", tuple(items)
++    if isinstance(value, (list, tuple)):
++        items = []
++        for item in value:
++            item_key = bson_value_identity_key(item)
++            if item_key is None:
++                return None
++            items.append(item_key)
++        return "array", tuple(items)
++    return None
+--- a/tests/contracts/test_array_update_contract.py
++++ b/compat/mongo/v1/runner/contracts/test_array_update_contract.py
+@@ -2,21 +2,11 @@
+ 
+ import pytest
+ 
+-from tinymongo.errors import WriteError as TinyMongoWriteError
+-
++from .support import WRITE_ERRORS as _WRITE_ERRORS
+ from .support import observe
+ 
+ 
+ pytestmark = pytest.mark.contract
+-
+-_WRITE_ERRORS = (TinyMongoWriteError,)
+-try:
+-    from pymongo.errors import WriteError as PyMongoWriteError
+-except ImportError:  # pragma: no cover - development dependency guard
+-    PyMongoWriteError = ()  # type: ignore[assignment,misc]
+-else:
+-    _WRITE_ERRORS += (PyMongoWriteError,)
+-
+ 
+ def test_push_each_slice_keeps_a_bounded_array(contract_target):
+     collection = contract_target.collection
+--- a/tests/contracts/test_bson_comparison_contract.py
++++ b/compat/mongo/v1/runner/contracts/test_bson_comparison_contract.py
+@@ -5,8 +5,8 @@
+ 
+ import pytest
+ 
+-from tinymongo.errors import OperationFailure as TinyMongoOperationFailure
+-from tinymongo.errors import WriteError as TinyMongoWriteError
++from .support import OPERATION_ERRORS as _OPERATION_ERRORS
++from .support import WRITE_ERRORS as _WRITE_ERRORS
+ 
+ 
+ pytestmark = pytest.mark.contract
+@@ -16,19 +16,7 @@
+ MinKey = bson.MinKey
+ ObjectId = bson.ObjectId
+ Regex = bson.Regex
+-
+-_OPERATION_ERRORS = (TinyMongoOperationFailure,)
+-_WRITE_ERRORS = (TinyMongoWriteError,)
+-try:
+-    from pymongo.errors import OperationFailure as PyMongoOperationFailure
+-    from pymongo.errors import WriteError as PyMongoWriteError
+-except ImportError:  # pragma: no cover - optional dependency guard
+-    pass
+-else:
+-    _OPERATION_ERRORS += (PyMongoOperationFailure,)
+-    _WRITE_ERRORS += (PyMongoWriteError,)
+ 
+-
+ def _ids(rows):
+     return {document["_id"] for document in rows}
+ 
+--- a/tests/contracts/test_bson_value_types_contract.py
++++ b/compat/mongo/v1/runner/contracts/test_bson_value_types_contract.py
+@@ -6,8 +6,8 @@
+ 
+ import pytest
+ 
+-from tinymongo.bson_types import bson_identity_key
+-from tinymongo.errors import DuplicateKeyError as TinyMongoDuplicateKeyError
++from .support import DUPLICATE_KEY_ERRORS as _DUPLICATE_ERRORS
++from .support import bson_identity_key
+ 
+ 
+ pytestmark = pytest.mark.contract
+@@ -17,15 +17,6 @@
+ MinKey = bson.MinKey
+ Timestamp = bson.Timestamp
+ 
+-_DUPLICATE_ERRORS = (TinyMongoDuplicateKeyError,)
+-try:
+-    from pymongo.errors import DuplicateKeyError as PyMongoDuplicateKeyError
+-except ImportError:  # pragma: no cover - optional dependency guard
+-    pass
+-else:
+-    _DUPLICATE_ERRORS += (PyMongoDuplicateKeyError,)
+-
+-
+ def _ids(rows):
+     return {row["_id"] for row in rows}
+ 
+@@ -71,7 +62,7 @@
+     assert type(restored_scoped.scope["nested"]["code"]) is Code
+ 
+     restored_regex = restored["native_regex"]
+-    if contract_target.name == "mongodb":
++    if contract_target.transport == "pymongo":
+         assert type(restored_regex) is bson.Regex
+     else:
+         assert type(restored_regex) is type(native_regex)
+--- a/tests/contracts/test_crud_contract.py
++++ b/compat/mongo/v1/runner/contracts/test_crud_contract.py
+@@ -2,22 +2,12 @@
+ 
+ import pytest
+ 
+-from tinymongo.errors import WriteError as TinyMongoWriteError
+-
++from .support import WRITE_ERRORS as _WRITE_ERRORS
+ from .support import observe
+ 
+ 
+ pytestmark = pytest.mark.contract
+ 
+-_WRITE_ERRORS = (TinyMongoWriteError,)
+-try:
+-    from pymongo.errors import WriteError as PyMongoWriteError
+-except ImportError:  # pragma: no cover - optional dependency guard
+-    pass
+-else:
+-    _WRITE_ERRORS += (PyMongoWriteError,)
+-
+-
+ def test_insert_query_sort_and_count(contract_target):
+     collection = contract_target.collection
+ 
+--- a/tests/contracts/test_decimal128_contract.py
++++ b/compat/mongo/v1/runner/contracts/test_decimal128_contract.py
+@@ -1,10 +1,8 @@
+ """Decimal128 behavior shared by every API and storage target."""
+ 
+ import pytest
+-from tinymongo.bson_types import bson_identity_key
+-from tinymongo.errors import TinyMongoNotSupportedError
+ 
+-from .support import observe
++from .support import UNSUPPORTED_ERRORS, bson_identity_key, observe
+ 
+ 
+ pytestmark = pytest.mark.contract
+@@ -378,7 +376,7 @@
+ 
+     collection.create_index("amount", unique=True)
+     if contract_target.name in ("postgres", "postgresql", "mysql", "mariadb"):
+-        with pytest.raises(TinyMongoNotSupportedError, match="Decimal128 values"):
++        with pytest.raises(UNSUPPORTED_ERRORS, match="Decimal128 values"):
+             collection.insert_one({"_id": "decimal-tenth", "amount": Decimal128("0.1")})
+         return
+ 
+--- a/tests/contracts/test_group_accumulators_contract.py
++++ b/compat/mongo/v1/runner/contracts/test_group_accumulators_contract.py
+@@ -4,10 +4,8 @@
+ 
+ import pytest
+ from bson import Decimal128
+-
+-from tinymongo.bson_types import bson_value_identity_key
+ 
+-from .support import observe
++from .support import bson_value_identity_key, observe
+ 
+ 
+ pytestmark = pytest.mark.contract
+--- a/tests/contracts/test_query_operator_contract.py
++++ b/compat/mongo/v1/runner/contracts/test_query_operator_contract.py
+@@ -5,32 +5,15 @@
+ 
+ import pytest
+ 
+-from tinymongo.bson_types import regex_type
+-from tinymongo.errors import DuplicateKeyError as TinyMongoDuplicateKeyError
+-from tinymongo.errors import OperationFailure as TinyMongoOperationFailure
+-from tinymongo.errors import TinyMongoNotSupportedError
+-from tinymongo.errors import WriteError as TinyMongoWriteError
++from .support import DUPLICATE_KEY_ERRORS as _DUPLICATE_KEY_ERRORS
++from .support import OPERATION_ERRORS as _OPERATION_ERRORS
++from .support import QUERY_REJECTION_ERRORS as _QUERY_REJECTION_ERRORS
++from .support import WRITE_ERRORS as _WRITE_ERRORS
++from .support import regex_type
+ 
+ 
+ pytestmark = pytest.mark.contract
+ 
+-_DUPLICATE_KEY_ERRORS = (TinyMongoDuplicateKeyError,)
+-_OPERATION_ERRORS = (TinyMongoOperationFailure,)
+-_WRITE_ERRORS = (TinyMongoWriteError,)
+-try:
+-    from pymongo.errors import DuplicateKeyError as PyMongoDuplicateKeyError
+-    from pymongo.errors import OperationFailure as PyMongoOperationFailure
+-    from pymongo.errors import WriteError as PyMongoWriteError
+-except ImportError:  # pragma: no cover - optional dependency guard
+-    pass
+-else:
+-    _DUPLICATE_KEY_ERRORS += (PyMongoDuplicateKeyError,)
+-    _OPERATION_ERRORS += (PyMongoOperationFailure,)
+-    _WRITE_ERRORS += (PyMongoWriteError,)
+-
+-_QUERY_REJECTION_ERRORS = _OPERATION_ERRORS + (TinyMongoNotSupportedError,)
+-
+-
+ def _ids(rows):
+     return sorted(document["_id"] for document in rows)
+ 
+--- a/tests/contracts/test_talkpython_contract.py
++++ b/compat/mongo/v1/runner/contracts/test_talkpython_contract.py
+@@ -4,8 +4,6 @@
+ 
+ import pytest
+ 
+-from tinymongo.indexes import TinyMongoUnsupportedWarning
+-
+ from .support import observe
+ 
+ 
+@@ -305,10 +303,10 @@
+         ),
+     ]
+ 
+-    if contract_target.name == "mongodb":
++    if contract_target.transport == "pymongo":
+         created = collection.create_indexes(models)
+     else:
+-        with pytest.warns(TinyMongoUnsupportedWarning) as captured:
++        with pytest.warns(contract_target.unsupported_warning) as captured:
+             created = collection.create_indexes(models)
+         assert len(captured) == 4
+         warning_messages = [str(item.message) for item in captured]
+@@ -387,10 +385,10 @@
+     with pytest.raises(bson_errors.InvalidDocument) as caught:
+         collection.insert_one(document)
+ 
+-    if contract_target.name != "mongodb" and contract_target.api == "sync":
++    if contract_target.transport != "pymongo" and contract_target.api == "sync":
+         assert collection.name not in collection.database.list_collection_names()
+     assert collection.count_documents({}) == 0
+-    if contract_target.name != "mongodb":
++    if contract_target.transport != "pymongo":
+         assert isinstance(caught.value, pymongo_errors.PyMongoError)
+         assert caught.value.document is document
+         assert collection.full_name in str(caught.value)
+@@ -458,7 +456,7 @@
+ 
+     assert collection.find_one({"value": b"talk-python"})["_id"] == "binary-object"
+     assert collection.find_one({"value": generic})["_id"] == "binary-object"
+-    if contract_target.name != "mongodb":
++    if contract_target.transport != "pymongo":
+         # TinyMongo accepts bytearray as a convenience and canonicalizes it to
+         # BSON's generic binary subtype. PyMongo rejects bytearray at encoding.
+         assert (
+--- a/tests/contracts/test_update_operator_contract.py
++++ b/compat/mongo/v1/runner/contracts/test_update_operator_contract.py
+@@ -2,20 +2,11 @@
+ 
+ import pytest
+ 
+-from tinymongo.errors import WriteError as TinyMongoWriteError
++from .support import WRITE_ERRORS as _WRITE_ERRORS
+ 
+ 
+ pytestmark = pytest.mark.contract
+ 
+-_WRITE_ERRORS = (TinyMongoWriteError,)
+-try:
+-    from pymongo.errors import WriteError as PyMongoWriteError
+-except ImportError:  # pragma: no cover - optional dependency guard
+-    pass
+-else:
+-    _WRITE_ERRORS += (PyMongoWriteError,)
+-
+-
+ def test_min_and_max_follow_bson_order_and_report_noops(contract_target):
+     collection = contract_target.collection
+     collection.insert_many(
+--- a/tests/contracts/test_uuid_regex_contract.py
++++ b/compat/mongo/v1/runner/contracts/test_uuid_regex_contract.py
+@@ -5,7 +5,7 @@
+ 
+ import pytest
+ 
+-from tinymongo.bson_types import bson_identity_key
++from .support import bson_identity_key
+ 
+ 
+ pytestmark = pytest.mark.contract
+@@ -23,7 +23,7 @@
+     """Opt real MongoDB into the standard UUID representation for this test."""
+ 
+     collection = contract_target.collection
+-    if contract_target.name != "mongodb":
++    if contract_target.transport != "pymongo":
+         return collection
+ 
+     codec_options = pytest.importorskip("bson.codec_options").CodecOptions(
+@@ -143,7 +143,7 @@
+ 
+     restored_native = collection.find_one({"_id": "native"})["value"]
+     restored_bson = collection.find_one({"_id": "bson"})["value"]
+-    if contract_target.name == "mongodb":
++    if contract_target.transport == "pymongo":
+         assert isinstance(restored_native, Regex)
+     else:
+         assert isinstance(restored_native, type(native))

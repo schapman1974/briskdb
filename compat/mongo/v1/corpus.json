@@ -1,0 +1,2402 @@
+{
+  "cases": [
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage0]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage10]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage11]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage12]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage13]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage14]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage15]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage16]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage17]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage18]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage1]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage2]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage3]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage4]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage5]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage6]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage7]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage8]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_basic_stage_validation_is_mongodb_shaped[stage9]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_compound_numeric_sort_paths_can_select_separate_array_indexes",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_compound_numeric_sort_rejects_parallel_selected_arrays",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_compound_sort_allows_nested_arrays_in_separate_parent_elements",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_compound_sort_preserves_shared_array_element_correlation",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_compound_sort_rejects_numeric_path_parallel_arrays[first.1]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_compound_sort_rejects_numeric_path_parallel_arrays[first.9]",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_compound_sort_rejects_parallel_arrays",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_empty_input_stays_empty_and_count_emits_no_document",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_integral_numeric_arguments_and_pagination_boundaries",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_numeric_sort_path_compares_selected_array_as_a_whole_value",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_numeric_sort_path_keeps_empty_array_special_order",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_out_of_range_numeric_sort_path_fans_out_to_named_fields",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_sort_array_fanout_includes_missing_but_not_nested_arrays",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_sort_numeric_path_segments_address_array_indexes",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_sort_rejects_ambiguous_numeric_array_paths",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_sort_skip_limit_and_count_compose_with_other_stages",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_sort_traverses_dotted_array_paths_and_compounds_ties",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_basic_stages_contract::test_sort_uses_mongodb_keys_for_missing_null_arrays_and_bson_types",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_aggregate_cursor_consumes_in_chunks",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_dotted_paths_preserve_empty_array_traversals",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_first_and_last_play_by_user",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_latest_activity_by_course",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_match_reuses_query_semantics_and_can_follow_group",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_null_missing_keys_and_empty_inputs",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_project_dotted_inclusion_preserves_array_shape",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_project_expression_argument_and_lazy_evaluation_contract",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_project_inclusion_id_and_expression_contract",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_project_size_ifnull_application_rollup",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_sum_and_min_max_follow_mongodb_value_rules",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_contract::test_whole_collection_rollup",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_projection_stages_contract::test_field_paths_do_not_descend_through_nested_arrays",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_projection_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_projection_stages_contract::test_literal_and_remove_expression_contract",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_projection_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_projection_stages_contract::test_project_computed_dotted_paths_preserve_array_shape",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_projection_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_projection_stages_contract::test_project_inclusion_exclusion_and_computed_modes",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_projection_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_projection_stages_contract::test_project_preserves_embedded_source_order_for_group_identity",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_projection_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_projection_stages_contract::test_set_and_add_fields_are_aliases_using_original_input",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_projection_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_aggregation_projection_stages_contract::test_unset_accepts_one_or_many_dotted_fields",
+      "requirements": {},
+      "source": "tests/contracts/test_aggregation_projection_stages_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_array_updates_reject_non_array_targets[$pull-remove]",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_array_updates_reject_non_array_targets[$pullAll-operand2]",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_array_updates_reject_non_array_targets[$push-append]",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_invalid_array_modifiers_fail_atomically",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_plain_push_and_add_to_set_each_regressions",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_pull_accepts_literal_and_query_operands",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_pull_all_uses_literal_bson_equality",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_pull_missing_fields_are_true_noops",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_pull_not_and_pull_all_operand_errors_match_mongodb",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_pull_query_operator_family_matches_mongodb",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_push_each_slice_keeps_a_bounded_array",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_push_modifiers_follow_mongodb_order_and_boundaries",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_tm038_pull_expr_errors_are_preflighted_like_mongodb",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_array_update_contract::test_tm038_pull_remaining_field_predicates_match_mongodb",
+      "requirements": {},
+      "source": "tests/contracts/test_array_update_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_beanie_odm_contract::test_beanie_write_result_contract",
+      "requirements": {},
+      "source": "tests/contracts/test_beanie_odm_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_array_range_queries_compare_whole_and_direct_nested_arrays",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_cursor_and_aggregation_sort_share_scalar_bson_order",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_embedded_id_fields_use_normal_array_comparison_semantics",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_generated_scalar_range_matrix[boolean-family]",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_generated_scalar_range_matrix[numeric-family]",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_generated_scalar_range_matrix[string-family]",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_indexed_ranges_feed_every_filter_consumer",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_legacy_binary_subtype_two_uses_its_encoded_length",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_nested_regex_range_values_are_compared_without_compilation",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_null_range_queries_include_missing_and_array_members",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_object_range_queries_use_recursive_bson_field_order",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_pull_document_ranges_share_missing_and_array_path_semantics",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_pull_reuses_recursive_bson_range_comparison",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_regex_range_operands_are_rejected_with_code_2[bson-malformed]",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_regex_range_operands_are_rejected_with_code_2[bson-valid]",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_regex_range_operands_are_rejected_with_code_2[native]",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_scalar_ranges_share_bson_keys_and_dates_use_milliseconds",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_tm036_extreme_array_members_preserve_exact_semantics",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_tm036_min_max_key_range_operands_cross_type_brackets",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_comparison_contract::test_tm036_pull_reuses_unbounded_min_max_key_ranges",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_comparison_contract.py",
+      "suite": "bson-comparison"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm035_exact_equality_and_distinct_use_bson_identity",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm035_new_bson_values_round_trip_at_every_depth",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm035_scoped_code_honors_recursive_client_read_options",
+      "requirements": {
+        "client_options": {
+          "document_class": "collections.OrderedDict",
+          "tz_aware": true
+        }
+      },
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm035_sort_uses_the_complete_supported_scalar_order",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm035_type_aliases_and_numeric_codes_match_mongodb[code-return 1;-javascript-13]",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm035_type_aliases_and_numeric_codes_match_mongodb[maximum-value4-maxKey-127]",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm035_type_aliases_and_numeric_codes_match_mongodb[minimum-value0-minKey--1]",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm035_type_aliases_and_numeric_codes_match_mongodb[scoped-code-return value;-javascriptWithScope-15]",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm035_type_aliases_and_numeric_codes_match_mongodb[timestamp-value1-timestamp-17]",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm035_unique_index_distinguishes_code_from_text_and_scope",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm037_zero_timestamp_insert_many_honors_unique_indexes",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_bson_value_types_contract::test_tm037_zero_timestamp_write_boundaries_match_mongodb",
+      "requirements": {},
+      "source": "tests/contracts/test_bson_value_types_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_client_read_fidelity_contract::test_configured_document_and_datetime_results_match_mongodb",
+      "requirements": {
+        "client_options": {
+          "document_class": "collections.OrderedDict",
+          "tz_aware": true
+        }
+      },
+      "source": "tests/contracts/test_client_read_fidelity_contract.py",
+      "suite": "client-read-fidelity"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_client_read_fidelity_contract::test_same_millisecond_write_identity_matches_mongodb",
+      "requirements": {
+        "client_options": {
+          "document_class": "collections.OrderedDict",
+          "tz_aware": true
+        }
+      },
+      "source": "tests/contracts/test_client_read_fidelity_contract.py",
+      "suite": "client-read-fidelity"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_array_in_query_contract",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_duplicate_id_has_a_shared_error_category",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_explicit_null_id_is_preserved_and_unique",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_insert_query_sort_and_count",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_replace_upsert_accepts_bson_equal_filter_and_replacement_ids",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_replace_upsert_and_delete_metadata",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_replace_upsert_preserves_equality_bound_id[query0-77]",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_replace_upsert_preserves_equality_bound_id[query1-pinned-key]",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_replace_upsert_preserves_equality_bound_id[query2-88]",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_replace_upsert_preserves_equality_bound_id[query3-None]",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_replace_upsert_rejects_conflicting_filter_and_replacement_ids",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_replace_upsert_stores_id_first",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_sort_skip_and_limit_contract",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_unset_removes_top_level_and_nested_fields",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_crud_contract::test_update_and_result_metadata",
+      "requirements": {},
+      "source": "tests/contracts/test_crud_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_decimal128_contract::test_decimal128_array_updates_and_distinct_reuse_numeric_identity",
+      "requirements": {},
+      "source": "tests/contracts/test_decimal128_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_decimal128_contract::test_decimal128_extreme_ids_round_trip",
+      "requirements": {},
+      "source": "tests/contracts/test_decimal128_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_decimal128_contract::test_decimal128_grouping_min_max_and_sum_use_one_numeric_family",
+      "requirements": {},
+      "source": "tests/contracts/test_decimal128_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_decimal128_contract::test_decimal128_inc_promotes_the_result",
+      "requirements": {},
+      "source": "tests/contracts/test_decimal128_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_decimal128_contract::test_decimal128_min_max_ties_and_literal_sum_match_mongodb",
+      "requirements": {},
+      "source": "tests/contracts/test_decimal128_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_decimal128_contract::test_decimal128_nan_query_comparisons_follow_mongodb",
+      "requirements": {},
+      "source": "tests/contracts/test_decimal128_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_decimal128_contract::test_decimal128_numeric_identity_is_enforced_by_ids_and_unique_indexes",
+      "requirements": {},
+      "source": "tests/contracts/test_decimal128_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_decimal128_contract::test_decimal128_projection_flags_and_stage_arguments",
+      "requirements": {},
+      "source": "tests/contracts/test_decimal128_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_decimal128_contract::test_decimal128_representation_changes_are_persisted",
+      "requirements": {},
+      "source": "tests/contracts/test_decimal128_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_decimal128_contract::test_decimal128_round_trips_and_participates_in_numeric_queries",
+      "requirements": {},
+      "source": "tests/contracts/test_decimal128_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_decimal128_contract::test_decimal128_sum_keeps_double_precision_until_promotion",
+      "requirements": {},
+      "source": "tests/contracts/test_decimal128_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_accumulators_accept_the_supported_expression_subset",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_add_to_set_uses_recursive_bson_identity",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_array_values_remain_whole_accumulator_values",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_avg_ignores_non_numeric_values_and_promotes_decimal",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_avg_preserves_cancellation_and_nonfinite_values",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_first_last_and_push_follow_sorted_input_and_missing_rules",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_group_accumulators_reject_array_argument_lists[$addToSet]",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_group_accumulators_reject_array_argument_lists[$avg]",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_group_accumulators_reject_array_argument_lists[$first]",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_group_accumulators_reject_array_argument_lists[$last]",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_group_accumulators_reject_array_argument_lists[$max]",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_group_accumulators_reject_array_argument_lists[$min]",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_group_accumulators_reject_array_argument_lists[$push]",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_group_accumulators_reject_array_argument_lists[$sum]",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_group_accumulators_contract::test_missing_only_arrays_and_empty_inputs_match_mongodb",
+      "requirements": {},
+      "source": "tests/contracts/test_group_accumulators_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_projection_contract::test_empty_and_invalid_projection_contract",
+      "requirements": {},
+      "source": "tests/contracts/test_projection_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_projection_contract::test_inclusion_exclusion_and_id_projection_contract",
+      "requirements": {},
+      "source": "tests/contracts/test_projection_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_projection_contract::test_nested_and_array_projection_contract",
+      "requirements": {},
+      "source": "tests/contracts/test_projection_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_projection_contract::test_projection_uses_unprojected_values_for_filter_and_sort",
+      "requirements": {},
+      "source": "tests/contracts/test_projection_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_add_to_set_non_array_errors_report_code_2_and_leave_document_atomic",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_comment_inside_document_elem_match_is_accepted",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_comment_is_accepted_and_ignored_while_matching",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_comment_remains_invalid_as_a_field_operator",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_continued_numeric_paths_ignore_scalar_index_dead_ends",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_distinct_rejects_falsey_non_document_filters",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_dotted_query_paths_traverse_document_arrays_not_raw_nested_arrays",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_duplicate_key_errors_report_code_11000",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_elem_match_document_paths_traverse_nested_arrays",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_elem_match_null_conditions_match_missing_document_fields",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_elem_match_requires_one_array_member_to_satisfy_every_condition",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_elem_match_unknown_or_misplaced_operators_report_code_2[misplaced-logical-clause]",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_elem_match_unknown_or_misplaced_operators_report_code_2[unknown-beside-field-operator]",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_elem_match_unknown_or_misplaced_operators_report_code_2[unknown]",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_embedded_regex_flags_and_options_report_code_51075",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_every_filtering_crud_entrypoint_rejects_invalid_not_operands",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_every_filtering_crud_entrypoint_rejects_operator_typos",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_find_rejects_top_level_and_field_operator_typos",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_index_name_and_key_conflict_codes_match_mongodb",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_mapping_filters_work_for_new_operators_and_dotted_paths",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_mod_uses_mongodb_integer_truncation_and_array_member_rules",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_not_accepts_operator_documents_and_compiled_regexes",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_not_rejects_non_regex_and_empty_operands_with_code_2[7]",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_not_rejects_non_regex_and_empty_operands_with_code_2[operand2]",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_not_rejects_non_regex_and_empty_operands_with_code_2[operand3]",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_not_rejects_non_regex_and_empty_operands_with_code_2[operand4]",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_not_rejects_non_regex_and_empty_operands_with_code_2[text]",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_null_equality_keeps_missing_fields_visible_after_indexing",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_numeric_query_paths_consider_array_indexes_and_document_field_names",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_recognized_query_operators_reject_malformed_operands",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_size_matches_arrays_with_the_exact_requested_length",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_tuple_equality_keeps_array_matches_visible_after_indexing",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_query_operator_contract::test_type_supports_aliases_codes_lists_and_array_element_matching",
+      "requirements": {},
+      "source": "tests/contracts/test_query_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_binary_ids_use_bson_equality_without_losing_subtype",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_binary_round_trip_query_and_mongodb_sort_order",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_boolean_and_numeric_ids_are_bson_distinct",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_create_indexes_accepts_the_real_mixed_batch_and_enforces_unique",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_cursor_limit_zero_means_unlimited",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_cursor_skip_limit_windows_and_past_end",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_cursor_to_list_accepts_both_application_spellings",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_distinct_returns_scalar_field_values",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_dot_notation_matches_an_embedded_document",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_duplicate_errors_are_catchable_as_pymongo_errors",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_find_one_sort_returns_the_newest_match",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_generated_id_uses_the_standard_object_id_round_trip",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_generic_binary_equality_matches_native_bytes_and_query_operators",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_inc_creates_a_missing_counter",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_insert_many_accepts_a_document_generator",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_insert_many_reports_compatible_partial_failures[False-expected_ids1-2]",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_insert_many_reports_compatible_partial_failures[True-expected_ids0-1]",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_invalid_document_has_a_bson_compatible_error",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_mixed_timezone_datetimes_sort_by_utc_instant",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_nin_and_negated_regex_share_one_field_specification",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_nin_excludes_values_and_includes_missing_fields",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_not_regex_with_case_insensitive_options",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_null_negation_distinguishes_missing_and_non_null_fields",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_object_id_and_datetime_round_trip_and_range_query",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_projection_none_absent_fields_and_integer_id",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_replace_one_preserves_id_and_replaces_the_full_document",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_scalar_equality_matches_an_array_member",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_single_and_multi_key_sort_break_ties",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_talkpython_contract::test_write_result_metadata_used_by_the_application",
+      "requirements": {},
+      "source": "tests/contracts/test_talkpython_contract.py",
+      "suite": "talkpython"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_update_operator_contract::test_malformed_new_update_operands_report_mongodb_codes",
+      "requirements": {},
+      "source": "tests/contracts/test_update_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_update_operator_contract::test_min_and_max_follow_bson_order_and_report_noops",
+      "requirements": {},
+      "source": "tests/contracts/test_update_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_update_operator_contract::test_min_and_max_include_null_in_whole_bson_value_order",
+      "requirements": {},
+      "source": "tests/contracts/test_update_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_update_operator_contract::test_new_update_operators_apply_to_upsert_equality_fields",
+      "requirements": {},
+      "source": "tests/contracts/test_update_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_update_operator_contract::test_new_update_operators_cover_upsert_update_many_and_find_and_modify",
+      "requirements": {},
+      "source": "tests/contracts/test_update_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_update_operator_contract::test_new_update_operators_follow_numeric_array_paths",
+      "requirements": {},
+      "source": "tests/contracts/test_update_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_update_operator_contract::test_new_update_operators_preserve_immutable_id_semantics",
+      "requirements": {},
+      "source": "tests/contracts/test_update_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_update_operator_contract::test_new_update_operators_report_target_and_path_errors_atomically",
+      "requirements": {},
+      "source": "tests/contracts/test_update_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_update_operator_contract::test_pop_handles_front_back_nested_empty_and_missing_arrays",
+      "requirements": {},
+      "source": "tests/contracts/test_update_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_update_operator_contract::test_rename_moves_nested_values_overwrites_and_ignores_missing_source",
+      "requirements": {},
+      "source": "tests/contracts/test_update_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_update_operator_contract::test_update_path_conflicts_report_code_40_before_writing",
+      "requirements": {},
+      "source": "tests/contracts/test_update_operator_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_uuid_regex_contract::test_local_regex_ids_use_exact_identity_for_duplicate_detection",
+      "requirements": {},
+      "source": "tests/contracts/test_uuid_regex_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_uuid_regex_contract::test_regex_predicates_and_exact_equality_follow_mongodb",
+      "requirements": {},
+      "source": "tests/contracts/test_uuid_regex_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_uuid_regex_contract::test_regex_sort_distinct_and_unique_index_identity",
+      "requirements": {},
+      "source": "tests/contracts/test_uuid_regex_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_uuid_regex_contract::test_uuid_and_subtype_four_binary_share_unique_identity",
+      "requirements": {
+        "mongodb_collection_options": {
+          "uuid_representation": "STANDARD"
+        }
+      },
+      "source": "tests/contracts/test_uuid_regex_contract.py",
+      "suite": "core"
+    },
+    {
+      "apis": [
+        "sync",
+        "async"
+      ],
+      "id": "tests.contracts.test_uuid_regex_contract::test_uuid_round_trip_uses_standard_binary_identity",
+      "requirements": {
+        "mongodb_collection_options": {
+          "uuid_representation": "STANDARD"
+        }
+      },
+      "source": "tests/contracts/test_uuid_regex_contract.py",
+      "suite": "core"
+    }
+  ],
+  "contract": "tinymongo-v1",
+  "harvest_toolchain": {
+    "pymongo": "4.17.0",
+    "pytest": "8.4.2",
+    "python": "3.9.6"
+  },
+  "schema_version": 1,
+  "source_commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
+  "source_files": [
+    {
+      "path": "tests/contracts/README.md",
+      "sha256": "74416b17722036fb552e97703b763a6ea4f13959568920a60bf0cfe725cc3f87"
+    },
+    {
+      "path": "tests/contracts/__init__.py",
+      "sha256": "ce7185ce04b04dbce35c37a155ff35b26bf878939a3c188b66c8286f06db1999"
+    },
+    {
+      "path": "tests/contracts/conftest.py",
+      "sha256": "002944603a433d408c1c2b9ce067a27195c6bf78753f27086a2a5b380d5b31d5"
+    },
+    {
+      "path": "tests/contracts/known_differences.py",
+      "sha256": "06f875b4e0c75337d83ff91f95767c14ef396362ece9b300475c529f38b5311a"
+    },
+    {
+      "path": "tests/contracts/support.py",
+      "sha256": "822c4b9739243ab3885f3b4912deb9de8b9c22a1a2d11a9b9b725a9f57c39e5a"
+    },
+    {
+      "path": "tests/contracts/test_aggregation_basic_stages_contract.py",
+      "sha256": "5549d7f226a278be17315b5cbb2847d564770cf5acb1ff0eb47bd467cb0ddf40"
+    },
+    {
+      "path": "tests/contracts/test_aggregation_contract.py",
+      "sha256": "2d4255f17629bf0c51489a7e334ff3087fb1c20800ff669ba58f3abe6c25940f"
+    },
+    {
+      "path": "tests/contracts/test_aggregation_projection_stages_contract.py",
+      "sha256": "4ef68dcf01c60edf25bfe88978d32d5276d2a6076110c2eef62e8bfb3d7f4e5e"
+    },
+    {
+      "path": "tests/contracts/test_array_update_contract.py",
+      "sha256": "0ff202cc19da7acc104f899225a73c0a77c476318784b57049ac65180978c8aa"
+    },
+    {
+      "path": "tests/contracts/test_beanie_odm_contract.py",
+      "sha256": "9a08b0651be070d6353bf5d6481b99c0b1f6bdcd61b745cdade670919bb8c5b1"
+    },
+    {
+      "path": "tests/contracts/test_bson_comparison_contract.py",
+      "sha256": "8222a1292691b9440014f6272b16ec7c690b9d5b30fa94211ae2cfdfca1ac620"
+    },
+    {
+      "path": "tests/contracts/test_bson_value_types_contract.py",
+      "sha256": "a6fc6f03a112edb2a28a3f52e565fe58b7fd0f2f0c370f70301742aa0ea1fcb0"
+    },
+    {
+      "path": "tests/contracts/test_client_read_fidelity_contract.py",
+      "sha256": "db43c0924aba50237fedca0cdf75d23cab07e6f40998b2110abd40405b45fcee"
+    },
+    {
+      "path": "tests/contracts/test_crud_contract.py",
+      "sha256": "de95254dfeaef9edcfa0a3fcb86badd993010dd555d2e0481916480339cb37a2"
+    },
+    {
+      "path": "tests/contracts/test_decimal128_contract.py",
+      "sha256": "05bdee5251731d81ed44070fadaccc83032ff07be0281b7894eb8e5933c67c86"
+    },
+    {
+      "path": "tests/contracts/test_group_accumulators_contract.py",
+      "sha256": "50634de1ff2666915ce99913421eb9981d0099df9a0160387cc291bceb617e57"
+    },
+    {
+      "path": "tests/contracts/test_projection_contract.py",
+      "sha256": "a08becc90d32497b16a93bdad1dc990cce597f4f7fb0e099c61a8ecf3c780b3a"
+    },
+    {
+      "path": "tests/contracts/test_query_operator_contract.py",
+      "sha256": "c8845833a1b6dd0257236508b52766c840ec0f643940bd120e2e1b5f55019851"
+    },
+    {
+      "path": "tests/contracts/test_talkpython_contract.py",
+      "sha256": "56ea087b75a6797d8bcb9557a39b73a5622514e95917fa7151c795d3531ec99a"
+    },
+    {
+      "path": "tests/contracts/test_update_operator_contract.py",
+      "sha256": "72fc64be51f48eebe7eebda94e2cff4a0ab1a49baae38ec2b43ddc6b0938e669"
+    },
+    {
+      "path": "tests/contracts/test_uuid_regex_contract.py",
+      "sha256": "a36ecde8854dadd1d3efa1700c6d72d84ba2f23726159234272d4b4921f8ec29"
+    }
+  ],
+  "source_git_tree": "6f671122ff5f76902cfe051e4558a2c57d161bc4"
+}

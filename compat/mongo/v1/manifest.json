@@ -1,0 +1,4070 @@
+{
+  "capabilities": {
+    "aggregation": {
+      "accumulators": [
+        "$addToSet",
+        "$avg",
+        "$first",
+        "$last",
+        "$max",
+        "$min",
+        "$push",
+        "$sum"
+      ],
+      "expressions": [
+        "$ifNull",
+        "$literal",
+        "$size"
+      ],
+      "expression_stages": [
+        "$addFields",
+        "$group",
+        "$project",
+        "$set"
+      ],
+      "remove_variable_stages": [
+        "$addFields",
+        "$project",
+        "$set"
+      ],
+      "operation_options": {
+        "other_keyword_arguments": "unsupported",
+        "session": "null-only"
+      },
+      "stage_rules": [
+        "$set is an alias of $addFields",
+        "$unset accepts a field string or a non-empty list/tuple of field strings",
+        "$group _id accepts only a field path or null"
+      ],
+      "stages": [
+        "$match",
+        "$sort",
+        "$skip",
+        "$limit",
+        "$count",
+        "$project",
+        "$set",
+        "$addFields",
+        "$unset",
+        "$group"
+      ],
+      "unsupported_special_forms": [
+        "$sort $meta",
+        "aggregation variables other than $$REMOVE in its supported stages"
+      ]
+    },
+    "api": {
+      "aliases": {
+        "tinymongo.AsyncCollection": "tinymongo.AsyncTinyMongoCollection",
+        "tinymongo.AsyncCursor": "tinymongo.AsyncTinyMongoCursor",
+        "tinymongo.AsyncDatabase": "tinymongo.AsyncTinyMongoDatabase"
+      },
+      "behavior_enum": {
+        "accepted_no_effect": "The value is accepted for call compatibility and has no effect.",
+        "applied": "The supplied value changes the operation directly.",
+        "applied_conditionally": "The supplied value changes behavior only under the stated condition.",
+        "default_or_empty_only": "Only the documented default, empty, or no-op form is accepted.",
+        "dispatched": "The option is forwarded to another inventoried operation whose behavior applies.",
+        "null_only": "None is accepted; a non-None value raises TinyMongoNotSupportedError.",
+        "rejected": "Python argument binding or explicit validation rejects the option.",
+        "rejected_unsupported": "The option or method is recognized but raises TinyMongoNotSupportedError."
+      },
+      "connection_options": {
+        "lookup": "case-insensitive against the installed pymongo.common.VALIDATORS catalog; the pinned offline contract is the 65-name fallback below",
+        "pymongo_fallback_catalog": [
+          {
+            "behavior": "accepted_no_effect",
+            "name": "appname"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "authmechanism"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "authmechanismproperties"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "authoidcallowedhosts"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "authsource"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "auto_encryption_opts"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "compressors"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "connect"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "connecttimeoutms"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "datetime_conversion"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "directconnection"
+          },
+          {
+            "behavior": "applied",
+            "name": "document_class"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "driver"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "enable_overload_retargeting"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "enableoverloadretargeting"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "event_listeners"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "fsync"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "heartbeatfrequencyms"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "journal"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "loadbalanced"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "localthresholdms"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "max_adaptive_retries"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "maxadaptiveretries"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "maxconnecting"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "maxidletimems"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "maxpoolsize"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "maxstalenessseconds"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "minpoolsize"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "password"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "read_preference"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "readconcernlevel"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "readpreference"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "readpreferencetags"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "replicaset"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "retryreads"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "retrywrites"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "server_api"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "server_selector"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "servermonitoringmode"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "serverselectiontimeoutms"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "sockettimeoutms"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "srvmaxhosts"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "srvservicename"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "ssl"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "timeoutms"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "tls"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "tlsallowinvalidcertificates"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "tlsallowinvalidhostnames"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "tlscafile"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "tlscertificatekeyfile"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "tlscertificatekeyfilepassword"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "tlscrlfile"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "tlsdisableocspendpointcheck"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "tlsinsecure"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "type_registry"
+          },
+          {
+            "behavior": "applied",
+            "name": "tz_aware"
+          },
+          {
+            "behavior": "applied_conditionally",
+            "condition": "applied to returned datetimes only when tz_aware is true",
+            "name": "tzinfo"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "unicode_decode_error_handler"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "username"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "uuidrepresentation"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "w"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "waitqueuemultiple"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "waitqueuetimeoutms"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "wtimeoutms"
+          },
+          {
+            "behavior": "accepted_no_effect",
+            "name": "zlibcompressionlevel"
+          }
+        ],
+        "pymongo_fallback_count": 65,
+        "tinymongo_storage_options": [
+          {
+            "behavior": "applied",
+            "name": "backend"
+          },
+          {
+            "behavior": "applied_conditionally",
+            "condition": "used only by remote SQL backends",
+            "name": "dsn"
+          },
+          {
+            "behavior": "applied_conditionally",
+            "condition": "passed to table backends that consume DuckDB configuration",
+            "name": "duckdb_config"
+          },
+          {
+            "behavior": "applied_conditionally",
+            "condition": "selects the local folder when no higher-precedence TinyMongo folder alias is truthy",
+            "name": "foldername"
+          },
+          {
+            "behavior": "applied_conditionally",
+            "condition": "used only by the 'sqlite-sharded' backend",
+            "name": "sqlite_shards"
+          },
+          {
+            "behavior": "applied_conditionally",
+            "condition": "used only by 'parquet' and 'parquetv2'",
+            "name": "storage_uri"
+          },
+          {
+            "behavior": "applied_conditionally",
+            "condition": "passed to table backends",
+            "name": "threads"
+          },
+          {
+            "behavior": "applied_conditionally",
+            "condition": "highest-precedence explicit local folder alias",
+            "name": "tinymongo_folder"
+          },
+          {
+            "behavior": "applied_conditionally",
+            "condition": "second-precedence explicit local folder alias",
+            "name": "tinymongo_path"
+          }
+        ],
+        "unknown_option_behavior": "raises ConfigurationError before storage is opened"
+      },
+      "constructors": {
+        "tinymongo.AsyncMongoClient": {
+          "options": [
+            {
+              "behavior": "applied_conditionally",
+              "condition": "a non-network string is a local folder; a memory URI can identify a shared namespace; network-shaped values are accepted without a connection",
+              "name": "host"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "a non-None value makes host network-shaped and prevents treating it as a local folder",
+              "name": "port"
+            },
+            {
+              "behavior": "applied",
+              "name": "document_class"
+            },
+            {
+              "behavior": "applied",
+              "name": "tz_aware"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "connect"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "type_registry"
+            },
+            {
+              "behavior": "dispatched",
+              "condition": "TinyMongo storage options and the 65-name PyMongo connection catalog below are recognized; any other name raises ConfigurationError",
+              "name": "**kwargs"
+            }
+          ],
+          "signature": "AsyncMongoClient(host=None, port=None, document_class=None, tz_aware=None, connect=None, type_registry=None, **kwargs)"
+        },
+        "tinymongo.AsyncTinyMongoClient": {
+          "options": [
+            {
+              "behavior": "applied",
+              "name": "foldername"
+            },
+            {
+              "behavior": "applied",
+              "name": "backend"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "non-None value overrides foldername",
+              "name": "tinymongo_folder"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "passed to table backends",
+              "name": "threads"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "used only by the 'sqlite-sharded' backend",
+              "name": "sqlite_shards"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "used only by 'parquet' and 'parquetv2'",
+              "name": "storage_uri"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "passed to table backends that consume DuckDB configuration",
+              "name": "duckdb_config"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "used only by remote SQL backends",
+              "name": "dsn"
+            }
+          ],
+          "signature": "AsyncTinyMongoClient(foldername='tinydb', backend='tinydb', *, tinymongo_folder=None, threads=None, sqlite_shards=None, storage_uri=None, duckdb_config=None, dsn=None)"
+        },
+        "tinymongo.AsyncTinyMongoCollection": {
+          "construction_scope": "normally returned by an async database rather than constructed directly",
+          "options": [],
+          "signature": "AsyncTinyMongoCollection(database, name)"
+        },
+        "tinymongo.AsyncTinyMongoCursor": {
+          "options": [
+            {
+              "behavior": "applied_conditionally",
+              "condition": "required for a lazy query source",
+              "name": "collection"
+            },
+            {
+              "behavior": "applied",
+              "name": "filter"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "dispatched",
+              "condition": "forwarded to the synchronous collection find operation when lazily loaded",
+              "name": "find_args"
+            },
+            {
+              "behavior": "dispatched",
+              "condition": "forwarded to the synchronous collection find operation when lazily loaded",
+              "name": "find_kwargs"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "provides an eager seed instead of a collection query",
+              "name": "documents"
+            }
+          ],
+          "signature": "AsyncTinyMongoCursor(collection=None, filter=None, projection=None, find_args=(), find_kwargs=None, documents=None)"
+        },
+        "tinymongo.AsyncTinyMongoDatabase": {
+          "construction_scope": "normally returned by an async client rather than constructed directly",
+          "options": [],
+          "signature": "AsyncTinyMongoDatabase(client, name)"
+        },
+        "tinymongo.MongoClient": {
+          "options": [
+            {
+              "behavior": "applied_conditionally",
+              "condition": "a non-network string is a local folder; a memory URI can identify a shared namespace; network-shaped values are accepted without a connection",
+              "name": "host"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "a non-None value makes host network-shaped and prevents treating it as a local folder",
+              "name": "port"
+            },
+            {
+              "behavior": "applied",
+              "name": "document_class"
+            },
+            {
+              "behavior": "applied",
+              "name": "tz_aware"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "connect"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "type_registry"
+            },
+            {
+              "behavior": "dispatched",
+              "condition": "TinyMongo storage options and the 65-name PyMongo connection catalog below are recognized; any other name raises ConfigurationError",
+              "name": "**kwargs"
+            }
+          ],
+          "signature": "MongoClient(host=None, port=None, document_class=None, tz_aware=None, connect=None, type_registry=None, **kwargs)"
+        },
+        "tinymongo.TinyGridFS": {
+          "construction_scope": "placeholder only; no GridFS storage operations are implemented",
+          "options": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "signature": "TinyGridFS(*args, **kwargs)"
+        },
+        "tinymongo.TinyMongoClient": {
+          "options": [
+            {
+              "behavior": "applied",
+              "name": "foldername"
+            },
+            {
+              "behavior": "applied",
+              "name": "backend"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "non-None value overrides foldername",
+              "name": "tinymongo_folder"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "passed to table backends",
+              "name": "threads"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "used only by the 'sqlite-sharded' backend",
+              "name": "sqlite_shards"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "used only by 'parquet' and 'parquetv2'",
+              "name": "storage_uri"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "passed to table backends that consume DuckDB configuration",
+              "name": "duckdb_config"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "used only by remote SQL backends",
+              "name": "dsn"
+            }
+          ],
+          "signature": "TinyMongoClient(foldername='tinydb', backend='tinydb', *, tinymongo_folder=None, threads=None, sqlite_shards=None, storage_uri=None, duckdb_config=None, dsn=None)"
+        },
+        "tinymongo.TinyMongoCollection": {
+          "construction_scope": "normally returned by a database rather than constructed directly",
+          "options": [
+            {
+              "behavior": "applied_conditionally",
+              "condition": "supplies database, storage, engine, and read-materialization context",
+              "name": "parent"
+            }
+          ],
+          "signature": "TinyMongoCollection(table, parent=None)"
+        },
+        "tinymongo.TinyMongoCursor": {
+          "options": [
+            {
+              "behavior": "applied",
+              "name": "sort"
+            },
+            {
+              "behavior": "applied",
+              "name": "skip"
+            },
+            {
+              "behavior": "applied",
+              "name": "limit"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "retains collection context for lazy reloads and chained sort",
+              "name": "collection"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "retained for lazy reloads",
+              "name": "query"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "tracks projection pushdown",
+              "name": "source_projected"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "defers backend reads",
+              "name": "deferred_loader"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "converts returned BSON values",
+              "name": "materializer"
+            }
+          ],
+          "signature": "TinyMongoCursor(cursordat, sort=None, skip=None, limit=None, collection=None, projection=None, query=None, source_projected=False, deferred_loader=None, materializer=None)"
+        },
+        "tinymongo.TinyMongoDatabase": {
+          "construction_scope": "normally returned by a client rather than constructed directly",
+          "options": [
+            {
+              "behavior": "applied_conditionally",
+              "condition": "selects table-engine operations when non-None",
+              "name": "engine"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "enables closed-client checks and configured read materialization",
+              "name": "client"
+            }
+          ],
+          "signature": "TinyMongoDatabase(database, path, storage, engine=None, client=None)"
+        }
+      },
+      "inventory_version": 1,
+      "method_options": {
+        "async_client": {
+          "capabilities": [],
+          "close": [],
+          "database_names": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "drop_database": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "get_database": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "list_database_names": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "list_databases": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "server_info": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "start_session": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*args"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**kwargs"
+            }
+          ],
+          "supports": [],
+          "watch": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*args"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**kwargs"
+            }
+          ]
+        },
+        "async_collection": {
+          "aggregate": [
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**aggregation options"
+            }
+          ],
+          "bulk_write": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*args"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**kwargs"
+            }
+          ],
+          "count": [],
+          "count_documents": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "create_index": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*positional options"
+            },
+            {
+              "behavior": "applied",
+              "name": "name"
+            },
+            {
+              "behavior": "applied",
+              "name": "partialFilterExpression"
+            },
+            {
+              "behavior": "applied",
+              "name": "sparse"
+            },
+            {
+              "behavior": "applied",
+              "name": "unique"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "create_indexes": [
+            {
+              "behavior": "rejected",
+              "name": "*positional options"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "delete_many": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "delete_one": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "distinct": [
+            {
+              "behavior": "applied",
+              "name": "filter"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "drop": [
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "drop_index": [],
+          "estimated_document_count": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "find": [
+            {
+              "behavior": "applied",
+              "name": "filter"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "applied",
+              "name": "skip"
+            },
+            {
+              "behavior": "applied",
+              "name": "limit"
+            },
+            {
+              "behavior": "applied",
+              "name": "sort"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "find_one": [
+            {
+              "behavior": "applied_conditionally",
+              "condition": "keyword alias is used only when the primary filter argument is None",
+              "name": "filter"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "applied",
+              "name": "sort"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "find_one_and_delete": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied",
+              "name": "sort"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "find_one_and_replace": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "enabled only by the literal true",
+              "name": "upsert"
+            },
+            {
+              "behavior": "applied",
+              "name": "sort"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "applied",
+              "condition": "must be boolean ReturnDocument.BEFORE or ReturnDocument.AFTER",
+              "name": "return_document"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "find_one_and_update": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "enabled only by the literal true",
+              "name": "upsert"
+            },
+            {
+              "behavior": "applied",
+              "name": "sort"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "applied",
+              "condition": "must be boolean ReturnDocument.BEFORE or ReturnDocument.AFTER",
+              "name": "return_document"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "index_information": [],
+          "insert": [
+            {
+              "behavior": "dispatched",
+              "condition": "forwarded to insert_many for list input or insert_one otherwise",
+              "name": "*args"
+            },
+            {
+              "behavior": "dispatched",
+              "condition": "forwarded to insert_many for list input or insert_one otherwise",
+              "name": "**kwargs"
+            }
+          ],
+          "insert_many": [
+            {
+              "behavior": "applied",
+              "name": "ordered"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "forwarded to table backends; storage codec validation still runs",
+              "name": "bypass_document_validation"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "comment"
+            },
+            {
+              "behavior": "rejected",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "insert_one": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "only the literal true is forwarded to table backends; storage codec validation still runs",
+              "name": "bypass_document_validation"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "list_indexes": [],
+          "remove": [
+            {
+              "behavior": "applied",
+              "name": "multi"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "replace_one": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "enabled only by the literal true",
+              "name": "upsert"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "update": [
+            {
+              "behavior": "dispatched",
+              "condition": "forwarded to update_one for each list member or update_many otherwise",
+              "name": "*args"
+            },
+            {
+              "behavior": "dispatched",
+              "condition": "forwarded to update_one for each list member or update_many otherwise",
+              "name": "**kwargs"
+            }
+          ],
+          "update_many": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "enabled only by the literal true",
+              "name": "upsert"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "update_one": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "enabled only by the literal true",
+              "name": "upsert"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "watch": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*args"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**kwargs"
+            }
+          ],
+          "with_options": [
+            {
+              "behavior": "default_or_empty_only",
+              "condition": "objects exposing a non-empty .document are rejected",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "codec_options"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "read_preference"
+            },
+            {
+              "behavior": "default_or_empty_only",
+              "condition": "None or an object with an empty .document is accepted",
+              "name": "write_concern"
+            },
+            {
+              "behavior": "default_or_empty_only",
+              "condition": "None or an object with an empty .document is accepted",
+              "name": "read_concern"
+            },
+            {
+              "behavior": "default_or_empty_only",
+              "condition": "None or a value without a non-empty .document is accepted",
+              "name": "**unrecognized keywords"
+            }
+          ]
+        },
+        "async_cursor": {
+          "clone": [],
+          "close": [],
+          "count": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "with_limit_and_skip"
+            }
+          ],
+          "hasNext": [],
+          "has_next": [],
+          "limit": [],
+          "next": [],
+          "paginate": [],
+          "rewind": [],
+          "skip": [],
+          "sort": [
+            {
+              "behavior": "applied",
+              "name": "direction"
+            }
+          ],
+          "to_list": [
+            {
+              "behavior": "applied",
+              "name": "length"
+            }
+          ],
+          "try_next": []
+        },
+        "async_database": {
+          "close": [],
+          "collection_names": [],
+          "command": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "value"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "drop_collection": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "get_collection": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "list_collection_names": [
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "default_or_empty_only",
+              "name": "filter"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "comment"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "authorizedCollections"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "nameOnly"
+            },
+            {
+              "behavior": "rejected",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "watch": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*args"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**kwargs"
+            }
+          ]
+        },
+        "gridfs_placeholder": {
+          "GridFS": [
+            {
+              "behavior": "applied",
+              "condition": "assigned to the placeholder database attribute; no file operations are implemented",
+              "name": "tinydatabase"
+            }
+          ],
+          "grid_fs": [
+            {
+              "behavior": "applied",
+              "condition": "assigned to the placeholder database attribute; no file operations are implemented",
+              "name": "tinydatabase"
+            }
+          ]
+        },
+        "sync_client": {
+          "capabilities": [],
+          "close": [],
+          "database_names": [],
+          "drop_database": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "get_database": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "list_database_names": [],
+          "list_databases": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "server_info": [],
+          "start_session": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*args"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**kwargs"
+            }
+          ],
+          "supports": [],
+          "watch": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*args"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**kwargs"
+            }
+          ]
+        },
+        "sync_collection": {
+          "aggregate": [
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**aggregation options"
+            }
+          ],
+          "build_table": [],
+          "bulk_write": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*args"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**kwargs"
+            }
+          ],
+          "count": [],
+          "count_documents": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "create_index": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*positional options"
+            },
+            {
+              "behavior": "applied",
+              "name": "name"
+            },
+            {
+              "behavior": "applied",
+              "name": "partialFilterExpression"
+            },
+            {
+              "behavior": "applied",
+              "name": "sparse"
+            },
+            {
+              "behavior": "applied",
+              "name": "unique"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "create_indexes": [
+            {
+              "behavior": "rejected",
+              "name": "*positional options"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "delete_many": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "delete_one": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "distinct": [
+            {
+              "behavior": "applied",
+              "name": "filter"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "drop": [
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "drop_index": [],
+          "estimated_document_count": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "find": [
+            {
+              "behavior": "applied_conditionally",
+              "condition": "keyword alias is used only when the primary filter argument is None",
+              "name": "filter"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "applied",
+              "name": "skip"
+            },
+            {
+              "behavior": "applied",
+              "name": "limit"
+            },
+            {
+              "behavior": "applied",
+              "name": "sort"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "find_one": [
+            {
+              "behavior": "applied_conditionally",
+              "condition": "keyword alias is used only when the primary filter argument is None",
+              "name": "filter"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "applied",
+              "name": "sort"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "find_one_and_delete": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied",
+              "name": "sort"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "find_one_and_replace": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "enabled only by the literal true",
+              "name": "upsert"
+            },
+            {
+              "behavior": "applied",
+              "name": "sort"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "applied",
+              "condition": "must be boolean ReturnDocument.BEFORE or ReturnDocument.AFTER",
+              "name": "return_document"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "find_one_and_update": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "enabled only by the literal true",
+              "name": "upsert"
+            },
+            {
+              "behavior": "applied",
+              "name": "sort"
+            },
+            {
+              "behavior": "applied",
+              "name": "projection"
+            },
+            {
+              "behavior": "applied",
+              "condition": "must be boolean ReturnDocument.BEFORE or ReturnDocument.AFTER",
+              "name": "return_document"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "index_information": [],
+          "insert": [
+            {
+              "behavior": "dispatched",
+              "condition": "forwarded to insert_many for list input or insert_one otherwise",
+              "name": "*args"
+            },
+            {
+              "behavior": "dispatched",
+              "condition": "forwarded to insert_many for list input or insert_one otherwise",
+              "name": "**kwargs"
+            }
+          ],
+          "insert_many": [
+            {
+              "behavior": "applied",
+              "name": "ordered"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "forwarded to table backends; storage codec validation still runs",
+              "name": "bypass_document_validation"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "comment"
+            },
+            {
+              "behavior": "rejected",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "insert_one": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "only the literal true is forwarded to table backends; storage codec validation still runs",
+              "name": "bypass_document_validation"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "list_indexes": [],
+          "parse_condition": [
+            {
+              "behavior": "applied_conditionally",
+              "condition": "internal recursive parser state",
+              "name": "prev_key"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "internal recursive parser state",
+              "name": "last_prev_key"
+            }
+          ],
+          "parse_query": [],
+          "remove": [
+            {
+              "behavior": "applied",
+              "name": "multi"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "replace_one": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "enabled only by the literal true",
+              "name": "upsert"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "update": [
+            {
+              "behavior": "dispatched",
+              "condition": "forwarded to update_one for each list member or update_many otherwise",
+              "name": "*args"
+            },
+            {
+              "behavior": "dispatched",
+              "condition": "forwarded to update_one for each list member or update_many otherwise",
+              "name": "**kwargs"
+            }
+          ],
+          "update_many": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "enabled only by the literal true",
+              "name": "upsert"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "update_one": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "applied_conditionally",
+              "condition": "enabled only by the literal true",
+              "name": "upsert"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "watch": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*args"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**kwargs"
+            }
+          ],
+          "with_options": [
+            {
+              "behavior": "default_or_empty_only",
+              "condition": "objects exposing a non-empty .document are rejected",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "codec_options"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "read_preference"
+            },
+            {
+              "behavior": "default_or_empty_only",
+              "condition": "None or an object with an empty .document is accepted",
+              "name": "write_concern"
+            },
+            {
+              "behavior": "default_or_empty_only",
+              "condition": "None or an object with an empty .document is accepted",
+              "name": "read_concern"
+            },
+            {
+              "behavior": "default_or_empty_only",
+              "condition": "None or a value without a non-empty .document is accepted",
+              "name": "**unrecognized keywords"
+            }
+          ]
+        },
+        "sync_cursor": {
+          "clone": [],
+          "close": [],
+          "count": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "with_limit_and_skip"
+            }
+          ],
+          "hasNext": [],
+          "has_next": [],
+          "limit": [],
+          "next": [],
+          "paginate": [],
+          "rewind": [],
+          "skip": [],
+          "sort": [
+            {
+              "behavior": "applied",
+              "name": "direction"
+            }
+          ],
+          "to_list": [
+            {
+              "behavior": "applied",
+              "name": "length"
+            }
+          ]
+        },
+        "sync_database": {
+          "close": [],
+          "collection_names": [],
+          "command": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "value"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "drop_collection": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "get_collection": [
+            {
+              "behavior": "accepted_no_effect",
+              "name": "*args"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "**kwargs"
+            }
+          ],
+          "list_collection_names": [
+            {
+              "behavior": "null_only",
+              "name": "session"
+            },
+            {
+              "behavior": "default_or_empty_only",
+              "name": "filter"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "comment"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "authorizedCollections"
+            },
+            {
+              "behavior": "accepted_no_effect",
+              "name": "nameOnly"
+            },
+            {
+              "behavior": "rejected",
+              "name": "**unrecognized keywords"
+            }
+          ],
+          "watch": [
+            {
+              "behavior": "rejected_unsupported",
+              "name": "*args"
+            },
+            {
+              "behavior": "rejected_unsupported",
+              "name": "**kwargs"
+            }
+          ]
+        }
+      },
+      "owners": {
+        "async_client": {
+          "awaitability": {
+            "awaitable": [
+              "capabilities",
+              "close",
+              "database_names",
+              "drop_database",
+              "list_database_names",
+              "list_databases",
+              "server_info",
+              "supports",
+              "watch"
+            ],
+            "immediate": [
+              "get_database",
+              "start_session"
+            ]
+          },
+          "classes": [
+            "tinymongo.AsyncTinyMongoClient",
+            "tinymongo.AsyncMongoClient"
+          ],
+          "extensions": [
+            "capabilities",
+            "database_names",
+            "supports"
+          ],
+          "present_but_unsupported": [
+            "start_session",
+            "watch"
+          ],
+          "properties": [],
+          "protocols": [
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__getitem__"
+              ],
+              "name": "database selection by subscription"
+            },
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__getattr__"
+              ],
+              "name": "database selection by attribute"
+            },
+            {
+              "awaitability": "awaitable",
+              "methods": [
+                "__aenter__",
+                "__aexit__"
+              ],
+              "name": "async context manager"
+            }
+          ],
+          "supported": [
+            "close",
+            "drop_database",
+            "get_database",
+            "list_database_names",
+            "list_databases",
+            "server_info"
+          ]
+        },
+        "async_collection": {
+          "awaitability": {
+            "awaitable": [
+              "aggregate",
+              "bulk_write",
+              "count",
+              "count_documents",
+              "create_index",
+              "create_indexes",
+              "delete_many",
+              "delete_one",
+              "distinct",
+              "drop",
+              "drop_index",
+              "estimated_document_count",
+              "find_one",
+              "find_one_and_delete",
+              "find_one_and_replace",
+              "find_one_and_update",
+              "index_information",
+              "insert",
+              "insert_many",
+              "insert_one",
+              "list_indexes",
+              "remove",
+              "replace_one",
+              "update",
+              "update_many",
+              "update_one",
+              "watch"
+            ],
+            "immediate": [
+              "find",
+              "with_options"
+            ]
+          },
+          "classes": [
+            "tinymongo.AsyncTinyMongoCollection",
+            "tinymongo.AsyncCollection"
+          ],
+          "extensions": [
+            "count",
+            "insert",
+            "remove",
+            "update"
+          ],
+          "present_but_unsupported": [
+            "bulk_write",
+            "watch"
+          ],
+          "properties": [
+            {
+              "kind": "instance_attribute",
+              "name": "database"
+            },
+            {
+              "kind": "property",
+              "name": "full_name"
+            },
+            {
+              "kind": "instance_attribute",
+              "name": "name"
+            },
+            {
+              "kind": "property",
+              "meaning": "empty compatibility concern",
+              "name": "read_concern"
+            },
+            {
+              "kind": "property",
+              "name": "tablename"
+            },
+            {
+              "kind": "property",
+              "meaning": "empty compatibility concern",
+              "name": "write_concern"
+            }
+          ],
+          "protocols": [
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__getitem__",
+                "__getattr__"
+              ],
+              "name": "dotted child collection selection"
+            },
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__call__"
+              ],
+              "name": "callable typo diagnostic"
+            }
+          ],
+          "supported": [
+            "aggregate",
+            "count_documents",
+            "create_index",
+            "create_indexes",
+            "delete_many",
+            "delete_one",
+            "distinct",
+            "drop",
+            "drop_index",
+            "estimated_document_count",
+            "find",
+            "find_one",
+            "find_one_and_delete",
+            "find_one_and_replace",
+            "find_one_and_update",
+            "index_information",
+            "insert_many",
+            "insert_one",
+            "list_indexes",
+            "replace_one",
+            "update_many",
+            "update_one",
+            "with_options"
+          ]
+        },
+        "async_cursor": {
+          "awaitability": {
+            "awaitable": [
+              "close",
+              "count",
+              "hasNext",
+              "has_next",
+              "next",
+              "rewind",
+              "to_list",
+              "try_next"
+            ],
+            "immediate": [
+              "clone",
+              "limit",
+              "paginate",
+              "skip",
+              "sort"
+            ]
+          },
+          "classes": [
+            "tinymongo.AsyncTinyMongoCursor",
+            "tinymongo.AsyncCursor"
+          ],
+          "extensions": [
+            "count",
+            "hasNext",
+            "has_next",
+            "paginate"
+          ],
+          "present_but_unsupported": [],
+          "properties": [
+            {
+              "kind": "property",
+              "name": "alive"
+            }
+          ],
+          "protocols": [
+            {
+              "awaitability": "mixed",
+              "methods": [
+                "__aiter__",
+                "__anext__"
+              ],
+              "name": "async iterator"
+            },
+            {
+              "awaitability": "awaitable",
+              "methods": [
+                "__aenter__",
+                "__aexit__"
+              ],
+              "name": "async context manager"
+            }
+          ],
+          "supported": [
+            "clone",
+            "close",
+            "limit",
+            "next",
+            "rewind",
+            "skip",
+            "sort",
+            "to_list",
+            "try_next"
+          ]
+        },
+        "async_database": {
+          "awaitability": {
+            "awaitable": [
+              "close",
+              "collection_names",
+              "command",
+              "drop_collection",
+              "list_collection_names",
+              "watch"
+            ],
+            "immediate": [
+              "get_collection"
+            ]
+          },
+          "classes": [
+            "tinymongo.AsyncTinyMongoDatabase",
+            "tinymongo.AsyncDatabase"
+          ],
+          "extensions": [
+            "collection_names"
+          ],
+          "present_but_unsupported": [
+            "watch"
+          ],
+          "properties": [
+            {
+              "kind": "property",
+              "meaning": "compatibility name alias",
+              "name": "database"
+            },
+            {
+              "kind": "instance_attribute",
+              "name": "name"
+            }
+          ],
+          "protocols": [
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__getitem__"
+              ],
+              "name": "collection selection by subscription"
+            },
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__getattr__"
+              ],
+              "name": "collection selection by attribute"
+            },
+            {
+              "awaitability": "awaitable",
+              "methods": [
+                "__aenter__",
+                "__aexit__"
+              ],
+              "name": "async context manager"
+            }
+          ],
+          "supported": [
+            "close",
+            "command",
+            "drop_collection",
+            "get_collection",
+            "list_collection_names"
+          ]
+        },
+        "gridfs_placeholder": {
+          "awaitability": {
+            "awaitable": [],
+            "immediate": [
+              "GridFS",
+              "grid_fs"
+            ]
+          },
+          "classes": [
+            "tinymongo.TinyGridFS"
+          ],
+          "extensions": [],
+          "present_but_unsupported": [
+            "GridFS",
+            "grid_fs"
+          ],
+          "properties": [
+            {
+              "kind": "instance_attribute",
+              "meaning": "assigned handle only; no GridFS operations exist",
+              "name": "database"
+            }
+          ],
+          "protocols": [],
+          "supported": []
+        },
+        "sync_client": {
+          "awaitability": {
+            "awaitable": [],
+            "immediate": [
+              "close",
+              "drop_database",
+              "get_database",
+              "list_database_names",
+              "list_databases",
+              "server_info",
+              "start_session",
+              "watch",
+              "capabilities",
+              "database_names",
+              "supports"
+            ]
+          },
+          "classes": [
+            "tinymongo.TinyMongoClient",
+            "tinymongo.MongoClient"
+          ],
+          "extensions": [
+            "capabilities",
+            "database_names",
+            "supports"
+          ],
+          "present_but_unsupported": [
+            "start_session",
+            "watch"
+          ],
+          "properties": [],
+          "protocols": [
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__getitem__"
+              ],
+              "name": "database selection by subscription"
+            },
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__getattr__"
+              ],
+              "name": "database selection by attribute"
+            },
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__enter__",
+                "__exit__"
+              ],
+              "name": "context manager"
+            }
+          ],
+          "supported": [
+            "close",
+            "drop_database",
+            "get_database",
+            "list_database_names",
+            "list_databases",
+            "server_info"
+          ]
+        },
+        "sync_collection": {
+          "awaitability": {
+            "awaitable": [],
+            "immediate": [
+              "aggregate",
+              "count_documents",
+              "create_index",
+              "create_indexes",
+              "delete_many",
+              "delete_one",
+              "distinct",
+              "drop",
+              "drop_index",
+              "estimated_document_count",
+              "find",
+              "find_one",
+              "find_one_and_delete",
+              "find_one_and_replace",
+              "find_one_and_update",
+              "index_information",
+              "insert_many",
+              "insert_one",
+              "list_indexes",
+              "replace_one",
+              "update_many",
+              "update_one",
+              "with_options",
+              "bulk_write",
+              "watch",
+              "build_table",
+              "count",
+              "insert",
+              "parse_condition",
+              "parse_query",
+              "remove",
+              "update"
+            ]
+          },
+          "classes": [
+            "tinymongo.TinyMongoCollection"
+          ],
+          "extensions": [
+            "build_table",
+            "count",
+            "insert",
+            "parse_condition",
+            "parse_query",
+            "remove",
+            "update"
+          ],
+          "present_but_unsupported": [
+            "bulk_write",
+            "watch"
+          ],
+          "properties": [
+            {
+              "kind": "property",
+              "name": "database"
+            },
+            {
+              "kind": "property",
+              "name": "full_name"
+            },
+            {
+              "kind": "property",
+              "name": "name"
+            },
+            {
+              "kind": "property",
+              "meaning": "empty compatibility concern",
+              "name": "read_concern"
+            },
+            {
+              "kind": "instance_attribute",
+              "name": "tablename"
+            },
+            {
+              "kind": "property",
+              "meaning": "empty compatibility concern",
+              "name": "write_concern"
+            }
+          ],
+          "protocols": [
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__getitem__",
+                "__getattr__"
+              ],
+              "name": "dotted child collection selection"
+            },
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__call__"
+              ],
+              "name": "callable typo diagnostic"
+            }
+          ],
+          "supported": [
+            "aggregate",
+            "count_documents",
+            "create_index",
+            "create_indexes",
+            "delete_many",
+            "delete_one",
+            "distinct",
+            "drop",
+            "drop_index",
+            "estimated_document_count",
+            "find",
+            "find_one",
+            "find_one_and_delete",
+            "find_one_and_replace",
+            "find_one_and_update",
+            "index_information",
+            "insert_many",
+            "insert_one",
+            "list_indexes",
+            "replace_one",
+            "update_many",
+            "update_one",
+            "with_options"
+          ]
+        },
+        "sync_cursor": {
+          "awaitability": {
+            "awaitable": [],
+            "immediate": [
+              "clone",
+              "close",
+              "limit",
+              "next",
+              "rewind",
+              "skip",
+              "sort",
+              "to_list",
+              "count",
+              "hasNext",
+              "has_next",
+              "paginate"
+            ]
+          },
+          "classes": [
+            "tinymongo.TinyMongoCursor"
+          ],
+          "extensions": [
+            "count",
+            "hasNext",
+            "has_next",
+            "paginate"
+          ],
+          "present_but_unsupported": [],
+          "properties": [
+            {
+              "kind": "property",
+              "name": "alive"
+            }
+          ],
+          "protocols": [
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__getitem__"
+              ],
+              "name": "indexing and slicing"
+            },
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__iter__",
+                "__next__"
+              ],
+              "name": "iterator"
+            },
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__enter__",
+                "__exit__"
+              ],
+              "name": "context manager"
+            }
+          ],
+          "supported": [
+            "clone",
+            "close",
+            "limit",
+            "next",
+            "rewind",
+            "skip",
+            "sort",
+            "to_list"
+          ]
+        },
+        "sync_database": {
+          "awaitability": {
+            "awaitable": [],
+            "immediate": [
+              "close",
+              "command",
+              "drop_collection",
+              "get_collection",
+              "list_collection_names",
+              "watch",
+              "collection_names"
+            ]
+          },
+          "classes": [
+            "tinymongo.TinyMongoDatabase"
+          ],
+          "extensions": [
+            "collection_names"
+          ],
+          "present_but_unsupported": [
+            "watch"
+          ],
+          "properties": [
+            {
+              "kind": "property",
+              "name": "name"
+            },
+            {
+              "kind": "instance_attribute",
+              "meaning": "compatibility name alias",
+              "name": "database"
+            }
+          ],
+          "protocols": [
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__getitem__"
+              ],
+              "name": "collection selection by subscription"
+            },
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__getattr__"
+              ],
+              "name": "collection selection by attribute"
+            },
+            {
+              "awaitability": "immediate",
+              "methods": [
+                "__enter__",
+                "__exit__"
+              ],
+              "name": "context manager"
+            }
+          ],
+          "supported": [
+            "close",
+            "command",
+            "drop_collection",
+            "get_collection",
+            "list_collection_names"
+          ]
+        }
+      }
+    },
+    "commands": {
+      "rules": [
+        "command names are case-insensitive",
+        "session is null-only",
+        "string or non-empty command-document input; the document's first key selects the command",
+        "value, positional arguments, and other keyword arguments are ignored"
+      ],
+      "supported": [
+        "buildInfo",
+        "ping"
+      ],
+      "unsupported": [
+        "arbitrary database commands"
+      ]
+    },
+    "errors": {
+      "class_shapes": {
+        "BulkWriteError": {
+          "constructor": "BulkWriteError(results)",
+          "detail_shape": "bulk_write_details",
+          "fields": [
+            {
+              "constant": 65,
+              "kind": "pymongo_property",
+              "name": "code"
+            },
+            {
+              "kind": "pymongo_property",
+              "name": "details",
+              "shape": "bulk_write_details"
+            },
+            {
+              "kind": "inherited_pymongo_property",
+              "name": "timeout",
+              "rule": "true when the last write concern error is a write timeout or the last write error has code 50; runtime-produced insert errors use code 11000"
+            }
+          ]
+        },
+        "ConfigurationError": {
+          "fields": [
+            {
+              "constant": false,
+              "kind": "inherited_pymongo_property",
+              "name": "timeout"
+            }
+          ]
+        },
+        "ConnectionFailure": {
+          "fields": [
+            {
+              "constant": false,
+              "kind": "inherited_pymongo_property",
+              "name": "timeout"
+            }
+          ]
+        },
+        "CursorNotFound": {
+          "fields": [
+            {
+              "kind": "pymongo_property",
+              "name": "code"
+            },
+            {
+              "kind": "pymongo_property",
+              "name": "details"
+            },
+            {
+              "kind": "inherited_pymongo_property",
+              "name": "timeout",
+              "rule": "true only when code is 50"
+            }
+          ]
+        },
+        "DuplicateKeyError": {
+          "constructor": "DuplicateKeyError(error, code=11000, details=None, max_wire_version=None)",
+          "fields": [
+            {
+              "kind": "pymongo_property",
+              "name": "code"
+            },
+            {
+              "kind": "pymongo_property",
+              "name": "details"
+            },
+            {
+              "kind": "inherited_pymongo_property",
+              "name": "timeout",
+              "rule": "true only when code is 50"
+            }
+          ]
+        },
+        "InvalidDocument": {
+          "constructor": "InvalidDocument(message, document=None)",
+          "fields": [
+            {
+              "identity": "original root document rejected by the BSON codec",
+              "kind": "tinymongo_property",
+              "name": "document"
+            },
+            {
+              "constant": false,
+              "kind": "inherited_pymongo_property",
+              "name": "timeout"
+            }
+          ]
+        },
+        "InvalidOperation": {
+          "fields": [
+            {
+              "constant": false,
+              "kind": "inherited_pymongo_property",
+              "name": "timeout"
+            }
+          ]
+        },
+        "LockError": {
+          "fields": [
+            {
+              "constant": false,
+              "kind": "inherited_pymongo_property",
+              "name": "timeout"
+            }
+          ]
+        },
+        "OperationFailure": {
+          "constructor": "OperationFailure(error, code=None, details=None, max_wire_version=None)",
+          "fields": [
+            {
+              "kind": "pymongo_property",
+              "name": "code"
+            },
+            {
+              "kind": "pymongo_property",
+              "name": "details"
+            },
+            {
+              "kind": "inherited_pymongo_property",
+              "name": "timeout",
+              "rule": "true only when code is 50"
+            }
+          ]
+        },
+        "StorageCorruptionError": {
+          "fields": [
+            {
+              "constant": false,
+              "kind": "inherited_pymongo_property",
+              "name": "timeout"
+            }
+          ]
+        },
+        "StorageError": {
+          "fields": [
+            {
+              "constant": false,
+              "kind": "inherited_pymongo_property",
+              "name": "timeout"
+            }
+          ]
+        },
+        "TinyMongoError": {
+          "fields": [
+            {
+              "constant": false,
+              "kind": "inherited_pymongo_property",
+              "name": "timeout"
+            }
+          ]
+        },
+        "TinyMongoNotSupportedError": {
+          "fields": [
+            {
+              "constant": false,
+              "kind": "inherited_pymongo_property",
+              "name": "timeout"
+            }
+          ]
+        },
+        "WriteError": {
+          "fields": [
+            {
+              "kind": "pymongo_property",
+              "name": "code"
+            },
+            {
+              "kind": "pymongo_property",
+              "name": "details"
+            },
+            {
+              "kind": "inherited_pymongo_property",
+              "name": "timeout",
+              "rule": "true only when code is 50"
+            }
+          ]
+        }
+      },
+      "classes": [
+        "BulkWriteError",
+        "ConfigurationError",
+        "ConnectionFailure",
+        "CursorNotFound",
+        "DuplicateKeyError",
+        "InvalidDocument",
+        "InvalidOperation",
+        "LockError",
+        "OperationFailure",
+        "StorageCorruptionError",
+        "StorageError",
+        "TinyMongoError",
+        "TinyMongoNotSupportedError",
+        "WriteError"
+      ],
+      "contract_asserted_codes": [
+        2,
+        9,
+        14,
+        28,
+        40,
+        66,
+        85,
+        86,
+        224,
+        11000,
+        51075
+      ],
+      "detail_shapes": {
+        "bulk_write_details": {
+          "kind": "document",
+          "required_fields": {
+            "nInserted": "integer",
+            "nMatched": {
+              "constant": 0
+            },
+            "nModified": {
+              "constant": 0
+            },
+            "nRemoved": {
+              "constant": 0
+            },
+            "nUpserted": {
+              "constant": 0
+            },
+            "upserted": {
+              "constant": []
+            },
+            "writeConcernErrors": {
+              "constant": []
+            },
+            "writeErrors": {
+              "item": {
+                "kind": "document",
+                "required_fields": {
+                  "code": {
+                    "constant": 11000
+                  },
+                  "errmsg": "string",
+                  "index": "integer",
+                  "keyPattern": "document",
+                  "keyValue": "document",
+                  "op": "original_document"
+                }
+              },
+              "kind": "array"
+            }
+          }
+        }
+      },
+      "field_scope": "public TinyMongo/PyMongo properties in the pinned PyMongo 4.17.0 reference environment; BaseException.args is omitted",
+      "runtime_emitted_code_count": 60,
+      "stable_codes_by_domain": {
+        "aggregation_expression_group_unset": {
+          "1257300": "ifNull_too_few_arguments",
+          "16020": "size_wrong_arity",
+          "17124": "size_input_not_array",
+          "31002": "unset_wrong_container_type",
+          "31119": "unset_empty_array",
+          "31120": "unset_non_string_member",
+          "40234": "accumulator_missing_empty_non_document_or_non_operator",
+          "40235": "group_output_field_contains_dot",
+          "40236": "group_output_field_starts_with_dollar",
+          "40237": "accumulator_array_operand_not_unary",
+          "40238": "multiple_accumulators",
+          "40272": "set_or_add_fields_non_document"
+        },
+        "aggregation_sort_count_numeric": {
+          "13103": "sort_more_than_32_keys",
+          "15948": "count_output_field_is_id",
+          "15958": "limit_is_zero",
+          "15969": "project_stage_not_document",
+          "15973": "sort_stage_not_document",
+          "15974": "sort_key_not_string_or_direction_not_numeric",
+          "15975": "sort_direction_not_plus_or_minus_one",
+          "15976": "sort_is_empty",
+          "16746": "ambiguous_numeric_array_sort_path",
+          "40156": "count_field_not_string",
+          "40157": "count_field_empty",
+          "40158": "count_field_starts_with_dollar",
+          "40159": "count_field_contains_nul",
+          "40160": "count_field_contains_dot",
+          "5107200": "skip_invalid_type_integrality_or_i64_range",
+          "5107201": "limit_invalid_type_integrality_or_i64_range"
+        },
+        "common_query_update_index": {
+          "11000": "duplicate_key",
+          "14": "type_mismatch",
+          "197": "invalid_unique_option_on_id_index",
+          "2": "bad_value",
+          "224": "expr_forbidden_in_pull",
+          "27": "index_not_found",
+          "28": "path_not_viable",
+          "40": "conflicting_update_paths",
+          "56": "empty_update_path",
+          "65": "bulk_write_outer",
+          "66": "immutable_id",
+          "72": "cannot_drop_id_index",
+          "85": "same_key_options_different_name",
+          "86": "same_name_or_key_different_options",
+          "9": "failed_to_parse"
+        },
+        "paths_and_projection": {
+          "15998": "empty_path_component",
+          "16410": "dollar_prefixed_path_component",
+          "16411": "nul_path_component",
+          "31249": "ancestor_before_descendant_collision",
+          "31250": "descendant_before_ancestor_or_duplicate_collision",
+          "31252": "operator_expression_after_exclusion",
+          "31253": "inclusion_after_exclusion",
+          "31254": "exclusion_after_inclusion",
+          "31310": "scalar_or_field_path_expression_after_exclusion",
+          "40176": "set_or_add_fields_path_collision",
+          "40352": "empty_or_nul_projection_output_field",
+          "40353": "aggregation_path_ends_with_dot",
+          "51270": "empty_subprojection",
+          "51272": "empty_project"
+        },
+        "regex": {
+          "51075": "options_with_embedded_flags",
+          "51091": "invalid_python_regex_pattern",
+          "51108": "unsupported_option_character"
+        }
+      }
+    },
+    "indexes": {
+      "constraints": [
+        "compound indexes reject parallel array fields",
+        "dotted index paths cannot traverse arrays",
+        "indexed objects, nested arrays, non-finite numbers, and unsupported BSON values are rejected",
+        "sparse and partialFilterExpression are mutually exclusive",
+        "top-level arrays create multikey entries"
+      ],
+      "create_index": {
+        "directions": [
+          1
+        ],
+        "options": [
+          "name",
+          "partialFilterExpression",
+          "sparse",
+          "unique"
+        ]
+      },
+      "create_indexes_index_model": {
+        "directions": [
+          1,
+          -1,
+          "hashed",
+          "text"
+        ],
+        "options": [
+          "background",
+          "expireAfterSeconds",
+          "name",
+          "partialFilterExpression",
+          "sparse",
+          "unique"
+        ]
+      },
+      "degraded_with_warning": [
+        "background",
+        "descending",
+        "hashed",
+        "text",
+        "ttl"
+      ],
+      "degradation_outcomes": {
+        "ascending_fallback": [
+          "descending",
+          "hashed"
+        ],
+        "ignored_semantics": [
+          "background",
+          "ttl"
+        ],
+        "skipped_without_effective_index": [
+          "text"
+        ]
+      },
+      "operations": [
+        "create_index",
+        "create_indexes",
+        "drop_index",
+        "index_information",
+        "list_indexes"
+      ],
+      "partial_filter_operators": [
+        "$and",
+        "$eq",
+        "$exists:true",
+        "$gt",
+        "$gte",
+        "$in",
+        "$lt",
+        "$lte",
+        "$or",
+        "$type"
+      ],
+      "supported": [
+        "ascending",
+        "compound",
+        "dotted paths",
+        "multikey",
+        "named",
+        "partial",
+        "sparse",
+        "unique"
+      ],
+      "unsafe_unique_degradations_rejected": [
+        "hashed",
+        "text",
+        "ttl"
+      ]
+    },
+    "projections": {
+      "rules": [
+        "boolean and BSON-number flags only",
+        "empty mapping or field sequence means no projection",
+        "nested mappings are dotted-path shorthand",
+        "path collisions are rejected"
+      ],
+      "supported": [
+        "array traversal",
+        "dotted paths",
+        "exclusion",
+        "explicit _id inclusion/exclusion",
+        "inclusion",
+        "list-of-fields shorthand"
+      ],
+      "unsupported": [
+        "$elemMatch projection",
+        "$slice projection",
+        "expression projection in find",
+        "mixed inclusion/exclusion except _id",
+        "numeric array-index output paths",
+        "positional projection"
+      ]
+    },
+    "queries": {
+      "field_operators": [
+        "$all",
+        "$elemMatch",
+        "$eq",
+        "$exists",
+        "$gt",
+        "$gte",
+        "$in",
+        "$lt",
+        "$lte",
+        "$mod",
+        "$ne",
+        "$nin",
+        "$not",
+        "$options",
+        "$regex",
+        "$size",
+        "$type"
+      ],
+      "ignored_metadata_operators": [
+        "$comment"
+      ],
+      "ignored_metadata_operator_scope": "query-document keys only; field-operator use is invalid",
+      "logical_operators": [
+        "$and",
+        "$nor",
+        "$or"
+      ],
+      "regex_options": [
+        "i",
+        "m",
+        "s",
+        "u",
+        "x"
+      ],
+      "unsupported_operators": [
+        "$bitsAllClear",
+        "$bitsAllSet",
+        "$bitsAnyClear",
+        "$bitsAnySet",
+        "$expr",
+        "$geoIntersects",
+        "$geoWithin",
+        "$jsonSchema",
+        "$near",
+        "$nearSphere",
+        "$text",
+        "$where"
+      ],
+      "type_aliases": [
+        "minKey",
+        "double",
+        "string",
+        "object",
+        "array",
+        "binData",
+        "undefined",
+        "objectId",
+        "bool",
+        "date",
+        "null",
+        "regex",
+        "dbPointer",
+        "javascript",
+        "symbol",
+        "javascriptWithScope",
+        "int",
+        "timestamp",
+        "long",
+        "decimal",
+        "maxKey",
+        "number"
+      ],
+      "type_codes": {
+        "-1": "minKey",
+        "1": "double",
+        "2": "string",
+        "3": "object",
+        "4": "array",
+        "5": "binData",
+        "6": "undefined",
+        "7": "objectId",
+        "8": "bool",
+        "9": "date",
+        "10": "null",
+        "11": "regex",
+        "12": "dbPointer",
+        "13": "javascript",
+        "14": "symbol",
+        "15": "javascriptWithScope",
+        "16": "int",
+        "17": "timestamp",
+        "18": "long",
+        "19": "decimal",
+        "127": "maxKey"
+      },
+      "rules": [
+        "array and dotted-path traversal",
+        "BSON type brackets",
+        "missing/null distinction",
+        "numeric cross-type comparison",
+        "recursive BSON equality",
+        "regex option normalization"
+      ]
+    },
+    "results": {
+      "cursor_results": {
+        "async_class": "tinymongo.AsyncTinyMongoCursor",
+        "async_cursor_returning_operations": [
+          "aggregate",
+          "find",
+          "list_databases",
+          "list_indexes"
+        ],
+        "behavior": [
+          "lazy async collection find",
+          "ordered local iteration",
+          "clone and rewind",
+          "sort then skip then absolute limit",
+          "length-bounded to_list",
+          "close and alive state",
+          "independent materialized values"
+        ],
+        "sync_class": "tinymongo.TinyMongoCursor",
+        "sync_cursor_returning_operations": [
+          "aggregate",
+          "find",
+          "list_databases"
+        ]
+      },
+      "document_results": {
+        "datetime_conversion": "MongoClient tz_aware and tzinfo are applied recursively at read materialization",
+        "field_order": "mapping insertion order is retained, including nested documents",
+        "mapping_class": "MongoClient document_class is applied recursively to returned mappings",
+        "value_isolation": "returned documents and BSON containers are copied so caller mutation does not mutate storage"
+      },
+      "inventory_version": 1,
+      "operation_result_shapes": {
+        "async_client": {
+          "capabilities": "capabilities_document",
+          "close": "none",
+          "database_names": "string_list",
+          "drop_database": "none",
+          "get_database": "database_handle_async",
+          "list_database_names": "string_list",
+          "list_databases": "database_metadata_cursor_async",
+          "server_info": "server_info_document",
+          "start_session": "unsupported_error",
+          "supports": "boolean",
+          "watch": "unsupported_error"
+        },
+        "async_collection": {
+          "aggregate": "cursor_async",
+          "bulk_write": "unsupported_error",
+          "count": "integer",
+          "count_documents": "integer",
+          "create_index": "string",
+          "create_indexes": "string_list",
+          "delete_many": "delete_result",
+          "delete_one": "delete_result",
+          "distinct": "value_list",
+          "drop": "boolean",
+          "drop_index": "none",
+          "estimated_document_count": "integer",
+          "find": "cursor_async",
+          "find_one": "document_or_none",
+          "find_one_and_delete": "document_or_none",
+          "find_one_and_replace": "document_or_none",
+          "find_one_and_update": "document_or_none",
+          "index_information": "index_information_document",
+          "insert": "legacy_insert_result",
+          "insert_many": "insert_many_result",
+          "insert_one": "insert_one_result",
+          "list_indexes": "index_metadata_cursor_async",
+          "remove": "delete_result",
+          "replace_one": "update_result",
+          "update": "legacy_update_result",
+          "update_many": "update_result",
+          "update_one": "update_result",
+          "watch": "unsupported_error",
+          "with_options": "self_async_collection"
+        },
+        "async_cursor": {
+          "clone": "cursor_handle_async",
+          "close": "none",
+          "count": "integer",
+          "hasNext": "boolean",
+          "has_next": "boolean",
+          "limit": "self_async_cursor",
+          "next": "document",
+          "paginate": "self_async_cursor",
+          "rewind": "self_async_cursor",
+          "skip": "self_async_cursor",
+          "sort": "self_async_cursor",
+          "to_list": "document_list",
+          "try_next": "document_or_none"
+        },
+        "async_database": {
+          "close": "none",
+          "collection_names": "string_list",
+          "command": "command_document",
+          "drop_collection": "boolean",
+          "get_collection": "collection_handle_async",
+          "list_collection_names": "string_list",
+          "watch": "unsupported_error"
+        },
+        "gridfs_placeholder": {
+          "GridFS": "self_gridfs_placeholder",
+          "grid_fs": "self_gridfs_placeholder"
+        },
+        "sync_client": {
+          "capabilities": "capabilities_document",
+          "close": "none",
+          "database_names": "string_list",
+          "drop_database": "none",
+          "get_database": "database_handle_sync",
+          "list_database_names": "string_list",
+          "list_databases": "database_metadata_cursor_sync",
+          "server_info": "server_info_document",
+          "start_session": "unsupported_error",
+          "supports": "boolean",
+          "watch": "unsupported_error"
+        },
+        "sync_collection": {
+          "aggregate": "cursor_sync",
+          "build_table": "none",
+          "bulk_write": "unsupported_error",
+          "count": "integer",
+          "count_documents": "integer",
+          "create_index": "string",
+          "create_indexes": "string_list",
+          "delete_many": "delete_result",
+          "delete_one": "delete_result",
+          "distinct": "value_list",
+          "drop": "boolean",
+          "drop_index": "none",
+          "estimated_document_count": "integer",
+          "find": "cursor_sync",
+          "find_one": "document_or_none",
+          "find_one_and_delete": "document_or_none",
+          "find_one_and_replace": "document_or_none",
+          "find_one_and_update": "document_or_none",
+          "index_information": "index_information_document",
+          "insert": "legacy_insert_result",
+          "insert_many": "insert_many_result",
+          "insert_one": "insert_one_result",
+          "list_indexes": "index_metadata_list",
+          "parse_condition": "query_condition_iterator",
+          "parse_query": "query_object",
+          "remove": "delete_result",
+          "replace_one": "update_result",
+          "update": "legacy_update_result",
+          "update_many": "update_result",
+          "update_one": "update_result",
+          "watch": "unsupported_error",
+          "with_options": "self_sync_collection"
+        },
+        "sync_cursor": {
+          "clone": "cursor_handle_sync",
+          "close": "none",
+          "count": "integer",
+          "hasNext": "boolean",
+          "has_next": "boolean",
+          "limit": "self_sync_cursor",
+          "next": "document",
+          "paginate": "self_sync_cursor",
+          "rewind": "self_sync_cursor",
+          "skip": "self_sync_cursor",
+          "sort": "self_sync_cursor",
+          "to_list": "document_list"
+        },
+        "sync_database": {
+          "close": "none",
+          "collection_names": "string_list",
+          "command": "command_document",
+          "drop_collection": "boolean",
+          "get_collection": "collection_handle_sync",
+          "list_collection_names": "string_list",
+          "watch": "unsupported_error"
+        }
+      },
+      "result_shapes": {
+        "boolean": {
+          "kind": "scalar",
+          "type": "boolean"
+        },
+        "boolean_true": {
+          "kind": "literal",
+          "value": true
+        },
+        "bson_value": {
+          "families": [
+            "array",
+            "binary",
+            "boolean",
+            "datetime",
+            "double",
+            "int",
+            "long",
+            "null",
+            "object",
+            "regex",
+            "string",
+            "uuid"
+          ],
+          "kind": "value"
+        },
+        "capabilities_document": {
+          "kind": "document",
+          "required_fields": {
+            "aggregation": "document",
+            "backend": "string",
+            "bson_types": "document",
+            "bulk_writes": "boolean",
+            "change_streams": "boolean",
+            "multiprocess_writes": "boolean",
+            "native_indexes": "boolean",
+            "object_storage": "boolean",
+            "persistent": "boolean",
+            "projections": "boolean",
+            "query_operators": "document",
+            "remote_storage": "boolean",
+            "sessions": "boolean",
+            "table_native": "boolean",
+            "transactions": "boolean",
+            "update_operators": "document"
+          }
+        },
+        "collection_handle_async": {
+          "class": "tinymongo.AsyncTinyMongoCollection",
+          "kind": "object"
+        },
+        "collection_handle_sync": {
+          "class": "tinymongo.TinyMongoCollection",
+          "kind": "object"
+        },
+        "command_document": {
+          "kind": "discriminated_document",
+          "variants": {
+            "buildInfo": {
+              "exact_fields": {
+                "ok": 1.0,
+                "tinymongo": true,
+                "version": "8.0.0",
+                "versionArray": [
+                  8,
+                  0,
+                  0,
+                  0
+                ]
+              }
+            },
+            "ping": {
+              "exact_fields": {
+                "ok": 1.0
+              }
+            }
+          }
+        },
+        "cursor_async": {
+          "class": "tinymongo.AsyncTinyMongoCursor",
+          "item": "document",
+          "kind": "cursor"
+        },
+        "cursor_handle_async": {
+          "class": "tinymongo.AsyncTinyMongoCursor",
+          "kind": "object"
+        },
+        "cursor_handle_sync": {
+          "class": "tinymongo.TinyMongoCursor",
+          "kind": "object"
+        },
+        "cursor_sync": {
+          "class": "tinymongo.TinyMongoCursor",
+          "item": "document",
+          "kind": "cursor"
+        },
+        "database_handle_async": {
+          "class": "tinymongo.AsyncTinyMongoDatabase",
+          "kind": "object"
+        },
+        "database_handle_sync": {
+          "class": "tinymongo.TinyMongoDatabase",
+          "kind": "object"
+        },
+        "database_metadata_cursor_async": {
+          "class": "tinymongo.AsyncTinyMongoCursor",
+          "item": {
+            "kind": "document",
+            "required_fields": {
+              "empty": "boolean",
+              "name": "string",
+              "sizeOnDisk": "integer"
+            }
+          },
+          "kind": "cursor"
+        },
+        "database_metadata_cursor_sync": {
+          "class": "tinymongo.TinyMongoCursor",
+          "item": {
+            "kind": "document",
+            "required_fields": {
+              "empty": "boolean",
+              "name": "string",
+              "sizeOnDisk": "integer"
+            }
+          },
+          "kind": "cursor"
+        },
+        "delete_result": {
+          "class": "tinymongo.results.DeleteResult",
+          "kind": "object"
+        },
+        "document": {
+          "additional_properties": "bson_value",
+          "kind": "document"
+        },
+        "document_list": {
+          "item": "document",
+          "kind": "array"
+        },
+        "document_or_none": {
+          "kind": "union",
+          "members": [
+            "document",
+            "none"
+          ]
+        },
+        "index_information_document": {
+          "additional_property": {
+            "kind": "document",
+            "optional_fields": {
+              "partialFilterExpression": "document",
+              "sparse": "boolean_true",
+              "unique": "boolean_true"
+            },
+            "required_fields": {
+              "key": "key_direction_pair_array"
+            }
+          },
+          "kind": "document"
+        },
+        "index_metadata_cursor_async": {
+          "class": "tinymongo.AsyncTinyMongoCursor",
+          "item": "index_metadata_document",
+          "kind": "cursor"
+        },
+        "index_metadata_document": {
+          "kind": "document",
+          "optional_fields": {
+            "partialFilterExpression": "document",
+            "sparse": "boolean_true",
+            "unique": "boolean_true"
+          },
+          "required_fields": {
+            "key": "key_direction_pair_array",
+            "name": "string"
+          }
+        },
+        "index_metadata_list": {
+          "item": "index_metadata_document",
+          "kind": "array"
+        },
+        "insert_many_result": {
+          "class": "tinymongo.results.InsertManyResult",
+          "kind": "object"
+        },
+        "insert_one_result": {
+          "class": "tinymongo.results.InsertOneResult",
+          "kind": "object"
+        },
+        "integer": {
+          "kind": "scalar",
+          "type": "integer"
+        },
+        "key_direction_pair": {
+          "items": [
+            "string",
+            "integer"
+          ],
+          "kind": "tuple"
+        },
+        "key_direction_pair_array": {
+          "item": "key_direction_pair",
+          "kind": "array"
+        },
+        "legacy_insert_result": {
+          "kind": "union",
+          "members": [
+            "insert_one_result",
+            "insert_many_result"
+          ],
+          "selection": "InsertManyResult for list input; InsertOneResult otherwise"
+        },
+        "legacy_update_result": {
+          "kind": "union",
+          "members": [
+            "update_result",
+            "update_result_list"
+          ],
+          "selection": "list[UpdateResult] for list update input; UpdateResult otherwise"
+        },
+        "none": {
+          "kind": "literal",
+          "value": null
+        },
+        "original_document": {
+          "additional_properties": "bson_value",
+          "identity": "the original caller-supplied operation document",
+          "kind": "document"
+        },
+        "path_or_uri": {
+          "kind": "value",
+          "meaning": "local path or storage URI",
+          "types": [
+            "string",
+            "os.PathLike"
+          ]
+        },
+        "query_condition_iterator": {
+          "item_class": "tinydb.queries.QueryImpl",
+          "kind": "iterator"
+        },
+        "query_object": {
+          "class": "tinydb.queries.QueryImpl",
+          "kind": "object"
+        },
+        "self_async_collection": {
+          "class": "tinymongo.AsyncTinyMongoCollection",
+          "identity": "self",
+          "kind": "object"
+        },
+        "self_async_cursor": {
+          "class": "tinymongo.AsyncTinyMongoCursor",
+          "identity": "self except clone, which returns an independent cursor",
+          "kind": "object"
+        },
+        "self_gridfs_placeholder": {
+          "class": "tinymongo.TinyGridFS",
+          "identity": "self",
+          "kind": "object"
+        },
+        "self_sync_collection": {
+          "class": "tinymongo.TinyMongoCollection",
+          "identity": "self",
+          "kind": "object"
+        },
+        "self_sync_cursor": {
+          "class": "tinymongo.TinyMongoCursor",
+          "identity": "self except clone, which returns an independent cursor",
+          "kind": "object"
+        },
+        "server_info_document": {
+          "kind": "document",
+          "required_fields": {
+            "dsnConfigured": "boolean",
+            "localPath": "path_or_uri",
+            "storage": "string",
+            "storageUri": "string_or_none",
+            "tinymongo": "boolean_true",
+            "version": "string"
+          }
+        },
+        "string": {
+          "kind": "scalar",
+          "type": "string"
+        },
+        "string_list": {
+          "item": "string",
+          "kind": "array"
+        },
+        "string_or_none": {
+          "kind": "union",
+          "members": [
+            "string",
+            "none"
+          ]
+        },
+        "unsupported_error": {
+          "class": "tinymongo.errors.TinyMongoNotSupportedError",
+          "kind": "raises"
+        },
+        "update_result": {
+          "class": "tinymongo.results.UpdateResult",
+          "kind": "object"
+        },
+        "update_result_list": {
+          "item": "update_result",
+          "kind": "array"
+        },
+        "value_list": {
+          "item": "bson_value",
+          "kind": "array"
+        }
+      },
+      "write_result_classes": {
+        "tinymongo.results.DeleteResult": {
+          "constructor": "DeleteResult(raw_result, acknowledged=True)",
+          "fields": [
+            {
+              "kind": "inherited_attribute",
+              "meaning": "caller-supplied acknowledgement flag",
+              "name": "acknowledged"
+            },
+            {
+              "kind": "pymongo_property",
+              "meaning": "raw_result.n for a mapping, list length for a list, otherwise raw_result",
+              "name": "deleted_count"
+            },
+            {
+              "kind": "pymongo_property",
+              "meaning": "local Mongo-shaped result mapping or legacy result value",
+              "name": "raw_result"
+            }
+          ]
+        },
+        "tinymongo.results.InsertManyResult": {
+          "constructor": "InsertManyResult(eids, inserted_ids, acknowledged=True)",
+          "fields": [
+            {
+              "kind": "inherited_attribute",
+              "meaning": "caller-supplied acknowledgement flag",
+              "name": "acknowledged"
+            },
+            {
+              "kind": "extension_property",
+              "meaning": "TinyDB element identifiers in input order",
+              "name": "eids"
+            },
+            {
+              "kind": "pymongo_property",
+              "meaning": "inserted document _id values in input order",
+              "name": "inserted_ids"
+            }
+          ]
+        },
+        "tinymongo.results.InsertOneResult": {
+          "constructor": "InsertOneResult(eid, inserted_id, acknowledged=True)",
+          "fields": [
+            {
+              "kind": "inherited_attribute",
+              "meaning": "caller-supplied acknowledgement flag",
+              "name": "acknowledged"
+            },
+            {
+              "kind": "extension_property",
+              "meaning": "TinyDB element identifier returned by the storage backend",
+              "name": "eid"
+            },
+            {
+              "kind": "pymongo_property",
+              "meaning": "inserted document _id",
+              "name": "inserted_id"
+            }
+          ]
+        },
+        "tinymongo.results.UpdateResult": {
+          "constructor": "UpdateResult(raw_result, acknowledged=True, matched_count=None, modified_count=None, upserted_id=None)",
+          "fields": [
+            {
+              "kind": "inherited_attribute",
+              "meaning": "caller-supplied acknowledgement flag",
+              "name": "acknowledged"
+            },
+            {
+              "kind": "pymongo_property",
+              "meaning": "true when raw_result is a mapping containing an upserted key",
+              "name": "did_upsert"
+            },
+            {
+              "kind": "pymongo_property",
+              "meaning": "explicit matched count, otherwise derived from raw_result; zero for an upsert",
+              "name": "matched_count"
+            },
+            {
+              "kind": "pymongo_property",
+              "meaning": "explicit modified count, otherwise derived from raw_result",
+              "name": "modified_count"
+            },
+            {
+              "kind": "pymongo_property",
+              "meaning": "local Mongo-shaped result mapping or legacy result list",
+              "name": "raw_result"
+            },
+            {
+              "kind": "pymongo_property",
+              "meaning": "explicit upserted id, otherwise raw_result.upserted",
+              "name": "upserted_id"
+            }
+          ]
+        }
+      }
+    },
+    "unsupported": [
+      "aggregate keyword options other than session=None",
+      "arbitrary server commands",
+      "array filters and positional path tokens are not implemented; update kwargs are ignored and mapping-only operators can persist tokens as literal keys",
+      "bulk_write",
+      "change streams",
+      "filtered collection listing",
+      "geospatial operators",
+      "non-null sessions",
+      "non-default read and write concerns",
+      "server-side JavaScript",
+      "TinyGridFS storage operations",
+      "transactions",
+      "unsupported aggregation stages/expressions/accumulators",
+      "unsupported index specifications",
+      "watch"
+    ],
+    "updates": {
+      "modifiers": {
+        "$addToSet": [
+          "$each"
+        ],
+        "$push": [
+          "$each",
+          "$position",
+          "$slice",
+          "$sort"
+        ]
+      },
+      "operators": [
+        "$addToSet",
+        "$inc",
+        "$max",
+        "$min",
+        "$pop",
+        "$pull",
+        "$pullAll",
+        "$push",
+        "$rename",
+        "$set",
+        "$unset"
+      ],
+      "path_policies": {
+        "mapping_only_dotted_paths": [
+          "$addToSet",
+          "$inc",
+          "$set",
+          "$unset"
+        ],
+        "numeric_array_index_paths": [
+          "$max",
+          "$min",
+          "$pop",
+          "$pull",
+          "$pullAll",
+          "$push"
+        ],
+        "rejects_array_element_and_positional_paths": [
+          "$rename"
+        ]
+      },
+      "pull_operators": {
+        "document_field_extra": [
+          "$not"
+        ],
+        "logical": [
+          "$and",
+          "$or",
+          "$nor"
+        ],
+        "scalar_and_document_field": [
+          "$all",
+          "$elemMatch",
+          "$eq",
+          "$exists",
+          "$gt",
+          "$gte",
+          "$in",
+          "$lt",
+          "$lte",
+          "$mod",
+          "$ne",
+          "$nin",
+          "$options",
+          "$regex",
+          "$size",
+          "$type"
+        ]
+      },
+      "rules": [
+        "atomic post-image validation",
+        "root _id remains unchanged after successful updates; error behavior is operator-specific",
+        "replacement writes",
+        "single and multi writes",
+        "upsert equality seeding"
+      ]
+    },
+    "values": {
+      "bson_family_aliases": {
+        "int": "int32",
+        "long": "int64"
+      },
+      "native": [
+        "array",
+        "binary",
+        "boolean",
+        "datetime",
+        "double",
+        "int",
+        "long",
+        "null",
+        "object",
+        "regex",
+        "string",
+        "uuid"
+      ],
+      "optional_pymongo_bson": [
+        "Binary",
+        "Code",
+        "Decimal128",
+        "MaxKey",
+        "MinKey",
+        "ObjectId",
+        "Regex",
+        "Timestamp"
+      ],
+      "rules": [
+        "datetime UTC millisecond canonicalization",
+        "duplicate-safe decode policy",
+        "field-order preservation",
+        "non-finite double preservation",
+        "ordered documents",
+        "standard UUID representation",
+        "typed binary subtypes"
+      ]
+    },
+    "warnings": {
+      "class": "TinyMongoUnsupportedWarning",
+      "contexts": [
+        "create_indexes degraded model creation or skip",
+        "create_indexes degraded model reuse",
+        "cursor sorting of unsupported values",
+        "aggregation $sort of unsupported values"
+      ],
+      "degraded_index_feature_messages": {
+        "background": "background creation is ignored",
+        "descending": "descending direction is treated as ascending",
+        "hashed": "hashed indexing is replaced by ascending equality indexing",
+        "text": "text indexing is ignored because $text queries are not supported",
+        "ttl": "TTL expiration is not performed"
+      },
+      "message_templates": {
+        "index_creation": "Index {0!r} was created with reduced behavior: {1}.",
+        "index_reuse": "Index {0!r} was accepted with reduced behavior: {1}. Its effective specification matches existing index {2!r}, so TinyMongo reused that index instead of creating a duplicate.",
+        "unsupported_sort_value": "Sorting field '{0}' encountered unsupported value type '{1}'; values of this type compare as null."
+      },
+      "policy": "warnings name the reduced behavior and are attributed to the caller; sort warnings say the value compares as null and are de-duplicated per field and Python type within the cursor or aggregation engine"
+    }
+  },
+  "case_count": 228,
+  "contract": "tinymongo-v1",
+  "contract_suites": [
+    "bson-comparison",
+    "client-read-fidelity",
+    "core",
+    "talkpython"
+  ],
+  "dimensions": {
+    "apis": [
+      "sync",
+      "async"
+    ],
+    "implementations": [
+      "tinymongo",
+      "briskdb",
+      "mongodb"
+    ],
+    "tinymongo_backends": [
+      "memory",
+      "json",
+      "sqlite",
+      "sqlite-sharded",
+      "duckdb",
+      "parquet",
+      "mongodb"
+    ]
+  },
+  "files": {
+    "corpus": "corpus.json",
+    "intentional_differences": "intentional-differences.json",
+    "reference_results": "reference-results.json",
+    "runner_provenance": "runner/provenance.json",
+    "semantic_variants": "semantic-variants.json"
+  },
+  "full_matrix_execution_count": 3192,
+  "harvest_toolchain": {
+    "pymongo": "4.17.0",
+    "pytest": "8.4.2",
+    "python": "3.9.6"
+  },
+  "reference_execution_count": 456,
+  "reference_target": "tinymongo-memory",
+  "schema_version": 1,
+  "sha256": {
+    "corpus": "118cad744b2cfdf520327ec8dce20e5af4140ee836511f5ac5b139d0adcc2231",
+    "intentional_differences": "a4de8c0a846c656cb76c3d05e2ba5a08b0654374b0c678d43479ac0d64ecefcc",
+    "reference_results": "43ee15367d980adb4554748733054f99a2658d998d64cc01565047be5cf6e98c",
+    "runner_provenance": "6a360104cc19e8fde486791edaa549224a085898da19cdd15d132917dcadf484",
+    "semantic_variants": "60284936b73124e8b72492d1853fc5ae2d48d19a7ae1dd547ec7d3a5d04b6c44"
+  },
+  "source": {
+    "commit": "53cbf44e98b8caa036163725d195fd29592e1cc0",
+    "contract_git_tree": "6f671122ff5f76902cfe051e4558a2c57d161bc4",
+    "contract_tree_sha256": "8855a754113af809ad41672ab2383fa0dac9b01809a64a3d7d8dc438d2f84460",
+    "repository": "https://github.com/schapman1974/tinymongo",
+    "runtime_git_tree": "0c94915ea81697a5728f64dc04e3929bf1e036e8"
+  },
+  "suite_case_counts": {
+    "bson-comparison": 20,
+    "client-read-fidelity": 2,
+    "core": 177,
+    "talkpython": 29
+  }
+}
