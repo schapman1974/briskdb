@@ -7,6 +7,17 @@ and CI validates the checked-in corpus and publishes a readable parity report.
 The current report is reference-only; it does not claim BriskDB parity before a
 candidate endpoint is available and tested. See [the Mongo parity contract](docs/MONGO_PARITY.md).
 
+The opt-in `documents` feature now provides the Rust BSON foundation for that
+work. It preserves ordered documents and BSON wire types, applies an explicit
+duplicate-field policy, implements TinyMongo-compatible equality, hashing, and
+comparison across numeric and extended BSON values, and exposes versioned
+`BBKY` semantic keys. Codec validation is bounded to MongoDB's 16 MiB document
+and 100-level nesting limits and is covered by frozen comparison vectors,
+official BSON corpus cases, property tests, and cargo-fuzz targets. This release
+does not yet add document storage, commands, a MongoDB listener, or the public
+Rust/Python collection APIs tracked by the following roadmap issues. See
+[the BSON contract](docs/BSON.md).
+
 HTTP now has an explicit version-1 contract, discovery at `/v1`, a versioned
 `/v1/health` alias, and `BriskDB-API-Version: 1` on v1 responses. Existing valid
 SQL requests and result encodings are preserved. Unknown or duplicate envelope

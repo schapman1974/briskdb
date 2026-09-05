@@ -72,9 +72,16 @@ server-cli = [
 # The offline SQLite importer is separate from the embedded query surface.
 sqlite-import = ["dep:serde", "dep:serde_json", "dep:tracing"]
 sqlite-import-cli = ["sqlite-import", "dep:anyhow", "dep:clap"]
-# Reserved feature names establish the intended package boundaries without
-# claiming that these roadmap surfaces are implemented.
-documents = ["embedded"]
+# The BSON foundation is opt-in while the document engine and listener are
+# still being built. BSON-only dependencies stay out of ordinary SQL builds.
+documents = [
+    "embedded",
+    "dep:bson",
+    "dep:num-bigint",
+    "dep:time",
+]
+# This reserved name establishes the intended package boundary without
+# claiming that the listener is implemented.
 mysql = []
 # Statically compile rusqlite's virtual-table API for the no-fork sharded-table
 # prototype. This does not enable SQLite's runtime extension loader.
@@ -85,6 +92,7 @@ anyhow = { version = "1.0", optional = true }
 async-trait = { version = "0.1", optional = true }
 axum = { version = "0.8.9", optional = true }
 blake3 = "1.8"
+bson = { version = "=3.1.0", default-features = false, features = ["compat-3-0-0"], optional = true }
 bytes = { version = "1.12", optional = true }
 clap = { version = "4.6.6", features = ["derive", "env"], optional = true }
 getrandom = "=0.4.3"
@@ -92,6 +100,11 @@ futures = { version = "0.3", optional = true }
 hyper = { version = "1.11", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1.20", features = ["service", "tokio"], optional = true }
 libc = "0.2"
+num-bigint = { version = "=0.4.8", optional = true }
+# bson 3.1 permits newer `time` releases whose MSRV has moved past BriskDB's
+# Rust 1.85 floor. Constrain that transitive edge for downstream consumers,
+# whose lockfiles do not inherit this repository's compatible resolution.
+time = { version = "=0.3.45", default-features = false, optional = true }
 # 0.36.3 is the newest pgwire release that supports BriskDB's Rust 1.85
 # baseline. Keep the pre-1.0 dependency exact. The `postgres` feature selects
 # the server API and its ring provider for TLS and SCRAM-SHA-256 without
