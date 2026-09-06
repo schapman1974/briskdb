@@ -101,6 +101,34 @@ write-coordination transactions, is required before making a performance
 recommendation. The broad alpha guardrails in the harness prevent silent
 worsening; they are not performance targets.
 
+### Hosted Linux physical-output accounting
+
+The [first Ubuntu 24.04 workflow run](https://github.com/schapman1974/briskdb/actions/runs/34014711881)
+exposed a platform gap in the original Apple M1 calibration. The harness
+records the timed-operation delta of
+`getrusage(RUSAGE_SELF).ru_oublock * 512`. The M1 reports returned zero for
+every case, including mutations, while the hosted Linux result charged output
+consistent with SQLite WAL shared-memory (`-shm`) initialization.
+
+On Linux, a single-process indexed hit or miss produced exactly 32 KiB per
+configured shard per attempt, from 64 KiB at two shards to 2 MiB at 64 shards,
+with zero WAL growth. The current freshness snapshot opens and closes every
+source shard for every non-unique indexed query. Indexed mutations produced at
+most 730,016 bytes per attempt in that run. This is real connection and
+shared-memory churn even though it does not represent the same durable row or
+WAL growth measured by the separate WAL column.
+
+The hosted alpha gate therefore uses explicit finite Linux guardrails for this
+counter: 64 KiB per configured shard per indexed-read attempt and 1 MiB per
+indexed-mutation attempt. Point and scatter reads retain the same relative
+budget and gain no nonzero allowance; WAL growth retains the 4x indexed-read
+and 16x indexed-write ratios. Exact-boundary tests fail on the first byte over
+either physical-output limit. These ceilings record an explicit alpha release
+decision rather than a production target. Issue
+[#293](https://github.com/schapman1974/briskdb/issues/293) tracks removal of the
+per-query shard connection and shared-memory churn. Workflow artifacts upload
+even when enforcement fails so a rejected run retains both TSV reports.
+
 ## Run locally
 
 ```bash

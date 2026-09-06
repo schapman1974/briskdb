@@ -89,7 +89,11 @@ and constraints while indexed hits/misses execute on one shard. It also finds
 that current freshness/summary inspection and write coordination are slower
 than the direct hot-cache baseline. Global indexes therefore remain explicit,
 experimental alpha functionality and are not yet recommended for
-latency-sensitive production use. See `docs/GLOBAL_INDEX_RELEASE_GATE.md`.
+latency-sensitive production use. The first hosted Ubuntu calibration also
+found shard-linear SQLite WAL shared-memory process output during indexed reads
+and bounded it with explicit Linux-tested alpha guardrails;
+[#293](https://github.com/schapman1974/briskdb/issues/293) tracks removing that
+connection churn. See `docs/GLOBAL_INDEX_RELEASE_GATE.md`.
 
 ## Install the Python package
 

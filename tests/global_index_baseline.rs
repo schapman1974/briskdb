@@ -1371,10 +1371,19 @@ struct RegressionBudget {
     maximum_p99_ratio: f64,
     maximum_p99_jitter_micros: u64,
     maximum_cpu_per_attempt_ratio: f64,
-    maximum_write_bytes_per_attempt_ratio: f64,
+    physical_write_budget: PhysicalWriteBudget,
     maximum_wal_bytes_per_attempt_ratio: f64,
     maximum_rss_growth_bytes: u64,
 }
+
+#[derive(Clone, Copy)]
+enum PhysicalWriteBudget {
+    RelativeToBaseline(f64),
+    AbsolutePerAttempt(u64),
+}
+
+const INDEXED_READ_PHYSICAL_WRITE_BYTES_PER_SHARD_PER_ATTEMPT: u64 = 64 * 1024;
+const INDEXED_WRITE_PHYSICAL_WRITE_BYTES_PER_ATTEMPT: u64 = 1024 * 1024;
 
 impl RegressionBudget {
     const STABLE_HOST: Self = Self {
@@ -1382,19 +1391,9 @@ impl RegressionBudget {
         maximum_p99_ratio: 3.0,
         maximum_p99_jitter_micros: 5_000,
         maximum_cpu_per_attempt_ratio: 2.0,
-        maximum_write_bytes_per_attempt_ratio: 2.0,
+        physical_write_budget: PhysicalWriteBudget::RelativeToBaseline(2.0),
         maximum_wal_bytes_per_attempt_ratio: 2.0,
         maximum_rss_growth_bytes: 64 * 1024 * 1024,
-    };
-
-    const INDEXED_READ_ALPHA: Self = Self {
-        minimum_throughput_ratio: 0.01,
-        maximum_p99_ratio: 150.0,
-        maximum_p99_jitter_micros: 100_000,
-        maximum_cpu_per_attempt_ratio: 64.0,
-        maximum_write_bytes_per_attempt_ratio: 4.0,
-        maximum_wal_bytes_per_attempt_ratio: 4.0,
-        maximum_rss_growth_bytes: 128 * 1024 * 1024,
     };
 
     const INDEXED_WRITE_ALPHA: Self = Self {
@@ -1402,14 +1401,26 @@ impl RegressionBudget {
         maximum_p99_ratio: 160.0,
         maximum_p99_jitter_micros: 250_000,
         maximum_cpu_per_attempt_ratio: 160.0,
-        maximum_write_bytes_per_attempt_ratio: 16.0,
+        physical_write_budget: PhysicalWriteBudget::AbsolutePerAttempt(
+            INDEXED_WRITE_PHYSICAL_WRITE_BYTES_PER_ATTEMPT,
+        ),
         maximum_wal_bytes_per_attempt_ratio: 16.0,
         maximum_rss_growth_bytes: 128 * 1024 * 1024,
     };
 
-    const fn release_for(workload: Workload) -> Self {
+    const fn release_for(workload: Workload, shard_count: u16) -> Self {
         match workload {
-            Workload::IndexedHit | Workload::IndexedMiss => Self::INDEXED_READ_ALPHA,
+            Workload::IndexedHit | Workload::IndexedMiss => Self {
+                minimum_throughput_ratio: 0.01,
+                maximum_p99_ratio: 150.0,
+                maximum_p99_jitter_micros: 100_000,
+                maximum_cpu_per_attempt_ratio: 64.0,
+                physical_write_budget: PhysicalWriteBudget::AbsolutePerAttempt(
+                    INDEXED_READ_PHYSICAL_WRITE_BYTES_PER_SHARD_PER_ATTEMPT * shard_count as u64,
+                ),
+                maximum_wal_bytes_per_attempt_ratio: 4.0,
+                maximum_rss_growth_bytes: 128 * 1024 * 1024,
+            },
             Workload::Insert
             | Workload::Update
             | Workload::Delete
@@ -1437,10 +1448,15 @@ impl RegressionBudget {
         {
             failures.push("CPU per attempt".to_owned());
         }
-        if per_attempt(candidate.physical_write_bytes, candidate.attempts)
-            > per_attempt(baseline.physical_write_bytes, baseline.attempts)
-                * self.maximum_write_bytes_per_attempt_ratio
-        {
+        let candidate_physical_write_bytes =
+            per_attempt(candidate.physical_write_bytes, candidate.attempts);
+        let physical_write_limit = match self.physical_write_budget {
+            PhysicalWriteBudget::RelativeToBaseline(ratio) => {
+                per_attempt(baseline.physical_write_bytes, baseline.attempts) * ratio
+            }
+            PhysicalWriteBudget::AbsolutePerAttempt(limit) => limit as f64,
+        };
+        if candidate_physical_write_bytes > physical_write_limit {
             failures.push("physical write bytes per attempt".to_owned());
         }
         if per_attempt(candidate.peak_wal_growth_bytes, candidate.attempts)
@@ -1526,7 +1542,7 @@ fn compare_release_reports(baseline: &str, candidate: &str) -> Result<Vec<String
                 after.visited_shards
             ));
         }
-        for metric in RegressionBudget::release_for(key.2).compare(before, after) {
+        for metric in RegressionBudget::release_for(key.2, key.1).compare(before, after) {
             failures.push(format!(
                 "{} shards {} {} exceeded its explicit alpha budget: {metric}",
                 key.1,
@@ -1544,11 +1560,11 @@ fn compare_release_reports(baseline: &str, candidate: &str) -> Result<Vec<String
     );
     decisions.push("unindexed reads: stable-host 50% throughput / 3x p99 budget".to_owned());
     decisions.push(
-        "indexed reads: mandatory 1-shard hit/miss passed; measured latency is accepted only for the experimental opt-in alpha and is not a speed claim"
+        "indexed reads: mandatory 1-shard hit/miss passed; measured latency and at most 64 KiB of Linux physical-output accounting per source shard per attempt are accepted only for the experimental opt-in alpha and are not a speed claim"
             .to_owned(),
     );
     decisions.push(
-        "indexed writes: measured overhead is accepted only for the experimental opt-in alpha; 200x throughput, 160x p99/CPU, and 16x write/WAL are regression guardrails, not targets"
+        "indexed writes: measured overhead is accepted only for the experimental opt-in alpha; 200x throughput, 160x p99/CPU, 1 MiB physical output per attempt, and 16x WAL are regression guardrails, not targets"
             .to_owned(),
     );
     decisions.push(
@@ -1605,6 +1621,77 @@ fn release_comparison_requires_index_pruning_and_explicit_alpha_budgets() {
     let miss_before = "result\tsingle_process\t2\tindexed_miss\t1\t32\t32\t32\t0\t0\t64\t1000\t32000.00\t20\t30\t40\t500\t1000\t0\t0\t2\tFULL";
     let miss_after = "result\tsingle_process\t2\tindexed_miss\t1\t32\t32\t32\t0\t0\t32\t1000\t32000.00\t20\t30\t40\t500\t1000\t0\t0\t1\tFULL";
     assert!(compare_release_reports(miss_before, miss_after).is_ok());
+}
+
+#[test]
+fn release_physical_write_budgets_are_explicit_with_zero_baselines() {
+    let case = |workload, shards, physical_write_bytes| ParsedBaseline {
+        mode: RunMode::SingleProcess,
+        shards,
+        workload,
+        throughput: 1_000.0,
+        p99_micros: 100,
+        cpu_micros: 100,
+        peak_rss_bytes: 1_000,
+        physical_write_bytes,
+        peak_wal_growth_bytes: 0,
+        attempts: 1,
+        successes: 1,
+        constraints: 0,
+        returned_rows: u64::from(workload == Workload::IndexedHit),
+        visited_shards: 1,
+    };
+
+    let zero_read = case(Workload::IndexedHit, 64, 0);
+    let read_limit = INDEXED_READ_PHYSICAL_WRITE_BYTES_PER_SHARD_PER_ATTEMPT * 64;
+    assert!(
+        !RegressionBudget::release_for(Workload::IndexedHit, 64)
+            .compare(&zero_read, &case(Workload::IndexedHit, 64, read_limit))
+            .iter()
+            .any(|failure| failure == "physical write bytes per attempt")
+    );
+    assert!(
+        RegressionBudget::release_for(Workload::IndexedHit, 64)
+            .compare(&zero_read, &case(Workload::IndexedHit, 64, read_limit + 1))
+            .iter()
+            .any(|failure| failure == "physical write bytes per attempt")
+    );
+
+    let zero_write = case(Workload::Insert, 2, 0);
+    assert!(
+        !RegressionBudget::release_for(Workload::Insert, 2)
+            .compare(
+                &zero_write,
+                &case(
+                    Workload::Insert,
+                    2,
+                    INDEXED_WRITE_PHYSICAL_WRITE_BYTES_PER_ATTEMPT
+                )
+            )
+            .iter()
+            .any(|failure| failure == "physical write bytes per attempt")
+    );
+    assert!(
+        RegressionBudget::release_for(Workload::Insert, 2)
+            .compare(
+                &zero_write,
+                &case(
+                    Workload::Insert,
+                    2,
+                    INDEXED_WRITE_PHYSICAL_WRITE_BYTES_PER_ATTEMPT + 1
+                )
+            )
+            .iter()
+            .any(|failure| failure == "physical write bytes per attempt")
+    );
+
+    let zero_point = case(Workload::PointRead, 2, 0);
+    assert!(
+        RegressionBudget::release_for(Workload::PointRead, 2)
+            .compare(&zero_point, &case(Workload::PointRead, 2, 1))
+            .iter()
+            .any(|failure| failure == "physical write bytes per attempt")
+    );
 }
 
 #[test]
