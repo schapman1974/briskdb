@@ -7,7 +7,7 @@ start a listener or add document commands by itself.
 
 ```toml
 [dependencies]
-briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["documents"] }
+briskdb = { git = "https://github.com/schapman1974/briskdb", tag = "v0.1.0-alpha.6", default-features = false, features = ["documents"] }
 ```
 
 The contract follows the source-locked TinyMongo v1.3.0 behavior recorded in

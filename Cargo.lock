@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "briskdb"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "briskdb-python"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 dependencies = [
  "briskdb",
  "pyo3",

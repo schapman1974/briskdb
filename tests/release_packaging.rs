@@ -1,6 +1,6 @@
 #[test]
 fn alpha_release_contract_covers_every_native_archive_and_safety_boundary() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-alpha.5");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-alpha.6");
 
     let workflow = include_str!("../.github/workflows/release.yml");
     for required in [
@@ -29,20 +29,36 @@ fn alpha_release_contract_covers_every_native_archive_and_safety_boundary() {
     }
 
     let notes = include_str!("../RELEASE_NOTES.md");
+    let release_heading = format!("# BriskDB {}", env!("CARGO_PKG_VERSION"));
+    let current_release = notes
+        .split_once(&release_heading)
+        .unwrap_or_else(|| panic!("release notes are missing heading: {release_heading}"))
+        .1
+        .split("\n# BriskDB ")
+        .next()
+        .expect("current release section must be present");
+    let current_release = current_release
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     for required in [
-        "no authentication, authorization, or TLS",
-        "PostgreSQL extended-query protocol is unsupported",
-        "psycopg.ClientCursor",
-        "General cross-shard transactions are unsupported",
+        "TLS and SCRAM-SHA-256",
+        "bounded simple and parameterized text/binary extended queries",
+        "single-shard transactions",
+        "native document API is limited",
+        "collection/index/insert/find/count/delete engine slice",
+        "`insert_one`",
+        "`find` and `count_documents`",
+        "`delete_one`",
         "complete data-directory copy",
         "There is no stable pre-1.0 on-disk compatibility promise",
-        "manifest version 12",
+        "manifest version 14",
+        "manifest versions 2 through 13",
         "In-place downgrade is unsupported",
-        "no on-disk format change",
     ] {
         assert!(
-            notes.contains(required),
-            "release notes are missing critical boundary: {required}"
+            current_release.contains(required),
+            "current release notes are missing critical boundary: {required}"
         );
     }
 }

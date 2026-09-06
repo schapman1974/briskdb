@@ -1,4 +1,12 @@
-# Unreleased
+# BriskDB 0.1.0-alpha.6 — 2026-09-06
+
+Alpha 6 expands the supported PostgreSQL and embedded Python surfaces while
+keeping the same-host, local-filesystem multi-process boundary from alpha 5.
+It adds a bounded extended-query lifecycle for PostgreSQL, single-shard
+transactions, TLS/SCRAM protection for remote PostgreSQL listeners, versioned
+HTTP behavior, experimental global indexes, and an opt-in Rust and Python
+document-command slice. This remains an evaluation and development release,
+not a production claim.
 
 Mongo compatibility now has a versioned, source-locked TinyMongo v1.3.0
 contract. Its manifest inventories the supported document surface, 228 logical
@@ -82,6 +90,59 @@ that current freshness/summary inspection and write coordination are slower
 than the direct hot-cache baseline. Global indexes therefore remain explicit,
 experimental alpha functionality and are not yet recommended for
 latency-sensitive production use. See `docs/GLOBAL_INDEX_RELEASE_GATE.md`.
+
+## Install the Python package
+
+Compiler-free `cp39-abi3` wheels support CPython 3.9 through 3.14 on Linux
+x86-64/ARM64 (`manylinux_2_28`) and macOS Intel/Apple Silicon (macOS 11+):
+
+```bash
+python -m pip install briskdb==0.1.0a6
+```
+
+Each native wheel is dependency-audited and installed for the minimum and
+maximum supported Python versions before publication. The separately built
+source distribution is also installed and tested. Release automation checks
+the Rust, Python, and tag versions, distribution contents, type information,
+checksums, and build provenance before publishing.
+
+## Critical alpha boundaries
+
+- HTTP remains unauthenticated and loopback-only. PostgreSQL may bind remotely
+  only with its configured TLS and SCRAM-SHA-256 boundary; BriskDB does not yet
+  provide general users, roles, or authorization policy.
+- PostgreSQL supports bounded simple and parameterized text/binary extended
+  queries plus single-shard transactions. DDL, `COPY`, broad type coverage,
+  and general PostgreSQL session semantics remain unavailable.
+- PostgreSQL operates only on an imported or registered catalog. It does not
+  provide an online `CREATE TABLE` workflow or full PostgreSQL compatibility.
+- General cross-shard transactions are unsupported. Global ordering,
+  pagination, and aggregation pushdown are incomplete, and BriskDB does not
+  claim full SQL compatibility.
+- Backups require every server and embedder to stop first. The supported
+  procedure is a complete data-directory copy. Online backup/restore,
+  resharding, and online rebalance are unsupported.
+- Global indexes remain experimental and their release-gate measurements do
+  not establish production latency or durability claims for the database as a
+  whole.
+- The Python package does not claim DB-API 2.0 or broad MongoDB compatibility.
+  Its native document API is limited to the
+  collection/index/insert/find/count/delete engine slice: collection and index
+  metadata, `insert_one`, empty-filter or exact-`_id` `find` and
+  `count_documents`, and exact-`_id` `delete_one`. General matchers, updates,
+  aggregation, and retained document cursors remain unavailable.
+
+## Storage compatibility
+
+There is no stable pre-1.0 on-disk compatibility promise. This release writes
+manifest version 14 and accepts the exact documented legacy version-1 shape and
+manifest versions 2 through 13 for automatic, ordered forward migration.
+Unknown, malformed, partially migrated, or newer layouts fail closed.
+
+Before opening existing data, stop every process and make a complete backup as
+described in `docs/OFFLINE_BACKUP.md`. Startup may migrate the data. In-place
+downgrade is unsupported; rollback requires restoring the complete pre-upgrade
+backup. Alpha 6 changes the on-disk format from alpha 5.
 
 # BriskDB 0.1.0-alpha.5
 

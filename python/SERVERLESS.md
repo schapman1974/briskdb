@@ -1,7 +1,7 @@
 # Warm-handler quickstart
 
 BriskDB can run inside one long-lived function/container process because the
-Opening the Python package starts no listener or subprocess. Keep one database handle warm
+Python package starts no listener or subprocess. Keep one database handle warm
 and create one session per request:
 
 ```python
