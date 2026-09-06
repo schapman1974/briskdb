@@ -457,7 +457,7 @@ requires an earlier dependency:
       see [`docs/DOCUMENT_ENGINE.md`](docs/DOCUMENT_ENGINE.md)
     - [x] [#191](https://github.com/schapman1974/briskdb/issues/191) — thin
       embedded Rust facade over protocol-neutral document commands
-    - [ ] [#198](https://github.com/schapman1974/briskdb/issues/198) — Python
+    - [x] [#198](https://github.com/schapman1974/briskdb/issues/198) — Python
       BSON conversions and document API
     - [ ] [#200](https://github.com/schapman1974/briskdb/issues/200) — release
       wheels and Mongo smoke coverage

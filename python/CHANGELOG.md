@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added opt-in synchronous and asyncio document commands for the currently
+  executable collection, index, insert, find, count, and delete engine slice.
+- Added lossless conversion for ordered mappings and PyMongo's BSON value
+  classes, including explicit datetime and UUID-representation rules, bounded
+  cycle/depth/size validation, and stable conversion errors.
+- Kept PyMongo optional and lazily loaded. Distribution gates now prove a bare
+  wheel or sdist can import, open, and execute SQL without `bson`, while the
+  document matrix runs against pinned PyMongo 4.17.0.
 - Added owned synchronous and asyncio transaction handles with deterministic
   commit/rollback context-manager behavior.
 - Python cursors now consume the engine's bounded SQLite row stream and cancel

@@ -1,9 +1,17 @@
 from decimal import Decimal
 from os import PathLike
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple, TypedDict, Union
+from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional, Sequence, Tuple, TypedDict, Union
+from uuid import UUID
 
 SqlParameter = Union[None, bool, int, float, Decimal, str, bytes, bytearray, memoryview]
 SqlRow = Tuple[object, ...]
+BsonDocument = Mapping[str, Any]
+BsonResultDocument = Dict[str, Any]
+UuidRepresentation = Literal[
+    "unspecified", "standard", "python_legacy", "java_legacy", "csharp_legacy"
+]
+DocumentPlanKind = Literal["point", "scatter"]
+DocumentIndexLifecycle = Literal["ready", "pending_build"]
 
 class ColumnInfo(TypedDict):
     name: str
@@ -22,6 +30,79 @@ class WriteResult(TypedDict):
     shard: int
     rows_affected: int
     generated_key: Optional[GeneratedKey]
+
+class DocumentPlan(TypedDict):
+    kind: DocumentPlanKind
+    collection_id: int
+    shards: List[int]
+
+class DocumentNamespaceInfo(TypedDict):
+    database: str
+    collection: str
+
+class DocumentPlacementInfo(TypedDict):
+    code: int
+    version: int
+
+class DocumentIndexInfo(TypedDict):
+    name: str
+    keys: BsonResultDocument
+    unique: bool
+    built_in: bool
+    lifecycle: DocumentIndexLifecycle
+
+class DocumentCollectionInfo(TypedDict):
+    id: int
+    database_id: int
+    database: str
+    name: str
+    namespace: str
+    options: BsonResultDocument
+    placement: DocumentPlacementInfo
+    indexes: List[DocumentIndexInfo]
+
+class DocumentExecution(TypedDict):
+    request_id: UUID
+    plan: Optional[DocumentPlan]
+
+class CreateCollectionResult(DocumentExecution):
+    kind: Literal["collection"]
+    collection: DocumentCollectionInfo
+
+class ListCollectionsResult(DocumentExecution):
+    kind: Literal["collections"]
+    collections: List[DocumentCollectionInfo]
+
+class CreateIndexResult(DocumentExecution):
+    kind: Literal["index_name"]
+    index_name: str
+    lifecycle: Literal["pending_build"]
+
+class ListIndexesResult(DocumentExecution):
+    kind: Literal["indexes"]
+    indexes: List[DocumentIndexInfo]
+
+class InsertOneResult(DocumentExecution):
+    kind: Literal["insert"]
+    acknowledged: bool
+    inserted_count: int
+    inserted_ids: List[Any]
+
+class FindResult(DocumentExecution):
+    kind: Literal["cursor"]
+    namespace: DocumentNamespaceInfo
+    cursor_id: Optional[int]
+    exhausted: bool
+    documents: List[BsonResultDocument]
+
+class CountDocumentsResult(DocumentExecution):
+    kind: Literal["count"]
+    count: int
+
+class DeleteOneResult(DocumentExecution):
+    kind: Literal["delete"]
+    acknowledged: bool
+    deleted_count: int
 
 class CloseReport(TypedDict):
     already_closed: bool
@@ -88,6 +169,8 @@ class InternalError(OperationalError): ...
 
 class Config:
     shards: Optional[int]
+    documents: bool
+    uuid_representation: UuidRepresentation
     connections_per_shard: int
     queue_capacity_per_shard: int
     max_result_rows: int
@@ -101,6 +184,8 @@ class Config:
         self,
         *,
         shards: Optional[int] = ...,
+        documents: bool = ...,
+        uuid_representation: UuidRepresentation = ...,
         connections_per_shard: int = ...,
         queue_capacity_per_shard: int = ...,
         max_result_rows: int = ...,
@@ -140,6 +225,8 @@ class Database:
         path: Union[str, PathLike[str]],
         *,
         shards: Optional[int] = None,
+        documents: bool = False,
+        uuid_representation: Optional[UuidRepresentation] = None,
         config: Optional[Config] = None,
     ) -> None: ...
     @property
@@ -251,6 +338,112 @@ class Session:
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,
     ) -> Cursor: ...
+    def create_collection(
+        self,
+        database: str,
+        collection: str,
+        *,
+        options: Optional[BsonDocument] = None,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> CreateCollectionResult: ...
+    def list_collections(
+        self,
+        database: str,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        batch_size: int = 101,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> ListCollectionsResult: ...
+    def create_index(
+        self,
+        database: str,
+        collection: str,
+        keys: BsonDocument,
+        *,
+        name: str,
+        unique: bool = False,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> CreateIndexResult: ...
+    def list_indexes(
+        self,
+        database: str,
+        collection: str,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        batch_size: int = 101,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> ListIndexesResult: ...
+    def insert_one(
+        self,
+        database: str,
+        collection: str,
+        document: BsonDocument,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> InsertOneResult: ...
+    def find(
+        self,
+        database: str,
+        collection: str,
+        filter: Optional[BsonDocument] = None,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        batch_size: int = 101,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> FindResult: ...
+    def count_documents(
+        self,
+        database: str,
+        collection: str,
+        filter: Optional[BsonDocument] = None,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> CountDocumentsResult: ...
+    def delete_one(
+        self,
+        database: str,
+        collection: str,
+        filter: BsonDocument,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> DeleteOneResult: ...
     def status(self) -> Status: ...
     def close(self) -> None: ...
     def __enter__(self) -> Session: ...
@@ -297,6 +490,8 @@ def open(
     path: Union[str, PathLike[str]],
     *,
     shards: Optional[int] = None,
+    documents: bool = False,
+    uuid_representation: Optional[UuidRepresentation] = None,
     config: Optional[Config] = None,
 ) -> Database: ...
 

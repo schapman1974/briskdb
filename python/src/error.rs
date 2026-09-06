@@ -1,5 +1,6 @@
 use std::{panic::AssertUnwindSafe, sync::PoisonError};
 
+use briskdb::document::{BsonError, BsonErrorContext};
 use briskdb::{EngineError, EngineErrorKind};
 use pyo3::{create_exception, exceptions::PyException, marker::Ungil, prelude::*, types::PyModule};
 
@@ -97,7 +98,7 @@ impl From<NativeError> for PyErr {
     }
 }
 
-fn engine_error_to_python(error: EngineError) -> PyErr {
+pub(crate) fn engine_error_to_python(error: EngineError) -> PyErr {
     let diagnostic = error.diagnostic().to_owned();
     match error.kind() {
         EngineErrorKind::InvalidArgument => InvalidArgumentError::new_err(diagnostic),
@@ -143,6 +144,18 @@ where
 
 pub(crate) fn invalid_value(message: impl Into<String>) -> PyErr {
     InvalidArgumentError::new_err(message.into())
+}
+
+pub(crate) fn invalid_text_encoding(message: impl Into<String>) -> PyErr {
+    InvalidTextEncodingError::new_err(message.into())
+}
+
+pub(crate) fn limit_exceeded(message: impl Into<String>) -> PyErr {
+    LimitExceededError::new_err(message.into())
+}
+
+pub(crate) fn bson_error_to_python(error: BsonError) -> PyErr {
+    engine_error_to_python(error.into_engine_error(BsonErrorContext::ClientInput))
 }
 
 pub(crate) fn numeric_out_of_range(message: impl Into<String>) -> PyErr {

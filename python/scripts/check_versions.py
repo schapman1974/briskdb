@@ -43,9 +43,12 @@ def main() -> None:
     if len(core_dependencies) != 1:
         raise SystemExit("briskdb-python must have exactly one briskdb dependency")
     dependency = core_dependencies[0]
-    if dependency["uses_default_features"] or dependency["features"] != ["listeners"]:
+    if dependency["uses_default_features"] or dependency["features"] != [
+        "documents",
+        "listeners",
+    ]:
         raise SystemExit(
-            "briskdb-python must depend only on the host-controlled listeners feature"
+            "briskdb-python must depend only on the documents and host-controlled listeners features"
         )
     if pathlib.Path(dependency["path"]).resolve() != ROOT:
         raise SystemExit("briskdb-python must bind the workspace's exact briskdb core")

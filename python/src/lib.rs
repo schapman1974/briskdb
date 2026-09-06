@@ -1,3 +1,5 @@
+mod bson;
+mod document_api;
 mod error;
 mod value;
 
@@ -8,11 +10,19 @@ use std::{
     time::Duration,
 };
 
+use briskdb::document::{
+    DocumentCollectionOptions, DocumentCommand, DocumentCountRequest,
+    DocumentCreateCollectionRequest, DocumentCreateIndexRequest, DocumentDeleteRequest,
+    DocumentFilter, DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest,
+    DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
+    DocumentNamespace, DocumentReadOptions, DocumentRequest, DocumentRequestId,
+    DocumentWriteOptions,
+};
 use briskdb::{
     BriskCursor, BriskDb, BriskSession, BriskTransaction,
-    CancellationToken as EngineCancellationToken, CheckpointReport, Column, EngineOptions,
-    EngineState, EngineStatus, PreparedStatementLimits, RequestContext, ResultLimits, SessionState,
-    Statement, TransactionExecution, Value,
+    CancellationToken as EngineCancellationToken, CheckpointReport, Column, DocumentSupport,
+    EngineOptions, EngineState, EngineStatus, PreparedStatementLimits, RequestContext,
+    ResultLimits, SessionState, Statement, TransactionExecution, Value,
     protocol::postgres::SecurityConfig as PostgresSecurityConfig,
     server::{AttachedServer, ListenerAddresses, ListenerConfig},
 };
@@ -23,6 +33,11 @@ use pyo3::{
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use crate::{
+    bson::{
+        PythonUuidRepresentation, ensure_bson_available, extract_bson_document, extract_request_id,
+        parse_uuid_representation,
+    },
+    document_api::execution_to_python as document_execution_to_python,
     error::{NativeError, NativeResult, listener_error, run_native},
     value::{
         data_type_name, extract_params, logical_result_to_python, routed_result_to_python,
@@ -84,6 +99,7 @@ struct DatabaseShared {
     runtime: Arc<RuntimeOwner>,
     root: PathBuf,
     config: Config,
+    uuid_representation: PythonUuidRepresentation,
 }
 
 impl DatabaseShared {
@@ -114,6 +130,8 @@ impl Drop for DatabaseShared {
 #[derive(Clone, Debug)]
 struct Config {
     shards: Option<u16>,
+    documents: bool,
+    uuid_representation: String,
     connections_per_shard: usize,
     queue_capacity_per_shard: usize,
     max_result_rows: u64,
@@ -129,6 +147,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             shards: None,
+            documents: false,
+            uuid_representation: "standard".to_owned(),
             connections_per_shard: briskdb::core::DEFAULT_CONNECTIONS_PER_SHARD,
             queue_capacity_per_shard: briskdb::core::DEFAULT_QUEUE_CAPACITY_PER_SHARD,
             max_result_rows: briskdb::core::DEFAULT_MAX_RESULT_ROWS,
@@ -172,6 +192,8 @@ impl Config {
     #[pyo3(signature = (
         *,
         shards = None,
+        documents = false,
+        uuid_representation = "standard",
         connections_per_shard = briskdb::core::DEFAULT_CONNECTIONS_PER_SHARD,
         queue_capacity_per_shard = briskdb::core::DEFAULT_QUEUE_CAPACITY_PER_SHARD,
         max_result_rows = briskdb::core::DEFAULT_MAX_RESULT_ROWS,
@@ -185,6 +207,8 @@ impl Config {
     #[allow(clippy::too_many_arguments)]
     fn new(
         shards: Option<u16>,
+        documents: bool,
+        uuid_representation: &str,
         connections_per_shard: usize,
         queue_capacity_per_shard: usize,
         max_result_rows: u64,
@@ -197,6 +221,8 @@ impl Config {
     ) -> PyResult<Self> {
         let config = Self {
             shards,
+            documents,
+            uuid_representation: uuid_representation.to_owned(),
             connections_per_shard,
             queue_capacity_per_shard,
             max_result_rows,
@@ -208,6 +234,7 @@ impl Config {
             shutdown_grace_ms,
         };
         config.engine_options()?;
+        parse_uuid_representation(&config.uuid_representation)?;
         Ok(config)
     }
 
@@ -216,8 +243,11 @@ impl Config {
             .shards
             .map_or_else(|| "None".to_owned(), |shards| shards.to_string());
         format!(
-            "Config(shards={shards}, connections_per_shard={}, queue_capacity_per_shard={})",
-            self.connections_per_shard, self.queue_capacity_per_shard
+            "Config(shards={shards}, documents={}, uuid_representation={:?}, connections_per_shard={}, queue_capacity_per_shard={})",
+            self.documents,
+            self.uuid_representation,
+            self.connections_per_shard,
+            self.queue_capacity_per_shard
         )
     }
 }
@@ -449,6 +479,8 @@ impl Cursor {
 struct SessionShared {
     session: Mutex<Option<BriskSession>>,
     runtime: Arc<RuntimeOwner>,
+    documents: bool,
+    uuid_representation: PythonUuidRepresentation,
 }
 
 impl SessionShared {
@@ -658,6 +690,7 @@ struct Database {
 
 impl Database {
     fn create(py: Python<'_>, root: PathBuf, config: Config) -> PyResult<Self> {
+        let uuid_representation = parse_uuid_representation(&config.uuid_representation)?;
         run_native(py, move || {
             let engine_options = config.engine_options()?;
             let runtime = RuntimeBuilder::new_multi_thread()
@@ -665,7 +698,13 @@ impl Database {
                 .thread_name("briskdb-python")
                 .build()
                 .map_err(|error| NativeError::Runtime(error.to_string()))?;
-            let builder = BriskDb::builder(&root).with_engine_options(engine_options);
+            let builder = BriskDb::builder(&root)
+                .with_engine_options(engine_options)
+                .with_document_support(if config.documents {
+                    DocumentSupport::Enabled
+                } else {
+                    DocumentSupport::Disabled
+                });
             let builder = match config.shards {
                 Some(shards) => builder.with_shard_count(shards),
                 None => builder,
@@ -681,6 +720,7 @@ impl Database {
                     runtime,
                     root,
                     config,
+                    uuid_representation,
                 }),
             })
         })
@@ -690,14 +730,16 @@ impl Database {
 #[pymethods]
 impl Database {
     #[new]
-    #[pyo3(signature = (path, *, shards = None, config = None))]
+    #[pyo3(signature = (path, *, shards = None, documents = false, uuid_representation = None, config = None))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
         shards: Option<u16>,
+        documents: bool,
+        uuid_representation: Option<&str>,
         config: Option<PyRef<'_, Config>>,
     ) -> PyResult<Self> {
-        let config = resolve_config(shards, config.as_deref())?;
+        let config = resolve_config(shards, documents, uuid_representation, config.as_deref())?;
         Self::create(py, path, config)
     }
 
@@ -757,6 +799,8 @@ impl Database {
                 shared: Arc::new(SessionShared {
                     session: Mutex::new(Some(session)),
                     runtime: Arc::clone(&shared.runtime),
+                    documents: shared.config.documents,
+                    uuid_representation: shared.uuid_representation,
                 }),
             })
         })
@@ -1020,6 +1064,49 @@ struct Session {
     shared: Arc<SessionShared>,
 }
 
+impl Session {
+    fn require_document_support(&self) -> PyResult<()> {
+        if !self.shared.documents {
+            return python_engine_result(Err(briskdb::EngineError::new(
+                briskdb::EngineErrorKind::FailedPrecondition,
+                "native document support is disabled for this embedded database",
+            )));
+        }
+        self.shared.session().map(|_| ()).map_err(PyErr::from)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_document_command(
+        &self,
+        py: Python<'_>,
+        command: DocumentCommand,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<&CancellationToken>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        // Resolve the optional dependency and retain the exact output
+        // constructors before engine execution. This keeps module-level type
+        // replacement while the GIL is released from changing result lookup
+        // after a mutation commits.
+        let bson_types = ensure_bson_available(py)?;
+        let request_id = python_document_request_id(py, request_id.as_ref())?;
+        let context =
+            document_request_context(timeout_ms, cancellation, max_result_rows, max_result_bytes)?;
+        let uuid_representation = self.shared.uuid_representation;
+        let shared = Arc::clone(&self.shared);
+        let execution = run_native(py, move || {
+            let session = shared.session()?;
+            Ok(shared.runtime.runtime.block_on(
+                session.execute_document(DocumentRequest::new(request_id, context, command)),
+            )?)
+        })?;
+        document_execution_to_python(py, execution, uuid_representation, &bson_types)
+    }
+}
+
 #[pymethods]
 impl Session {
     #[getter]
@@ -1217,6 +1304,377 @@ impl Session {
         ))
     }
 
+    #[pyo3(signature = (
+        database,
+        collection,
+        *,
+        options = None,
+        request_id = None,
+        timeout_ms = None,
+        cancellation = None,
+        max_result_rows = None,
+        max_result_bytes = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn create_collection(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        options: Option<Py<PyAny>>,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let representation = self.shared.uuid_representation;
+        let options = match options {
+            Some(options) => DocumentCollectionOptions::new(extract_bson_document(
+                py,
+                options.bind(py),
+                representation,
+            )?),
+            None => Ok(DocumentCollectionOptions::empty()),
+        };
+        let command = DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            python_engine_result(options)?,
+            DocumentWriteOptions::new(),
+        ));
+        self.execute_document_command(
+            py,
+            command,
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (
+        database,
+        *,
+        skip = 0,
+        limit = None,
+        batch_size = 101,
+        request_id = None,
+        timeout_ms = None,
+        cancellation = None,
+        max_result_rows = None,
+        max_result_bytes = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn list_collections(
+        &self,
+        py: Python<'_>,
+        database: String,
+        skip: u64,
+        limit: Option<u64>,
+        batch_size: u64,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let command = DocumentCommand::ListCollections(python_engine_result(
+            DocumentListCollectionsRequest::new(
+                database,
+                document_read_options(skip, limit, batch_size)?,
+            ),
+        )?);
+        self.execute_document_command(
+            py,
+            command,
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (
+        database,
+        collection,
+        keys,
+        *,
+        name,
+        unique = false,
+        request_id = None,
+        timeout_ms = None,
+        cancellation = None,
+        max_result_rows = None,
+        max_result_bytes = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn create_index(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        keys: Py<PyAny>,
+        name: String,
+        unique: bool,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let namespace = python_engine_result(DocumentNamespace::new(database, collection))?;
+        let keys = extract_bson_document(py, keys.bind(py), self.shared.uuid_representation)?;
+        let index = python_engine_result(DocumentIndexRequest::new(keys))?;
+        let index = python_engine_result(index.with_name(name))?.with_unique(unique);
+        let command = DocumentCommand::CreateIndex(DocumentCreateIndexRequest::new(
+            namespace,
+            index,
+            DocumentWriteOptions::new(),
+        ));
+        self.execute_document_command(
+            py,
+            command,
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (
+        database,
+        collection,
+        *,
+        skip = 0,
+        limit = None,
+        batch_size = 101,
+        request_id = None,
+        timeout_ms = None,
+        cancellation = None,
+        max_result_rows = None,
+        max_result_bytes = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn list_indexes(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        skip: u64,
+        limit: Option<u64>,
+        batch_size: u64,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let command = DocumentCommand::ListIndexes(DocumentListIndexesRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            document_read_options(skip, limit, batch_size)?,
+        ));
+        self.execute_document_command(
+            py,
+            command,
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (
+        database,
+        collection,
+        document,
+        *,
+        request_id = None,
+        timeout_ms = None,
+        cancellation = None,
+        max_result_rows = None,
+        max_result_bytes = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_one(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        document: Py<PyAny>,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let document =
+            extract_bson_document(py, document.bind(py), self.shared.uuid_representation)?;
+        let request = python_engine_result(DocumentInsertRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            [document],
+            DocumentWriteOptions::new(),
+        ))?;
+        self.execute_document_command(
+            py,
+            DocumentCommand::Insert(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (
+        database,
+        collection,
+        filter = None,
+        *,
+        skip = 0,
+        limit = None,
+        batch_size = 101,
+        request_id = None,
+        timeout_ms = None,
+        cancellation = None,
+        max_result_rows = None,
+        max_result_bytes = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn find(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        filter: Option<Py<PyAny>>,
+        skip: u64,
+        limit: Option<u64>,
+        batch_size: u64,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let filter = document_filter(py, filter.as_ref(), self.shared.uuid_representation)?;
+        let request = DocumentFindRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            filter,
+            document_read_options(skip, limit, batch_size)?,
+        );
+        self.execute_document_command(
+            py,
+            DocumentCommand::Find(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (
+        database,
+        collection,
+        filter = None,
+        *,
+        skip = 0,
+        limit = None,
+        request_id = None,
+        timeout_ms = None,
+        cancellation = None,
+        max_result_rows = None,
+        max_result_bytes = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn count_documents(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        filter: Option<Py<PyAny>>,
+        skip: u64,
+        limit: Option<u64>,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let filter = document_filter(py, filter.as_ref(), self.shared.uuid_representation)?;
+        let request = DocumentCountRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            filter,
+            document_read_options(skip, limit, briskdb::document::DEFAULT_DOCUMENT_BATCH_SIZE)?,
+        );
+        self.execute_document_command(
+            py,
+            DocumentCommand::Count(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (
+        database,
+        collection,
+        filter,
+        *,
+        request_id = None,
+        timeout_ms = None,
+        cancellation = None,
+        max_result_rows = None,
+        max_result_bytes = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn delete_one(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        filter: Py<PyAny>,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let filter = DocumentFilter::new(extract_bson_document(
+            py,
+            filter.bind(py),
+            self.shared.uuid_representation,
+        )?);
+        let request = DocumentDeleteRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            python_engine_result(filter)?,
+            DocumentMutationScope::One,
+            DocumentWriteOptions::new(),
+        );
+        self.execute_document_command(
+            py,
+            DocumentCommand::Delete(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
     fn status(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let shared = Arc::clone(&self.shared);
         let status = run_native(py, move || {
@@ -1258,33 +1716,49 @@ impl Session {
     }
 }
 
-#[pyfunction(name = "open", signature = (path, *, shards = None, config = None))]
+#[pyfunction(name = "open", signature = (path, *, shards = None, documents = false, uuid_representation = None, config = None))]
 fn open_database(
     py: Python<'_>,
     path: PathBuf,
     shards: Option<u16>,
+    documents: bool,
+    uuid_representation: Option<&str>,
     config: Option<PyRef<'_, Config>>,
 ) -> PyResult<Database> {
-    let config = resolve_config(shards, config.as_deref())?;
+    let config = resolve_config(shards, documents, uuid_representation, config.as_deref())?;
     Database::create(py, path, config)
 }
 
-fn resolve_config(shards: Option<u16>, config: Option<&Config>) -> PyResult<Config> {
-    match (shards, config) {
-        (Some(_), Some(_)) => Err(crate::error::invalid_value(
-            "pass either shards or config to open a database, not both",
-        )),
-        (Some(shards), None) => {
-            let config = Config {
-                shards: Some(shards),
-                ..Config::default()
-            };
-            config.engine_options()?;
-            Ok(config)
-        }
-        (None, Some(config)) => Ok(config.clone()),
-        (None, None) => Ok(Config::default()),
+fn resolve_config(
+    shards: Option<u16>,
+    documents: bool,
+    uuid_representation: Option<&str>,
+    config: Option<&Config>,
+) -> PyResult<Config> {
+    if let Some(uuid_representation) = uuid_representation {
+        parse_uuid_representation(uuid_representation)?;
     }
+    if let Some(config) = config {
+        if shards.is_some() {
+            return Err(crate::error::invalid_value(
+                "pass either shards or config to open a database, not both",
+            ));
+        }
+        if documents || uuid_representation.is_some() {
+            return Err(crate::error::invalid_value(
+                "pass document options through either direct open options or config, not both",
+            ));
+        }
+        return Ok(config.clone());
+    }
+    let config = Config {
+        shards,
+        documents,
+        uuid_representation: uuid_representation.unwrap_or("standard").to_owned(),
+        ..Config::default()
+    };
+    config.engine_options()?;
+    Ok(config)
 }
 
 fn parse_listener_address(value: &str, label: &str) -> PyResult<SocketAddr> {
@@ -1320,6 +1794,71 @@ fn request_context(
             .map_err(PyErr::from),
         None => Ok(context),
     }
+}
+
+fn document_request_context(
+    timeout_ms: Option<u64>,
+    cancellation: Option<&CancellationToken>,
+    max_result_rows: Option<u64>,
+    max_result_bytes: Option<u64>,
+) -> PyResult<RequestContext> {
+    let mut context = request_context(timeout_ms, cancellation)?;
+    if max_result_rows.is_some() || max_result_bytes.is_some() {
+        let limits = ResultLimits::new(
+            max_result_rows.unwrap_or(briskdb::core::MAX_RESULT_ROWS),
+            max_result_bytes.unwrap_or(briskdb::core::MAX_RESULT_BYTES),
+        );
+        context = context.with_result_limits(python_engine_result(limits)?);
+    }
+    Ok(context)
+}
+
+fn python_document_request_id(
+    py: Python<'_>,
+    request_id: Option<&Py<PyAny>>,
+) -> PyResult<DocumentRequestId> {
+    match request_id {
+        Some(request_id) => extract_request_id(request_id.bind(py)),
+        None => {
+            let generated = py.import("uuid")?.getattr("uuid4")?.call0()?;
+            extract_request_id(&generated)
+        }
+    }
+}
+
+fn document_filter(
+    py: Python<'_>,
+    filter: Option<&Py<PyAny>>,
+    uuid_representation: PythonUuidRepresentation,
+) -> PyResult<DocumentFilter> {
+    match filter {
+        Some(filter) => python_engine_result(DocumentFilter::new(extract_bson_document(
+            py,
+            filter.bind(py),
+            uuid_representation,
+        )?)),
+        None => Ok(DocumentFilter::empty()),
+    }
+}
+
+fn document_read_options(
+    skip: u64,
+    limit: Option<u64>,
+    batch_size: u64,
+) -> PyResult<DocumentReadOptions> {
+    let mut options = python_engine_result(
+        DocumentReadOptions::new()
+            .with_skip(skip)
+            .with_batch_size(batch_size),
+    )?;
+    if let Some(limit) = limit {
+        options = python_engine_result(options.with_limit(limit))?;
+    }
+    Ok(options)
+}
+
+fn python_engine_result<T>(result: briskdb::EngineResult<T>) -> PyResult<T> {
+    result.map_err(NativeError::from).map_err(PyErr::from)
 }
 
 fn validate_cursor_batch_size(batch_size: usize) -> PyResult<()> {

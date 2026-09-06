@@ -37,14 +37,28 @@ Differential integration tests compare direct engine execution with both
 facades for point and scatter commands, ordered extended BSON values, request
 controls, session ownership, and shutdown.
 
+The typed Python wheel now exposes the same command slice on `Session` and
+`AsyncSession`, gated by `documents=True`. Ordered mappings and PyMongo BSON
+classes convert without JSON, including exact int32/int64 identity, IEEE-754
+bits, Decimal128 BID payloads, ObjectId, Code with scope, and all five UUID
+representation modes. Datetimes use aware UTC millisecond results, validation
+enforces the 16 MiB and 100-container BSON limits, and conversion failures use
+the existing stable Python exception hierarchy. PyMongo 4.17.0 is the pinned
+compatibility oracle, but remains an optional, lazily imported companion:
+installed-wheel and sdist gates first prove SQL and the missing-BSON failure
+path in an environment without PyMongo.
+
 The facade exposes the exact engine slice above. General matchers, update
 expressions, replacements, aggregation, retained cursors, the MongoDB listener,
-a collection-oriented Rust convenience API, and the Python document API remain
-follow-up work before MongoDB compatibility can be claimed. See the
+a collection-oriented Rust convenience API, and broader Python document
+operations remain follow-up work before MongoDB compatibility can be claimed.
+See the
 [embedded Rust guide](docs/EMBEDDED_RUST.md),
 [the BSON contract](docs/BSON.md),
 [the document storage contract](docs/DOCUMENT_STORAGE.md), and
-[the document engine contract](docs/DOCUMENT_ENGINE.md).
+[the document engine contract](docs/DOCUMENT_ENGINE.md). Python users should
+also read the [document API map](python/API.md) and
+[value-conversion contract](python/VALUE_CONVERSIONS.md).
 
 HTTP now has an explicit version-1 contract, discovery at `/v1`, a versioned
 `/v1/health` alias, and `BriskDB-API-Version: 1` on v1 responses. Existing valid
