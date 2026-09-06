@@ -28,7 +28,6 @@ fn degraded_error() -> EngineError {
 }
 
 /// One deterministic view of schema admission and current occupancy.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SchemaGateSnapshot {
     pub(crate) state: SchemaGateState,
@@ -93,7 +92,6 @@ impl SchemaGate {
     }
 
     /// Return a coherent snapshot for status and diagnostics.
-    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> SchemaGateSnapshot {
         let data = self.inner.lock();
         SchemaGateSnapshot {

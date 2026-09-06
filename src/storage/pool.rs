@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "documents")]
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 #[cfg(test)]
@@ -844,6 +843,18 @@ impl PooledConnection {
         self.broken = true;
     }
 
+    /// Replace this lease with a freshly opened, fully validated shard handle.
+    ///
+    /// Operational shard inspection uses this path so a successful report
+    /// revalidates durable identity, generation, metadata, and schema digest
+    /// instead of relying on an earlier pooled checkout.
+    pub(crate) fn revalidate_controlled(
+        &mut self,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<()> {
+        self.replace_with_fresh_controlled(control)
+    }
+
     /// Run work while cancellation is armed against exactly this leased handle.
     ///
     /// The progress hook closes the small race between starting SQLite and an
@@ -1134,7 +1145,6 @@ fn run_connection_validation_controlled<T>(
 /// pool should retire it. One [`OperationControl`] may use this helper
 /// repeatedly for sequential manifest and shard work; each invocation arms
 /// exactly the handle currently executing SQLite.
-#[cfg(feature = "documents")]
 pub(super) fn run_dedicated_connection_controlled<T>(
     connection: &mut Connection,
     control: Arc<OperationControl>,

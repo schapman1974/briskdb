@@ -1,5 +1,26 @@
 # Unreleased
 
+The administration HTTP listener now exposes versioned operational endpoints
+for readiness, relational catalog inspection, migration progress and exact
+generation lookup, validated shard state, bounded active-query inspection and
+cancellation, stopped-server backup capability, and passive checkpoint
+maintenance. The data listener continues to own query and execute; an opaque
+active-query handle created there can be listed and cancelled from the admin
+listener because every Engine clone shares the same bounded registry. Reports
+omit SQL, parameters, query SQL digests, and the durable migration identity;
+handles disappear when their HTTP handlers finish or drop, and cancelling one
+handle cannot target later work. Engine leases remain held independently until
+any interrupted SQLite cleanup finishes.
+
+`GET /v1/ready` returns HTTP 200 only while lifecycle and schema admission are
+ready; release archives and Debian service smoke tests now require that probe
+instead of treating a bound socket as sufficient. `/ready` is its unversioned
+probe alias. The backup endpoint reports the existing stopped-directory-copy
+procedure and performs no copy. Passive checkpoint remains optional preparation
+and is not an online snapshot or cross-file recovery point; coordinated online
+backup remains issue #67. These endpoints add no manifest, shard, or other
+on-disk format change.
+
 HTTP data and administration traffic now use separate routers and listener
 sockets over the same engine. `--listen` and `BRISKDB_LISTEN` remain the data
 plane at `127.0.0.1:7654`, serving `/v1` discovery, query, and execute. The new

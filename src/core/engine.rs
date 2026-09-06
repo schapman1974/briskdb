@@ -19,18 +19,22 @@ use tokio::{
 
 use super::session::TransactionState;
 use super::{
-    BlockingPool, BoundStatementPlan, CancelOnDrop, CancellationReason, CancellationToken,
-    Database, DescribeTarget, EngineError, EngineErrorKind, EngineOptions, EngineResult,
-    EngineState, Executed, GlobalIndexOperationalReport, Lifecycle, LogicalDatabaseId,
-    OperationControl, OperationLease, PortalId, PrepareRequest, PreparedExecution,
-    PreparedStatementDescription, PreparedStatementId, PreparedStatementLimits, RawDataOperation,
-    RawDataTarget, RequestContext, ResultLimits, ResultSet, Routed, RowProducer, RowStream,
-    Session, SessionInner, ShutdownReport, TablePlacement, TransactionExecution, Value,
-    merge_scatter_results, wait_for_cancellation, wait_pending,
+    ActiveQueryRegistry, ActiveQueryStatus, BlockingPool, BoundStatementPlan, CancelOnDrop,
+    CancellationReason, CancellationToken, Database, DescribeTarget, EngineError, EngineErrorKind,
+    EngineOptions, EngineResult, EngineState, Executed, GlobalIndexOperationalReport, Lifecycle,
+    LogicalDatabaseId, OperationControl, OperationLease, PortalId, PrepareRequest,
+    PreparedExecution, PreparedStatementDescription, PreparedStatementId, PreparedStatementLimits,
+    QueryId, RawDataOperation, RawDataTarget, ReadinessSnapshot, RequestContext, ResultLimits,
+    ResultSet, Routed, RowProducer, RowStream, SchemaMigrationStatus, SchemaMigrationSummary,
+    SchemaState, Session, SessionInner, ShardState, ShardStatus, ShardStatusReport, ShutdownReport,
+    TablePlacement, TrackedQuery, TransactionExecution, Value, merge_scatter_results,
+    wait_for_cancellation, wait_pending,
 };
 use crate::{
     sql,
-    storage::{ConnectionOwner, ConnectionPools, PooledConnection, SchemaOperationGuard},
+    storage::{
+        ConnectionOwner, ConnectionPools, PooledConnection, SchemaGateState, SchemaOperationGuard,
+    },
 };
 
 #[cfg(feature = "experimental-vtab")]
@@ -375,6 +379,7 @@ struct EngineInner {
     workers: BlockingPool,
     connections: ConnectionPools,
     lifecycle: Arc<Lifecycle>,
+    active_queries: Arc<ActiveQueryRegistry>,
     shutdown_cancel: CancellationToken,
     shutdown_gate: Arc<tokio::sync::Mutex<()>>,
     #[cfg(feature = "experimental-vtab")]
@@ -600,6 +605,7 @@ impl Engine {
                 workers,
                 connections,
                 lifecycle: Lifecycle::new(),
+                active_queries: ActiveQueryRegistry::new(),
                 shutdown_cancel: CancellationToken::new(),
                 shutdown_gate: Arc::new(tokio::sync::Mutex::new(())),
                 #[cfg(feature = "experimental-vtab")]
@@ -856,6 +862,54 @@ impl Engine {
         self.inner.lifecycle.state()
     }
 
+    /// Return a narrow readiness snapshot without admitting an operation.
+    ///
+    /// Readiness means the engine lifecycle is running and the application
+    /// schema gate is ready. Global-index degradation is reported by its
+    /// dedicated health surface and does not change this admission result.
+    pub fn readiness(&self) -> ReadinessSnapshot {
+        // Admission occupancy can change continuously under load, so readiness
+        // must never spin waiting for two identical observations. The gate
+        // snapshot is internally coherent; the published generation is a
+        // neighboring live diagnostic and may advance immediately before or
+        // after any returned snapshot.
+        let schema = self.inner.database.storage.schema_gate_snapshot();
+        let schema_generation = self.inner.database.storage.current_schema_generation();
+        ReadinessSnapshot {
+            lifecycle_state: self.state(),
+            schema_state: match schema.state {
+                SchemaGateState::Ready => SchemaState::Ready,
+                SchemaGateState::Migrating => SchemaState::Migrating,
+                SchemaGateState::Pending => SchemaState::Pending,
+                SchemaGateState::Degraded => SchemaState::Degraded,
+            },
+            schema_generation,
+            active_schema_operations: schema.active_operations,
+        }
+    }
+
+    /// Register one frontend query for bounded inspection and cancellation.
+    ///
+    /// The returned guard owns registration. Dropping it requests cancellation
+    /// and removes the query, including after errors or task unwinding.
+    pub fn begin_tracked_query(&self, sql: &str) -> EngineResult<TrackedQuery> {
+        self.inner.active_queries.begin(sql)
+    }
+
+    /// Return a deterministic, redaction-safe snapshot of active queries.
+    pub fn active_queries(&self) -> Vec<ActiveQueryStatus> {
+        self.inner.active_queries.snapshot()
+    }
+
+    /// Request cancellation of one active query.
+    ///
+    /// `None` means the identity is unknown or already stale. `Some(true)`
+    /// records a new cancellation and `Some(false)` means it was already
+    /// requested. Cancellation is performed after releasing registry locks.
+    pub fn cancel_query(&self, id: QueryId) -> Option<bool> {
+        self.inner.active_queries.cancel(id)
+    }
+
     #[cfg(test)]
     pub(crate) fn active_operations_for_test(&self) -> usize {
         self.inner.lifecycle.active()
@@ -1010,6 +1064,155 @@ impl Engine {
         operation.finish(result)
     }
 
+    /// Fully validate every physical shard under one application-schema generation.
+    pub async fn shard_status(&self) -> EngineResult<ShardStatusReport> {
+        self.shard_status_with_context(RequestContext::new()).await
+    }
+
+    /// Fully validate every physical shard with request cancellation controls.
+    ///
+    /// The result is all-or-nothing and ordered by shard ID. Each validation
+    /// replaces any retained pooled handle with a fresh controlled open so a
+    /// successful status never relies only on stale pool metadata.
+    pub async fn shard_status_with_context(
+        &self,
+        context: RequestContext,
+    ) -> EngineResult<ShardStatusReport> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let schema_generation = self.inner.database.storage.current_schema_generation();
+        let permits = match operation
+            .wait_pending(
+                self.inner
+                    .connections
+                    .acquire_all_for_owner(ConnectionOwner::stateless_catalog_write()),
+            )
+            .await
+        {
+            Ok(permits) => permits,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if let Err(error) = operation.check_before_start() {
+            return operation.finish(Err(error));
+        }
+
+        let lease = operation.take_lease();
+        let worker_control = Arc::clone(&operation.control);
+        let storage = self.inner.database.storage.clone();
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _schema_operation = schema_operation;
+            let result = permits
+                .into_iter()
+                .map(|(shard_id, permit)| {
+                    let mut connection = permit.checkout_controlled(Arc::clone(&worker_control))?;
+                    connection.revalidate_controlled(Arc::clone(&worker_control))?;
+                    if storage.current_schema_generation() != schema_generation {
+                        return Err(EngineError::new(
+                            EngineErrorKind::Internal,
+                            "application-schema generation changed during shard inspection",
+                        ));
+                    }
+                    Ok(ShardStatus {
+                        shard_id,
+                        state: ShardState::Ready,
+                    })
+                })
+                .collect::<EngineResult<Vec<_>>>()
+                .map(|shards| ShardStatusReport {
+                    schema_generation,
+                    shards,
+                });
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                storage.record_schema_degraded();
+            }
+            worker_control.complete(result)
+        });
+        let result = operation.wait_started(join).await;
+        operation.finish_started(result)
+    }
+
+    /// Return the active and latest complete schema migrations without SQL text.
+    pub async fn migration_summary(&self) -> EngineResult<SchemaMigrationSummary> {
+        self.migration_summary_with_context(RequestContext::new())
+            .await
+    }
+
+    /// Return the bounded schema-migration summary with request controls.
+    ///
+    /// This deliberately bypasses ordinary schema-operation admission so
+    /// `Migrating` and `Pending` journal state remains observable.
+    pub async fn migration_summary_with_context(
+        &self,
+        context: RequestContext,
+    ) -> EngineResult<SchemaMigrationSummary> {
+        let mut operation = self.operation(context)?;
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if let Err(error) = operation.check_before_start() {
+            return operation.finish(Err(error));
+        }
+        let lease = operation.take_lease();
+        let worker_control = Arc::clone(&operation.control);
+        let storage = self.inner.database.storage.clone();
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let result = storage.schema_migration_summary(Arc::clone(&worker_control));
+            worker_control.complete(result)
+        });
+        let result = operation.wait_started(join).await;
+        operation.finish_started(result)
+    }
+
+    /// Look up one schema migration by its indexed target generation.
+    pub async fn migration(
+        &self,
+        target_generation: u64,
+    ) -> EngineResult<Option<SchemaMigrationStatus>> {
+        self.migration_with_context(target_generation, RequestContext::new())
+            .await
+    }
+
+    /// Look up one schema migration generation with request controls.
+    ///
+    /// The returned metadata never includes the migration SQL.
+    pub async fn migration_with_context(
+        &self,
+        target_generation: u64,
+        context: RequestContext,
+    ) -> EngineResult<Option<SchemaMigrationStatus>> {
+        let mut operation = self.operation(context)?;
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if let Err(error) = operation.check_before_start() {
+            return operation.finish(Err(error));
+        }
+        let lease = operation.take_lease();
+        let worker_control = Arc::clone(&operation.control);
+        let storage = self.inner.database.storage.clone();
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let result = storage.schema_migration(target_generation, Arc::clone(&worker_control));
+            worker_control.complete(result)
+        });
+        let result = operation.wait_started(join).await;
+        operation.finish_started(result)
+    }
+
     /// Inspect redaction-safe global-index health and operational counters.
     pub async fn global_index_operational_report(
         &self,
@@ -1140,6 +1343,12 @@ impl Engine {
                     let databases = storage.checkpoint_auxiliary_databases()?;
                     Ok(CheckpointReport { shards, databases })
                 });
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                storage.record_schema_degraded();
+            }
             worker_control.complete(result)
         });
         let result = operation.wait_started(join).await;
@@ -3198,7 +3407,24 @@ impl Engine {
         operation.finish_started(result)
     }
 
+    /// Apply a parameterless SQL migration through the durable shard journal.
+    pub async fn migrate(&self, session: &Session, sql: String) -> EngineResult<Vec<u16>> {
+        self.broadcast(session, sql).await
+    }
+
+    /// Apply a parameterless SQL migration with explicit request controls.
+    pub async fn migrate_with_context(
+        &self,
+        session: &Session,
+        sql: String,
+        context: RequestContext,
+    ) -> EngineResult<Vec<u16>> {
+        self.broadcast_with_context(session, sql, context).await
+    }
+
     /// Apply a parameterless SQL migration batch through the durable shard journal.
+    ///
+    /// This compatibility name has the same behavior as [`Engine::migrate`].
     pub async fn broadcast(&self, session: &Session, sql: String) -> EngineResult<Vec<u16>> {
         self.broadcast_with_context(session, sql, RequestContext::new())
             .await
@@ -4572,7 +4798,8 @@ mod tests {
     #[cfg(feature = "experimental-vtab")]
     use crate::core::GeneratedIdPolicy;
     use crate::core::{
-        Column, DataType, Row, SessionState, ShardKeyMetadata, ShardKeyType, TableDeclaration,
+        Column, DataType, Row, SchemaMigrationState, SessionState, ShardKeyMetadata, ShardKeyType,
+        TableDeclaration,
     };
 
     #[test]
@@ -4979,6 +5206,202 @@ mod tests {
             PreparedStatementLimits::default()
         );
         assert_eq!(session.state().await, SessionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn operational_query_readiness_shards_and_migrations_share_engine_state() {
+        let (_temp, engine) = engine_with_options(2, 1, 2);
+        let clone = engine.clone();
+
+        let readiness = engine.readiness();
+        assert!(readiness.ready());
+        assert_eq!(readiness.lifecycle_state(), EngineState::Running);
+        assert_eq!(readiness.schema_state(), SchemaState::Ready);
+        assert_eq!(readiness.schema_generation(), 0);
+        assert_eq!(readiness.active_schema_operations(), 0);
+
+        let tracked = engine.begin_tracked_query("SELECT private_value").unwrap();
+        assert_eq!(clone.active_queries().len(), 1);
+        assert_eq!(clone.cancel_query(tracked.id()), Some(true));
+        assert_eq!(clone.cancel_query(tracked.id()), Some(false));
+        assert!(tracked.cancellation_token().is_cancelled());
+        let tracked_id = tracked.id();
+        drop(tracked);
+        assert!(clone.active_queries().is_empty());
+        assert_eq!(clone.cancel_query(tracked_id), None);
+
+        let shards = engine.shard_status().await.unwrap();
+        assert_eq!(shards.schema_generation(), 0);
+        assert_eq!(
+            shards
+                .shards()
+                .iter()
+                .map(|shard| (shard.shard_id(), shard.state()))
+                .collect::<Vec<_>>(),
+            vec![(0, ShardState::Ready), (1, ShardState::Ready)]
+        );
+
+        let initial = engine.migration_summary().await.unwrap();
+        assert_eq!(initial.schema_generation(), 0);
+        assert_eq!(initial.active(), None);
+        assert_eq!(initial.latest_complete(), None);
+
+        let session = engine.session();
+        let sql = "CREATE TABLE operational_marker (id INTEGER PRIMARY KEY)".to_owned();
+        assert_eq!(engine.migrate(&session, sql.clone()).await.unwrap(), [0, 1]);
+        let summary = engine.migration_summary().await.unwrap();
+        assert_eq!(summary.schema_generation(), 1);
+        assert_eq!(summary.active(), None);
+        let completed = summary.latest_complete().unwrap();
+        assert_eq!(completed.generation(), 1);
+        assert_eq!(completed.source_generation(), 0);
+        assert_eq!(completed.target_generation(), 1);
+        assert_eq!(completed.state(), SchemaMigrationState::Complete);
+        assert_eq!(completed.shard_count(), 2);
+        assert_eq!(completed.next_shard(), 2);
+        assert_eq!(completed.completed_shards(), 2);
+        assert_eq!(completed.sql_bytes(), sql.len());
+        assert_eq!(engine.migration(1).await.unwrap(), Some(completed));
+        assert_eq!(engine.migration(0).await.unwrap(), None);
+        assert_eq!(engine.migration(2).await.unwrap(), None);
+    }
+
+    #[test]
+    fn readiness_tracks_schema_occupancy_migration_and_lifecycle() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let schema_operation = engine
+            .inner
+            .database
+            .storage
+            .enter_schema_operation()
+            .unwrap();
+        let occupied = engine.readiness();
+        assert!(occupied.ready());
+        assert_eq!(occupied.active_schema_operations(), 1);
+        drop(schema_operation);
+
+        let migration = engine
+            .inner
+            .database
+            .storage
+            .begin_schema_migration()
+            .unwrap();
+        let migrating = engine.readiness();
+        assert!(!migrating.ready());
+        assert_eq!(migrating.schema_state(), SchemaState::Migrating);
+        drop(migration);
+        assert!(engine.readiness().ready());
+
+        assert_eq!(engine.begin_shutdown(), EngineState::Draining);
+        let draining = engine.readiness();
+        assert!(!draining.ready());
+        assert_eq!(draining.lifecycle_state(), EngineState::Draining);
+    }
+
+    #[test]
+    fn readiness_remains_bounded_while_schema_admission_churns() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let engine = Arc::new(engine);
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let churn = (0..4)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                let running = Arc::clone(&running);
+                std::thread::spawn(move || {
+                    while running.load(std::sync::atomic::Ordering::Acquire) {
+                        let operation = engine
+                            .inner
+                            .database
+                            .storage
+                            .enter_schema_operation()
+                            .unwrap();
+                        std::thread::yield_now();
+                        drop(operation);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let (complete_tx, complete_rx) = mpsc::channel();
+        let reader_engine = Arc::clone(&engine);
+        let reader = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                let readiness = reader_engine.readiness();
+                assert!(readiness.ready());
+                assert_eq!(readiness.schema_generation(), 0);
+            }
+            complete_tx.send(()).unwrap();
+        });
+
+        let completed = complete_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        running.store(false, std::sync::atomic::Ordering::Release);
+        for thread in churn {
+            thread.join().unwrap();
+        }
+        reader.join().unwrap();
+        assert!(
+            completed,
+            "readiness must not wait for admission occupancy to stop changing"
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_status_is_all_or_nothing_and_degrades_on_authoritative_corruption() {
+        let (temp, engine) = engine_with_options(2, 1, 1);
+        let shard = rusqlite::Connection::open(temp.path().join("shards/0001.sqlite")).unwrap();
+        shard
+            .execute(
+                "UPDATE briskdb_shard_metadata SET shard_id = 0 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        drop(shard);
+
+        let error = engine.shard_status().await.unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(engine.readiness().schema_state(), SchemaState::Degraded);
+    }
+
+    #[tokio::test]
+    async fn operational_inspection_degrades_when_authoritative_storage_disappears() {
+        let (summary_temp, summary_engine) = engine_with_options(2, 1, 1);
+        std::fs::remove_file(summary_temp.path().join("manifest.sqlite")).unwrap();
+
+        let summary_error = summary_engine.migration_summary().await.unwrap_err();
+        assert_eq!(summary_error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            summary_engine.readiness().schema_state(),
+            SchemaState::Degraded
+        );
+
+        let (detail_temp, detail_engine) = engine_with_options(2, 1, 1);
+        std::fs::remove_file(detail_temp.path().join("manifest.sqlite")).unwrap();
+
+        let detail_error = detail_engine.migration(0).await.unwrap_err();
+        assert_eq!(detail_error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            detail_engine.readiness().schema_state(),
+            SchemaState::Degraded
+        );
+
+        let (checkpoint_temp, checkpoint_engine) = engine_with_options(2, 1, 1);
+        std::fs::remove_file(checkpoint_temp.path().join("manifest.sqlite")).unwrap();
+
+        let checkpoint_error = checkpoint_engine.checkpoint().await.unwrap_err();
+        assert_eq!(checkpoint_error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            checkpoint_engine.readiness().schema_state(),
+            SchemaState::Degraded
+        );
+
+        let (shard_temp, shard_engine) = engine_with_options(2, 1, 1);
+        std::fs::remove_file(shard_temp.path().join("shards/0001.sqlite")).unwrap();
+
+        let shard_error = shard_engine.checkpoint().await.unwrap_err();
+        assert_eq!(shard_error.kind(), EngineErrorKind::DataCorruption);
+        assert_eq!(
+            shard_engine.readiness().schema_state(),
+            SchemaState::Degraded
+        );
     }
 
     #[tokio::test]
@@ -7691,6 +8114,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_inspection_spans_finalization_publication_and_pending_recovery() {
+        let (_temp, engine) = engine_with_options(2, 1, 1);
+        let sql = "CREATE TABLE finalization_handoff_marker (id INTEGER)";
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        engine
+            .inner
+            .database
+            .storage
+            .install_schema_migration_test_block(
+                crate::storage::SchemaMigrationCoordinatorPoint::FinalizationCommitted,
+                started_tx,
+                release_rx,
+            )
+            .unwrap();
+
+        let session = Arc::new(engine.session());
+        let migration_engine = engine.clone();
+        let migration_session = Arc::clone(&session);
+        let migration = tokio::spawn(async move {
+            migration_engine
+                .migrate(&migration_session, sql.to_owned())
+                .await
+        });
+        wait_for_blocking_signal(started_rx, "migration finalization should commit").await;
+
+        let readiness = engine.readiness();
+        assert_eq!(readiness.schema_state(), SchemaState::Migrating);
+        assert_eq!(readiness.schema_generation(), 0);
+        let committed = timeout(Duration::from_secs(2), engine.migration_summary())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.schema_generation(), 1);
+        assert_eq!(committed.active(), None);
+        let completed = committed.latest_complete().unwrap();
+        assert_eq!(completed.state(), SchemaMigrationState::Complete);
+        assert_eq!(engine.migration(1).await.unwrap(), Some(completed));
+
+        // Disconnecting this one-shot barrier injects a failure after the
+        // durable finalization commit but before in-memory publication.
+        drop(release_tx);
+        let error = migration.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Internal);
+        let pending_readiness = engine.readiness();
+        assert_eq!(pending_readiness.schema_state(), SchemaState::Pending);
+        assert_eq!(pending_readiness.schema_generation(), 0);
+
+        let pending = engine.migration_summary().await.unwrap();
+        assert_eq!(pending, committed);
+        assert_eq!(engine.migration(1).await.unwrap(), Some(completed));
+
+        let retry = engine.session();
+        assert_eq!(
+            engine.migrate(&retry, sql.to_owned()).await.unwrap(),
+            [0, 1]
+        );
+        assert!(engine.readiness().ready());
+        assert_eq!(engine.readiness().schema_generation(), 1);
+    }
+
+    #[tokio::test]
     async fn cancellation_after_durable_journal_waits_for_cleanup_and_exact_retry_recovers() {
         let (_temp, engine) = engine_with_options(2, 1, 1);
         let sql = "CREATE TABLE durable_cancel_marker (id INTEGER)";
@@ -7723,6 +8208,12 @@ mod tests {
             engine.inner.database.storage.schema_gate_snapshot().state,
             crate::storage::SchemaGateState::Migrating
         );
+        let active = engine.migration_summary().await.unwrap().active().unwrap();
+        assert_eq!(active.state(), SchemaMigrationState::Applying);
+        assert_eq!(active.source_generation(), 0);
+        assert_eq!(active.target_generation(), 1);
+        assert_eq!(active.next_shard(), 0);
+        assert_eq!(active.sql_bytes(), sql.len());
 
         assert!(token.cancel());
         assert!(
@@ -7745,6 +8236,8 @@ mod tests {
             engine.inner.database.storage.schema_gate_snapshot().state,
             crate::storage::SchemaGateState::Pending
         );
+        let pending = engine.migration_summary().await.unwrap().active().unwrap();
+        assert_eq!(pending, active);
 
         let ordinary = engine.session();
         ordinary.set_routing_key("pending-work").await.unwrap();

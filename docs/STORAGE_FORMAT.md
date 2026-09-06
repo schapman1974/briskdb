@@ -1132,10 +1132,12 @@ The retained journal proves which exact batches BriskDB coordinated; it does
 not authenticate the files or cryptographically cover application rows. Version
 7 separately requires every shard's persistent application-schema fingerprint
 to match the trusted source or target fingerprint for its position in an active
-migration. Richer migration submission, history, and status APIs remain issue
-#53. The general physical-SQL entry point retains the `broadcast` name and
-response shape; the generated-table DDL bridge is a separate initialization-only
-producer of one canonical physical migration.
+migration. HTTP v1 now exposes a bounded current/latest summary and exact
+target-generation lookup without returning retained SQL or the internal
+migration identity described here; it does not add an unbounded history
+listing. The general physical-SQL entry point retains the `broadcast` name and
+response shape; the generated-table DDL bridge is a separate
+initialization-only producer of one canonical physical migration.
 
 ### Integrity metadata and durable database states
 

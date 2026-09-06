@@ -1,18 +1,26 @@
 //! Version 1 transport contract. Storage and SQL semantics remain in Engine.
 
+use std::fmt;
+
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, FromRequest, Request},
-    http::{HeaderValue, StatusCode},
+    body::Bytes,
+    extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Request},
+    http::{HeaderValue, StatusCode, request::Parts},
     middleware,
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Serialize,
+    de::{DeserializeOwned, IgnoredAny, MapAccess, Visitor},
+};
 use serde_json::value::RawValue;
 
 use super::{
-    HttpState, ProblemDetails, broadcast, execute, global_indexes, health, problem_response, query,
+    HttpState, ProblemDetails, active_queries, backup_capability, broadcast, cancel_query, catalog,
+    checkpoint, execute, global_indexes, health, migration, migrations, problem_response, query,
+    ready, shard_status,
 };
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -22,10 +30,19 @@ pub(super) fn routes() -> Router<HttpState> {
         Router::new()
             .route("/", get(discovery))
             .route("/health", get(health))
+            .route("/ready", get(ready))
             .route("/execute", post(execute))
             .route("/query", post(query))
             .route("/admin/broadcast", post(broadcast))
-            .route("/admin/global-indexes", get(global_indexes)),
+            .route("/admin/global-indexes", get(global_indexes))
+            .route("/admin/catalog", get(catalog))
+            .route("/admin/migrations", get(migrations))
+            .route("/admin/migrations/{target_generation}", get(migration))
+            .route("/admin/shards", get(shard_status))
+            .route("/admin/queries", get(active_queries))
+            .route("/admin/queries/{query_id}/cancel", post(cancel_query))
+            .route("/admin/backup", get(backup_capability))
+            .route("/admin/maintenance/checkpoint", post(checkpoint)),
         true,
     )
 }
@@ -44,8 +61,17 @@ pub(super) fn admin_routes() -> Router<HttpState> {
     versioned_routes(
         Router::new()
             .route("/health", get(health))
+            .route("/ready", get(ready))
             .route("/admin/broadcast", post(broadcast))
-            .route("/admin/global-indexes", get(global_indexes)),
+            .route("/admin/global-indexes", get(global_indexes))
+            .route("/admin/catalog", get(catalog))
+            .route("/admin/migrations", get(migrations))
+            .route("/admin/migrations/{target_generation}", get(migration))
+            .route("/admin/shards", get(shard_status))
+            .route("/admin/queries", get(active_queries))
+            .route("/admin/queries/{query_id}/cancel", post(cancel_query))
+            .route("/admin/backup", get(backup_capability))
+            .route("/admin/maintenance/checkpoint", post(checkpoint)),
         false,
     )
 }
@@ -146,6 +172,40 @@ pub(super) struct BroadcastRequest {
     pub(super) sql: String,
 }
 
+#[derive(Debug)]
+pub(super) struct EmptyRequest;
+
+impl<'de> Deserialize<'de> for EmptyRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EmptyRequestVisitor;
+
+        impl<'de> Visitor<'de> for EmptyRequestVisitor {
+            type Value = EmptyRequest;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an empty JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                if map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "the empty request must not contain fields",
+                    ));
+                }
+                Ok(EmptyRequest)
+            }
+        }
+
+        deserializer.deserialize_map(EmptyRequestVisitor)
+    }
+}
+
 pub(super) struct V1Json<T>(pub(super) T);
 
 impl<T, S> FromRequest<S> for V1Json<T>
@@ -164,6 +224,51 @@ where
                 StatusCode::UNSUPPORTED_MEDIA_TYPE => TransportError::MediaType,
                 _ => TransportError::InvalidRequest,
             })
+    }
+}
+
+/// An exact empty request body under the shared v1 byte limit.
+///
+/// Routes without a JSON envelope still extract the body so Axum applies
+/// [`DefaultBodyLimit`] before the handler can perform an operation.
+pub(super) struct V1EmptyBody;
+
+impl<S> FromRequest<S> for V1EmptyBody
+where
+    S: Send + Sync,
+{
+    type Rejection = TransportError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let body =
+            Bytes::from_request(request, state)
+                .await
+                .map_err(|rejection| match rejection.status() {
+                    StatusCode::PAYLOAD_TOO_LARGE => TransportError::BodyTooLarge,
+                    _ => TransportError::InvalidRequest,
+                })?;
+        if body.is_empty() {
+            Ok(Self)
+        } else {
+            Err(TransportError::InvalidRequest)
+        }
+    }
+}
+
+pub(super) struct V1Path<T>(pub(super) T);
+
+impl<T, S> FromRequestParts<S> for V1Path<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = TransportError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Path(value)| Self(value))
+            .map_err(|_| TransportError::NotFound)
     }
 }
 

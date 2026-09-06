@@ -327,10 +327,12 @@ keys in the same generated-ID routing domain, Sharded-to-Global, or
 Global-to-Global placement, and SQLite must accept the referenced parent key;
 triggers and virtual tables remain prohibited. Row-moving DML, table drops, and
 trigger creation are rejected before this rollback-only check. A violation fails
-preflight before journal publication. Richer
-migration/history APIs remain issue #53. Manifest v8 retains the v7
-generation-bound persistent-schema fingerprint requirement in addition to this
-catalog enforcement.
+preflight before journal publication. HTTP v1 exposes a bounded current/latest
+migration summary and exact target-generation lookup without returning this SQL
+or its durable migration identity; `broadcast` remains its only migration
+submission route. Manifest v8 retains the v7 generation-bound
+persistent-schema fingerprint requirement in addition to this catalog
+enforcement.
 
 The schema gate admits no new routed work after migration begins and waits for
 previously admitted operations to drain. During active preflight or apply,

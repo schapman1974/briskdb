@@ -989,6 +989,28 @@ pub(super) enum SchemaMigrationClassification {
     Complete(SchemaMigration),
 }
 
+/// A bounded, transactionally coherent view of migration history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SchemaMigrationSummarySnapshot {
+    schema_generation: u64,
+    active: Option<SchemaMigration>,
+    latest_complete: Option<SchemaMigration>,
+}
+
+impl SchemaMigrationSummarySnapshot {
+    pub(super) const fn schema_generation(&self) -> u64 {
+        self.schema_generation
+    }
+
+    pub(super) fn active(&self) -> Option<&SchemaMigration> {
+        self.active.as_ref()
+    }
+
+    pub(super) fn latest_complete(&self) -> Option<&SchemaMigration> {
+        self.latest_complete.as_ref()
+    }
+}
+
 /// One fully validated, checksummed table-provisioning journal.
 ///
 /// The durable prefix means every shard below `next_shard` has committed the
@@ -4573,6 +4595,135 @@ fn find_schema_migration(
              FROM briskdb_schema_migrations
              WHERE migration_id = ?1",
             [migration_id.as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .map(Some)
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            error => Err(error),
+        })
+        .map_err(|error| manifest_read_error(error, "failed to read schema migration journal"))?
+        .map(|stored| schema_migration_from_stored(stored, expected_shard_count))
+        .transpose()
+}
+
+/// Inspect only the active and latest complete journal rows.
+///
+/// Both rows are addressed through the `target_generation` primary key: a
+/// valid active row can only be the generation after the catalog, and the
+/// latest complete row can only be the catalog generation itself.
+pub(super) fn inspect_schema_migration_summary(
+    connection: &Connection,
+    expected_shard_count: u16,
+) -> EngineResult<SchemaMigrationSummarySnapshot> {
+    let schema_generation =
+        validate_schema_catalog_configuration(connection, SchemaGenerationPolicy::Journaled)?
+            .schema_generation;
+    let latest_complete = if schema_generation == 0 {
+        None
+    } else {
+        let migration = find_schema_migration_by_generation(
+            connection,
+            expected_shard_count,
+            schema_generation,
+        )?
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "schema migration journal is missing its latest complete generation",
+            )
+        })?;
+        if !migration.is_complete() {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                "catalog generation refers to an incomplete schema migration",
+            ));
+        }
+        Some(migration)
+    };
+    let active = match schema_generation.checked_add(1) {
+        Some(target) if target <= MAX_SCHEMA_GENERATION => {
+            find_schema_migration_by_generation(connection, expected_shard_count, target)?
+        }
+        Some(_) | None => None,
+    };
+    if active
+        .as_ref()
+        .is_some_and(|migration| !migration.is_applying())
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "journal row after the catalog generation is not active",
+        ));
+    }
+    Ok(SchemaMigrationSummarySnapshot {
+        schema_generation,
+        active,
+        latest_complete,
+    })
+}
+
+/// Look up one journal row through its indexed target-generation key.
+pub(super) fn inspect_schema_migration_generation(
+    connection: &Connection,
+    expected_shard_count: u16,
+    target_generation: u64,
+) -> EngineResult<(u64, Option<SchemaMigration>)> {
+    let schema_generation =
+        validate_schema_catalog_configuration(connection, SchemaGenerationPolicy::Journaled)?
+            .schema_generation;
+    if target_generation == 0 || target_generation > MAX_SCHEMA_GENERATION {
+        return Ok((schema_generation, None));
+    }
+    let migration =
+        find_schema_migration_by_generation(connection, expected_shard_count, target_generation)?;
+    if let Some(migration) = migration.as_ref() {
+        if migration.is_complete() && target_generation <= schema_generation {
+            return Ok((schema_generation, Some(migration.clone())));
+        }
+        if migration.is_applying() && schema_generation.checked_add(1) == Some(target_generation) {
+            return Ok((schema_generation, Some(migration.clone())));
+        }
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "schema migration state is inconsistent with the catalog generation",
+        ));
+    }
+    Ok((schema_generation, None))
+}
+
+fn find_schema_migration_by_generation(
+    connection: &Connection,
+    expected_shard_count: u16,
+    target_generation: u64,
+) -> EngineResult<Option<SchemaMigration>> {
+    debug_assert!((1..=MAX_SCHEMA_GENERATION).contains(&target_generation));
+    let target_generation =
+        i64::try_from(target_generation).expect("validated schema generation fits SQLite");
+    connection
+        .query_row(
+            "SELECT target_generation,
+                    source_generation,
+                    migration_id,
+                    digest_version,
+                    sql_text,
+                    shard_count,
+                    migration_state,
+                    next_shard
+             FROM briskdb_schema_migrations
+             WHERE target_generation = ?1",
+            [target_generation],
             |row| {
                 Ok((
                     row.get(0)?,

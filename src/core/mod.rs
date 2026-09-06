@@ -11,6 +11,7 @@ pub(crate) mod generated_id;
 mod global_index;
 mod index_key;
 mod lifecycle;
+mod operations;
 mod options;
 mod planner;
 mod prepared;
@@ -72,6 +73,12 @@ pub use index_key::{
 };
 pub use lifecycle::{EngineState, ShutdownReport};
 pub(crate) use lifecycle::{Lifecycle, OperationLease};
+pub(crate) use operations::ActiveQueryRegistry;
+pub use operations::{
+    ActiveQueryStatus, MAX_ACTIVE_QUERIES, ParseQueryIdError, QueryId, ReadinessSnapshot,
+    SchemaMigrationState, SchemaMigrationStatus, SchemaMigrationSummary, SchemaState, ShardState,
+    ShardStatus, ShardStatusReport, TrackedQuery,
+};
 pub use options::{
     DEFAULT_CONNECTIONS_PER_SHARD, DEFAULT_MAX_PORTALS_PER_SESSION,
     DEFAULT_MAX_PREPARED_STATEMENTS_PER_SESSION, DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_ROWS,

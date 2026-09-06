@@ -44,6 +44,45 @@ keys. Closing a PostgreSQL connection unregisters its key and cancels active
 work. A cancelled command returns SQLSTATE `57014`; an explicit transaction
 enters failed state until rollback.
 
+The Engine also keeps a bounded registry for active HTTP queries. A query gets
+an opaque 32-character lowercase hexadecimal handle before it enters engine
+admission. Normal completion removes that handle when the handler finishes.
+Dropping the handler unregisters it immediately while the Engine's independent
+operation drop guard cancels SQLite and retains lifecycle and pool ownership
+until cleanup actually finishes. `GET /v1/admin/queries` returns a bounded,
+redaction-safe snapshot that never includes SQL, SQL digests, parameter values,
+routing keys, sessions, or paths.
+`POST /v1/admin/queries/{operation_id}/cancel` requests cancellation for that
+exact live handle and returns HTTP 202. An unknown,
+malformed, completed, or stale handle returns the fixed versioned 404 problem
+and cannot affect another query. The response's `newly_requested` Boolean
+distinguishes the call that changed the sticky token from a repeated request
+while cleanup is still in progress.
+
+Cancel takes its identity only from the path and requires a zero-byte body. A
+nonempty body receives the fixed versioned HTTP 400 problem, or HTTP 413 when
+it exceeds the 2 MiB limit, before the registry can be changed. An empty body
+does not require a content type.
+
+The registry is shared by every Engine clone, including the clones the server
+passes to its separate data and administration routers. An embedder building
+both planes must likewise clone one Engine into `data_router_with_engine` and
+`admin_router_with_engine`; calling the two `Arc<Database>` compatibility
+wrappers separately constructs independent Engines and registries. The registry
+is process memory, has no manifest or restart state, and contains active
+operations only. Listing and cancellation are inherently live observations: a
+listed query can complete before the cancel request arrives. Completion known
+to have succeeded still wins its close race with cancellation. Closing a data
+connection or dropping its HTTP handler unregisters the HTTP handle, requests
+exact-operation cancellation, and leaves the engine lease in place until the
+leased SQLite work and pool cleanup have really stopped.
+
+The registry holds at most 1,024 queries. When it is full, another HTTP query
+returns the standard HTTP 422 `limit_exceeded` problem before Engine admission.
+When a handler drops its tracking guard, removing the exact entry immediately
+restores one registry slot even when the independently leased SQLite cleanup is
+still finishing.
+
 An operation still waiting for its session, shard connection, or blocking
 worker leaves the queue immediately when cancelled. It never starts SQL. Once
 SQLite is running, BriskDB arms an interrupt handle and progress callback only

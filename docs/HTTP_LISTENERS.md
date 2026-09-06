@@ -36,7 +36,14 @@ operator or browser paths at `127.0.0.1:7654` must use
 | `GET /v1`, `GET /v1/` | `GET /health` |
 | `POST /v1/query` | `GET /metrics` |
 | `POST /v1/execute` | `GET /v1/health` |
+|  | `GET /ready`, `GET /v1/ready` |
 |  | `POST /v1/admin/broadcast` |
+|  | `GET /v1/admin/catalog` |
+|  | `GET /v1/admin/migrations`, `GET /v1/admin/migrations/{target_generation}` |
+|  | `GET /v1/admin/shards` |
+|  | `GET /v1/admin/queries`, `POST /v1/admin/queries/{operation_id}/cancel` |
+|  | `GET /v1/admin/backup` |
+|  | `POST /v1/admin/maintenance/checkpoint` |
 |  | `GET /v1/admin/global-indexes` |
 |  | `/admin`, `/admin/`, assets, and `/admin/api/*` |
 
@@ -45,16 +52,21 @@ therefore receives HTTP 404 and cannot execute the hidden operation. Responses
 under an omitted `/v1` path retain the version-1 problem-detail and version
 header behavior; unversioned missing paths use the ordinary HTTP 404 response.
 The embedded browser and its JSON endpoints stay together on the administration
-listener, so its same-origin cookie and asset rules do not change.
+listener, so its same-origin cookie and asset rules do not change. Its temporary
+cookie does not authenticate the operator endpoints above.
 
 The public Rust HTTP module exposes `data_router` and
 `data_router_with_engine`, plus `admin_router` and
 `admin_router_with_engine`. Its established `router` and `router_with_engine`
 functions remain combined-router compatibility helpers for applications that
 deliberately own their HTTP serving boundary. BriskDB's daemon and attached
-server use only the separate routers. A host that serves a router itself owns
-socket validation and exposure; loopback enforcement belongs to `server`, not
-to an Axum `Router` value.
+server clone one Engine into the two Engine-based router constructors. A host
+building both planes must do the same so lifecycle and active-query
+cancellation are shared. Calling the two `Arc<Database>` compatibility wrappers
+separately creates independent Engines and therefore independent operational
+registries. A host that serves a router itself owns socket validation and
+exposure; loopback enforcement belongs to `server`, not to an Axum `Router`
+value.
 
 ## Rust and Python attached servers
 
@@ -83,11 +95,27 @@ and logs readiness only after every configured socket has bound. Any bind or
 accept failure releases all listener sockets and enters the existing cleanup
 path; a partially started daemon never reports readiness.
 
+After binding, service and packaging probes use `GET /v1/ready` on the
+administration listener. HTTP 200 means the shared engine lifecycle is running
+and its schema gate is ready at that snapshot. A non-ready engine returns HTTP
+503 with the same JSON report and finite lifecycle/schema reasons. `/ready` is
+the unversioned alias. Data discovery remains static metadata and is not a
+readiness signal. Disabling the administration listener also removes both
+readiness paths, so a host that chooses that configuration must inspect its
+embedded Engine lifecycle directly.
+
 Both HTTP planes share the existing finite engine admission, deadline, result,
 pool, and shutdown controls. One shutdown signal stops admission, closes every
 listener, signals all tracked HTTP and PostgreSQL connections, and drains them
 against the configured grace period. An attached server performs the same
 listener drain without beginning shutdown of its borrowed database.
+
+Active HTTP query handles are likewise stored in the shared Engine rather than
+one router. A data-plane `/v1/query` can therefore be listed and cancelled from
+the administration listener even though neither plane forwards requests to the
+other. Closing a data socket drops its handler and removes the query handle;
+the engine's operation guard retains its own lifecycle and pool leases until
+SQLite interruption and cleanup finish.
 
 ## Compatibility and deferred work
 
@@ -98,9 +126,10 @@ administration address. `/v1/query`, `/v1/execute`, and version discovery stay
 on the established data address. The move changes no SQL semantics, JSON value
 codec, error mapping, manifest or shard format, migration, or dependency.
 
-Issue #53 owns richer health/readiness, catalog, migration, shard, cancellation,
-backup, and maintenance endpoints. Issue #54 owns request IDs, idempotency,
-pagination/streaming, and further transport limits. Issue #55 owns OpenAPI.
+Issue #53 adds readiness, catalog, migration, shard, active-query cancellation,
+backup-capability, and checkpoint-maintenance endpoints. Issue #54 owns general
+request IDs, idempotency, pagination/streaming, and further transport limits.
+Issue #55 owns OpenAPI.
 Issue #56 owns the HTTP authentication and role-check boundary, issue #64 owns
 the durable user/role and credential model, and issue #65 owns listener TLS and
 safe remote activation. Until those land, the separate loopback listeners are

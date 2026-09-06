@@ -330,7 +330,7 @@ protocol-specific golden tests only for encoding and state-machine behavior.
   `--listen` for data on `127.0.0.1:7654` and moving operator and browser routes
   to the optional loopback administration listener on `127.0.0.1:7655`
   (issue #52); see [the listener contract](docs/HTTP_LISTENERS.md).
-- [ ] Add endpoints for health, readiness, catalog inspection, migrations,
+- [x] Add endpoints for health, readiness, catalog inspection, migrations,
   shard state, query cancellation, backup, and maintenance.
 - [ ] Add request IDs, idempotency keys for eligible writes, pagination/streaming,
   body/result limits, and stable problem-detail errors.

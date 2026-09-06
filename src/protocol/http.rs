@@ -16,15 +16,16 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as STANDARD_BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use v1::{
-    BroadcastRequest, RawJsonParameter, SqlRequest as QueryRequest, SqlRequest as RoutedSqlRequest,
-    V1Json, ValueEncoding,
+    BroadcastRequest, EmptyRequest, RawJsonParameter, SqlRequest as QueryRequest,
+    SqlRequest as RoutedSqlRequest, TransportError, V1EmptyBody, V1Json, V1Path, ValueEncoding,
 };
 
 use crate::{
     core::{
-        DataType, Database, Decimal, Engine, EngineError, EngineErrorKind, Executed, GeneratedKey,
-        GlobalIndexHealthState, GlobalIndexLifecycle, GlobalIndexOperationalReport,
-        GlobalIndexOperationalStatus, ResultSet, Routed, Statement, Value,
+        DataType, Database, Decimal, Engine, EngineError, EngineErrorKind, EngineState, Executed,
+        GeneratedIdPolicy, GeneratedKey, GlobalIndexHealthState, GlobalIndexLifecycle,
+        GlobalIndexOperationalReport, GlobalIndexOperationalStatus, RequestContext, ResultSet,
+        Routed, SchemaMigrationStatus, SchemaState, ShardKeyType, Statement, TablePlacement, Value,
     },
     protocol::error::http_error,
 };
@@ -48,6 +49,7 @@ pub fn router_with_engine(engine: Engine) -> Router {
     let state = HttpState::new(engine);
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/metrics", get(metrics))
         .merge(v1::routes())
         .merge(admin::routes(state.clone()))
@@ -55,6 +57,12 @@ pub fn router_with_engine(engine: Engine) -> Router {
 }
 
 /// Build the data-plane router from the legacy synchronous database handle.
+///
+/// This compatibility wrapper constructs a new [`Engine`] for this router. A
+/// host serving separate data and administration planes must construct one
+/// Engine and pass clones to [`data_router_with_engine`] and
+/// [`admin_router_with_engine`] so lifecycle and active-query cancellation are
+/// shared across both routers.
 pub fn data_router(database: Arc<Database>) -> Router {
     data_router_with_engine(Engine::from_database(database))
 }
@@ -69,6 +77,11 @@ pub fn data_router_with_engine(engine: Engine) -> Router {
 }
 
 /// Build the admin-plane router from the legacy synchronous database handle.
+///
+/// This compatibility wrapper constructs a new [`Engine`] for this router. A
+/// separately constructed [`data_router`] has an independent lifecycle and
+/// active-query registry. Use the two Engine-based constructors with clones of
+/// one Engine when the routers form one service.
 pub fn admin_router(database: Arc<Database>) -> Router {
     admin_router_with_engine(Engine::from_database(database))
 }
@@ -81,6 +94,7 @@ pub fn admin_router_with_engine(engine: Engine) -> Router {
     let state = HttpState::new(engine);
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/metrics", get(metrics))
         .merge(v1::admin_routes())
         .merge(admin::routes(state.clone()))
@@ -141,6 +155,61 @@ async fn health(State(state): State<HttpState>) -> Result<Json<JsonValue>, ApiEr
     })))
 }
 
+#[derive(Debug, Serialize)]
+struct ReadinessResponse {
+    status: &'static str,
+    ready: bool,
+    reasons: Vec<&'static str>,
+    engine_state: &'static str,
+    schema_state: &'static str,
+    schema_generation: String,
+    active_schema_operations: usize,
+}
+
+async fn ready(State(state): State<HttpState>) -> Response {
+    let readiness = state.engine.readiness();
+    let engine_state = readiness.lifecycle_state();
+    let schema_state = readiness.schema_state();
+    let mut reasons = Vec::new();
+    #[allow(unreachable_patterns)]
+    match engine_state {
+        EngineState::Running => {}
+        EngineState::Draining => reasons.push("engine_draining"),
+        EngineState::Stopped => reasons.push("engine_stopped"),
+        _ => reasons.push("engine_state_unknown"),
+    }
+    #[allow(unreachable_patterns)]
+    match schema_state {
+        SchemaState::Ready => {}
+        SchemaState::Migrating => reasons.push("schema_migrating"),
+        SchemaState::Pending => reasons.push("schema_recovery_pending"),
+        SchemaState::Degraded => reasons.push("schema_degraded"),
+        _ => reasons.push("schema_state_unknown"),
+    }
+    if !readiness.ready() && reasons.is_empty() {
+        reasons.push("readiness_unavailable");
+    }
+    let ready = readiness.ready();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(ReadinessResponse {
+            status: if ready { "ready" } else { "not_ready" },
+            ready,
+            reasons,
+            engine_state: engine_state.code(),
+            schema_state: schema_state.code(),
+            schema_generation: readiness.schema_generation().to_string(),
+            active_schema_operations: readiness.active_schema_operations(),
+        }),
+    )
+        .into_response()
+}
+
 async fn metrics(State(state): State<HttpState>) -> Result<Response, ApiError> {
     let report = state.engine.global_index_operational_report().await?;
     let mut response = prometheus_metrics(&report).into_response();
@@ -149,6 +218,414 @@ async fn metrics(State(state): State<HttpState>) -> Result<Response, ApiError> {
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
     Ok(response)
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogResponse {
+    identifier_encoding_version: u32,
+    schema_generation: String,
+    default_database_id: String,
+    databases: Vec<CatalogDb>,
+    tables: Vec<CatalogTable>,
+    global_indexes: Vec<CatalogGlobalIndex>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogDb {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogTable {
+    id: String,
+    database_id: String,
+    name: String,
+    placement: CatalogPlacement,
+    generated_id: CatalogGeneratedId,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogPlacement {
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shard_key: Option<CatalogShardKey>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogShardKey {
+    column: String,
+    data_type: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogGeneratedId {
+    policy: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    column: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_version: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogGlobalIndex {
+    id: String,
+    table_id: String,
+    name: String,
+    unique: bool,
+    lifecycle: &'static str,
+    schema_generation: String,
+    key_encoding_version: u32,
+}
+
+async fn catalog(State(state): State<HttpState>) -> Json<CatalogResponse> {
+    let catalog = state.engine.catalog();
+    let databases = catalog
+        .logical_databases()
+        .iter()
+        .map(|database| CatalogDb {
+            id: database.id().to_string(),
+            name: database.name().to_owned(),
+        })
+        .collect();
+    let tables = catalog
+        .tables()
+        .iter()
+        .map(|table| CatalogTable {
+            id: table.id().to_string(),
+            database_id: table.database_id().to_string(),
+            name: table.name().to_owned(),
+            placement: catalog_placement(table.placement()),
+            generated_id: catalog_generated_id(table.generated_id_policy()),
+        })
+        .collect();
+    let global_indexes = catalog
+        .global_indexes()
+        .iter()
+        .map(|index| CatalogGlobalIndex {
+            id: index.id().to_string(),
+            table_id: index.table_id().to_string(),
+            name: index.name().to_owned(),
+            unique: index.is_unique(),
+            lifecycle: lifecycle_status(index.lifecycle()).0,
+            schema_generation: index.schema_generation().to_string(),
+            key_encoding_version: index.key_encoding_version(),
+        })
+        .collect();
+    Json(CatalogResponse {
+        identifier_encoding_version: catalog.identifier_encoding_version(),
+        schema_generation: catalog.schema_generation().to_string(),
+        default_database_id: catalog.default_database().id().to_string(),
+        databases,
+        tables,
+        global_indexes,
+    })
+}
+
+#[allow(unreachable_patterns)]
+fn catalog_placement(placement: &TablePlacement) -> CatalogPlacement {
+    match placement {
+        TablePlacement::Sharded(shard_key) => CatalogPlacement {
+            kind: "sharded",
+            shard_key: Some(CatalogShardKey {
+                column: shard_key.column().to_owned(),
+                data_type: shard_key_type_name(shard_key.key_type()),
+            }),
+        },
+        TablePlacement::Global => CatalogPlacement {
+            kind: "global",
+            shard_key: None,
+        },
+        TablePlacement::Catalog => CatalogPlacement {
+            kind: "catalog",
+            shard_key: None,
+        },
+        _ => CatalogPlacement {
+            kind: "unknown",
+            shard_key: None,
+        },
+    }
+}
+
+#[allow(unreachable_patterns)]
+const fn shard_key_type_name(key_type: ShardKeyType) -> &'static str {
+    match key_type {
+        ShardKeyType::Int64 => "int64",
+        ShardKeyType::Text => "text",
+        ShardKeyType::Binary => "binary",
+        _ => "unknown",
+    }
+}
+
+#[allow(unreachable_patterns)]
+fn catalog_generated_id(policy: &GeneratedIdPolicy) -> CatalogGeneratedId {
+    let policy_name = match policy {
+        GeneratedIdPolicy::None => "none",
+        GeneratedIdPolicy::NativeRangeV1 { .. } => "native_range_v1",
+        GeneratedIdPolicy::HiloV1 { .. } => "hilo_v1",
+        _ => "unknown",
+    };
+    CatalogGeneratedId {
+        policy: policy_name,
+        column: policy.column().map(ToOwned::to_owned),
+        encoding_version: policy.encoding_version(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MigrationsResponse {
+    schema_generation: String,
+    active: Option<MigrationResponse>,
+    latest_complete: Option<MigrationResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct MigrationResponse {
+    generation: String,
+    source_generation: String,
+    target_generation: String,
+    state: &'static str,
+    shard_count: u16,
+    next_shard: u16,
+    completed_shards: u16,
+    sql_bytes: usize,
+}
+
+async fn migrations(State(state): State<HttpState>) -> Result<Json<MigrationsResponse>, ApiError> {
+    let summary = state
+        .engine
+        .migration_summary_with_context(RequestContext::new())
+        .await?;
+    Ok(Json(MigrationsResponse {
+        schema_generation: summary.schema_generation().to_string(),
+        active: summary.active().map(migration_response),
+        latest_complete: summary.latest_complete().map(migration_response),
+    }))
+}
+
+async fn migration(
+    State(state): State<HttpState>,
+    V1Path(raw_generation): V1Path<String>,
+) -> Result<Response, ApiError> {
+    let Some(generation) = parse_canonical_generation(&raw_generation) else {
+        return Ok(TransportError::NotFound.into_response());
+    };
+    let migration = state
+        .engine
+        .migration_with_context(generation, RequestContext::new())
+        .await?;
+    Ok(match migration {
+        Some(migration) => Json(migration_response(migration)).into_response(),
+        None => TransportError::NotFound.into_response(),
+    })
+}
+
+fn migration_response(migration: SchemaMigrationStatus) -> MigrationResponse {
+    MigrationResponse {
+        generation: migration.generation().to_string(),
+        source_generation: migration.source_generation().to_string(),
+        target_generation: migration.target_generation().to_string(),
+        state: migration.state().code(),
+        shard_count: migration.shard_count(),
+        next_shard: migration.next_shard(),
+        completed_shards: migration.completed_shards(),
+        sql_bytes: migration.sql_bytes(),
+    }
+}
+
+fn parse_canonical_generation(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+}
+
+#[derive(Debug, Serialize)]
+struct ShardStatusResponse {
+    schema_generation: String,
+    shards: Vec<ShardStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct ShardStatus {
+    id: u16,
+    state: &'static str,
+}
+
+async fn shard_status(
+    State(state): State<HttpState>,
+) -> Result<Json<ShardStatusResponse>, ApiError> {
+    let report = state
+        .engine
+        .shard_status_with_context(RequestContext::new())
+        .await?;
+    let shards = report
+        .shards()
+        .iter()
+        .map(|shard| ShardStatus {
+            id: shard.shard_id(),
+            state: shard.state().code(),
+        })
+        .collect();
+    Ok(Json(ShardStatusResponse {
+        schema_generation: report.schema_generation().to_string(),
+        shards,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct ActiveQueriesResponse {
+    queries: Vec<ActiveQueryResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActiveQueryResponse {
+    operation_id: String,
+    elapsed_ms: u64,
+    sql_bytes: usize,
+    cancellation_requested: bool,
+}
+
+async fn active_queries(State(state): State<HttpState>) -> Json<ActiveQueriesResponse> {
+    let mut queries = state
+        .engine
+        .active_queries()
+        .into_iter()
+        .map(|query| ActiveQueryResponse {
+            operation_id: query.id().to_string(),
+            elapsed_ms: query.elapsed_ms(),
+            sql_bytes: query.sql_bytes(),
+            cancellation_requested: query.cancellation_requested(),
+        })
+        .collect::<Vec<_>>();
+    queries.sort_unstable_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    Json(ActiveQueriesResponse { queries })
+}
+
+#[derive(Debug, Serialize)]
+struct CancelQueryResponse {
+    operation_id: String,
+    newly_requested: bool,
+}
+
+async fn cancel_query(
+    State(state): State<HttpState>,
+    V1Path(raw_query_id): V1Path<String>,
+    _body: V1EmptyBody,
+) -> Response {
+    let Ok(query_id) = raw_query_id.parse() else {
+        return TransportError::NotFound.into_response();
+    };
+    match state.engine.cancel_query(query_id) {
+        Some(newly_requested) => (
+            StatusCode::ACCEPTED,
+            Json(CancelQueryResponse {
+                operation_id: query_id.to_string(),
+                newly_requested,
+            }),
+        )
+            .into_response(),
+        None => TransportError::NotFound.into_response(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BackupCapabilityResponse {
+    mode: &'static str,
+    online: bool,
+    requires_all_processes_stopped: bool,
+    checkpoint_endpoint: &'static str,
+    checkpoint_role: &'static str,
+    checkpoint_is_recovery_point: bool,
+}
+
+async fn backup_capability() -> Json<BackupCapabilityResponse> {
+    Json(BackupCapabilityResponse {
+        mode: "stopped_directory_copy",
+        online: false,
+        requires_all_processes_stopped: true,
+        checkpoint_endpoint: "/v1/admin/maintenance/checkpoint",
+        checkpoint_role: "preparation_only",
+        checkpoint_is_recovery_point: false,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct CheckpointResponse {
+    operation: &'static str,
+    busy: bool,
+    complete: bool,
+    recovery_point: bool,
+    shards: Vec<CheckpointShardResponse>,
+    databases: Vec<CheckpointDbResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckpointShardResponse {
+    shard: u16,
+    busy: bool,
+    counts_available: bool,
+    wal_frames: u64,
+    checkpointed_frames: u64,
+    complete: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckpointDbResponse {
+    database: &'static str,
+    busy: bool,
+    counts_available: bool,
+    wal_frames: u64,
+    checkpointed_frames: u64,
+    complete: bool,
+}
+
+async fn checkpoint(
+    State(state): State<HttpState>,
+    V1Json(_request): V1Json<EmptyRequest>,
+) -> Result<Json<CheckpointResponse>, ApiError> {
+    let report = state
+        .engine
+        .checkpoint_with_context(RequestContext::new())
+        .await?;
+    let shards = report
+        .shards()
+        .iter()
+        .map(|shard| CheckpointShardResponse {
+            shard: shard.shard(),
+            busy: shard.busy(),
+            counts_available: shard.counts_available(),
+            wal_frames: shard.wal_frames(),
+            checkpointed_frames: shard.checkpointed_frames(),
+            complete: shard.complete(),
+        })
+        .collect();
+    let databases = report
+        .databases()
+        .iter()
+        .map(|database| CheckpointDbResponse {
+            database: database.database().code(),
+            busy: database.busy(),
+            counts_available: database.counts_available(),
+            wal_frames: database.wal_frames(),
+            checkpointed_frames: database.checkpointed_frames(),
+            complete: database.complete(),
+        })
+        .collect();
+    Ok(Json(CheckpointResponse {
+        operation: "passive_checkpoint",
+        busy: report.busy(),
+        complete: report.complete(),
+        recovery_point: false,
+        shards,
+        databases,
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -289,12 +766,15 @@ async fn query(
             session.set_routing_key(shard_key).await?;
         }
     }
+    let tracked_query = engine.begin_tracked_query(&request.sql)?;
+    let context = tracked_query.request_context();
     let Executed {
         shards,
         value: result,
     } = engine
-        .query_logical(&session, Statement::new(request.sql, params))
+        .query_logical_with_context(&session, Statement::new(request.sql, params), context)
         .await?;
+    drop(tracked_query);
     let response = result_set_to_query_response(shards, result, value_encoding);
 
     Ok(Json(response))
@@ -306,7 +786,7 @@ async fn broadcast(
 ) -> Result<Json<JsonValue>, ApiError> {
     let engine = state.engine;
     let session = engine.session();
-    let shards = engine.broadcast(&session, request.sql).await?;
+    let shards = engine.migrate(&session, request.sql).await?;
     Ok(Json(json!({"completed_shards": shards})))
 }
 
@@ -1051,6 +1531,32 @@ mod tests {
 
         let engine = Engine::from_database(Arc::new(database));
         let application = router_with_engine(engine.clone());
+        let catalog_index = engine
+            .catalog()
+            .global_indexes()
+            .iter()
+            .find(|index| index.id() == index_id)
+            .unwrap();
+        let (_, catalog) = request_json(&application, Method::GET, "/v1/admin/catalog", None).await;
+        let definition = &catalog["global_indexes"][0];
+        assert_eq!(catalog["global_indexes"].as_array().unwrap().len(), 1);
+        assert_eq!(definition.as_object().unwrap().len(), 7);
+        assert_eq!(
+            definition,
+            &json!({
+                "id": index_id.to_string(),
+                "table_id": table.to_string(),
+                "name": "events_email_lookup",
+                "unique": false,
+                "lifecycle": "ready",
+                "schema_generation": catalog_index.schema_generation().to_string(),
+                "key_encoding_version": catalog_index.key_encoding_version()
+            })
+        );
+        for withheld in ["key_sql", "predicate", "predicate_sql", "sql"] {
+            assert!(definition.get(withheld).is_none());
+        }
+
         assert_eq!(
             request_json(&application, Method::GET, "/v1/admin/global-indexes", None,).await,
             (

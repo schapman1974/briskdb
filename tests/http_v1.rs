@@ -1,6 +1,6 @@
 #![cfg(feature = "http")]
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -36,7 +36,7 @@ fn application() -> (tempfile::TempDir, Engine, Router) {
     (temp, engine, router)
 }
 
-fn scatter_application() -> (tempfile::TempDir, Router, [String; 2]) {
+fn scatter_application() -> (tempfile::TempDir, Engine, Router, [String; 2]) {
     let temp = tempfile::tempdir().unwrap();
     let mut database = Database::open(temp.path(), 2).unwrap();
     database
@@ -83,8 +83,9 @@ fn scatter_application() -> (tempfile::TempDir, Router, [String; 2]) {
         assert_eq!(inserted.shard, shard);
         assert_eq!(inserted.value, 1);
     }
-    let router = briskdb::api::router(Arc::new(database));
-    (temp, router, tenant_keys)
+    let engine = Engine::from_database(Arc::new(database));
+    let router = briskdb::api::router_with_engine(engine.clone());
+    (temp, engine, router, tenant_keys)
 }
 
 async fn request(
@@ -133,6 +134,25 @@ fn tagged(tag: &str, value: &str) -> Value {
     json!({"$briskdb_type": tag, "value": value})
 }
 
+async fn wait_for_active_query_count(app: &Router, expected: usize) -> Vec<Value> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (status, headers, body) =
+                request(app, Method::GET, "/v1/admin/queries", None, Body::empty()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(headers["briskdb-api-version"], "1");
+            let body = serde_json::from_slice::<Value>(&body).unwrap();
+            let queries = body["queries"].as_array().unwrap();
+            if queries.len() == expected {
+                return queries.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("active-query registry should reach the expected size")
+}
+
 #[tokio::test]
 async fn discovery_health_alias_and_head_identify_the_contract() {
     let (_temp, _engine, app) = application();
@@ -162,6 +182,425 @@ async fn discovery_health_alias_and_head_identify_the_contract() {
     assert_eq!(versioned.1["briskdb-api-version"], "1");
     assert_eq!(versioned.2, legacy.2);
     assert!(!legacy.1.contains_key("briskdb-api-version"));
+}
+
+#[tokio::test]
+async fn readiness_has_one_exact_versioned_and_unversioned_probe_shape() {
+    let (_temp, engine, app) = application();
+    let expected = json!({
+        "status": "ready",
+        "ready": true,
+        "reasons": [],
+        "engine_state": "running",
+        "schema_state": "ready",
+        "schema_generation": engine.catalog().schema_generation().to_string(),
+        "active_schema_operations": 0
+    });
+
+    let versioned = request(&app, Method::GET, "/v1/ready", None, Body::empty()).await;
+    let unversioned = request(&app, Method::GET, "/ready", None, Body::empty()).await;
+    assert_eq!(versioned.0, StatusCode::OK);
+    assert_eq!(versioned.1["briskdb-api-version"], "1");
+    assert_eq!(versioned.1["content-type"], "application/json");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&versioned.2).unwrap(),
+        expected
+    );
+    assert_eq!(unversioned.0, StatusCode::OK);
+    assert!(!unversioned.1.contains_key("briskdb-api-version"));
+    assert_eq!(unversioned.2, versioned.2);
+
+    let head = request(&app, Method::HEAD, "/v1/ready", None, Body::empty()).await;
+    assert_eq!(head.0, StatusCode::OK);
+    assert_eq!(head.1["briskdb-api-version"], "1");
+    assert!(head.2.is_empty());
+
+    assert_eq!(
+        engine.begin_shutdown(),
+        briskdb::core::EngineState::Draining
+    );
+    let unavailable = request(&app, Method::GET, "/v1/ready", None, Body::empty()).await;
+    assert_eq!(unavailable.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(unavailable.1["briskdb-api-version"], "1");
+    assert_eq!(unavailable.1["content-type"], "application/json");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&unavailable.2).unwrap(),
+        json!({
+            "status": "not_ready",
+            "ready": false,
+            "reasons": ["engine_draining"],
+            "engine_state": "draining",
+            "schema_state": "ready",
+            "schema_generation": engine.catalog().schema_generation().to_string(),
+            "active_schema_operations": 0
+        })
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn relational_catalog_preserves_ids_order_and_placement_without_physical_details() {
+    let (_temp, engine, app, _tenant_keys) = scatter_application();
+    let (status, headers, body) =
+        request(&app, Method::GET, "/v1/admin/catalog", None, Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["briskdb-api-version"], "1");
+    assert_eq!(headers["content-type"], "application/json");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({
+            "identifier_encoding_version": 1,
+            "schema_generation": engine.catalog().schema_generation().to_string(),
+            "default_database_id": "1",
+            "databases": [{"id":"1", "name":"default"}],
+            "tables": [{
+                "id": "1",
+                "database_id": "1",
+                "name": "events",
+                "placement": {
+                    "kind": "sharded",
+                    "shard_key": {"column":"tenant_key", "data_type":"text"}
+                },
+                "generated_id": {"policy":"none"}
+            }],
+            "global_indexes": []
+        })
+    );
+    let rendered = String::from_utf8(body).unwrap();
+    for forbidden in [
+        "manifest.sqlite",
+        "shard-",
+        "CREATE TABLE",
+        "private-sentinel",
+    ] {
+        assert!(!rendered.contains(forbidden));
+    }
+}
+
+#[tokio::test]
+async fn operational_reports_are_bounded_redacted_and_checkpoint_input_is_strict() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = Arc::new(Database::open(temp.path(), 2).unwrap());
+    let engine = Engine::from_database(database);
+    let app = briskdb::api::router_with_engine(engine.clone());
+
+    let (status, _, body) = request(
+        &app,
+        Method::GET,
+        "/v1/admin/migrations",
+        None,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"schema_generation":"0", "active":null, "latest_complete":null})
+    );
+
+    let migration_sql = "CREATE TABLE private_sentinel_items (id INTEGER PRIMARY KEY)";
+    let (status, _, body) = request(
+        &app,
+        Method::POST,
+        "/v1/admin/broadcast",
+        Some("application/json"),
+        serde_json::to_vec(&json!({"sql":migration_sql})).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"completed_shards":[0, 1]})
+    );
+
+    let (status, headers, body) = request(
+        &app,
+        Method::GET,
+        "/v1/admin/migrations",
+        None,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["briskdb-api-version"], "1");
+    let summary = serde_json::from_slice::<Value>(&body).unwrap();
+    assert_eq!(summary["schema_generation"], "1");
+    assert!(summary["active"].is_null());
+    let completed = summary["latest_complete"].clone();
+    assert_eq!(completed["generation"], "1");
+    assert_eq!(completed["source_generation"], "0");
+    assert_eq!(completed["target_generation"], "1");
+    assert_eq!(completed["state"], "complete");
+    assert_eq!(completed["shard_count"], 2);
+    assert_eq!(completed["next_shard"], 2);
+    assert_eq!(completed["completed_shards"], 2);
+    assert_eq!(completed["sql_bytes"], migration_sql.len());
+    assert_eq!(completed.as_object().unwrap().len(), 8);
+    assert!(completed.get("id").is_none());
+    assert!(completed.get("digest").is_none());
+    assert!(!String::from_utf8(body).unwrap().contains(migration_sql));
+
+    let (status, _, body) = request(
+        &app,
+        Method::GET,
+        "/v1/admin/migrations/1",
+        None,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), completed);
+    for generation in [
+        "0",
+        "01",
+        "-1",
+        "2",
+        "18446744073709551616",
+        "private-sentinel",
+    ] {
+        assert_problem(
+            request(
+                &app,
+                Method::GET,
+                &format!("/v1/admin/migrations/{generation}"),
+                None,
+                Body::empty(),
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+            "not_found",
+        );
+    }
+
+    let (status, _, body) =
+        request(&app, Method::GET, "/v1/admin/shards", None, Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({
+            "schema_generation": "1",
+            "shards": [{"id":0,"state":"ready"},{"id":1,"state":"ready"}]
+        })
+    );
+
+    let (status, _, body) =
+        request(&app, Method::GET, "/v1/admin/backup", None, Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({
+            "mode": "stopped_directory_copy",
+            "online": false,
+            "requires_all_processes_stopped": true,
+            "checkpoint_endpoint": "/v1/admin/maintenance/checkpoint",
+            "checkpoint_role": "preparation_only",
+            "checkpoint_is_recovery_point": false
+        })
+    );
+
+    let (status, headers, body) = request(
+        &app,
+        Method::POST,
+        "/v1/admin/maintenance/checkpoint",
+        Some("application/json"),
+        "{}",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["briskdb-api-version"], "1");
+    let checkpoint = serde_json::from_slice::<Value>(&body).unwrap();
+    assert_eq!(checkpoint["operation"], "passive_checkpoint");
+    assert_eq!(checkpoint["busy"], false);
+    assert_eq!(checkpoint["complete"], true);
+    assert_eq!(checkpoint["recovery_point"], false);
+    assert_eq!(checkpoint["shards"].as_array().unwrap().len(), 2);
+    assert_eq!(checkpoint["shards"][0]["shard"], 0);
+    assert_eq!(checkpoint["shards"][1]["shard"], 1);
+    assert_eq!(checkpoint["databases"].as_array().unwrap().len(), 1);
+    assert_eq!(checkpoint["databases"][0]["database"], "manifest");
+    for row in checkpoint["shards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(checkpoint["databases"].as_array().unwrap())
+    {
+        assert_eq!(row.as_object().unwrap().len(), 6);
+        assert!(row["busy"].is_boolean());
+        assert!(row["counts_available"].is_boolean());
+        assert!(row["wal_frames"].is_u64());
+        assert!(row["checkpointed_frames"].is_u64());
+        assert!(row["complete"].is_boolean());
+    }
+
+    for uri in [
+        "/v1/admin/catalog",
+        "/v1/admin/migrations",
+        "/v1/admin/migrations/1",
+        "/v1/admin/shards",
+        "/v1/admin/queries",
+        "/v1/admin/backup",
+    ] {
+        let (status, headers, body) = request(&app, Method::HEAD, uri, None, Body::empty()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(headers["briskdb-api-version"], "1", "{uri}");
+        assert!(body.is_empty(), "{uri}");
+    }
+
+    for body in ["", "[]", "null", r#"{"private-sentinel":true}"#] {
+        assert_problem(
+            request(
+                &app,
+                Method::POST,
+                "/v1/admin/maintenance/checkpoint",
+                Some("application/json"),
+                body,
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+        );
+    }
+    assert_problem(
+        request(
+            &app,
+            Method::POST,
+            "/v1/admin/maintenance/checkpoint",
+            None,
+            "{}",
+        )
+        .await,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "unsupported_media_type",
+    );
+}
+
+#[tokio::test]
+async fn active_query_handles_cancel_exact_work_and_disappear_after_cleanup() {
+    let (_temp, _engine, app) = application();
+    let sql = "WITH RECURSIVE numbers(value) AS (VALUES(0) UNION ALL SELECT value + 1 FROM numbers WHERE value < 1000000000) SELECT sum(value) FROM numbers";
+    let query_app = app.clone();
+    let query_body = serde_json::to_vec(&json!({"shard_key":"cancel-owner", "sql":sql})).unwrap();
+    let query = tokio::spawn(async move {
+        request(
+            &query_app,
+            Method::POST,
+            "/v1/query",
+            Some("application/json"),
+            query_body,
+        )
+        .await
+    });
+
+    let active = wait_for_active_query_count(&app, 1).await;
+    let query_status = active[0].as_object().unwrap();
+    assert_eq!(query_status.len(), 4);
+    let operation_id = query_status["operation_id"].as_str().unwrap().to_owned();
+    assert_eq!(operation_id.len(), 32);
+    assert!(
+        operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    assert!(query_status["elapsed_ms"].is_u64());
+    assert_eq!(query_status["sql_bytes"], sql.len());
+    assert_eq!(query_status["cancellation_requested"], false);
+    let rendered = serde_json::to_string(&active).unwrap();
+    assert!(!rendered.contains("WITH RECURSIVE"));
+    assert!(!rendered.contains("sql_digest"));
+
+    assert_problem(
+        request(
+            &app,
+            Method::POST,
+            &format!("/v1/admin/queries/{operation_id}/cancel"),
+            None,
+            "private-sentinel",
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "invalid_argument",
+    );
+    let still_active = wait_for_active_query_count(&app, 1).await;
+    assert_eq!(still_active[0]["operation_id"], operation_id);
+    assert_eq!(still_active[0]["cancellation_requested"], false);
+
+    let oversized_cancel_body = "private-sentinel".repeat(150_000);
+    assert_problem(
+        request(
+            &app,
+            Method::POST,
+            &format!("/v1/admin/queries/{operation_id}/cancel"),
+            None,
+            oversized_cancel_body,
+        )
+        .await,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "request_too_large",
+    );
+    let still_active = wait_for_active_query_count(&app, 1).await;
+    assert_eq!(still_active[0]["operation_id"], operation_id);
+    assert_eq!(still_active[0]["cancellation_requested"], false);
+
+    let cancellation = request(
+        &app,
+        Method::POST,
+        &format!("/v1/admin/queries/{operation_id}/cancel"),
+        None,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(cancellation.0, StatusCode::ACCEPTED);
+    assert_eq!(cancellation.1["briskdb-api-version"], "1");
+    assert_eq!(cancellation.1["content-type"], "application/json");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&cancellation.2).unwrap(),
+        json!({"operation_id":operation_id, "newly_requested":true})
+    );
+
+    let query_response = tokio::time::timeout(Duration::from_secs(5), query)
+        .await
+        .expect("the cancelled query should stop promptly")
+        .unwrap();
+    assert_problem(
+        query_response,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "cancelled",
+    );
+    assert!(wait_for_active_query_count(&app, 0).await.is_empty());
+
+    for stale_or_invalid in [
+        operation_id.as_str(),
+        "00000000000000000000000000000000",
+        "0123456789ABCDEF0123456789ABCDEF",
+        "private-sentinel",
+    ] {
+        assert_problem(
+            request(
+                &app,
+                Method::POST,
+                &format!("/v1/admin/queries/{stale_or_invalid}/cancel"),
+                None,
+                Body::empty(),
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+            "not_found",
+        );
+    }
+
+    let (status, _, body) = request(
+        &app,
+        Method::POST,
+        "/v1/query",
+        Some("application/json"),
+        r#"{"shard_key":"cancel-owner","sql":"SELECT 1 AS value"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["rows"],
+        json!([[1]])
+    );
 }
 
 #[tokio::test]
@@ -358,7 +797,7 @@ async fn invalid_lossless_tags_and_encoding_selection_fail_before_mutation() {
 
 #[tokio::test]
 async fn lossless_scatter_keeps_shard_row_and_duplicate_column_order() {
-    let (_temp, app, tenant_keys) = scatter_application();
+    let (_temp, _engine, app, tenant_keys) = scatter_application();
     let query = json!({
         "sql": "SELECT tenant_key AS duplicate, ordinal AS duplicate, payload AS \"\" FROM events",
         "value_encoding": "lossless-json-v1"
@@ -487,6 +926,19 @@ async fn transport_rejections_have_redacted_versioned_problems_and_allow_headers
         ("/v1/query", Method::GET, "POST"),
         ("/v1/admin/broadcast", Method::PUT, "POST"),
         ("/v1/admin/global-indexes", Method::POST, "GET,HEAD"),
+        ("/v1/ready", Method::POST, "GET,HEAD"),
+        ("/v1/admin/catalog", Method::POST, "GET,HEAD"),
+        ("/v1/admin/migrations", Method::POST, "GET,HEAD"),
+        ("/v1/admin/migrations/1", Method::POST, "GET,HEAD"),
+        ("/v1/admin/shards", Method::POST, "GET,HEAD"),
+        ("/v1/admin/queries", Method::POST, "GET,HEAD"),
+        (
+            "/v1/admin/queries/0123456789abcdef0123456789abcdef/cancel",
+            Method::GET,
+            "POST",
+        ),
+        ("/v1/admin/backup", Method::POST, "GET,HEAD"),
+        ("/v1/admin/maintenance/checkpoint", Method::GET, "POST"),
         ("/v1", Method::POST, "GET,HEAD"),
     ] {
         let response = request(&app, method, uri, None, Body::empty()).await;
@@ -518,7 +970,12 @@ async fn transport_rejections_have_redacted_versioned_problems_and_allow_headers
 async fn oversized_json_is_rejected_and_later_requests_still_work() {
     let (_temp, _engine, app) = application();
     let oversized = json!({"sql": "private-sentinel".repeat(150_000)}).to_string();
-    for uri in ["/v1/query", "/v1/execute", "/v1/admin/broadcast"] {
+    for uri in [
+        "/v1/query",
+        "/v1/execute",
+        "/v1/admin/broadcast",
+        "/v1/admin/maintenance/checkpoint",
+    ] {
         assert_problem(
             request(
                 &app,

@@ -278,6 +278,19 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _request_context: core::RequestContext = core::RequestContext::new();
     let _cancellation_token: core::CancellationToken = core::CancellationToken::new();
     let _running = core::EngineState::Running;
+    let _schema_ready = core::SchemaState::Ready;
+    let _shard_ready = core::ShardState::Ready;
+    let _migration_complete = core::SchemaMigrationState::Complete;
+    let _query_id: Option<core::QueryId> = None;
+    let _query_id_error: Option<core::ParseQueryIdError> = None;
+    let _tracked_query: Option<core::TrackedQuery> = None;
+    let _active_query: Option<core::ActiveQueryStatus> = None;
+    let _readiness: Option<core::ReadinessSnapshot> = None;
+    let _shard_status: Option<core::ShardStatus> = None;
+    let _shard_report: Option<core::ShardStatusReport> = None;
+    let _migration_status: Option<core::SchemaMigrationStatus> = None;
+    let _migration_summary: Option<core::SchemaMigrationSummary> = None;
+    assert_eq!(core::MAX_ACTIVE_QUERIES, 1_024);
     let _shutdown_report: Option<core::ShutdownReport> = None;
     let _session: Option<core::Session> = None;
     let _ready = core::SessionState::Ready;
@@ -351,6 +364,68 @@ fn legacy_and_explicit_module_paths_are_both_available() {
         error::mysql_error(core::EngineErrorKind::UniqueViolation).error_number,
         1062
     );
+}
+
+#[tokio::test]
+async fn operational_engine_api_is_public_shared_bounded_and_redacted() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = core::Engine::open(temp.path(), 2).await.unwrap();
+
+    let readiness: core::ReadinessSnapshot = engine.readiness();
+    assert!(readiness.ready());
+    assert_eq!(readiness.lifecycle_state().code(), "running");
+    assert_eq!(readiness.schema_state(), core::SchemaState::Ready);
+    assert_eq!(readiness.schema_generation(), 0);
+
+    let tracked: core::TrackedQuery = engine
+        .begin_tracked_query("SELECT private_public_api_sentinel")
+        .unwrap();
+    let query_id: core::QueryId = tracked.id().to_string().parse().unwrap();
+    assert_eq!(query_id, tracked.id());
+    let invalid: core::ParseQueryIdError = "INVALID".parse::<core::QueryId>().unwrap_err();
+    assert!(invalid.to_string().contains("lowercase hexadecimal"));
+    let active: Vec<core::ActiveQueryStatus> = engine.active_queries();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id(), query_id);
+    assert_eq!(active[0].sql_bytes(), 34);
+    assert!(!format!("{active:?}").contains("private_public_api_sentinel"));
+    assert_eq!(engine.cancel_query(query_id), Some(true));
+    assert!(tracked.cancellation_token().is_cancelled());
+    drop(tracked);
+    assert!(engine.active_queries().is_empty());
+    assert_eq!(engine.cancel_query(query_id), None);
+
+    let shards: core::ShardStatusReport = engine.shard_status().await.unwrap();
+    assert_eq!(shards.schema_generation(), 0);
+    assert_eq!(shards.shards().len(), 2);
+    assert!(
+        shards
+            .shards()
+            .iter()
+            .all(|shard: &core::ShardStatus| shard.state().code() == "ready")
+    );
+
+    let session = engine.session();
+    let sql = "CREATE TABLE public_operational_marker (id INTEGER PRIMARY KEY)";
+    assert_eq!(
+        engine.migrate(&session, sql.to_owned()).await.unwrap(),
+        [0, 1]
+    );
+    let summary: core::SchemaMigrationSummary = engine.migration_summary().await.unwrap();
+    assert_eq!(summary.schema_generation(), 1);
+    assert_eq!(summary.active(), None);
+    let completed: core::SchemaMigrationStatus = summary.latest_complete().unwrap();
+    assert_eq!(completed.generation(), 1);
+    assert_eq!(completed.source_generation(), 0);
+    assert_eq!(completed.target_generation(), 1);
+    assert_eq!(completed.state().code(), "complete");
+    assert_eq!(completed.completed_shards(), 2);
+    assert_eq!(completed.sql_bytes(), sql.len());
+    assert_eq!(engine.migration(1).await.unwrap(), Some(completed));
+    assert_eq!(engine.migration(2).await.unwrap(), None);
+
+    engine.shutdown().await.unwrap();
+    assert_eq!(engine.readiness().lifecycle_state().code(), "stopped");
 }
 
 #[test]

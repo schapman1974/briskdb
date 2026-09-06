@@ -18,6 +18,18 @@ addresses. Equal nonzero data/admin socket addresses are rejected as a
 configuration error; port zero may be requested for both because the operating
 system resolves them to distinct sockets. A path sent to the wrong HTTP plane
 is an ordinary 404 and never reaches the hidden handler.
+Within HTTP v1, a malformed or absent exact migration generation and a
+malformed, unknown, completed, or stale active-query operation ID use the same
+fixed `not_found` transport problem. These resource lookups do not add an
+engine error kind. A non-ready probe instead returns its documented readiness
+JSON at HTTP 503 rather than a Problem Details document.
+The active-query cancel route requires a zero-byte body. A nonempty body is a
+fixed v1 `invalid_argument`, or `request_too_large` above the transport limit,
+and is rejected before it can request cancellation.
+An HTTP query that encounters all 1,024 active-query registry entries occupied
+returns the standard `LimitExceeded` mapping at HTTP 422 before Engine
+admission. Handler removal restores registry capacity independently of any
+remaining SQLite cleanup lease.
 
 ## Taxonomy and protocol mappings
 
