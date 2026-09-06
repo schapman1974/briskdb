@@ -109,13 +109,36 @@ add no routing or SQLite implementation.
 Issue #52 gives the production server two disjoint Axum routers. The data
 router owns `/v1` discovery, query, and execute on `Config::listen`, which keeps
 the `127.0.0.1:7654` process default. The administration router owns
-`/health`, `/metrics`, `/v1/health`, `/v1/admin/*`, and `/admin/*` on
+`/health`, `/ready`, `/metrics`, `/v1/health`, `/v1/ready`, `/v1/admin/*`, and
+`/admin/*` on
 `Config::admin_listen`; the binary defaults it to `127.0.0.1:7655` and maps the
 exact `disabled` CLI/environment sentinel to `None`. Cross-plane paths are
-absent rather than forwarded. Both routers convert into the same `Engine`, and
-the established public `router`/`router_with_engine` constructors remain
+absent rather than forwarded. The server clones one `Engine` into both routers,
+and the established public `router`/`router_with_engine` constructors remain
 combined compatibility helpers for applications that own their serving
 boundary. See [the HTTP listener contract](HTTP_LISTENERS.md).
+
+Issue #53 adds protocol-neutral readiness, relational-catalog, migration,
+physical-shard, active-query, and checkpoint reports. Core and storage validate
+and own their semantics; the HTTP adapter only selects fields, assigns v1 names,
+and serializes them. In particular, it does not open the manifest or shard
+files, count routing buckets, hash migration SQL, or infer lifecycle from an
+error message. The readiness snapshot can observe a non-ready schema gate
+without trying to enter that same gate. Catalog responses expose stable
+identifiers, while migration responses expose generations without revealing
+retained migration SQL or its deterministic durable identity.
+The backup route serializes the supported stopped-directory-copy capability;
+it performs no copy and does not turn a passive checkpoint into a recovery
+point.
+
+Active HTTP query handles live in a finite Engine-owned registry shared by all
+Engine clones, so a request arriving through the administration router can
+cancel work admitted through the data router. The opaque handle maps only to
+that query's existing `CancellationToken`; query execution still enters the
+normal `RequestContext` and `OperationControl` path. Registration and removal
+use the exact opaque ID, completion keeps the established close-race rule, and
+listing returns only bounded redaction-safe metadata. The handles are neither
+general request IDs nor durable records.
 
 The independent `Config::postgres_listen` is also either a numeric socket
 address or disabled with `None`. The process default disables PostgreSQL;
@@ -843,9 +866,9 @@ numeric codes, downgrade policy, recovery cases, and tests are documented in
 Integrity failure marks the canonical-root admission gate sticky `Degraded`;
 ordinary operations, status calls, and migrations then fail with
 `DataCorruption`, and a trusted manifest records that terminal state when
-possible. BriskDB exposes no repair, rebaseline, or detailed integrity status
-API here; richer migration administration and status surfaces remain issue
-#53.
+possible. The issue-53 readiness, migration, and validated-shard reports expose
+the finite operational state without returning stored SQL or fingerprints.
+BriskDB still exposes no repair or rebaseline API.
 
 ## Generated-ID boundary
 

@@ -122,7 +122,7 @@ experimental and opt-in; the exact contract lives in
 | --- | --- |
 | Durable virtual-bucket routing over independent SQLite WAL files | Working |
 | Exact-key routing and bounded scatter/gather reads | Working |
-| HTTP query/write API and admin data browser | Working on separate data/admin listeners, loopback-only |
+| HTTP query/write API, operational API, and admin data browser | Working on separate data/admin listeners, loopback-only; readiness, catalog/migration/shard inspection, active-query cancellation, stopped-copy capability, and passive checkpoint are versioned |
 | PostgreSQL wire protocol | TLS/SCRAM, backpressured row streaming, SQLite-interrupt cancellation, text/binary CRUD, real single-shard transactions, and a live psql/tokio-postgres/psycopg/SQLAlchemy matrix |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
@@ -185,6 +185,8 @@ the separate administration listener:
 
 ```bash
 curl http://127.0.0.1:7655/health
+curl http://127.0.0.1:7655/v1/ready
+curl http://127.0.0.1:7655/v1/admin/catalog
 curl http://127.0.0.1:7655/metrics
 ```
 
@@ -332,8 +334,10 @@ more valuable than a star. Start with the
 - Global ordering/pagination and general aggregate pushdown are still limited.
 - The supported backup today is a stopped-server copy of the complete data
   directory after every server and embedder exits. Passive checkpoints now
-  report shards, manifest, and global-index storage, but are not an online
-  snapshot; online/serverless snapshots are planned.
+  report shards, manifest, and global-index storage through both Rust and the
+  administration API, but are not an online snapshot. The backup capability
+  endpoint reports this limitation rather than copying live files;
+  online/serverless snapshots are planned.
 - Multi-process access is same-host/local-filesystem only. Schema, catalog,
   upgrade, and recovery work requires sole-process ownership.
 - Pre-1.0 storage and public-library compatibility can change between releases.

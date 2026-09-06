@@ -1,6 +1,6 @@
 # HTTP API version 1
 
-Status: implemented for issues #50, #51, and #52. BriskDB remains an alpha
+Status: implemented for issues #50 through #53. BriskDB remains an alpha
 database. Its data and administration HTTP listeners are separate,
 loopback-only, and have no complete authorization boundary. The `/admin`
 browser login authenticates only its browser endpoints.
@@ -24,8 +24,9 @@ Every response within `/v1`, including engine errors, decoding failures,
 unknown endpoints, and unsupported methods, carries `BriskDB-API-Version: 1`.
 The URL selects the API version; a client header does not select another
 version. Unknown versions have no routes and return HTTP 404. Discovery is
-static contract metadata, not a readiness check; use `/v1/health` on the
-administration listener for the current engine health report.
+static contract metadata, not a readiness check; use `/v1/ready` on the
+administration listener before sending traffic and `/v1/health` for the
+broader engine and global-index health report.
 
 The HTTP API major version is independent of the package version and manifest
 format. Within v1, existing request fields, successful response fields, known
@@ -65,12 +66,25 @@ the entire plane:
 | `GET /health` | Engine and aggregate global-index health report |
 | `GET /metrics` | Prometheus text report |
 | `GET /v1/health` | Versioned alias of `/health` |
+| `GET /ready` | Unversioned readiness probe |
+| `GET /v1/ready` | Versioned readiness probe |
 | `POST /v1/admin/broadcast` | Journaled application-schema migration result |
+| `GET /v1/admin/catalog` | Relational catalog metadata |
+| `GET /v1/admin/migrations` | Current schema generation and migration summary |
+| `GET /v1/admin/migrations/{target_generation}` | One exact migration generation |
+| `GET /v1/admin/shards` | Validated physical-shard state |
+| `GET /v1/admin/queries` | Bounded active-query report |
+| `POST /v1/admin/queries/{operation_id}/cancel` | Cancel one exact active query |
+| `GET /v1/admin/backup` | Supported stopped-server backup capability |
+| `POST /v1/admin/maintenance/checkpoint` | Passive checkpoint of every database |
 | `GET /v1/admin/global-indexes` | [Global-index operational report](GLOBAL_INDEX_RELEASE_GATE.md) |
 | `/admin`, `/admin/`, assets, and `/admin/api/*` | [Admin data browser](ADMIN_BROWSER.md) |
 
 GET routes also accept HEAD, returning headers without a body. Success is HTTP
-200 with `application/json`, except for Prometheus text and browser assets.
+200 with `application/json`, except for Prometheus text, browser assets, and a
+successful cancellation request, which is HTTP 202. A readiness response uses
+HTTP 503 while the engine cannot admit ordinary work but retains the readiness
+JSON representation described below.
 Each production router omits the other plane's handlers, so sending a route to
 the wrong listener returns 404 without executing it. The complete address,
 Rust/Python configuration, startup, and drain contract is in
@@ -128,8 +142,9 @@ not parse SQL, hash keys, open files, or implement transaction or migration
 coordination. See [SQL compatibility](SQL_COMPATIBILITY.md),
 [generated keys](GENERATED_KEYS.md), and [request controls](REQUEST_CONTROLS.md).
 Engine deadlines, cancellation, admission, and result limits still apply.
-This API buffers bounded results; it does not expose an HTTP row stream or a
-multi-request cancellation endpoint.
+This API buffers bounded results and does not expose an HTTP row stream. The
+administration listener can enumerate and cancel a currently active query, as
+described below; the handle does not retain an HTTP transaction or result.
 
 ## Successful responses
 
@@ -273,6 +288,256 @@ On the administration listener, broadcast accepts only
 operation, with preflight and resumable application across every shard. It
 does not create catalog metadata implicitly or accept bound parameters.
 
+## Operational responses
+
+### Readiness
+
+`GET /ready` and `GET /v1/ready` return the same JSON. The versioned form adds
+the v1 response header. A ready engine returns HTTP 200:
+
+```json
+{
+  "status": "ready",
+  "ready": true,
+  "reasons": [],
+  "engine_state": "running",
+  "schema_state": "ready",
+  "schema_generation": "7",
+  "active_schema_operations": 2
+}
+```
+
+Readiness means that the engine lifecycle is `running` and its schema gate is
+`ready`, so a new ordinary operation can attempt admission. It does not reserve
+a pool slot or promise that a later request cannot race with shutdown,
+contention, or a schema transition. Global-index degradation remains visible in
+`/health` and `/v1/admin/global-indexes`; it does not change this narrow
+admission result.
+
+A non-ready engine returns HTTP 503 with the same `application/json` shape,
+`status:"not_ready"`, and `ready:false`. `engine_state` is `draining` or
+`stopped`; `schema_state` is `migrating`, `pending`, or `degraded`. The ordered
+`reasons` array uses the corresponding finite codes `engine_draining`,
+`engine_stopped`, `schema_migrating`, `schema_recovery_pending`, and
+`schema_degraded`. This probe response is not a Problem Details document.
+`schema_generation` is exact decimal text. `active_schema_operations` is a
+snapshot count and can change immediately.
+
+### Relational catalog and physical shards
+
+`GET /v1/admin/catalog` returns the immutable relational catalog view and its
+currently published schema generation:
+
+```json
+{
+  "identifier_encoding_version": 1,
+  "schema_generation": "7",
+  "default_database_id": "1",
+  "databases": [{"id":"1","name":"default"}],
+  "tables": [{
+    "id": "9",
+    "database_id": "1",
+    "name": "events",
+    "placement": {
+      "kind": "sharded",
+      "shard_key": {"column":"tenant_id","data_type":"text"}
+    },
+    "generated_id": {"policy":"none"}
+  }],
+  "global_indexes": [{
+    "id": "3",
+    "table_id": "9",
+    "name": "events_email",
+    "unique": false,
+    "lifecycle": "ready",
+    "schema_generation": "7",
+    "key_encoding_version": 1
+  }]
+}
+```
+
+Database, table, and global-index IDs and schema generations use decimal
+strings so JavaScript does not round a persisted `u64`. Arrays preserve the
+catalog's stable order. A sharded placement includes one shard-key declaration
+whose `data_type` is `int64`, `text`, or `binary`; `global` and `catalog`
+placements contain only `kind`. `generated_id.policy` is `none`,
+`native_range_v1`, or `hilo_v1`; enabled policies also include `column` and
+`encoding_version`. Global-index lifecycle is one of `creating`, `ready`,
+`invalid`, `rebuilding`, or `dropping`. This catalog response deliberately
+omits migration SQL, index expressions and predicates, physical filenames, and
+row contents. Runtime global-index health and recovery instructions remain in
+the dedicated global-index endpoint.
+
+`GET /v1/admin/shards` reopens and validates every configured physical shard
+through the bounded engine path before returning any result:
+
+```json
+{
+  "schema_generation": "7",
+  "shards": [
+    {"id":0,"state":"ready"},
+    {"id":1,"state":"ready"}
+  ]
+}
+```
+
+The array is ordered by numeric shard ID. `ready` currently means that the
+file's identity, layout, metadata, schema generation, and committed schema
+digest all match the validated engine view. Any shard failure rejects the
+whole request through the standard engine error mapping; the endpoint never
+returns a partial healthy subset. It does not claim a heartbeat, replica state,
+WAL-size measurement, load sample, or cross-file transaction snapshot.
+
+### Migration inspection
+
+`GET /v1/admin/migrations` returns a bounded summary rather than unbounded
+history:
+
+```json
+{
+  "schema_generation": "7",
+  "active": null,
+  "latest_complete": {
+    "generation": "7",
+    "source_generation": "6",
+    "target_generation": "7",
+    "state": "complete",
+    "shard_count": 2,
+    "next_shard": 2,
+    "completed_shards": 2,
+    "sql_bytes": 42
+  }
+}
+```
+
+`active` and `latest_complete` are always present and use JSON null when there
+is no matching row. `generation` names the target generation and is repeated as
+`target_generation` to make the source-to-target transition explicit.
+`completed_shards` is a count and equals `next_shard`; it is separate from
+broadcast's array of completed shard IDs. Neither the journal's exact SQL nor
+its deterministic durable identity is returned. `sql_bytes` permits size
+diagnosis without exposing its contents.
+
+`GET /v1/admin/migrations/{target_generation}` returns the same migration
+object for one canonical positive decimal generation. Leading zeroes, signs,
+non-decimal text, zero, overflow, and a generation absent from retained history
+all receive the fixed v1 404 problem. This exact lookup keeps the surface
+bounded while general pagination remains later work.
+
+Broadcast remains the only v1 migration mutation. Its SQL is capped at 65,536
+UTF-8 bytes by the durable migration contract in addition to the HTTP body
+limit. An exact retry resumes or recognizes the same journaled operation; a
+different migration while one is active fails without replacing its durable
+state. Migration inspection participates in engine cancellation, deadlines,
+worker admission, and manifest validation, but may observe the active journal
+without entering the ordinary schema gate that the migration excludes.
+
+### Active query cancellation
+
+`GET /v1/admin/queries` returns at most 1,024 currently registered HTTP query
+operations, sorted by opaque operation ID:
+
+```json
+{
+  "queries": [{
+    "operation_id": "0123456789abcdef0123456789abcdef",
+    "elapsed_ms": 17,
+    "sql_bytes": 128,
+    "cancellation_requested": false
+  }]
+}
+```
+
+The 32-character lowercase hexadecimal ID is random and exists only while that
+query is active. `elapsed_ms` is the whole-millisecond age at snapshot time and
+can increase between calls. The report does not contain SQL, a SQL digest,
+parameters, routing keys, result data, sessions, or paths. Execute, migration,
+checkpoint, browser, and PostgreSQL operations do not enter this HTTP-query
+list. The list is live: an operation can complete after it is returned. When
+all 1,024 registry entries are occupied, another HTTP query fails before Engine
+admission with the standard HTTP 422 `limit_exceeded` problem. Removing a
+tracking guard restores capacity.
+
+`POST /v1/admin/queries/{operation_id}/cancel` selects the operation entirely
+from the path and requires exactly zero request-body bytes; no content type is
+required. A nonempty body within the 2 MiB limit receives the fixed HTTP 400
+`invalid_argument` problem, while a larger body receives HTTP 413
+`request_too_large`. Body rejection occurs before registry cancellation, so it
+cannot cancel the named query. An exact active ID with an empty body receives
+HTTP 202:
+
+```json
+{"operation_id":"0123456789abcdef0123456789abcdef","newly_requested":true}
+```
+
+`newly_requested` is false when cancellation was already sticky but cleanup
+has not removed the operation yet. A malformed, all-zero, unknown, completed,
+or stale ID receives the fixed 404 problem and cannot target another query.
+The data query ultimately reports the existing `cancelled` engine problem,
+currently HTTP 500. Completion known to have succeeded wins a close
+cancellation race. Disconnecting the data client drops the HTTP handler and
+removes its ID. The Engine's separate operation guard requests exact-handle
+interruption and retains lifecycle and pool ownership until SQLite cleanup
+finishes; registry disappearance does not claim that cleanup has already
+finished. Handles are neither preallocated tickets, response headers, general
+request IDs, durable records, nor idempotency keys.
+
+### Backup capability and checkpoint maintenance
+
+`GET /v1/admin/backup` reports the only supported alpha backup procedure:
+
+```json
+{
+  "mode": "stopped_directory_copy",
+  "online": false,
+  "requires_all_processes_stopped": true,
+  "checkpoint_endpoint": "/v1/admin/maintenance/checkpoint",
+  "checkpoint_role": "preparation_only",
+  "checkpoint_is_recovery_point": false
+}
+```
+
+This response performs no copy and accepts no destination. Follow the complete
+[stopped-server backup procedure](OFFLINE_BACKUP.md). Coordinated online backup
+and a manifest-defined recovery point remain issue #67.
+
+`POST /v1/admin/maintenance/checkpoint` accepts the exact JSON object `{}` and
+passively checkpoints every shard, the manifest, and the global-index database
+when present:
+
+```json
+{
+  "operation": "passive_checkpoint",
+  "busy": false,
+  "complete": true,
+  "recovery_point": false,
+  "shards": [{
+    "shard": 0,
+    "busy": false,
+    "counts_available": true,
+    "wal_frames": 0,
+    "checkpointed_frames": 0,
+    "complete": true
+  }],
+  "databases": [{
+    "database": "manifest",
+    "busy": false,
+    "counts_available": true,
+    "wal_frames": 0,
+    "checkpointed_frames": 0,
+    "complete": true
+  }]
+}
+```
+
+Auxiliary `database` names are `manifest` and `global_index`. Every array is
+deterministically ordered. HTTP 200 means the passive attempt ran; SQLite may
+still report `busy:true` or `complete:false`, and unavailable counts are zero
+with `counts_available:false`. Engine failures use Problem Details. Unknown or
+duplicate request fields, a non-object, an empty body, or a missing JSON content
+type fail before maintenance. A complete report can reduce retained WAL but
+still has `recovery_point:false` and does not make a live directory copy safe.
+
 ## Errors
 
 Errors within v1 have `Content-Type: application/problem+json`, the version
@@ -282,8 +547,9 @@ names, query text, filesystem paths, and decoder diagnostics are not echoed.
 
 | Failure | HTTP | Code |
 | --- | ---: | --- |
-| Malformed JSON, invalid request envelope, or invalid value encoding/tag | 400 | `invalid_argument` |
+| Malformed JSON, invalid request envelope, nonempty cancel body, or invalid value encoding/tag | 400 | `invalid_argument` |
 | Unknown v1 endpoint | 404 | `not_found` |
+| Unknown migration generation or malformed/stale query operation ID | 404 | `not_found` |
 | Unsupported method on a known endpoint | 405 | `method_not_allowed` |
 | Body exceeds 2 MiB | 413 | `request_too_large` |
 | Missing or non-JSON content type | 415 | `unsupported_media_type` |
@@ -296,31 +562,44 @@ engine `busy` code advertises retryability. A write may commit before its
 response reaches the client; v1 supplies no idempotency key and makes no
 exactly-once delivery guarantee.
 
+The readiness probe's HTTP 503 JSON is the documented exception to the
+Problem Details shape: it is a successful observation that the engine cannot
+currently admit ordinary work, not an `EngineError` serialization.
+
 ## Migration from the combined listener
 
 Route names, valid request bodies, successful result shapes, and cell encodings
 are unchanged. Data requests and discovery stay on `--listen`. Operator and
-browser clients must change their base address to `--admin-listen` for
-`/health`, `/metrics`, `/v1/health`, `/v1/admin/*`, and `/admin/*`. The daemon
-default moves those routes from `127.0.0.1:7654` to `127.0.0.1:7655`; setting
-the admin listener to `disabled` makes every one of them unavailable.
+browser clients must use `--admin-listen` for `/health`, `/ready`, `/metrics`,
+`/v1/health`, `/v1/ready`, `/v1/admin/*`, and `/admin/*`. The daemon default
+serves those routes at `127.0.0.1:7655`; setting the admin listener to
+`disabled` makes every one of them unavailable.
 
 This authority change is intentional pre-1.0 listener configuration, not an
 API-major representation change. It introduces no storage migration and does
 not alter Rust engine behavior. The established Rust `router` and
 `router_with_engine` helpers remain combined for host-owned integrations; the
-daemon and attached server use the isolated plane routers.
+daemon and attached server use the isolated plane routers with clones of one
+Engine. A host constructing both planes must also pass clones of one Engine to
+`data_router_with_engine` and `admin_router_with_engine` for shared lifecycle
+and cancellation. Calling the two `Arc<Database>` split-router wrappers
+separately creates independent Engines and operational registries.
 
 The earlier experimental-to-v1 migration still applies: unknown envelope
 fields and malformed bodies now return the fixed errors above, and clients may
 adopt lossless cells one request at a time with
 `"value_encoding":"lossless-json-v1"`.
 
-`tests/http_v1.rs` exercises discovery, schema rejection before mutation, body
-limits, routing errors, method headers, version isolation, and session isolation.
-Existing HTTP tests cover catalog routing, generated keys, concurrent requests,
-deadlines, result limits, and exact response shapes. Lossless-codec tests cover
-every tag, canonical validation, binary reuse, and unchanged legacy responses;
-embedded differential tests verify shared-engine outcomes. Listener tests prove
-the route matrix on separate real sockets, disabled administration, partial-bind
-cleanup, address reporting, and common shutdown behavior.
+`tests/http_v1.rs` exercises discovery, readiness and drain state, catalog and
+operational response shapes, migration lookup redaction, checkpoint envelope
+strictness, active-query cancellation and cleanup, schema rejection before
+mutation, body limits, routing errors, method headers, version isolation, and
+session isolation. Existing HTTP tests cover catalog routing, generated keys,
+concurrent requests, deadlines, result limits, and exact response shapes.
+Lossless-codec tests cover every tag, canonical validation, binary reuse, and
+unchanged legacy responses; embedded differential tests verify shared-engine
+outcomes. Listener tests prove the complete admin-only route matrix on separate
+real sockets, selected-query cancellation from the admin plane, stale-handle
+isolation, registry disappearance and later query usability after a client
+disconnect, disabled administration, partial-bind cleanup, address reporting,
+and common shutdown behavior.

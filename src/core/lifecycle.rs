@@ -21,6 +21,17 @@ pub enum EngineState {
     Stopped,
 }
 
+impl EngineState {
+    /// Return the stable machine-readable lifecycle state name.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
 /// Outcome of a completed graceful shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShutdownReport {

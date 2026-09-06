@@ -32,9 +32,12 @@ contract.
 
 The supported runner tests separate Tokio TCP listeners on numeric IPv4
 secure/non-secure address validation, isolated data/admin HTTP routes,
-concurrent HTTP and PostgreSQL sessions, disabled administration/PostgreSQL
-binding, bind-failure cleanup, TLS/SCRAM exchange, and shutdown of every
-listener.
+concurrent HTTP and PostgreSQL sessions, cross-plane HTTP query cancellation,
+registry disappearance and later query usability after a data-client
+disconnect, disabled administration/PostgreSQL binding, bind-failure cleanup,
+TLS/SCRAM exchange, and shutdown of every listener. HTTP tests also freeze the
+readiness, relational catalog, migration, validated-shard, backup-capability,
+and checkpoint representations over real sockets.
 It also starts a real imported two-shard server and gates releases on
 transaction CRUD, error recovery, close, and reconnect through Ubuntu's
 `psql`, tokio-postgres 0.7.18, psycopg 3.2.13, and SQLAlchemy 2.0.43.
@@ -81,8 +84,9 @@ on these GitHub-hosted runners:
 - macOS Apple Silicon ARM64 (`aarch64-apple-darwin`).
 
 Those release artifacts are previews outside Ubuntu 24.04 x86-64. Their native
-jobs verify the locked release build, CLI version, HTTP startup, admin endpoint,
-and clean termination, but do not run the full storage and integration suite.
+jobs verify the locked release build, CLI version, data discovery, an HTTP 200
+administration readiness probe, the admin endpoint, and clean termination, but
+do not run the full storage and integration suite.
 Windows, the musl target, 32-bit targets, big-endian targets, mobile platforms,
 and WebAssembly are not currently tested or supported.
 

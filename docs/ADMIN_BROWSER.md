@@ -25,9 +25,10 @@ roadmap issues #56, #64, and #65.
 Anyone who can reach the administration listener knows these credentials.
 Server startup therefore restricts the current administration service to an
 IPv4 or IPv6 loopback address. Do not treat this login as a production identity
-boundary. It does not authenticate `/health`, `/metrics`, `/v1/health`, or
-`/v1/admin/*` on the same listener, and no `/v1/query` or `/v1/execute` handler
-exists there. The data listener has no `/admin` handlers.
+boundary. It does not authenticate `/health`, `/ready`, `/metrics`,
+`/v1/health`, `/v1/ready`, or `/v1/admin/*` on the same listener, and no
+`/v1/query` or `/v1/execute` handler exists there. The data listener has no
+`/admin` handlers.
 
 A successful login creates an opaque session from 32 operating-system-random
 bytes and sends its lowercase 64-character hexadecimal token only in the
@@ -176,9 +177,12 @@ continue.
 ## Deliberate non-goals
 
 The browser does not add editing, arbitrary SQL, schema migration, backup,
-maintenance, an atomic cross-file snapshot, stable pagination across concurrent
-writes, general distributed SQL aggregation or ordering, durable users or
-roles, credential configuration, or TLS. Those remain separate roadmap work.
+maintenance, active-query controls, an atomic cross-file snapshot, stable
+pagination across concurrent writes, general distributed SQL aggregation or
+ordering, durable users or roles, credential configuration, or TLS. The
+versioned operator API exposes separate migration inspection, query
+cancellation, stopped-copy capability, and passive-checkpoint routes; none is
+called by the browser or protected by its temporary login.
 Listener topology is specified in [HTTP_LISTENERS.md](HTTP_LISTENERS.md). The
 browser adds no manifest table, file, version, checksum input, migration, or
 recovery step.

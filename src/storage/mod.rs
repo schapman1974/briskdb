@@ -44,7 +44,6 @@ use rusqlite::{
 pub(crate) use migration::SchemaMigrationCoordinatorPoint;
 use schema_gate::SchemaMigrationGuard as LocalSchemaMigrationGuard;
 pub(crate) use schema_gate::SchemaOperationGuard;
-#[cfg(test)]
 pub(crate) use schema_gate::{SchemaGateSnapshot, SchemaGateState};
 
 pub use crate::core::Database;
@@ -62,7 +61,8 @@ use crate::{
         GlobalIndexShardSummaryRebuildReport, GlobalIndexShardSummaryState,
         GlobalIndexShardSummaryStatus, GlobalIndexValidationMode, GlobalIndexValidationOptions,
         GlobalIndexValidationReport, GlobalOperationId, GlobalUniqueMutation,
-        GlobalUniqueReservation, GlobalValueLease, IndexKeyValue, MAX_TABLES, ShardKeyType,
+        GlobalUniqueReservation, GlobalValueLease, IndexKeyValue, MAX_TABLES, OperationControl,
+        SchemaMigrationState, SchemaMigrationStatus, SchemaMigrationSummary, ShardKeyType,
         TableDeclaration, TablePlacement,
         generated_id::{
             NATIVE_RANGE_V1_FORMAT_MARKER, native_range_v1_sequence_ceiling,
@@ -549,6 +549,24 @@ pub(crate) struct GlobalWriteReservationGuard {
     _lease: process_lock::GlobalWriteOperationLease,
 }
 
+fn schema_migration_status(migration: &manifest::SchemaMigration) -> SchemaMigrationStatus {
+    let state = if migration.is_applying() {
+        SchemaMigrationState::Applying
+    } else {
+        debug_assert!(migration.is_complete());
+        SchemaMigrationState::Complete
+    };
+    SchemaMigrationStatus {
+        generation: migration.target_generation(),
+        source_generation: migration.source_generation(),
+        target_generation: migration.target_generation(),
+        state,
+        shard_count: migration.shard_count(),
+        next_shard: migration.next_shard(),
+        sql_bytes: migration.sql_text().len(),
+    }
+}
+
 impl Storage {
     pub(crate) fn open(root: impl AsRef<Path>, requested_shards: u16) -> EngineResult<Self> {
         validate_shard_count(requested_shards)?;
@@ -946,19 +964,22 @@ impl Storage {
     pub(crate) fn checkpoint_auxiliary_databases(
         &self,
     ) -> EngineResult<Vec<CheckpointDatabaseReport>> {
-        let manifest = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
-        configure_manifest_connection(&manifest)?;
-        let mut reports = vec![checkpoint_database(
-            &manifest,
-            CheckpointDatabase::Manifest,
-        )?];
-        if let Some((global_index, _)) = global_index::open_existing(&self.root)? {
-            reports.push(checkpoint_database(
-                &global_index,
-                CheckpointDatabase::GlobalIndex,
-            )?);
-        }
-        Ok(reports)
+        let result = (|| {
+            let manifest = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+            configure_manifest_connection(&manifest)?;
+            let mut reports = vec![checkpoint_database(
+                &manifest,
+                CheckpointDatabase::Manifest,
+            )?];
+            if let Some((global_index, _)) = global_index::open_existing(&self.root)? {
+                reports.push(checkpoint_database(
+                    &global_index,
+                    CheckpointDatabase::GlobalIndex,
+                )?);
+            }
+            Ok(reports)
+        })();
+        self.fail_closed_on_corruption(result)
     }
 
     pub(crate) fn shard_for_key(&self, key: &[u8]) -> u16 {
@@ -2834,9 +2855,151 @@ impl Storage {
             .publish_schema_generation(expected_generation, target_generation)
     }
 
-    #[cfg(test)]
     pub(crate) fn schema_gate_snapshot(&self) -> SchemaGateSnapshot {
         self.schema_coordination.gate.snapshot()
+    }
+
+    /// Inspect the bounded migration summary without entering ordinary schema
+    /// admission, so an active or pending migration remains observable.
+    pub(crate) fn schema_migration_summary(
+        &self,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<SchemaMigrationSummary> {
+        const MAX_GENERATION_RETRIES: usize = 8;
+        let mut committed_handoff = None;
+        for _ in 0..MAX_GENERATION_RETRIES {
+            let before_generation = self.current_schema_generation();
+            let manifest_path = self.root.join("manifest.sqlite");
+            let snapshot = (|| {
+                let mut connection = open_existing_manifest(&manifest_path)?;
+                pool::run_dedicated_connection_controlled(
+                    &mut connection,
+                    Arc::clone(&control),
+                    |connection| {
+                        configure_manifest_connection_after_busy_setup(connection)?;
+                        let transaction = connection
+                            .transaction_with_behavior(TransactionBehavior::Deferred)
+                            .map_err(sqlite_error::storage)?;
+                        let snapshot = manifest::inspect_schema_migration_summary(
+                            &transaction,
+                            self.shard_count(),
+                        )?;
+                        transaction.commit().map_err(sqlite_error::storage)?;
+                        Ok(snapshot)
+                    },
+                )
+            })();
+            let snapshot = self.fail_closed_on_corruption(snapshot)?;
+            let after_generation = self.current_schema_generation();
+            if before_generation == after_generation
+                && snapshot.schema_generation() == after_generation
+            {
+                return Ok(SchemaMigrationSummary {
+                    schema_generation: after_generation,
+                    active: snapshot.active().map(schema_migration_status),
+                    latest_complete: snapshot.latest_complete().map(schema_migration_status),
+                });
+            }
+            if before_generation == after_generation {
+                let gate_state = self.schema_gate_snapshot().state;
+                if self.current_schema_generation() != after_generation {
+                    continue;
+                }
+                if after_generation.checked_add(1) == Some(snapshot.schema_generation())
+                    && matches!(
+                        gate_state,
+                        SchemaGateState::Migrating | SchemaGateState::Pending
+                    )
+                {
+                    committed_handoff = Some(snapshot);
+                } else {
+                    self.record_schema_degraded();
+                    return Err(EngineError::new(
+                        EngineErrorKind::DataCorruption,
+                        "manifest schema generation is inconsistent with runtime publication",
+                    ));
+                }
+            }
+            std::thread::yield_now();
+        }
+        if let Some(snapshot) = committed_handoff {
+            return Ok(SchemaMigrationSummary {
+                schema_generation: snapshot.schema_generation(),
+                active: snapshot.active().map(schema_migration_status),
+                latest_complete: snapshot.latest_complete().map(schema_migration_status),
+            });
+        }
+        Err(EngineError::new(
+            EngineErrorKind::Busy,
+            "application-schema generation changed during migration inspection",
+        ))
+    }
+
+    /// Inspect one migration by its indexed target generation without exposing SQL.
+    pub(crate) fn schema_migration(
+        &self,
+        target_generation: u64,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<Option<SchemaMigrationStatus>> {
+        const MAX_GENERATION_RETRIES: usize = 8;
+        let mut committed_handoff = None;
+        for _ in 0..MAX_GENERATION_RETRIES {
+            let before_generation = self.current_schema_generation();
+            let manifest_path = self.root.join("manifest.sqlite");
+            let snapshot = (|| {
+                let mut connection = open_existing_manifest(&manifest_path)?;
+                pool::run_dedicated_connection_controlled(
+                    &mut connection,
+                    Arc::clone(&control),
+                    |connection| {
+                        configure_manifest_connection_after_busy_setup(connection)?;
+                        let transaction = connection
+                            .transaction_with_behavior(TransactionBehavior::Deferred)
+                            .map_err(sqlite_error::storage)?;
+                        let snapshot = manifest::inspect_schema_migration_generation(
+                            &transaction,
+                            self.shard_count(),
+                            target_generation,
+                        )?;
+                        transaction.commit().map_err(sqlite_error::storage)?;
+                        Ok(snapshot)
+                    },
+                )
+            })();
+            let (manifest_generation, migration) = self.fail_closed_on_corruption(snapshot)?;
+            let after_generation = self.current_schema_generation();
+            if before_generation == after_generation && manifest_generation == after_generation {
+                return Ok(migration.as_ref().map(schema_migration_status));
+            }
+            if before_generation == after_generation {
+                let gate_state = self.schema_gate_snapshot().state;
+                if self.current_schema_generation() != after_generation {
+                    continue;
+                }
+                if after_generation.checked_add(1) == Some(manifest_generation)
+                    && matches!(
+                        gate_state,
+                        SchemaGateState::Migrating | SchemaGateState::Pending
+                    )
+                {
+                    committed_handoff = Some(migration);
+                } else {
+                    self.record_schema_degraded();
+                    return Err(EngineError::new(
+                        EngineErrorKind::DataCorruption,
+                        "manifest schema generation is inconsistent with runtime publication",
+                    ));
+                }
+            }
+            std::thread::yield_now();
+        }
+        if let Some(migration) = committed_handoff {
+            return Ok(migration.as_ref().map(schema_migration_status));
+        }
+        Err(EngineError::new(
+            EngineErrorKind::Busy,
+            "application-schema generation changed during migration inspection",
+        ))
     }
 
     pub(crate) fn apply_schema_migration(

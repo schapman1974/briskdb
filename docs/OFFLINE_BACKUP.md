@@ -10,13 +10,22 @@ This is not an online backup. Do not copy a live data directory, even when no
 application writes are expected. Coordinated online backup remains tracked by
 issue #67.
 
+`GET /v1/admin/backup` reports this stopped-copy capability in machine-readable
+form. It does not start a copy, choose a destination, stop an embedder, or make
+live files consistent. `POST /v1/admin/maintenance/checkpoint` with the exact
+JSON body `{}` performs the same optional passive checkpoint available through
+the embedded engine. Neither endpoint is an online-backup API or a
+manifest-defined cross-file recovery point.
+
 ## Backup
 
-1. Optionally ask the running engine to perform a passive checkpoint and inspect
+1. Optionally ask the running engine to perform a passive checkpoint, directly
+   or through `POST /v1/admin/maintenance/checkpoint` with `{}`, and inspect
    every returned shard plus the `manifest` and optional `global_index`
    database report. Retry a `busy`/incomplete report if reducing retained WAL
    is important. This is preparation only: it does not make a live copy safe
-   or establish a cross-file recovery point.
+   or establish a cross-file recovery point. A successful HTTP response can
+   still report `busy` or `complete: false`.
 2. Record the BriskDB version, configured shard count, and absolute data
    directory path.
 3. Stop every BriskDB server and embedded application cleanly and wait for each
@@ -54,9 +63,10 @@ stopped directory as one recovery point.
 3. Start the same BriskDB release with the recorded shard count and the restored
    directory. Startup must reach `Ready` without a migration, integrity, shard
    identity, WAL-mode, or schema-generation error.
-4. Check `/health` on the administration listener, inspect the expected logical
-   catalog, and read known rows through the data listener from representative
-   shard keys before returning the service to use.
+4. Require HTTP 200 from `/v1/ready` on the administration listener, inspect
+   `/v1/admin/catalog`, check `/health`, and read known rows through the data
+   listener from representative shard keys before returning the service to
+   use.
 5. Keep the prior directory and backup unchanged until validation succeeds.
    If validation fails, stop the process and investigate; do not edit manifest
    state, SQLite headers, or checksums to force startup.

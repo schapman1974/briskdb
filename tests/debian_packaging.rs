@@ -90,6 +90,7 @@ fn debian_package_contract_preserves_configuration_and_database_state() {
         "systemd-analyze verify",
         "BriskDB is ready",
         "http://127.0.0.1:7654/v1",
+        "http://127.0.0.1:7655/v1/ready",
         "http://127.0.0.1:7655/admin",
         "package smoke-test local configuration",
         "wait_for_service",
