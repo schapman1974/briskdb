@@ -1,5 +1,29 @@
 # Unreleased
 
+BriskDB now ships a deterministic, code-first OpenAPI 3.1 artifact at
+`docs/openapi-v1.json`. It describes exactly the 17 versioned `/v1` paths and
+28 GET, HEAD, and POST operations, including each operation's data- or
+administration-listener ownership, closed request schemas, additive response
+schemas, common headers and errors, readiness 503 response, and bounded NDJSON
+record contract.
+The public `briskdb::api::openapi_v1()` Rust function returns the same document
+when the `http` feature is enabled, and the `generate-openapi-v1` example
+regenerates byte-identical checked JSON. The Cargo crate, every native release
+archive, and each Debian package include the artifact.
+
+The artifact deliberately excludes unversioned probes, Prometheus metrics, and
+the `/admin` browser. It is a shipped file for contract validation and client
+tool input, not a served endpoint or committed generated client. It declares no
+security scheme before HTTP authentication and roles exist. OpenAPI cannot by
+itself express duplicate raw JSON members or headers, the raw 2 MiB body limit,
+conditional idempotency headers, or NDJSON byte-sequence ordering, so the live
+router tests and [HTTP contract](docs/HTTP_API.md) remain authoritative for
+those rules. The change is confined to the HTTP adapter and distribution
+contents; it changes no Engine behavior, SQL/routing semantics, manifest, shard
+format, migration, or listener exposure. Normal OpenAPI generation
+dependencies remain optional and selected only by `http`; the independent
+validators are test-only dependencies. Rust 1.85 remains supported.
+
 BriskDB's HTTP routers now assign every response a `BriskDB-Request-ID`;
 callers may supply one canonical nonzero 128-bit lowercase-hex value and BriskDB
 echoes it for correlation, while malformed or duplicate values fail with a fresh redacted ID.

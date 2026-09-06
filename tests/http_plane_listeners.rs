@@ -415,6 +415,10 @@ async fn attached_data_and_admin_planes_are_isolated_over_real_tcp() {
     assert_eq!(discovery_head.status, 200);
     assert_eq!(discovery_head.header("briskdb-api-version"), Some("1"));
     assert_eq!(
+        discovery_head.header("content-type"),
+        Some("application/json")
+    );
+    assert_eq!(
         discovery_head.header("content-length"),
         discovery.header("content-length")
     );
@@ -500,6 +504,7 @@ async fn attached_data_and_admin_planes_are_isolated_over_real_tcp() {
     let health_head = request(admin, "HEAD", "/v1/health", None, &[], &[]).await;
     assert_eq!(health_head.status, 200);
     assert_eq!(health_head.header("briskdb-api-version"), Some("1"));
+    assert_eq!(health_head.header("content-type"), Some("application/json"));
     assert_eq!(
         health_head.header("content-length"),
         versioned_health.header("content-length")

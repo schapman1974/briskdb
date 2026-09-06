@@ -10,6 +10,10 @@ The [versioned HTTP transport](HTTP_API.md) has its own compatibility boundary:
 breaking request/response or default value-encoding changes require a new API
 major version and a documented migration. This does not stabilize the alpha
 SQL subset, storage layout, browser API, or public Rust library.
+The checked [OpenAPI v1 artifact](OPENAPI.md) makes that machine-readable
+surface reviewable and is tested against the live router. Its documented
+representation limits do not weaken the duplicate-member, raw-byte, header, or
+NDJSON rules in the HTTP contract.
 
 This policy is narrower than the stable storage-format commitment planned for
 1.0 in issue #77.

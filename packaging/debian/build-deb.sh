@@ -46,6 +46,11 @@ for binary in briskdb briskdb-import; do
     fi
 done
 
+if [[ ! -s docs/openapi-v1.json ]]; then
+    echo "missing OpenAPI artifact: docs/openapi-v1.json" >&2
+    exit 1
+fi
+
 debian_version=$(to_debian_version "$cargo_version")
 filename_version=${debian_version//\~/.}
 package_basename="briskdb_${filename_version}_${architecture}"

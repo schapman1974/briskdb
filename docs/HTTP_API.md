@@ -1,6 +1,6 @@
 # HTTP API version 1
 
-Status: implemented for issues #50 through #54. BriskDB remains an alpha
+Status: implemented for issues #50 through #55. BriskDB remains an alpha
 database. Its data and administration HTTP listeners are separate,
 loopback-only, and have no complete authorization boundary. The `/admin`
 browser login authenticates only its browser endpoints.
@@ -51,6 +51,13 @@ follow their separately documented alpha contracts.
 including its losses. `lossless-json-v1` is an explicitly selected, tagged
 encoding for the complete current protocol-neutral value model. Adding that
 choice does not reinterpret an omitted v1 field or change the default response.
+
+The deterministic [OpenAPI 3.1 artifact](OPENAPI.md) is generated from the
+registered v1 handlers and their actual DTOs. It covers the exact versioned
+machine surface, including implicit HEAD operations and listener ownership,
+and is available through `briskdb::api::openapi_v1()`. The artifact is not an
+HTTP endpoint; this document remains the human-readable contract for wire
+rules that OpenAPI cannot fully express.
 
 ## Routes and listeners
 
@@ -455,11 +462,13 @@ contention, or a schema transition. Global-index degradation remains visible in
 admission result.
 
 A non-ready engine returns HTTP 503 with the same `application/json` shape,
-`status:"not_ready"`, and `ready:false`. `engine_state` is `draining` or
-`stopped`; `schema_state` is `migrating`, `pending`, or `degraded`. The ordered
-`reasons` array uses the corresponding finite codes `engine_draining`,
-`engine_stopped`, `schema_migrating`, `schema_recovery_pending`, and
-`schema_degraded`. This probe response is not a Problem Details document.
+`status:"not_ready"`, and `ready:false`. `engine_state` retains the observed
+`running`, `draining`, or `stopped` lifecycle state, and `schema_state` retains
+the observed `ready`, `migrating`, `pending`, or `degraded` gate state. The
+ordered `reasons` array names only the non-ready cause or causes with the finite
+codes `engine_draining`, `engine_stopped`, `schema_migrating`,
+`schema_recovery_pending`, and `schema_degraded`. This probe response is not a
+Problem Details document.
 `schema_generation` is exact decimal text. `active_schema_operations` is a
 snapshot count and can change immediately.
 

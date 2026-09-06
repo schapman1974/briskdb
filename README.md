@@ -214,6 +214,9 @@ The [versioned HTTP contract](docs/HTTP_API.md) defines requests, response
 shapes, value encodings, request IDs, eligible-write idempotency, bounded row
 streaming, limits, and errors. `GET /v1` reports the supported API version and
 configured result ceilings.
+The checked [OpenAPI 3.1 artifact](docs/OPENAPI.md) describes the exact v1
+machine surface from the same route and DTO definitions and is included in
+Cargo, native archive, and Debian distributions.
 The [HTTP listener contract](docs/HTTP_LISTENERS.md) defines the strict route
 split, configuration, and shared startup/shutdown behavior. The data listener
 defaults to `127.0.0.1:7654`; administration defaults to
@@ -358,6 +361,7 @@ more valuable than a star. Start with the
 ## Go deeper
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [OpenAPI v1 artifact](docs/OPENAPI.md)
 - [HTTP listener separation](docs/HTTP_LISTENERS.md)
 - [Global uniqueness and value authority](docs/GLOBAL_INDEX_AUTHORITY.md)
 - [Global-index production gate](docs/GLOBAL_INDEX_RELEASE_GATE.md)

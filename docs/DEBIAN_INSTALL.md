@@ -28,6 +28,7 @@ prerelease version `0.1.0~alpha.6-1` so it sorts before the final release.
 | Import utility | `/usr/bin/briskdb-import` |
 | Administrator configuration | `/etc/default/briskdb` |
 | Vendor systemd unit | `/lib/systemd/system/briskdb.service` |
+| OpenAPI v1 artifact | `/usr/share/doc/briskdb/docs/openapi-v1.json` |
 | Persistent database state | `/var/lib/briskdb` |
 | Logs | systemd journal for `briskdb.service` |
 
