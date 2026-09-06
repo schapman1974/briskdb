@@ -318,11 +318,14 @@ protocol-specific golden tests only for encoding and state-machine behavior.
   authentication/role, pagination, or scatter/gather items below.
 - [x] Replace the experimental endpoints with a versioned `/v1` contract built
   on the shared session/engine types, with discovery, strict envelopes, and
-  fixed transport errors; see [the HTTP contract](docs/HTTP_API.md). The default
-  `legacy-json-v1` value encoding is preserved; lossless encoding remains #51.
-- [ ] Return ordered columns and row arrays so duplicate names and binary values
-  round-trip without loss; define JSON encodings for integers, decimals,
-  timestamps, and blobs.
+  fixed transport errors; see [the HTTP contract](docs/HTTP_API.md).
+- [x] Preserve ordered columns and positional row arrays and add the explicitly
+  selected `lossless-json-v1` encoding for integers, decimals, binary64 bits,
+  blobs, and invalid SQLite text (issue #51). `legacy-json-v1` remains the
+  default. Relational timestamps remain application-defined `Text` or `Int64`
+  because the shared SQL value system has no timestamp type or storage policy;
+  [#298](https://github.com/schapman1974/briskdb/issues/298) tracks that shared
+  contract.
 - [ ] Separate data-plane and admin-plane routers/listeners.
 - [ ] Add endpoints for health, readiness, catalog inspection, migrations,
   shard state, query cancellation, backup, and maintenance.

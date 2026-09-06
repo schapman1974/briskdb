@@ -1,9 +1,9 @@
 # Architecture
 
 BriskDB is organized so network protocols can share one routing and execution
-core. The module layout preserves the experimental HTTP contract and existing
-Rust module paths while making the active PostgreSQL startup adapter and the
-planned MySQL adapter explicit peers.
+core. The module layout preserves the versioned HTTP contract and existing Rust
+module paths while making the active PostgreSQL startup adapter and the planned
+MySQL adapter explicit peers.
 
 ```text
 binary (main)
@@ -33,7 +33,7 @@ server ---------> protocol::http
 | `storage` | Versioned routing and authoritative logical/global-index manifest, persisted generated-ID policy/activation, stable active/retired allocation-owner slots, durable per-table hi/lo block leases, recoverable one-time table provisioning, shard layout, migration journals and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `import` | Offline source-schema preflight, explicit placement and generated-ID plan validation, exact-value row routing into private staging, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, generated-ID inference, implicit Global placement, or protocol-specific behavior |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
-| `protocol::http` | Existing HTTP request extraction, shared JSON/BriskDB value and RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
+| `protocol::http` | Versioned HTTP request extraction, legacy and lossless JSON/BriskDB value codecs, RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
 | `protocol::postgres` | BriskDB-owned bounded protocol-3.0 baseline and newer-minor downgrade, selected identity/status, per-connection core-session ownership, simple query execution, bounded parameterized text/binary extended lifecycle, fixed error recovery, and private compile/query-parser seam around exactly pinned `pgwire` | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, loopback validation, separate HTTP/PostgreSQL listener binding, finite connection-task supervision, and shared graceful/forced draining | SQL parsing, PostgreSQL wire framing, or storage implementation details |
@@ -56,8 +56,8 @@ The module split deliberately preserved:
   shapes, and current error statuses;
 - BLAKE3 routing, shard filenames, manifest schema, WAL and synchronous modes;
 - legacy SQLite pass-through semantics while the table catalog is empty,
-  authoritative catalog gating after registration, and cell-level HTTP JSON
-  encoding behavior; and
+  authoritative catalog gating after registration, and the default cell-level
+  HTTP JSON encoding behavior; and
 - the existing `briskdb::api::router` and `briskdb::storage::Database` Rust
   paths through compatibility re-exports.
 
@@ -102,9 +102,10 @@ address or `None`.
 
 HTTP routes under `/v1` have an explicit transport contract in
 [HTTP_API.md](HTTP_API.md). `protocol::http::v1` owns version discovery, the
-shared strict SQL envelope, body extraction, version headers, and transport
-errors. Existing handlers still create core sessions and send typed statements
-through the shared engine; versioning adds no routing or SQLite implementation.
+shared strict SQL envelope, selected value codec, body extraction, version
+headers, and transport errors. Existing handlers still create core sessions and
+send typed statements through the shared engine; versioning and JSON conversion
+add no routing or SQLite implementation.
 
 The HTTP address remains `Config::listen`. The independent
 `Config::postgres_listen` is either a numeric socket address or disabled with
@@ -1358,23 +1359,37 @@ exact decimals, invalid UTF-8 text, and `NaN` are rejected rather than coerced
 to another SQLite storage class. SQLite `TEXT` results preserve invalid bytes as
 `Value::InvalidText` inside the core.
 
-The experimental HTTP adapter is the only JSON conversion boundary.
-`/v1/query` and the admin row-page response use the same ordered `columns` array
-of `name` and `data_type` metadata objects plus positional arrays in `rows`.
-Column and row indices correspond exactly. Duplicate and empty names are valid,
-and metadata is returned even when there are zero rows. The admin response adds
-physical-shard, table, and finite pagination metadata. It also tags signed or
-unsigned integers outside JavaScript's exact range with their decimal text so
-the browser cannot round them; the experimental `/v1/query` cell encoding is
-unchanged.
+The HTTP adapter is the only relational JSON conversion boundary. `/v1/query`
+and the admin row-page response use the same ordered `columns` array of `name`
+and `data_type` metadata objects plus positional arrays in `rows`. Column and
+row indices correspond exactly. Duplicate and empty names are valid, and
+metadata is returned even when there are zero rows. The admin response adds
+physical-shard, table, and finite pagination metadata and retains its separate
+browser display codec.
 
-The adapter renders exact decimals as JSON strings, converts `InvalidText` to a
-JSON string with invalid byte sequences replaced by U+FFFD, and maps non-finite
-floats to JSON `null`; these losses are explicit adapter policy rather than
-storage behavior. HTTP parameters that cannot bind to SQLite without loss fail
-instead of being rounded or rewritten. The ordered response change affects only
-HTTP query serialization: it does not change routing, configuration, the
-manifest, shard files, or any other on-disk data.
+Version 1 keeps `legacy-json-v1` as its default value conversion. That codec
+renders exact decimals as JSON strings, converts `InvalidText` to a string with
+U+FFFD replacement, represents blobs as byte arrays, exposes integers as JSON
+numbers, and maps non-finite floats to JSON null. These losses remain explicit
+adapter policy rather than storage behavior.
+
+An execute or query request may instead select `lossless-json-v1`. Nulls,
+Booleans, and valid text stay native JSON; every integer, decimal, binary64
+float, blob, and invalid-text value uses an exact two-field `$briskdb_type` tag.
+Integers use canonical decimal strings, floats use 16 lowercase hexadecimal
+IEEE-754 bits, and byte sequences use canonical padded standard base64. The
+adapter validates the complete tagged parameter set before invoking the engine,
+so malformed tags cannot partially execute a request. A returned binary tag can
+be reused as a parameter and reaches SQLite as the same BLOB bytes.
+
+Lossless JSON does not add a SQLite type or change which core values SQLite can
+bind. The SQL layer continues to reject oversized unsigned integers, decimals,
+invalid-text parameters, and NaN rather than coercing them. Relational
+timestamps likewise remain application-managed `Text` or `Int64`; there is no
+timestamp query value or HTTP tag. Engine byte limits account the
+protocol-neutral result before base64 and tag expansion. The optional codec
+changes only HTTP serialization and adds no routing, configuration, manifest,
+shard-file, or other on-disk change.
 
 The pre-1.0 Rust `Database::execute` and `Database::query` signatures now use
 BriskDB `Value` and `ResultSet` directly instead of `serde_json::Value`. This is

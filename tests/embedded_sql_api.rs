@@ -22,6 +22,10 @@ async fn request_json(router: axum::Router, uri: &str, body: JsonValue) -> (Stat
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+fn tagged(tag: &str, value: &str) -> JsonValue {
+    json!({"$briskdb_type": tag, "value": value})
+}
+
 #[tokio::test]
 async fn embedded_prepared_commands_preserve_order_values_and_handle_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
@@ -156,7 +160,7 @@ async fn embedded_and_http_calls_observe_the_same_engine_outcome() {
         .unwrap();
     let application = briskdb::api::router_with_engine(database.engine().clone());
     let http = request_json(
-        application,
+        application.clone(),
         "/v1/query",
         json!({
             "shard_key": "shared-outcome",
@@ -179,6 +183,25 @@ async fn embedded_and_http_calls_observe_the_same_engine_outcome() {
             Value::Binary(vec![1, 2, 255]),
             Value::Null,
         ]
+    );
+
+    let lossless = request_json(
+        application,
+        "/v1/query",
+        json!({
+            "shard_key": "shared-outcome",
+            "sql": "SELECT id, payload, note FROM records WHERE id = ?1",
+            "params": ["shared-outcome"],
+            "value_encoding": "lossless-json-v1"
+        }),
+    )
+    .await;
+    assert_eq!(lossless.0, StatusCode::OK);
+    assert_eq!(lossless.1["shard"], json!(embedded.shards[0]));
+    assert_eq!(lossless.1["value_encoding"], "lossless-json-v1");
+    assert_eq!(
+        lossless.1["rows"],
+        json!([["shared-outcome", tagged("binary", "AQL/"), null]])
     );
 
     session.close().await.unwrap();

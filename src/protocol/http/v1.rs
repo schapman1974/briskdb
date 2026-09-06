@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 
 use super::{
     HttpState, ProblemDetails, broadcast, execute, global_indexes, health, problem_response, query,
@@ -45,7 +45,8 @@ async fn version_header(mut response: Response) -> Response {
 #[derive(Serialize)]
 struct ApiVersion {
     api_version: &'static str,
-    value_encoding: &'static str,
+    value_encoding: ValueEncoding,
+    supported_value_encodings: [ValueEncoding; 2],
     session_scope: &'static str,
     sql_dialect: &'static str,
     max_request_bytes: usize,
@@ -54,11 +55,39 @@ struct ApiVersion {
 async fn discovery() -> Json<ApiVersion> {
     Json(ApiVersion {
         api_version: "1",
-        value_encoding: "legacy-json-v1",
+        value_encoding: ValueEncoding::LegacyJsonV1,
+        supported_value_encodings: ValueEncoding::ALL,
         session_scope: "request",
         sql_dialect: "sqlite",
         max_request_bytes: MAX_REQUEST_BYTES,
     })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) enum ValueEncoding {
+    #[default]
+    #[serde(rename = "legacy-json-v1")]
+    LegacyJsonV1,
+    #[serde(rename = "lossless-json-v1")]
+    LosslessJsonV1,
+}
+
+impl ValueEncoding {
+    pub(super) const ALL: [Self; 2] = [Self::LegacyJsonV1, Self::LosslessJsonV1];
+
+    pub(super) const fn is_legacy(self) -> bool {
+        matches!(self, Self::LegacyJsonV1)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+pub(super) struct RawJsonParameter(Box<RawValue>);
+
+impl RawJsonParameter {
+    pub(super) fn get(&self) -> &str {
+        self.0.get()
+    }
 }
 
 /// Shared SQL envelope; each handler creates a fresh core Session and Statement.
@@ -71,7 +100,9 @@ pub(super) struct SqlRequest {
     pub(super) shard_key: Option<String>,
     pub(super) sql: String,
     #[serde(default)]
-    pub(super) params: Vec<JsonValue>,
+    pub(super) params: Vec<RawJsonParameter>,
+    #[serde(default)]
+    pub(super) value_encoding: ValueEncoding,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,4 +199,29 @@ async fn not_found() -> TransportError {
 
 async fn method_not_allowed() -> TransportError {
     TransportError::MethodNotAllowed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SqlRequest, ValueEncoding};
+
+    #[test]
+    fn sql_request_defaults_and_explicit_legacy_selection_preserve_raw_parameters() {
+        for (raw, expected_parameter) in [
+            (
+                r#"{"sql":"SELECT ?1","params":[{"z":0,"a":1}]}"#,
+                r#"{"z":0,"a":1}"#,
+            ),
+            (
+                r#"{"sql":"SELECT ?1","params":[ [ 1, 2 ] ],"value_encoding":"legacy-json-v1"}"#,
+                "[ 1, 2 ]",
+            ),
+        ] {
+            let request = serde_json::from_str::<SqlRequest>(raw).unwrap();
+
+            assert_eq!(request.value_encoding, ValueEncoding::LegacyJsonV1);
+            assert_eq!(request.params.len(), 1);
+            assert_eq!(request.params[0].get(), expected_parameter);
+        }
+    }
 }
