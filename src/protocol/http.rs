@@ -3,32 +3,66 @@
 mod admin;
 mod v1;
 
-use std::{fmt::Write as _, sync::Arc};
+use std::{
+    fmt::{self, Write as _},
+    str::FromStr as _,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use axum::{
     Json, Router,
-    extract::State,
-    http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
+    body::{Body, Bytes},
+    extract::{Extension, Request, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as STANDARD_BASE64};
+use futures::{StreamExt as _, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use v1::{
-    BroadcastRequest, EmptyRequest, RawJsonParameter, SqlRequest as QueryRequest,
-    SqlRequest as RoutedSqlRequest, TransportError, V1EmptyBody, V1Json, V1Path, ValueEncoding,
+    BroadcastRequest, EmptyRequest, ExecuteRequest, QueryRequest, QueryResultLimits,
+    RawJsonParameter, TransportError, V1EmptyBody, V1Json, V1Path, ValueEncoding,
 };
 
 use crate::{
     core::{
         DataType, Database, Decimal, Engine, EngineError, EngineErrorKind, EngineState, Executed,
         GeneratedIdPolicy, GeneratedKey, GlobalIndexHealthState, GlobalIndexLifecycle,
-        GlobalIndexOperationalReport, GlobalIndexOperationalStatus, RequestContext, ResultSet,
-        Routed, SchemaMigrationStatus, SchemaState, ShardKeyType, Statement, TablePlacement, Value,
+        GlobalIndexOperationalReport, GlobalIndexOperationalStatus, IdempotencyKey, RequestContext,
+        ResultLimits, ResultSet, Routed, RowStream, SchemaMigrationStatus, SchemaState,
+        ShardKeyType, Statement, TablePlacement, TrackedQuery, Value,
     },
     protocol::error::http_error,
 };
+
+pub(super) const REQUEST_ID_HEADER_NAME: &str = "BriskDB-Request-ID";
+pub(super) const IDEMPOTENCY_KEY_HEADER_NAME: &str = "BriskDB-Idempotency-Key";
+pub(super) const STREAM_MEDIA_TYPE: &str = "application/x-ndjson; charset=utf-8";
+
+const REQUEST_ID_HEADER: &str = "briskdb-request-id";
+const IDEMPOTENCY_KEY_HEADER: &str = "briskdb-idempotency-key";
+const IDEMPOTENCY_STATUS_HEADER: &str = "briskdb-idempotency-status";
+
+#[derive(Clone, Copy)]
+struct RequestIdentity([u8; 16]);
+
+impl fmt::Display for RequestIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RequestIdempotency(Option<IdempotencyKey>);
 
 /// Build an HTTP router from the legacy synchronous database handle.
 ///
@@ -53,6 +87,7 @@ pub fn router_with_engine(engine: Engine) -> Router {
         .route("/metrics", get(metrics))
         .merge(v1::routes())
         .merge(admin::routes(state.clone()))
+        .layer(middleware::from_fn(request_controls))
         .with_state(state)
 }
 
@@ -73,6 +108,7 @@ pub fn data_router(database: Arc<Database>) -> Router {
 pub fn data_router_with_engine(engine: Engine) -> Router {
     Router::new()
         .merge(v1::data_routes())
+        .layer(middleware::from_fn(request_controls))
         .with_state(HttpState::new(engine))
 }
 
@@ -98,7 +134,154 @@ pub fn admin_router_with_engine(engine: Engine) -> Router {
         .route("/metrics", get(metrics))
         .merge(v1::admin_routes())
         .merge(admin::routes(state.clone()))
+        .layer(middleware::from_fn(request_controls))
         .with_state(state)
+}
+
+async fn request_controls(mut request: Request, next: Next) -> Response {
+    let versioned = is_v1_path(request.uri().path());
+    let request_id = match one_header(request.headers(), REQUEST_ID_HEADER) {
+        Ok(Some(value)) => match parse_opaque_id(value) {
+            Some(value) => RequestIdentity(value),
+            None => {
+                return controlled_response(
+                    TransportError::InvalidRequest.into_response(),
+                    generate_request_id(),
+                    versioned,
+                );
+            }
+        },
+        Ok(None) => generate_request_id(),
+        Err(()) => {
+            return controlled_response(
+                TransportError::InvalidRequest.into_response(),
+                generate_request_id(),
+                versioned,
+            );
+        }
+    };
+
+    let idempotency = match one_header(request.headers(), IDEMPOTENCY_KEY_HEADER) {
+        Ok(Some(value)) => {
+            let Some(value) = value
+                .to_str()
+                .ok()
+                .and_then(|value| IdempotencyKey::from_str(value).ok())
+            else {
+                return controlled_response(
+                    TransportError::InvalidRequest.into_response(),
+                    request_id,
+                    versioned,
+                );
+            };
+            if request.method() != Method::POST || request.uri().path() != "/v1/execute" {
+                return controlled_response(
+                    ApiError(EngineError::new(
+                        EngineErrorKind::Unsupported,
+                        "the idempotency header is supported only by POST /v1/execute",
+                    ))
+                    .into_response(),
+                    request_id,
+                    versioned,
+                );
+            }
+            Some(value)
+        }
+        Ok(None) => None,
+        Err(()) => {
+            return controlled_response(
+                TransportError::InvalidRequest.into_response(),
+                request_id,
+                versioned,
+            );
+        }
+    };
+
+    request
+        .extensions_mut()
+        .insert(RequestIdempotency(idempotency));
+    let response = next.run(request).await;
+    controlled_response(response, request_id, false)
+}
+
+fn controlled_response(
+    mut response: Response,
+    request_id: RequestIdentity,
+    versioned: bool,
+) -> Response {
+    if versioned {
+        response
+            .headers_mut()
+            .insert("briskdb-api-version", HeaderValue::from_static("1"));
+    }
+    response.headers_mut().insert(
+        REQUEST_ID_HEADER,
+        HeaderValue::from_str(&request_id.to_string())
+            .expect("a hexadecimal request identity is a valid HTTP header"),
+    );
+    response
+}
+
+fn one_header<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+) -> Result<Option<&'a HeaderValue>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next();
+    if values.next().is_some() {
+        Err(())
+    } else {
+        Ok(first)
+    }
+}
+
+fn parse_opaque_id(value: &HeaderValue) -> Option<[u8; 16]> {
+    value.to_str().ok().and_then(parse_opaque_id_bytes)
+}
+
+fn parse_opaque_id_bytes(value: &str) -> Option<[u8; 16]> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut decoded = [0_u8; 16];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (decode_hex(pair[0]) << 4) | decode_hex(pair[1]);
+    }
+    (decoded != [0; 16]).then_some(decoded)
+}
+
+const fn decode_hex(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => 0,
+    }
+}
+
+fn generate_request_id() -> RequestIdentity {
+    static FALLBACK: AtomicU64 = AtomicU64::new(1);
+
+    loop {
+        let mut value = [0_u8; 16];
+        match getrandom::fill(&mut value) {
+            Ok(()) if value != [0; 16] => return RequestIdentity(value),
+            Ok(()) => continue,
+            Err(error) => {
+                tracing::error!(?error, "could not generate a random HTTP request identity");
+                value[..8].copy_from_slice(b"briskdb!");
+                value[8..].copy_from_slice(&FALLBACK.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+                return RequestIdentity(value);
+            }
+        }
+    }
+}
+
+fn is_v1_path(path: &str) -> bool {
+    path == "/v1" || path.starts_with("/v1/")
 }
 
 #[derive(Clone)]
@@ -697,10 +880,53 @@ struct QueryColumn {
     data_type: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct QueryStreamMeta {
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shard: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shards: Option<Vec<u16>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_encoding: Option<ValueEncoding>,
+    columns: Vec<QueryColumn>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryStreamRow {
+    kind: &'static str,
+    values: Vec<JsonValue>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryStreamComplete {
+    kind: &'static str,
+    rows: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryStreamError {
+    kind: &'static str,
+    #[serde(rename = "type")]
+    problem_type: &'static str,
+    title: &'static str,
+    status: u16,
+    detail: &'static str,
+    code: &'static str,
+}
+
+struct QueryStreamState {
+    stream: RowStream,
+    _tracked_query: TrackedQuery,
+    value_encoding: ValueEncoding,
+    rows: u64,
+}
+
 async fn execute(
     State(state): State<HttpState>,
-    V1Json(request): V1Json<RoutedSqlRequest>,
-) -> Result<Json<ExecuteResponse>, ApiError> {
+    Extension(RequestIdempotency(idempotency)): Extension<RequestIdempotency>,
+    V1Json(request): V1Json<ExecuteRequest>,
+) -> Result<Response, ApiError> {
     let engine = state.engine;
     let value_encoding = request.value_encoding;
     let params = request
@@ -712,23 +938,44 @@ async fn execute(
     if let Some(shard_key) = request.shard_key {
         session.set_routing_key(shard_key).await?;
     }
-    let Routed {
-        shard,
-        value: write_result,
-    } = engine
-        .execute_http_request(&session, Statement::new(request.sql, params))
-        .await?;
+    let statement = Statement::new(request.sql, params);
+    let (
+        Routed {
+            shard,
+            value: write_result,
+        },
+        idempotency_status,
+    ) = if let Some(idempotency) = idempotency {
+        let result = engine
+            .execute_idempotent_write(&session, idempotency, statement)
+            .await?;
+        let (routed, status) = result.into_parts();
+        (routed, Some(status))
+    } else {
+        (
+            engine.execute_http_request(&session, statement).await?,
+            None,
+        )
+    };
     let rows_affected = write_result.rows_affected;
     let generated_key = write_result
         .generated_key
         .map(execute_generated_key)
         .transpose()?;
 
-    Ok(Json(ExecuteResponse {
+    let mut response = Json(ExecuteResponse {
         shard,
         rows_affected,
         generated_key,
-    }))
+    })
+    .into_response();
+    if let Some(status) = idempotency_status {
+        response.headers_mut().insert(
+            IDEMPOTENCY_STATUS_HEADER,
+            HeaderValue::from_static(status.as_str()),
+        );
+    }
+    Ok(response)
 }
 
 fn execute_generated_key(generated: GeneratedKey) -> Result<ExecuteGeneratedKey, EngineError> {
@@ -754,6 +1001,8 @@ async fn query(
     V1Json(request): V1Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let engine = state.engine;
+    let result_limits =
+        effective_query_result_limits(request.result_limits, engine.options().result_limits())?;
     let value_encoding = request.value_encoding;
     let params = request
         .params
@@ -767,7 +1016,7 @@ async fn query(
         }
     }
     let tracked_query = engine.begin_tracked_query(&request.sql)?;
-    let context = tracked_query.request_context();
+    let context = tracked_query_context(&tracked_query, result_limits);
     let Executed {
         shards,
         value: result,
@@ -778,6 +1027,153 @@ async fn query(
     let response = result_set_to_query_response(shards, result, value_encoding);
 
     Ok(Json(response))
+}
+
+async fn query_stream(
+    State(state): State<HttpState>,
+    V1Json(request): V1Json<QueryRequest>,
+) -> Result<Response, ApiError> {
+    let engine = state.engine;
+    let result_limits =
+        effective_query_result_limits(request.result_limits, engine.options().result_limits())?;
+    let value_encoding = request.value_encoding;
+    let params = request
+        .params
+        .into_iter()
+        .map(|value| parameter_to_value(value, value_encoding))
+        .collect::<Result<Vec<_>, _>>()?;
+    let session = engine.session();
+    if engine.catalog().tables().is_empty() {
+        if let Some(shard_key) = request.shard_key {
+            session.set_routing_key(shard_key).await?;
+        }
+    }
+    let tracked_query = engine.begin_tracked_query(&request.sql)?;
+    let context = tracked_query_context(&tracked_query, result_limits);
+    let Executed {
+        shards,
+        value: row_stream,
+    } = engine
+        .stream_query_logical_with_context(&session, Statement::new(request.sql, params), context)
+        .await?;
+    let (shard, response_shards) = response_shards(&shards);
+    let meta = QueryStreamMeta {
+        kind: "meta",
+        shard,
+        shards: response_shards,
+        value_encoding: (!value_encoding.is_legacy()).then_some(value_encoding),
+        columns: query_columns(row_stream.columns()),
+    };
+    let meta = ndjson_line(&meta);
+    let rows = stream::unfold(
+        Some(QueryStreamState {
+            stream: row_stream,
+            _tracked_query: tracked_query,
+            value_encoding,
+            rows: 0,
+        }),
+        |state| async move {
+            let mut state = state?;
+            let next = match state.stream.next_row().await {
+                Some(Ok(row)) => {
+                    state.rows += 1;
+                    ndjson_line(&QueryStreamRow {
+                        kind: "row",
+                        values: row
+                            .into_values()
+                            .into_iter()
+                            .map(|value| value_to_json_with_encoding(value, state.value_encoding))
+                            .collect(),
+                    })
+                }
+                Some(Err(error)) => {
+                    let problem = problem_details(error);
+                    let line = ndjson_line(&QueryStreamError {
+                        kind: "error",
+                        problem_type: problem.problem_type,
+                        title: problem.title,
+                        status: problem.status,
+                        detail: problem.detail,
+                        code: problem.code,
+                    });
+                    return Some((Ok::<_, std::convert::Infallible>(line), None));
+                }
+                None => {
+                    let line = ndjson_line(&QueryStreamComplete {
+                        kind: "complete",
+                        rows: state.rows,
+                    });
+                    return Some((Ok::<_, std::convert::Infallible>(line), None));
+                }
+            };
+            Some((Ok::<_, std::convert::Infallible>(next), Some(state)))
+        },
+    );
+    let body = Body::from_stream(
+        stream::once(async move { Ok::<_, std::convert::Infallible>(meta) }).chain(rows),
+    );
+    let mut response = Response::new(body);
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(STREAM_MEDIA_TYPE));
+    Ok(response)
+}
+
+fn effective_query_result_limits(
+    requested: Option<QueryResultLimits>,
+    configured: ResultLimits,
+) -> Result<Option<ResultLimits>, EngineError> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    if requested.max_rows.is_none() && requested.max_logical_bytes.is_none() {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "result_limits must contain max_rows or max_logical_bytes",
+        ));
+    }
+    ResultLimits::new(
+        requested.max_rows.unwrap_or(configured.max_rows()),
+        requested
+            .max_logical_bytes
+            .unwrap_or(configured.max_bytes()),
+    )
+    .map(Some)
+}
+
+fn tracked_query_context(
+    tracked_query: &TrackedQuery,
+    result_limits: Option<ResultLimits>,
+) -> RequestContext {
+    let context = tracked_query.request_context();
+    match result_limits {
+        Some(result_limits) => context.with_result_limits(result_limits),
+        None => context,
+    }
+}
+
+fn response_shards(shards: &[u16]) -> (Option<u16>, Option<Vec<u16>>) {
+    match shards {
+        [shard] => (Some(*shard), None),
+        _ => (None, Some(shards.to_vec())),
+    }
+}
+
+fn query_columns(columns: &[crate::core::Column]) -> Vec<QueryColumn> {
+    columns
+        .iter()
+        .map(|column| QueryColumn {
+            name: column.name.clone(),
+            data_type: data_type_name(column.data_type),
+        })
+        .collect()
+}
+
+fn ndjson_line(value: &impl Serialize) -> Bytes {
+    let mut encoded =
+        serde_json::to_vec(value).expect("HTTP stream records contain only infallible JSON values");
+    encoded.push(b'\n');
+    Bytes::from(encoded)
 }
 
 async fn broadcast(
@@ -1272,19 +1668,23 @@ struct ProblemDetails {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let mapping = http_error(self.0.kind());
-        tracing::error!(
-            error = ?self.0,
-            error_code = self.0.code(),
-            "engine request failed"
-        );
-        problem_response(ProblemDetails {
-            problem_type: mapping.problem_type,
-            title: mapping.title,
-            status: mapping.status,
-            detail: mapping.detail,
-            code: self.0.code(),
-        })
+        problem_response(problem_details(self.0))
+    }
+}
+
+fn problem_details(error: EngineError) -> ProblemDetails {
+    let mapping = http_error(error.kind());
+    tracing::error!(
+        error = ?error,
+        error_code = error.code(),
+        "engine request failed"
+    );
+    ProblemDetails {
+        problem_type: mapping.problem_type,
+        title: mapping.title,
+        status: mapping.status,
+        detail: mapping.detail,
+        code: error.code(),
     }
 }
 
@@ -3086,7 +3486,7 @@ mod tests {
             let body = format!(r#"{{"sql":"SELECT ?1","params":[{nested}]}}"#);
             let previous_accepts = serde_json::from_str::<PreviousSqlRequest>(&body)
                 .is_ok_and(|request| request.params.len() == 1);
-            let current_accepts = serde_json::from_str::<RoutedSqlRequest>(&body)
+            let current_accepts = serde_json::from_str::<ExecuteRequest>(&body)
                 .ok()
                 .and_then(|mut request| request.params.pop())
                 .is_some_and(|parameter| {
@@ -3130,13 +3530,13 @@ mod tests {
         .unwrap();
         assert_eq!(read.shard_key, None);
 
-        let generated = serde_json::from_value::<RoutedSqlRequest>(json!({
+        let generated = serde_json::from_value::<ExecuteRequest>(json!({
             "sql": "INSERT INTO events (payload) VALUES (?1)"
         }))
         .unwrap();
         assert_eq!(generated.shard_key, None);
 
-        let explicit = serde_json::from_value::<RoutedSqlRequest>(json!({
+        let explicit = serde_json::from_value::<ExecuteRequest>(json!({
             "shard_key": "tenant-42",
             "sql": "INSERT INTO events (tenant_key, payload) VALUES (?1, ?2)"
         }))

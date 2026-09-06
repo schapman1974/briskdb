@@ -88,9 +88,45 @@ jobs:
           }
           trap cleanup EXIT
           for attempt in {1..30}; do
-            if curl --fail --silent --show-error http://127.0.0.1:17654/v1 >/dev/null \
-              && curl --fail --silent --show-error http://127.0.0.1:17655/v1/ready >/dev/null \
-              && curl --fail --silent --show-error http://127.0.0.1:17655/admin >/dev/null; then
+            if curl --fail --silent --show-error \
+                --dump-header "$data_dir/data.headers" \
+                --output "$data_dir/data.json" \
+                http://127.0.0.1:17654/v1 \
+              && curl --fail --silent --show-error \
+                --dump-header "$data_dir/ready.headers" \
+                --output "$data_dir/ready.json" \
+                http://127.0.0.1:17655/v1/ready \
+              && curl --fail --silent --show-error \
+                --dump-header "$data_dir/stream.headers" \
+                --output "$data_dir/stream.ndjson" \
+                --header 'content-type: application/json' \
+                --data '{"sql":"SELECT 1 AS value","shard_key":"release-smoke"}' \
+                http://127.0.0.1:17654/v1/query/stream \
+              && curl --fail --silent --show-error http://127.0.0.1:17655/admin >/dev/null \
+              && python3 - "$data_dir" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          for name in ("data", "ready", "stream"):
+              headers = (root / f"{name}.headers").read_text(encoding="utf-8")
+              values = [
+                  line.split(":", 1)[1].strip()
+                  for line in headers.splitlines()
+                  if line.split(":", 1)[0].lower() == "briskdb-request-id"
+              ]
+              assert len(values) == 1 and re.fullmatch(r"[0-9a-f]{32}", values[0])
+              assert values[0] != "0" * 32
+          stream_headers = (root / "stream.headers").read_text(encoding="utf-8").lower()
+          assert "content-type: application/x-ndjson; charset=utf-8" in stream_headers
+          records = [json.loads(line) for line in (root / "stream.ndjson").read_text().splitlines()]
+          assert [record["kind"] for record in records] == ["meta", "row", "complete"]
+          assert records[1]["values"] == [1]
+          assert records[2] == {"kind": "complete", "rows": 1}
+          PY
+            then
               kill -TERM "$server_pid"
               wait "$server_pid"
               trap - EXIT

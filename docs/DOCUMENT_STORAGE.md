@@ -10,9 +10,9 @@ listener or a high-level embedded collection API.
 
 ## Logical catalog
 
-Manifest format 14 keeps document namespaces separate from the SQL table
-catalog. A SQL table can never become a collection through schema discovery.
-The manifest stores:
+Manifest format 14 introduced document namespaces separate from the SQL table
+catalog, and the current format 15 retains that contract. A SQL table can
+never become a collection through schema discovery. The manifest stores:
 
 - exact, case-sensitive database and collection names;
 - ordered BSON collection options;
@@ -92,8 +92,8 @@ A retained cursor forces sole-process startup ownership. Restart resumes the
 exact remaining shard prefix idempotently. An active collection with a missing
 or incompatible table is corruption. An exact document table without catalog
 authority is also rejected. Builds without the `documents` feature still
-understand manifest format 14 and validate its physical schema, but refuse to
-open a root containing active collections.
+understand current manifest format 15 and validate its physical schema, but
+refuse to open a root containing active collections.
 
 ## TinyMongo SQLite import
 

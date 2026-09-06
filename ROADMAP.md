@@ -332,8 +332,10 @@ protocol-specific golden tests only for encoding and state-machine behavior.
   (issue #52); see [the listener contract](docs/HTTP_LISTENERS.md).
 - [x] Add endpoints for health, readiness, catalog inspection, migrations,
   shard state, query cancellation, backup, and maintenance.
-- [ ] Add request IDs, idempotency keys for eligible writes, pagination/streaming,
-  body/result limits, and stable problem-detail errors.
+- [x] Add request IDs, durable idempotency keys for eligible writes,
+  request-local result limits, and bounded HTTP row streaming with stable
+  problem-detail errors (issue #54). Retained pagination and global SQL ordering
+  remain in Phase 7 issues #58 and #59.
 - [ ] Generate and test an OpenAPI document from the implementation.
 - [ ] Require authentication and role checks; apply TLS or explicitly document
   trusted reverse-proxy termination.

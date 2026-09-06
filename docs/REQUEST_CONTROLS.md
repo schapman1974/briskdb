@@ -129,6 +129,56 @@ request deadlines wins. Deadline failures use the distinct
 `DeadlineExceeded` kind. The server flag `--request-timeout-ms 0` disables the
 engine default.
 
+## HTTP request identity and idempotent writes
+
+The HTTP adapter generates a fresh nonzero 128-bit request ID when one is
+omitted, or validates and echoes one canonical value supplied by the caller. It
+returns the value as 32 lowercase hexadecimal characters in
+`BriskDB-Request-ID`. Generation normally uses operating-system randomness and
+falls back to a process-local counter if that source fails, so the value is
+correlation data rather than a global uniqueness or security guarantee.
+Malformed or duplicate values fail before Engine admission and receive a new
+server-generated ID on the error. Request IDs have no Engine or storage state:
+reusing one does not deduplicate, cancel, authorize, or otherwise couple two
+operations.
+
+`BriskDB-Idempotency-Key` is a separate opt-in control for the narrow write
+class the Engine can receipt atomically. `Engine::execute_idempotent_write`
+accepts an `IdempotencyKey` only for one planner-proven exact-shard direct
+autocommit DML statement over a registered table without generated-key or
+global-index coordination. Unsupported shapes fail before mutation. The
+ordinary execute APIs and an HTTP execute without the header retain their
+existing at-least-once delivery semantics.
+
+Key ownership covers the database root in the current unauthenticated,
+service-wide namespace. It does not vary by listener, connection, request ID,
+or source address. One of 256 fixed advisory lock stripes
+serializes the key across processes while the Engine reserves ordinary shard
+and worker admission and checks the receipt on every shard. A duplicate exact
+semantic digest replays the retained `WriteResult`; a duplicate key with a
+different digest returns `IdempotencyConflict`. A new operation executes the
+DML and inserts its receipt in the same target-shard SQLite transaction. Crash
+or disconnect before that commit retains neither; after commit it retains both,
+so the next exact request can return the known result without rerunning SQL.
+Cancellation observed only after that known commit cannot turn the success
+into an unknown failure.
+
+The semantic digest is a versioned core encoding of the API operation, exact
+SQL bytes, typed parameter values and floating-point bits, explicit routing
+input, default logical database, table, and resolved shard. It does not depend
+on HTTP JSON whitespace/member order, the selected value representation,
+request or query IDs, translated SQL, or current schema generation. Storage
+keeps only the key and request digests plus the target, row count, format, and
+retention timestamps; raw keys and request content are never persisted.
+
+Each target shard retains at most 4,096 unexpired receipts for a fixed 24-hour
+server-wall-clock window. No unexpired receipt is evicted. The target
+transaction removes an expired same-key row plus at most 64 additional expired
+rows before checking capacity; a full unexpired set rejects the write before
+DML. Lock acquisition is nonblocking, so contention is the ordinary retryable
+`Busy` result rather than an unbounded wait. The hidden table and lock-file
+format are specified in [the storage contract](STORAGE_FORMAT.md).
+
 ## Query result budgets
 
 Every query has a finite row and logical-byte budget. Defaults are 10,000 rows
@@ -137,6 +187,14 @@ context may narrow but never widen its engine's configured budget. Equality at
 the limit succeeds. Exceeding either limit returns `LimitExceeded`. Materialized
 Engine APIs return no partial `ResultSet`; a streaming frontend may already
 have delivered the bounded prefix that preceded a later limit failure.
+
+HTTP query requests may supply a strict `result_limits` object containing one
+or both positive integer members `max_rows` and `max_logical_bytes`. The
+adapter creates the query's `RequestContext` from those values, and the Engine
+uses the lower request or configured value independently for each dimension.
+The object applies to both `/v1/query` and `/v1/query/stream`; execute and
+administration envelopes reject it. The data-plane discovery document reports
+the configured ceilings, not a per-request override.
 
 Logical bytes use a stable protocol-neutral model rather than JSON or future
 wire-protocol encoding:
@@ -164,13 +222,22 @@ unaffected by query result budgets. A logical scatter applies one budget to the
 combined result, including one result envelope and one set of column metadata;
 it does not grant every shard a fresh row or byte allowance.
 
-PostgreSQL reads use a protocol-neutral stream with a 16-row handoff. SQLite
-stops stepping when that handoff is full and resumes only as the client drains
-rows. Scatter streams visit physical shards in ascending order to retain the
-same deterministic concatenation while holding one shard connection at a time.
-Dropping or closing a stream cancels its operation; request cancellation,
-deadline expiry, and shutdown interrupt the currently leased SQLite handle and
-discard already-buffered rows.
+PostgreSQL reads and HTTP `/v1/query/stream` use the protocol-neutral stream
+with a 16-row handoff. SQLite stops stepping when that handoff is full and
+resumes only as the client drains rows. Scatter streams visit physical shards
+in ascending order to retain the same deterministic concatenation while
+holding one shard connection at a time. Dropping or closing a stream cancels
+its operation; request cancellation, deadline expiry, and shutdown interrupt
+the currently leased SQLite handle and discard already-buffered rows.
+
+The HTTP response owns both its `TrackedQuery` guard and the `RowStream` until
+the final record or body drop. A successful NDJSON response ends only with a
+completion record. Once HTTP 200 and metadata have been emitted, a deadline,
+cancellation, storage, or result-limit failure appears as one redacted terminal
+error record after the already delivered prefix. It is not a partial successful
+query. EOF without completion is indeterminate. The adapter adds no retained
+cursor, idle connection lease, SQL rewrite, or new cross-shard snapshot and
+ordering promise.
 
 Logical scatter/gather schedules at most eight shard tasks concurrently. All
 children inherit the operation's one absolute deadline and sticky cancellation

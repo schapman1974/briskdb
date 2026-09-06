@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added the non-retryable `IdempotencyConflictError` integrity category for
+  the matching protocol-neutral engine error.
 - Split attached HTTP serving into data and administration listeners over the
   same engine. `http` and `http_address` retain their data-plane meaning and
   `data_address` names it explicitly. `admin` defaults to an ephemeral loopback

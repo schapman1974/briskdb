@@ -9,6 +9,7 @@ Python wheel use the same locks and SQLite WAL files.
 | Operation | While peers are open |
 | --- | --- |
 | Reads and autocommit writes | Supported; normal SQLite writer contention can return retryable `Busy` |
+| Eligible durable idempotent writes | Supported; one of 256 retained database-root lock stripes serializes database-wide key ownership before the target-shard DML and receipt commit together |
 | Generated IDs | Supported; native ranges and manifest-leased hi/lo blocks remain unique |
 | Non-unique global-index outbox writes | Supported; row and event share one shard transaction, and each shard cursor follows WAL commit order |
 | Asynchronous non-unique index workers | Supported; expiring per-index/per-shard leases and monotonic fences allow safe handoff, replay, and concurrent processes |
@@ -31,21 +32,30 @@ should use the `spawn` multiprocessing context or start a fresh interpreter.
 
 ## Coordination files
 
-Two owner-only regular files live beside `manifest.sqlite`:
+Two lifecycle files and up to 256 keyed-write stripe files live beside
+`manifest.sqlite`:
 
 ```text
 .briskdb-process.lock   lifetime shared lease and sole-process mutation fence
 .briskdb-startup.lock   startup and recovery serialization
+.briskdb-idempotency-XX.lock  fixed keyed-write stripe, XX = 00..ff
 ```
 
 They are created with mode `0600`, opened without following symbolic links,
 and released by the kernel when a process exits, including an abrupt exit. The
 files may remain after shutdown; lock ownership is not stored in their bytes.
-Do not delete, replace, or edit them while any BriskDB process is running.
+Idempotency stripe files are created on first use and deliberately retained, so
+unlinking one cannot let later callers lock different inodes for the same
+stripe. Do not delete, replace, or edit any coordination file while a BriskDB
+process is running.
 
 The lock order is startup lock, process mutation fence when needed, in-process
 schema gate, manifest transaction, then shard work. Steady-state data requests
 hold only the lifetime shared process lease plus ordinary SQLite locks.
+An eligible idempotent write takes schema/session and ordinary pool/worker
+admission, then its nonblocking fixed stripe lock, then visits shard
+transactions in physical-shard order. Stripe contention returns retryable
+`Busy`; it never waits while holding an application transaction.
 
 ## Python processes
 
@@ -107,3 +117,10 @@ entry/watermark/ack boundaries, abrupt termination, reopen/integrity
 validation, and one service plus one embedder.
 `python/tests/test_multiprocess.py` repeats the public wheel contract with
 independently spawned interpreters.
+
+Database-wide keyed-write serialization and replay use actual child processes
+in the `core::engine`, `storage::process_lock`, and `storage::idempotency` unit
+tests. They race equal and conflicting requests through independent Engines,
+verify cross-process stripe contention and release, and kill a writer on both
+sides of the atomic application-DML/receipt commit before reopening and
+replaying the result.

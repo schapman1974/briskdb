@@ -3,8 +3,8 @@
 BriskDB's supported alpha backup is a complete copy made while every BriskDB
 process using the data directory is stopped. This procedure preserves one
 consistent manifest, shard set, schema generation, routing map, generated-ID
-allocator state, physical global-index storage, and any SQLite sidecar files as
-a unit.
+allocator state, idempotency receipts, physical global-index storage, and any
+SQLite sidecar files as a unit.
 
 This is not an online backup. Do not copy a live data directory, even when no
 application writes are expected. Coordinated online backup remains tracked by
@@ -36,8 +36,10 @@ manifest-defined cross-file recovery point.
    `global-indexes` directory when present, the import receipt when present,
    `.briskdb-process.lock`, `.briskdb-startup.lock`, and every SQLite `-wal`,
    `-shm`, or journal sidecar that exists. The lock files contain no persistent
-   ownership, but a complete-directory copy includes them. Do not select
-   individual database files.
+   ownership; this also applies to any fixed
+   `.briskdb-idempotency-XX.lock` stripe files created so far. A complete-
+   directory copy includes them, while durable idempotency receipts live inside
+   their shard databases. Do not select individual database files.
 6. Make the backup durable using the snapshot, archive, or copy tool's normal
    completion and sync guarantees. Retain the recorded BriskDB version and
    shard count with the backup.
@@ -66,7 +68,8 @@ stopped directory as one recovery point.
 4. Require HTTP 200 from `/v1/ready` on the administration listener, inspect
    `/v1/admin/catalog`, check `/health`, and read known rows through the data
    listener from representative shard keys before returning the service to
-   use.
+   use. A retained eligible-write idempotency key remains replayable until its
+   stored server-time expiry; restore does not restart its 24-hour window.
 5. Keep the prior directory and backup unchanged until validation succeeds.
    If validation fails, stop the process and investigate; do not edit manifest
    state, SQLite headers, or checksums to force startup.

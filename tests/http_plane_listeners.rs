@@ -84,7 +84,28 @@ async fn request(
         .unwrap()
         .parse()
         .unwrap();
-    let headers = lines
+    let header_lines = lines.collect::<Vec<_>>();
+    let request_ids = header_lines
+        .iter()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("briskdb-request-id"))
+        .map(|(_, value)| value.trim())
+        .collect::<Vec<_>>();
+    assert_eq!(request_ids.len(), 1, "{method} {path}");
+    let request_id = request_ids[0];
+    assert_eq!(request_id.len(), 32, "{method} {path}");
+    assert!(
+        request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{method} {path}"
+    );
+    assert_ne!(
+        request_id, "00000000000000000000000000000000",
+        "{method} {path}"
+    );
+    let headers = header_lines
+        .into_iter()
         .map(|line| {
             let (name, value) = line.split_once(':').unwrap();
             (name.to_ascii_lowercase(), value.trim().to_owned())
@@ -171,6 +192,63 @@ async fn start_unread_query(address: SocketAddr, sql: &str) -> tokio::net::TcpSt
     stream
 }
 
+async fn start_unread_stream(address: SocketAddr, sql: &str) -> tokio::net::TcpStream {
+    let body = serde_json::to_vec(&json!({"shard_key":"stream-owner", "sql":sql})).unwrap();
+    let head = format!(
+        "POST /v1/query/stream HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(&body).await.unwrap();
+
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(
+                read > 0,
+                "streaming response closed before its metadata frame"
+            );
+            response.extend_from_slice(&chunk[..read]);
+            if response
+                .windows(b"\"kind\":\"meta\"".len())
+                .any(|window| window == b"\"kind\":\"meta\"")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the streaming response should produce metadata promptly");
+    let boundary = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let headers = std::str::from_utf8(&response[..boundary])
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(headers.starts_with("http/1.1 200 ok\r\n"));
+    assert!(headers.contains("\r\ncontent-type: application/x-ndjson; charset=utf-8\r\n"));
+    assert!(headers.contains("\r\nbriskdb-api-version: 1\r\n"));
+    let request_ids = headers
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name == &"briskdb-request-id")
+        .map(|(_, value)| value.trim())
+        .collect::<Vec<_>>();
+    assert_eq!(request_ids.len(), 1);
+    assert_eq!(request_ids[0].len(), 32);
+    assert!(
+        request_ids[0]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    assert_ne!(request_ids[0], "00000000000000000000000000000000");
+    stream
+}
+
 #[tokio::test]
 async fn attached_data_and_admin_planes_are_isolated_over_real_tcp() {
     let temp = tempfile::tempdir().unwrap();
@@ -195,6 +273,137 @@ async fn attached_data_and_admin_planes_are_isolated_over_real_tcp() {
     assert_ne!(admin.port(), 0);
     assert_ne!(data, admin);
 
+    let supplied_request_id = "1234567890abcdef1234567890abcdef";
+    let fallback = request(
+        data,
+        "GET",
+        "/private-sentinel",
+        None,
+        &[],
+        &[("BriskDB-Request-ID", supplied_request_id)],
+    )
+    .await;
+    assert_eq!(fallback.status, 404);
+    assert_eq!(
+        fallback.header("briskdb-request-id"),
+        Some(supplied_request_id)
+    );
+
+    for path in ["/admin", "/admin/assets/app.js"] {
+        let browser = request(
+            admin,
+            "GET",
+            path,
+            None,
+            &[],
+            &[("BriskDB-Request-ID", supplied_request_id)],
+        )
+        .await;
+        assert_eq!(browser.status, 200, "{path}");
+        assert_eq!(
+            browser.header("briskdb-request-id"),
+            Some(supplied_request_id),
+            "{path}"
+        );
+    }
+
+    let invalid_browser_id = request(
+        admin,
+        "GET",
+        "/admin/assets/app.js",
+        None,
+        &[],
+        &[("BriskDB-Request-ID", "ABC")],
+    )
+    .await;
+    assert_eq!(invalid_browser_id.status, 400);
+    assert_ne!(invalid_browser_id.header("briskdb-request-id"), Some("ABC"));
+    assert!(invalid_browser_id.header("briskdb-api-version").is_none());
+    assert_eq!(invalid_browser_id.json()["code"], "invalid_argument");
+    assert_eq!(invalid_browser_id.json().as_object().unwrap().len(), 5);
+
+    let duplicate_data_id = request(
+        data,
+        "GET",
+        "/v1",
+        None,
+        &[],
+        &[
+            ("BriskDB-Request-ID", supplied_request_id),
+            ("BriskDB-Request-ID", supplied_request_id),
+        ],
+    )
+    .await;
+    assert_versioned_problem(&duplicate_data_id, 400, "invalid_argument");
+    assert_ne!(
+        duplicate_data_id.header("briskdb-request-id"),
+        Some(supplied_request_id)
+    );
+
+    for (headers, expected_status, echoed) in [
+        (vec![("BriskDB-Request-ID", "ABC")], 400, None),
+        (
+            vec![
+                ("BriskDB-Request-ID", supplied_request_id),
+                ("BriskDB-Request-ID", supplied_request_id),
+            ],
+            400,
+            None,
+        ),
+        (
+            vec![
+                ("BriskDB-Request-ID", supplied_request_id),
+                ("BriskDB-Idempotency-Key", supplied_request_id),
+            ],
+            501,
+            Some(supplied_request_id),
+        ),
+    ] {
+        let response = request(data, "HEAD", "/v1/query", None, &[], &headers).await;
+        assert_eq!(response.status, expected_status);
+        assert_eq!(response.header("briskdb-api-version"), Some("1"));
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/problem+json")
+        );
+        assert!(
+            response
+                .header("content-length")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                > 0
+        );
+        assert!(response.header("briskdb-idempotency-status").is_none());
+        assert!(response.body.is_empty());
+        if let Some(echoed) = echoed {
+            assert_eq!(response.header("briskdb-request-id"), Some(echoed));
+        } else {
+            assert_ne!(
+                response.header("briskdb-request-id"),
+                Some(supplied_request_id)
+            );
+            assert_ne!(response.header("briskdb-request-id"), Some("ABC"));
+        }
+    }
+
+    let padded_request_id = format!("  {supplied_request_id}\t");
+    let normalized_ows = request(
+        data,
+        "HEAD",
+        "/v1",
+        None,
+        &[],
+        &[("BriskDB-Request-ID", &padded_request_id)],
+    )
+    .await;
+    assert_eq!(normalized_ows.status, 200);
+    assert_eq!(
+        normalized_ows.header("briskdb-request-id"),
+        Some(supplied_request_id)
+    );
+    assert!(normalized_ows.body.is_empty());
+
     let discovery = get(data, "/v1").await;
     assert_eq!(discovery.status, 200);
     assert_eq!(discovery.header("briskdb-api-version"), Some("1"));
@@ -205,6 +414,10 @@ async fn attached_data_and_admin_planes_are_isolated_over_real_tcp() {
     let discovery_head = request(data, "HEAD", "/v1", None, &[], &[]).await;
     assert_eq!(discovery_head.status, 200);
     assert_eq!(discovery_head.header("briskdb-api-version"), Some("1"));
+    assert_eq!(
+        discovery_head.header("content-length"),
+        discovery.header("content-length")
+    );
     assert!(discovery_head.body.is_empty());
 
     let data_query = post_json(
@@ -215,6 +428,17 @@ async fn attached_data_and_admin_planes_are_isolated_over_real_tcp() {
     .await;
     assert_eq!(data_query.status, 200);
     assert_eq!(data_query.json()["rows"], json!([[7]]));
+    let data_stream = post_json(
+        data,
+        "/v1/query/stream",
+        json!({"shard_key":"plane-owner", "sql":"SELECT 8 AS value"}),
+    )
+    .await;
+    assert_eq!(data_stream.status, 200);
+    assert_eq!(
+        data_stream.header("content-type"),
+        Some("application/x-ndjson; charset=utf-8")
+    );
 
     for path in ["/health", "/ready", "/metrics", "/admin"] {
         let response = get(data, path).await;
@@ -276,6 +500,10 @@ async fn attached_data_and_admin_planes_are_isolated_over_real_tcp() {
     let health_head = request(admin, "HEAD", "/v1/health", None, &[], &[]).await;
     assert_eq!(health_head.status, 200);
     assert_eq!(health_head.header("briskdb-api-version"), Some("1"));
+    assert_eq!(
+        health_head.header("content-length"),
+        versioned_health.header("content-length")
+    );
     assert!(health_head.body.is_empty());
     let ready = get(admin, "/ready").await;
     assert_eq!(ready.status, 200);
@@ -333,6 +561,14 @@ async fn attached_data_and_admin_planes_are_isolated_over_real_tcp() {
         &post_json(
             admin,
             "/v1/query",
+            json!({"shard_key":"plane-owner", "sql":"SELECT 99"}),
+        )
+        .await,
+    );
+    assert_versioned_not_found(
+        &post_json(
+            admin,
+            "/v1/query/stream",
             json!({"shard_key":"plane-owner", "sql":"SELECT 99"}),
         )
         .await,
@@ -457,6 +693,7 @@ async fn admin_cancels_only_the_selected_data_query_and_disconnect_unregisters_i
     let data = server.addresses().data();
     let admin = server.addresses().admin().unwrap();
     let slow_sql = "WITH RECURSIVE numbers(value) AS (VALUES(0) UNION ALL SELECT value + 1 FROM numbers WHERE value < 1000000000) SELECT sum(value) FROM numbers";
+    let streaming_sql = "WITH RECURSIVE numbers(value) AS (VALUES(0) UNION ALL SELECT value + 1 FROM numbers WHERE value < 1000000000) SELECT value FROM numbers";
 
     let first = tokio::spawn(async move {
         post_json(
@@ -611,6 +848,31 @@ async fn admin_cancels_only_the_selected_data_query_and_disconnect_unregisters_i
     .await;
     assert_eq!(after_disconnect.status, 200);
     assert_eq!(after_disconnect.json()["rows"], json!([[11]]));
+
+    let unread_stream = start_unread_stream(data, streaming_sql).await;
+    let streamed = wait_for_active_query_count(admin, 1).await;
+    let streamed_id = operation_id(&streamed[0]).to_owned();
+    drop(unread_stream);
+    assert!(wait_for_active_query_count(admin, 0).await.is_empty());
+    assert_versioned_not_found(
+        &request(
+            admin,
+            "POST",
+            &format!("/v1/admin/queries/{streamed_id}/cancel"),
+            None,
+            &[],
+            &[],
+        )
+        .await,
+    );
+    let after_stream_disconnect = post_json(
+        data,
+        "/v1/query",
+        json!({"shard_key":"stream-owner", "sql":"SELECT 13 AS value"}),
+    )
+    .await;
+    assert_eq!(after_stream_disconnect.status, 200);
+    assert_eq!(after_stream_disconnect.json()["rows"], json!([[13]]));
 
     assert!(!server.close().await.unwrap());
     assert_eq!(database.state(), briskdb::core::EngineState::Running);

@@ -5,6 +5,7 @@ import briskdb
 
 
 def sync_contract(path: str) -> None:
+    conflict_type: type[briskdb.IntegrityError] = briskdb.IdempotencyConflictError
     config: briskdb.Config = briskdb.Config(shards=2)
     database: briskdb.Database = briskdb.open(path, config=config)
     server: briskdb.Server = database.serve()
@@ -56,6 +57,7 @@ def sync_contract(path: str) -> None:
         documents,
         count,
         deleted,
+        conflict_type,
     )
 
 

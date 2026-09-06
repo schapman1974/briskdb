@@ -1,5 +1,41 @@
 # Unreleased
 
+BriskDB's HTTP routers now assign every response a `BriskDB-Request-ID`;
+callers may supply one canonical nonzero 128-bit lowercase-hex value and BriskDB
+echoes it for correlation, while malformed or duplicate values fail with a fresh redacted ID.
+Request IDs do not cancel, authenticate, or deduplicate work. Existing Problem
+Details keep their exact five fields and mappings.
+
+Eligible catalog-routed single-shard autocommit DML can opt into durable replay
+with `BriskDB-Idempotency-Key`. BriskDB checks the key database-wide under a
+fixed cross-process lock stripe and commits the mutation and hidden receipt in
+one target-shard transaction. Exact retries within 24 hours replay the original
+row count; different-operation reuse returns `idempotency_conflict`, and
+generated-target, global-index, raw, schema, transaction, and coordinator writes fail
+as unsupported before mutation. Receipts contain digests and bounded metadata,
+never raw request content, and each shard retains at most 4,096 unexpired rows.
+The Rust API adds `IdempotencyKey`, `IdempotencyStatus`,
+`IdempotentWriteResult`, the idempotent Engine methods and limits, plus the
+non-exhaustive `EngineErrorKind::IdempotencyConflict`. Python exposes the
+matching `IdempotencyConflictError` category even though keyed execution is
+currently an HTTP and Rust Engine operation.
+
+`POST /v1/query/stream` adds LF-delimited JSON metadata, positional row, and
+terminal completion or redacted error records over the existing 16-row Engine
+stream. Query-only `result_limits` can narrow the configured logical row and
+byte budgets for either materialized or streamed reads. The existing
+`/v1/query` representation and unkeyed execute behavior remain unchanged.
+Retained cursors, continuation tokens, global ordering, and general SQL
+pagination remain Phase 7 work.
+
+The on-disk format advances from manifest version 14 to 15. The automatic
+v14-to-v15 manifest transaction changes only the downgrade fence; the manifest
+table set and semantic digest version remain unchanged. Keyed execution may
+then create the exact optional shard-local `briskdb_idempotency_receipts_v1`
+table. Older binaries refuse the version-15 manifest. In-place downgrade is
+unsupported; rollback requires the complete stopped-server backup made before
+upgrade.
+
 The administration HTTP listener now exposes versioned operational endpoints
 for readiness, relational catalog inspection, migration progress and exact
 generation lookup, validated shard state, bounded active-query inspection and
@@ -31,7 +67,9 @@ Both unauthenticated HTTP planes remain loopback-only.
 
 Relative route paths and response representations are unchanged, but operator
 and browser clients must use the administration base address. Cross-plane paths
-return 404 rather than reaching the other router. Rust retains the established
+with ordinary request controls return 404 rather than reaching the other router;
+malformed controls or an idempotency key on an unsupported route can fail before
+route dispatch. Rust retains the established
 combined HTTP router helpers for host-owned integration, while daemon and
 attached-server assembly use the split routers. Python attached servers add an
 ephemeral-by-default `admin` listener and optional `admin_address`; passing

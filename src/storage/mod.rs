@@ -8,6 +8,7 @@ pub(crate) use document::{
 mod global_index;
 mod global_index_async;
 mod hilo;
+mod idempotency;
 mod index_outbox;
 mod manifest;
 mod migration;
@@ -22,7 +23,9 @@ mod sharded_vtab;
 pub(crate) use sharded_vtab::{RegistrySchemaCache, WriteCoordinator};
 
 pub(crate) mod pool;
+pub(crate) use idempotency::{IdempotencyReceipt, IdempotentExecuteOutcome, NewIdempotencyReceipt};
 pub(crate) use pool::{ConnectionOwner, ConnectionPools, PooledConnection};
+pub(crate) use process_lock::IdempotencyStripeGuard;
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -61,9 +64,9 @@ use crate::{
         GlobalIndexShardSummaryRebuildReport, GlobalIndexShardSummaryState,
         GlobalIndexShardSummaryStatus, GlobalIndexValidationMode, GlobalIndexValidationOptions,
         GlobalIndexValidationReport, GlobalOperationId, GlobalUniqueMutation,
-        GlobalUniqueReservation, GlobalValueLease, IndexKeyValue, MAX_TABLES, OperationControl,
-        SchemaMigrationState, SchemaMigrationStatus, SchemaMigrationSummary, ShardKeyType,
-        TableDeclaration, TablePlacement,
+        GlobalUniqueReservation, GlobalValueLease, IDEMPOTENCY_LOCK_STRIPES, IndexKeyValue,
+        MAX_TABLES, OperationControl, SchemaMigrationState, SchemaMigrationStatus,
+        SchemaMigrationSummary, ShardKeyType, TableDeclaration, TablePlacement,
         generated_id::{
             NATIVE_RANGE_V1_FORMAT_MARKER, native_range_v1_sequence_ceiling,
             native_range_v1_sequence_floor,
@@ -83,6 +86,7 @@ pub(crate) const MAX_SCHEMA_MIGRATION_SQL_BYTES: usize = manifest::MAX_SCHEMA_MI
 struct RootSchemaCoordination {
     gate: schema_gate::SchemaGate,
     process_lease: process_lock::RootProcessLease,
+    idempotency_stripes: Arc<[AtomicBool; IDEMPOTENCY_LOCK_STRIPES]>,
     catalogs: Mutex<Vec<Weak<CatalogSnapshot>>>,
     schema_digests: Mutex<RuntimeSchemaDigests>,
     #[cfg_attr(not(feature = "experimental-vtab"), allow(dead_code))]
@@ -126,6 +130,7 @@ impl RootSchemaCoordination {
         Ok(Self {
             gate: schema_gate::SchemaGate::new(),
             process_lease: process_lock::RootProcessLease::acquire(root)?,
+            idempotency_stripes: Arc::new(std::array::from_fn(|_| AtomicBool::new(false))),
             catalogs: Mutex::new(Vec::new()),
             schema_digests: Mutex::new(RuntimeSchemaDigests::default()),
             hilo_allocator: hilo::HiloAllocator::new()?,
@@ -568,6 +573,17 @@ fn schema_migration_status(migration: &manifest::SchemaMigration) -> SchemaMigra
 }
 
 impl Storage {
+    pub(crate) fn try_acquire_idempotency_stripe(
+        &self,
+        key_digest: [u8; 32],
+    ) -> EngineResult<IdempotencyStripeGuard> {
+        process_lock::IdempotencyStripeGuard::try_acquire(
+            &self.root,
+            key_digest,
+            Arc::clone(&self.schema_coordination.idempotency_stripes),
+        )
+    }
+
     pub(crate) fn open(root: impl AsRef<Path>, requested_shards: u16) -> EngineResult<Self> {
         validate_shard_count(requested_shards)?;
 
@@ -3335,6 +3351,7 @@ impl Storage {
             .authorizer(Some(move |context: AuthContext<'_>| {
                 if shard::denies_client_action(context.action)
                     && !document_pool_action_is_allowed(context.action)
+                    && !idempotency_pool_action_is_allowed(context.action)
                 {
                     return Authorization::Deny;
                 }
@@ -3378,6 +3395,29 @@ fn document_pool_action_is_allowed(action: AuthAction<'_>) -> bool {
         }
         AuthAction::Update { table_name, .. } | AuthAction::Read { table_name, .. } => {
             table_name == document::RECORDS_TABLE
+        }
+        _ => false,
+    }
+}
+
+fn idempotency_pool_action_is_allowed(action: AuthAction<'_>) -> bool {
+    if !pool::idempotency_storage_operation_active() {
+        return false;
+    }
+    match action {
+        AuthAction::Insert { table_name } | AuthAction::Delete { table_name } => {
+            table_name == idempotency::RECEIPTS_TABLE
+        }
+        AuthAction::Update { table_name, .. } | AuthAction::Read { table_name, .. } => {
+            table_name == idempotency::RECEIPTS_TABLE
+        }
+        AuthAction::CreateTable { table_name } => table_name == idempotency::RECEIPTS_TABLE,
+        AuthAction::CreateIndex {
+            index_name,
+            table_name,
+        } => {
+            index_name == "sqlite_autoindex_briskdb_idempotency_receipts_v1_1"
+                && table_name == idempotency::RECEIPTS_TABLE
         }
         _ => false,
     }

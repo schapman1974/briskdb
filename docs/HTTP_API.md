@@ -1,6 +1,6 @@
 # HTTP API version 1
 
-Status: implemented for issues #50 through #53. BriskDB remains an alpha
+Status: implemented for issues #50 through #54. BriskDB remains an alpha
 database. Its data and administration HTTP listeners are separate,
 loopback-only, and have no complete authorization boundary. The `/admin`
 browser login authenticates only its browser endpoints.
@@ -16,7 +16,13 @@ browser login authenticates only its browser endpoints.
   "supported_value_encodings": ["legacy-json-v1", "lossless-json-v1"],
   "session_scope": "request",
   "sql_dialect": "sqlite",
-  "max_request_bytes": 2097152
+  "max_request_bytes": 2097152,
+  "max_result_rows": 10000,
+  "max_result_logical_bytes": 16777216,
+  "stream_buffer_rows": 16,
+  "request_id_header": "BriskDB-Request-ID",
+  "idempotency_key_header": "BriskDB-Idempotency-Key",
+  "stream_media_type": "application/x-ndjson; charset=utf-8"
 }
 ```
 
@@ -56,6 +62,7 @@ The data listener defaults to `127.0.0.1:7654` through `--listen` and
 | `GET /v1`, `GET /v1/` | Version discovery above |
 | `POST /v1/execute` | One routed write result |
 | `POST /v1/query` | Ordered result columns and positional rows |
+| `POST /v1/query/stream` | Bounded newline-delimited result stream |
 
 The administration listener defaults to `127.0.0.1:7655` through
 `--admin-listen` and `BRISKDB_ADMIN_LISTEN`; the exact value `disabled` omits
@@ -85,14 +92,41 @@ GET routes also accept HEAD, returning headers without a body. Success is HTTP
 successful cancellation request, which is HTTP 202. A readiness response uses
 HTTP 503 while the engine cannot admit ordinary work but retains the readiness
 JSON representation described below.
-Each production router omits the other plane's handlers, so sending a route to
-the wrong listener returns 404 without executing it. The complete address,
-Rust/Python configuration, startup, and drain contract is in
+Each production router omits the other plane's handlers, so sending a route with
+ordinary request controls to the wrong listener returns 404 without executing
+it. Malformed request-control headers or an idempotency key on an unsupported
+route can fail before route dispatch. The complete address, Rust/Python
+configuration, startup, and drain contract is in
 [HTTP_LISTENERS.md](HTTP_LISTENERS.md).
+
+## Request identity
+
+Every response from either production HTTP plane and from the combined Rust
+router carries exactly one `BriskDB-Request-ID` header. This includes
+unversioned health, readiness, metrics, browser, and missing-route responses as
+well as every response below `/v1`.
+
+A caller may supply the header once with exactly 32 lowercase hexadecimal
+characters representing a nonzero 128-bit value. BriskDB echoes a valid value.
+When it is absent, BriskDB generates a fresh nonzero server value. It normally
+uses operating-system randomness and has a process-local counter fallback if
+that source is unavailable; callers must not treat the value as a globally
+unique identifier or security capability.
+An empty, zero, uppercase, non-hexadecimal, comma-folded, duplicate, or parsed
+value that still contains whitespace is rejected with the fixed HTTP 400
+`invalid_argument` problem. Standard HTTP optional whitespace next to the
+field delimiter is removed by the HTTP parser before this validation. A
+rejection carries a newly generated request ID and never echoes the invalid
+input.
+
+The value is untrusted correlation data. Reusing it does not deduplicate work,
+select an active query, identify a document operation, authenticate a caller,
+or act as an idempotency key. Ordinary success bodies and the exact five-field
+Problem Details representation do not repeat it.
 
 ## SQL requests and session lifetime
 
-Both SQL endpoints accept this exact envelope:
+All three SQL endpoints accept this base envelope:
 
 ```json
 {
@@ -118,6 +152,22 @@ Both SQL endpoints accept this exact envelope:
   is 2,097,152 bytes, including whitespace. JSON syntax, numeric-range, and
   nesting validation occur before execution.
 
+The two query endpoints also accept an optional strict `result_limits` object:
+
+```json
+{
+  "sql": "SELECT id, name FROM widgets",
+  "result_limits": {"max_rows": 100, "max_logical_bytes": 1048576}
+}
+```
+
+The object must contain at least one of the positive integer members
+`max_rows` and `max_logical_bytes`, and no other or duplicate member. It narrows
+the Engine's configured protocol-neutral result budget for this request;
+larger values cannot widen that budget. Equality at the effective boundary
+succeeds. `/v1/execute` rejects `result_limits` instead of silently ignoring
+it.
+
 Each SQL or migration request creates a fresh core `Session` and invokes the
 shared asynchronous `Engine` with typed `Statement`/`Value` inputs. Routing
 state does not survive the response. There are no HTTP transaction handles,
@@ -142,9 +192,10 @@ not parse SQL, hash keys, open files, or implement transaction or migration
 coordination. See [SQL compatibility](SQL_COMPATIBILITY.md),
 [generated keys](GENERATED_KEYS.md), and [request controls](REQUEST_CONTROLS.md).
 Engine deadlines, cancellation, admission, and result limits still apply.
-This API buffers bounded results and does not expose an HTTP row stream. The
-administration listener can enumerate and cancel a currently active query, as
-described below; the handle does not retain an HTTP transaction or result.
+`/v1/query` buffers a bounded result, while `/v1/query/stream` exposes the same
+Engine row stream incrementally. The administration listener can enumerate and
+cancel either kind of currently active query, as described below; the handle
+does not retain an HTTP transaction or reusable result.
 
 ## Successful responses
 
@@ -160,6 +211,52 @@ includes `generated_key`, for example
 The value is exact decimal text. An absent generated key is omitted, not null.
 The execute response does not echo `value_encoding`; its generated-key shape is
 already exact and remains unchanged for both encodings.
+
+### Durable idempotent execute
+
+An execute request may supply one `BriskDB-Idempotency-Key` header using the
+same exact nonzero 32-lowercase-hex grammar as a request ID. It is a separate
+value with different semantics. Malformed or duplicate keys fail with HTTP 400
+before Engine admission. Supplying this header on any route other than exact
+`POST /v1/execute` fails before that route can act.
+
+The Engine accepts a key only after it proves that the request is one
+catalog-routed, exact-target, direct autocommit DML statement. Generated-target
+writes, tables with global-index definitions, experimental writable-vtable
+coordination, schema or transaction statements, raw empty-catalog execution,
+and every administration operation are ineligible and return the fixed
+`unsupported` problem before mutation. Omitting the key retains the existing
+at-least-once execute behavior.
+
+The first committed keyed result has
+`BriskDB-Idempotency-Status: created`. An exact retry within the promised
+24-hour receipt window returns the same logical `shard`, `rows_affected`, and
+optional generated-key result with
+`BriskDB-Idempotency-Status: replayed`, without executing the DML again. Each
+attempt still has its own request ID. Reusing a key for a different semantic
+operation returns HTTP 409 `idempotency_conflict` without mutation.
+
+Key ownership spans the complete database root and all of its current shards.
+A key currently lives in one unauthenticated, service-wide namespace; it is not
+scoped by request ID, connection, listener, or source address. Future identity
+work must define authorization before lookup rather than silently changing this
+v1 meaning.
+A fixed cross-process lock stripe serializes one key while the Engine checks
+every shard through normal admission, then commits the mutation and its hidden
+receipt in the same target-shard SQLite transaction. The receipt binds the
+exact SQL bytes, canonical typed parameters, explicit routing input, default
+logical database, table, and resolved target. JSON whitespace and member order,
+the request ID, schema generation, and representation-only value-encoding
+choice are not mutation identity. Receipt storage keeps only digests and
+bounded result metadata; it never retains the raw key, SQL, parameters,
+routing value, or request ID.
+
+Receipts are retained for 24 hours according to server wall time and are never
+evicted while unexpired. A target shard admits at most 4,096 unexpired
+receipts; capacity exhaustion rejects a new keyed write before DML, while
+cleanup removes expired rows in bounded batches. The guarantee applies only
+inside that retained window. Stopped-server backup preserves receipts with the
+shard files.
 
 Query returns one shard or the complete visited-shard array, never both:
 
@@ -177,6 +274,48 @@ retain their columns. Types use the names in
 [the SQL value contract](SQL_COMPATIBILITY.md#current-http-parameter-and-result-conversion).
 No partial rows are returned when execution or a combined result budget fails.
 Scatter reads do not establish a cross-file atomic snapshot.
+
+### Streaming query response
+
+`POST /v1/query/stream` returns
+`Content-Type: application/x-ndjson; charset=utf-8`. Each record is one compact
+JSON object followed by LF. The record order is:
+
+1. exactly one metadata record with `"kind":"meta"`, the same `shard` or
+   `shards`, the optional nondefault `value_encoding`, and ordered `columns`;
+2. zero or more records with `"kind":"row"` and one positional `values`
+   array; and
+3. exactly one `{"kind":"complete","rows":N}` record on success.
+
+For example:
+
+```text
+{"kind":"meta","shard":2,"columns":[{"name":"id","data_type":"text"}]}
+{"kind":"row","values":["widget-1"]}
+{"kind":"complete","rows":1}
+```
+
+The metadata must be read before interpreting rows. The selected legacy or
+lossless cell codec is identical to the materialized endpoint. The stream uses
+one 16-row Engine handoff, one absolute deadline, and one logical row/byte
+budget across all visited shards. Scatter output remains shard-major in
+ascending physical-shard order and does not establish a cross-file snapshot or
+global SQL ordering.
+
+A route, envelope, value, planning, or preparation failure before the metadata
+record is an ordinary HTTP Problem response with its real status. After HTTP
+200 and stream metadata are committed, a later Engine failure emits exactly
+one flat terminal record with `"kind":"error"` plus the fixed `type`, `title`,
+`status`, `detail`, and `code` values, and emits no completion record. This
+in-band record is not itself an RFC 9457 HTTP response because the outer status
+is already 200. Clients must observe `complete`; EOF without it is
+indeterminate. Dropping the response cancels the Engine stream, interrupts its
+current SQLite work, and unregisters its active-query handle.
+
+This endpoint is the bounded streaming alternative for Phase 6. It creates no
+retained cursor or continuation token, rewrites no SQL, and adds no
+`ORDER BY`/`OFFSET`/`LIMIT` semantics. Deterministic global ordering and general
+pagination remain in Phase 7 issues #58 and #59.
 
 `legacy-json-v1` converts input arrays/objects to compact JSON **text**, not
 binary values or document commands. Results encode blobs as byte arrays,
@@ -271,11 +410,12 @@ tracks that shared temporal contract.
 The 2 MiB request limit counts the encoded JSON body, including tag and base64
 expansion. Engine result limits count protocol-neutral column, row, and value
 bytes before JSON serialization. Base64 expands a binary payload and tag objects
-add response bytes beyond that logical accounting; v1 still buffers the bounded
-result and has no separate encoded-response-byte or streaming contract. Those
-transport controls remain later roadmap work. A result-budget failure returns
+add response bytes beyond that logical accounting. V1 has no separate
+encoded-response-byte ceiling because a new default could reject materialized
+responses that already succeed. A materialized result-budget failure returns
 only the standard problem document, without partial columns, rows, or an
-encoding echo.
+encoding echo. A stream can already have delivered its bounded prefix and then
+emits the terminal error record described above.
 
 Binary values can make a storage round trip without becoming JSON text. For
 example, insert the canonical base64 tag with `lossless-json-v1`, query the BLOB
@@ -540,27 +680,30 @@ still has `recovery_point:false` and does not make a live directory copy safe.
 
 ## Errors
 
-Errors within v1 have `Content-Type: application/problem+json`, the version
-header, and exactly the currently defined fields `type`, `title`, `status`,
-`detail`, and `code`. Text is fixed and redacted; request bodies, unknown field
-names, query text, filesystem paths, and decoder diagnostics are not echoed.
+Errors within v1 have `Content-Type: application/problem+json`, the version and
+request-ID headers, and exactly the currently defined fields `type`, `title`,
+`status`, `detail`, and `code`. Text is fixed and redacted; request bodies,
+unknown field names, query text, idempotency keys, filesystem paths, and decoder
+diagnostics are not echoed.
 
 | Failure | HTTP | Code |
 | --- | ---: | --- |
-| Malformed JSON, invalid request envelope, nonempty cancel body, or invalid value encoding/tag | 400 | `invalid_argument` |
+| Malformed JSON, invalid request envelope/header, nonempty cancel body, or invalid value encoding/tag | 400 | `invalid_argument` |
 | Unknown v1 endpoint | 404 | `not_found` |
 | Unknown migration generation or malformed/stale query operation ID | 404 | `not_found` |
 | Unsupported method on a known endpoint | 405 | `method_not_allowed` |
 | Body exceeds 2 MiB | 413 | `request_too_large` |
 | Missing or non-JSON content type | 415 | `unsupported_media_type` |
+| Reused idempotency key with a different semantic request | 409 | `idempotency_conflict` |
 | Engine rejection | Per [error taxonomy](ERRORS.md) | Exact engine code |
 
 Method errors retain the `Allow` header. The four transport-only codes use
 `urn:briskdb:http:v1:` problem types with hyphenated code names; invalid
 arguments use the same problem type as engine `InvalidArgument`. Only the
-engine `busy` code advertises retryability. A write may commit before its
-response reaches the client; v1 supplies no idempotency key and makes no
-exactly-once delivery guarantee.
+engine `busy` code advertises retryability. An unkeyed write may commit before
+its response reaches the client and remains at least once. An eligible keyed
+write makes a known committed success replayable for the documented retention
+window; failures before commit are not cached.
 
 The readiness probe's HTTP 503 JSON is the documented exception to the
 Problem Details shape: it is a successful observation that the engine cannot

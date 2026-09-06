@@ -16,6 +16,7 @@ create_exception!(briskdb._briskdb, InvalidTextEncodingError, DataError);
 create_exception!(briskdb._briskdb, InvalidQueryError, ProgrammingError);
 create_exception!(briskdb._briskdb, UnsupportedError, ProgrammingError);
 create_exception!(briskdb._briskdb, FailedPreconditionError, OperationalError);
+create_exception!(briskdb._briskdb, IdempotencyConflictError, IntegrityError);
 create_exception!(briskdb._briskdb, TypeMismatchError, DataError);
 create_exception!(briskdb._briskdb, ConstraintViolationError, IntegrityError);
 create_exception!(
@@ -107,6 +108,7 @@ pub(crate) fn engine_error_to_python(error: EngineError) -> PyErr {
         EngineErrorKind::InvalidQuery => InvalidQueryError::new_err(diagnostic),
         EngineErrorKind::Unsupported => UnsupportedError::new_err(diagnostic),
         EngineErrorKind::FailedPrecondition => FailedPreconditionError::new_err(diagnostic),
+        EngineErrorKind::IdempotencyConflict => IdempotencyConflictError::new_err(diagnostic),
         EngineErrorKind::TypeMismatch => TypeMismatchError::new_err(diagnostic),
         EngineErrorKind::ConstraintViolation => ConstraintViolationError::new_err(diagnostic),
         EngineErrorKind::UniqueViolation => UniqueViolationError::new_err(diagnostic),
@@ -202,6 +204,10 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     add_kind!(InvalidQueryError, EngineErrorKind::InvalidQuery);
     add_kind!(UnsupportedError, EngineErrorKind::Unsupported);
     add_kind!(FailedPreconditionError, EngineErrorKind::FailedPrecondition);
+    add_kind!(
+        IdempotencyConflictError,
+        EngineErrorKind::IdempotencyConflict
+    );
     add_kind!(TypeMismatchError, EngineErrorKind::TypeMismatch);
     add_kind!(
         ConstraintViolationError,
@@ -244,6 +250,16 @@ mod tests {
                 assert_eq!(python_error.value(py).to_string(), "safe diagnostic");
             });
         }
+
+        let conflict = engine_error_to_python(EngineError::new(
+            EngineErrorKind::IdempotencyConflict,
+            "safe conflict diagnostic",
+        ));
+        Python::attach(|py| {
+            assert!(conflict.is_instance_of::<IdempotencyConflictError>(py));
+            assert!(conflict.is_instance_of::<IntegrityError>(py));
+            assert!(!conflict.is_instance_of::<InternalError>(py));
+        });
     }
 
     #[test]

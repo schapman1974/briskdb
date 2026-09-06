@@ -9,6 +9,7 @@ mod engine;
 mod error;
 pub(crate) mod generated_id;
 mod global_index;
+mod idempotency;
 mod index_key;
 mod lifecycle;
 mod operations;
@@ -65,6 +66,15 @@ pub(crate) use global_index::{
     GlobalIndexShardSummaryPrunedShard, GlobalIndexShardSummaryReadResolution,
     MAX_GLOBAL_INDEX_PARTS, MAX_GLOBAL_INDEX_READ_CANDIDATES, MAX_GLOBAL_INDEX_READ_REPAIRS,
     MAX_GLOBAL_INDEX_SQL_BYTES, MAX_GLOBAL_INDEXES, MAX_GLOBAL_VALUE_LEASE_COUNT,
+};
+pub(crate) use idempotency::{
+    ActiveIdempotencyKeyGuard, ActiveIdempotencyKeys, IDEMPOTENCY_RECEIPT_RETENTION_MS,
+    IdempotencyDigests, write_digests,
+};
+pub use idempotency::{
+    IDEMPOTENCY_FINGERPRINT_VERSION, IDEMPOTENCY_LOCK_STRIPES, IDEMPOTENCY_RECEIPT_RETENTION,
+    IdempotencyKey, IdempotencyStatus, IdempotentWriteResult, MAX_IDEMPOTENCY_RECEIPTS_PER_SHARD,
+    ParseIdempotencyKeyError,
 };
 pub use index_key::{
     CanonicalIndexKey, DecodedIndexKeyPart, INDEX_KEY_ENCODING_VERSION, IndexKeyCollation,
@@ -128,6 +138,7 @@ use crate::{sql, storage::Storage};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawDataOperation {
     Execute,
+    IdempotentExecute,
     Query,
 }
 
@@ -1064,10 +1075,18 @@ fn raw_data_execution_target(
 ) -> EngineResult<RawDataTarget> {
     let behavior_matches_operation = matches!(
         (operation, plan.behavior()),
-        (RawDataOperation::Execute, sql::StatementBehavior::Write(_))
-            | (RawDataOperation::Query, sql::StatementBehavior::Read)
+        (
+            RawDataOperation::Execute | RawDataOperation::IdempotentExecute,
+            sql::StatementBehavior::Write(_)
+        ) | (RawDataOperation::Query, sql::StatementBehavior::Read)
     );
     if !behavior_matches_operation {
+        if operation == RawDataOperation::IdempotentExecute {
+            return Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "durable idempotency supports only INSERT, UPDATE, and DELETE",
+            ));
+        }
         return match plan.behavior() {
             sql::StatementBehavior::Schema(_) | sql::StatementBehavior::Session(_) => {
                 Err(EngineError::new(

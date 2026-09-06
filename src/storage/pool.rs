@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::{
-    core::{EngineError, EngineErrorKind, EngineResult, OperationControl},
+    core::{EngineError, EngineErrorKind, EngineResult, OperationControl, Value},
     sqlite_error,
 };
 
@@ -25,10 +25,20 @@ use super::{CONNECTION_BUSY_TIMEOUT, ConnectionHygiene, Storage};
 thread_local! {
     static BUSY_OPERATION: RefCell<Option<BusyOperation>> = const { RefCell::new(None) };
     static DOCUMENT_STORAGE_OPERATION: Cell<bool> = const { Cell::new(false) };
+    static IDEMPOTENCY_STORAGE_OPERATION: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(super) fn document_storage_operation_active() -> bool {
     DOCUMENT_STORAGE_OPERATION.get()
+}
+
+pub(super) fn idempotency_storage_operation_active() -> bool {
+    IDEMPOTENCY_STORAGE_OPERATION.get()
+}
+
+pub(super) fn with_idempotency_storage_operation<T>(work: impl FnOnce() -> T) -> T {
+    let _operation = IdempotencyStorageOperationGuard::install();
+    work()
 }
 
 #[cfg(feature = "documents")]
@@ -49,6 +59,26 @@ impl DocumentStorageOperationGuard {
 impl Drop for DocumentStorageOperationGuard {
     fn drop(&mut self) {
         DOCUMENT_STORAGE_OPERATION.set(false);
+    }
+}
+
+struct IdempotencyStorageOperationGuard;
+
+impl IdempotencyStorageOperationGuard {
+    fn install() -> Self {
+        IDEMPOTENCY_STORAGE_OPERATION.with(|active| {
+            assert!(
+                !active.replace(true),
+                "idempotency storage operation guard must not be nested"
+            );
+        });
+        Self
+    }
+}
+
+impl Drop for IdempotencyStorageOperationGuard {
+    fn drop(&mut self) {
+        IDEMPOTENCY_STORAGE_OPERATION.set(false);
     }
 }
 
@@ -841,6 +871,55 @@ impl PooledConnection {
     /// Retire this physical connection instead of returning it to the pool.
     pub(crate) fn mark_broken(&mut self) {
         self.broken = true;
+    }
+
+    /// Read one active receipt from this already-admitted physical shard.
+    pub(crate) fn find_idempotency_receipt(
+        &mut self,
+        key_digest: [u8; 32],
+        now_unix_ms: i64,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<Option<super::IdempotencyReceipt>> {
+        let receipt_control = Arc::clone(&control);
+        self.run_controlled(control, |connection| {
+            super::idempotency::find_receipt(
+                connection,
+                key_digest,
+                now_unix_ms,
+                Some(&receipt_control),
+            )
+        })
+    }
+
+    /// Commit application DML and its result receipt in one SQLite transaction.
+    pub(crate) fn execute_idempotent(
+        &mut self,
+        statement: &str,
+        parameters: &[Value],
+        receipt: super::NewIdempotencyReceipt,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<super::IdempotentExecuteOutcome> {
+        let physical_shard = self.pool.inner.shard;
+        let mut committed = None;
+        let receipt_control = Arc::clone(&control);
+        let result = self.run_controlled(control, |connection| {
+            let outcome = super::idempotency::execute_with_receipt(
+                connection,
+                physical_shard,
+                statement,
+                parameters,
+                receipt,
+                Some(&receipt_control),
+            )?;
+            // This assignment occurs only after COMMIT succeeds. Preserve that
+            // known durable result if control-hook cleanup subsequently fails.
+            committed = Some(outcome.clone());
+            Ok(outcome)
+        });
+        match (result, committed) {
+            (Ok(outcome), _) | (Err(_), Some(outcome)) => Ok(outcome),
+            (Err(error), None) => Err(error),
+        }
     }
 
     /// Replace this lease with a freshly opened, fully validated shard handle.

@@ -1084,7 +1084,7 @@ fn abort_at_test_boundary(_boundary: &str) {}
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{path::Path, process::Command, sync::Arc, time::Duration};
+    use std::{os::unix::process::ExitStatusExt as _, path::Path, process::Command, sync::Arc};
 
     use rusqlite::Connection;
 
@@ -1098,6 +1098,8 @@ mod tests {
             ShardKeyType, TableDeclaration,
         },
     };
+
+    const CRASH_TEST_LEASE_MS: u64 = 60_000;
 
     fn setup(root: &Path) -> (crate::GlobalIndexId, String) {
         let mut database = Database::open(root, 2).unwrap();
@@ -1182,7 +1184,10 @@ mod tests {
         .unwrap();
         let database = Database::open(root, 2).unwrap();
         database
-            .process_global_index_async(index, GlobalIndexAsyncOptions::new(64, 100, 5).unwrap())
+            .process_global_index_async(
+                index,
+                GlobalIndexAsyncOptions::new(64, CRASH_TEST_LEASE_MS, 5).unwrap(),
+            )
             .unwrap();
     }
 
@@ -1307,13 +1312,37 @@ mod tests {
                 .env("BRISKDB_GLOBAL_INDEX_ASYNC_ABORT_POINT", boundary)
                 .status()
                 .unwrap();
-            assert!(!status.success(), "child did not abort at {boundary}");
-            std::thread::sleep(Duration::from_millis(120));
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGABRT),
+                "child did not reach the abort hook at {boundary}: {status}"
+            );
+
+            // Model time advancing beyond the dead process's lease without a
+            // scheduler-sensitive sleep. Retaining the row preserves its
+            // fencing token, exactly as natural expiry does.
+            let authority =
+                Connection::open(temp.path().join("global-indexes/global.sqlite")).unwrap();
+            let expired = authority
+                .execute(
+                    "UPDATE briskdb_global_index_async_leases
+                     SET expires_unix_ms = 1
+                     WHERE index_id = ?1 AND source_shard = 0",
+                    [i64::try_from(index.get()).unwrap()],
+                )
+                .unwrap();
+            assert_eq!(
+                expired,
+                usize::from(boundary != "lease-before-commit"),
+                "boundary {boundary} left an unexpected durable lease state"
+            );
+            drop(authority);
+
             let database = Database::open(temp.path(), 2).unwrap();
             database
                 .process_global_index_async(
                     index,
-                    GlobalIndexAsyncOptions::new(64, 100, 5).unwrap(),
+                    GlobalIndexAsyncOptions::new(64, CRASH_TEST_LEASE_MS, 5).unwrap(),
                 )
                 .unwrap();
             let status = database.global_index_async_status(index).unwrap();
