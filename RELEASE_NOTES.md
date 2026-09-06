@@ -37,14 +37,28 @@ Differential integration tests compare direct engine execution with both
 facades for point and scatter commands, ordered extended BSON values, request
 controls, session ownership, and shutdown.
 
+The typed Python wheel now exposes the same command slice on `Session` and
+`AsyncSession`, gated by `documents=True`. Ordered mappings and PyMongo BSON
+classes convert without JSON, including exact int32/int64 identity, IEEE-754
+bits, Decimal128 BID payloads, ObjectId, Code with scope, and all five UUID
+representation modes. Datetimes use aware UTC millisecond results, validation
+enforces the 16 MiB and 100-container BSON limits, and conversion failures use
+the existing stable Python exception hierarchy. PyMongo 4.17.0 is the pinned
+compatibility oracle, but remains an optional, lazily imported companion:
+installed-wheel and sdist gates first prove SQL and the missing-BSON failure
+path in an environment without PyMongo.
+
 The facade exposes the exact engine slice above. General matchers, update
 expressions, replacements, aggregation, retained cursors, the MongoDB listener,
-a collection-oriented Rust convenience API, and the Python document API remain
-follow-up work before MongoDB compatibility can be claimed. See the
+a collection-oriented Rust convenience API, and broader Python document
+operations remain follow-up work before MongoDB compatibility can be claimed.
+See the
 [embedded Rust guide](docs/EMBEDDED_RUST.md),
 [the BSON contract](docs/BSON.md),
 [the document storage contract](docs/DOCUMENT_STORAGE.md), and
-[the document engine contract](docs/DOCUMENT_ENGINE.md).
+[the document engine contract](docs/DOCUMENT_ENGINE.md). Python users should
+also read the [document API map](python/API.md) and
+[value-conversion contract](python/VALUE_CONVERSIONS.md).
 
 HTTP now has an explicit version-1 contract, discovery at `/v1`, a versioned
 `/v1/health` alias, and `BriskDB-API-Version: 1` on v1 responses. Existing valid
@@ -149,10 +163,10 @@ The release also provides `briskdb` and `briskdb-import` archives for Ubuntu
 `briskdb` account, administrator configuration under `/etc/default/briskdb`,
 persistent state under `/var/lib/briskdb`, and journald logging.
 
-The disabled-by-default PostgreSQL listener supports one registered-table
-simple-query `SELECT`, `INSERT`, `UPDATE`, or `DELETE` statement at a time.
-Psycopg 3 clients must use `psycopg.ClientCursor`; the ordinary cursor uses the
-unsupported extended-query protocol. See `docs/POSTGRES_QUICKSTART.md`.
+The disabled-by-default PostgreSQL listener supports registered-table
+`SELECT`, `INSERT`, `UPDATE`, and `DELETE` through simple queries and bounded
+text/binary extended queries. It also supports real single-shard transactions
+and optional TLS with SCRAM-SHA-256. See `docs/POSTGRES_QUICKSTART.md`.
 
 Every native archive and wheel is built and smoke-tested on its matching native
 GitHub runner. Wheels are installed and tested under CPython 3.9 and 3.14, and
@@ -161,12 +175,12 @@ GitHub build-provenance attestation.
 
 ## Critical alpha boundaries
 
-- There is no authentication, authorization, or TLS. HTTP and PostgreSQL are
-  restricted to loopback. Do not expose either listener to a network.
-- PostgreSQL extended-query protocol is unsupported. Parameters sent through
-  Parse/Bind/Execute, server-side prepared statements, transactions, DDL,
-  `COPY`, and binary results are unavailable. Psycopg must use
-  `psycopg.ClientCursor`.
+- HTTP remains unauthenticated and loopback-only. PostgreSQL may bind remotely
+  only with its configured TLS and SCRAM-SHA-256 boundary; BriskDB does not yet
+  provide general users, roles, or authorization policy.
+- PostgreSQL supports bounded simple and parameterized text/binary extended
+  queries plus single-shard transactions. DDL, `COPY`, broad type coverage,
+  and general PostgreSQL session semantics remain unavailable.
 - PostgreSQL accepts exactly one simple-query statement per message and only
   operates on an offline imported/registered catalog. It does not provide an
   online `CREATE TABLE` workflow or full PostgreSQL compatibility.
@@ -177,18 +191,19 @@ GitHub build-provenance attestation.
   procedure is a complete data-directory copy. Online backup/restore,
   resharding, and online rebalance are unsupported.
 - There is no production metrics or observability suite.
-- The Python package does not claim DB-API 2.0 compatibility, transaction
-  methods, retained SQLite streaming cursors, or native document operations.
+- The Python package does not claim DB-API 2.0 or broad MongoDB compatibility.
+  Its native document methods expose only the command slice listed above;
+  general matchers, updates, aggregation, and retained document cursors remain
+  unavailable.
 
 ## Storage compatibility
 
 There is no stable pre-1.0 on-disk compatibility promise. This release writes
-manifest version 12 and accepts the exact documented legacy version-1 shape and
-manifest versions 2 through 11 for automatic, ordered forward migration.
+manifest version 14 and accepts the exact documented legacy version-1 shape and
+manifest versions 2 through 13 for automatic, ordered forward migration.
 Unknown, malformed, partially migrated, or newer layouts fail closed.
 
 Before opening existing data, stop every process and make a complete backup as
 described in `docs/OFFLINE_BACKUP.md`. Startup may migrate the data.
 In-place downgrade is unsupported; rollback requires restoring the complete
-pre-upgrade backup. This release has no on-disk format change from alpha 1,
-alpha 2, alpha 3, or alpha 4.
+pre-upgrade backup.

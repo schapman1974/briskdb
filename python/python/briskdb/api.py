@@ -7,6 +7,7 @@ import functools
 from collections.abc import AsyncIterator
 from os import PathLike
 from typing import Any, Optional, Union
+from uuid import UUID
 
 from ._briskdb import (
     CancellationToken,
@@ -24,11 +25,19 @@ def connect(
     path: Union[str, PathLike[str]],
     *,
     shards: Optional[int] = None,
+    documents: bool = False,
+    uuid_representation: Optional[str] = None,
     config: Optional[Config] = None,
 ) -> Database:
     """Open an in-process database; no listener starts unless ``serve()`` is called."""
 
-    return _native_open(path, shards=shards, config=config)
+    return _native_open(
+        path,
+        shards=shards,
+        documents=documents,
+        uuid_representation=uuid_representation,
+        config=config,
+    )
 
 
 async def _cancelable_call(
@@ -230,6 +239,218 @@ class AsyncSession:
             cancellation=cancellation,
         )
         return AsyncCursor(cursor)
+
+    async def create_collection(
+        self,
+        database: str,
+        collection: str,
+        *,
+        options: Optional[Any] = None,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.create_collection,
+            database,
+            collection,
+            options=options,
+            request_id=request_id,
+            max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
+    async def list_collections(
+        self,
+        database: str,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        batch_size: int = 101,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.list_collections,
+            database,
+            skip=skip,
+            limit=limit,
+            batch_size=batch_size,
+            request_id=request_id,
+            max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
+    async def create_index(
+        self,
+        database: str,
+        collection: str,
+        keys: Any,
+        *,
+        name: str,
+        unique: bool = False,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.create_index,
+            database,
+            collection,
+            keys,
+            name=name,
+            unique=unique,
+            request_id=request_id,
+            max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
+    async def list_indexes(
+        self,
+        database: str,
+        collection: str,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        batch_size: int = 101,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.list_indexes,
+            database,
+            collection,
+            skip=skip,
+            limit=limit,
+            batch_size=batch_size,
+            request_id=request_id,
+            max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
+    async def insert_one(
+        self,
+        database: str,
+        collection: str,
+        document: Any,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.insert_one,
+            database,
+            collection,
+            document,
+            request_id=request_id,
+            max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
+    async def find(
+        self,
+        database: str,
+        collection: str,
+        filter: Optional[Any] = None,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        batch_size: int = 101,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.find,
+            database,
+            collection,
+            filter,
+            skip=skip,
+            limit=limit,
+            batch_size=batch_size,
+            request_id=request_id,
+            max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
+    async def count_documents(
+        self,
+        database: str,
+        collection: str,
+        filter: Optional[Any] = None,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.count_documents,
+            database,
+            collection,
+            filter,
+            skip=skip,
+            limit=limit,
+            request_id=request_id,
+            max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
+    async def delete_one(
+        self,
+        database: str,
+        collection: str,
+        filter: Any,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.delete_one,
+            database,
+            collection,
+            filter,
+            request_id=request_id,
+            max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
 
     async def status(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._session.status)
@@ -467,11 +688,20 @@ async def connect_async(
     path: Union[str, PathLike[str]],
     *,
     shards: Optional[int] = None,
+    documents: bool = False,
+    uuid_representation: Optional[str] = None,
     config: Optional[Config] = None,
 ) -> AsyncDatabase:
     """Open an in-process database without blocking the event loop."""
 
-    database = await asyncio.to_thread(connect, path, shards=shards, config=config)
+    database = await asyncio.to_thread(
+        connect,
+        path,
+        shards=shards,
+        documents=documents,
+        uuid_representation=uuid_representation,
+        config=config,
+    )
     return AsyncDatabase(database)
 
 

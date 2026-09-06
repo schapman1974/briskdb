@@ -13,7 +13,7 @@ name = "_briskdb"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-briskdb = { path = "..", default-features = false, features = ["listeners"] }
+briskdb = { path = "..", default-features = false, features = ["documents", "listeners"] }
 pyo3 = { version = "=0.29.2", features = ["abi3-py39"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time"] }
 

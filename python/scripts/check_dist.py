@@ -58,14 +58,18 @@ def release_version() -> Version:
         text=True,
     )
     packages = json.loads(completed.stdout)["packages"]
-    version = next(package["version"] for package in packages if package["name"] == "briskdb")
+    version = next(
+        package["version"] for package in packages if package["name"] == "briskdb"
+    )
     return Version(version)
 
 
 def require_suffixes(names: Iterable[str], suffixes: Set[str]) -> None:
     available = tuple(names)
     missing = sorted(
-        suffix for suffix in suffixes if not any(name.endswith(suffix) for name in available)
+        suffix
+        for suffix in suffixes
+        if not any(name.endswith(suffix) for name in available)
     )
     if missing:
         raise SystemExit("artifact is missing: {}".format(", ".join(missing)))
@@ -74,11 +78,15 @@ def require_suffixes(names: Iterable[str], suffixes: Set[str]) -> None:
 def check_wheel(path: pathlib.Path, platform: str) -> None:
     distribution, version, _build, tags = parse_wheel_filename(path.name)
     if distribution != "briskdb" or version != release_version():
-        raise SystemExit("wheel name/version does not match the Rust package: {}".format(path.name))
+        raise SystemExit(
+            "wheel name/version does not match the Rust package: {}".format(path.name)
+        )
     expected_tag = "cp39-abi3-{}".format(platform)
     if expected_tag not in {str(tag) for tag in tags}:
         raise SystemExit(
-            "wheel must carry exact supported tag {}: {}".format(expected_tag, path.name)
+            "wheel must carry exact supported tag {}: {}".format(
+                expected_tag, path.name
+            )
         )
 
     with zipfile.ZipFile(path) as archive:
@@ -89,12 +97,20 @@ def check_wheel(path: pathlib.Path, platform: str) -> None:
             for name in names
         ):
             raise SystemExit("wheel does not contain the native extension")
-        metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
+        metadata_name = next(
+            name for name in names if name.endswith(".dist-info/METADATA")
+        )
         metadata = Parser().parsestr(archive.read(metadata_name).decode("utf-8"))
         if metadata["Requires-Python"] != ">=3.9":
             raise SystemExit("wheel has the wrong Requires-Python metadata")
         if metadata["License-Expression"] != "MIT":
             raise SystemExit("wheel has the wrong license expression")
+        dependencies = metadata.get_all("Requires-Dist", [])
+        if any(
+            dependency.partition(";")[0].strip().lower().startswith(("bson", "pymongo"))
+            for dependency in dependencies
+        ):
+            raise SystemExit("wheel must not require bson or PyMongo for SQL-only use")
         if not any(
             name.endswith(".dist-info/licenses/BRISKDB_LICENSE.txt") for name in names
         ):
@@ -106,7 +122,9 @@ def check_wheel(path: pathlib.Path, platform: str) -> None:
 def check_sdist(path: pathlib.Path) -> None:
     expected = release_version()
     if not path.name.startswith("briskdb-{}".format(expected)):
-        raise SystemExit("sdist name/version does not match the Rust package: {}".format(path.name))
+        raise SystemExit(
+            "sdist name/version does not match the Rust package: {}".format(path.name)
+        )
     with tarfile.open(path, "r:gz") as archive:
         require_suffixes(archive.getnames(), SDIST_FILES)
     print("sdist contract passed: {}".format(path.name))

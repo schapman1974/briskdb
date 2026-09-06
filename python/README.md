@@ -12,6 +12,15 @@ macOS and Linux targets:
 python -m pip install --only-binary=:all: briskdb
 ```
 
+Document commands use PyMongo's public BSON classes as an optional companion:
+
+```bash
+python -m pip install --only-binary=:all: briskdb
+python -m pip install pymongo
+```
+
+The BriskDB wheel does not require or import PyMongo for SQL-only applications.
+
 To build the current checkout from source, use Python 3.9+ and Rust 1.85+:
 
 ```bash
@@ -29,6 +38,31 @@ print(session.query("SELECT body FROM notes WHERE id = ?1", [1]))
 session.close()
 db.close()
 ```
+
+Enable native BSON commands per database handle. The default `standard` UUID
+representation uses subtype 4; legacy and `unspecified` modes are documented
+in the [value conversion contract](VALUE_CONVERSIONS.md).
+
+```python
+from bson import ObjectId
+import briskdb
+
+with briskdb.open("./data", shards=4, documents=True) as db:
+    with db.session() as session:
+        session.create_collection("app", "notes")
+        note_id = ObjectId()
+        session.insert_one(
+            "app", "notes", {"_id": note_id, "body": "hello"}
+        )
+        result = session.find("app", "notes", {"_id": note_id})
+        print(result["documents"])
+```
+
+This first slice supports collection/index metadata, one explicit-ID insert,
+empty or exact-`_id` find/count, and exact-`_id` deletion through synchronous
+and asyncio sessions. Secondary indexes are declared as `pending_build` until
+their physical execution milestone. Broader matchers, updates, aggregation,
+bulk writes, and cursor continuation are still outside the Python API.
 
 Pass `shards` when creating a data directory. Later calls may omit it and use
 the count stored in the manifest. Passing the wrong count raises
@@ -93,6 +127,6 @@ errors when SQLite cannot store a value losslessly. See the executable
 [value and exception contract](VALUE_CONVERSIONS.md) for boundaries and the
 stable `BriskDBError` hierarchy.
 
-Native Mongo/document commands are not claimed until BriskDB's document engine
-lands. The extension uses the host-controlled `listeners` Rust feature and
-does not include the daemon CLI, signal handler, or logging subscriber.
+The extension uses the host-controlled `listeners` and `documents` Rust
+features and does not include the daemon CLI, signal handler, or logging
+subscriber. Enabling documents starts no MongoDB listener.

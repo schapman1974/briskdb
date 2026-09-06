@@ -132,7 +132,7 @@ experimental and opt-in; the exact contract lives in
 | Same-host service and embedded processes sharing one ready root | Working on local filesystems |
 | Native MongoDB wire protocol with TinyMongo parity | [Versioned parity contract](docs/MONGO_PARITY.md), [Rust BSON foundation](docs/BSON.md), [document storage/import](docs/DOCUMENT_STORAGE.md), the first [protocol-neutral document commands](docs/DOCUMENT_ENGINE.md), and their embedded Rust facade landed; remaining matcher/write semantics and the listener remain [planned](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
-| Native Python extension | Sync/async API working; tagged releases build audited macOS/Linux ARM/x86 wheels |
+| Native Python extension | Typed sync/async SQL and opt-in BSON document commands; tagged releases build audited macOS/Linux ARM/x86 wheels |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
 
 ## Where BriskDB fits
@@ -232,8 +232,36 @@ with briskdb.open("./data", shards=4) as db:
         print(server.http_address, server.postgres_address)
 ```
 
+The wheel also exposes the current protocol-neutral document slice through
+sync and asyncio sessions. Install PyMongo for its BSON value classes, then
+enable document commands on the database handle:
+
+```bash
+python -m pip install briskdb pymongo
+```
+
+```python
+from bson import ObjectId
+import briskdb
+
+with briskdb.open("./data", shards=4, documents=True) as db:
+    with db.session() as session:
+        session.create_collection("app", "notes")
+        note_id = ObjectId()
+        session.insert_one("app", "notes", {"_id": note_id, "body": "hello"})
+        print(session.find("app", "notes", {"_id": note_id})["documents"])
+```
+
+PyMongo remains optional and is loaded only when a document method runs, so a
+SQL-only installation has no BSON dependency. The current slice supports
+collection/index metadata, one explicit-ID insert, empty or exact-`_id`
+find/count, and exact-`_id` deletion. Secondary index declarations remain
+`pending_build`.
+
 See the [Python quickstart](python/README.md) for sync and asyncio write/read
-examples. Tagged releases publish compiler-free `cp39-abi3` wheels for the
+examples and the [Python value contract](python/VALUE_CONVERSIONS.md) for BSON,
+datetime, UUID, and error behavior. Tagged releases publish compiler-free
+`cp39-abi3` wheels for the
 [supported platform matrix](python/COMPATIBILITY.md); repository checkouts can
 still be installed from source with Rust 1.85+. Independently spawned Python,
 Rust, and server processes can share a ready local data directory; read the
@@ -301,6 +329,9 @@ more valuable than a star. Start with the
 - Multi-process access is same-host/local-filesystem only. Schema, catalog,
   upgrade, and recovery work requires sole-process ownership.
 - Pre-1.0 storage and public-library compatibility can change between releases.
+- Python document commands currently require explicit `_id` values and only
+  implement empty or exact-`_id` filters. Updates, aggregation, bulk writes,
+  retained document cursors, and built secondary indexes are still planned.
 - Ubuntu 24.04 x86-64 receives the full required Rust CI suite. Python wheels
   receive native build, audit, install, restart, corruption, and concurrency
   checks on Linux/macOS x86-64 and ARM64.

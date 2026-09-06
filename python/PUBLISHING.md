@@ -5,6 +5,15 @@ wheel on each native macOS/Linux ARM/x86 runner, audits native dependencies,
 installs each wheel under CPython 3.9 and 3.14, runs the complete Python suite,
 checks packaged typing, and separately builds/installs the sdist.
 
+Each installed artifact is tested before PyMongo is installed. That first
+smoke test proves the artifact declares no BSON runtime dependency, imports and
+executes SQL in a clean environment, and rejects an enabled document command
+with the stable `UnsupportedError` before mutation. The workflow then installs
+the pinned PyMongo 4.17.0 oracle and runs the full BSON/document matrix. Keep
+that order when reproducing a release gate locally; installing test
+requirements first would hide a regression in the optional-dependency
+boundary.
+
 A `v<crate-version>` tag is publishable only when the root Rust crate,
 `briskdb-python` crate, Python metadata, wheel filenames, and runtime
 `briskdb.__version__` agree. The release workflow then:

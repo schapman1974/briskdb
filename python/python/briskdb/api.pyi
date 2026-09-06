@@ -1,14 +1,23 @@
 from os import PathLike
 from typing import AsyncIterator, List, Optional, Sequence, Union
+from uuid import UUID
 
 from ._briskdb import (
+    BsonDocument,
     CancellationToken,
     CloseReport,
     CheckpointReport,
     ColumnInfo,
     Config,
-    Cursor,
+    CountDocumentsResult,
+    CreateCollectionResult,
+    CreateIndexResult,
     Database,
+    DeleteOneResult,
+    FindResult,
+    InsertOneResult,
+    ListCollectionsResult,
+    ListIndexesResult,
     QueryResult,
     Server,
     ServerCloseReport,
@@ -17,6 +26,7 @@ from ._briskdb import (
     SqlRow,
     Status,
     Transaction,
+    UuidRepresentation,
     WriteResult,
 )
 
@@ -24,6 +34,8 @@ def connect(
     path: Union[str, PathLike[str]],
     *,
     shards: Optional[int] = None,
+    documents: bool = False,
+    uuid_representation: Optional[UuidRepresentation] = None,
     config: Optional[Config] = None,
 ) -> Database: ...
 
@@ -103,6 +115,112 @@ class AsyncSession:
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,
     ) -> AsyncCursor: ...
+    async def create_collection(
+        self,
+        database: str,
+        collection: str,
+        *,
+        options: Optional[BsonDocument] = None,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> CreateCollectionResult: ...
+    async def list_collections(
+        self,
+        database: str,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        batch_size: int = 101,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> ListCollectionsResult: ...
+    async def create_index(
+        self,
+        database: str,
+        collection: str,
+        keys: BsonDocument,
+        *,
+        name: str,
+        unique: bool = False,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> CreateIndexResult: ...
+    async def list_indexes(
+        self,
+        database: str,
+        collection: str,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        batch_size: int = 101,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> ListIndexesResult: ...
+    async def insert_one(
+        self,
+        database: str,
+        collection: str,
+        document: BsonDocument,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> InsertOneResult: ...
+    async def find(
+        self,
+        database: str,
+        collection: str,
+        filter: Optional[BsonDocument] = None,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        batch_size: int = 101,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> FindResult: ...
+    async def count_documents(
+        self,
+        database: str,
+        collection: str,
+        filter: Optional[BsonDocument] = None,
+        *,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> CountDocumentsResult: ...
+    async def delete_one(
+        self,
+        database: str,
+        collection: str,
+        filter: BsonDocument,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> DeleteOneResult: ...
     async def status(self) -> Status: ...
     async def close(self) -> None: ...
     async def __aenter__(self) -> AsyncSession: ...
@@ -202,6 +320,8 @@ async def connect_async(
     path: Union[str, PathLike[str]],
     *,
     shards: Optional[int] = None,
+    documents: bool = False,
+    uuid_representation: Optional[UuidRepresentation] = None,
     config: Optional[Config] = None,
 ) -> AsyncDatabase: ...
 

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use briskdb::GeneratedKey;
 use briskdb::{DataType, Decimal, Executed, ResultSet, Routed, Value, WriteResult};
 use pyo3::{
     conversion::IntoPyObjectExt,
@@ -217,6 +219,65 @@ mod tests {
             assert_eq!(
                 CanonicalIndexKey::encode_values(&through_python).unwrap(),
                 CanonicalIndexKey::encode_values(&direct).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn generated_write_keys_keep_their_column_and_typed_value() {
+        Python::initialize();
+        Python::attach(|py| {
+            let output = write_result_parts_to_python(
+                py,
+                3,
+                WriteResult::with_generated_key(
+                    1,
+                    GeneratedKey::new("event_id", Value::Int64(4_620_693_217_682_128_897)),
+                ),
+            )
+            .unwrap();
+            let output = output.bind(py).cast::<PyDict>().unwrap();
+            assert_eq!(
+                output
+                    .get_item("shard")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<u16>()
+                    .unwrap(),
+                3
+            );
+            assert_eq!(
+                output
+                    .get_item("rows_affected")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                1
+            );
+            let generated = output
+                .get_item("generated_key")
+                .unwrap()
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            assert_eq!(
+                generated
+                    .get_item("column")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "event_id"
+            );
+            assert_eq!(
+                generated
+                    .get_item("value")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<i64>()
+                    .unwrap(),
+                4_620_693_217_682_128_897
             );
         });
     }

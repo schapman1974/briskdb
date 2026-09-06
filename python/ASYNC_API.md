@@ -73,6 +73,27 @@ Closing the database closes every attached server first. Remote PostgreSQL
 uses the same TLS certificate/key/user/password-file keyword arguments as the
 synchronous `Database.serve()` method.
 
+Native document methods have the same sync/async pairing. Enable the document
+engine on open and install PyMongo for its `bson` value classes:
+
+```python
+from bson import ObjectId
+
+async with await briskdb.open_async("./data", shards=4, documents=True) as db:
+    async with await db.session() as session:
+        await session.create_collection("app", "notes")
+        note_id = ObjectId()
+        await session.insert_one(
+            "app", "notes", {"_id": note_id, "body": "hello"}
+        )
+        result = await session.find("app", "notes", {"_id": note_id})
+```
+
+`AsyncSession` includes create/list collection and index calls plus
+`insert_one`, `find`, `count_documents`, and `delete_one`. They use the same
+request IDs, deadlines, cancellation tokens, result limits, BSON conversion,
+and point/scatter plans as their synchronous `Session` methods.
+
 ## Transactions and DB-API boundaries
 
 `Database.transaction()` returns an owned, single-shard transaction. Its first
@@ -90,7 +111,8 @@ with db.transaction(routing_key="account-1") as transaction:
 
 The asyncio equivalent is `async with await db.transaction(...)`. BriskDB does
 not claim Python DB-API 2.0 compliance; these are explicit native handles, not
-implicit connection transactions. Mongo document CRUD/aggregation waits for
-the native document engine in [#160](https://github.com/schapman1974/briskdb/issues/160),
-and snapshot/fencing helpers remain in
+implicit connection transactions. Document commands run on sessions rather
+than SQL transactions; broader Mongo-compatible CRUD and aggregation remain
+in [#160](https://github.com/schapman1974/briskdb/issues/160), and
+snapshot/fencing helpers remain in
 [#194–#196](https://github.com/schapman1974/briskdb/issues/194).
