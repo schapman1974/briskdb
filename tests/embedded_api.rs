@@ -184,14 +184,30 @@ async fn invalid_complete_configuration_fails_before_creating_storage() {
     assert_eq!(error.kind(), EngineErrorKind::Unsupported);
     assert!(!unsupported_runtime.exists());
 
-    let unsupported_documents = parent.path().join("unsupported-documents");
-    let error = BriskDb::builder(&unsupported_documents)
-        .with_document_support(DocumentSupport::Enabled)
-        .open()
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), EngineErrorKind::Unsupported);
-    assert!(!unsupported_documents.exists());
+    #[cfg(not(feature = "documents"))]
+    {
+        let unsupported_documents = parent.path().join("unsupported-documents");
+        let error = BriskDb::builder(&unsupported_documents)
+            .with_document_support(DocumentSupport::Enabled)
+            .open()
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Unsupported);
+        assert!(!unsupported_documents.exists());
+    }
+
+    #[cfg(feature = "documents")]
+    {
+        let supported_documents = parent.path().join("supported-documents");
+        let database = BriskDb::builder(&supported_documents)
+            .with_shard_count(2)
+            .with_document_support(DocumentSupport::Enabled)
+            .open()
+            .await
+            .unwrap();
+        assert_eq!(database.document_support(), DocumentSupport::Enabled);
+        database.close().await.unwrap();
+    }
 
     let empty = BriskDb::builder("").validate().unwrap_err();
     assert_eq!(empty.kind(), EngineErrorKind::InvalidArgument);

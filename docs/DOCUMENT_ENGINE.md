@@ -1,12 +1,14 @@
 # Protocol-neutral document engine
 
-Status: implemented by roadmap issue #162
+Status: engine slice implemented by roadmap issue #162; embedded facade
+implemented by issue #191
 
 The opt-in `documents` feature adds an asynchronous document command boundary
 to `core::Engine`. A caller submits an owned `DocumentRequest` to
 `Engine::execute_document`; no HTTP, PostgreSQL, MongoDB, or other network
-listener participates. This is the shared execution boundary for future Rust,
-Python, and MongoDB adapters.
+listener participates. `BriskDb` and `BriskSession` expose the same operation
+to embedded Rust callers. This is the shared execution boundary for future
+Python and MongoDB adapters.
 
 Every request carries a nonzero 128-bit request identity and the same
 `RequestContext` controls as SQL operations: cancellation, an absolute
@@ -14,6 +16,40 @@ deadline, and result limits that may narrow the engine defaults. The returned
 `DocumentExecution` echoes the request identity and, for routed data commands,
 the selected point or scatter plan. Reusing an identity helps correlate logs;
 it does not make a write idempotent.
+
+## Embedded facade
+
+With the `documents` feature, the listener-free API adds these exact methods:
+
+```text
+BriskDb::execute_document(
+    &self,
+    session: &Session,
+    request: DocumentRequest,
+) -> EngineResult<DocumentExecution>
+
+BriskSession::execute_document(
+    &self,
+    request: DocumentRequest,
+) -> EngineResult<DocumentExecution>
+```
+
+The database form is useful to hosts that already manage core `Session`
+values. The owned-session form keeps the database identity and shared
+serialized session state in one cloneable handle. Neither method translates
+BSON, reconstructs requests, or owns document semantics; after checking
+per-handle enablement, it forwards the request unchanged to
+`Engine::execute_document`.
+
+The embedded facade has a build-time and a per-handle gate. Applications
+compile with `default-features = false, features = ["documents"]`, then open
+through `BriskDb::builder(...)` with `DocumentSupport::Enabled`.
+Without the Cargo feature, these methods are not compiled and builder
+validation of the enabled setting returns `Unsupported` before filesystem
+access. With the feature present but support disabled on the handle, a facade
+call returns `FailedPrecondition` before engine admission. See
+[Embedded Rust](EMBEDDED_RUST.md#native-document-commands) for a complete
+example.
 
 ## Implemented commands
 
@@ -65,8 +101,9 @@ Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
 category. Inserts require caller-supplied `_id` values until generated document
 IDs land.
 
-This release does not add a MongoDB listener or the higher-level embedded Rust
-and Python collection APIs. Those adapters will translate into this engine
-boundary instead of implementing routing or storage behavior themselves. See
-[the Mongo parity contract](MONGO_PARITY.md), [the BSON contract](BSON.md), and
-[document storage](DOCUMENT_STORAGE.md) for the adjacent contracts.
+This release does not add a MongoDB listener, a collection-oriented Rust
+convenience API, or the Python document API. Those later adapters will
+translate into this engine boundary instead of implementing routing or storage
+behavior themselves. See [the Mongo parity contract](MONGO_PARITY.md),
+[the BSON contract](BSON.md), and [document storage](DOCUMENT_STORAGE.md) for
+the adjacent contracts.

@@ -18,6 +18,8 @@ use crate::core::{
     RequestContext, ResultSet, Routed, Row, RowStream, Session, SessionId, SessionState,
     ShutdownReport, Statement, TransactionExecution, Value, WriteResult,
 };
+#[cfg(feature = "documents")]
+use crate::document::{DocumentExecution, DocumentRequest};
 use crate::{EngineError, EngineErrorKind};
 use crate::{SqlDialect, SqlTranslationMode};
 
@@ -45,8 +47,9 @@ pub enum RuntimeBehavior {
 /// Optional native document-command surface for an embedded database.
 ///
 /// Document support is an explicit configuration choice so enabling it later
-/// cannot silently change a SQL-only application's storage contract. The
-/// current build rejects [`DocumentSupport::Enabled`] before touching storage.
+/// cannot silently change a SQL-only application's storage contract. Builds
+/// without the `documents` feature reject [`DocumentSupport::Enabled`] before
+/// touching storage.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DocumentSupport {
@@ -147,10 +150,11 @@ impl BriskDbBuilder {
                 "a dedicated embedded runtime is not implemented; use CallerManaged",
             ));
         }
+        #[cfg(not(feature = "documents"))]
         if self.document_support != DocumentSupport::Disabled {
             return Err(EngineError::new(
                 EngineErrorKind::Unsupported,
-                "native embedded document support is not implemented in this build",
+                "native embedded document support requires the `documents` Cargo feature",
             ));
         }
         Ok(())
@@ -255,6 +259,17 @@ impl fmt::Debug for BriskCursor {
 }
 
 impl BriskDb {
+    #[cfg(feature = "documents")]
+    fn require_document_support(&self) -> EngineResult<()> {
+        if self.document_support != DocumentSupport::Enabled {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "native document support is disabled for this embedded database",
+            ));
+        }
+        Ok(())
+    }
+
     /// Start a builder for one data directory.
     pub fn builder(root: impl Into<PathBuf>) -> BriskDbBuilder {
         BriskDbBuilder::new(root)
@@ -334,6 +349,20 @@ impl BriskDb {
     /// Return immutable engine and resource-limit status.
     pub async fn status(&self, session: &Session) -> EngineResult<EngineStatus> {
         self.engine.status(session).await
+    }
+
+    /// Execute one native document request through the protocol-neutral engine.
+    ///
+    /// The database must be opened with [`DocumentSupport::Enabled`]. The
+    /// request and engine outcome are otherwise forwarded unchanged.
+    #[cfg(feature = "documents")]
+    pub async fn execute_document(
+        &self,
+        session: &Session,
+        request: DocumentRequest,
+    ) -> EngineResult<DocumentExecution> {
+        self.require_document_support()?;
+        self.engine.execute_document(session, request).await
     }
 
     /// Execute one routed write and return only its affected-row count.
@@ -796,6 +825,20 @@ impl BriskSession {
         self.database.status(self.session.as_ref()).await
     }
 
+    /// Execute one native document request on this owned session.
+    ///
+    /// The owning database must have been opened with
+    /// [`DocumentSupport::Enabled`].
+    #[cfg(feature = "documents")]
+    pub async fn execute_document(
+        &self,
+        request: DocumentRequest,
+    ) -> EngineResult<DocumentExecution> {
+        self.database
+            .execute_document(self.session.as_ref(), request)
+            .await
+    }
+
     /// Execute one routed write and return only its affected-row count.
     pub async fn execute(&self, statement: Statement) -> EngineResult<Routed<usize>> {
         self.database
@@ -1234,5 +1277,121 @@ impl BriskCursor {
     /// Wait for the next row, terminal query error, or clean end of stream.
     pub async fn next_row(&mut self) -> Option<EngineResult<Row>> {
         self.stream.next_row().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(feature = "documents"))]
+    #[test]
+    fn document_support_fails_closed_without_documents_feature() {
+        let error = BriskDb::builder("unused")
+            .with_document_support(DocumentSupport::Enabled)
+            .validate()
+            .unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::Unsupported);
+        assert_eq!(
+            error.to_string(),
+            "native embedded document support requires the `documents` Cargo feature"
+        );
+    }
+
+    #[cfg(feature = "documents")]
+    mod documents {
+        use super::*;
+        use crate::document::{
+            DocumentCollectionOptions, DocumentCommand, DocumentCreateCollectionRequest,
+            DocumentListCollectionsRequest, DocumentNamespace, DocumentReadOptions,
+            DocumentRequestId, DocumentResult, DocumentWriteOptions,
+        };
+
+        fn request(seed: u8, command: DocumentCommand) -> DocumentRequest {
+            DocumentRequest::new(
+                DocumentRequestId::new([seed; 16]).unwrap(),
+                RequestContext::new(),
+                command,
+            )
+        }
+
+        #[tokio::test]
+        async fn document_facades_require_opt_in_and_preserve_engine_outcomes() {
+            let temp = tempfile::tempdir().unwrap();
+            let disabled = BriskDb::builder(temp.path())
+                .with_shard_count(2)
+                .open()
+                .await
+                .unwrap();
+            let disabled_session = disabled.session();
+            let namespace = DocumentNamespace::new("app", "events").unwrap();
+            let create = DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                namespace.clone(),
+                DocumentCollectionOptions::empty(),
+                DocumentWriteOptions::new(),
+            ));
+
+            let error = disabled
+                .execute_document(&disabled_session, request(1, create))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+            assert_eq!(
+                error.to_string(),
+                "native document support is disabled for this embedded database"
+            );
+            disabled_session.close().await.unwrap();
+            disabled.close().await.unwrap();
+
+            let enabled = BriskDb::builder(temp.path())
+                .with_document_support(DocumentSupport::Enabled)
+                .open()
+                .await
+                .unwrap();
+            assert_eq!(enabled.document_support(), DocumentSupport::Enabled);
+            let session = enabled.session();
+            let create_id = DocumentRequestId::new([2; 16]).unwrap();
+            let created = enabled
+                .execute_document(
+                    &session,
+                    DocumentRequest::new(
+                        create_id,
+                        RequestContext::new(),
+                        DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                            namespace,
+                            DocumentCollectionOptions::empty(),
+                            DocumentWriteOptions::new(),
+                        )),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(created.request_id(), create_id);
+            assert!(matches!(created.result(), DocumentResult::Collection(_)));
+            session.close().await.unwrap();
+
+            let owned = enabled.owned_session();
+            let list_id = DocumentRequestId::new([3; 16]).unwrap();
+            let listed = owned
+                .execute_document(DocumentRequest::new(
+                    list_id,
+                    RequestContext::new(),
+                    DocumentCommand::ListCollections(
+                        DocumentListCollectionsRequest::new("app", DocumentReadOptions::new())
+                            .unwrap(),
+                    ),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(listed.request_id(), list_id);
+            match listed.result() {
+                DocumentResult::Collections(collections) => assert_eq!(collections.len(), 1),
+                result => panic!("expected collections, got {:?}", result.kind()),
+            }
+
+            owned.close().await.unwrap();
+            enabled.close().await.unwrap();
+        }
     }
 }

@@ -128,9 +128,9 @@ experimental and opt-in; the exact contract lives in
 | Global-index health and Prometheus metrics | `/health`, `/v1/admin/global-indexes`, `/metrics`, plus Rust operational reports |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
 | Debian package and hardened systemd service | Published |
-| Rust library entrypoint with optional attached listeners | Working |
+| Rust library entrypoint with optional attached listeners | Working; the opt-in `documents` feature adds a thin native document-command facade |
 | Same-host service and embedded processes sharing one ready root | Working on local filesystems |
-| Native MongoDB wire protocol with TinyMongo parity | [Versioned parity contract](docs/MONGO_PARITY.md), [Rust BSON foundation](docs/BSON.md), [document storage/import](docs/DOCUMENT_STORAGE.md), and the first [protocol-neutral document commands](docs/DOCUMENT_ENGINE.md) landed; remaining matcher/write semantics and the listener remain [planned](https://github.com/schapman1974/briskdb/issues/160) |
+| Native MongoDB wire protocol with TinyMongo parity | [Versioned parity contract](docs/MONGO_PARITY.md), [Rust BSON foundation](docs/BSON.md), [document storage/import](docs/DOCUMENT_STORAGE.md), the first [protocol-neutral document commands](docs/DOCUMENT_ENGINE.md), and their embedded Rust facade landed; remaining matcher/write semantics and the listener remain [planned](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
 | Native Python extension | Sync/async API working; tagged releases build audited macOS/Linux ARM/x86 wheels |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
@@ -215,8 +215,11 @@ packages with a hardened systemd service.
 Embedding in Rust starts with `BriskDb::open()` or the validated builder. The
 [embedded Rust guide](docs/EMBEDDED_RUST.md) includes a complete listener-free
 example. Choose a shard count when creating data; later opens detect it from
-the manifest and reject explicit mismatches. Use `default-features = false` with the
-`embedded` feature to leave the network and CLI stacks out; see the
+the manifest and reject explicit mismatches. Use `default-features = false`
+with the `embedded` feature for SQL-only embedding. Select `documents` and
+explicitly enable `DocumentSupport` to submit native BSON commands through
+`BriskDb` or an owned `BriskSession`. Both forms use the same document engine
+and routing plans as future protocol adapters; see the
 [crate feature map](docs/CRATE_FEATURES.md).
 
 Python runs the same engine directly in-process. It starts no listener by
@@ -257,8 +260,9 @@ and integrity metadata. Application rows stay in ordinary SQLite files.
 
 ## Where this is going
 
-- **MongoDB:** a native Rust Mongo listener with BSON, queries, updates,
-  indexes, cursors, aggregation, and differential TinyMongo parity.
+- **MongoDB:** complete the matcher, write, index, cursor, and aggregation
+  semantics behind the native embedded command facade, then add a Rust Mongo
+  listener and differential TinyMongo parity.
 - **More wire protocols:** broader PostgreSQL client compatibility and a MySQL
   listener, all sharing the same engine behavior.
 - **Serverless storage:** atomic snapshots, object-store adapters, and fenced
