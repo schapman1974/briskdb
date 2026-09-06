@@ -72,6 +72,9 @@ server-cli = [
 # The offline SQLite importer is separate from the embedded query surface.
 sqlite-import = ["dep:serde", "dep:serde_json", "dep:tracing"]
 sqlite-import-cli = ["sqlite-import", "dep:anyhow", "dep:clap"]
+# Strict offline migration from TinyMongo's SQLite formats. This remains
+# opt-in because it requires the BSON model in addition to the SQL importer.
+tinymongo-import = ["documents", "sqlite-import"]
 # The BSON foundation is opt-in while the document engine and listener are
 # still being built. BSON-only dependencies stay out of ordinary SQL builds.
 documents = [
@@ -114,7 +117,7 @@ rustls-pemfile = { version = "2.2", optional = true }
 rusqlite = { version = "0.39.0", features = ["bundled", "column_decltype", "column_metadata", "hooks", "limits", "preupdate_hook"] }
 same-file = "1.0"
 serde = { version = "1.0.229", features = ["derive"], optional = true }
-serde_json = { version = "1.0", optional = true }
+serde_json = { version = "1.0", features = ["arbitrary_precision", "preserve_order"], optional = true }
 sqlparser = { version = "=0.62.0", default-features = false, features = ["std", "recursive-protection", "visitor"] }
 # `recursive` admits newer `psm` releases whose build dependencies require
 # Rust 1.88. The direct exact constraint preserves BriskDB's Rust 1.85 MSRV for

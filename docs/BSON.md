@@ -1,9 +1,9 @@
 # BSON value and codec contract
 
-BriskDB's `documents` feature provides the BSON value model used by the planned
-MongoDB listener, document storage, query engine, and Rust and Python document
-APIs. The foundation is protocol-neutral and does not start a listener or add
-document commands by itself.
+BriskDB's `documents` feature provides the BSON value model used by the
+versioned document store and planned MongoDB listener, query engine, and Rust
+and Python document APIs. The foundation is protocol-neutral and does not
+start a listener or add document commands by itself.
 
 ```toml
 [dependencies]
@@ -267,3 +267,6 @@ cargo install cargo-fuzz
 cargo fuzz run --fuzz-dir fuzz bson_codec
 cargo fuzz run --fuzz-dir fuzz bson_comparison
 ```
+
+The versioned collection catalog and shard persistence built on these types is
+documented in [document storage and TinyMongo import](DOCUMENT_STORAGE.md).

@@ -4,12 +4,21 @@
 //! protocol-neutral: the MongoDB listener, embedded document API, and storage
 //! layer all consume the same value and codec rules.
 
+mod catalog;
 mod codec;
 mod error;
 mod key;
 mod number;
 mod value;
 
+pub(crate) use catalog::validate_namespace;
+pub use catalog::{
+    DOCUMENT_CATALOG_VERSION, DOCUMENT_INDEX_FORMAT_VERSION, DOCUMENT_SCHEMA_VERSION,
+    DOCUMENT_STORAGE_FORMAT_VERSION, DocumentCatalog, DocumentCollectionId,
+    DocumentCollectionMetadata, DocumentCollectionOptions, DocumentDatabaseId,
+    DocumentIndexLifecycle, DocumentIndexMetadata, DocumentPlacement,
+    MAX_DOCUMENT_DATABASE_NAME_BYTES, MAX_DOCUMENT_NAMESPACE_BYTES,
+};
 pub use codec::{
     BSON_MAX_DECODED_BYTES, BSON_MAX_DOCUMENT_BYTES, BSON_MAX_NESTING_DEPTH, BsonCodecOptions,
     DuplicateFieldPolicy, decode_document, decode_document_with_options, encode_document,

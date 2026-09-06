@@ -449,8 +449,9 @@ requires an earlier dependency:
     - [x] [#164](https://github.com/schapman1974/briskdb/issues/164) — canonical
       BSON model, codec, ordering, and versioned semantic keys; see
       [`docs/BSON.md`](docs/BSON.md)
-    - [ ] [#163](https://github.com/schapman1974/briskdb/issues/163) — document
-      catalog and storage layout
+    - [x] [#163](https://github.com/schapman1974/briskdb/issues/163) — versioned
+      document catalog, sharded BSON storage, and atomic TinyMongo SQLite
+      import; see [`docs/DOCUMENT_STORAGE.md`](docs/DOCUMENT_STORAGE.md)
     - [ ] [#162](https://github.com/schapman1974/briskdb/issues/162) —
       protocol-neutral document engine
     - [ ] [#191](https://github.com/schapman1974/briskdb/issues/191) — embedded

@@ -3,6 +3,19 @@
 mod copy;
 mod schema;
 mod staging;
+#[cfg(feature = "tinymongo-import")]
+mod tinymongo;
+
+#[cfg(feature = "tinymongo-import")]
+pub use tinymongo::{
+    MAX_TINYMONGO_IMPORT_BSON_BYTES, MAX_TINYMONGO_IMPORT_COLLECTIONS,
+    MAX_TINYMONGO_IMPORT_DOCUMENTS, MAX_TINYMONGO_IMPORT_INDEX_NAME_BYTES,
+    MAX_TINYMONGO_IMPORT_INDEXES, MAX_TINYMONGO_IMPORT_METADATA_BSON_BYTES,
+    MAX_TINYMONGO_IMPORT_SOURCE_METADATA_BYTES, TINYMONGO_IMPORT_FORMAT_VERSION,
+    TINYMONGO_IMPORT_RECEIPT_VERSION, TinyMongoImportCollection, TinyMongoImportIndex,
+    TinyMongoImportOptions, TinyMongoImportPlan, TinyMongoImportReport, TinyMongoImportSource,
+    TinyMongoSourceVariant, import_tinymongo_database, read_tinymongo_source,
+};
 
 use std::{
     fmt,

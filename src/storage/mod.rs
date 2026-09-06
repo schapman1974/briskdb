@@ -1,5 +1,6 @@
 //! SQLite file layout, versioned manifest management, and connection configuration.
 
+mod document;
 mod global_index;
 mod global_index_async;
 mod hilo;
@@ -906,6 +907,24 @@ impl Storage {
             sealed.committed_schema_digest(),
             sealed.target_schema_digest(),
         )?;
+        let document_provisioning = manifest
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM briskdb_document_provisioning)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sqlite_error::storage)?;
+        if document_provisioning {
+            startup.mark_pending_on_drop();
+        }
+        if let Err(error) = document::recover_or_validate(&storage, &mut manifest) {
+            if error.kind() == EngineErrorKind::DataCorruption {
+                storage.mark_schema_degraded();
+                let _ =
+                    manifest::mark_degraded(&mut manifest, requested_shards, &storage.shard_layout);
+            }
+            return Err(error);
+        }
         storage
             .schema_coordination
             .reconcile_validated_catalog_generation(&storage.catalog)?;
@@ -2676,6 +2695,8 @@ impl Storage {
                      WHERE name NOT GLOB 'sqlite_*'
                        AND name <> 'briskdb_shard_metadata'
                        AND tbl_name <> 'briskdb_shard_metadata'
+                       AND name <> 'briskdb_documents_v1'
+                       AND tbl_name <> 'briskdb_documents_v1'
                      ORDER BY name COLLATE BINARY
                      LIMIT 1",
                     [],
@@ -3328,6 +3349,7 @@ fn application_table_names(connection: &Connection) -> EngineResult<BTreeSet<Str
              WHERE schema = 'main' AND type IN ('table', 'virtual')
                AND name NOT GLOB 'sqlite_*'
                AND name <> 'briskdb_shard_metadata'
+               AND name <> 'briskdb_documents_v1'
              ORDER BY name COLLATE BINARY",
         )
         .map_err(sqlite_error::storage)?;
@@ -4388,6 +4410,10 @@ mod tests {
             manifest
                 .execute_batch(
                     "BEGIN IMMEDIATE;
+                     DROP TABLE briskdb_document_provisioning;
+                     DROP TABLE briskdb_document_indexes;
+                     DROP TABLE briskdb_document_collections;
+                     DROP TABLE briskdb_document_databases;
                      DROP TABLE briskdb_global_index_parts;
                      DROP TABLE briskdb_global_indexes;
                      DROP TABLE briskdb_generated_table_ddl;
@@ -4494,6 +4520,10 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_document_provisioning;
+                 DROP TABLE briskdb_document_indexes;
+                 DROP TABLE briskdb_document_collections;
+                 DROP TABLE briskdb_document_databases;
                  DROP TABLE briskdb_global_index_parts;
                  DROP TABLE briskdb_global_indexes;
                  DROP TABLE briskdb_generated_table_ddl;
@@ -4594,6 +4624,10 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_document_provisioning;
+                 DROP TABLE briskdb_document_indexes;
+                 DROP TABLE briskdb_document_collections;
+                 DROP TABLE briskdb_document_databases;
                  DROP TABLE briskdb_global_index_parts;
                  DROP TABLE briskdb_global_indexes;
                  DROP TABLE briskdb_generated_table_ddl;

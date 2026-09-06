@@ -24,6 +24,7 @@ briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["em
 | `server-cli` | `briskdb` binary, Clap, logging subscriber, multithread runtime | Process integration |
 | `sqlite-import` | Offline SQLite import library | Alpha-supported |
 | `sqlite-import-cli` | `briskdb-import` binary | Process integration |
+| `tinymongo-import` | Strict TinyMongo v1.3 SQLite reader and atomic document import; selects `documents` and `sqlite-import` | Experimental migration API |
 | `experimental-vtab` | Sharded virtual-table prototype | Experimental |
 | `documents` | BSON values, codec, comparison, and canonical semantic keys; also selects `embedded` | Experimental foundation; no document engine or listener yet |
 | `mysql` | Reserved MySQL boundary | Reserved; no listener yet |
@@ -44,11 +45,13 @@ listener assembly.
 - The public `core`, `sql`, and `storage` modules expose implementation-facing
   building blocks used by current adapters. Prefer crate-root and `embedded`
   APIs unless implementing a BriskDB adapter.
-- The `documents` feature exposes the protocol-neutral BSON foundation
-  documented in [BSON value and codec contract](BSON.md). Its value, codec,
-  comparison, and key APIs are experimental while the document engine is built.
-  It does not yet expose collections, persistence, commands, or a MongoDB
-  listener.
+- The `documents` feature exposes the protocol-neutral BSON foundation and
+  versioned internal persistence documented in
+  [BSON value and codec contract](BSON.md) and
+  [document storage](DOCUMENT_STORAGE.md). Its public value, codec,
+  comparison, key, and catalog metadata APIs are experimental while the
+  document engine is built. It does not yet expose document commands or a
+  MongoDB listener.
 - The `mysql` reserved feature compiles but intentionally exposes no claimed
   implementation.
 

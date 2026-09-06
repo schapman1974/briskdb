@@ -179,7 +179,7 @@ async fn execute(
         .params
         .into_iter()
         .map(json_to_value)
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let session = engine.session();
     if let Some(shard_key) = request.shard_key {
         session.set_routing_key(shard_key).await?;
@@ -230,7 +230,7 @@ async fn query(
         .params
         .into_iter()
         .map(json_to_value)
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let session = engine.session();
     if engine.catalog().tables().is_empty() {
         if let Some(shard_key) = request.shard_key {
@@ -419,8 +419,9 @@ fn write_index_metrics(output: &mut String, index: &GlobalIndexOperationalStatus
     );
 }
 
-fn json_to_value(value: JsonValue) -> Value {
-    match value {
+fn json_to_value(value: JsonValue) -> Result<Value, EngineError> {
+    validate_json_numbers(&value)?;
+    Ok(match value {
         JsonValue::Null => Value::Null,
         JsonValue::Bool(value) => Value::Boolean(value),
         JsonValue::Number(value) => value
@@ -428,13 +429,60 @@ fn json_to_value(value: JsonValue) -> Value {
             .map(Value::Int64)
             .or_else(|| value.as_u64().map(Value::UInt64))
             .or_else(|| value.as_f64().map(Value::Float64))
-            .unwrap_or_else(|| {
-                Value::decimal(value.to_string())
-                    .expect("a serde_json Number always has valid decimal syntax")
-            }),
+            .expect("validated JSON numbers fit the HTTP v1 numeric contract"),
         JsonValue::String(value) => Value::Text(value),
-        JsonValue::Array(value) => Value::Text(JsonValue::Array(value).to_string()),
-        JsonValue::Object(value) => Value::Text(JsonValue::Object(value).to_string()),
+        JsonValue::Array(value) => Value::Text(legacy_json_text(JsonValue::Array(value))),
+        JsonValue::Object(value) => Value::Text(legacy_json_text(JsonValue::Object(value))),
+    })
+}
+
+fn legacy_json_text(value: JsonValue) -> String {
+    fn sort_object_keys(value: JsonValue) -> JsonValue {
+        match value {
+            JsonValue::Array(values) => {
+                JsonValue::Array(values.into_iter().map(sort_object_keys).collect())
+            }
+            JsonValue::Object(values) => {
+                let mut entries = values.into_iter().collect::<Vec<_>>();
+                entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                JsonValue::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, sort_object_keys(value)))
+                        .collect(),
+                )
+            }
+            value => value,
+        }
+    }
+
+    sort_object_keys(value).to_string()
+}
+
+fn validate_json_numbers(value: &JsonValue) -> Result<(), EngineError> {
+    match value {
+        JsonValue::Number(number) => {
+            let rendered = number.to_string();
+            let valid = if rendered
+                .as_bytes()
+                .iter()
+                .any(|byte| matches!(byte, b'.' | b'e' | b'E'))
+            {
+                number.as_f64().is_some_and(f64::is_finite)
+            } else {
+                number.as_i64().is_some() || number.as_u64().is_some()
+            };
+            if !valid {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    "an HTTP JSON parameter contains a number outside the v1 numeric range",
+                ));
+            }
+            Ok(())
+        }
+        JsonValue::Array(values) => values.iter().try_for_each(validate_json_numbers),
+        JsonValue::Object(values) => values.values().try_for_each(validate_json_numbers),
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::String(_) => Ok(()),
     }
 }
 
@@ -629,6 +677,23 @@ mod tests {
         body: Option<JsonValue>,
     ) -> (StatusCode, JsonValue) {
         response_json(send_json(router, method, uri, body).await).await
+    }
+
+    async fn request_raw_json(router: &Router, uri: &str, body: &str) -> (StatusCode, JsonValue) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["briskdb-api-version"], "1");
+        response_json(response).await
     }
 
     #[tokio::test]
@@ -1936,6 +2001,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_numbers_outside_json_v1_range_are_rejected_at_every_depth() {
+        let temp = tempfile::tempdir().unwrap();
+        let application = engine_router(Arc::new(Database::open(temp.path(), 4).unwrap()));
+        let expected = (
+            StatusCode::BAD_REQUEST,
+            json!({
+                "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#invalid-argument",
+                "title": "Invalid argument",
+                "status": 400,
+                "detail": "The request contains an invalid argument.",
+                "code": "invalid_argument"
+            }),
+        );
+
+        for body in [
+            r#"{"shard_key":"numeric-boundary","sql":"SELECT ?1","params":[18446744073709551616]}"#,
+            r#"{"shard_key":"numeric-boundary","sql":"SELECT ?1","params":[[18446744073709551616]]}"#,
+            r#"{"shard_key":"numeric-boundary","sql":"SELECT ?1","params":[{"nested":-9223372036854775809}]}"#,
+            r#"{"shard_key":"numeric-boundary","sql":"SELECT ?1","params":[1e400]}"#,
+            r#"{"shard_key":"numeric-boundary","sql":"SELECT ?1","params":[{"nested":[1e400]}]}"#,
+        ] {
+            assert_eq!(
+                request_raw_json(&application, "/v1/query", body).await,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn constraint_failures_keep_their_precise_safe_kind() {
         let temp = tempfile::tempdir().unwrap();
         let application = engine_router(Arc::new(Database::open(temp.path(), 4).unwrap()));
@@ -2216,20 +2310,29 @@ mod tests {
 
     #[test]
     fn json_parameters_keep_the_existing_binding_contract() {
-        assert_eq!(json_to_value(JsonValue::Null), Value::Null);
-        assert_eq!(json_to_value(json!(true)), Value::from(true));
-        assert_eq!(json_to_value(json!(42)), Value::from(42_i64));
-        assert_eq!(json_to_value(json!(1.5)), Value::from(1.5_f64));
-        assert_eq!(json_to_value(json!("text")), Value::from("text"));
-        assert_eq!(json_to_value(json!([1, "two"])), Value::from("[1,\"two\"]"));
+        assert_eq!(json_to_value(JsonValue::Null).unwrap(), Value::Null);
+        assert_eq!(json_to_value(json!(true)).unwrap(), Value::from(true));
+        assert_eq!(json_to_value(json!(42)).unwrap(), Value::from(42_i64));
+        assert_eq!(json_to_value(json!(1.5)).unwrap(), Value::from(1.5_f64));
+        assert_eq!(json_to_value(json!("text")).unwrap(), Value::from("text"));
         assert_eq!(
-            json_to_value(json!({"nested": true})),
+            json_to_value(json!([1, "two"])).unwrap(),
+            Value::from("[1,\"two\"]")
+        );
+        assert_eq!(
+            json_to_value(json!({"nested": true})).unwrap(),
             Value::from("{\"nested\":true}")
+        );
+        let insertion_ordered: JsonValue =
+            serde_json::from_str(r#"{"z":0,"a":{"z":1,"a":2},"m":[{"z":3,"a":4}]}"#).unwrap();
+        assert_eq!(
+            json_to_value(insertion_ordered).unwrap(),
+            Value::from(r#"{"a":{"a":2,"z":1},"m":[{"a":4,"z":3}],"z":0}"#)
         );
 
         let above_signed_i64_range = json!(9_223_372_036_854_775_809_u64);
         assert_eq!(
-            json_to_value(above_signed_i64_range),
+            json_to_value(above_signed_i64_range).unwrap(),
             Value::from(9_223_372_036_854_775_809_u64)
         );
     }
@@ -2237,11 +2340,11 @@ mod tests {
     #[test]
     fn http_parameters_use_the_shared_canonical_index_key_encoding() {
         let through_http = [
-            json_to_value(json!(true)),
-            json_to_value(json!(-42)),
-            json_to_value(json!(9_223_372_036_854_775_809_u64)),
-            json_to_value(json!(1.5)),
-            json_to_value(json!("shared")),
+            json_to_value(json!(true)).unwrap(),
+            json_to_value(json!(-42)).unwrap(),
+            json_to_value(json!(9_223_372_036_854_775_809_u64)).unwrap(),
+            json_to_value(json!(1.5)).unwrap(),
+            json_to_value(json!("shared")).unwrap(),
         ];
         let direct = [
             Value::Boolean(true),
