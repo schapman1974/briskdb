@@ -26,7 +26,7 @@ briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["em
 | `sqlite-import-cli` | `briskdb-import` binary | Process integration |
 | `tinymongo-import` | Strict TinyMongo v1.3 SQLite reader and atomic document import; selects `documents` and `sqlite-import` | Experimental migration API |
 | `experimental-vtab` | Sharded virtual-table prototype | Experimental |
-| `documents` | BSON values, codec, comparison, and canonical semantic keys; also selects `embedded` | Experimental foundation; no document engine or listener yet |
+| `documents` | BSON values and codec, catalog/storage, TinyMongo-ready semantic keys, and protocol-neutral document commands; also selects `embedded` | Experimental document engine; no MongoDB listener yet |
 | `mysql` | Reserved MySQL boundary | Reserved; no listener yet |
 | `tls` | Compatibility alias for the secure `postgres` surface | Alpha-supported; selected by `listeners` |
 
@@ -45,13 +45,13 @@ listener assembly.
 - The public `core`, `sql`, and `storage` modules expose implementation-facing
   building blocks used by current adapters. Prefer crate-root and `embedded`
   APIs unless implementing a BriskDB adapter.
-- The `documents` feature exposes the protocol-neutral BSON foundation and
-  versioned internal persistence documented in
+- The `documents` feature exposes the protocol-neutral BSON foundation,
+  versioned persistence, and first document-engine commands documented in
   [BSON value and codec contract](BSON.md) and
-  [document storage](DOCUMENT_STORAGE.md). Its public value, codec,
-  comparison, key, and catalog metadata APIs are experimental while the
-  document engine is built. It does not yet expose document commands or a
-  MongoDB listener.
+  [document storage](DOCUMENT_STORAGE.md), and
+  [protocol-neutral document engine](DOCUMENT_ENGINE.md). Its public value,
+  command, result, and metadata APIs remain experimental while Mongo semantics
+  are completed. It does not expose a MongoDB listener.
 - The `mysql` reserved feature compiles but intentionally exposes no claimed
   implementation.
 

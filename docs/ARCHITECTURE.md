@@ -608,6 +608,21 @@ without the optional `documents` feature still understand and checksum version
 14 metadata and recognize its exact shard schema; they refuse to activate a
 store with document collections.
 
+The optional document engine sits above that persistence boundary. Owned
+`DocumentRequest` values carry request identity, cancellation, deadline, read
+or write options, and narrower result limits through `Engine::execute_document`.
+Collection and index metadata commands, single explicit-ID inserts,
+single-document exact-ID deletion, and the first exact-`_id` or empty-filter
+find/count paths use ordinary engine session, lifecycle, worker, and
+connection-pool admission. Exact IDs compile to one point shard; empty filters
+compile to a deterministic all-shard plan whose results merge by durable
+natural order. The returned `DocumentExecution`
+retains that redaction-safe plan and the request identity while its result
+preserves BSON field order and representation. Protocol adapters have no
+direct SQLite or document-storage path. General matching, transformations,
+retained cursors, and Mongo wire behavior build on this boundary in later
+issues; see [the document engine contract](DOCUMENT_ENGINE.md).
+
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4
 migration remains manifest-atomic. The v4-to-v5 step first validates the v4

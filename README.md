@@ -130,7 +130,7 @@ experimental and opt-in; the exact contract lives in
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working |
 | Same-host service and embedded processes sharing one ready root | Working on local filesystems |
-| Native MongoDB wire protocol with TinyMongo parity | [Versioned parity contract](docs/MONGO_PARITY.md), [Rust BSON foundation](docs/BSON.md), and [document storage/import](docs/DOCUMENT_STORAGE.md) landed; engine and listener remain [planned](https://github.com/schapman1974/briskdb/issues/160) |
+| Native MongoDB wire protocol with TinyMongo parity | [Versioned parity contract](docs/MONGO_PARITY.md), [Rust BSON foundation](docs/BSON.md), [document storage/import](docs/DOCUMENT_STORAGE.md), and the first [protocol-neutral document commands](docs/DOCUMENT_ENGINE.md) landed; remaining matcher/write semantics and the listener remain [planned](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
 | Native Python extension | Sync/async API working; tagged releases build audited macOS/Linux ARM/x86 wheels |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
@@ -317,6 +317,7 @@ more valuable than a star. Start with the
 - [Mongo compatibility parity contract](docs/MONGO_PARITY.md)
 - [BSON value and codec contract](docs/BSON.md)
 - [Document catalog, storage, and TinyMongo import](docs/DOCUMENT_STORAGE.md)
+- [Protocol-neutral document engine](docs/DOCUMENT_ENGINE.md)
 - [SQL compatibility](docs/SQL_COMPATIBILITY.md)
 - [Generated keys](docs/GENERATED_KEYS.md)
 - [Storage format](docs/STORAGE_FORMAT.md)

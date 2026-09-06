@@ -452,8 +452,9 @@ requires an earlier dependency:
     - [x] [#163](https://github.com/schapman1974/briskdb/issues/163) — versioned
       document catalog, sharded BSON storage, and atomic TinyMongo SQLite
       import; see [`docs/DOCUMENT_STORAGE.md`](docs/DOCUMENT_STORAGE.md)
-    - [ ] [#162](https://github.com/schapman1974/briskdb/issues/162) —
-      protocol-neutral document engine
+    - [x] [#162](https://github.com/schapman1974/briskdb/issues/162) —
+      protocol-neutral document engine with controlled point/scatter commands;
+      see [`docs/DOCUMENT_ENGINE.md`](docs/DOCUMENT_ENGINE.md)
     - [ ] [#191](https://github.com/schapman1974/briskdb/issues/191) — embedded
       Rust document API
     - [ ] [#198](https://github.com/schapman1974/briskdb/issues/198) — Python

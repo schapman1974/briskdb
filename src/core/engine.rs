@@ -1,5 +1,8 @@
 //! Asynchronous protocol-neutral engine boundary.
 
+#[cfg(feature = "documents")]
+mod document_engine;
+
 use std::{
     path::{Path, PathBuf},
     sync::{

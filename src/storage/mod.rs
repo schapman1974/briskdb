@@ -1,6 +1,10 @@
 //! SQLite file layout, versioned manifest management, and connection configuration.
 
 mod document;
+#[cfg(feature = "documents")]
+pub(crate) use document::{
+    DocumentStorageRecord, MAX_DOCUMENT_SHARD_SCAN_RECORDS, PreparedDocumentWrite,
+};
 mod global_index;
 mod global_index_async;
 mod hilo;
@@ -3155,7 +3159,9 @@ impl Storage {
         let authorizer_probe_wrote = Arc::clone(&probe_wrote);
         connection
             .authorizer(Some(move |context: AuthContext<'_>| {
-                if shard::denies_client_action(context.action) {
+                if shard::denies_client_action(context.action)
+                    && !document_pool_action_is_allowed(context.action)
+                {
                     return Authorization::Deny;
                 }
                 if action_taints_connection(context.action) {
@@ -3185,6 +3191,21 @@ impl Storage {
                 probe_wrote,
             },
         ))
+    }
+}
+
+fn document_pool_action_is_allowed(action: AuthAction<'_>) -> bool {
+    if !pool::document_storage_operation_active() {
+        return false;
+    }
+    match action {
+        AuthAction::Insert { table_name } | AuthAction::Delete { table_name } => {
+            table_name == document::RECORDS_TABLE
+        }
+        AuthAction::Update { table_name, .. } | AuthAction::Read { table_name, .. } => {
+            table_name == document::RECORDS_TABLE
+        }
+        _ => false,
     }
 }
 

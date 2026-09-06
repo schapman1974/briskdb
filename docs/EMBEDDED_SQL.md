@@ -77,6 +77,9 @@ one finite runtime outside the GIL/host lock, submit these async calls to it,
 and map cancellation back through `RequestContext`; they must not create a new
 runtime per query.
 
-Native document commands remain unavailable until the BSON/document engine in
-#162–#164 lands. Selecting `DocumentSupport::Enabled` fails before storage is
-touched, so SQL-only embedding cannot accidentally claim Mongo compatibility.
+The opt-in `documents` feature now exposes protocol-neutral document commands
+on `core::Engine`; see [the document engine contract](DOCUMENT_ENGINE.md).
+`BriskDb` does not yet wrap those commands as a high-level collection API.
+Selecting `DocumentSupport::Enabled` therefore still fails before storage is
+touched until issue #191 lands, so SQL-only embedding cannot accidentally claim
+Mongo compatibility.

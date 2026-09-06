@@ -16,10 +16,17 @@ and 100-level nesting limits and is covered by frozen comparison vectors,
 official BSON corpus cases, property tests, and cargo-fuzz targets. This release
 also adds manifest-v14 document namespaces, exact sharded BSON records,
 canonical `_id` routing and uniqueness, restart-safe collection provisioning,
-and an atomic TinyMongo v1.3 SQLite importer. It does not yet add document
-commands, a MongoDB listener, or the public Rust/Python collection APIs tracked
-by the following roadmap issues. See [the BSON contract](docs/BSON.md) and
-[the document storage contract](docs/DOCUMENT_STORAGE.md).
+and an atomic TinyMongo v1.3 SQLite importer. A new protocol-neutral document
+engine executes collection and index metadata commands, single explicit-ID
+inserts, empty-filter or exact-`_id` find/count commands, and exact-`_id`
+single-document deletion through the same session, pool, routing, cancellation,
+deadline, shutdown, and result-limit boundaries as SQL. Point plans target one
+shard; scatter reads merge in durable natural order while preserving exact
+ordered BSON. General matchers, update expressions, replacements, aggregation,
+retained cursors, the MongoDB listener, and public Rust/Python collection APIs
+remain follow-up work. See [the BSON contract](docs/BSON.md),
+[the document storage contract](docs/DOCUMENT_STORAGE.md), and
+[the document engine contract](docs/DOCUMENT_ENGINE.md).
 
 HTTP now has an explicit version-1 contract, discovery at `/v1`, a versioned
 `/v1/health` alias, and `BriskDB-API-Version: 1` on v1 responses. Existing valid

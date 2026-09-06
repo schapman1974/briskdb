@@ -141,12 +141,15 @@ fn shard_read_error(error: rusqlite::Error, diagnostic: &'static str) -> EngineE
 
 #[cfg(feature = "documents")]
 mod enabled {
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
     use crate::{
-        core::{CancellationToken, EngineError, EngineErrorKind, EngineResult},
+        core::{CancellationToken, EngineError, EngineErrorKind, EngineResult, OperationControl},
         document::{
             BsonDocument, BsonErrorContext, BsonValue, CanonicalBsonKey, DocumentCatalog,
             DocumentCollectionId, DocumentCollectionMetadata, DocumentCollectionOptions,
@@ -158,7 +161,8 @@ mod enabled {
 
     use super::{Storage, corrupt, ensure_schema, require_schema, shard_read_error};
     use crate::storage::{
-        configure_journal_mode, configure_manifest_connection, manifest, open_existing_manifest,
+        SchemaMigrationGuard, configure_journal_mode, configure_manifest_connection,
+        configure_manifest_connection_after_busy_setup, manifest, open_existing_manifest, pool,
     };
 
     const COLLECTION_PROVISIONING: i64 = manifest::DOCUMENT_COLLECTION_PROVISIONING;
@@ -166,6 +170,74 @@ mod enabled {
     const INDEX_READY: i64 = manifest::DOCUMENT_INDEX_READY;
     const INDEX_PENDING_BUILD: i64 = manifest::DOCUMENT_INDEX_PENDING_BUILD;
     const RECORD_CHECKSUM_DOMAIN: &[u8] = b"briskdb.document-record.v1\0";
+    pub(crate) const MAX_DOCUMENT_SHARD_SCAN_RECORDS: usize = 4_096;
+
+    /// Exact, validated bytes prepared for one shard-local document write.
+    ///
+    /// The command engine can retain this value between routing and execution
+    /// without exposing SQLite or re-encoding BSON on a blocking worker.
+    #[derive(Debug, Clone)]
+    pub(crate) struct PreparedDocumentWrite {
+        id_key: CanonicalBsonKey,
+        document_bson: Vec<u8>,
+        shard: u16,
+    }
+
+    impl PreparedDocumentWrite {
+        pub(crate) const fn shard(&self) -> u16 {
+            self.shard
+        }
+
+        pub(crate) const fn id_key(&self) -> &CanonicalBsonKey {
+            &self.id_key
+        }
+
+        pub(crate) fn document_bson_len(&self) -> usize {
+            self.document_bson.len()
+        }
+    }
+
+    /// One checksum-validated shard record returned to the document engine.
+    #[derive(Debug, Clone)]
+    pub(crate) struct DocumentStorageRecord {
+        collection_id: DocumentCollectionId,
+        shard: u16,
+        natural_order: u64,
+        id_key: CanonicalBsonKey,
+        document: BsonDocument,
+        encoded_len: usize,
+    }
+
+    impl DocumentStorageRecord {
+        pub(crate) const fn collection_id(&self) -> DocumentCollectionId {
+            self.collection_id
+        }
+
+        pub(crate) const fn shard(&self) -> u16 {
+            self.shard
+        }
+
+        pub(crate) const fn natural_order(&self) -> u64 {
+            self.natural_order
+        }
+
+        pub(crate) const fn id_key(&self) -> &CanonicalBsonKey {
+            &self.id_key
+        }
+
+        #[cfg(test)]
+        pub(crate) const fn document(&self) -> &BsonDocument {
+            &self.document
+        }
+
+        pub(crate) const fn encoded_len(&self) -> usize {
+            self.encoded_len
+        }
+
+        pub(crate) fn into_document(self) -> BsonDocument {
+            self.document
+        }
+    }
 
     fn require_ready_manifest(connection: &Connection, shard_count: u16) -> EngineResult<()> {
         match manifest::current_integrity(connection, shard_count)?.state() {
@@ -189,25 +261,152 @@ mod enabled {
         next_shard: u16,
     }
 
+    enum CreateCollectionStart {
+        Existing(DocumentCollectionMetadata),
+        Provisioning(Provisioning),
+    }
+
+    fn run_dedicated_controlled<T>(
+        connection: &mut Connection,
+        control: Arc<OperationControl>,
+        work: impl FnOnce(&mut Connection) -> EngineResult<T>,
+    ) -> EngineResult<T> {
+        pool::run_dedicated_connection_controlled(connection, control, work)
+    }
+
+    fn run_manifest_controlled<T>(
+        connection: &mut Connection,
+        control: Arc<OperationControl>,
+        work: impl FnOnce(&mut Connection) -> EngineResult<T>,
+    ) -> EngineResult<T> {
+        run_dedicated_controlled(connection, control, |connection| {
+            // The controlled helper already owns the busy handler. Calling the
+            // ordinary configurator here would replace it with a fixed timeout.
+            configure_manifest_connection_after_busy_setup(connection)?;
+            work(connection)
+        })
+    }
+
+    fn ensure_control_active(
+        control: &OperationControl,
+        boundary: &'static str,
+    ) -> EngineResult<()> {
+        match control.reason() {
+            Some(reason) => Err(reason.error().context(boundary)),
+            None => Ok(()),
+        }
+    }
+
+    fn read_ready_manifest_snapshot<T>(
+        connection: &mut Connection,
+        shard_count: u16,
+        read: impl FnOnce(&Connection) -> EngineResult<T>,
+    ) -> EngineResult<T> {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(sqlite_error::storage)?;
+        require_ready_manifest(&transaction, shard_count)?;
+        let value = read(&transaction)?;
+        transaction.commit().map_err(sqlite_error::storage)?;
+        Ok(value)
+    }
+
     impl Storage {
+        #[cfg(any(feature = "tinymongo-import", test))]
         pub(crate) fn document_catalog(&self) -> EngineResult<DocumentCatalog> {
             let result = self.document_catalog_inner();
             self.fail_closed_on_corruption(result)
         }
 
+        #[cfg(test)]
+        pub(crate) fn document_catalog_controlled(
+            &self,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<DocumentCatalog> {
+            // Engine callers already own one schema-operation admission for
+            // the complete logical command. Reacquiring here could fail after
+            // a migration starts behind that admitted command.
+            let result = self.document_catalog_controlled_inner(control);
+            self.fail_closed_on_corruption(result)
+        }
+
+        /// Load one active collection without materializing unrelated catalog
+        /// metadata. Engine callers already own schema-operation admission.
+        pub(crate) fn document_collection_controlled(
+            &self,
+            database: &str,
+            collection: &str,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<Option<DocumentCollectionMetadata>> {
+            let result = self.document_collection_controlled_inner(
+                database,
+                collection,
+                Arc::clone(&control),
+            );
+            self.fail_closed_on_corruption(result)
+        }
+
+        /// Load active collections in one database without decoding metadata
+        /// owned by other namespaces. Engine callers own schema admission.
+        pub(crate) fn document_collections_for_database_controlled(
+            &self,
+            database: &str,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<Vec<DocumentCollectionMetadata>> {
+            let result = self.document_collections_for_database_controlled_inner(database, control);
+            self.fail_closed_on_corruption(result)
+        }
+
+        #[cfg(any(feature = "tinymongo-import", test))]
         fn document_catalog_inner(&self) -> EngineResult<DocumentCatalog> {
             let _operation = self.enter_schema_operation()?;
-            self.load_document_catalog()
+            self.document_catalog_controlled_inner(OperationControl::new(None))
         }
 
-        fn load_document_catalog(&self) -> EngineResult<DocumentCatalog> {
+        #[cfg(any(feature = "tinymongo-import", test))]
+        fn document_catalog_controlled_inner(
+            &self,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<DocumentCatalog> {
             let manifest_path = self.root.join("manifest.sqlite");
-            let connection = open_existing_manifest(&manifest_path)?;
-            configure_manifest_connection(&connection)?;
-            require_ready_manifest(&connection, self.shard_count())?;
-            load_catalog_rows(&connection)
+            let mut connection = open_existing_manifest(&manifest_path)?;
+            run_manifest_controlled(&mut connection, control, |connection| {
+                read_ready_manifest_snapshot(connection, self.shard_count(), load_catalog_rows)
+            })
         }
 
+        fn document_collection_controlled_inner(
+            &self,
+            database: &str,
+            collection: &str,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<Option<DocumentCollectionMetadata>> {
+            let manifest_path = self.root.join("manifest.sqlite");
+            let mut connection = open_existing_manifest(&manifest_path)?;
+            let read_control = Arc::clone(&control);
+            run_manifest_controlled(&mut connection, control, |connection| {
+                read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
+                    load_collection_row(connection, database, collection, read_control.as_ref())
+                })
+            })
+        }
+
+        fn document_collections_for_database_controlled_inner(
+            &self,
+            database: &str,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<Vec<DocumentCollectionMetadata>> {
+            let manifest_path = self.root.join("manifest.sqlite");
+            let mut connection = open_existing_manifest(&manifest_path)?;
+            let read_control = Arc::clone(&control);
+            run_manifest_controlled(&mut connection, control, |connection| {
+                read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
+                    load_collection_rows_for_database(connection, database, read_control.as_ref())
+                })
+            })
+        }
+
+        #[cfg(any(feature = "tinymongo-import", test))]
         pub(crate) fn create_document_collection(
             &self,
             database: &str,
@@ -218,12 +417,55 @@ mod enabled {
             self.fail_closed_on_corruption(result)
         }
 
+        #[cfg(any(feature = "tinymongo-import", test))]
         fn create_document_collection_inner(
             &self,
             database: &str,
             collection: &str,
             options: &DocumentCollectionOptions,
         ) -> EngineResult<DocumentCollectionMetadata> {
+            let migration =
+                SchemaMigrationGuard::new(self.schema_coordination.gate.begin_new_migration()?);
+            migration.wait_for_quiescence_blocking();
+            self.create_document_collection_controlled_inner(
+                database,
+                collection,
+                options,
+                migration,
+                OperationControl::new(None),
+            )
+        }
+
+        /// Create and provision a collection under a migration guard acquired
+        /// before an engine session is leased.
+        ///
+        /// The caller must acquire the migration guard while holding no
+        /// session, preflight and release its target session, await
+        /// `migration.wait_for_quiescence()`, then reacquire the session and
+        /// move the guard into this method.
+        pub(crate) fn create_document_collection_controlled(
+            &self,
+            database: &str,
+            collection: &str,
+            options: &DocumentCollectionOptions,
+            migration: SchemaMigrationGuard,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<DocumentCollectionMetadata> {
+            let result = self.create_document_collection_controlled_inner(
+                database, collection, options, migration, control,
+            );
+            self.fail_closed_on_corruption(result)
+        }
+
+        fn create_document_collection_controlled_inner(
+            &self,
+            database: &str,
+            collection: &str,
+            options: &DocumentCollectionOptions,
+            mut migration: SchemaMigrationGuard,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<DocumentCollectionMetadata> {
+            ensure_control_active(&control, "before creating document collection")?;
             crate::document::validate_namespace(database, collection)?;
             let options_bson = encode_document(options.document())
                 .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
@@ -231,113 +473,129 @@ mod enabled {
             let id_specification = builtin_id_specification()?;
             let id_specification_bson = encode_document(&id_specification)
                 .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
-
-            let mut migration = super::super::SchemaMigrationGuard::new(
-                self.schema_coordination.gate.begin_new_migration()?,
-            );
-            migration.wait_for_quiescence_blocking();
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
 
             let result = (|| {
                 let manifest_path = self.root.join("manifest.sqlite");
                 let mut connection = open_existing_manifest(&manifest_path)?;
-                configure_manifest_connection(&connection)?;
-                configure_journal_mode(&connection)?;
-                require_ready_manifest(&connection, self.shard_count())?;
+                let start = run_manifest_controlled(
+                    &mut connection,
+                    Arc::clone(&control),
+                    |connection| {
+                        configure_journal_mode(connection)?;
+                        require_ready_manifest(connection, self.shard_count())?;
 
-                if let Some(existing) = existing_collection(&connection, database, collection)? {
-                    if existing.1 != options_bson {
-                        return Err(EngineError::new(
-                            EngineErrorKind::FailedPrecondition,
-                            "document collection already exists with different options",
-                        ));
-                    }
-                    if existing.0 != COLLECTION_ACTIVE {
-                        return Err(EngineError::new(
-                            EngineErrorKind::FailedPrecondition,
-                            "document collection has incomplete durable provisioning; reopen the database to recover it",
-                        ));
-                    }
-                    return load_catalog_rows(&connection)?
-                        .collection(database, collection)
-                        .cloned()
-                        .ok_or_else(|| {
-                            corrupt("active document collection disappeared from its catalog")
-                        });
-                }
-                if load_provisioning(&connection)?.is_some() {
-                    return Err(corrupt(
-                        "document catalog retained provisioning after startup recovery",
-                    ));
-                }
+                        if let Some(existing) =
+                            existing_collection(connection, database, collection)?
+                        {
+                            if existing.1 != options_bson {
+                                return Err(EngineError::new(
+                                    EngineErrorKind::FailedPrecondition,
+                                    "document collection already exists with different options",
+                                ));
+                            }
+                            if existing.0 != COLLECTION_ACTIVE {
+                                return Err(EngineError::new(
+                                    EngineErrorKind::FailedPrecondition,
+                                    "document collection has incomplete durable provisioning; reopen the database to recover it",
+                                ));
+                            }
+                            let metadata = load_catalog_rows(connection)?
+                                .collection(database, collection)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    corrupt(
+                                        "active document collection disappeared from its catalog",
+                                    )
+                                })?;
+                            return Ok(CreateCollectionStart::Existing(metadata));
+                        }
+                        if load_provisioning(connection)?.is_some() {
+                            return Err(corrupt(
+                                "document catalog retained provisioning after startup recovery",
+                            ));
+                        }
 
-                let transaction = connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .map_err(sqlite_error::storage)?;
-                require_ready_manifest(&transaction, self.shard_count())?;
-                let database_id = ensure_database(&transaction, database)?;
-                let collection_id = next_positive_id(
-                    &transaction,
-                    "briskdb_document_collections",
-                    "collection_id",
-                    "document collection",
+                        let transaction = connection
+                            .transaction_with_behavior(TransactionBehavior::Immediate)
+                            .map_err(sqlite_error::storage)?;
+                        require_ready_manifest(&transaction, self.shard_count())?;
+                        let database_id = ensure_database(&transaction, database)?;
+                        let collection_id = next_positive_id(
+                            &transaction,
+                            "briskdb_document_collections",
+                            "collection_id",
+                            "document collection",
+                        )?;
+                        let operation_id = provisioning_id(database, collection, &options_bson);
+                        transaction
+                            .execute(
+                                "INSERT INTO briskdb_document_collections (
+                                    collection_id, database_id, collection_name, options_bson,
+                                    bson_schema_version, storage_format_version,
+                                    placement_policy, placement_version, next_natural_order,
+                                    lifecycle_state
+                                 ) VALUES (?1, ?2, ?3, ?4, 1, 1, 1, 1, 1, ?5)",
+                                params![
+                                    collection_id,
+                                    database_id,
+                                    collection,
+                                    options_bson,
+                                    COLLECTION_PROVISIONING
+                                ],
+                            )
+                            .map_err(sqlite_error::storage)?;
+                        transaction
+                            .execute(
+                                "INSERT INTO briskdb_document_indexes (
+                                    collection_id, index_name, spec_bson, is_unique, is_builtin,
+                                    index_format_version, lifecycle_state
+                                 ) VALUES (?1, '_id_', ?2, 1, 1, 1, ?3)",
+                                params![collection_id, id_specification_bson, INDEX_PENDING_BUILD],
+                            )
+                            .map_err(sqlite_error::storage)?;
+                        transaction
+                            .execute(
+                                "INSERT INTO briskdb_document_provisioning (
+                                    singleton, collection_id, operation_id, shard_count, next_shard
+                                 ) VALUES (1, ?1, ?2, ?3, 0)",
+                                params![collection_id, operation_id.as_slice(), self.shard_count()],
+                            )
+                            .map_err(sqlite_error::storage)?;
+                        manifest::validate_document_catalog(&transaction, self.shard_count())?;
+                        manifest::refresh_manifest_digest(&transaction)?;
+                        require_ready_manifest(&transaction, self.shard_count())?;
+                        ensure_control_active(
+                            &control,
+                            "before committing document collection provisioning",
+                        )?;
+                        migration.mark_pending_on_drop();
+                        transaction.commit().map_err(sqlite_error::storage)?;
+
+                        Ok(CreateCollectionStart::Provisioning(Provisioning {
+                            collection_id: DocumentCollectionId::from_validated(
+                                u64::try_from(collection_id)
+                                    .expect("positive SQLite document ID fits u64"),
+                            ),
+                            operation_id,
+                            shard_count: self.shard_count(),
+                            next_shard: 0,
+                        }))
+                    },
                 )?;
-                let operation_id = provisioning_id(database, collection, &options_bson);
-                transaction
-                    .execute(
-                        "INSERT INTO briskdb_document_collections (
-                            collection_id, database_id, collection_name, options_bson,
-                            bson_schema_version, storage_format_version,
-                            placement_policy, placement_version, next_natural_order,
-                            lifecycle_state
-                         ) VALUES (?1, ?2, ?3, ?4, 1, 1, 1, 1, 1, ?5)",
-                        params![
-                            collection_id,
-                            database_id,
-                            collection,
-                            options_bson,
-                            COLLECTION_PROVISIONING
-                        ],
-                    )
-                    .map_err(sqlite_error::storage)?;
-                transaction
-                    .execute(
-                        "INSERT INTO briskdb_document_indexes (
-                            collection_id, index_name, spec_bson, is_unique, is_builtin,
-                            index_format_version, lifecycle_state
-                         ) VALUES (?1, '_id_', ?2, 1, 1, 1, ?3)",
-                        params![collection_id, id_specification_bson, INDEX_PENDING_BUILD],
-                    )
-                    .map_err(sqlite_error::storage)?;
-                transaction
-                    .execute(
-                        "INSERT INTO briskdb_document_provisioning (
-                            singleton, collection_id, operation_id, shard_count, next_shard
-                         ) VALUES (1, ?1, ?2, ?3, 0)",
-                        params![collection_id, operation_id.as_slice(), self.shard_count()],
-                    )
-                    .map_err(sqlite_error::storage)?;
-                manifest::validate_document_catalog(&transaction, self.shard_count())?;
-                manifest::refresh_manifest_digest(&transaction)?;
-                require_ready_manifest(&transaction, self.shard_count())?;
-                migration.mark_pending_on_drop();
-                transaction.commit().map_err(sqlite_error::storage)?;
 
-                let provisioning = Provisioning {
-                    collection_id: DocumentCollectionId::from_validated(
-                        u64::try_from(collection_id).expect("positive SQLite document ID fits u64"),
-                    ),
-                    operation_id,
-                    shard_count: self.shard_count(),
-                    next_shard: 0,
+                let metadata = match start {
+                    CreateCollectionStart::Existing(metadata) => metadata,
+                    CreateCollectionStart::Provisioning(provisioning) => {
+                        recover_provisioning_controlled(
+                            self,
+                            &mut connection,
+                            provisioning,
+                            &control,
+                        )?
+                    }
                 };
-                recover_provisioning(self, &mut connection, provisioning)?;
-                load_catalog_rows(&connection)?
-                    .collection(database, collection)
-                    .cloned()
-                    .ok_or_else(|| {
-                        corrupt("completed document collection is missing from its catalog")
-                    })
+                Ok(metadata)
             })();
 
             match result {
@@ -349,6 +607,7 @@ mod enabled {
             }
         }
 
+        #[cfg(any(feature = "tinymongo-import", test))]
         pub(crate) fn declare_document_index(
             &self,
             collection_id: DocumentCollectionId,
@@ -361,6 +620,7 @@ mod enabled {
             self.fail_closed_on_corruption(result)
         }
 
+        #[cfg(any(feature = "tinymongo-import", test))]
         fn declare_document_index_inner(
             &self,
             collection_id: DocumentCollectionId,
@@ -368,6 +628,46 @@ mod enabled {
             specification: &BsonDocument,
             unique: bool,
         ) -> EngineResult<DocumentIndexMetadata> {
+            let _operation = self.enter_schema_operation()?;
+            self.declare_document_index_controlled_inner(
+                collection_id,
+                name,
+                specification,
+                unique,
+                OperationControl::new(None),
+            )
+        }
+
+        pub(crate) fn declare_document_index_controlled(
+            &self,
+            collection_id: DocumentCollectionId,
+            name: &str,
+            specification: &BsonDocument,
+            unique: bool,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<DocumentIndexMetadata> {
+            // The Engine retains schema admission across catalog resolution
+            // and this manifest mutation; standalone wrappers acquire it once
+            // before delegating to the same controlled implementation.
+            let result = self.declare_document_index_controlled_inner(
+                collection_id,
+                name,
+                specification,
+                unique,
+                control,
+            );
+            self.fail_closed_on_corruption(result)
+        }
+
+        fn declare_document_index_controlled_inner(
+            &self,
+            collection_id: DocumentCollectionId,
+            name: &str,
+            specification: &BsonDocument,
+            unique: bool,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<DocumentIndexMetadata> {
+            ensure_control_active(&control, "before declaring document index")?;
             if name.is_empty()
                 || name.len() > manifest::MAX_DOCUMENT_INDEX_NAME_BYTES
                 || name.contains('\0')
@@ -381,65 +681,64 @@ mod enabled {
             let spec_bson = encode_document(specification)
                 .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
             debug_assert!(spec_bson.len() <= manifest::MAX_DOCUMENT_METADATA_BSON_BYTES);
-            let _operation = self.enter_schema_operation()?;
             let manifest_path = self.root.join("manifest.sqlite");
             let mut connection = open_existing_manifest(&manifest_path)?;
-            configure_manifest_connection(&connection)?;
-            configure_journal_mode(&connection)?;
-            require_ready_manifest(&connection, self.shard_count())?;
-            require_active_collection(&connection, collection_id)?;
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sqlite_error::storage)?;
-            require_ready_manifest(&transaction, self.shard_count())?;
-            require_active_collection(&transaction, collection_id)?;
-            let existing = transaction
-                .query_row(
-                    "SELECT spec_bson, is_unique, lifecycle_state
-                     FROM briskdb_document_indexes
-                     WHERE collection_id = ?1 AND index_name = ?2",
-                    params![to_sqlite_id(collection_id)?, name],
-                    |row| {
-                        Ok((
-                            row.get::<_, Vec<u8>>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(sqlite_error::storage)?;
-            if let Some((existing_spec, existing_unique, lifecycle)) = existing {
-                if existing_spec != spec_bson
-                    || existing_unique != i64::from(unique)
-                    || lifecycle != INDEX_PENDING_BUILD
-                {
-                    return Err(EngineError::new(
-                        EngineErrorKind::FailedPrecondition,
-                        "document index name already has a different declaration",
-                    ));
-                }
-            } else {
-                transaction
-                    .execute(
-                        "INSERT INTO briskdb_document_indexes (
-                            collection_id, index_name, spec_bson, is_unique, is_builtin,
-                            index_format_version, lifecycle_state
-                         ) VALUES (?1, ?2, ?3, ?4, 0, 1, ?5)",
-                        params![
-                            to_sqlite_id(collection_id)?,
-                            name,
-                            spec_bson,
-                            i64::from(unique),
-                            INDEX_PENDING_BUILD
-                        ],
-                    )
+            run_manifest_controlled(&mut connection, control.clone(), |connection| {
+                configure_journal_mode(connection)?;
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(sqlite_error::storage)?;
-                manifest::validate_document_catalog(&transaction, self.shard_count())?;
-                manifest::refresh_manifest_digest(&transaction)?;
                 require_ready_manifest(&transaction, self.shard_count())?;
-            }
-            transaction.commit().map_err(sqlite_error::storage)?;
+                require_active_collection(&transaction, collection_id)?;
+                let existing = transaction
+                    .query_row(
+                        "SELECT spec_bson, is_unique, lifecycle_state
+                         FROM briskdb_document_indexes
+                         WHERE collection_id = ?1 AND index_name = ?2",
+                        params![to_sqlite_id(collection_id)?, name],
+                        |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(sqlite_error::storage)?;
+                if let Some((existing_spec, existing_unique, lifecycle)) = existing {
+                    if existing_spec != spec_bson
+                        || existing_unique != i64::from(unique)
+                        || lifecycle != INDEX_PENDING_BUILD
+                    {
+                        return Err(EngineError::new(
+                            EngineErrorKind::FailedPrecondition,
+                            "document index name already has a different declaration",
+                        ));
+                    }
+                } else {
+                    transaction
+                        .execute(
+                            "INSERT INTO briskdb_document_indexes (
+                                collection_id, index_name, spec_bson, is_unique, is_builtin,
+                                index_format_version, lifecycle_state
+                             ) VALUES (?1, ?2, ?3, ?4, 0, 1, ?5)",
+                            params![
+                                to_sqlite_id(collection_id)?,
+                                name,
+                                spec_bson,
+                                i64::from(unique),
+                                INDEX_PENDING_BUILD
+                            ],
+                        )
+                        .map_err(sqlite_error::storage)?;
+                    manifest::validate_document_catalog(&transaction, self.shard_count())?;
+                    manifest::refresh_manifest_digest(&transaction)?;
+                    require_ready_manifest(&transaction, self.shard_count())?;
+                }
+                ensure_control_active(&control, "before committing document index declaration")?;
+                transaction.commit().map_err(sqlite_error::storage)
+            })?;
             let decoded = decode_metadata_document(&spec_bson, "document index specification")?;
             Ok(DocumentIndexMetadata::from_validated_parts(
                 name.to_owned(),
@@ -450,6 +749,26 @@ mod enabled {
             ))
         }
 
+        /// Validate and encode one document once before routing its write.
+        pub(crate) fn prepare_document_write(
+            &self,
+            document: &BsonDocument,
+        ) -> EngineResult<PreparedDocumentWrite> {
+            prepare_document(self, document)
+        }
+
+        /// Canonicalize an exact `_id` value and return its one owning shard.
+        pub(crate) fn prepare_document_id(
+            &self,
+            id: &BsonValue,
+        ) -> EngineResult<(CanonicalBsonKey, u16)> {
+            let id_key = CanonicalBsonKey::encode(id)
+                .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+            let shard = self.shard_for_key(id_key.as_bytes());
+            Ok((id_key, shard))
+        }
+
+        #[cfg(any(feature = "tinymongo-import", test))]
         pub(crate) fn insert_document(
             &self,
             collection_id: DocumentCollectionId,
@@ -459,24 +778,22 @@ mod enabled {
             self.fail_closed_on_corruption(result)
         }
 
+        #[cfg(any(feature = "tinymongo-import", test))]
         fn insert_document_inner(
             &self,
             collection_id: DocumentCollectionId,
             document: &BsonDocument,
         ) -> EngineResult<u16> {
             let _operation = self.enter_schema_operation()?;
-            let (id_key, document_bson, shard) = prepare_document(self, document)?;
-            let natural_order = self.reserve_document_natural_orders(collection_id, 1)?;
-            self.insert_prepared_document(
-                collection_id,
-                natural_order,
-                shard,
-                &id_key,
-                &document_bson,
-            )?;
-            Ok(shard)
+            let cancellation = CancellationToken::new();
+            let prepared = self.prepare_document_write(document)?;
+            let natural_order =
+                self.reserve_document_natural_orders_for_engine(collection_id, 1, &cancellation)?;
+            self.insert_prepared_document(collection_id, natural_order, &prepared, &cancellation)?;
+            Ok(prepared.shard())
         }
 
+        #[cfg(any(feature = "tinymongo-import", test))]
         pub(crate) fn insert_documents(
             &self,
             collection_id: DocumentCollectionId,
@@ -487,6 +804,7 @@ mod enabled {
             self.fail_closed_on_corruption(result)
         }
 
+        #[cfg(any(feature = "tinymongo-import", test))]
         fn insert_documents_inner(
             &self,
             collection_id: DocumentCollectionId,
@@ -499,7 +817,7 @@ mod enabled {
                 self.require_active_document_collection(collection_id)?;
                 return Ok(());
             }
-            let natural_order = self.reserve_document_natural_orders(
+            let natural_order = self.reserve_document_natural_orders_for_engine(
                 collection_id,
                 u64::try_from(documents.len()).map_err(|error| {
                     EngineError::from_source(
@@ -508,12 +826,13 @@ mod enabled {
                         error,
                     )
                 })?,
+                cancellation,
             )?;
             // A committed range is never reused. Cancellation or a later shard
             // failure may leave gaps, preserving monotonic order after retry.
             for (offset, document) in documents.iter().enumerate() {
                 ensure_document_write_not_cancelled(cancellation)?;
-                let offset = i64::try_from(offset).map_err(|error| {
+                let offset = u64::try_from(offset).map_err(|error| {
                     EngineError::from_source(
                         EngineErrorKind::LimitExceeded,
                         "document batch offset exceeds its supported range",
@@ -526,35 +845,118 @@ mod enabled {
                         "document natural-order identity space is exhausted",
                     )
                 })?;
-                let (id_key, document_bson, shard) = prepare_document(self, document)?;
-                self.insert_prepared_document(
-                    collection_id,
-                    order,
-                    shard,
-                    &id_key,
-                    &document_bson,
-                )?;
+                let prepared = self.prepare_document_write(document)?;
+                self.insert_prepared_document(collection_id, order, &prepared, cancellation)?;
             }
             Ok(())
         }
 
-        fn reserve_document_natural_orders(
+        /// Reserve a durable, never-reused natural-order range for engine writes.
+        ///
+        /// The caller must hold the request's schema-operation guard while this
+        /// manifest transaction runs. Cancellation is checked before the lock,
+        /// by SQLite's progress hook, and immediately before commit.
+        #[cfg(any(feature = "tinymongo-import", test))]
+        pub(crate) fn reserve_document_natural_orders_for_engine(
             &self,
             collection_id: DocumentCollectionId,
             count: u64,
-        ) -> EngineResult<i64> {
-            debug_assert!(count > 0);
-            let count = i64::try_from(count).map_err(|error| {
-                EngineError::from_source(
-                    EngineErrorKind::LimitExceeded,
-                    "document natural-order reservation exceeds SQLite's supported range",
-                    error,
+            cancellation: &CancellationToken,
+        ) -> EngineResult<u64> {
+            let result =
+                self.reserve_document_natural_orders_inner(collection_id, count, cancellation);
+            self.fail_closed_on_corruption(result)
+        }
+
+        pub(crate) fn reserve_document_natural_orders_controlled(
+            &self,
+            collection_id: DocumentCollectionId,
+            count: u64,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<u64> {
+            let result = self.reserve_document_natural_orders_controlled_inner(
+                collection_id,
+                count,
+                control,
+            );
+            self.fail_closed_on_corruption(result)
+        }
+
+        fn reserve_document_natural_orders_controlled_inner(
+            &self,
+            collection_id: DocumentCollectionId,
+            count: u64,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<u64> {
+            ensure_control_active(&control, "before reserving document natural order")?;
+            let count = validate_natural_order_reservation_count(count)?;
+            let manifest_path = self.root.join("manifest.sqlite");
+            let mut connection = open_existing_manifest(&manifest_path)?;
+            run_manifest_controlled(&mut connection, control.clone(), |connection| {
+                configure_journal_mode(connection)?;
+                self.reserve_document_natural_orders_on_connection(
+                    connection,
+                    collection_id,
+                    count,
+                    || {
+                        ensure_control_active(
+                            &control,
+                            "before committing document natural-order reservation",
+                        )
+                    },
                 )
-            })?;
+            })
+        }
+
+        #[cfg(any(feature = "tinymongo-import", test))]
+        fn reserve_document_natural_orders_inner(
+            &self,
+            collection_id: DocumentCollectionId,
+            count: u64,
+            cancellation: &CancellationToken,
+        ) -> EngineResult<u64> {
+            ensure_document_operation_not_cancelled(
+                cancellation,
+                "before reserving document natural order",
+            )?;
+            let count = validate_natural_order_reservation_count(count)?;
             let manifest_path = self.root.join("manifest.sqlite");
             let mut connection = open_existing_manifest(&manifest_path)?;
             configure_manifest_connection(&connection)?;
             configure_journal_mode(&connection)?;
+            let progress_cancellation = cancellation.clone();
+            connection
+                .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
+                .map_err(sqlite_error::storage)?;
+            let result = self.reserve_document_natural_orders_on_connection(
+                &mut connection,
+                collection_id,
+                count,
+                || {
+                    ensure_document_operation_not_cancelled(
+                        cancellation,
+                        "before committing document natural-order reservation",
+                    )
+                },
+            );
+            let cleanup = connection
+                .progress_handler(0, None::<fn() -> bool>)
+                .map_err(sqlite_error::storage);
+            match (result, cleanup) {
+                (Ok(first), Ok(())) => Ok(first),
+                (Ok(_), Err(error)) => Err(error
+                    .context("failed to remove the document allocator cancellation progress hook")),
+                (Err(error), _) => Err(error),
+            }
+        }
+
+        fn reserve_document_natural_orders_on_connection(
+            &self,
+            connection: &mut Connection,
+            collection_id: DocumentCollectionId,
+            count: i64,
+            before_commit: impl FnOnce() -> EngineResult<()>,
+        ) -> EngineResult<u64> {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error::storage)?;
@@ -602,33 +1004,65 @@ mod enabled {
             manifest::validate_document_catalog(&transaction, self.shard_count())?;
             manifest::refresh_manifest_digest(&transaction)?;
             require_ready_manifest(&transaction, self.shard_count())?;
+            before_commit()?;
             transaction.commit().map_err(sqlite_error::storage)?;
-            Ok(first)
+            document_natural_order_from_sqlite(first)
         }
 
+        #[cfg(any(feature = "tinymongo-import", test))]
         fn insert_prepared_document(
             &self,
             collection_id: DocumentCollectionId,
-            natural_order: i64,
-            shard: u16,
-            id_key: &CanonicalBsonKey,
-            document_bson: &[u8],
+            natural_order: u64,
+            prepared: &PreparedDocumentWrite,
+            cancellation: &CancellationToken,
         ) -> EngineResult<()> {
-            debug_assert_eq!(self.shard_for_key(id_key.as_bytes()), shard);
+            let shard = prepared.shard();
             let mut connection = self.open_unconfigured_shard(shard)?;
             self.validate_unconfigured_shard(&connection, shard)?;
             require_schema(&connection)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sqlite_error::storage)?;
+            self.insert_prepared_document_on_connection(
+                &transaction,
+                collection_id,
+                natural_order,
+                shard,
+                prepared,
+                cancellation,
+            )?;
+            transaction.commit().map_err(sqlite_error::storage)?;
+            Ok(())
+        }
+
+        /// Insert one prepared record through an already-leased shard handle.
+        ///
+        /// Transaction ownership remains with the engine. The caller supplies
+        /// the lease's physical shard identity and arms SQLite's progress and
+        /// interrupt hooks around this call.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn insert_prepared_document_on_connection(
+            &self,
+            connection: &Connection,
+            collection_id: DocumentCollectionId,
+            natural_order: u64,
+            shard: u16,
+            prepared: &PreparedDocumentWrite,
+            cancellation: &CancellationToken,
+        ) -> EngineResult<()> {
+            ensure_document_operation_not_cancelled(cancellation, "before inserting document")?;
+            self.validate_prepared_document_route(shard, prepared)?;
+            require_schema(connection)?;
+            let natural_order = document_natural_order_to_sqlite(natural_order)?;
             let checksum = record_checksum(
                 collection_id,
                 shard,
                 natural_order,
-                id_key.as_bytes(),
-                document_bson,
+                prepared.id_key.as_bytes(),
+                &prepared.document_bson,
             );
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sqlite_error::storage)?;
-            transaction
+            connection
                 .execute(
                     "INSERT INTO briskdb_documents_v1 (
                         collection_id, id_key, natural_order, document_bson,
@@ -636,17 +1070,131 @@ mod enabled {
                      ) VALUES (?1, ?2, ?3, ?4, ?5, 1)",
                     params![
                         to_sqlite_id(collection_id)?,
-                        id_key.as_bytes(),
+                        prepared.id_key.as_bytes(),
                         natural_order,
-                        document_bson,
+                        prepared.document_bson,
                         checksum.as_slice()
                     ],
                 )
                 .map_err(sqlite_error::statement)?;
-            transaction.commit().map_err(sqlite_error::storage)?;
             Ok(())
         }
 
+        /// Replace one exact `_id` record while preserving its natural order.
+        ///
+        /// `false` means the target record no longer exists at the supplied
+        /// natural order. A replacement cannot change the semantic `_id`.
+        #[allow(clippy::too_many_arguments)]
+        // The protocol-neutral command model already reserves replacement;
+        // matcher/update semantics will consume this atomic storage primitive.
+        #[allow(dead_code)]
+        pub(crate) fn replace_document_on_connection(
+            &self,
+            connection: &Connection,
+            collection_id: DocumentCollectionId,
+            shard: u16,
+            id_key: &CanonicalBsonKey,
+            natural_order: u64,
+            replacement: &PreparedDocumentWrite,
+            cancellation: &CancellationToken,
+        ) -> EngineResult<bool> {
+            ensure_document_operation_not_cancelled(cancellation, "before replacing document")?;
+            self.validate_document_key_route(shard, id_key)?;
+            if replacement.id_key != *id_key {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    "document replacement cannot change the semantic _id",
+                ));
+            }
+            self.validate_prepared_document_route(shard, replacement)?;
+            require_schema(connection)?;
+            let natural_order = document_natural_order_to_sqlite(natural_order)?;
+            let checksum = record_checksum(
+                collection_id,
+                shard,
+                natural_order,
+                id_key.as_bytes(),
+                &replacement.document_bson,
+            );
+            let changed = connection
+                .execute(
+                    "UPDATE briskdb_documents_v1
+                     SET document_bson = ?1, document_checksum = ?2
+                     WHERE collection_id = ?3 AND id_key = ?4 AND natural_order = ?5",
+                    params![
+                        replacement.document_bson,
+                        checksum.as_slice(),
+                        to_sqlite_id(collection_id)?,
+                        id_key.as_bytes(),
+                        natural_order
+                    ],
+                )
+                .map_err(sqlite_error::statement)?;
+            if changed > 1 {
+                return Err(corrupt(
+                    "exact document replacement changed more than one stored record",
+                ));
+            }
+            Ok(changed == 1)
+        }
+
+        /// Delete one exact canonical `_id` through an already-leased handle.
+        pub(crate) fn delete_document_on_connection(
+            &self,
+            connection: &Connection,
+            collection_id: DocumentCollectionId,
+            shard: u16,
+            id_key: &CanonicalBsonKey,
+            cancellation: &CancellationToken,
+        ) -> EngineResult<bool> {
+            ensure_document_operation_not_cancelled(cancellation, "before deleting document")?;
+            self.validate_document_key_route(shard, id_key)?;
+            require_schema(connection)?;
+            let changed = connection
+                .execute(
+                    "DELETE FROM briskdb_documents_v1
+                     WHERE collection_id = ?1 AND id_key = ?2",
+                    params![to_sqlite_id(collection_id)?, id_key.as_bytes()],
+                )
+                .map_err(sqlite_error::statement)?;
+            if changed > 1 {
+                return Err(corrupt(
+                    "exact document deletion changed more than one stored record",
+                ));
+            }
+            Ok(changed == 1)
+        }
+
+        fn validate_prepared_document_route(
+            &self,
+            shard: u16,
+            prepared: &PreparedDocumentWrite,
+        ) -> EngineResult<()> {
+            if prepared.shard != shard {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "prepared document was sent to a different shard lease",
+                ));
+            }
+            self.validate_document_key_route(shard, &prepared.id_key)
+        }
+
+        fn validate_document_key_route(
+            &self,
+            shard: u16,
+            id_key: &CanonicalBsonKey,
+        ) -> EngineResult<()> {
+            self.ensure_shard_in_range(shard)?;
+            if self.shard_for_key(id_key.as_bytes()) != shard {
+                return Err(EngineError::new(
+                    EngineErrorKind::Internal,
+                    "canonical document _id was sent to a non-owning shard lease",
+                ));
+            }
+            Ok(())
+        }
+
+        #[cfg(any(feature = "tinymongo-import", test))]
         pub(crate) fn get_document(
             &self,
             collection_id: DocumentCollectionId,
@@ -656,6 +1204,7 @@ mod enabled {
             self.fail_closed_on_corruption(result)
         }
 
+        #[cfg(any(feature = "tinymongo-import", test))]
         fn get_document_inner(
             &self,
             collection_id: DocumentCollectionId,
@@ -663,12 +1212,32 @@ mod enabled {
         ) -> EngineResult<Option<BsonDocument>> {
             let _operation = self.enter_schema_operation()?;
             self.require_active_document_collection(collection_id)?;
-            let id_key = CanonicalBsonKey::encode(id)
-                .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
-            let shard = self.shard_for_key(id_key.as_bytes());
+            let cancellation = CancellationToken::new();
+            let (id_key, shard) = self.prepare_document_id(id)?;
             let connection = self.open_unconfigured_shard(shard)?;
             self.validate_unconfigured_shard(&connection, shard)?;
-            require_schema(&connection)?;
+            self.get_document_on_connection(
+                &connection,
+                collection_id,
+                shard,
+                &id_key,
+                &cancellation,
+            )
+            .map(|record| record.map(DocumentStorageRecord::into_document))
+        }
+
+        /// Read one exact canonical `_id` through an already-leased shard.
+        pub(crate) fn get_document_on_connection(
+            &self,
+            connection: &Connection,
+            collection_id: DocumentCollectionId,
+            shard: u16,
+            id_key: &CanonicalBsonKey,
+            cancellation: &CancellationToken,
+        ) -> EngineResult<Option<DocumentStorageRecord>> {
+            ensure_document_operation_not_cancelled(cancellation, "before reading document")?;
+            self.validate_document_key_route(shard, id_key)?;
+            require_schema(connection)?;
             let row = connection
                 .query_row(
                     "SELECT natural_order, document_bson, document_checksum,
@@ -687,18 +1256,138 @@ mod enabled {
                 )
                 .optional()
                 .map_err(|error| shard_read_error(error, "failed to read stored BSON document"))?;
-            row.map(|(natural_order, bson, checksum, version)| {
-                decode_record(
+            let record = row
+                .map(|(natural_order, bson, checksum, version)| {
+                    decode_storage_record(
+                        collection_id,
+                        shard,
+                        natural_order,
+                        id_key.as_bytes().to_vec(),
+                        bson,
+                        checksum,
+                        version,
+                    )
+                })
+                .transpose()?;
+            ensure_document_operation_not_cancelled(cancellation, "after reading document")?;
+            Ok(record)
+        }
+
+        /// Count one collection on one already-leased shard.
+        ///
+        /// This deliberately counts rows without decoding every BSON payload.
+        /// Startup validation and point/scan reads remain the checksum boundary.
+        pub(crate) fn count_document_shard_on_connection(
+            &self,
+            connection: &Connection,
+            collection_id: DocumentCollectionId,
+            shard: u16,
+            cancellation: &CancellationToken,
+        ) -> EngineResult<u64> {
+            ensure_document_operation_not_cancelled(cancellation, "before counting documents")?;
+            self.ensure_shard_in_range(shard)?;
+            require_schema(connection)?;
+            let count = connection
+                .query_row(
+                    "SELECT count(*) FROM briskdb_documents_v1
+                     WHERE collection_id = ?1",
+                    [to_sqlite_id(collection_id)?],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| {
+                    shard_read_error(error, "failed to count stored BSON documents")
+                })?;
+            ensure_document_operation_not_cancelled(cancellation, "after counting documents")?;
+            u64::try_from(count)
+                .map_err(|_| corrupt("stored BSON document count is outside its range"))
+        }
+
+        /// Return one bounded, ascending shard-local natural-order page.
+        pub(crate) fn scan_document_shard_on_connection(
+            &self,
+            connection: &Connection,
+            collection_id: DocumentCollectionId,
+            shard: u16,
+            after_natural_order: Option<u64>,
+            limit: usize,
+            cancellation: &CancellationToken,
+        ) -> EngineResult<Vec<DocumentStorageRecord>> {
+            ensure_document_operation_not_cancelled(cancellation, "before scanning documents")?;
+            self.ensure_shard_in_range(shard)?;
+            if !(1..=MAX_DOCUMENT_SHARD_SCAN_RECORDS).contains(&limit) {
+                return Err(EngineError::new(
+                    EngineErrorKind::InvalidArgument,
+                    format!(
+                        "document shard scan limit must be between 1 and {MAX_DOCUMENT_SHARD_SCAN_RECORDS}"
+                    ),
+                ));
+            }
+            let after_natural_order = after_natural_order
+                .map(document_natural_order_to_sqlite)
+                .transpose()?
+                .unwrap_or(0);
+            let sqlite_limit =
+                i64::try_from(limit).expect("bounded document scan limit fits SQLite");
+            require_schema(connection)?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT natural_order, id_key, document_bson, document_checksum,
+                            storage_format_version
+                     FROM briskdb_documents_v1
+                     WHERE collection_id = ?1 AND natural_order > ?2
+                     ORDER BY natural_order LIMIT ?3",
+                )
+                .map_err(|error| {
+                    shard_read_error(error, "failed to prepare stored BSON document scan")
+                })?;
+            let mut rows = statement
+                .query(params![
+                    to_sqlite_id(collection_id)?,
+                    after_natural_order,
+                    sqlite_limit
+                ])
+                .map_err(|error| {
+                    shard_read_error(error, "failed to start stored BSON document scan")
+                })?;
+            let mut records = Vec::with_capacity(limit);
+            while let Some(row) = rows.next().map_err(|error| {
+                shard_read_error(error, "failed while scanning stored BSON documents")
+            })? {
+                ensure_document_operation_not_cancelled(cancellation, "while scanning documents")?;
+                let natural_order = row.get::<_, i64>(0).map_err(|error| {
+                    shard_read_error(error, "failed to decode stored BSON natural order")
+                })?;
+                let id_key = row.get::<_, Vec<u8>>(1).map_err(|error| {
+                    shard_read_error(error, "failed to decode stored BSON canonical key")
+                })?;
+                let document_bson = row.get::<_, Vec<u8>>(2).map_err(|error| {
+                    shard_read_error(error, "failed to decode stored BSON payload")
+                })?;
+                let checksum = row.get::<_, Vec<u8>>(3).map_err(|error| {
+                    shard_read_error(error, "failed to decode stored BSON checksum")
+                })?;
+                let version = row.get::<_, i64>(4).map_err(|error| {
+                    shard_read_error(error, "failed to decode stored BSON format version")
+                })?;
+                let canonical = CanonicalBsonKey::from_bytes(&id_key)
+                    .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?;
+                if self.shard_for_key(canonical.as_bytes()) != shard {
+                    return Err(corrupt(
+                        "stored BSON document is on a shard that disagrees with its canonical _id route",
+                    ));
+                }
+                records.push(decode_storage_record(
                     collection_id,
                     shard,
                     natural_order,
-                    id_key.as_bytes(),
-                    bson,
+                    id_key,
+                    document_bson,
                     checksum,
                     version,
-                )
-            })
-            .transpose()
+                )?);
+            }
+            ensure_document_operation_not_cancelled(cancellation, "after scanning documents")?;
+            Ok(records)
         }
 
         #[cfg(feature = "tinymongo-import")]
@@ -714,23 +1403,17 @@ mod enabled {
         fn document_count_inner(&self, collection_id: DocumentCollectionId) -> EngineResult<u64> {
             let _operation = self.enter_schema_operation()?;
             self.require_active_document_collection(collection_id)?;
+            let cancellation = CancellationToken::new();
             let mut total = 0_u64;
             for shard in 0..self.shard_count() {
                 let connection = self.open_unconfigured_shard(shard)?;
                 self.validate_unconfigured_shard(&connection, shard)?;
-                require_schema(&connection)?;
-                let count = connection
-                    .query_row(
-                        "SELECT count(*) FROM briskdb_documents_v1
-                         WHERE collection_id = ?1",
-                        [to_sqlite_id(collection_id)?],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map_err(|error| {
-                        shard_read_error(error, "failed to count stored BSON documents")
-                    })?;
-                let count = u64::try_from(count)
-                    .map_err(|_| corrupt("stored BSON document count is outside its range"))?;
+                let count = self.count_document_shard_on_connection(
+                    &connection,
+                    collection_id,
+                    shard,
+                    &cancellation,
+                )?;
                 total = total.checked_add(count).ok_or_else(|| {
                     corrupt("stored BSON document count exceeds its supported range")
                 })?;
@@ -753,47 +1436,29 @@ mod enabled {
         ) -> EngineResult<Vec<BsonDocument>> {
             let _operation = self.enter_schema_operation()?;
             self.require_active_document_collection(collection_id)?;
+            let cancellation = CancellationToken::new();
             let mut documents = Vec::new();
             for shard in 0..self.shard_count() {
                 let connection = self.open_unconfigured_shard(shard)?;
                 self.validate_unconfigured_shard(&connection, shard)?;
-                require_schema(&connection)?;
-                let mut statement = connection
-                    .prepare(
-                        "SELECT natural_order, id_key, document_bson, document_checksum,
-                                storage_format_version
-                         FROM briskdb_documents_v1 WHERE collection_id = ?1
-                         ORDER BY natural_order",
-                    )
-                    .map_err(sqlite_error::storage)?;
-                let mut rows = statement
-                    .query([to_sqlite_id(collection_id)?])
-                    .map_err(sqlite_error::storage)?;
-                while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
-                    let natural_order = row.get::<_, i64>(0).map_err(sqlite_error::storage)?;
-                    let key = row.get::<_, Vec<u8>>(1).map_err(sqlite_error::storage)?;
-                    let bson = row.get::<_, Vec<u8>>(2).map_err(sqlite_error::storage)?;
-                    let checksum = row.get::<_, Vec<u8>>(3).map_err(sqlite_error::storage)?;
-                    let version = row.get::<_, i64>(4).map_err(sqlite_error::storage)?;
-                    CanonicalBsonKey::from_bytes(&key)
-                        .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?;
-                    if self.shard_for_key(&key) != shard {
-                        return Err(corrupt(
-                            "stored BSON document is on a shard that disagrees with its canonical _id route",
-                        ));
+                let mut after = None;
+                loop {
+                    let page = self.scan_document_shard_on_connection(
+                        &connection,
+                        collection_id,
+                        shard,
+                        after,
+                        MAX_DOCUMENT_SHARD_SCAN_RECORDS,
+                        &cancellation,
+                    )?;
+                    if page.is_empty() {
+                        break;
                     }
-                    documents.push((
-                        natural_order,
-                        decode_record(
-                            collection_id,
-                            shard,
-                            natural_order,
-                            &key,
-                            bson,
-                            checksum,
-                            version,
-                        )?,
-                    ));
+                    after = page.last().map(DocumentStorageRecord::natural_order);
+                    documents.extend(
+                        page.into_iter()
+                            .map(|record| (record.natural_order(), record.into_document())),
+                    );
                 }
             }
             documents.sort_by_key(|(natural_order, _)| *natural_order);
@@ -820,12 +1485,12 @@ mod enabled {
         fn next_document_natural_order(
             &self,
             collection_id: DocumentCollectionId,
-        ) -> EngineResult<i64> {
+        ) -> EngineResult<u64> {
             let path = self.root.join("manifest.sqlite");
             let connection = open_existing_manifest(&path)?;
             configure_manifest_connection(&connection)?;
             require_ready_manifest(&connection, self.shard_count())?;
-            connection
+            let next = connection
                 .query_row(
                     "SELECT next_natural_order FROM briskdb_document_collections
                      WHERE collection_id = ?1 AND lifecycle_state = ?2",
@@ -834,7 +1499,13 @@ mod enabled {
                 )
                 .optional()
                 .map_err(sqlite_error::storage)?
-                .ok_or_else(|| corrupt("active document collection disappeared from its catalog"))
+                .ok_or_else(|| {
+                    corrupt("active document collection disappeared from its catalog")
+                })?;
+            u64::try_from(next)
+                .ok()
+                .filter(|next| *next > 0)
+                .ok_or_else(|| corrupt("document natural-order allocator is not positive"))
         }
 
         fn require_active_document_collection(
@@ -877,8 +1548,38 @@ mod enabled {
     fn recover_provisioning(
         storage: &Storage,
         manifest_connection: &mut Connection,
-        mut provisioning: Provisioning,
+        provisioning: Provisioning,
     ) -> EngineResult<()> {
+        recover_provisioning_inner(storage, manifest_connection, provisioning, None).map(|_| ())
+    }
+
+    fn recover_provisioning_controlled(
+        storage: &Storage,
+        manifest_connection: &mut Connection,
+        provisioning: Provisioning,
+        control: &Arc<OperationControl>,
+    ) -> EngineResult<DocumentCollectionMetadata> {
+        ensure_control_active(control, "before provisioning document collection")?;
+        recover_provisioning_inner(storage, manifest_connection, provisioning, Some(control))
+    }
+
+    fn run_provisioning_step<T>(
+        connection: &mut Connection,
+        control: Option<&Arc<OperationControl>>,
+        work: impl FnOnce(&mut Connection) -> EngineResult<T>,
+    ) -> EngineResult<T> {
+        match control {
+            Some(control) => run_dedicated_controlled(connection, Arc::clone(control), work),
+            None => work(connection),
+        }
+    }
+
+    fn recover_provisioning_inner(
+        storage: &Storage,
+        manifest_connection: &mut Connection,
+        mut provisioning: Provisioning,
+        control: Option<&Arc<OperationControl>>,
+    ) -> EngineResult<DocumentCollectionMetadata> {
         if provisioning.shard_count != storage.shard_count() {
             return Err(corrupt(
                 "document provisioning shard count differs from routing metadata",
@@ -887,94 +1588,124 @@ mod enabled {
         while provisioning.next_shard < provisioning.shard_count {
             let shard = provisioning.next_shard;
             let mut connection = storage.open_unconfigured_shard(shard)?;
-            storage.validate_unconfigured_shard(&connection, shard)?;
-            ensure_schema(&mut connection)?;
+            match control {
+                Some(control) => {
+                    run_dedicated_controlled(&mut connection, Arc::clone(control), |connection| {
+                        storage.validate_unconfigured_shard_nonterminal(connection, shard)?;
+                        ensure_schema(connection)
+                    })?
+                }
+                None => {
+                    storage.validate_unconfigured_shard(&connection, shard)?;
+                    ensure_schema(&mut connection)?;
+                }
+            }
+            run_provisioning_step(manifest_connection, control, |manifest_connection| {
+                let transaction = manifest_connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sqlite_error::storage)?;
+                manifest::current_integrity(&transaction, storage.shard_count())?;
+                let changed = transaction
+                    .execute(
+                        "UPDATE briskdb_document_provisioning SET next_shard = ?1
+                         WHERE singleton = 1 AND collection_id = ?2
+                           AND operation_id = ?3 AND next_shard = ?4",
+                        params![
+                            shard + 1,
+                            to_sqlite_id(provisioning.collection_id)?,
+                            provisioning.operation_id.as_slice(),
+                            shard
+                        ],
+                    )
+                    .map_err(sqlite_error::storage)?;
+                if changed != 1 {
+                    return Err(corrupt(
+                        "document provisioning journal did not advance exactly once",
+                    ));
+                }
+                manifest::validate_document_catalog(&transaction, storage.shard_count())?;
+                manifest::refresh_manifest_digest(&transaction)?;
+                manifest::current_integrity(&transaction, storage.shard_count())?;
+                if let Some(control) = control {
+                    ensure_control_active(
+                        control,
+                        "before committing document collection provisioning cursor",
+                    )?;
+                }
+                transaction.commit().map_err(sqlite_error::storage)
+            })?;
+            provisioning.next_shard = shard + 1;
+        }
+
+        run_provisioning_step(manifest_connection, control, |manifest_connection| {
             let transaction = manifest_connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error::storage)?;
             manifest::current_integrity(&transaction, storage.shard_count())?;
+            let activated_index = transaction
+                .execute(
+                    "UPDATE briskdb_document_indexes SET lifecycle_state = ?1
+                     WHERE collection_id = ?2 AND index_name = '_id_'
+                       AND is_unique = 1 AND is_builtin = 1 AND lifecycle_state = ?3",
+                    params![
+                        INDEX_READY,
+                        to_sqlite_id(provisioning.collection_id)?,
+                        INDEX_PENDING_BUILD
+                    ],
+                )
+                .map_err(sqlite_error::storage)?;
+            if activated_index != 1 {
+                return Err(corrupt(
+                    "document collection activation did not update its built-in _id index",
+                ));
+            }
             let changed = transaction
                 .execute(
-                    "UPDATE briskdb_document_provisioning SET next_shard = ?1
-                     WHERE singleton = 1 AND collection_id = ?2
-                       AND operation_id = ?3 AND next_shard = ?4",
+                    "UPDATE briskdb_document_collections SET lifecycle_state = ?1
+                     WHERE collection_id = ?2 AND lifecycle_state = ?3",
                     params![
-                        shard + 1,
+                        COLLECTION_ACTIVE,
                         to_sqlite_id(provisioning.collection_id)?,
-                        provisioning.operation_id.as_slice(),
-                        shard
+                        COLLECTION_PROVISIONING
                     ],
                 )
                 .map_err(sqlite_error::storage)?;
             if changed != 1 {
                 return Err(corrupt(
-                    "document provisioning journal did not advance exactly once",
+                    "document collection activation did not update exactly one row",
+                ));
+            }
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM briskdb_document_provisioning
+                     WHERE singleton = 1 AND collection_id = ?1 AND operation_id = ?2
+                       AND next_shard = shard_count",
+                    params![
+                        to_sqlite_id(provisioning.collection_id)?,
+                        provisioning.operation_id.as_slice()
+                    ],
+                )
+                .map_err(sqlite_error::storage)?;
+            if deleted != 1 {
+                return Err(corrupt(
+                    "document provisioning journal did not finalize exactly once",
                 ));
             }
             manifest::validate_document_catalog(&transaction, storage.shard_count())?;
             manifest::refresh_manifest_digest(&transaction)?;
             manifest::current_integrity(&transaction, storage.shard_count())?;
+            let metadata = load_catalog_rows(&transaction)?
+                .collection_by_id(provisioning.collection_id)
+                .cloned()
+                .ok_or_else(|| {
+                    corrupt("completed document collection is missing from its catalog")
+                })?;
+            if let Some(control) = control {
+                ensure_control_active(control, "before committing document collection activation")?;
+            }
             transaction.commit().map_err(sqlite_error::storage)?;
-            provisioning.next_shard = shard + 1;
-        }
-
-        let transaction = manifest_connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_error::storage)?;
-        manifest::current_integrity(&transaction, storage.shard_count())?;
-        let activated_index = transaction
-            .execute(
-                "UPDATE briskdb_document_indexes SET lifecycle_state = ?1
-                 WHERE collection_id = ?2 AND index_name = '_id_'
-                   AND is_unique = 1 AND is_builtin = 1 AND lifecycle_state = ?3",
-                params![
-                    INDEX_READY,
-                    to_sqlite_id(provisioning.collection_id)?,
-                    INDEX_PENDING_BUILD
-                ],
-            )
-            .map_err(sqlite_error::storage)?;
-        if activated_index != 1 {
-            return Err(corrupt(
-                "document collection activation did not update its built-in _id index",
-            ));
-        }
-        let changed = transaction
-            .execute(
-                "UPDATE briskdb_document_collections SET lifecycle_state = ?1
-                 WHERE collection_id = ?2 AND lifecycle_state = ?3",
-                params![
-                    COLLECTION_ACTIVE,
-                    to_sqlite_id(provisioning.collection_id)?,
-                    COLLECTION_PROVISIONING
-                ],
-            )
-            .map_err(sqlite_error::storage)?;
-        if changed != 1 {
-            return Err(corrupt(
-                "document collection activation did not update exactly one row",
-            ));
-        }
-        let deleted = transaction
-            .execute(
-                "DELETE FROM briskdb_document_provisioning
-                 WHERE singleton = 1 AND collection_id = ?1 AND operation_id = ?2
-                   AND next_shard = shard_count",
-                params![
-                    to_sqlite_id(provisioning.collection_id)?,
-                    provisioning.operation_id.as_slice()
-                ],
-            )
-            .map_err(sqlite_error::storage)?;
-        if deleted != 1 {
-            return Err(corrupt(
-                "document provisioning journal did not finalize exactly once",
-            ));
-        }
-        manifest::validate_document_catalog(&transaction, storage.shard_count())?;
-        manifest::refresh_manifest_digest(&transaction)?;
-        manifest::current_integrity(&transaction, storage.shard_count())?;
-        transaction.commit().map_err(sqlite_error::storage)
+            Ok(metadata)
+        })
     }
 
     fn validate_stored_records(
@@ -1233,10 +1964,164 @@ mod enabled {
         ))
     }
 
+    type StoredCollectionRow = (i64, i64, String, String, Vec<u8>, i64, i64);
+
+    fn load_collection_row(
+        connection: &Connection,
+        database: &str,
+        collection: &str,
+        control: &OperationControl,
+    ) -> EngineResult<Option<DocumentCollectionMetadata>> {
+        ensure_control_active(control, "before reading document collection metadata")?;
+        let row = connection
+            .query_row(
+                "SELECT c.collection_id, c.database_id, d.database_name,
+                        c.collection_name, c.options_bson, c.placement_policy,
+                        c.placement_version
+                 FROM briskdb_document_collections AS c
+                 JOIN briskdb_document_databases AS d
+                   ON d.database_id = c.database_id
+                 WHERE c.lifecycle_state = 2
+                   AND d.database_name = ?1
+                   AND c.collection_name = ?2",
+                params![database, collection],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sqlite_error::storage)?;
+        let metadata = row
+            .map(|row| decode_collection_row(connection, row, Some(control)))
+            .transpose()?;
+        ensure_control_active(control, "after reading document collection metadata")?;
+        Ok(metadata)
+    }
+
+    fn load_collection_rows_for_database(
+        connection: &Connection,
+        database: &str,
+        control: &OperationControl,
+    ) -> EngineResult<Vec<DocumentCollectionMetadata>> {
+        ensure_control_active(control, "before listing document collection metadata")?;
+        let mut statement = connection
+            .prepare(
+                "SELECT c.collection_id, c.database_id, d.database_name,
+                        c.collection_name, c.options_bson, c.placement_policy,
+                        c.placement_version
+                 FROM briskdb_document_collections AS c
+                 JOIN briskdb_document_databases AS d
+                   ON d.database_id = c.database_id
+                 WHERE c.lifecycle_state = 2 AND d.database_name = ?1
+                 ORDER BY c.collection_id",
+            )
+            .map_err(sqlite_error::storage)?;
+        let mut rows = statement.query([database]).map_err(sqlite_error::storage)?;
+        let mut stored = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
+            ensure_control_active(control, "while listing document collection metadata")?;
+            stored.push((
+                row.get(0).map_err(sqlite_error::storage)?,
+                row.get(1).map_err(sqlite_error::storage)?,
+                row.get(2).map_err(sqlite_error::storage)?,
+                row.get(3).map_err(sqlite_error::storage)?,
+                row.get(4).map_err(sqlite_error::storage)?,
+                row.get(5).map_err(sqlite_error::storage)?,
+                row.get(6).map_err(sqlite_error::storage)?,
+            ));
+        }
+        drop(rows);
+        drop(statement);
+        let mut collections = Vec::new();
+        collections
+            .try_reserve_exact(stored.len())
+            .map_err(|error| {
+                EngineError::from_source(
+                    EngineErrorKind::OutOfMemory,
+                    "unable to reserve bounded document collection metadata",
+                    error,
+                )
+            })?;
+        for row in stored {
+            ensure_control_active(control, "while decoding document collection metadata")?;
+            collections.push(decode_collection_row(connection, row, Some(control))?);
+        }
+        ensure_control_active(control, "after listing document collection metadata")?;
+        Ok(collections)
+    }
+
+    fn decode_collection_row(
+        connection: &Connection,
+        row: StoredCollectionRow,
+        control: Option<&OperationControl>,
+    ) -> EngineResult<DocumentCollectionMetadata> {
+        let (
+            collection_id,
+            database_id,
+            database_name,
+            name,
+            options_bson,
+            placement_policy,
+            placement_version,
+        ) = row;
+        if let Some(control) = control {
+            ensure_control_active(control, "before decoding document collection metadata")?;
+        }
+        let collection_id = positive_u64(collection_id, "document collection ID")?;
+        let database_id = positive_u64(database_id, "document database ID")?;
+        if placement_policy != 1 || placement_version != 1 {
+            return Err(corrupt("document collection has an unsupported placement"));
+        }
+        let options = DocumentCollectionOptions::new(decode_metadata_document(
+            &options_bson,
+            "document collection options",
+        )?)
+        .map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::DataCorruption,
+                "stored document collection options are invalid",
+                error,
+            )
+        })?;
+        if let Some(control) = control {
+            ensure_control_active(control, "after decoding document collection options")?;
+        }
+        let id = DocumentCollectionId::from_validated(collection_id);
+        let indexes = load_indexes_with_control(connection, id, control)?;
+        Ok(DocumentCollectionMetadata::from_validated_parts(
+            id,
+            DocumentDatabaseId::from_validated(database_id),
+            database_name,
+            name,
+            options,
+            DocumentPlacement::HashByIdV1,
+            indexes,
+        ))
+    }
+
     fn load_indexes(
         connection: &Connection,
         collection_id: DocumentCollectionId,
     ) -> EngineResult<Box<[DocumentIndexMetadata]>> {
+        load_indexes_with_control(connection, collection_id, None)
+    }
+
+    fn load_indexes_with_control(
+        connection: &Connection,
+        collection_id: DocumentCollectionId,
+        control: Option<&OperationControl>,
+    ) -> EngineResult<Box<[DocumentIndexMetadata]>> {
+        if let Some(control) = control {
+            ensure_control_active(control, "before reading document index metadata")?;
+        }
         let mut statement = connection
             .prepare(
                 "SELECT index_name, spec_bson, is_unique, is_builtin, lifecycle_state
@@ -1260,6 +2145,9 @@ mod enabled {
         let expected_id = builtin_id_specification()?;
         let mut indexes = Vec::with_capacity(rows.len());
         for (name, spec_bson, unique, built_in, lifecycle) in rows {
+            if let Some(control) = control {
+                ensure_control_active(control, "while decoding document index metadata")?;
+            }
             let specification =
                 decode_metadata_document(&spec_bson, "document index specification")?;
             let lifecycle = DocumentIndexLifecycle::from_code(
@@ -1288,6 +2176,9 @@ mod enabled {
                 built_in,
                 lifecycle,
             ));
+        }
+        if let Some(control) = control {
+            ensure_control_active(control, "after reading document index metadata")?;
         }
         Ok(indexes.into_boxed_slice())
     }
@@ -1420,25 +2311,76 @@ mod enabled {
     fn prepare_document(
         storage: &Storage,
         document: &BsonDocument,
-    ) -> EngineResult<(CanonicalBsonKey, Vec<u8>, u16)> {
+    ) -> EngineResult<PreparedDocumentWrite> {
         let id = required_document_id(document)?;
         let id_key = CanonicalBsonKey::encode(id)
             .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
         let document_bson = encode_document(document)
             .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
         let shard = storage.shard_for_key(id_key.as_bytes());
-        Ok((id_key, document_bson, shard))
+        Ok(PreparedDocumentWrite {
+            id_key,
+            document_bson,
+            shard,
+        })
     }
 
+    #[cfg(any(feature = "tinymongo-import", test))]
     fn ensure_document_write_not_cancelled(cancellation: &CancellationToken) -> EngineResult<()> {
+        ensure_document_operation_not_cancelled(cancellation, "while inserting document batch")
+    }
+
+    fn ensure_document_operation_not_cancelled(
+        cancellation: &CancellationToken,
+        boundary: &'static str,
+    ) -> EngineResult<()> {
         if cancellation.is_cancelled() {
             Err(EngineError::new(
                 EngineErrorKind::Cancelled,
-                "document batch insertion was cancelled",
+                format!("document operation was cancelled {boundary}"),
             ))
         } else {
             Ok(())
         }
+    }
+
+    fn validate_natural_order_reservation_count(count: u64) -> EngineResult<i64> {
+        if count == 0 {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "document natural-order reservation count must be greater than zero",
+            ));
+        }
+        i64::try_from(count).map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::LimitExceeded,
+                "document natural-order reservation exceeds SQLite's supported range",
+                error,
+            )
+        })
+    }
+
+    fn document_natural_order_to_sqlite(natural_order: u64) -> EngineResult<i64> {
+        if natural_order == 0 {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidArgument,
+                "document natural order must be greater than zero",
+            ));
+        }
+        i64::try_from(natural_order).map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::NumericOutOfRange,
+                "document natural order does not fit SQLite",
+                error,
+            )
+        })
+    }
+
+    fn document_natural_order_from_sqlite(natural_order: i64) -> EngineResult<u64> {
+        u64::try_from(natural_order)
+            .ok()
+            .filter(|order| *order > 0)
+            .ok_or_else(|| corrupt("stored BSON document natural order is not positive"))
     }
 
     fn provisioning_id(database: &str, collection: &str, options: &[u8]) -> [u8; 32] {
@@ -1504,6 +2446,37 @@ mod enabled {
         Ok(document)
     }
 
+    fn decode_storage_record(
+        collection_id: DocumentCollectionId,
+        shard: u16,
+        natural_order: i64,
+        id_key: Vec<u8>,
+        bson: Vec<u8>,
+        checksum: Vec<u8>,
+        version: i64,
+    ) -> EngineResult<DocumentStorageRecord> {
+        let canonical_id = CanonicalBsonKey::from_bytes(&id_key)
+            .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?;
+        let encoded_len = bson.len();
+        let document = decode_record(
+            collection_id,
+            shard,
+            natural_order,
+            &id_key,
+            bson,
+            checksum,
+            version,
+        )?;
+        Ok(DocumentStorageRecord {
+            collection_id,
+            shard,
+            natural_order: document_natural_order_from_sqlite(natural_order)?,
+            id_key: canonical_id,
+            document,
+            encoded_len,
+        })
+    }
+
     fn hash_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
@@ -1536,7 +2509,7 @@ mod enabled {
 
         use super::*;
         use crate::{
-            core::Database,
+            core::{CancellationReason, Database},
             document::{
                 BsonBinary, BsonUuid, DocumentPlacement, UuidRepresentation, encode_document,
             },
@@ -1549,6 +2522,452 @@ mod enabled {
 
         fn document(entries: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocument {
             BsonDocument::from_entries(entries).unwrap()
+        }
+
+        #[test]
+        fn controlled_catalog_mutations_honor_preaccepted_cancellation() {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 2).unwrap();
+
+            let migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            let cancelled_create = OperationControl::new(None);
+            assert!(cancelled_create.request_cancel(CancellationReason::Cancelled));
+            assert_eq!(
+                storage
+                    .create_document_collection_controlled(
+                        "engine_db",
+                        "cancelled",
+                        &DocumentCollectionOptions::empty(),
+                        migration,
+                        cancelled_create,
+                    )
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::Cancelled
+            );
+
+            let migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            let collection = storage
+                .create_document_collection_controlled(
+                    "engine_db",
+                    "events",
+                    &DocumentCollectionOptions::empty(),
+                    migration,
+                    OperationControl::new(None),
+                )
+                .unwrap();
+
+            for result in [
+                storage
+                    .document_catalog_controlled({
+                        let control = OperationControl::new(None);
+                        assert!(control.request_cancel(CancellationReason::Cancelled));
+                        control
+                    })
+                    .map(|_| ()),
+                storage
+                    .declare_document_index_controlled(
+                        collection.id(),
+                        "value_1",
+                        &document([("value", BsonValue::Int32(1))]),
+                        false,
+                        {
+                            let control = OperationControl::new(None);
+                            assert!(control.request_cancel(CancellationReason::Cancelled));
+                            control
+                        },
+                    )
+                    .map(|_| ()),
+                storage
+                    .reserve_document_natural_orders_controlled(collection.id(), 1, {
+                        let control = OperationControl::new(None);
+                        assert!(control.request_cancel(CancellationReason::Cancelled));
+                        control
+                    })
+                    .map(|_| ()),
+            ] {
+                assert_eq!(result.unwrap_err().kind(), EngineErrorKind::Cancelled);
+            }
+        }
+
+        #[test]
+        fn manifest_snapshot_reads_remain_coherent_across_concurrent_catalog_commit() {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let collection = storage
+                .create_document_collection(
+                    "engine_db",
+                    "snapshot_events",
+                    &DocumentCollectionOptions::empty(),
+                )
+                .unwrap();
+            let manifest_path = temp.path().join("manifest.sqlite");
+            let (snapshot_ready_tx, snapshot_ready_rx) = std::sync::mpsc::sync_channel(0);
+            let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
+
+            let reader = std::thread::spawn(move || {
+                let mut connection = open_existing_manifest(&manifest_path).unwrap();
+                let control = OperationControl::new(None);
+                read_ready_manifest_snapshot(&mut connection, 2, |connection| {
+                    snapshot_ready_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                    load_collection_row(
+                        connection,
+                        "engine_db",
+                        "snapshot_events",
+                        control.as_ref(),
+                    )
+                })
+                .unwrap()
+                .unwrap()
+            });
+
+            snapshot_ready_rx.recv().unwrap();
+            storage
+                .declare_document_index(
+                    collection.id(),
+                    "value_1",
+                    &document([("value", BsonValue::Int32(1))]),
+                    false,
+                )
+                .unwrap();
+            continue_tx.send(()).unwrap();
+
+            let snapshot = reader.join().unwrap();
+            assert_eq!(snapshot.indexes().len(), 1);
+            let current = storage
+                .document_collection_controlled(
+                    "engine_db",
+                    "snapshot_events",
+                    OperationControl::new(None),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.indexes().len(), 2);
+        }
+
+        #[test]
+        fn controlled_natural_order_reservation_interrupts_manifest_lock_wait() {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let collection = storage
+                .create_document_collection(
+                    "engine_db",
+                    "locked_allocator",
+                    &DocumentCollectionOptions::empty(),
+                )
+                .unwrap();
+            let _operation = storage.enter_schema_operation().unwrap();
+
+            let mut blocker = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+            let blocker_transaction = blocker
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let worker_storage = storage.clone();
+            let control = OperationControl::new(None);
+            let worker_control = Arc::clone(&control);
+            let collection_id = collection.id();
+            let started = std::time::Instant::now();
+            let worker = std::thread::spawn(move || {
+                worker_storage.reserve_document_natural_orders_controlled(
+                    collection_id,
+                    1,
+                    worker_control,
+                )
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(control.request_cancel(CancellationReason::Cancelled));
+            let error = worker.join().unwrap().unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "manifest lock wait did not respond promptly to cancellation"
+            );
+            blocker_transaction.rollback().unwrap();
+
+            assert_eq!(
+                storage
+                    .reserve_document_natural_orders_controlled(
+                        collection.id(),
+                        1,
+                        OperationControl::new(None),
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+
+        #[test]
+        fn connection_bound_point_operations_preserve_identity_order_and_exact_bson() {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let collection = storage
+                .create_document_collection(
+                    "engine_db",
+                    "point_records",
+                    &DocumentCollectionOptions::empty(),
+                )
+                .unwrap();
+            let cancellation = CancellationToken::new();
+            let original = document([
+                ("before_id", BsonValue::String("first".to_owned())),
+                ("_id", BsonValue::Int32(17)),
+                ("number", BsonValue::Double(-0.0)),
+                ("after_id", BsonValue::Int64(17)),
+            ]);
+            let prepared = storage.prepare_document_write(&original).unwrap();
+            let natural_order = storage
+                .reserve_document_natural_orders_for_engine(collection.id(), 1, &cancellation)
+                .unwrap();
+            let mut connection = storage.open_unconfigured_shard(prepared.shard()).unwrap();
+            storage
+                .validate_unconfigured_shard(&connection, prepared.shard())
+                .unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+
+            storage
+                .insert_prepared_document_on_connection(
+                    &transaction,
+                    collection.id(),
+                    natural_order,
+                    prepared.shard(),
+                    &prepared,
+                    &cancellation,
+                )
+                .unwrap();
+            let stored = storage
+                .get_document_on_connection(
+                    &transaction,
+                    collection.id(),
+                    prepared.shard(),
+                    prepared.id_key(),
+                    &cancellation,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.collection_id(), collection.id());
+            assert_eq!(stored.shard(), prepared.shard());
+            assert_eq!(stored.natural_order(), natural_order);
+            assert_eq!(stored.id_key(), prepared.id_key());
+            assert_eq!(
+                stored.encoded_len(),
+                encode_document(&original).unwrap().len()
+            );
+            assert!(stored.document().representation_eq(&original));
+
+            let replacement = document([
+                ("_id", BsonValue::Int64(17)),
+                ("number", BsonValue::Double(0.0)),
+                ("replacement", BsonValue::Boolean(true)),
+            ]);
+            let prepared_replacement = storage.prepare_document_write(&replacement).unwrap();
+            assert!(
+                storage
+                    .replace_document_on_connection(
+                        &transaction,
+                        collection.id(),
+                        prepared.shard(),
+                        prepared.id_key(),
+                        natural_order,
+                        &prepared_replacement,
+                        &cancellation,
+                    )
+                    .unwrap()
+            );
+            let replaced = storage
+                .get_document_on_connection(
+                    &transaction,
+                    collection.id(),
+                    prepared.shard(),
+                    prepared.id_key(),
+                    &cancellation,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(replaced.natural_order(), natural_order);
+            assert!(replaced.document().representation_eq(&replacement));
+
+            let changed_id = storage
+                .prepare_document_write(&document([
+                    ("_id", BsonValue::Int32(18)),
+                    ("replacement", BsonValue::Boolean(true)),
+                ]))
+                .unwrap();
+            assert_eq!(
+                storage
+                    .replace_document_on_connection(
+                        &transaction,
+                        collection.id(),
+                        prepared.shard(),
+                        prepared.id_key(),
+                        natural_order,
+                        &changed_id,
+                        &cancellation,
+                    )
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::InvalidArgument
+            );
+            assert!(
+                storage
+                    .delete_document_on_connection(
+                        &transaction,
+                        collection.id(),
+                        prepared.shard(),
+                        prepared.id_key(),
+                        &cancellation,
+                    )
+                    .unwrap()
+            );
+            assert!(
+                storage
+                    .get_document_on_connection(
+                        &transaction,
+                        collection.id(),
+                        prepared.shard(),
+                        prepared.id_key(),
+                        &cancellation,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            transaction.commit().unwrap();
+        }
+
+        #[test]
+        fn connection_bound_shard_scans_are_bounded_resumable_and_cancellable() {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let collection = storage
+                .create_document_collection(
+                    "engine_db",
+                    "scan_records",
+                    &DocumentCollectionOptions::empty(),
+                )
+                .unwrap();
+            let cancellation = CancellationToken::new();
+            let mut selected_shard = None;
+            let mut prepared = Vec::new();
+            for id in 0..100 {
+                let document = document([
+                    ("_id", BsonValue::Int32(id)),
+                    ("ordinal", BsonValue::Int32(id)),
+                ]);
+                let candidate = storage.prepare_document_write(&document).unwrap();
+                if selected_shard.is_none() {
+                    selected_shard = Some(candidate.shard());
+                }
+                if Some(candidate.shard()) == selected_shard {
+                    prepared.push(candidate);
+                }
+                if prepared.len() == 3 {
+                    break;
+                }
+            }
+            assert_eq!(prepared.len(), 3);
+            let shard = selected_shard.unwrap();
+            let first_order = storage
+                .reserve_document_natural_orders_for_engine(
+                    collection.id(),
+                    prepared.len() as u64,
+                    &cancellation,
+                )
+                .unwrap();
+            let mut connection = storage.open_unconfigured_shard(shard).unwrap();
+            storage
+                .validate_unconfigured_shard(&connection, shard)
+                .unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            for (offset, document) in prepared.iter().enumerate() {
+                storage
+                    .insert_prepared_document_on_connection(
+                        &transaction,
+                        collection.id(),
+                        first_order + offset as u64,
+                        shard,
+                        document,
+                        &cancellation,
+                    )
+                    .unwrap();
+            }
+
+            assert_eq!(
+                storage
+                    .count_document_shard_on_connection(
+                        &transaction,
+                        collection.id(),
+                        shard,
+                        &cancellation,
+                    )
+                    .unwrap(),
+                3
+            );
+            let first_page = storage
+                .scan_document_shard_on_connection(
+                    &transaction,
+                    collection.id(),
+                    shard,
+                    None,
+                    2,
+                    &cancellation,
+                )
+                .unwrap();
+            assert_eq!(first_page.len(), 2);
+            assert_eq!(first_page[0].natural_order(), first_order);
+            assert_eq!(first_page[1].natural_order(), first_order + 1);
+            let second_page = storage
+                .scan_document_shard_on_connection(
+                    &transaction,
+                    collection.id(),
+                    shard,
+                    Some(first_page[1].natural_order()),
+                    2,
+                    &cancellation,
+                )
+                .unwrap();
+            assert_eq!(second_page.len(), 1);
+            assert_eq!(second_page[0].natural_order(), first_order + 2);
+
+            for limit in [0, MAX_DOCUMENT_SHARD_SCAN_RECORDS + 1] {
+                assert_eq!(
+                    storage
+                        .scan_document_shard_on_connection(
+                            &transaction,
+                            collection.id(),
+                            shard,
+                            None,
+                            limit,
+                            &cancellation,
+                        )
+                        .unwrap_err()
+                        .kind(),
+                    EngineErrorKind::InvalidArgument
+                );
+            }
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            assert_eq!(
+                storage
+                    .scan_document_shard_on_connection(
+                        &transaction,
+                        collection.id(),
+                        shard,
+                        None,
+                        1,
+                        &cancelled,
+                    )
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::Cancelled
+            );
+            transaction.commit().unwrap();
         }
 
         #[test]
@@ -2435,6 +3854,10 @@ mod enabled {
 
 #[cfg(feature = "documents")]
 pub(super) use enabled::recover_or_validate;
+#[cfg(feature = "documents")]
+pub(crate) use enabled::{
+    DocumentStorageRecord, MAX_DOCUMENT_SHARD_SCAN_RECORDS, PreparedDocumentWrite,
+};
 
 #[cfg(not(feature = "documents"))]
 pub(super) fn recover_or_validate(
