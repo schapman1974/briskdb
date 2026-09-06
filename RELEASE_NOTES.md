@@ -22,9 +22,27 @@ inserts, empty-filter or exact-`_id` find/count commands, and exact-`_id`
 single-document deletion through the same session, pool, routing, cancellation,
 deadline, shutdown, and result-limit boundaries as SQL. Point plans target one
 shard; scatter reads merge in durable natural order while preserving exact
-ordered BSON. General matchers, update expressions, replacements, aggregation,
-retained cursors, the MongoDB listener, and public Rust/Python collection APIs
-remain follow-up work. See [the BSON contract](docs/BSON.md),
+ordered BSON.
+
+The embedded Rust surface now exposes that engine through thin
+`BriskDb::execute_document` and `BriskSession::execute_document` methods. A
+document-enabled handle forwards the caller's owned `DocumentRequest`
+unchanged, preserving ordered BSON, typed results, request identity, point or
+scatter plans, cancellation, deadlines, result limits, and classified engine
+errors. Document support remains opt-in twice: compile with the `documents`
+feature and open with `DocumentSupport::Enabled`. A disabled handle rejects a
+facade call with `FailedPrecondition`; a build without `documents` rejects the
+enabled builder setting with `Unsupported` before accessing storage.
+Differential integration tests compare direct engine execution with both
+facades for point and scatter commands, ordered extended BSON values, request
+controls, session ownership, and shutdown.
+
+The facade exposes the exact engine slice above. General matchers, update
+expressions, replacements, aggregation, retained cursors, the MongoDB listener,
+a collection-oriented Rust convenience API, and the Python document API remain
+follow-up work before MongoDB compatibility can be claimed. See the
+[embedded Rust guide](docs/EMBEDDED_RUST.md),
+[the BSON contract](docs/BSON.md),
 [the document storage contract](docs/DOCUMENT_STORAGE.md), and
 [the document engine contract](docs/DOCUMENT_ENGINE.md).
 

@@ -12,11 +12,22 @@ handling dependencies:
 briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["embedded"] }
 ```
 
+For the same facade plus native BSON/document commands:
+
+```toml
+[dependencies]
+briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["documents"] }
+```
+
+The `documents` feature selects `embedded`; each database handle must still be
+opened with `DocumentSupport::Enabled` before its document facade accepts work.
+Command, BSON, plan, and result types live under `briskdb::document`.
+
 ## Feature map
 
 | Feature | Adds | Tier |
 | --- | --- | --- |
-| `embedded` | Listener-free `BriskDb` and `BriskSession` APIs | Alpha-supported |
+| `embedded` | Listener-free `BriskDb` and `BriskSession` SQL APIs | Alpha-supported |
 | `http` | Axum HTTP API and admin browser | Alpha-supported |
 | `postgres` | PostgreSQL wire adapter, including TLS/SCRAM implementation | Alpha-supported, bounded SQL subset |
 | `listeners` | Host-controlled HTTP/PostgreSQL listeners, selecting `tls`, without signals or engine ownership | Alpha-supported |
@@ -26,7 +37,7 @@ briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["em
 | `sqlite-import-cli` | `briskdb-import` binary | Process integration |
 | `tinymongo-import` | Strict TinyMongo v1.3 SQLite reader and atomic document import; selects `documents` and `sqlite-import` | Experimental migration API |
 | `experimental-vtab` | Sharded virtual-table prototype | Experimental |
-| `documents` | BSON values and codec, catalog/storage, TinyMongo-ready semantic keys, and protocol-neutral document commands; also selects `embedded` | Experimental document engine; no MongoDB listener yet |
+| `documents` | BSON values and codec, catalog/storage, TinyMongo-ready semantic keys, protocol-neutral document commands, and their `BriskDb`/`BriskSession` facade; also selects `embedded` | Experimental document engine; no MongoDB listener yet |
 | `mysql` | Reserved MySQL boundary | Reserved; no listener yet |
 | `tls` | Compatibility alias for the secure `postgres` surface | Alpha-supported; selected by `listeners` |
 
@@ -46,12 +57,15 @@ listener assembly.
   building blocks used by current adapters. Prefer crate-root and `embedded`
   APIs unless implementing a BriskDB adapter.
 - The `documents` feature exposes the protocol-neutral BSON foundation,
-  versioned persistence, and first document-engine commands documented in
-  [BSON value and codec contract](BSON.md) and
-  [document storage](DOCUMENT_STORAGE.md), and
+  versioned persistence, first document-engine commands, and the thin embedded
+  facade documented in the
+  [BSON value and codec contract](BSON.md),
+  [document storage contract](DOCUMENT_STORAGE.md), and
   [protocol-neutral document engine](DOCUMENT_ENGINE.md). Its public value,
   command, result, and metadata APIs remain experimental while Mongo semantics
-  are completed. It does not expose a MongoDB listener.
+  are completed. Callers must also open with `DocumentSupport::Enabled`; merely
+  compiling the feature does not enable document commands on a handle. It does
+  not expose a MongoDB listener or a collection-oriented convenience API.
 - The `mysql` reserved feature compiles but intentionally exposes no claimed
   implementation.
 

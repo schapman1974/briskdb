@@ -420,7 +420,7 @@ requires an earlier dependency:
    - [x] [#237](https://github.com/schapman1974/briskdb/issues/237) — asynchronous indexing and watermarks
    - [x] [#238](https://github.com/schapman1974/briskdb/issues/238) — Bloom/min-max shard summaries
    - [x] [#239](https://github.com/schapman1974/briskdb/issues/239) — production/release gates
-4. [ ] **Finish the embedded Rust API.** Make sessions, transactions,
+4. [x] **Finish the embedded Rust API.** Make sessions, transactions,
    cancellation, concurrency, document commands, and shutdown safe for a host
    process.
 5. [ ] **Finish the Python API and wheels.** Provide matching synchronous and
@@ -455,8 +455,8 @@ requires an earlier dependency:
     - [x] [#162](https://github.com/schapman1974/briskdb/issues/162) —
       protocol-neutral document engine with controlled point/scatter commands;
       see [`docs/DOCUMENT_ENGINE.md`](docs/DOCUMENT_ENGINE.md)
-    - [ ] [#191](https://github.com/schapman1974/briskdb/issues/191) — embedded
-      Rust document API
+    - [x] [#191](https://github.com/schapman1974/briskdb/issues/191) — thin
+      embedded Rust facade over protocol-neutral document commands
     - [ ] [#198](https://github.com/schapman1974/briskdb/issues/198) — Python
       BSON conversions and document API
     - [ ] [#200](https://github.com/schapman1974/briskdb/issues/200) — release
