@@ -95,17 +95,23 @@ object or MongoDB network listener in this slice.
 
 ## Attached listeners
 
-- `db.serve(*, http="127.0.0.1:0", postgres=None, postgres_tls_cert=None, postgres_tls_key=None, postgres_user="briskdb", postgres_password_file=None) -> Server`
+- `db.serve(*, http="127.0.0.1:0", admin="127.0.0.1:0", postgres=None, postgres_tls_cert=None, postgres_tls_key=None, postgres_user="briskdb", postgres_password_file=None) -> Server`; pass `admin=None` to disable administration
 - `await async_db.serve(...) -> AsyncServer`
-- `Server.http_address` and `.postgres_address` report actual bound addresses.
+- `Server.data_address` reports the data address and `Server.http_address`
+  remains its compatibility alias. `.admin_address` and `.postgres_address`
+  report optional bound addresses.
 - `Server.close()` is idempotent; server context exit closes only listeners.
 - Database close first drains every attached server, then stops the engine.
 
-HTTP and unauthenticated PostgreSQL accept only numeric loopback addresses.
+Data HTTP, administration HTTP, and unauthenticated PostgreSQL accept only
+numeric loopback addresses. The data address serves `/v1` discovery, query, and
+execute. The optional administration address serves `/health`, `/metrics`,
+`/v1/health`, `/v1/admin/*`, and `/admin/*`; cross-plane paths return 404.
 Certificate, key, and password-file arguments enable TLS/SCRAM PostgreSQL and
 permit a non-loopback PostgreSQL address. This is single-identity
 authentication, not roles or authorization. The PostgreSQL endpoint supports
-BriskDB's documented bounded SQL subset.
+BriskDB's documented bounded SQL subset. See the repository's
+[HTTP listener contract](../docs/HTTP_LISTENERS.md).
 
 ## Results and errors
 

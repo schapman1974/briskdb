@@ -8,6 +8,9 @@ ready for latency-sensitive production use.
 
 ## Operator surfaces
 
+The HTTP surfaces below are served only by the configured administration
+listener (default `127.0.0.1:7655`):
+
 - `GET /health` reports aggregate global-index state, unavailable/degraded
   counts, async lag, retained outbox bytes/events, and backpressured shards.
 - `GET /v1/admin/global-indexes` reports per-index lifecycle, authority rows,

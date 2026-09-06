@@ -54,9 +54,13 @@ sudo systemctl restart briskdb
 sudo systemctl status briskdb --no-pager
 ```
 
-The default database location is `/var/lib/briskdb/data`. The HTTP listener is
-`127.0.0.1:7654`, and PostgreSQL is disabled. PostgreSQL rejects non-loopback
-activation unless TLS and SCRAM-SHA-256 are fully configured.
+The default database location is `/var/lib/briskdb/data`. The HTTP data
+listener is `127.0.0.1:7654`, the administration listener is
+`127.0.0.1:7655`, and PostgreSQL is disabled. Both HTTP planes reject
+non-loopback addresses. PostgreSQL rejects non-loopback activation unless TLS
+and SCRAM-SHA-256 are fully configured. Set
+`BRISKDB_ADMIN_LISTEN=disabled` to omit the browser, health, metrics, and all
+other administration HTTP routes.
 
 ## Enable PostgreSQL queries
 

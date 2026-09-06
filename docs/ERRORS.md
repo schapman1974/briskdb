@@ -13,6 +13,11 @@ startup. Listener bind/accept failures terminate the shared server lifecycle
 with process-level diagnostics after cleanup; they are not `EngineErrorKind`
 values and are not encoded as HTTP or PostgreSQL responses. A PostgreSQL
 startup timeout closes without a frame because no session was established.
+The current data and administration HTTP listeners reject non-loopback
+addresses. Equal nonzero data/admin socket addresses are rejected as a
+configuration error; port zero may be requested for both because the operating
+system resolves them to distinct sockets. A path sent to the wrong HTTP plane
+is an ordinary 404 and never reaches the hidden handler.
 
 ## Taxonomy and protocol mappings
 
@@ -187,8 +192,9 @@ reaches the engine; that decoding rejection is outside this taxonomy.
 
 ### Admin-browser responses
 
-The embedded `/admin` application's login and cookie checks happen in the HTTP
-adapter before an engine operation exists. Wrong credentials and a missing,
+The embedded `/admin` application's login and cookie checks happen in the
+administration HTTP adapter before an engine operation exists. Wrong
+credentials and a missing,
 malformed, unknown, expired, or logged-out `briskdb_admin_session` therefore use
 HTTP 401 rather than inventing an `EngineErrorKind`. A protected call with an
 unusable session returns a fixed JSON response without changing cookies, so an

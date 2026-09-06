@@ -1,12 +1,13 @@
 # HTTP API version 1
 
-Status: implemented for issues #50 and #51. BriskDB remains an alpha database;
-HTTP is loopback-only and has no data/admin authorization. The `/admin` browser
-login does not authenticate `/v1` requests.
+Status: implemented for issues #50, #51, and #52. BriskDB remains an alpha
+database. Its data and administration HTTP listeners are separate,
+loopback-only, and have no complete authorization boundary. The `/admin`
+browser login authenticates only its browser endpoints.
 
 ## Version and compatibility
 
-`GET /v1` (also `/v1/`) describes the transport contract:
+`GET /v1` (also `/v1/`) on the data listener describes the transport contract:
 
 ```json
 {
@@ -23,17 +24,20 @@ Every response within `/v1`, including engine errors, decoding failures,
 unknown endpoints, and unsupported methods, carries `BriskDB-API-Version: 1`.
 The URL selects the API version; a client header does not select another
 version. Unknown versions have no routes and return HTTP 404. Discovery is
-static contract metadata, not a readiness check; use `/v1/health` for engine
-health.
+static contract metadata, not a readiness check; use `/v1/health` on the
+administration listener for the current engine health report.
 
 The HTTP API major version is independent of the package version and manifest
 format. Within v1, existing request fields, successful response fields, known
 error mappings, and the default value encoding keep their documented meaning.
 Compatible additions may introduce optional request fields, new endpoints,
 response fields, or new error codes. Clients must tolerate unknown response
-fields and handle unknown error codes by status. A breaking transport change
-requires a new API major version and a documented migration; it must not
-silently reinterpret a v1 request. SQL support and storage compatibility still
+fields and handle unknown error codes by status. A breaking request or
+representation change requires a new API major version and a documented
+migration; it must not silently reinterpret a v1 request. The issue #52
+listener split is a separately documented pre-1.0 deployment change: relative
+v1 paths and their representations are preserved, while admin paths use a
+different configured base address. SQL support and storage compatibility still
 follow their separately documented alpha contracts.
 
 `legacy-json-v1` remains the default and retains the original cell conversion,
@@ -41,21 +45,36 @@ including its losses. `lossless-json-v1` is an explicitly selected, tagged
 encoding for the complete current protocol-neutral value model. Adding that
 choice does not reinterpret an omitted v1 field or change the default response.
 
-## Routes
+## Routes and listeners
 
-| Method and path | Success |
+The data listener defaults to `127.0.0.1:7654` through `--listen` and
+`BRISKDB_LISTEN`:
+
+| Data method and path | Success |
 | --- | --- |
 | `GET /v1`, `GET /v1/` | Version discovery above |
-| `GET /v1/health` | Same engine and global-index health report as `/health` |
 | `POST /v1/execute` | One routed write result |
 | `POST /v1/query` | Ordered result columns and positional rows |
+
+The administration listener defaults to `127.0.0.1:7655` through
+`--admin-listen` and `BRISKDB_ADMIN_LISTEN`; the exact value `disabled` omits
+the entire plane:
+
+| Administration method and path | Success |
+| --- | --- |
+| `GET /health` | Engine and aggregate global-index health report |
+| `GET /metrics` | Prometheus text report |
+| `GET /v1/health` | Versioned alias of `/health` |
 | `POST /v1/admin/broadcast` | Journaled application-schema migration result |
 | `GET /v1/admin/global-indexes` | [Global-index operational report](GLOBAL_INDEX_RELEASE_GATE.md) |
+| `/admin`, `/admin/`, assets, and `/admin/api/*` | [Admin data browser](ADMIN_BROWSER.md) |
 
 GET routes also accept HEAD, returning headers without a body. Success is HTTP
-200 with `application/json`. The unversioned `/health` and `/metrics` routes
-remain operator conveniences. The browser's `/admin/api/*` contract is
-separate and described in [ADMIN_BROWSER.md](ADMIN_BROWSER.md).
+200 with `application/json`, except for Prometheus text and browser assets.
+Each production router omits the other plane's handlers, so sending a route to
+the wrong listener returns 404 without executing it. The complete address,
+Rust/Python configuration, startup, and drain contract is in
+[HTTP_LISTENERS.md](HTTP_LISTENERS.md).
 
 ## SQL requests and session lifetime
 
@@ -248,7 +267,8 @@ example, insert the canonical base64 tag with `lossless-json-v1`, query the BLOB
 with the same selection, and reuse the returned tag as another parameter. The
 second parameter decodes to `Value::Binary`, not to a JSON array or text value.
 
-Broadcast accepts only `{"sql":"CREATE TABLE ..."}` and returns
+On the administration listener, broadcast accepts only
+`{"sql":"CREATE TABLE ..."}` and returns
 `{"completed_shards":[0,1]}`. It is the existing journaled schema migration
 operation, with preflight and resumable application across every shard. It
 does not create catalog metadata implicitly or accept bound parameters.
@@ -276,21 +296,31 @@ engine `busy` code advertises retryability. A write may commit before its
 response reaches the client; v1 supplies no idempotency key and makes no
 exactly-once delivery guarantee.
 
-## Migration from the experimental endpoints
+## Migration from the combined listener
 
-Existing route names, valid legacy request bodies, successful legacy result
-shapes, and legacy cell encodings continue to work. Unknown fields were
-previously ignored and now return 400. Malformed-body responses previously used
-framework-specific text and statuses; they now use the fixed problems above.
-Clients must remove unused envelope fields and consume `code` instead of decoder
-text. Clients may adopt lossless cells one request at a time by adding
-`"value_encoding":"lossless-json-v1"`; no API-major or storage migration is
-involved. No storage format, Rust engine behavior, or startup configuration
-changes are involved.
+Route names, valid request bodies, successful result shapes, and cell encodings
+are unchanged. Data requests and discovery stay on `--listen`. Operator and
+browser clients must change their base address to `--admin-listen` for
+`/health`, `/metrics`, `/v1/health`, `/v1/admin/*`, and `/admin/*`. The daemon
+default moves those routes from `127.0.0.1:7654` to `127.0.0.1:7655`; setting
+the admin listener to `disabled` makes every one of them unavailable.
+
+This authority change is intentional pre-1.0 listener configuration, not an
+API-major representation change. It introduces no storage migration and does
+not alter Rust engine behavior. The established Rust `router` and
+`router_with_engine` helpers remain combined for host-owned integrations; the
+daemon and attached server use the isolated plane routers.
+
+The earlier experimental-to-v1 migration still applies: unknown envelope
+fields and malformed bodies now return the fixed errors above, and clients may
+adopt lossless cells one request at a time with
+`"value_encoding":"lossless-json-v1"`.
 
 `tests/http_v1.rs` exercises discovery, schema rejection before mutation, body
 limits, routing errors, method headers, version isolation, and session isolation.
 Existing HTTP tests cover catalog routing, generated keys, concurrent requests,
 deadlines, result limits, and exact response shapes. Lossless-codec tests cover
 every tag, canonical validation, binary reuse, and unchanged legacy responses;
-embedded differential tests verify shared-engine outcomes.
+embedded differential tests verify shared-engine outcomes. Listener tests prove
+the route matrix on separate real sockets, disabled administration, partial-bind
+cleanup, address reporting, and common shutdown behavior.

@@ -295,10 +295,15 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _legacy_router: fn(Arc<storage::Database>) -> Router = api::router;
     let _http_router: fn(Arc<core::Database>) -> Router = http::router;
     let _engine_router: fn(core::Engine) -> Router = http::router_with_engine;
+    let _data_router: fn(Arc<core::Database>) -> Router = http::data_router;
+    let _data_engine_router: fn(core::Engine) -> Router = http::data_router_with_engine;
+    let _admin_router: fn(Arc<core::Database>) -> Router = http::admin_router;
+    let _admin_engine_router: fn(core::Engine) -> Router = http::admin_router_with_engine;
     let _default_server_entry_point = server::run;
     let _configured_server_entry_point = server::run_with_engine_options;
     let server_config = server::Config {
         listen: "127.0.0.1:7654".parse().unwrap(),
+        admin_listen: Some("127.0.0.1:7655".parse().unwrap()),
         postgres_listen: Some("127.0.0.1:5433".parse().unwrap()),
         postgres_security: None,
         data_dir: std::path::PathBuf::from("./briskdb-data"),
@@ -308,6 +313,12 @@ fn legacy_and_explicit_module_paths_are_both_available() {
         server_config.postgres_listen,
         Some("127.0.0.1:5433".parse().unwrap())
     );
+    let listener_config = server::ListenerConfig {
+        http_listen: server_config.listen,
+        admin_listen: server_config.admin_listen,
+        postgres_listen: server_config.postgres_listen,
+    };
+    assert_eq!(listener_config.admin_listen, server_config.admin_listen);
     let postgres_security =
         postgres::SecurityConfig::new("server.crt", "server.key", "briskdb", "postgres-password")
             .unwrap();

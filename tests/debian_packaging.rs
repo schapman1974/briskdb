@@ -26,6 +26,7 @@ fn debian_service_uses_fhs_paths_journald_and_a_restricted_account() {
     let configuration = include_str!("../packaging/debian/briskdb.default");
     for required in [
         "BRISKDB_LISTEN=127.0.0.1:7654",
+        "BRISKDB_ADMIN_LISTEN=127.0.0.1:7655",
         "BRISKDB_POSTGRES_LISTEN=disabled",
         "BRISKDB_DATA_DIR=/var/lib/briskdb/data",
         "RUST_LOG=briskdb=info",
@@ -88,6 +89,8 @@ fn debian_package_contract_preserves_configuration_and_database_state() {
     for required in [
         "systemd-analyze verify",
         "BriskDB is ready",
+        "http://127.0.0.1:7654/v1",
+        "http://127.0.0.1:7655/admin",
         "package smoke-test local configuration",
         "wait_for_service",
         "dpkg -r briskdb",

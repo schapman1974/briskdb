@@ -9,6 +9,8 @@ def sync_contract(path: str) -> None:
     database: briskdb.Database = briskdb.open(path, config=config)
     server: briskdb.Server = database.serve()
     address: str = server.http_address
+    data_address: str = server.data_address
+    admin_address: Optional[str] = server.admin_address
     server.close()
     session: briskdb.Session = database.session(routing_key="typed")
     write_result = session.execute("DELETE FROM notes WHERE id = ?1", [1])
@@ -42,6 +44,8 @@ def sync_contract(path: str) -> None:
     ]
     print(
         address,
+        data_address,
+        admin_address,
         affected,
         rows,
         row,
@@ -59,6 +63,8 @@ async def async_contract(path: str) -> None:
     database: briskdb.AsyncDatabase = await briskdb.open_async(path, shards=2)
     server: briskdb.AsyncServer = await database.serve()
     address: str = server.http_address
+    data_address: str = server.data_address
+    admin_address: Optional[str] = server.admin_address
     await server.close()
     session: briskdb.AsyncSession = await database.session(routing_key="typed")
     cursor: briskdb.AsyncCursor = await session.cursor("SELECT 1")
@@ -71,4 +77,4 @@ async def async_contract(path: str) -> None:
     namespace: str = created["collection"]["namespace"]
     await session.insert_one("app", "typed", {"_id": 1})
     document_count: int = (await session.count_documents("app", "typed"))["count"]
-    print(address, rows, outcome, namespace, document_count)
+    print(address, data_address, admin_address, rows, outcome, namespace, document_count)

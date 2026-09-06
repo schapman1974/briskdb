@@ -91,10 +91,10 @@ set, every shard for an unconstrained Sharded read, or shard 0 once for a
 
 | Interface | Status | SQL accepted | Routing |
 | --- | --- | --- | --- |
-| HTTP `/v1/execute` | Experimental | Empty catalog: legacy SQLite statement. Populated catalog: exactly one SQLite common-subset write with normalized positional parameters and strict SQLite translation | Empty catalog requires caller `shard_key`; a populated catalog requires authoritative finite single-shard inference except for one active-policy omitted generated key, and rejects Global/Catalog writes |
-| HTTP `/v1/query` | Experimental | Empty catalog: legacy raw SQLite query. Populated catalog: exactly one SQLite common-subset read; no session cache; multi-shard execution is limited to the row-local scatter-safe subset | Empty catalog requires caller `shard_key`; populated catalog derives targets from registered metadata, reads Global data once on shard 0, and denies Catalog/undeclared tables |
-| HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch; populated catalogs reject row-moving DML, table drops, and trigger creation | Preflight on every shard, then ascending resumable apply |
-| HTTP `/admin` browser | Experimental, read-only | No caller SQL; metadata-driven logical table discovery, specialized exact logical `COUNT(*)`, and bounded deterministic `SELECT *` page slices | Sharded tables visit all files; Global tables visit shard 0 once; no browser shard selector or arbitrary SQL |
+| Data HTTP `/v1/execute` | Experimental | Empty catalog: legacy SQLite statement. Populated catalog: exactly one SQLite common-subset write with normalized positional parameters and strict SQLite translation | Empty catalog requires caller `shard_key`; a populated catalog requires authoritative finite single-shard inference except for one active-policy omitted generated key, and rejects Global/Catalog writes |
+| Data HTTP `/v1/query` | Experimental | Empty catalog: legacy raw SQLite query. Populated catalog: exactly one SQLite common-subset read; no session cache; multi-shard execution is limited to the row-local scatter-safe subset | Empty catalog requires caller `shard_key`; populated catalog derives targets from registered metadata, reads Global data once on shard 0, and denies Catalog/undeclared tables |
+| Admin HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch; populated catalogs reject row-moving DML, table drops, and trigger creation | Preflight on every shard, then ascending resumable apply |
+| Admin HTTP `/admin` browser | Experimental, read-only | No caller SQL; metadata-driven logical table discovery, specialized exact logical `COUNT(*)`, and bounded deterministic `SELECT *` page slices | Sharded tables visit all files; Global tables visit shard 0 once; no browser shard selector or arbitrary SQL |
 | PostgreSQL wire protocol | Protocol 3.0, newer-minor downgrade, TLS/SCRAM, cancellation, simple and extended flow; live psql/tokio-postgres/psycopg/SQLAlchemy matrix | Registered-table CRUD, basic OIDs/formats, single-shard transactions, and exact placeholder `::VARCHAR` adaptation; general casts and DDL remain unsupported | Secure startup authenticates before database/session creation; queries use Engine prepare/bind/logical execution and fixed SQLSTATE mapping |
 | MySQL wire protocol | Planned | Rust parsing, validation, classification, placeholder normalization, finite compatibility translation, and prepared lifecycle implemented; listener adoption planned | Core batch/write policy, bind validation, routing snapshots, current execute-time planning, and supported target execution implemented; wire mapping planned |
 
@@ -171,8 +171,9 @@ transaction cannot span requests.
 
 ### Admin browser inspection
 
-The `/admin` application is an early operational view rather than another SQL
-compatibility mode. The browser never submits SQL. With a populated catalog,
+The `/admin` application on the administration listener is an early operational
+view rather than another SQL compatibility mode. The browser never submits SQL.
+With a populated catalog,
 its overview lists non-Catalog tables in the default logical database. An empty
 catalog retains a shard-0 physical-discovery fallback through SQLite's typed
 `table_list` metadata. ASCII-case-insensitive `sqlite_`, the exact name

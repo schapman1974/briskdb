@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderValue, StatusCode},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
@@ -18,21 +18,56 @@ use super::{
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn routes() -> Router<HttpState> {
-    let endpoints = Router::new()
-        .route("/", get(discovery))
-        .route("/health", get(health))
-        .route("/execute", post(execute))
-        .route("/query", post(query))
-        .route("/admin/broadcast", post(broadcast))
-        .route("/admin/global-indexes", get(global_indexes))
+    versioned_routes(
+        Router::new()
+            .route("/", get(discovery))
+            .route("/health", get(health))
+            .route("/execute", post(execute))
+            .route("/query", post(query))
+            .route("/admin/broadcast", post(broadcast))
+            .route("/admin/global-indexes", get(global_indexes)),
+        true,
+    )
+}
+
+pub(super) fn data_routes() -> Router<HttpState> {
+    versioned_routes(
+        Router::new()
+            .route("/", get(discovery))
+            .route("/execute", post(execute))
+            .route("/query", post(query)),
+        true,
+    )
+}
+
+pub(super) fn admin_routes() -> Router<HttpState> {
+    versioned_routes(
+        Router::new()
+            .route("/health", get(health))
+            .route("/admin/broadcast", post(broadcast))
+            .route("/admin/global-indexes", get(global_indexes)),
+        false,
+    )
+}
+
+fn versioned_routes(
+    endpoints: Router<HttpState>,
+    include_discovery_slash: bool,
+) -> Router<HttpState> {
+    let endpoints = endpoints
         .fallback(not_found)
-        .method_not_allowed_fallback(method_not_allowed);
-    Router::new()
-        .route("/v1/", get(discovery))
         .method_not_allowed_fallback(method_not_allowed)
-        .nest("/v1", endpoints)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .layer(middleware::map_response(version_header))
+        .layer(middleware::map_response(version_header));
+    let router = Router::new().nest("/v1", endpoints);
+    let slash = (if include_discovery_slash {
+        get(discovery).fallback(method_not_allowed)
+    } else {
+        any(not_found)
+    })
+    .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+    .layer(middleware::map_response(version_header));
+    router.route("/v1/", slash)
 }
 
 async fn version_header(mut response: Response) -> Response {

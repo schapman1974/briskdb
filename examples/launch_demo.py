@@ -74,7 +74,7 @@ def run_demo(writes: int) -> dict[str, object]:
             counts = shard_counts(root)
             with database.serve(postgres="127.0.0.1:0") as server:
                 with urllib.request.urlopen(
-                    f"http://{server.http_address}/health", timeout=5
+                    f"http://{server.admin_address}/health", timeout=5
                 ) as response:
                     health = json.load(response)
                 postgres_address = server.postgres_address

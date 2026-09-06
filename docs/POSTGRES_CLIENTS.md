@@ -42,6 +42,8 @@ bash tests/postgres_client_matrix.sh
 ```
 
 `BRISKDB_POSTGRES_MATRIX_PYTHON` and `BRISKDB_POSTGRES_MATRIX_PSQL` can select
-non-default executables. `BRISKDB_POSTGRES_MATRIX_PORT` and
-`BRISKDB_HTTP_MATRIX_PORT` can move the temporary listeners. The script creates
-and removes its own temporary imported database.
+non-default executables. `BRISKDB_POSTGRES_MATRIX_PORT`,
+`BRISKDB_HTTP_MATRIX_PORT`, and `BRISKDB_ADMIN_MATRIX_PORT` move the temporary
+PostgreSQL, data HTTP, and administration HTTP listeners respectively. The
+script waits for both data discovery and admin health, then creates and removes
+its own temporary imported database.

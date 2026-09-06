@@ -1,12 +1,16 @@
 # Admin data browser
 
-Status: implemented for roadmap issue #106, hardened by issue #110, and made
-placement-aware by issue #57
+Status: implemented for roadmap issue #106, hardened by issue #110, made
+placement-aware by issue #57, and moved to the administration listener by
+issue #52.
 
-BriskDB serves a small read-only data explorer from the existing HTTP listener.
-Open `/admin` (or `/admin/`) to use the embedded application. Its HTML, CSS,
-and JavaScript are compiled into the server binary; loading the page does not
-contact a package CDN, font service, analytics service, or other third party.
+BriskDB serves a small read-only data explorer from the administration HTTP
+listener, which defaults to `127.0.0.1:7655`. Open `/admin` (or `/admin/`) on
+that address to use the embedded application. Its HTML, CSS, and JavaScript are
+compiled into the server binary; loading the page does not contact a package
+CDN, font service, analytics service, or other third party. In daemon
+configuration, setting `--admin-listen disabled` removes the browser and every
+other administration route.
 
 ## Temporary login
 
@@ -15,13 +19,15 @@ The first implementation has one exact built-in credential pair:
 - username: `admin`
 - password: `admin`
 
-This is a temporary development convenience, not the user/role, password
-rotation, or transport-encryption work described by roadmap issues #56 and #64.
-Anyone who can reach the HTTP listener knows these credentials. Server startup
-therefore restricts the current unauthenticated HTTP service to an IPv4 or IPv6
-loopback address. Do not treat this login as a production identity boundary.
-The existing `/health` and `/v1/*` endpoints retain their
-previous behavior and are not made authenticated by issue #106.
+This is a temporary development convenience, not the HTTP access boundary,
+durable user/role and credential model, or listener TLS work described by
+roadmap issues #56, #64, and #65.
+Anyone who can reach the administration listener knows these credentials.
+Server startup therefore restricts the current administration service to an
+IPv4 or IPv6 loopback address. Do not treat this login as a production identity
+boundary. It does not authenticate `/health`, `/metrics`, `/v1/health`, or
+`/v1/admin/*` on the same listener, and no `/v1/query` or `/v1/execute` handler
+exists there. The data listener has no `/admin` handlers.
 
 A successful login creates an opaque session from 32 operating-system-random
 bytes and sends its lowercase 64-character hexadecimal token only in the
@@ -46,6 +52,10 @@ request still creates a short-lived engine session, and login does not create a
 multi-request SQL transaction.
 
 ## Routes
+
+In the daemon and attached server, every route in this table exists only on the
+administration listener. The shell and JSON API remain same-origin, so the
+listener split does not change cookie scope or require cross-origin requests.
 
 | Surface | Contract |
 | --- | --- |
@@ -166,8 +176,9 @@ continue.
 ## Deliberate non-goals
 
 The browser does not add editing, arbitrary SQL, schema migration, backup,
-maintenance, a separate admin listener, an atomic cross-file snapshot, stable
-pagination across concurrent writes, general distributed SQL aggregation or
-ordering, durable users or roles, credential configuration, or TLS. Those
-remain separate roadmap work. The browser adds no manifest table, file,
-version, checksum input, migration, or recovery step.
+maintenance, an atomic cross-file snapshot, stable pagination across concurrent
+writes, general distributed SQL aggregation or ordering, durable users or
+roles, credential configuration, or TLS. Those remain separate roadmap work.
+Listener topology is specified in [HTTP_LISTENERS.md](HTTP_LISTENERS.md). The
+browser adds no manifest table, file, version, checksum input, migration, or
+recovery step.

@@ -326,7 +326,10 @@ protocol-specific golden tests only for encoding and state-machine behavior.
   because the shared SQL value system has no timestamp type or storage policy;
   [#298](https://github.com/schapman1974/briskdb/issues/298) tracks that shared
   contract.
-- [ ] Separate data-plane and admin-plane routers/listeners.
+- [x] Separate data-plane and admin-plane routers/listeners, preserving
+  `--listen` for data on `127.0.0.1:7654` and moving operator and browser routes
+  to the optional loopback administration listener on `127.0.0.1:7655`
+  (issue #52); see [the listener contract](docs/HTTP_LISTENERS.md).
 - [ ] Add endpoints for health, readiness, catalog inspection, migrations,
   shard state, query cancellation, backup, and maintenance.
 - [ ] Add request IDs, idempotency keys for eligible writes, pagination/streaming,

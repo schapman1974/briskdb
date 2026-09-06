@@ -76,6 +76,7 @@ jobs:
           data_dir="$(mktemp -d)"
           "$binary" \
             --listen 127.0.0.1:17654 \
+            --admin-listen 127.0.0.1:17655 \
             --postgres-listen disabled \
             --data-dir "$data_dir/database" \
             --shards 2 &
@@ -87,7 +88,8 @@ jobs:
           }
           trap cleanup EXIT
           for attempt in {1..30}; do
-            if curl --fail --silent --show-error http://127.0.0.1:17654/admin >/dev/null; then
+            if curl --fail --silent --show-error http://127.0.0.1:17654/v1 >/dev/null \
+              && curl --fail --silent --show-error http://127.0.0.1:17655/admin >/dev/null; then
               kill -TERM "$server_pid"
               wait "$server_pid"
               trap - EXIT

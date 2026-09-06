@@ -31,9 +31,10 @@ service-manager integration beyond those signals is not yet part of the support
 contract.
 
 The supported runner tests separate Tokio TCP listeners on numeric IPv4
-secure/non-secure address validation, concurrent HTTP and PostgreSQL sessions,
-disabled PostgreSQL binding, bind-failure cleanup, TLS/SCRAM exchange, and
-shutdown of both listeners.
+secure/non-secure address validation, isolated data/admin HTTP routes,
+concurrent HTTP and PostgreSQL sessions, disabled administration/PostgreSQL
+binding, bind-failure cleanup, TLS/SCRAM exchange, and shutdown of every
+listener.
 It also starts a real imported two-shard server and gates releases on
 transaction CRUD, error recovery, close, and reconnect through Ubuntu's
 `psql`, tokio-postgres 0.7.18, psycopg 3.2.13, and SQLAlchemy 2.0.43.
@@ -51,9 +52,10 @@ selection is active only behind BriskDB-owned framing, authentication, startup,
 status, error, and session policy; see the
 [adapter decision record](POSTGRES_ADAPTER.md).
 
-The same runner exercises the embedded `/admin` shell and assets, temporary
-login/session lifecycle, physical-shard table discovery, and bounded row-page
-JSON contract without contacting third-party asset hosts. The all-target test
+The same runner exercises the embedded `/admin` shell and assets on the
+administration router, temporary login/session lifecycle, physical-shard table
+discovery, and bounded row-page JSON contract without contacting third-party
+asset hosts. The all-target test
 suite also uses the pinned runner's Node.js executable to syntax-check both
 embedded scripts and run the pure display/authentication-order logic tests.
 Node.js is a development-test dependency, not a BriskDB runtime or frontend
@@ -127,7 +129,7 @@ application-schema migration step; see the
 [manifest storage-format contract](STORAGE_FORMAT.md). After manifest load or
 upgrade, an active schema migration is resumed before ordinary layout
 reconciliation and final strict shard validation. All startup work finishes
-before either server listener accepts requests. Outside the explicit
+before any configured server listener accepts requests. Outside the explicit
 `Creating` state, every shard is opened read-write with SQLite create and
 symbolic-link following disabled. A missing, extra canonical, swapped,
 foreign, non-WAL, or

@@ -3,7 +3,7 @@
 This package runs BriskDB's sharded SQLite engine in the Python process. It
 starts no listener by default and never installs a signal handler or global
 logger. A database can optionally expose its exact engine through
-host-controlled HTTP and PostgreSQL listeners.
+host-controlled data HTTP, administration HTTP, and PostgreSQL listeners.
 
 Tagged releases publish compiler-free wheels for CPython 3.9–3.14 on supported
 macOS and Linux targets:
@@ -81,15 +81,20 @@ To serve that same open database to browser/HTTP and PostgreSQL clients:
 ```python
 with briskdb.open("./data") as db:
     with db.serve(postgres="127.0.0.1:0") as server:
-        print(server.http_address)      # actual address; port 0 is resolved
+        print(server.data_address)      # data API; port 0 is resolved
+        print(server.http_address)      # compatibility alias for data_address
+        print(server.admin_address)     # health, metrics, and browser
         print(server.postgres_address)
 ```
 
-HTTP and unauthenticated PostgreSQL are loopback-only. To expose PostgreSQL on
-another address, pass `postgres_tls_cert`, `postgres_tls_key`, `postgres_user`,
-and `postgres_password_file` to `serve()`; TLS plus SCRAM-SHA-256 are then
-required for every database session. The password is read from the file, never
-passed as a Python string.
+The data and administration HTTP listeners are separate and loopback-only.
+Administration defaults to another operating-system-selected loopback port;
+pass `admin=None` to disable `/health`, `/metrics`, `/v1/admin/*`, and the
+browser. Unauthenticated PostgreSQL is also loopback-only. To expose PostgreSQL
+on another address, pass `postgres_tls_cert`, `postgres_tls_key`,
+`postgres_user`, and `postgres_password_file` to `serve()`; TLS plus
+SCRAM-SHA-256 are then required for every database session. The password is
+read from the file, never passed as a Python string.
 Closing a server leaves the database usable; closing the database first closes
 all of its attached servers. The asyncio API provides `await db.serve()` and
 an `AsyncServer` context manager with the same lifecycle.

@@ -9,22 +9,18 @@ MySQL adapter explicit peers.
 binary (main)
     |
     v
-server ---------> protocol::http
-    |               |    |
-    |               |    v
-    |               +-> embedded admin browser
-    |                    |
-    |                    v
-    +-----------------> core
-    |                 /    \
-    |                v      v
-    |            storage    sql
+server
     |
-    +---------> protocol::postgres
-                    |
-                    v
-                  core
-        (startup/session active; SQL deferred)
+    +---------> protocol::http
+    |               |
+    |               +-> data router ------------------+
+    |               |                                 |
+    |               +-> administration router --------+-> core
+    |                       |                          |    / \
+    |                       +-> embedded admin browser |   v   v
+    |                                                  | storage sql
+    +---------> protocol::postgres --------------------+
+                    (startup/session active; SQL deferred)
 ```
 
 | Module | Responsibility | Must not own |
@@ -33,10 +29,10 @@ server ---------> protocol::http
 | `storage` | Versioned routing and authoritative logical/global-index manifest, persisted generated-ID policy/activation, stable active/retired allocation-owner slots, durable per-table hi/lo block leases, recoverable one-time table provisioning, shard layout, migration journals and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `import` | Offline source-schema preflight, explicit placement and generated-ID plan validation, exact-value row routing into private staging, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, generated-ID inference, implicit Global placement, or protocol-specific behavior |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
-| `protocol::http` | Versioned HTTP request extraction, legacy and lossless JSON/BriskDB value codecs, RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
+| `protocol::http` | Separate data/admin Axum routers, versioned HTTP request extraction, legacy and lossless JSON/BriskDB value codecs, RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | Listener binding, BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
 | `protocol::postgres` | BriskDB-owned bounded protocol-3.0 baseline and newer-minor downgrade, selected identity/status, per-connection core-session ownership, simple query execution, bounded parameterized text/binary extended lifecycle, fixed error recovery, and private compile/query-parser seam around exactly pinned `pgwire` | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
-| `server` | Process configuration, database assembly, loopback validation, separate HTTP/PostgreSQL listener binding, finite connection-task supervision, and shared graceful/forced draining | SQL parsing, PostgreSQL wire framing, or storage implementation details |
+| `server` | Process configuration, database assembly, loopback validation, separate data HTTP, administration HTTP, and PostgreSQL listener binding, finite connection-task supervision, and shared graceful/forced draining | HTTP route selection, SQL parsing, PostgreSQL wire framing, or storage implementation details |
 
 Implementation dependencies flow one way: adapters call the async `Engine` in
 `core`; the engine coordinates routing, `storage`, and `sql`. An adapter supplies
@@ -96,6 +92,9 @@ remains available as a Rust compatibility surface; existing engine and server
 function signatures remain in place and delegate to the controlled defaults.
 Issue #28 added `Config::postgres_listen: Option<SocketAddr>`, so pre-1.0 Rust
 callers constructing `Config` with a struct literal must now choose an enabled
+address or `None`. Issue #52 similarly adds
+`Config::admin_listen: Option<SocketAddr>` and
+`ListenerConfig::admin_listen`; callers choose a distinct administration
 address or `None`.
 
 ## Listener boundary
@@ -107,14 +106,23 @@ headers, and transport errors. Existing handlers still create core sessions and
 send typed statements through the shared engine; versioning and JSON conversion
 add no routing or SQLite implementation.
 
-The HTTP address remains `Config::listen`. The independent
-`Config::postgres_listen` is either a numeric socket address or disabled with
-`None`; the binary maps the exact `disabled` CLI/environment sentinel to that
-option. The process default disables PostgreSQL; callers may explicitly enable
-loopback `127.0.0.1:5433`, while non-loopback binds require the complete
-`Config::postgres_security` TLS/SCRAM value. See the
-[PostgreSQL listener contract](POSTGRES_LISTENER.md) for the full grammar and
-startup order.
+Issue #52 gives the production server two disjoint Axum routers. The data
+router owns `/v1` discovery, query, and execute on `Config::listen`, which keeps
+the `127.0.0.1:7654` process default. The administration router owns
+`/health`, `/metrics`, `/v1/health`, `/v1/admin/*`, and `/admin/*` on
+`Config::admin_listen`; the binary defaults it to `127.0.0.1:7655` and maps the
+exact `disabled` CLI/environment sentinel to `None`. Cross-plane paths are
+absent rather than forwarded. Both routers convert into the same `Engine`, and
+the established public `router`/`router_with_engine` constructors remain
+combined compatibility helpers for applications that own their serving
+boundary. See [the HTTP listener contract](HTTP_LISTENERS.md).
+
+The independent `Config::postgres_listen` is also either a numeric socket
+address or disabled with `None`. The process default disables PostgreSQL;
+callers may explicitly enable loopback `127.0.0.1:5433`, while non-loopback
+binds require the complete `Config::postgres_security` TLS/SCRAM value. See the
+[PostgreSQL listener contract](POSTGRES_LISTENER.md) for its grammar and the
+shared startup order.
 
 Issue #29 selects exact `pgwire` 0.36.3 with `server-api` and adds the
 BriskDB-owned `protocol::postgres::{Adapter, Connection}` seam. Issue #30
@@ -134,9 +142,10 @@ crosses into core or the public server contract. See the
 
 ## Admin browser boundary
 
-Issue #106 adds an embedded application under `/admin` on the existing HTTP
-listener. The public shell, stylesheet, and JavaScript are static bytes compiled
-into the binary. Same-origin JSON handlers validate the temporary `admin` /
+Issue #106 adds an embedded application under `/admin`; issue #52 places its
+complete same-origin surface on the administration listener. The public shell,
+stylesheet, and JavaScript are static bytes compiled into the binary. Same-origin
+JSON handlers validate the temporary `admin` /
 `admin` login, retain at most 128 opaque sessions in process memory for an
 absolute eight hours, and enforce the cookie on session, discovery, logical
 count, and row-page operations. Logout revokes a presented token when
@@ -1287,10 +1296,11 @@ this explicit asynchronous path. Prepared statement/portal close and terminal
 session close remain available as in-memory cleanup while draining; no
 prepared state is persisted for restart recovery.
 
-The server owns accepted HTTP/1 and PostgreSQL connections in separate tracked
-task sets under one accept lifecycle. It stops engine admission before dropping
-both listeners, signals both task sets, and starts connection/core draining
-together. Tasks that exceed the common grace deadline are aborted. HTTP task
+The server owns accepted data/admin HTTP/1 connections and PostgreSQL
+connections in tracked task sets under one accept lifecycle. It stops engine
+admission before dropping every configured listener, signals both task sets,
+and starts connection/core draining together. Tasks that exceed the common
+grace deadline are aborted. HTTP task
 joins are awaited, while the PostgreSQL supervisor gets one additional grace
 interval to join aborted tasks and attempt to close each selected core session.
 If that second interval expires, server return does not await the remaining
@@ -1298,7 +1308,7 @@ PostgreSQL session closes; they are scheduled on the runtime as best-effort
 cleanup.
 Partial startup sockets own a task but no session. Signal receivers are
 installed only after every configured listener binds and before readiness is
-logged. Dropping the server future closes both listeners, aborts both task
+logged. Dropping the server future closes all listener sockets, aborts both task
 sets, synchronously enters `Draining`, and schedules best-effort terminal
 PostgreSQL session cleanup; a surviving embedder-owned `Engine` clone can
 resume asynchronous cleanup with `shutdown()`.

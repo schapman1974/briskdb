@@ -859,6 +859,7 @@ impl Database {
     #[pyo3(signature = (
         *,
         http = "127.0.0.1:0",
+        admin = "127.0.0.1:0",
         postgres = None,
         postgres_tls_cert = None,
         postgres_tls_key = None,
@@ -871,6 +872,7 @@ impl Database {
         &self,
         py: Python<'_>,
         http: &str,
+        admin: Option<&str>,
         postgres: Option<&str>,
         postgres_tls_cert: Option<PathBuf>,
         postgres_tls_key: Option<PathBuf>,
@@ -878,10 +880,21 @@ impl Database {
         postgres_password_file: Option<PathBuf>,
     ) -> PyResult<Server> {
         let http_listen = parse_listener_address(http, "HTTP")?;
+        let admin_listen = admin
+            .map(|address| parse_listener_address(address, "admin HTTP"))
+            .transpose()?;
         let postgres_listen = postgres
             .map(|address| parse_listener_address(address, "PostgreSQL"))
             .transpose()?;
         validate_python_listener_address(http_listen, "HTTP")?;
+        if let Some(address) = admin_listen {
+            validate_python_listener_address(address, "admin HTTP")?;
+            if address.port() != 0 && address == http_listen {
+                return Err(crate::error::invalid_value(format!(
+                    "data and admin HTTP listeners require distinct addresses; both were configured as {address}"
+                )));
+            }
+        }
         let postgres_security = match (postgres_tls_cert, postgres_tls_key, postgres_password_file)
         {
             (None, None, None) => None,
@@ -911,6 +924,7 @@ impl Database {
                 .ok_or(NativeError::Closed("database"))?;
             let listener_config = ListenerConfig {
                 http_listen,
+                admin_listen,
                 postgres_listen,
             };
             let attached = match postgres_security {
@@ -1009,8 +1023,21 @@ struct Server {
 #[pymethods]
 impl Server {
     #[getter]
+    fn data_address(&self) -> String {
+        self.shared.addresses.data().to_string()
+    }
+
+    #[getter]
     fn http_address(&self) -> String {
         self.shared.addresses.http().to_string()
+    }
+
+    #[getter]
+    fn admin_address(&self) -> Option<String> {
+        self.shared
+            .addresses
+            .admin()
+            .map(|address| address.to_string())
     }
 
     #[getter]
@@ -1036,8 +1063,9 @@ impl Server {
 
     fn __repr__(&self) -> PyResult<String> {
         Ok(format!(
-            "Server(http_address={:?}, postgres_address={:?}, closed={})",
+            "Server(http_address={:?}, admin_address={:?}, postgres_address={:?}, closed={})",
             self.http_address(),
+            self.admin_address(),
             self.postgres_address(),
             self.closed()?
         ))

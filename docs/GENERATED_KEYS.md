@@ -103,9 +103,10 @@ exact repeat is idempotent. A different dialect, source byte, canonical
 physical SQL, or declaration conflicts with the retained request and fails
 closed. The physical application schema must also be empty: this operation must
 be the original creation path, not an adoption wrapper for a table previously
-created with the experimental `/v1/admin/broadcast` endpoint or another schema
-migration. That endpoint remains a physical SQLite migration API and does not
-invoke this source-dialect bridge.
+created with the experimental administration-listener
+`/v1/admin/broadcast` endpoint or another schema migration. That endpoint
+remains a physical SQLite migration API and does not invoke this source-dialect
+bridge.
 
 Offline SQLite import is a separate initialization path. It may explicitly opt
 an exact `INTEGER PRIMARY KEY AUTOINCREMENT` Sharded `Int64` table into
