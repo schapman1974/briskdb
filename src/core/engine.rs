@@ -6928,7 +6928,7 @@ mod tests {
         .unwrap();
 
         let report = engine
-            .shutdown_with_grace(Duration::from_millis(20))
+            .shutdown_with_grace(Duration::from_secs(1))
             .await
             .unwrap();
         assert!(report.forced());
