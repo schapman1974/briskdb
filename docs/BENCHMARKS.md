@@ -23,12 +23,15 @@ file's `PRAGMA quick_check` before accepting timing data.
 
 Every result is a tab-separated record with attempts, successes, constraint
 failures, returned rows, visited shards, throughput, p50/p95/p99 latency,
-process CPU, peak RSS, operating-system-reported physical write bytes, peak WAL
-growth, and SQLite durability mode. `physical_write_bytes` comes from
-`getrusage`; a platform/filesystem may report zero. The harness does not invent
-an fsync count when portable syscall accounting is unavailable. It records the
-production `WAL` plus `synchronous=FULL` policy explicitly, while WAL growth
-provides a portable storage-cost signal.
+process CPU, peak RSS, operating-system-reported process block-output bytes,
+peak WAL growth, and SQLite durability mode. The historical
+`physical_write_bytes` column is `getrusage(RUSAGE_SELF).ru_oublock * 512`; it
+is not an fsync or durable-device-write count. A platform/filesystem may report
+the counter as unavailable (including zero for workloads that do write), while
+Linux can charge transient or later-deleted SQLite WAL shared-memory pages.
+The harness preserves the raw counter instead of inventing an fsync count. It
+records the production `WAL` plus `synchronous=FULL` policy explicitly, while
+WAL growth provides a separate storage-cost signal.
 
 Run the parser/budget unit test and the same short correctness smoke used by CI:
 
@@ -69,6 +72,19 @@ It records the exact engine revision, host, compiler, controls, and all 64
 results. The local SQLite secondary index makes individual child lookups cheap,
 but `indexed_hit` and `indexed_miss` still visit 2/4/10/64 shards respectively;
 future gains therefore cannot be mistaken for cache-only improvements.
+
+The first Ubuntu 24.04 release-gate run made this platform distinction
+observable. Its indexed hit/miss path charged exactly 32 KiB per configured
+shard per attempt while reporting zero WAL growth. That is consistent with
+repeated SQLite `-shm` initialization as the freshness path opened and closed
+every source shard. The hosted release comparator now applies explicit finite
+alpha caps to that counter instead of a ratio whose baseline is zero: 64 KiB
+per source shard for indexed reads and 1 MiB per indexed mutation. Point and
+scatter reads keep their zero-baseline relative guard, and WAL retains its
+existing ratios. See the
+[global-index production gate](GLOBAL_INDEX_RELEASE_GATE.md) for the run
+evidence and release decision; [#293](https://github.com/schapman1974/briskdb/issues/293)
+tracks removal of the per-query shard connection churn.
 
 Issue #239 adds an `after` mode that builds a non-unique lookup index and a
 unique constraint index before running the identical matrix. It includes the
