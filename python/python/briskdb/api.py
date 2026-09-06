@@ -621,6 +621,7 @@ class AsyncDatabase:
         self,
         *,
         http: str = "127.0.0.1:0",
+        admin: Optional[str] = "127.0.0.1:0",
         postgres: Optional[str] = None,
         postgres_tls_cert: Optional[Union[str, PathLike[str]]] = None,
         postgres_tls_key: Optional[Union[str, PathLike[str]]] = None,
@@ -632,6 +633,7 @@ class AsyncDatabase:
         server = await asyncio.to_thread(
             self._database.serve,
             http=http,
+            admin=admin,
             postgres=postgres,
             postgres_tls_cert=postgres_tls_cert,
             postgres_tls_key=postgres_tls_key,
@@ -664,6 +666,14 @@ class AsyncServer:
     @property
     def http_address(self) -> str:
         return self._server.http_address
+
+    @property
+    def data_address(self) -> str:
+        return self._server.data_address
+
+    @property
+    def admin_address(self) -> Optional[str]:
+        return self._server.admin_address
 
     @property
     def postgres_address(self) -> Optional[str]:

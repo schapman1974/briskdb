@@ -799,6 +799,8 @@ fn service_and_embedded_process_share_one_ready_root() {
     let child = Command::new(env!("CARGO_BIN_EXE_briskdb"))
         .arg("--listen")
         .arg(address.to_string())
+        .arg("--admin-listen")
+        .arg("disabled")
         .arg("--postgres-listen")
         .arg("disabled")
         .arg("--data-dir")
@@ -815,17 +817,17 @@ fn service_and_embedded_process_share_one_ready_root() {
     loop {
         if let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(50)) {
             stream
-                .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .expect("write health request");
+                .write_all(b"GET /v1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .expect("write discovery request");
             let mut response = String::new();
             stream
                 .read_to_string(&mut response)
                 .expect("read health response");
-            if response.contains("200 OK") && response.contains("\"status\":\"ok\"") {
+            if response.contains("200 OK") && response.contains("\"api_version\":\"1\"") {
                 break;
             }
         }
-        assert!(Instant::now() < deadline, "service did not become healthy");
+        assert!(Instant::now() < deadline, "service did not become ready");
         assert!(
             service
                 .0

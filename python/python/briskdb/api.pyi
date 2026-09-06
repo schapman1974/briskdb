@@ -293,6 +293,7 @@ class AsyncDatabase:
         self,
         *,
         http: str = "127.0.0.1:0",
+        admin: Optional[str] = "127.0.0.1:0",
         postgres: Optional[str] = None,
         postgres_tls_cert: Optional[Union[str, PathLike[str]]] = None,
         postgres_tls_key: Optional[Union[str, PathLike[str]]] = None,
@@ -308,6 +309,10 @@ class AsyncServer:
     def native(self) -> Server: ...
     @property
     def http_address(self) -> str: ...
+    @property
+    def data_address(self) -> str: ...
+    @property
+    def admin_address(self) -> Optional[str]: ...
     @property
     def postgres_address(self) -> Optional[str]: ...
     @property

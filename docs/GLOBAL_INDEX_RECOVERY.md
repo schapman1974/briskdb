@@ -48,7 +48,8 @@ retryable `Busy` before lifecycle or physical state changes.
 
 ## Service status
 
-`GET /v1/admin/global-indexes` returns a machine-readable catalog snapshot:
+`GET /v1/admin/global-indexes` on the administration listener returns a
+machine-readable catalog snapshot:
 
 ```json
 {

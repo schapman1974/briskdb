@@ -1,5 +1,25 @@
 # Unreleased
 
+HTTP data and administration traffic now use separate routers and listener
+sockets over the same engine. `--listen` and `BRISKDB_LISTEN` remain the data
+plane at `127.0.0.1:7654`, serving `/v1` discovery, query, and execute. The new
+`--admin-listen` / `BRISKDB_ADMIN_LISTEN` defaults to
+`127.0.0.1:7655`, accepts the exact value `disabled`, and exclusively serves
+`/health`, `/metrics`, `/v1/health`, `/v1/admin/*`, and the `/admin` browser.
+Both unauthenticated HTTP planes remain loopback-only.
+
+Relative route paths and response representations are unchanged, but operator
+and browser clients must use the administration base address. Cross-plane paths
+return 404 rather than reaching the other router. Rust retains the established
+combined HTTP router helpers for host-owned integration, while daemon and
+attached-server assembly use the split routers. Python attached servers add an
+ephemeral-by-default `admin` listener and optional `admin_address`; passing
+`admin=None` disables it. All configured sockets bind before readiness and
+share the existing drain lifecycle. Pre-1.0 Rust callers that construct
+`server::Config` or `server::ListenerConfig` with a struct literal must add the
+new optional `admin_listen` field. This change adds no dependency or on-disk
+format change. See [the HTTP listener contract](docs/HTTP_LISTENERS.md).
+
 HTTP v1 now offers the opt-in `lossless-json-v1` value encoding while retaining
 `legacy-json-v1` as the byte-compatible default. Lossless query rows keep the
 existing ordered columns and positional arrays, tag every signed and unsigned

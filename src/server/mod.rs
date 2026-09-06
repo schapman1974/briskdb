@@ -33,6 +33,7 @@ const MAX_POSTGRES_CONNECTIONS: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub listen: SocketAddr,
+    pub admin_listen: Option<SocketAddr>,
     pub postgres_listen: Option<SocketAddr>,
     pub postgres_security: Option<postgres::SecurityConfig>,
     pub data_dir: PathBuf,
@@ -43,6 +44,7 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListenerConfig {
     pub http_listen: SocketAddr,
+    pub admin_listen: Option<SocketAddr>,
     pub postgres_listen: Option<SocketAddr>,
 }
 
@@ -50,12 +52,23 @@ pub struct ListenerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListenerAddresses {
     http: SocketAddr,
+    admin: Option<SocketAddr>,
     postgres: Option<SocketAddr>,
 }
 
 impl ListenerAddresses {
+    /// Data-plane HTTP address. This is the explicit name for [`Self::http`].
+    pub const fn data(self) -> SocketAddr {
+        self.http
+    }
+
+    /// Data-plane HTTP address retained under its original API name.
     pub const fn http(self) -> SocketAddr {
         self.http
+    }
+
+    pub const fn admin(self) -> Option<SocketAddr> {
+        self.admin
     }
 
     pub const fn postgres(self) -> Option<SocketAddr> {
@@ -66,6 +79,7 @@ impl ListenerAddresses {
 #[derive(Debug)]
 struct BoundListeners {
     http: tokio::net::TcpListener,
+    admin: Option<tokio::net::TcpListener>,
     postgres: Option<tokio::net::TcpListener>,
 }
 
@@ -74,6 +88,14 @@ impl BoundListeners {
         let http = tokio::net::TcpListener::bind(config.http_listen)
             .await
             .with_context(|| format!("failed to bind {}", config.http_listen))?;
+        let admin = match config.admin_listen {
+            Some(address) => Some(
+                tokio::net::TcpListener::bind(address)
+                    .await
+                    .with_context(|| format!("failed to bind admin HTTP listener {address}"))?,
+            ),
+            None => None,
+        };
         let postgres = match config.postgres_listen {
             Some(address) => Some(
                 tokio::net::TcpListener::bind(address)
@@ -82,7 +104,11 @@ impl BoundListeners {
             ),
             None => None,
         };
-        Ok(Self { http, postgres })
+        Ok(Self {
+            http,
+            admin,
+            postgres,
+        })
     }
 
     fn addresses(&self) -> anyhow::Result<ListenerAddresses> {
@@ -91,6 +117,12 @@ impl BoundListeners {
                 .http
                 .local_addr()
                 .context("failed to read the bound HTTP listener address")?,
+            admin: self
+                .admin
+                .as_ref()
+                .map(tokio::net::TcpListener::local_addr)
+                .transpose()
+                .context("failed to read the bound admin HTTP listener address")?,
             postgres: self
                 .postgres
                 .as_ref()
@@ -104,6 +136,7 @@ impl BoundListeners {
     fn http_only(http: tokio::net::TcpListener) -> Self {
         Self {
             http,
+            admin: None,
             postgres: None,
         }
     }
@@ -123,6 +156,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> anyhow::Result<()> {
     let listener_config = ListenerConfig {
         http_listen: config.listen,
+        admin_listen: config.admin_listen,
         postgres_listen: config.postgres_listen,
     };
     validate_listener_addresses(&listener_config, config.postgres_security.is_some())?;
@@ -172,6 +206,7 @@ pub async fn run_with_engine_options(config: Config, options: EngineOptions) -> 
 
     info!(
         listen = %config.listen,
+        admin_listen = ?config.admin_listen,
         postgres_listen = ?config.postgres_listen,
         postgres_secure = postgres_security.is_some(),
         data_dir = %config.data_dir.display(),
@@ -217,6 +252,22 @@ fn validate_listener_addresses(
         anyhow::bail!(
             "unauthenticated HTTP startup requires a loopback listen address; received {}",
             config.http_listen
+        );
+    }
+    if let Some(address) = config
+        .admin_listen
+        .filter(|address| !address.ip().is_loopback())
+    {
+        anyhow::bail!(
+            "unauthenticated admin HTTP startup requires a loopback listen address; received {address}"
+        );
+    }
+    if let Some(admin) = config
+        .admin_listen
+        .filter(|admin| admin.port() != 0 && *admin == config.http_listen)
+    {
+        anyhow::bail!(
+            "data and admin HTTP listeners require distinct addresses; both were configured as {admin}"
         );
     }
     if postgres_secure && config.postgres_listen.is_none() {
@@ -412,7 +463,11 @@ where
 {
     let mut shutdown_guard =
         (engine_shutdown == EngineShutdown::Owned).then(|| ShutdownOnDrop::new(engine.clone()));
-    let router = http::router_with_engine(engine.clone());
+    let data_router = http::data_router_with_engine(engine.clone());
+    let admin_router = listeners
+        .admin
+        .as_ref()
+        .map(|_| http::admin_router_with_engine(engine.clone()));
     let postgres_adapter = listeners.postgres.as_ref().map(|_| {
         postgres_security.map_or_else(
             || postgres::Adapter::new(engine.clone()),
@@ -441,7 +496,7 @@ where
                 match accepted_connection {
                     ListenerAccept::Http(Ok((stream, peer))) => {
                         let accepted = accepted.clone();
-                        let service = TowerToHyperService::new(router.clone().map_request(
+                        let service = TowerToHyperService::new(data_router.clone().map_request(
                             move |request: Request<Incoming>| {
                                 if let Some(accepted) = &accepted {
                                     accepted.notify_one();
@@ -457,6 +512,30 @@ where
                     ListenerAccept::Http(Err(error)) => {
                         server_error = Some(
                             anyhow::Error::from(error).context("HTTP listener accept failed")
+                        );
+                        break;
+                    }
+                    ListenerAccept::Admin(Ok((stream, peer))) => {
+                        let accepted = accepted.clone();
+                        let router = admin_router
+                            .as_ref()
+                            .expect("an accepted admin socket has a router");
+                        let service = TowerToHyperService::new(router.clone().map_request(
+                            move |request: Request<Incoming>| {
+                                if let Some(accepted) = &accepted {
+                                    accepted.notify_one();
+                                }
+                                request.map(Body::new)
+                            },
+                        ));
+                        let graceful_rx = graceful_tx.subscribe();
+                        http_connections.spawn(async move {
+                            serve_http_connection(stream, peer, service, graceful_rx).await;
+                        });
+                    }
+                    ListenerAccept::Admin(Err(error)) => {
+                        server_error = Some(
+                            anyhow::Error::from(error).context("admin HTTP listener accept failed")
                         );
                         break;
                     }
@@ -525,12 +604,14 @@ where
 
 enum ListenerAccept {
     Http(std::io::Result<(tokio::net::TcpStream, SocketAddr)>),
+    Admin(std::io::Result<(tokio::net::TcpStream, SocketAddr)>),
     Postgres(std::io::Result<(tokio::net::TcpStream, SocketAddr)>),
 }
 
 async fn accept_next_connection(listeners: &BoundListeners) -> ListenerAccept {
     tokio::select! {
         accepted = listeners.http.accept() => ListenerAccept::Http(accepted),
+        accepted = accept_optional(&listeners.admin) => ListenerAccept::Admin(accepted),
         accepted = accept_optional(&listeners.postgres) => ListenerAccept::Postgres(accepted),
     }
 }
@@ -982,12 +1063,11 @@ mod tests {
         assert_peer_closes(stream).await;
     }
 
-    async fn read_http_health(address: SocketAddr) -> Vec<u8> {
+    async fn read_http_path(address: SocketAddr, path: &str) -> Vec<u8> {
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        stream
-            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
         timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
             .await
@@ -1011,6 +1091,7 @@ mod tests {
         let (_occupied_listener, listen) = unavailable_address();
         let error = run(Config {
             listen,
+            admin_listen: None,
             postgres_listen: None,
             postgres_security: None,
             data_dir: data_dir.clone(),
@@ -1029,6 +1110,7 @@ mod tests {
         let data_dir = temp.path().join("database");
         let error = run(Config {
             listen: "127.0.0.1:0".parse().unwrap(),
+            admin_listen: None,
             postgres_listen: Some("0.0.0.0:0".parse().unwrap()),
             postgres_security: None,
             data_dir: data_dir.clone(),
@@ -1050,6 +1132,7 @@ mod tests {
         let data_dir = temp.path().join("database");
         let error = run(Config {
             listen: "0.0.0.0:0".parse().unwrap(),
+            admin_listen: None,
             postgres_listen: Some("127.0.0.1:0".parse().unwrap()),
             postgres_security: None,
             data_dir: data_dir.clone(),
@@ -1065,13 +1148,63 @@ mod tests {
         assert!(!data_dir.exists());
     }
 
+    #[tokio::test]
+    async fn non_loopback_admin_activation_fails_before_database_or_listener_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("database");
+        let error = run(Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            admin_listen: Some("0.0.0.0:0".parse().unwrap()),
+            postgres_listen: None,
+            postgres_security: None,
+            data_dir: data_dir.clone(),
+            shards: 2,
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unauthenticated admin HTTP startup requires a loopback listen address; received 0.0.0.0:0"
+        );
+        assert!(!data_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn duplicate_fixed_http_addresses_fail_before_database_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("database");
+        let address = "127.0.0.1:7654".parse().unwrap();
+        let error = run(Config {
+            listen: address,
+            admin_listen: Some(address),
+            postgres_listen: None,
+            postgres_security: None,
+            data_dir: data_dir.clone(),
+            shards: 2,
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "data and admin HTTP listeners require distinct addresses; both were configured as 127.0.0.1:7654"
+        );
+        assert!(!data_dir.exists());
+    }
+
     #[test]
     fn listener_validation_accepts_ipv4_and_ipv6_loopback_addresses() {
-        for listen in ["127.0.0.1:7654", "[::1]:7654"] {
+        for (listen, admin_listen) in [
+            ("127.0.0.1:7654", Some("127.0.0.1:7655")),
+            ("[::1]:7654", Some("[::1]:7655")),
+            ("127.0.0.1:7654", None),
+        ] {
             for postgres_listen in [None, Some("127.0.0.1:5433"), Some("[::1]:5433")] {
                 validate_listener_addresses(
                     &ListenerConfig {
                         http_listen: listen.parse().unwrap(),
+                        admin_listen: admin_listen.map(|address| address.parse().unwrap()),
                         postgres_listen: postgres_listen.map(|address| address.parse().unwrap()),
                     },
                     false,
@@ -1085,6 +1218,7 @@ mod tests {
     fn listener_validation_requires_security_only_for_remote_postgres() {
         let remote = ListenerConfig {
             http_listen: "127.0.0.1:7654".parse().unwrap(),
+            admin_listen: None,
             postgres_listen: Some("0.0.0.0:5433".parse().unwrap()),
         };
         assert!(validate_listener_addresses(&remote, false).is_err());
@@ -1092,6 +1226,7 @@ mod tests {
 
         let disabled = ListenerConfig {
             http_listen: "127.0.0.1:7654".parse().unwrap(),
+            admin_listen: None,
             postgres_listen: None,
         };
         let error = validate_listener_addresses(&disabled, true).unwrap_err();
@@ -1110,6 +1245,7 @@ mod tests {
         let error = run_with_engine_options(
             Config {
                 listen,
+                admin_listen: None,
                 postgres_listen: None,
                 postgres_security: None,
                 data_dir: data_dir.clone(),
@@ -1129,24 +1265,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_listeners_bind_enabled_and_disabled_postgres_modes() {
+    async fn configured_listeners_bind_enabled_and_disabled_admin_and_postgres_modes() {
         let enabled = BoundListeners::bind(&ListenerConfig {
             http_listen: "127.0.0.1:0".parse().unwrap(),
+            admin_listen: Some("127.0.0.1:0".parse().unwrap()),
             postgres_listen: Some("127.0.0.1:0".parse().unwrap()),
         })
         .await
         .unwrap();
         let http_address = enabled.http.local_addr().unwrap();
+        let admin_address = enabled.admin.as_ref().unwrap().local_addr().unwrap();
         let postgres_address = enabled.postgres.as_ref().unwrap().local_addr().unwrap();
+        assert_ne!(http_address, admin_address);
         assert_ne!(http_address, postgres_address);
+        assert_ne!(admin_address, postgres_address);
         drop(enabled);
 
         let disabled = BoundListeners::bind(&ListenerConfig {
             http_listen: "127.0.0.1:0".parse().unwrap(),
+            admin_listen: None,
             postgres_listen: None,
         })
         .await
         .unwrap();
+        assert!(disabled.admin.is_none());
         assert!(disabled.postgres.is_none());
     }
 
@@ -1162,6 +1304,7 @@ mod tests {
             &database,
             ListenerConfig {
                 http_listen: "127.0.0.1:0".parse().unwrap(),
+                admin_listen: Some("127.0.0.1:0".parse().unwrap()),
                 postgres_listen: Some("127.0.0.1:0".parse().unwrap()),
             },
         )
@@ -1169,10 +1312,14 @@ mod tests {
         .unwrap();
         let addresses = server.addresses();
         assert_ne!(addresses.http().port(), 0);
+        assert_eq!(addresses.data(), addresses.http());
+        let admin_address = addresses.admin().unwrap();
+        assert_ne!(admin_address.port(), 0);
+        assert_ne!(admin_address, addresses.http());
         let postgres_address = addresses.postgres().unwrap();
         assert_ne!(postgres_address.port(), 0);
         assert!(
-            read_http_health(addresses.http())
+            read_http_path(admin_address, "/health")
                 .await
                 .starts_with(b"HTTP/1.1 200 OK\r\n")
         );
@@ -1196,6 +1343,7 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(tokio::net::TcpStream::connect(admin_address).await.is_err());
 
         let session = database.owned_session();
         session.set_routing_key("still-running").await.unwrap();
@@ -1215,13 +1363,14 @@ mod tests {
             &database,
             ListenerConfig {
                 http_listen: "127.0.0.1:0".parse().unwrap(),
+                admin_listen: None,
                 postgres_listen: None,
             },
         )
         .await
         .unwrap();
         assert!(
-            read_http_health(restarted.addresses().http())
+            read_http_path(restarted.addresses().http(), "/v1")
                 .await
                 .starts_with(b"HTTP/1.1 200 OK\r\n")
         );
@@ -1241,6 +1390,7 @@ mod tests {
             &database,
             ListenerConfig {
                 http_listen: "0.0.0.0:0".parse().unwrap(),
+                admin_listen: None,
                 postgres_listen: None,
             },
         )
@@ -1253,6 +1403,7 @@ mod tests {
             &database,
             ListenerConfig {
                 http_listen: unavailable,
+                admin_listen: None,
                 postgres_listen: None,
             },
         )
@@ -1332,6 +1483,7 @@ mod tests {
 
         let error = run(Config {
             listen: http_address,
+            admin_listen: None,
             postgres_listen: Some(postgres_address),
             postgres_security: None,
             data_dir: temp.path().to_path_buf(),
@@ -1352,9 +1504,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (http_reservation, http_address) = unavailable_address();
         drop(http_reservation);
+        let (admin_reservation, admin_address) = unavailable_address();
+        drop(admin_reservation);
         let (postgres_reservation, postgres_address) = unavailable_address();
         let config = Config {
             listen: http_address,
+            admin_listen: Some(admin_address),
             postgres_listen: Some(postgres_address),
             postgres_security: None,
             data_dir: temp.path().to_path_buf(),
@@ -1370,12 +1525,16 @@ mod tests {
         let rebound = std::net::TcpListener::bind(http_address)
             .expect("the partially started HTTP listener should be released");
         drop(rebound);
+        let rebound = std::net::TcpListener::bind(admin_address)
+            .expect("the partially started admin HTTP listener should be released");
+        drop(rebound);
         let reopened = Engine::open(temp.path(), 2)
             .await
             .expect("the startup engine should complete cleanup after the bind failure");
         drop(postgres_reservation);
         let rebound = BoundListeners::bind(&ListenerConfig {
             http_listen: config.listen,
+            admin_listen: config.admin_listen,
             postgres_listen: config.postgres_listen,
         })
         .await
@@ -1385,7 +1544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_signal_stops_both_listeners_and_fully_stops_the_engine() {
+    async fn injected_signal_stops_all_listeners_and_fully_stops_the_engine() {
         let temp = tempfile::tempdir().unwrap();
         let options = EngineOptions::default()
             .with_shutdown_grace(Duration::from_millis(50))
@@ -1396,6 +1555,8 @@ mod tests {
         let observer = engine.clone();
         let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_address = http.local_addr().unwrap();
+        let admin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_address = admin.local_addr().unwrap();
         let postgres = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let postgres_address = postgres.local_addr().unwrap();
         let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
@@ -1410,6 +1571,7 @@ mod tests {
             serve_listeners_with_shutdown(
                 BoundListeners {
                     http,
+                    admin: Some(admin),
                     postgres: Some(postgres),
                 },
                 engine,
@@ -1431,6 +1593,7 @@ mod tests {
 
         assert_eq!(observer.state(), crate::core::EngineState::Stopped);
         assert!(tokio::net::TcpStream::connect(http_address).await.is_err());
+        assert!(tokio::net::TcpStream::connect(admin_address).await.is_err());
         assert!(
             tokio::net::TcpStream::connect(postgres_address)
                 .await
@@ -1456,6 +1619,7 @@ mod tests {
         let server = tokio::spawn(serve_listeners_with_shutdown(
             BoundListeners {
                 http,
+                admin: None,
                 postgres: Some(postgres),
             },
             engine,
@@ -1474,7 +1638,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let response = read_http_health(http_address).await;
+        let response = read_http_path(http_address, "/v1").await;
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         for client in clients {
             client.await.unwrap();
@@ -1486,7 +1650,7 @@ mod tests {
             terminate_postgres_session(&mut stream).await;
         }
         assert!(
-            read_http_health(http_address)
+            read_http_path(http_address, "/v1")
                 .await
                 .starts_with(b"HTTP/1.1 200 OK\r\n")
         );
@@ -1517,6 +1681,7 @@ mod tests {
         let server = tokio::spawn(serve_listeners_with_shutdown(
             BoundListeners {
                 http,
+                admin: None,
                 postgres: Some(postgres),
             },
             engine,
@@ -1551,7 +1716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_ready_shutdown_signal_closes_both_listeners_without_lost_wakeup() {
+    async fn already_ready_shutdown_signal_closes_all_listeners_without_lost_wakeup() {
         let temp = tempfile::tempdir().unwrap();
         let options = EngineOptions::default()
             .with_shutdown_grace(Duration::from_millis(50))
@@ -1562,6 +1727,8 @@ mod tests {
         let observer = engine.clone();
         let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_address = http.local_addr().unwrap();
+        let admin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_address = admin.local_addr().unwrap();
         let postgres = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let postgres_address = postgres.local_addr().unwrap();
 
@@ -1570,6 +1737,7 @@ mod tests {
             serve_listeners_with_shutdown(
                 BoundListeners {
                     http,
+                    admin: Some(admin),
                     postgres: Some(postgres),
                 },
                 engine,
@@ -1582,6 +1750,7 @@ mod tests {
         .unwrap();
         assert_eq!(observer.state(), crate::core::EngineState::Stopped);
         assert!(tokio::net::TcpStream::connect(http_address).await.is_err());
+        assert!(tokio::net::TcpStream::connect(admin_address).await.is_err());
         assert!(
             tokio::net::TcpStream::connect(postgres_address)
                 .await
@@ -1658,6 +1827,7 @@ mod tests {
         let server = tokio::spawn(serve_listeners_with_shutdown_observed(
             BoundListeners {
                 http: listener,
+                admin: None,
                 postgres: Some(postgres),
             },
             engine,

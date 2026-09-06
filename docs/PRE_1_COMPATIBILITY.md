@@ -26,7 +26,8 @@ contract](STORAGE_FORMAT.md). Each release that changes the format must:
   migrated layouts; and
 - update the documented current version and its executable consistency test.
 
-A supported forward migration runs during startup before either listener binds.
+A supported forward migration runs during startup before any configured
+listener binds.
 It may update `manifest.sqlite`, shard metadata, schema generations, or other
 files in the data directory. Treat startup of a newer binary as a storage
 mutation even when application rows do not change.

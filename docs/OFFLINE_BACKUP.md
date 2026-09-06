@@ -54,8 +54,9 @@ stopped directory as one recovery point.
 3. Start the same BriskDB release with the recorded shard count and the restored
    directory. Startup must reach `Ready` without a migration, integrity, shard
    identity, WAL-mode, or schema-generation error.
-4. Check `/health`, inspect the expected logical catalog, and read known rows
-   from representative shard keys before returning the service to use.
+4. Check `/health` on the administration listener, inspect the expected logical
+   catalog, and read known rows through the data listener from representative
+   shard keys before returning the service to use.
 5. Keep the prior directory and backup unchanged until validation succeeds.
    If validation fails, stop the process and investigate; do not edit manifest
    state, SQLite headers, or checksums to force startup.

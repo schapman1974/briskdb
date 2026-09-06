@@ -13,7 +13,8 @@ state_directory=/var/lib/briskdb
 wait_for_service() {
     for attempt in {1..30}; do
         if sudo systemctl is-active --quiet briskdb.service \
-            && curl --fail --silent --show-error http://127.0.0.1:7654/admin >/dev/null; then
+            && curl --fail --silent --show-error http://127.0.0.1:7654/v1 >/dev/null \
+            && curl --fail --silent --show-error http://127.0.0.1:7655/admin >/dev/null; then
             return 0
         fi
         sleep 1

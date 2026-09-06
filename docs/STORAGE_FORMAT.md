@@ -2134,6 +2134,12 @@ binding, a later bind failure does not undo a migration or recovery transaction
 that already committed; a subsequent startup revalidates the same version-14
 layout normally.
 
+Issue #52's separate data/admin HTTP routers and optional administration socket
+have the same process-only status. Route ownership, socket addresses, and the
+enabled/disabled admin choice are not stored in the manifest or shards. Both
+planes share one engine and introduce no format version, migration, checksum,
+catalog metadata, or recovery rule.
+
 Issue #29's pinned `pgwire` dependency and issue #30's production startup,
 `protocol::postgres::Adapter`, selected identity, and per-connection core
 `Session` are also process-only code and memory state. They add no manifest or

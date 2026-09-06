@@ -65,13 +65,17 @@ Listeners can be started explicitly without reopening storage:
 
 ```python
 async with await database.serve(postgres="127.0.0.1:0") as server:
-    print(server.http_address, server.postgres_address)
+    print(server.data_address, server.admin_address, server.postgres_address)
 ```
 
 `AsyncServer.close()` drains its listeners but leaves the database running.
-Closing the database closes every attached server first. Remote PostgreSQL
-uses the same TLS certificate/key/user/password-file keyword arguments as the
-synchronous `Database.serve()` method.
+`data_address` is the data plane and `http_address` remains its compatibility
+alias; `admin_address` is the optional administration plane. The admin listener
+defaults to an operating-system-selected loopback
+port, and `admin=None` disables it. Closing the database closes every attached
+server first. Remote PostgreSQL uses the same TLS
+certificate/key/user/password-file keyword arguments as the synchronous
+`Database.serve()` method.
 
 Native document methods have the same sync/async pairing. Enable the document
 engine on open and install PyMongo for its `bson` value classes:

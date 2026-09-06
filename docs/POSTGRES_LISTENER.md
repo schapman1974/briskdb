@@ -31,8 +31,9 @@ rejected during command-line parsing. Port zero retains the standard
 IPv4 or IPv6 loopback addresses may use the compatibility mode without
 credentials. A non-loopback address is rejected unless the complete TLS/SCRAM
 group is configured. Security with a disabled listener is also rejected.
-These rules are applied before opening the data directory or binding either
-listener. HTTP remains independently configured and loopback-only.
+These rules are applied before opening the data directory or binding any
+listener. The HTTP data and administration planes remain independently
+configured and loopback-only; see [HTTP_LISTENERS.md](HTTP_LISTENERS.md).
 
 `server::Config::postgres_listen` is `Option<SocketAddr>`:
 
@@ -51,16 +52,17 @@ Startup has one deterministic order:
 2. listener/security combinations are validated;
 3. certificate, private key, and password file are read and validated;
 4. the engine opens the data directory and completes startup recovery;
-5. the HTTP listener binds;
-6. the PostgreSQL listener binds when configured;
-7. process signal receivers are installed; and
-8. readiness is logged and the shared accept loop starts.
+5. the HTTP data listener binds;
+6. the HTTP administration listener binds when configured;
+7. the PostgreSQL listener binds when configured;
+8. process signal receivers are installed; and
+9. readiness is logged and the shared accept loop starts.
 
-The server never logs readiness after only one configured listener has bound.
-An HTTP bind failure precedes a PostgreSQL bind attempt. If the PostgreSQL bind
-or signal setup fails, the HTTP listener is released and engine shutdown is
-awaited before the original error is returned. Disabled mode cannot cause a
-PostgreSQL bind failure.
+The server never logs readiness until every configured listener has bound. A
+data HTTP bind failure precedes administration and PostgreSQL bind attempts; an
+administration bind failure precedes PostgreSQL. If a later bind or signal setup
+fails, earlier sockets are released and engine shutdown is awaited before the
+original error is returned. Disabled modes cannot cause a bind failure.
 
 Engine open still precedes network binding, so a recorded storage recovery can
 finish before a later bind failure. That completed recovery is durable; after
@@ -297,19 +299,19 @@ session and tracks it for closure on every terminal path:
 
 - `Terminate` closes promptly without waiting for client EOF;
 - client EOF or a wire failure closes the session;
-- ordinary server shutdown signals both HTTP and PostgreSQL tasks, then drains
-  them concurrently with core shutdown;
+- ordinary server shutdown signals both HTTP planes and PostgreSQL tasks, then
+  drains them concurrently with core shutdown;
 - tasks that exceed the configured shutdown grace are aborted, then get one
   additional grace interval for their joins and retained-session closes;
 - if that second interval expires, server return does not await the remaining
   PostgreSQL session closes and schedules them as best-effort runtime cleanup;
   and
-- dropping the outer server future closes both listener sockets, aborts owned
+- dropping the outer server future closes every listener socket, aborts owned
   connection tasks, begins the resumable engine drain, and schedules
   best-effort terminal session cleanup.
 
 Partial startup sockets are tracked and close during shutdown even though they
-have not created a core session. An accept failure on either listener ends the
+have not created a core session. An accept failure on any listener ends the
 shared server and enters the same cleanup path.
 
 ## Compatibility and storage boundary
@@ -344,7 +346,7 @@ Automated coverage includes:
 - rejection of insecure non-loopback activation before database/listener creation;
 - TLS certificate/key/password validation, fixed plaintext rejection, successful
   SCRAM queries, wrong-password SQLSTATE, concurrent authentication, and recovery;
-- dual-listener binding, bind-failure cleanup, and clean retry;
+- data/admin/PostgreSQL listener binding, partial-bind cleanup, and clean retry;
 - exact `SSLRequest`/`GSSENCRequest` refusal and boundary handling, startup frame
   order, selected identity, omitted-database behavior, and useful BriskDB server
   identification;

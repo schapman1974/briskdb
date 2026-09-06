@@ -1,8 +1,12 @@
 # BriskDB systemd service configuration.
 # After editing, run: sudo systemctl restart briskdb
 
-# The alpha HTTP endpoint has no authentication or TLS and must remain loopback.
+# The alpha HTTP data listener has no authentication or TLS and must remain loopback.
 BRISKDB_LISTEN=127.0.0.1:7654
+
+# Operational routes and the temporary-auth browser use a separate loopback
+# listener. Set the exact value disabled to turn the administration plane off.
+BRISKDB_ADMIN_LISTEN=127.0.0.1:7655
 
 # PostgreSQL may run unauthenticated only on loopback. To bind remotely, set
 # all three commented file paths below; the key/password may be mode 0640 with

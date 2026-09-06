@@ -33,17 +33,19 @@ use crate::{
 ///
 /// New callers should construct one shared [`Engine`] and use
 /// [`router_with_engine`]. This wrapper preserves the pre-engine Rust API while
-/// still sending every request through the shared asynchronous engine.
+/// still sending every request through the shared asynchronous engine. It also
+/// preserves the original combined data/admin router; network servers should
+/// use [`data_router_with_engine`] and [`admin_router_with_engine`] instead.
 pub fn router(database: Arc<Database>) -> Router {
     router_with_engine(Engine::from_database(database))
 }
 
-/// Build an HTTP router backed by the protocol-neutral asynchronous engine.
+/// Build the original combined data/admin HTTP router.
+///
+/// This compatibility constructor is useful to in-process Tower hosts. The
+/// BriskDB server binds the two planes separately.
 pub fn router_with_engine(engine: Engine) -> Router {
-    let state = HttpState {
-        engine,
-        admin_sessions: admin::SessionStore::new(),
-    };
+    let state = HttpState::new(engine);
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -52,10 +54,52 @@ pub fn router_with_engine(engine: Engine) -> Router {
         .with_state(state)
 }
 
+/// Build the data-plane router from the legacy synchronous database handle.
+pub fn data_router(database: Arc<Database>) -> Router {
+    data_router_with_engine(Engine::from_database(database))
+}
+
+/// Build the data-plane router backed by the protocol-neutral engine.
+///
+/// This plane contains only HTTP v1 discovery and SQL query/execute routes.
+pub fn data_router_with_engine(engine: Engine) -> Router {
+    Router::new()
+        .merge(v1::data_routes())
+        .with_state(HttpState::new(engine))
+}
+
+/// Build the admin-plane router from the legacy synchronous database handle.
+pub fn admin_router(database: Arc<Database>) -> Router {
+    admin_router_with_engine(Engine::from_database(database))
+}
+
+/// Build the admin-plane router backed by the protocol-neutral engine.
+///
+/// This plane contains operational health and metrics, the versioned
+/// administration routes, and the embedded browser.
+pub fn admin_router_with_engine(engine: Engine) -> Router {
+    let state = HttpState::new(engine);
+    Router::new()
+        .route("/health", get(health))
+        .route("/metrics", get(metrics))
+        .merge(v1::admin_routes())
+        .merge(admin::routes(state.clone()))
+        .with_state(state)
+}
+
 #[derive(Clone)]
 struct HttpState {
     engine: Engine,
     admin_sessions: admin::SessionStore,
+}
+
+impl HttpState {
+    fn new(engine: Engine) -> Self {
+        Self {
+            engine,
+            admin_sessions: admin::SessionStore::new(),
+        }
+    }
 }
 
 async fn health(State(state): State<HttpState>) -> Result<Json<JsonValue>, ApiError> {
@@ -2446,6 +2490,10 @@ mod tests {
     fn legacy_api_module_reexports_the_router() {
         let _legacy_router: fn(Arc<Database>) -> Router = crate::api::router;
         let _engine_router: fn(Engine) -> Router = crate::api::router_with_engine;
+        let _data_router: fn(Arc<Database>) -> Router = crate::api::data_router;
+        let _data_engine_router: fn(Engine) -> Router = crate::api::data_router_with_engine;
+        let _admin_router: fn(Arc<Database>) -> Router = crate::api::admin_router;
+        let _admin_engine_router: fn(Engine) -> Router = crate::api::admin_router_with_engine;
     }
 
     #[test]
@@ -2458,8 +2506,8 @@ mod tests {
 
         assert_eq!(
             production_source.matches("Database").count(),
-            2,
-            "Database may appear only in the compatibility import and router signature"
+            4,
+            "Database may appear only in the compatibility import and three router signatures"
         );
 
         for forbidden in [

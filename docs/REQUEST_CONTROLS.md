@@ -141,7 +141,8 @@ their cleanup. The caller receives only the error, never rows from the shards
 that happened to finish first. Successful results are concatenated in ascending
 physical-shard order and keep duplicate rows.
 
-The `/admin` browser independently caps a requested page at 200 returned rows
+The `/admin` browser on the administration listener independently caps a
+requested page at 200 returned rows
 and validates offsets no greater than 1,000,000. It may inspect one additional
 row to decide whether another page exists; that row is not serialized. The
 physical inspections and their merged logical page use the engine's configured
@@ -264,9 +265,10 @@ persisted or recovered after process shutdown.
 
 The server constructs its SIGINT/SIGTERM receivers after every configured
 listener binds and before logging readiness on supported Unix hosts. It
-transitions the engine to `Draining` before dropping both the HTTP listener and
-the optional PostgreSQL listener and signaling every tracked HTTP/PostgreSQL
-connection. Connection draining and core shutdown start together. A connection
+transitions the engine to `Draining` before dropping the data HTTP listener,
+the optional administration HTTP listener, and the optional PostgreSQL listener,
+then signals every tracked HTTP/PostgreSQL connection. Connection draining and
+core shutdown start together. A connection
 still active at the grace deadline is aborted. HTTP task joins are awaited;
 PostgreSQL task joins and retained-session closes get one additional grace
 interval. If that second interval expires, server return does not await the
@@ -278,3 +280,9 @@ grace. A forced cancellation cannot erase committed
 schema-migration progress: the current shard transaction rolls back if still
 running, the retained prefix remains resumable, and the next startup finishes
 it before serving ordinary work.
+
+Data and administration HTTP connections use the same engine admission,
+deadline, result, and drain controls. Listener separation changes which router
+can admit a path; it does not add an independent pool, worker budget, deadline,
+shutdown grace, or engine lifecycle. See
+[HTTP data and administration listeners](HTTP_LISTENERS.md).

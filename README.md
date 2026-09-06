@@ -46,8 +46,9 @@ shard-safe IDs, cross-shard indexes, protocols, and operational guardrails.
   an optimization cannot silently hide a row.
 - **One engine everywhere.** PostgreSQL, HTTP, Rust, and Python share routing,
   limits, cancellation, errors, and storage behavior.
-- **Operations are visible.** `/health`, `/metrics`, admin JSON, and Rust status
-  reports expose lag, repairs, rebuilds, contention, and outbox pressure.
+- **Operations are visible.** The separate loopback administration listener
+  serves `/health`, `/metrics`, admin JSON, and the browser without exposing
+  those handlers on the data listener.
 
 ## One engine, many ways in
 
@@ -84,20 +85,21 @@ leaving room for more protocols and storage adapters later.
 
 ![BriskDB data browser showing one logical table across four SQLite shards](docs/assets/admin-browser.svg)
 
-BriskDB serves a responsive, read-only data browser at `/admin`. It uses the
-same bounded HTTP engine paths as other clients, combines sharded rows into one
-logical view, reads global tables once, and preserves large integer values.
+BriskDB serves a responsive, read-only data browser at `/admin` on its separate
+administration listener. It uses the same bounded engine paths as other
+clients, combines sharded rows into one logical view, reads global tables once,
+and preserves large integer values.
 
 For the current local alpha:
 
 ```text
-http://127.0.0.1:7654/admin
+http://127.0.0.1:7655/admin
 username: admin
 password: admin
 ```
 
 The temporary credentials are a development convenience—not a security
-boundary—which is why the server currently refuses non-loopback HTTP addresses.
+boundary—which is why both HTTP listeners currently require loopback addresses.
 
 ## The unusual part: shard-safe generated IDs
 
@@ -120,12 +122,12 @@ experimental and opt-in; the exact contract lives in
 | --- | --- |
 | Durable virtual-bucket routing over independent SQLite WAL files | Working |
 | Exact-key routing and bounded scatter/gather reads | Working |
-| HTTP query/write API and admin data browser | Working, loopback-only |
+| HTTP query/write API and admin data browser | Working on separate data/admin listeners, loopback-only |
 | PostgreSQL wire protocol | TLS/SCRAM, backpressured row streaming, SQLite-interrupt cancellation, text/binary CRUD, real single-shard transactions, and a live psql/tokio-postgres/psycopg/SQLAlchemy matrix |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
 | Cross-shard indexes and global value leases | Experimental/opt-in: correctness, recovery, and shard pruning pass; current latency/write overhead is documented in the release gate |
-| Global-index health and Prometheus metrics | `/health`, `/v1/admin/global-indexes`, `/metrics`, plus Rust operational reports |
+| Global-index health and Prometheus metrics | Admin listener `/health`, `/v1/admin/global-indexes`, `/metrics`, plus Rust operational reports |
 | Ubuntu/macOS x86-64 and ARM64 release artifacts | Published |
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working; the opt-in `documents` feature adds a thin native document-command facade |
@@ -178,11 +180,12 @@ then:
 ./briskdb --data-dir ./briskdb-data --shards 4
 ```
 
-Open the [data browser](http://127.0.0.1:7654/admin) or inspect the service:
+Open the [data browser](http://127.0.0.1:7655/admin) or inspect the service on
+the separate administration listener:
 
 ```bash
-curl http://127.0.0.1:7654/health
-curl http://127.0.0.1:7654/metrics
+curl http://127.0.0.1:7655/health
+curl http://127.0.0.1:7655/metrics
 ```
 
 Enable the PostgreSQL listener explicitly. Simple and parameterized
@@ -207,6 +210,10 @@ curl -X POST http://127.0.0.1:7654/v1/query \
 
 The [versioned HTTP contract](docs/HTTP_API.md) defines requests, response
 shapes, value encodings, and errors. `GET /v1` reports the supported API version.
+The [HTTP listener contract](docs/HTTP_LISTENERS.md) defines the strict route
+split, configuration, and shared startup/shutdown behavior. The data listener
+defaults to `127.0.0.1:7654`; administration defaults to
+`127.0.0.1:7655` and can be disabled with `--admin-listen disabled`.
 
 Have an existing SQLite database? Use the offline
 [SQLite importer](docs/SQLITE_IMPORT.md). Linux releases also include `.deb`
@@ -223,13 +230,13 @@ and routing plans as future protocol adapters; see the
 [crate feature map](docs/CRATE_FEATURES.md).
 
 Python runs the same engine directly in-process. It starts no listener by
-default, but `Database.serve()` can attach HTTP/PostgreSQL listeners (remote
-PostgreSQL requires its TLS/SCRAM arguments):
+default, but `Database.serve()` can attach data HTTP, administration HTTP, and
+PostgreSQL listeners (remote PostgreSQL requires its TLS/SCRAM arguments):
 
 ```python
 with briskdb.open("./data", shards=4) as db:
     with db.serve(postgres="127.0.0.1:0") as server:
-        print(server.http_address, server.postgres_address)
+        print(server.data_address, server.admin_address, server.postgres_address)
 ```
 
 The wheel also exposes the current protocol-neutral document slice through
@@ -319,7 +326,8 @@ more valuable than a star. Start with the
 ## Honest alpha boundaries
 
 - PostgreSQL has TLS and single-identity SCRAM-SHA-256 authentication, but no
-  roles or authorization yet. HTTP remains a loopback-only development surface.
+  roles or authorization yet. The separated HTTP data and administration
+  listeners remain loopback-only development surfaces.
 - No general atomic transaction across multiple shard files.
 - Global ordering/pagination and general aggregate pushdown are still limited.
 - The supported backup today is a stopped-server copy of the complete data
@@ -342,6 +350,7 @@ more valuable than a star. Start with the
 ## Go deeper
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [HTTP listener separation](docs/HTTP_LISTENERS.md)
 - [Global uniqueness and value authority](docs/GLOBAL_INDEX_AUTHORITY.md)
 - [Global-index production gate](docs/GLOBAL_INDEX_RELEASE_GATE.md)
 - [Embedded Rust](docs/EMBEDDED_RUST.md)

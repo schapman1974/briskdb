@@ -55,6 +55,7 @@ async fn attached_listener_serves_the_lossless_query_contract_over_tcp() {
         &database,
         ListenerConfig {
             http_listen: "127.0.0.1:0".parse().unwrap(),
+            admin_listen: None,
             postgres_listen: None,
         },
     )

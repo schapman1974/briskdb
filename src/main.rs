@@ -16,6 +16,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_POSTGRES_LISTEN: &str = "disabled";
+const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:7655";
 
 /// Command-line representation of an optional TCP listener.
 ///
@@ -54,9 +55,18 @@ impl FromStr for ListenerSetting {
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
-    /// Loopback address on which the unauthenticated HTTP server listens.
+    /// Loopback data-plane HTTP listener address.
     #[arg(long, env = "BRISKDB_LISTEN", default_value = "127.0.0.1:7654")]
     listen: SocketAddr,
+
+    /// Loopback administration HTTP listener address, or `disabled` to turn it off.
+    #[arg(
+        long,
+        env = "BRISKDB_ADMIN_LISTEN",
+        default_value = DEFAULT_ADMIN_LISTEN,
+        value_name = "SOCKET_ADDR|disabled"
+    )]
+    admin_listen: ListenerSetting,
 
     /// Loopback PostgreSQL TCP listener address, or `disabled` to turn it off.
     #[arg(
@@ -229,6 +239,7 @@ impl Args {
         let options = options.with_experimental_vtab_writes(self.experimental_vtab_writes);
         let config = Config {
             listen: self.listen,
+            admin_listen: self.admin_listen.into_option(),
             postgres_listen: self.postgres_listen.into_option(),
             postgres_security,
             data_dir: self.data_dir,
@@ -263,6 +274,10 @@ mod tests {
         let args = Args::try_parse_from(["briskdb"]).unwrap();
 
         assert_eq!(args.listen, "127.0.0.1:7654".parse().unwrap());
+        assert_eq!(
+            args.admin_listen,
+            ListenerSetting::Address("127.0.0.1:7655".parse().unwrap())
+        );
         assert_eq!(args.postgres_listen, ListenerSetting::Disabled);
         assert_eq!(args.postgres_tls_cert, None);
         assert_eq!(args.postgres_tls_key, None);
@@ -301,6 +316,8 @@ mod tests {
             "briskdb",
             "--listen",
             "127.0.0.1:9000",
+            "--admin-listen",
+            "127.0.0.1:9001",
             "--postgres-listen",
             "127.0.0.1:9543",
             "--postgres-tls-cert",
@@ -338,6 +355,10 @@ mod tests {
 
         assert_eq!(args.listen, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(
+            args.admin_listen,
+            ListenerSetting::Address("127.0.0.1:9001".parse().unwrap())
+        );
+        assert_eq!(
             args.postgres_listen,
             ListenerSetting::Address("127.0.0.1:9543".parse().unwrap())
         );
@@ -373,6 +394,8 @@ mod tests {
             "briskdb",
             "--listen",
             "127.0.0.1:9000",
+            "--admin-listen",
+            "127.0.0.1:9001",
             "--postgres-listen",
             "127.0.0.1:9543",
             "--data-dir",
@@ -405,6 +428,7 @@ mod tests {
             config,
             Config {
                 listen: "127.0.0.1:9000".parse().unwrap(),
+                admin_listen: Some("127.0.0.1:9001".parse().unwrap()),
                 postgres_listen: Some("127.0.0.1:9543".parse().unwrap()),
                 postgres_security: None,
                 data_dir: PathBuf::from("/tmp/briskdb-test-data"),
@@ -510,6 +534,15 @@ mod tests {
     }
 
     #[test]
+    fn admin_listener_can_be_disabled_explicitly() {
+        let args = Args::try_parse_from(["briskdb", "--admin-listen", "disabled"]).unwrap();
+        assert_eq!(args.admin_listen, ListenerSetting::Disabled);
+
+        let (config, _) = args.into_server_parts().unwrap();
+        assert_eq!(config.admin_listen, None);
+    }
+
+    #[test]
     fn postgres_listener_is_disabled_in_the_default_server_config() {
         let args = Args::try_parse_from(["briskdb"]).unwrap();
 
@@ -517,6 +550,7 @@ mod tests {
 
         assert_eq!(config.postgres_listen, None);
         assert_eq!(config.postgres_security, None);
+        assert_eq!(config.admin_listen, Some("127.0.0.1:7655".parse().unwrap()));
     }
 
     #[test]
@@ -587,6 +621,20 @@ mod tests {
     }
 
     #[test]
+    fn admin_listener_accepts_ipv4_and_ipv6_socket_addresses() {
+        for (input, expected) in [
+            ("127.0.0.1:7655", "127.0.0.1:7655"),
+            ("[::1]:7655", "[::1]:7655"),
+        ] {
+            let args = Args::try_parse_from(["briskdb", "--admin-listen", input]).unwrap();
+            assert_eq!(
+                args.admin_listen,
+                ListenerSetting::Address(expected.parse().unwrap())
+            );
+        }
+    }
+
+    #[test]
     fn malformed_postgres_listener_values_fail_during_cli_parsing() {
         for value in [
             "",
@@ -605,8 +653,30 @@ mod tests {
     }
 
     #[test]
+    fn malformed_admin_listener_values_fail_during_cli_parsing() {
+        for value in [
+            "",
+            "off",
+            "none",
+            "DISABLED",
+            "localhost:7655",
+            "127.0.0.1",
+            "127.0.0.1:not-a-port",
+        ] {
+            assert!(
+                Args::try_parse_from(["briskdb", "--admin-listen", value]).is_err(),
+                "value should be rejected: {value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn resource_flags_are_bound_to_the_documented_environment_variables() {
         let command = Args::command();
+        let admin_listener = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "admin_listen")
+            .unwrap();
         let postgres_listener = command
             .get_arguments()
             .find(|argument| argument.get_id() == "postgres_listen")
@@ -669,6 +739,10 @@ mod tests {
             .find(|argument| argument.get_id() == "experimental_vtab_writes")
             .unwrap();
 
+        assert_eq!(
+            admin_listener.get_env(),
+            Some(OsStr::new("BRISKDB_ADMIN_LISTEN"))
+        );
         assert_eq!(
             postgres_listener.get_env(),
             Some(OsStr::new("BRISKDB_POSTGRES_LISTEN"))
@@ -827,6 +901,61 @@ mod tests {
                 ])
                 .env(CHILD_MARKER, expected)
                 .env("BRISKDB_POSTGRES_LISTEN", value)
+                .status()
+                .unwrap();
+            assert!(status.success(), "environment case failed: {expected}");
+        }
+    }
+
+    #[test]
+    fn admin_listener_environment_and_cli_precedence_are_exact() {
+        const CHILD_MARKER: &str = "BRISKDB_ADMIN_LISTENER_ENV_TEST_CHILD";
+
+        if let Some(expected) = std::env::var_os(CHILD_MARKER) {
+            let args = match expected.to_str().unwrap() {
+                "env-address" | "env-disabled" => Args::try_parse_from(["briskdb"]),
+                "cli-address" => {
+                    Args::try_parse_from(["briskdb", "--admin-listen", "127.0.0.1:9655"])
+                }
+                "cli-disabled" => Args::try_parse_from(["briskdb", "--admin-listen", "disabled"]),
+                "invalid" => {
+                    assert!(Args::try_parse_from(["briskdb"]).is_err());
+                    return;
+                }
+                unexpected => panic!("unexpected child case {unexpected}"),
+            }
+            .unwrap();
+            match expected.to_str().unwrap() {
+                "env-address" => assert_eq!(
+                    args.admin_listen,
+                    ListenerSetting::Address("127.0.0.1:8655".parse().unwrap())
+                ),
+                "env-disabled" | "cli-disabled" => {
+                    assert_eq!(args.admin_listen, ListenerSetting::Disabled);
+                }
+                "cli-address" => assert_eq!(
+                    args.admin_listen,
+                    ListenerSetting::Address("127.0.0.1:9655".parse().unwrap())
+                ),
+                _ => unreachable!(),
+            }
+            return;
+        }
+
+        for (environment, expected) in [
+            ("127.0.0.1:8655", "env-address"),
+            ("disabled", "env-disabled"),
+            ("disabled", "cli-address"),
+            ("127.0.0.1:8655", "cli-disabled"),
+            ("localhost:7655", "invalid"),
+        ] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::admin_listener_environment_and_cli_precedence_are_exact",
+                ])
+                .env(CHILD_MARKER, expected)
+                .env("BRISKDB_ADMIN_LISTEN", environment)
                 .status()
                 .unwrap();
             assert!(status.success(), "environment case failed: {expected}");

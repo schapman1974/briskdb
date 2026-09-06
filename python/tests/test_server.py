@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 from pathlib import Path
@@ -37,8 +38,13 @@ class AttachedServerTests(unittest.TestCase):
             database = briskdb.open(data_dir, shards=2)
             with database.serve(postgres="127.0.0.1:0") as server:
                 self.assertNotEqual(split_address(server.http_address)[1], 0)
+                self.assertEqual(server.data_address, server.http_address)
+                self.assertIsNotNone(server.admin_address)
+                self.assertNotEqual(server.admin_address, server.http_address)
+                self.assertTrue(repr(server).startswith("Server(http_address="))
+                self.assertIn("admin_address=", repr(server))
                 self.assertIsNotNone(server.postgres_address)
-                health = http_json(server.http_address, "/health")
+                health = http_json(server.admin_address or "", "/health")
                 self.assertEqual(health["status"], "ok")
                 self.assertEqual(health["shards"], 2)
                 self.assertEqual(
@@ -61,6 +67,16 @@ class AttachedServerTests(unittest.TestCase):
                     {"shard_key": "python-http", "sql": "SELECT 7 AS value"},
                 )
                 self.assertEqual(query["rows"], [[7]])
+                with self.assertRaises(urllib.error.HTTPError) as missing_admin:
+                    http_json(server.data_address, "/health")
+                self.assertEqual(missing_admin.exception.code, 404)
+                with self.assertRaises(urllib.error.HTTPError) as missing_data:
+                    http_json(
+                        server.admin_address or "",
+                        "/v1/query",
+                        {"shard_key": "python-http", "sql": "SELECT 9"},
+                    )
+                self.assertEqual(missing_data.exception.code, 404)
 
                 host, port = split_address(server.postgres_address or "")
                 with psycopg.connect(
@@ -82,7 +98,9 @@ class AttachedServerTests(unittest.TestCase):
                 self.assertEqual(session.query("SELECT 1")["rows"], [(1,)])
 
             restarted = database.serve()
-            self.assertEqual(http_json(restarted.http_address, "/health")["status"], "ok")
+            self.assertEqual(
+                http_json(restarted.admin_address or "", "/health")["status"], "ok"
+            )
             database.close()
             self.assertTrue(restarted.closed)
             self.assertTrue(restarted.close()["already_closed"])
@@ -141,6 +159,10 @@ class AttachedServerTests(unittest.TestCase):
             database = briskdb.open(data_dir, shards=2)
             with self.assertRaisesRegex(briskdb.InvalidArgumentError, "loopback"):
                 database.serve(http="0.0.0.0:0")
+            with self.assertRaisesRegex(briskdb.InvalidArgumentError, "loopback"):
+                database.serve(admin="0.0.0.0:0")
+            with self.assertRaisesRegex(briskdb.InvalidArgumentError, "distinct"):
+                database.serve(http="127.0.0.1:8765", admin="127.0.0.1:8765")
             with self.assertRaisesRegex(briskdb.InvalidArgumentError, "IP socket address"):
                 database.serve(http="localhost:0")
             with self.assertRaisesRegex(briskdb.InvalidArgumentError, "must be set together"):
@@ -158,7 +180,20 @@ class AttachedServerTests(unittest.TestCase):
 
             with database.session(routing_key="after-bind-error") as session:
                 self.assertEqual(session.query("SELECT 1")["rows"], [(1,)])
+
+            data_only = database.serve(admin=None)
+            self.assertIsNone(data_only.admin_address)
+            self.assertEqual(
+                http_json(data_only.data_address, "/v1")["api_version"], "1"
+            )
+            data_only.close()
             database.close()
+
+    def test_listener_signature_and_address_properties_are_stable(self) -> None:
+        signature = inspect.signature(briskdb.Database.serve)
+        self.assertEqual(signature.parameters["http"].default, "127.0.0.1:0")
+        self.assertEqual(signature.parameters["admin"].default, "127.0.0.1:0")
+        self.assertIsNone(signature.parameters["postgres"].default)
 
 
 class AsyncAttachedServerTests(unittest.IsolatedAsyncioTestCase):
@@ -166,7 +201,11 @@ class AsyncAttachedServerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as data_dir:
             database = await briskdb.open_async(data_dir, shards=2)
             async with await database.serve() as server:
-                health = await asyncio.to_thread(http_json, server.http_address, "/health")
+                self.assertEqual(server.data_address, server.http_address)
+                self.assertIsNotNone(server.admin_address)
+                health = await asyncio.to_thread(
+                    http_json, server.admin_address or "", "/health"
+                )
                 self.assertEqual(health["status"], "ok")
             self.assertTrue(server.closed)
 

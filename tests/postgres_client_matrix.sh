@@ -23,6 +23,7 @@ trap cleanup EXIT
 
 postgres_port="${BRISKDB_POSTGRES_MATRIX_PORT:-55438}"
 http_port="${BRISKDB_HTTP_MATRIX_PORT:-17654}"
+admin_port="${BRISKDB_ADMIN_MATRIX_PORT:-17655}"
 data_dir="${matrix_root}/data"
 source_db="${matrix_root}/source.sqlite"
 plan="${matrix_root}/import-plan.json"
@@ -91,12 +92,14 @@ target/debug/briskdb \
   --data-dir "${data_dir}" \
   --shards 2 \
   --listen "127.0.0.1:${http_port}" \
+  --admin-listen "127.0.0.1:${admin_port}" \
   --postgres-listen "127.0.0.1:${postgres_port}" \
   >"${server_log}" 2>&1 &
 server_pid="$!"
 
 for _ in {1..100}; do
-  if curl --fail --silent "http://127.0.0.1:${http_port}/health" >/dev/null; then
+  if curl --fail --silent "http://127.0.0.1:${admin_port}/health" >/dev/null \
+    && curl --fail --silent "http://127.0.0.1:${http_port}/v1" >/dev/null; then
     break
   fi
   if ! kill -0 "${server_pid}" 2>/dev/null; then
@@ -105,7 +108,8 @@ for _ in {1..100}; do
   fi
   sleep 0.1
 done
-curl --fail --silent "http://127.0.0.1:${http_port}/health" >/dev/null
+curl --fail --silent "http://127.0.0.1:${admin_port}/health" >/dev/null
+curl --fail --silent "http://127.0.0.1:${http_port}/v1" >/dev/null
 
 matrix_dsn="host=127.0.0.1 port=${postgres_port} user=briskdb dbname=default sslmode=disable"
 matrix_url="postgresql+psycopg://briskdb@127.0.0.1:${postgres_port}/default"

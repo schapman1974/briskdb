@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Split attached HTTP serving into data and administration listeners over the
+  same engine. `http` and `http_address` retain their data-plane meaning and
+  `data_address` names it explicitly. `admin` defaults to an ephemeral loopback
+  listener, `admin=None` disables it, and `admin_address` reports the selected
+  address. Existing admin/operator paths and response shapes are unchanged but
+  now use that second base address.
+
 ## 0.1.0-alpha.6 — 2026-09-06
 
 - Added opt-in synchronous and asyncio document commands for the currently
