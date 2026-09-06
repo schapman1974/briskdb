@@ -894,6 +894,10 @@ fn production_protocol_modules_do_not_bypass_the_engine_for_document_storage() {
             include_str!("../src/protocol/http/admin.rs"),
         ),
         (
+            "protocol/http/openapi.rs",
+            include_str!("../src/protocol/http/openapi.rs"),
+        ),
+        (
             "protocol/postgres.rs",
             include_str!("../src/protocol/postgres.rs"),
         ),

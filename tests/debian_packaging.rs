@@ -73,6 +73,8 @@ fn debian_package_contract_preserves_configuration_and_database_state() {
         "/usr/bin/briskdb-import",
         "/lib/systemd/system/briskdb.service",
         "/etc/default/briskdb",
+        "missing OpenAPI artifact: docs/openapi-v1.json",
+        "cp -R docs",
         "dpkg-deb --build --root-owner-group",
     ] {
         assert!(
@@ -100,6 +102,7 @@ fn debian_package_contract_preserves_configuration_and_database_state() {
         "wait_for_service",
         "dpkg -r briskdb",
         "package-smoke-state",
+        "./usr/share/doc/briskdb/docs/openapi-v1.json",
     ] {
         assert!(
             smoke.contains(required),

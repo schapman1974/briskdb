@@ -1,0 +1,6426 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "BriskDB HTTP API",
+    "version": "1",
+    "description": "Versioned BriskDB data and administration machine API. The API version is independent of the Cargo package and storage-format versions.",
+    "license": {
+      "name": "MIT"
+    }
+  },
+  "tags": [
+    {
+      "name": "data",
+      "description": "SQL query and write operations on the data listener."
+    },
+    {
+      "name": "administration",
+      "description": "Operational inspection and maintenance on the administration listener."
+    }
+  ],
+  "paths": {
+    "/v1": {
+      "get": {
+        "tags": [
+          "data"
+        ],
+        "operationId": "getApiVersion",
+        "responses": {
+          "200": {
+            "description": "HTTP API version",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiVersion"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          }
+        },
+        "summary": "Discover HTTP API version",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7654",
+            "description": "Data listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "data",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "data"
+        ],
+        "operationId": "headApiVersion",
+        "responses": {
+          "200": {
+            "description": "HTTP API version",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or argument",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Unsupported operation or globally rejected request control",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect headers for discover http api version",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7654",
+            "description": "Data listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "data",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-implicit-head": true
+      }
+    },
+    "/v1/execute": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "operationId": "executeStatement",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecuteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Routed write result",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "BriskDB-Idempotency-Status": {
+                "$ref": "#/components/headers/BriskDBIdempotencyStatus"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecuteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          },
+          "413": {
+            "$ref": "#/components/responses/Problem413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem415"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem403"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem409"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem422"
+          },
+          "500": {
+            "$ref": "#/components/responses/Problem500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Problem504"
+          },
+          "507": {
+            "$ref": "#/components/responses/Problem507"
+          }
+        },
+        "summary": "Execute one routed write",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7654",
+            "description": "Data listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "data",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          },
+          {
+            "$ref": "#/components/parameters/BriskDBIdempotencyKey"
+          }
+        ],
+        "x-briskdb-max-request-bytes": 2097152
+      }
+    },
+    "/v1/query": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "operationId": "queryRows",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Materialized query result",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          },
+          "413": {
+            "$ref": "#/components/responses/Problem413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem415"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem403"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem409"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem422"
+          },
+          "500": {
+            "$ref": "#/components/responses/Problem500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Problem504"
+          },
+          "507": {
+            "$ref": "#/components/responses/Problem507"
+          }
+        },
+        "summary": "Query materialized rows",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7654",
+            "description": "Data listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "data",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-max-request-bytes": 2097152
+      }
+    },
+    "/v1/query/stream": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "operationId": "streamQueryRows",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bounded NDJSON query stream",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/x-ndjson; charset=utf-8": {
+                "schema": {
+                  "type": "string",
+                  "description": "A byte sequence of compact JSON records, each terminated by LF. It is not one JSON instance. Every row uses the value encoding declared by the preceding metadata record."
+                },
+                "x-briskdb-ndjson": {
+                  "framing": "lf-delimited-json",
+                  "delimiter": "LF",
+                  "compact": true,
+                  "sequence": [
+                    {
+                      "schema": "#/components/schemas/QueryStreamMeta",
+                      "minimum": 1,
+                      "maximum": 1
+                    },
+                    {
+                      "schema": "#/components/schemas/QueryStreamRow",
+                      "minimum": 0,
+                      "maximum": 1000000
+                    },
+                    {
+                      "oneOf": [
+                        "#/components/schemas/QueryStreamComplete",
+                        "#/components/schemas/QueryStreamError"
+                      ],
+                      "minimum": 1,
+                      "maximum": 1
+                    }
+                  ],
+                  "terminalRecordRequired": true,
+                  "eofBeforeTerminal": "indeterminate",
+                  "lateErrorsRetainHttpStatus": 200
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          },
+          "413": {
+            "$ref": "#/components/responses/Problem413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem415"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem403"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem409"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem422"
+          },
+          "500": {
+            "$ref": "#/components/responses/Problem500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Problem504"
+          },
+          "507": {
+            "$ref": "#/components/responses/Problem507"
+          }
+        },
+        "summary": "Stream bounded query rows",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7654",
+            "description": "Data listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "data",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-max-request-bytes": 2097152
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "Engine and global-index health",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem403"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem409"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem422"
+          },
+          "500": {
+            "$ref": "#/components/responses/Problem500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Problem504"
+          },
+          "507": {
+            "$ref": "#/components/responses/Problem507"
+          }
+        },
+        "summary": "Inspect engine and global-index health",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "headHealth",
+        "responses": {
+          "200": {
+            "description": "Engine and global-index health",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or argument",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Unsupported operation or globally rejected request control",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied or read-only storage",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "State or constraint conflict",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable value, query, type, or limit",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Cancelled request, corruption, or internal error",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Storage, memory, contention, or shutdown unavailable",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Request deadline exceeded",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Storage full",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect headers for inspect engine and global-index health",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-implicit-head": true
+      }
+    },
+    "/v1/ready": {
+      "get": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "getReadiness",
+        "responses": {
+          "200": {
+            "description": "Ready for ordinary requests",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Not ready for ordinary requests",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotReadyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          }
+        },
+        "summary": "Inspect request-admission readiness",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "headReadiness",
+        "responses": {
+          "200": {
+            "description": "Ready for ordinary requests",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Not ready for ordinary requests",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or argument",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Unsupported operation or globally rejected request control",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect headers for inspect request-admission readiness",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-implicit-head": true
+      }
+    },
+    "/v1/admin/broadcast": {
+      "post": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "broadcastMigration",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BroadcastRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Completed migration shards",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BroadcastResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          },
+          "413": {
+            "$ref": "#/components/responses/Problem413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem415"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem403"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem409"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem422"
+          },
+          "500": {
+            "$ref": "#/components/responses/Problem500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Problem504"
+          },
+          "507": {
+            "$ref": "#/components/responses/Problem507"
+          }
+        },
+        "summary": "Apply a journaled schema migration",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-max-request-bytes": 2097152
+      }
+    },
+    "/v1/admin/global-indexes": {
+      "get": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "getGlobalIndexes",
+        "responses": {
+          "200": {
+            "description": "Global-index operational report",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalIndexesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem403"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem409"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem422"
+          },
+          "500": {
+            "$ref": "#/components/responses/Problem500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Problem504"
+          },
+          "507": {
+            "$ref": "#/components/responses/Problem507"
+          }
+        },
+        "summary": "Inspect global-index operation",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "headGlobalIndexes",
+        "responses": {
+          "200": {
+            "description": "Global-index operational report",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or argument",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Unsupported operation or globally rejected request control",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied or read-only storage",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "State or constraint conflict",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable value, query, type, or limit",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Cancelled request, corruption, or internal error",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Storage, memory, contention, or shutdown unavailable",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Request deadline exceeded",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Storage full",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect headers for inspect global-index operation",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-implicit-head": true
+      }
+    },
+    "/v1/admin/catalog": {
+      "get": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "getCatalog",
+        "responses": {
+          "200": {
+            "description": "Relational catalog",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          }
+        },
+        "summary": "Inspect the relational catalog",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "headCatalog",
+        "responses": {
+          "200": {
+            "description": "Relational catalog",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or argument",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Unsupported operation or globally rejected request control",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect headers for inspect the relational catalog",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-implicit-head": true
+      }
+    },
+    "/v1/admin/migrations": {
+      "get": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "listMigrations",
+        "responses": {
+          "200": {
+            "description": "Migration summary",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem403"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem409"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem422"
+          },
+          "500": {
+            "$ref": "#/components/responses/Problem500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Problem504"
+          },
+          "507": {
+            "$ref": "#/components/responses/Problem507"
+          }
+        },
+        "summary": "Inspect migration summary",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "headMigrations",
+        "responses": {
+          "200": {
+            "description": "Migration summary",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or argument",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Unsupported operation or globally rejected request control",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied or read-only storage",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "State or constraint conflict",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable value, query, type, or limit",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Cancelled request, corruption, or internal error",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Storage, memory, contention, or shutdown unavailable",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Request deadline exceeded",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Storage full",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect headers for inspect migration summary",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-implicit-head": true
+      }
+    },
+    "/v1/admin/migrations/{target_generation}": {
+      "get": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "getMigration",
+        "x-briskdb-plane": "administration",
+        "responses": {
+          "200": {
+            "description": "Migration generation",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem404"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem403"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem409"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem422"
+          },
+          "500": {
+            "$ref": "#/components/responses/Problem500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Problem504"
+          },
+          "507": {
+            "$ref": "#/components/responses/Problem507"
+          }
+        },
+        "summary": "Inspect one migration generation",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          },
+          {
+            "name": "target_generation",
+            "in": "path",
+            "description": "Canonical positive decimal schema generation",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-4]|18446744073709551615)$"
+            }
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "headMigration",
+        "x-briskdb-plane": "administration",
+        "responses": {
+          "200": {
+            "description": "Migration generation",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or argument",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Unsupported operation or globally rejected request control",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied or read-only storage",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "State or constraint conflict",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable value, query, type, or limit",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Cancelled request, corruption, or internal error",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Storage, memory, contention, or shutdown unavailable",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Request deadline exceeded",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Storage full",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect headers for inspect one migration generation",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          },
+          {
+            "name": "target_generation",
+            "in": "path",
+            "description": "Canonical positive decimal schema generation",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-4]|18446744073709551615)$"
+            }
+          }
+        ],
+        "x-briskdb-implicit-head": true
+      }
+    },
+    "/v1/admin/shards": {
+      "get": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "listShards",
+        "responses": {
+          "200": {
+            "description": "Validated physical shards",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem403"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem409"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem422"
+          },
+          "500": {
+            "$ref": "#/components/responses/Problem500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Problem504"
+          },
+          "507": {
+            "$ref": "#/components/responses/Problem507"
+          }
+        },
+        "summary": "Inspect validated physical shards",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "headShards",
+        "responses": {
+          "200": {
+            "description": "Validated physical shards",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or argument",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Unsupported operation or globally rejected request control",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied or read-only storage",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "State or constraint conflict",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable value, query, type, or limit",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Cancelled request, corruption, or internal error",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Storage, memory, contention, or shutdown unavailable",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Request deadline exceeded",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Storage full",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect headers for inspect validated physical shards",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-implicit-head": true
+      }
+    },
+    "/v1/admin/queries": {
+      "get": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "listActiveQueries",
+        "responses": {
+          "200": {
+            "description": "Active HTTP queries",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActiveQueriesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          }
+        },
+        "summary": "List active HTTP queries",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "headActiveQueries",
+        "responses": {
+          "200": {
+            "description": "Active HTTP queries",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or argument",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Unsupported operation or globally rejected request control",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect headers for list active http queries",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-implicit-head": true
+      }
+    },
+    "/v1/admin/queries/{operation_id}/cancel": {
+      "post": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "cancelQuery",
+        "x-briskdb-plane": "administration",
+        "responses": {
+          "202": {
+            "description": "Cancellation requested",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelQueryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          },
+          "413": {
+            "$ref": "#/components/responses/Problem413"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem404"
+          }
+        },
+        "summary": "Cancel one active HTTP query",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          },
+          {
+            "name": "operation_id",
+            "in": "path",
+            "description": "Active query operation ID",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OpaqueId"
+            }
+          }
+        ],
+        "x-briskdb-request-body": {
+          "mode": "exactly-zero-bytes",
+          "maxBytes": 2097152
+        }
+      }
+    },
+    "/v1/admin/backup": {
+      "get": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "getBackupCapability",
+        "responses": {
+          "200": {
+            "description": "Backup capability",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupCapabilityResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          }
+        },
+        "summary": "Inspect backup capability",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "headBackupCapability",
+        "responses": {
+          "200": {
+            "description": "Backup capability",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or argument",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Unsupported operation or globally rejected request control",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect headers for inspect backup capability",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-implicit-head": true
+      }
+    },
+    "/v1/admin/maintenance/checkpoint": {
+      "post": {
+        "tags": [
+          "administration"
+        ],
+        "operationId": "checkpointDatabases",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmptyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Passive checkpoint report",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckpointResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          },
+          "413": {
+            "$ref": "#/components/responses/Problem413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem415"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem403"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem409"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem422"
+          },
+          "500": {
+            "$ref": "#/components/responses/Problem500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Problem504"
+          },
+          "507": {
+            "$ref": "#/components/responses/Problem507"
+          }
+        },
+        "summary": "Checkpoint every database",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7655",
+            "description": "Administration listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "administration",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-max-request-bytes": 2097152
+      }
+    },
+    "/v1/": {
+      "get": {
+        "tags": [
+          "data"
+        ],
+        "operationId": "getApiVersionAlias",
+        "responses": {
+          "200": {
+            "description": "HTTP API version",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiVersion"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem400"
+          },
+          "501": {
+            "$ref": "#/components/responses/Problem501"
+          }
+        },
+        "summary": "Discover HTTP API version through the slash alias",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7654",
+            "description": "Data listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "data",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "data"
+        ],
+        "operationId": "headApiVersionAlias",
+        "responses": {
+          "200": {
+            "description": "HTTP API version",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or argument",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Unsupported operation or globally rejected request control",
+            "headers": {
+              "BriskDB-API-Version": {
+                "$ref": "#/components/headers/BriskDBApiVersion"
+              },
+              "BriskDB-Request-ID": {
+                "$ref": "#/components/headers/BriskDBRequestId"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Content-Type": {
+                "description": "Media type of the corresponding GET representation.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "application/problem+json"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Inspect discovery headers through the slash alias",
+        "servers": [
+          {
+            "url": "http://127.0.0.1:7654",
+            "description": "Data listener (default address)"
+          }
+        ],
+        "x-briskdb-plane": "data",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BriskDBRequestId"
+          }
+        ],
+        "x-briskdb-implicit-head": true
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ActiveQueriesResponse": {
+        "type": "object",
+        "properties": {
+          "queries": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {
+              "$ref": "#/components/schemas/ActiveQueryResponse"
+            }
+          }
+        },
+        "required": [
+          "queries"
+        ]
+      },
+      "ActiveQueryResponse": {
+        "type": "object",
+        "properties": {
+          "operation_id": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "sql_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "cancellation_requested": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation_id",
+          "elapsed_ms",
+          "sql_bytes",
+          "cancellation_requested"
+        ]
+      },
+      "ApiVersion": {
+        "type": "object",
+        "properties": {
+          "api_version": {
+            "type": "string",
+            "const": "1"
+          },
+          "value_encoding": {
+            "type": "string",
+            "const": "legacy-json-v1"
+          },
+          "supported_value_encodings": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "string",
+                "const": "legacy-json-v1"
+              },
+              {
+                "type": "string",
+                "const": "lossless-json-v1"
+              }
+            ],
+            "items": false,
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "session_scope": {
+            "type": "string",
+            "const": "request"
+          },
+          "sql_dialect": {
+            "type": "string",
+            "const": "sqlite"
+          },
+          "max_request_bytes": {
+            "type": "integer",
+            "const": 2097152
+          },
+          "max_result_rows": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000
+          },
+          "max_result_logical_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1073741824
+          },
+          "stream_buffer_rows": {
+            "type": "integer",
+            "const": 16
+          },
+          "request_id_header": {
+            "type": "string",
+            "const": "BriskDB-Request-ID"
+          },
+          "idempotency_key_header": {
+            "type": "string",
+            "const": "BriskDB-Idempotency-Key"
+          },
+          "stream_media_type": {
+            "type": "string",
+            "const": "application/x-ndjson; charset=utf-8"
+          }
+        },
+        "required": [
+          "api_version",
+          "value_encoding",
+          "supported_value_encodings",
+          "session_scope",
+          "sql_dialect",
+          "max_request_bytes",
+          "max_result_rows",
+          "max_result_logical_bytes",
+          "stream_buffer_rows",
+          "request_id_header",
+          "idempotency_key_header",
+          "stream_media_type"
+        ]
+      },
+      "BackupCapabilityResponse": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "const": "stopped_directory_copy"
+          },
+          "online": {
+            "type": "boolean",
+            "const": false
+          },
+          "requires_all_processes_stopped": {
+            "type": "boolean",
+            "const": true
+          },
+          "checkpoint_endpoint": {
+            "type": "string",
+            "const": "/v1/admin/maintenance/checkpoint"
+          },
+          "checkpoint_role": {
+            "type": "string",
+            "const": "preparation_only"
+          },
+          "checkpoint_is_recovery_point": {
+            "type": "boolean",
+            "const": false
+          }
+        },
+        "required": [
+          "mode",
+          "online",
+          "requires_all_processes_stopped",
+          "checkpoint_endpoint",
+          "checkpoint_role",
+          "checkpoint_is_recovery_point"
+        ]
+      },
+      "BroadcastRequest": {
+        "type": "object",
+        "properties": {
+          "sql": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "sql"
+        ]
+      },
+      "BroadcastResponse": {
+        "type": "object",
+        "properties": {
+          "completed_shards": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 63
+            }
+          }
+        },
+        "required": [
+          "completed_shards"
+        ]
+      },
+      "CancelQueryResponse": {
+        "type": "object",
+        "properties": {
+          "operation_id": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "newly_requested": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation_id",
+          "newly_requested"
+        ]
+      },
+      "CatalogDb": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-4]|18446744073709551615)$"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "CatalogGeneratedId": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/CatalogGeneratedIdDisabled"
+          },
+          {
+            "$ref": "#/components/schemas/CatalogGeneratedIdEnabled"
+          }
+        ]
+      },
+      "CatalogGlobalIndex": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-4]|18446744073709551615)$"
+          },
+          "table_id": {
+            "type": "string",
+            "pattern": "^(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-4]|18446744073709551615)$"
+          },
+          "name": {
+            "type": "string"
+          },
+          "unique": {
+            "type": "boolean"
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "creating",
+              "ready",
+              "invalid",
+              "rebuilding",
+              "dropping"
+            ]
+          },
+          "schema_generation": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])$"
+          },
+          "key_encoding_version": {
+            "type": "integer",
+            "const": 1
+          }
+        },
+        "required": [
+          "id",
+          "table_id",
+          "name",
+          "unique",
+          "lifecycle",
+          "schema_generation",
+          "key_encoding_version"
+        ]
+      },
+      "CatalogPlacement": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/CatalogShardedPlacement"
+          },
+          {
+            "$ref": "#/components/schemas/CatalogUnshardedPlacement"
+          }
+        ]
+      },
+      "CatalogResponse": {
+        "type": "object",
+        "properties": {
+          "identifier_encoding_version": {
+            "type": "integer",
+            "const": 1
+          },
+          "schema_generation": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])$"
+          },
+          "default_database_id": {
+            "type": "string",
+            "const": "1"
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogDb"
+            },
+            "minItems": 1,
+            "maxItems": 64,
+            "contains": {
+              "type": "object",
+              "required": [
+                "id",
+                "name"
+              ],
+              "properties": {
+                "id": {
+                  "const": "1"
+                },
+                "name": {
+                  "const": "default"
+                }
+              }
+            },
+            "minContains": 1,
+            "maxContains": 1
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogTable"
+            },
+            "maxItems": 4096
+          },
+          "global_indexes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogGlobalIndex"
+            },
+            "maxItems": 4096
+          }
+        },
+        "required": [
+          "identifier_encoding_version",
+          "schema_generation",
+          "default_database_id",
+          "databases",
+          "tables",
+          "global_indexes"
+        ]
+      },
+      "CatalogShardKey": {
+        "type": "object",
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "data_type": {
+            "type": "string",
+            "enum": [
+              "int64",
+              "text",
+              "binary"
+            ]
+          }
+        },
+        "required": [
+          "column",
+          "data_type"
+        ]
+      },
+      "CatalogTable": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-4]|18446744073709551615)$"
+          },
+          "database_id": {
+            "type": "string",
+            "pattern": "^(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-4]|18446744073709551615)$"
+          },
+          "name": {
+            "type": "string"
+          },
+          "placement": {
+            "$ref": "#/components/schemas/CatalogPlacement"
+          },
+          "generated_id": {
+            "$ref": "#/components/schemas/CatalogGeneratedId"
+          }
+        },
+        "required": [
+          "id",
+          "database_id",
+          "name",
+          "placement",
+          "generated_id"
+        ]
+      },
+      "CheckpointDbResponse": {
+        "type": "object",
+        "properties": {
+          "database": {
+            "type": "string",
+            "enum": [
+              "manifest",
+              "global_index"
+            ]
+          },
+          "busy": {
+            "type": "boolean"
+          },
+          "counts_available": {
+            "type": "boolean"
+          },
+          "wal_frames": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "checkpointed_frames": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "complete": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "database",
+          "busy",
+          "counts_available",
+          "wal_frames",
+          "checkpointed_frames",
+          "complete"
+        ]
+      },
+      "CheckpointResponse": {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "passive_checkpoint"
+          },
+          "busy": {
+            "type": "boolean"
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "recovery_point": {
+            "type": "boolean",
+            "const": false
+          },
+          "shards": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CheckpointShardResponse"
+            },
+            "minItems": 2,
+            "maxItems": 64,
+            "uniqueItems": true
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CheckpointDbResponse"
+            },
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "operation",
+          "busy",
+          "complete",
+          "recovery_point",
+          "shards",
+          "databases"
+        ]
+      },
+      "CheckpointShardResponse": {
+        "type": "object",
+        "properties": {
+          "shard": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 63
+          },
+          "busy": {
+            "type": "boolean"
+          },
+          "counts_available": {
+            "type": "boolean"
+          },
+          "wal_frames": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "checkpointed_frames": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "complete": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "shard",
+          "busy",
+          "counts_available",
+          "wal_frames",
+          "checkpointed_frames",
+          "complete"
+        ]
+      },
+      "EmptyRequest": {
+        "type": "object",
+        "maxProperties": 0,
+        "additionalProperties": false
+      },
+      "ExecuteGeneratedKey": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "column": {
+                "type": "string"
+              },
+              "data_type": {
+                "type": "string",
+                "const": "int64"
+              },
+              "value": {
+                "$ref": "#/components/schemas/LosslessInt64/properties/value"
+              }
+            },
+            "required": [
+              "column",
+              "data_type",
+              "value"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "column": {
+                "type": "string"
+              },
+              "data_type": {
+                "type": "string",
+                "const": "uint64"
+              },
+              "value": {
+                "$ref": "#/components/schemas/LosslessUInt64/properties/value"
+              }
+            },
+            "required": [
+              "column",
+              "data_type",
+              "value"
+            ]
+          }
+        ]
+      },
+      "ExecuteRequest": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/LegacyExecuteRequest"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessExecuteRequest"
+          }
+        ]
+      },
+      "ExecuteResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "shard": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 63
+              },
+              "rows_affected": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615
+              }
+            },
+            "required": [
+              "shard",
+              "rows_affected"
+            ],
+            "not": {
+              "required": [
+                "generated_key"
+              ]
+            }
+          },
+          {
+            "type": "object",
+            "properties": {
+              "shard": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 63
+              },
+              "rows_affected": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615
+              },
+              "generated_key": {
+                "$ref": "#/components/schemas/ExecuteGeneratedKey"
+              }
+            },
+            "required": [
+              "shard",
+              "rows_affected",
+              "generated_key"
+            ]
+          }
+        ]
+      },
+      "GlobalIndexStatus": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-4]|18446744073709551615)$"
+          },
+          "name": {
+            "type": "string"
+          },
+          "unique": {
+            "type": "boolean"
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "creating",
+              "ready",
+              "invalid",
+              "rebuilding",
+              "dropping"
+            ]
+          },
+          "health": {
+            "type": "string",
+            "enum": [
+              "healthy",
+              "degraded",
+              "unavailable"
+            ]
+          },
+          "available": {
+            "type": "boolean"
+          },
+          "recovery": {
+            "type": "string",
+            "enum": [
+              "build",
+              "none",
+              "rebuild",
+              "resume_rebuild"
+            ]
+          },
+          "authority_entries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "unique_keys": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "active_operations": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "active_unique_reservations": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "active_value_leases": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "pending_read_repairs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "applied_read_repairs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "async_lag": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "async_failures": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "poisoned_shards": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64
+          },
+          "leased_shards": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64
+          },
+          "async_paused": {
+            "type": "boolean"
+          },
+          "rebuild_required": {
+            "type": "boolean"
+          },
+          "summary_ready_shards": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64
+          },
+          "summary_degraded_shards": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64
+          },
+          "summary_saturated_shards": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "unique",
+          "lifecycle",
+          "health",
+          "available",
+          "recovery",
+          "authority_entries",
+          "unique_keys",
+          "active_operations",
+          "active_unique_reservations",
+          "active_value_leases",
+          "pending_read_repairs",
+          "applied_read_repairs",
+          "async_lag",
+          "async_failures",
+          "poisoned_shards",
+          "leased_shards",
+          "async_paused",
+          "rebuild_required",
+          "summary_ready_shards",
+          "summary_degraded_shards",
+          "summary_saturated_shards"
+        ]
+      },
+      "GlobalIndexesResponse": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "healthy",
+              "degraded",
+              "unavailable"
+            ]
+          },
+          "retained_outbox_events": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64000000
+          },
+          "retained_outbox_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 17179869184
+          },
+          "backpressured_outbox_shards": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64
+          },
+          "indexes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GlobalIndexStatus"
+            },
+            "maxItems": 4096
+          }
+        },
+        "required": [
+          "state",
+          "retained_outbox_events",
+          "retained_outbox_bytes",
+          "backpressured_outbox_shards",
+          "indexes"
+        ]
+      },
+      "HealthGlobalIndexesResponse": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "healthy",
+              "degraded",
+              "unavailable"
+            ]
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4096
+          },
+          "healthy": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4096
+          },
+          "degraded": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4096
+          },
+          "unavailable": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4096
+          },
+          "async_lag": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "retained_outbox_events": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64000000
+          },
+          "retained_outbox_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 17179869184
+          },
+          "backpressured_outbox_shards": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64
+          }
+        },
+        "required": [
+          "state",
+          "total",
+          "healthy",
+          "degraded",
+          "unavailable",
+          "async_lag",
+          "retained_outbox_events",
+          "retained_outbox_bytes",
+          "backpressured_outbox_shards"
+        ]
+      },
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded"
+            ]
+          },
+          "shards": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 64
+          },
+          "global_indexes": {
+            "$ref": "#/components/schemas/HealthGlobalIndexesResponse"
+          }
+        },
+        "required": [
+          "status",
+          "shards",
+          "global_indexes"
+        ]
+      },
+      "MigrationResponse": {
+        "type": "object",
+        "properties": {
+          "generation": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])$",
+            "not": {
+              "const": "0"
+            }
+          },
+          "source_generation": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])$"
+          },
+          "target_generation": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])$",
+            "not": {
+              "const": "0"
+            }
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "applying",
+              "complete"
+            ]
+          },
+          "shard_count": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 64
+          },
+          "next_shard": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64
+          },
+          "completed_shards": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64
+          },
+          "sql_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65536
+          }
+        },
+        "required": [
+          "generation",
+          "source_generation",
+          "target_generation",
+          "state",
+          "shard_count",
+          "next_shard",
+          "completed_shards",
+          "sql_bytes"
+        ]
+      },
+      "MigrationsResponse": {
+        "type": "object",
+        "properties": {
+          "schema_generation": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])$"
+          },
+          "active": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MigrationResponse"
+              }
+            ]
+          },
+          "latest_complete": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MigrationResponse"
+              }
+            ]
+          }
+        },
+        "required": [
+          "schema_generation",
+          "active",
+          "latest_complete"
+        ]
+      },
+      "ProblemDetails": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "QueryColumn": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "data_type": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "null",
+              "boolean",
+              "int64",
+              "uint64",
+              "float64",
+              "decimal",
+              "text",
+              "binary"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "data_type"
+        ]
+      },
+      "QueryRequest": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/LegacyQueryRequest"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessQueryRequest"
+          }
+        ]
+      },
+      "QueryResponse": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/LegacySingleShardQueryResponse"
+          },
+          {
+            "$ref": "#/components/schemas/LegacyMultiShardQueryResponse"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessSingleShardQueryResponse"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessMultiShardQueryResponse"
+          }
+        ]
+      },
+      "QueryResultLimits": {
+        "type": "object",
+        "minProperties": 1,
+        "properties": {
+          "max_rows": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000
+          },
+          "max_logical_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1073741824
+          }
+        },
+        "additionalProperties": false,
+        "x-briskdb-number-token-limit": "max_rows and max_logical_bytes require unsigned-integer JSON token spelling; JSON Schema validators may also accept mathematically integral decimal or exponent tokens."
+      },
+      "ReadinessResponse": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ReadyResponse"
+          },
+          {
+            "$ref": "#/components/schemas/NotReadyResponse"
+          }
+        ]
+      },
+      "ShardStatus": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 63
+          },
+          "state": {
+            "type": "string",
+            "const": "ready"
+          }
+        },
+        "required": [
+          "id",
+          "state"
+        ]
+      },
+      "ShardStatusResponse": {
+        "type": "object",
+        "properties": {
+          "schema_generation": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])$"
+          },
+          "shards": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ShardStatus"
+            },
+            "minItems": 2,
+            "maxItems": 64,
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "schema_generation",
+          "shards"
+        ]
+      },
+      "ValueEncoding": {
+        "type": "string",
+        "enum": [
+          "legacy-json-v1",
+          "lossless-json-v1"
+        ],
+        "default": "legacy-json-v1"
+      },
+      "OpaqueId": {
+        "allOf": [
+          {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          {
+            "not": {
+              "const": "00000000000000000000000000000000"
+            }
+          }
+        ],
+        "examples": [
+          "0123456789abcdef0123456789abcdef"
+        ]
+      },
+      "LegacyJsonValue": {
+        "$ref": "#/components/schemas/LegacyJsonParameter",
+        "description": "The legacy parameter codec accepts recursively nested JSON and binds arrays and objects as compact JSON text."
+      },
+      "LegacyJsonParameter": {
+        "description": "One legacy-json-v1 request parameter. Integer tokens fit i64 or u64; fractional or exponent tokens must convert to finite binary64. JSON Schema validation cannot retain the original number token spelling, so its numeric schema accepts every value whose conversion rounds to a finite binary64 value.",
+        "oneOf": [
+          {
+            "type": "null"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "$ref": "#/components/schemas/LegacyJsonParameterNumber"
+          },
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LegacyJsonParameter"
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/LegacyJsonParameter"
+            }
+          }
+        ],
+        "x-briskdb-number-token-limit": "JSON Schema sees numeric value, while the decoder also distinguishes integer tokens from fractional or exponent tokens."
+      },
+      "LegacyJsonParameterNumber": {
+        "description": "A legacy request JSON number whose conversion rounds to a finite binary64 value. The decoder additionally restricts bare integer tokens to i64 or u64.",
+        "type": "number",
+        "exclusiveMinimum": -179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792,
+        "exclusiveMaximum": 179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792
+      },
+      "LegacyJsonNumber": {
+        "description": "A legacy result JSON number within the finite binary64 range.",
+        "type": "number",
+        "minimum": -1.7976931348623157e+308,
+        "maximum": 1.7976931348623157e+308
+      },
+      "LegacyJsonCell": {
+        "description": "One legacy-json-v1 result cell. A byte array represents Binary; objects and nested arrays are never emitted.",
+        "oneOf": [
+          {
+            "type": "null"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "$ref": "#/components/schemas/LegacyJsonNumber"
+          },
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            }
+          }
+        ]
+      },
+      "LosslessJsonValue": {
+        "description": "One canonical lossless-json-v1 BriskDB value.",
+        "oneOf": [
+          {
+            "type": "null"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "string"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessInt64"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessUInt64"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessFloat64"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessDecimal"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessBinary"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessInvalidText"
+          }
+        ]
+      },
+      "LosslessInt64": {
+        "type": "object",
+        "properties": {
+          "$briskdb_type": {
+            "type": "string",
+            "const": "int64"
+          },
+          "value": {
+            "type": "string",
+            "oneOf": [
+              {
+                "pattern": "^(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$"
+              },
+              {
+                "pattern": "^-(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-7]|9223372036854775808)$"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "$briskdb_type",
+          "value"
+        ]
+      },
+      "LosslessUInt64": {
+        "type": "object",
+        "properties": {
+          "$briskdb_type": {
+            "type": "string",
+            "const": "uint64"
+          },
+          "value": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-4]|18446744073709551615)$"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "$briskdb_type",
+          "value"
+        ]
+      },
+      "LosslessFloat64": {
+        "type": "object",
+        "properties": {
+          "$briskdb_type": {
+            "type": "string",
+            "const": "float64"
+          },
+          "value": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{16}$"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "$briskdb_type",
+          "value"
+        ]
+      },
+      "LosslessDecimal": {
+        "type": "object",
+        "properties": {
+          "$briskdb_type": {
+            "type": "string",
+            "const": "decimal"
+          },
+          "value": {
+            "type": "string",
+            "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "$briskdb_type",
+          "value"
+        ]
+      },
+      "LosslessBinary": {
+        "type": "object",
+        "properties": {
+          "$briskdb_type": {
+            "type": "string",
+            "const": "binary"
+          },
+          "value": {
+            "type": "string",
+            "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/][AQgw]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=)?$"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "$briskdb_type",
+          "value"
+        ]
+      },
+      "LosslessInvalidText": {
+        "type": "object",
+        "properties": {
+          "$briskdb_type": {
+            "type": "string",
+            "const": "invalid_text"
+          },
+          "value": {
+            "type": "string",
+            "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/][AQgw]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=)?$"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "$briskdb_type",
+          "value"
+        ]
+      },
+      "LegacyExecuteRequest": {
+        "type": "object",
+        "properties": {
+          "shard_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sql": {
+            "type": "string"
+          },
+          "params": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LegacyJsonParameter"
+            },
+            "default": []
+          },
+          "value_encoding": {
+            "type": "string",
+            "const": "legacy-json-v1",
+            "default": "legacy-json-v1"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "sql"
+        ]
+      },
+      "LosslessExecuteRequest": {
+        "type": "object",
+        "properties": {
+          "shard_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sql": {
+            "type": "string"
+          },
+          "params": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LosslessJsonValue"
+            },
+            "default": []
+          },
+          "value_encoding": {
+            "type": "string",
+            "const": "lossless-json-v1"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "sql",
+          "value_encoding"
+        ]
+      },
+      "LegacyQueryRequest": {
+        "type": "object",
+        "properties": {
+          "shard_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sql": {
+            "type": "string"
+          },
+          "params": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LegacyJsonParameter"
+            },
+            "default": []
+          },
+          "value_encoding": {
+            "type": "string",
+            "const": "legacy-json-v1",
+            "default": "legacy-json-v1"
+          },
+          "result_limits": {
+            "$ref": "#/components/schemas/QueryResultLimits"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "sql"
+        ]
+      },
+      "LosslessQueryRequest": {
+        "type": "object",
+        "properties": {
+          "shard_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sql": {
+            "type": "string"
+          },
+          "params": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LosslessJsonValue"
+            },
+            "default": []
+          },
+          "value_encoding": {
+            "type": "string",
+            "const": "lossless-json-v1"
+          },
+          "result_limits": {
+            "$ref": "#/components/schemas/QueryResultLimits"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "sql",
+          "value_encoding"
+        ]
+      },
+      "LegacySingleShardQueryResponse": {
+        "type": "object",
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryColumn"
+            }
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/LegacyJsonCell"
+              }
+            },
+            "maxItems": 1000000
+          },
+          "shard": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 63
+          }
+        },
+        "required": [
+          "columns",
+          "rows",
+          "shard"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "shards"
+              ]
+            },
+            {
+              "required": [
+                "value_encoding"
+              ]
+            }
+          ]
+        }
+      },
+      "LegacyMultiShardQueryResponse": {
+        "type": "object",
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryColumn"
+            }
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/LegacyJsonCell"
+              }
+            },
+            "maxItems": 1000000
+          },
+          "shards": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 63
+            }
+          }
+        },
+        "required": [
+          "columns",
+          "rows",
+          "shards"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "shard"
+              ]
+            },
+            {
+              "required": [
+                "value_encoding"
+              ]
+            }
+          ]
+        }
+      },
+      "LosslessSingleShardQueryResponse": {
+        "type": "object",
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryColumn"
+            }
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/LosslessJsonValue"
+              }
+            },
+            "maxItems": 1000000
+          },
+          "shard": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 63
+          },
+          "value_encoding": {
+            "type": "string",
+            "const": "lossless-json-v1"
+          }
+        },
+        "required": [
+          "columns",
+          "rows",
+          "shard",
+          "value_encoding"
+        ],
+        "not": {
+          "required": [
+            "shards"
+          ]
+        }
+      },
+      "LosslessMultiShardQueryResponse": {
+        "type": "object",
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryColumn"
+            }
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/LosslessJsonValue"
+              }
+            },
+            "maxItems": 1000000
+          },
+          "shards": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 63
+            }
+          },
+          "value_encoding": {
+            "type": "string",
+            "const": "lossless-json-v1"
+          }
+        },
+        "required": [
+          "columns",
+          "rows",
+          "shards",
+          "value_encoding"
+        ],
+        "not": {
+          "required": [
+            "shard"
+          ]
+        }
+      },
+      "LegacySingleShardStreamMeta": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "meta"
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryColumn"
+            }
+          },
+          "shard": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 63
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "columns",
+          "shard"
+        ]
+      },
+      "LegacyMultiShardStreamMeta": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "meta"
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryColumn"
+            }
+          },
+          "shards": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 63
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "columns",
+          "shards"
+        ]
+      },
+      "LosslessSingleShardStreamMeta": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "meta"
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryColumn"
+            }
+          },
+          "shard": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 63
+          },
+          "value_encoding": {
+            "type": "string",
+            "const": "lossless-json-v1"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "columns",
+          "shard",
+          "value_encoding"
+        ]
+      },
+      "LosslessMultiShardStreamMeta": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "meta"
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryColumn"
+            }
+          },
+          "shards": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 63
+            }
+          },
+          "value_encoding": {
+            "type": "string",
+            "const": "lossless-json-v1"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "columns",
+          "shards",
+          "value_encoding"
+        ]
+      },
+      "ReadyResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "ready"
+          },
+          "ready": {
+            "type": "boolean",
+            "const": true
+          },
+          "reasons": {
+            "type": "array",
+            "prefixItems": [],
+            "items": false,
+            "minItems": 0,
+            "maxItems": 0
+          },
+          "engine_state": {
+            "type": "string",
+            "const": "running"
+          },
+          "schema_state": {
+            "type": "string",
+            "const": "ready"
+          },
+          "schema_generation": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])$"
+          },
+          "active_schema_operations": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          }
+        },
+        "required": [
+          "status",
+          "ready",
+          "reasons",
+          "engine_state",
+          "schema_state",
+          "schema_generation",
+          "active_schema_operations"
+        ]
+      },
+      "NotReadyResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "not_ready"
+          },
+          "ready": {
+            "type": "boolean",
+            "const": false
+          },
+          "reasons": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "engine_draining",
+                "engine_stopped",
+                "schema_migrating",
+                "schema_recovery_pending",
+                "schema_degraded"
+              ]
+            }
+          },
+          "engine_state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "draining",
+              "stopped"
+            ]
+          },
+          "schema_state": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "migrating",
+              "pending",
+              "degraded"
+            ]
+          },
+          "schema_generation": {
+            "type": "string",
+            "pattern": "^(?:0|[1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])$"
+          },
+          "active_schema_operations": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          }
+        },
+        "required": [
+          "status",
+          "ready",
+          "reasons",
+          "engine_state",
+          "schema_state",
+          "schema_generation",
+          "active_schema_operations"
+        ],
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "engine_state",
+              "schema_state",
+              "reasons"
+            ],
+            "properties": {
+              "engine_state": {
+                "type": "string",
+                "const": "running"
+              },
+              "schema_state": {
+                "type": "string",
+                "const": "migrating"
+              },
+              "reasons": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string",
+                    "const": "schema_migrating"
+                  }
+                ],
+                "items": false,
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "engine_state",
+              "schema_state",
+              "reasons"
+            ],
+            "properties": {
+              "engine_state": {
+                "type": "string",
+                "const": "running"
+              },
+              "schema_state": {
+                "type": "string",
+                "const": "pending"
+              },
+              "reasons": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string",
+                    "const": "schema_recovery_pending"
+                  }
+                ],
+                "items": false,
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "engine_state",
+              "schema_state",
+              "reasons"
+            ],
+            "properties": {
+              "engine_state": {
+                "type": "string",
+                "const": "running"
+              },
+              "schema_state": {
+                "type": "string",
+                "const": "degraded"
+              },
+              "reasons": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string",
+                    "const": "schema_degraded"
+                  }
+                ],
+                "items": false,
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "engine_state",
+              "schema_state",
+              "reasons"
+            ],
+            "properties": {
+              "engine_state": {
+                "type": "string",
+                "const": "draining"
+              },
+              "schema_state": {
+                "type": "string",
+                "const": "ready"
+              },
+              "reasons": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string",
+                    "const": "engine_draining"
+                  }
+                ],
+                "items": false,
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "engine_state",
+              "schema_state",
+              "reasons"
+            ],
+            "properties": {
+              "engine_state": {
+                "type": "string",
+                "const": "draining"
+              },
+              "schema_state": {
+                "type": "string",
+                "const": "migrating"
+              },
+              "reasons": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string",
+                    "const": "engine_draining"
+                  },
+                  {
+                    "type": "string",
+                    "const": "schema_migrating"
+                  }
+                ],
+                "items": false,
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "engine_state",
+              "schema_state",
+              "reasons"
+            ],
+            "properties": {
+              "engine_state": {
+                "type": "string",
+                "const": "draining"
+              },
+              "schema_state": {
+                "type": "string",
+                "const": "pending"
+              },
+              "reasons": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string",
+                    "const": "engine_draining"
+                  },
+                  {
+                    "type": "string",
+                    "const": "schema_recovery_pending"
+                  }
+                ],
+                "items": false,
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "engine_state",
+              "schema_state",
+              "reasons"
+            ],
+            "properties": {
+              "engine_state": {
+                "type": "string",
+                "const": "draining"
+              },
+              "schema_state": {
+                "type": "string",
+                "const": "degraded"
+              },
+              "reasons": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string",
+                    "const": "engine_draining"
+                  },
+                  {
+                    "type": "string",
+                    "const": "schema_degraded"
+                  }
+                ],
+                "items": false,
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "engine_state",
+              "schema_state",
+              "reasons"
+            ],
+            "properties": {
+              "engine_state": {
+                "type": "string",
+                "const": "stopped"
+              },
+              "schema_state": {
+                "type": "string",
+                "const": "ready"
+              },
+              "reasons": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string",
+                    "const": "engine_stopped"
+                  }
+                ],
+                "items": false,
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "engine_state",
+              "schema_state",
+              "reasons"
+            ],
+            "properties": {
+              "engine_state": {
+                "type": "string",
+                "const": "stopped"
+              },
+              "schema_state": {
+                "type": "string",
+                "const": "migrating"
+              },
+              "reasons": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string",
+                    "const": "engine_stopped"
+                  },
+                  {
+                    "type": "string",
+                    "const": "schema_migrating"
+                  }
+                ],
+                "items": false,
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "engine_state",
+              "schema_state",
+              "reasons"
+            ],
+            "properties": {
+              "engine_state": {
+                "type": "string",
+                "const": "stopped"
+              },
+              "schema_state": {
+                "type": "string",
+                "const": "pending"
+              },
+              "reasons": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string",
+                    "const": "engine_stopped"
+                  },
+                  {
+                    "type": "string",
+                    "const": "schema_recovery_pending"
+                  }
+                ],
+                "items": false,
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "engine_state",
+              "schema_state",
+              "reasons"
+            ],
+            "properties": {
+              "engine_state": {
+                "type": "string",
+                "const": "stopped"
+              },
+              "schema_state": {
+                "type": "string",
+                "const": "degraded"
+              },
+              "reasons": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string",
+                    "const": "engine_stopped"
+                  },
+                  {
+                    "type": "string",
+                    "const": "schema_degraded"
+                  }
+                ],
+                "items": false,
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          }
+        ]
+      },
+      "QueryStreamMeta": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/LegacySingleShardStreamMeta"
+          },
+          {
+            "$ref": "#/components/schemas/LegacyMultiShardStreamMeta"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessSingleShardStreamMeta"
+          },
+          {
+            "$ref": "#/components/schemas/LosslessMultiShardStreamMeta"
+          }
+        ]
+      },
+      "QueryStreamRow": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "row"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/LegacyJsonCell"
+                },
+                {
+                  "$ref": "#/components/schemas/LosslessJsonValue"
+                }
+              ]
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "values"
+        ]
+      },
+      "QueryStreamComplete": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "complete"
+          },
+          "rows": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "rows"
+        ]
+      },
+      "QueryStreamError": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "error"
+          },
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "QueryStreamRecord": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/QueryStreamMeta"
+          },
+          {
+            "$ref": "#/components/schemas/QueryStreamRow"
+          },
+          {
+            "$ref": "#/components/schemas/QueryStreamComplete"
+          },
+          {
+            "$ref": "#/components/schemas/QueryStreamError"
+          }
+        ]
+      },
+      "CatalogShardedPlacement": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "sharded"
+          },
+          "shard_key": {
+            "$ref": "#/components/schemas/CatalogShardKey"
+          }
+        },
+        "required": [
+          "kind",
+          "shard_key"
+        ]
+      },
+      "CatalogUnshardedPlacement": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "global",
+              "catalog",
+              "unknown"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "not": {
+          "required": [
+            "shard_key"
+          ]
+        }
+      },
+      "CatalogGeneratedIdDisabled": {
+        "type": "object",
+        "properties": {
+          "policy": {
+            "type": "string",
+            "enum": [
+              "none",
+              "unknown"
+            ]
+          }
+        },
+        "required": [
+          "policy"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "column"
+              ]
+            },
+            {
+              "required": [
+                "encoding_version"
+              ]
+            }
+          ]
+        }
+      },
+      "CatalogGeneratedIdEnabled": {
+        "type": "object",
+        "properties": {
+          "policy": {
+            "type": "string",
+            "enum": [
+              "native_range_v1",
+              "hilo_v1"
+            ]
+          },
+          "column": {
+            "type": "string"
+          },
+          "encoding_version": {
+            "type": "integer",
+            "const": 1
+          }
+        },
+        "required": [
+          "policy",
+          "column",
+          "encoding_version"
+        ]
+      },
+      "ProblemDetails400": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 400
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails403": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 403
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails404": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 404
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails405": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 405
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails409": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 409
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails413": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 413
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails415": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 415
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails422": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 422
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails500": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 500
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails501": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 501
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails503": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 503
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails504": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 504
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      },
+      "ProblemDetails507": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "const": 507
+          },
+          "detail": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code"
+        ]
+      }
+    },
+    "parameters": {
+      "BriskDBRequestId": {
+        "name": "BriskDB-Request-ID",
+        "in": "header",
+        "required": false,
+        "description": "Optional caller-supplied correlation ID. It must occur exactly once and use the canonical nonzero 128-bit lowercase hexadecimal form.",
+        "schema": {
+          "$ref": "#/components/schemas/OpaqueId"
+        }
+      },
+      "BriskDBIdempotencyKey": {
+        "name": "BriskDB-Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "description": "Optional durable idempotency key for an eligible exact-target direct autocommit DML request.",
+        "schema": {
+          "$ref": "#/components/schemas/OpaqueId"
+        }
+      }
+    },
+    "headers": {
+      "BriskDBApiVersion": {
+        "description": "Version of the HTTP representation contract.",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "const": "1"
+        }
+      },
+      "BriskDBRequestId": {
+        "description": "Canonical request correlation ID supplied or generated for this attempt.",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/OpaqueId"
+        }
+      },
+      "BriskDBIdempotencyStatus": {
+        "description": "Present only for a successfully created or replayed durable idempotency receipt.",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "created",
+            "replayed"
+          ]
+        }
+      },
+      "ContentLength": {
+        "description": "The size of the corresponding GET representation; a HEAD response carries no body.",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      },
+      "Allow": {
+        "description": "Methods accepted by the matched HTTP v1 route family.",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "GET,HEAD",
+            "POST"
+          ]
+        }
+      }
+    },
+    "responses": {
+      "Problem400": {
+        "description": "Invalid request or argument",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails400"
+            }
+          }
+        }
+      },
+      "Problem403": {
+        "description": "Permission denied or read-only storage",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails403"
+            }
+          }
+        }
+      },
+      "Problem404": {
+        "description": "Resource not found",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails404"
+            }
+          }
+        }
+      },
+      "Problem405": {
+        "description": "Method not allowed",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          },
+          "Allow": {
+            "$ref": "#/components/headers/Allow"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails405"
+            }
+          }
+        }
+      },
+      "Problem409": {
+        "description": "State or constraint conflict",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails409"
+            }
+          }
+        }
+      },
+      "Problem413": {
+        "description": "Request body too large",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails413"
+            }
+          }
+        }
+      },
+      "Problem415": {
+        "description": "Unsupported request media type",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails415"
+            }
+          }
+        }
+      },
+      "Problem422": {
+        "description": "Unprocessable value, query, type, or limit",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails422"
+            }
+          }
+        }
+      },
+      "Problem500": {
+        "description": "Cancelled request, corruption, or internal error",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails500"
+            }
+          }
+        }
+      },
+      "Problem501": {
+        "description": "Unsupported operation or globally rejected request control",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails501"
+            }
+          }
+        }
+      },
+      "Problem503": {
+        "description": "Storage, memory, contention, or shutdown unavailable",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails503"
+            }
+          }
+        }
+      },
+      "Problem504": {
+        "description": "Request deadline exceeded",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails504"
+            }
+          }
+        }
+      },
+      "Problem507": {
+        "description": "Storage full",
+        "headers": {
+          "BriskDB-API-Version": {
+            "$ref": "#/components/headers/BriskDBApiVersion"
+          },
+          "BriskDB-Request-ID": {
+            "$ref": "#/components/headers/BriskDBRequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails507"
+            }
+          }
+        }
+      }
+    }
+  },
+  "x-briskdb-engine-errors": [
+    {
+      "code": "invalid_argument",
+      "status": 400,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#invalid-argument",
+      "title": "Invalid argument",
+      "detail": "The request contains an invalid argument."
+    },
+    {
+      "code": "numeric_out_of_range",
+      "status": 422,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#numeric-out-of-range",
+      "title": "Numeric value out of range",
+      "detail": "A numeric value is outside the supported range."
+    },
+    {
+      "code": "invalid_text_encoding",
+      "status": 422,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#invalid-text-encoding",
+      "title": "Invalid text encoding",
+      "detail": "A text value has an unsupported encoding."
+    },
+    {
+      "code": "invalid_query",
+      "status": 422,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#invalid-query",
+      "title": "Invalid query",
+      "detail": "The query could not be processed."
+    },
+    {
+      "code": "unsupported",
+      "status": 501,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#unsupported",
+      "title": "Unsupported operation",
+      "detail": "The requested operation is not supported."
+    },
+    {
+      "code": "failed_precondition",
+      "status": 409,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#failed-precondition",
+      "title": "Failed precondition",
+      "detail": "The operation cannot run in the current state."
+    },
+    {
+      "code": "idempotency_conflict",
+      "status": 409,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#idempotency-conflict",
+      "title": "Idempotency key conflict",
+      "detail": "The idempotency key was already used for a different operation."
+    },
+    {
+      "code": "transaction_aborted",
+      "status": 409,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#transaction-aborted",
+      "title": "Transaction aborted",
+      "detail": "The transaction is aborted; roll it back before continuing."
+    },
+    {
+      "code": "type_mismatch",
+      "status": 422,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#type-mismatch",
+      "title": "Type mismatch",
+      "detail": "A value has an incompatible type."
+    },
+    {
+      "code": "constraint_violation",
+      "status": 409,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#constraint-violation",
+      "title": "Constraint violation",
+      "detail": "A database constraint was violated."
+    },
+    {
+      "code": "unique_violation",
+      "status": 409,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#unique-violation",
+      "title": "Unique constraint violation",
+      "detail": "A unique constraint was violated."
+    },
+    {
+      "code": "not_null_violation",
+      "status": 409,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#not-null-violation",
+      "title": "Not-null constraint violation",
+      "detail": "A not-null constraint was violated."
+    },
+    {
+      "code": "foreign_key_violation",
+      "status": 409,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#foreign-key-violation",
+      "title": "Foreign-key constraint violation",
+      "detail": "A foreign-key constraint was violated."
+    },
+    {
+      "code": "check_violation",
+      "status": 409,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#check-violation",
+      "title": "Check constraint violation",
+      "detail": "A check constraint was violated."
+    },
+    {
+      "code": "permission_denied",
+      "status": 403,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#permission-denied",
+      "title": "Permission denied",
+      "detail": "The operation is not permitted."
+    },
+    {
+      "code": "read_only",
+      "status": 403,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#read-only",
+      "title": "Read-only storage",
+      "detail": "The storage is read-only."
+    },
+    {
+      "code": "busy",
+      "status": 503,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#busy",
+      "title": "Database busy",
+      "detail": "The database is busy; retry the operation later."
+    },
+    {
+      "code": "cancelled",
+      "status": 500,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#cancelled",
+      "title": "Request cancelled",
+      "detail": "The operation was cancelled."
+    },
+    {
+      "code": "deadline_exceeded",
+      "status": 504,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#deadline-exceeded",
+      "title": "Request deadline exceeded",
+      "detail": "The operation exceeded its request deadline."
+    },
+    {
+      "code": "limit_exceeded",
+      "status": 422,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#limit-exceeded",
+      "title": "Limit exceeded",
+      "detail": "The request exceeds an engine limit."
+    },
+    {
+      "code": "shutting_down",
+      "status": 503,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#shutting-down",
+      "title": "Server shutting down",
+      "detail": "The server is shutting down and cannot accept the operation."
+    },
+    {
+      "code": "storage_full",
+      "status": 507,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#storage-full",
+      "title": "Storage full",
+      "detail": "The storage has no available space."
+    },
+    {
+      "code": "out_of_memory",
+      "status": 503,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#out-of-memory",
+      "title": "Out of memory",
+      "detail": "The engine does not have enough memory."
+    },
+    {
+      "code": "storage_unavailable",
+      "status": 503,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#storage-unavailable",
+      "title": "Storage unavailable",
+      "detail": "The storage is unavailable."
+    },
+    {
+      "code": "data_corruption",
+      "status": 500,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#data-corruption",
+      "title": "Data corruption",
+      "detail": "Stored data failed an integrity check."
+    },
+    {
+      "code": "internal",
+      "status": 500,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#internal",
+      "title": "Internal error",
+      "detail": "An internal engine error occurred."
+    }
+  ],
+  "x-briskdb-transport-errors": [
+    {
+      "code": "invalid_argument",
+      "status": 400,
+      "type": "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#invalid-argument",
+      "title": "Invalid argument",
+      "detail": "The request contains an invalid argument."
+    },
+    {
+      "code": "request_too_large",
+      "status": 413,
+      "type": "urn:briskdb:http:v1:request-too-large",
+      "title": "Request too large",
+      "detail": "The request body exceeds the HTTP API limit."
+    },
+    {
+      "code": "unsupported_media_type",
+      "status": 415,
+      "type": "urn:briskdb:http:v1:unsupported-media-type",
+      "title": "Unsupported media type",
+      "detail": "The request requires a JSON content type."
+    },
+    {
+      "code": "not_found",
+      "status": 404,
+      "type": "urn:briskdb:http:v1:not-found",
+      "title": "Not found",
+      "detail": "The requested API endpoint does not exist."
+    },
+    {
+      "code": "method_not_allowed",
+      "status": 405,
+      "type": "urn:briskdb:http:v1:method-not-allowed",
+      "title": "Method not allowed",
+      "detail": "The method is not supported by this API endpoint."
+    }
+  ],
+  "x-briskdb-wire-contract": {
+    "maxRequestBytes": 2097152,
+    "requestObjectsRejectUnknownAndDuplicateMembers": true,
+    "requestControlHeadersRequireOneCanonicalValue": true,
+    "openapiCannotValidateDuplicateJsonMembersOrRawHeaderMultiplicity": true,
+    "idempotencyStatusHeaderIsConditional": true
+  }
+}

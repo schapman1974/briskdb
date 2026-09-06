@@ -9,74 +9,66 @@ use axum::{
     http::{HeaderValue, StatusCode, request::Parts},
     middleware,
     response::{IntoResponse, Response},
-    routing::{any, get, post},
+    routing::{any, get},
 };
 use serde::{
     Deserialize, Serialize,
     de::{DeserializeOwned, IgnoredAny, MapAccess, Visitor},
 };
 use serde_json::value::RawValue;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::{
     HttpState, IDEMPOTENCY_KEY_HEADER_NAME, ProblemDetails, REQUEST_ID_HEADER_NAME,
-    STREAM_MEDIA_TYPE, active_queries, backup_capability, broadcast, cancel_query, catalog,
-    checkpoint, execute, global_indexes, health, migration, migrations, problem_response, query,
-    query_stream, ready, shard_status,
+    STREAM_MEDIA_TYPE, problem_response,
 };
 
-const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+pub(super) const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn routes() -> Router<HttpState> {
-    versioned_routes(
-        Router::new()
-            .route("/", get(discovery))
-            .route("/health", get(health))
-            .route("/ready", get(ready))
-            .route("/execute", post(execute))
-            .route("/query", post(query))
-            .route("/query/stream", post(query_stream))
-            .route("/admin/broadcast", post(broadcast))
-            .route("/admin/global-indexes", get(global_indexes))
-            .route("/admin/catalog", get(catalog))
-            .route("/admin/migrations", get(migrations))
-            .route("/admin/migrations/{target_generation}", get(migration))
-            .route("/admin/shards", get(shard_status))
-            .route("/admin/queries", get(active_queries))
-            .route("/admin/queries/{query_id}/cancel", post(cancel_query))
-            .route("/admin/backup", get(backup_capability))
-            .route("/admin/maintenance/checkpoint", post(checkpoint)),
-        true,
-    )
+    let endpoints: Router<HttpState> = annotated_data_routes()
+        .merge(annotated_admin_routes())
+        .into();
+    versioned_routes(endpoints, true)
 }
 
 pub(super) fn data_routes() -> Router<HttpState> {
-    versioned_routes(
-        Router::new()
-            .route("/", get(discovery))
-            .route("/execute", post(execute))
-            .route("/query", post(query))
-            .route("/query/stream", post(query_stream)),
-        true,
-    )
+    versioned_routes(annotated_data_routes().into(), true)
 }
 
 pub(super) fn admin_routes() -> Router<HttpState> {
-    versioned_routes(
-        Router::new()
-            .route("/health", get(health))
-            .route("/ready", get(ready))
-            .route("/admin/broadcast", post(broadcast))
-            .route("/admin/global-indexes", get(global_indexes))
-            .route("/admin/catalog", get(catalog))
-            .route("/admin/migrations", get(migrations))
-            .route("/admin/migrations/{target_generation}", get(migration))
-            .route("/admin/shards", get(shard_status))
-            .route("/admin/queries", get(active_queries))
-            .route("/admin/queries/{query_id}/cancel", post(cancel_query))
-            .route("/admin/backup", get(backup_capability))
-            .route("/admin/maintenance/checkpoint", post(checkpoint)),
-        false,
-    )
+    versioned_routes(annotated_admin_routes().into(), false)
+}
+
+pub(super) fn openapi() -> utoipa::openapi::OpenApi {
+    annotated_data_routes()
+        .merge(annotated_admin_routes())
+        .into_openapi()
+}
+
+fn annotated_data_routes() -> OpenApiRouter<HttpState> {
+    OpenApiRouter::new()
+        .routes(routes!(discovery))
+        .routes(routes!(super::execute))
+        .routes(routes!(super::query))
+        .routes(routes!(super::query_stream))
+}
+
+fn annotated_admin_routes() -> OpenApiRouter<HttpState> {
+    OpenApiRouter::new()
+        .routes(routes!(super::health))
+        .routes(routes!(super::ready))
+        .routes(routes!(super::broadcast))
+        .routes(routes!(super::global_indexes))
+        .routes(routes!(super::catalog))
+        .routes(routes!(super::migrations))
+        .routes(routes!(super::migration))
+        .routes(routes!(super::shard_status))
+        .routes(routes!(super::active_queries))
+        .routes(routes!(super::cancel_query))
+        .routes(routes!(super::backup_capability))
+        .routes(routes!(super::checkpoint))
 }
 
 fn versioned_routes(
@@ -106,8 +98,8 @@ async fn version_header(mut response: Response) -> Response {
     response
 }
 
-#[derive(Serialize)]
-struct ApiVersion {
+#[derive(Serialize, ToSchema)]
+pub(super) struct ApiVersion {
     api_version: &'static str,
     value_encoding: ValueEncoding,
     supported_value_encodings: [ValueEncoding; 2],
@@ -122,7 +114,14 @@ struct ApiVersion {
     stream_media_type: &'static str,
 }
 
-async fn discovery(
+#[utoipa::path(
+    get,
+    path = "/",
+    operation_id = "getApiVersion",
+    tag = "data",
+    responses((status = 200, description = "HTTP API version", body = ApiVersion))
+)]
+pub(super) async fn discovery(
     axum::extract::State(state): axum::extract::State<HttpState>,
 ) -> Json<ApiVersion> {
     let result_limits = state.engine.options().result_limits();
@@ -142,7 +141,7 @@ async fn discovery(
     })
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 pub(super) enum ValueEncoding {
     #[default]
     #[serde(rename = "legacy-json-v1")]
@@ -172,26 +171,28 @@ impl RawJsonParameter {
 /// Execute envelope; each handler creates a fresh core Session and Statement.
 /// Unknown fields must fail rather than silently ignoring a client's routing,
 /// transaction, dialect, value-encoding, or request-control expectations.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ExecuteRequest {
     #[serde(default)]
     pub(super) shard_key: Option<String>,
     pub(super) sql: String,
     #[serde(default)]
+    #[schema(value_type = Vec<serde_json::Value>)]
     pub(super) params: Vec<RawJsonParameter>,
     #[serde(default)]
     pub(super) value_encoding: ValueEncoding,
 }
 
 /// Query envelope with optional protocol-neutral result-limit narrowing.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct QueryRequest {
     #[serde(default)]
     pub(super) shard_key: Option<String>,
     pub(super) sql: String,
     #[serde(default)]
+    #[schema(value_type = Vec<serde_json::Value>)]
     pub(super) params: Vec<RawJsonParameter>,
     #[serde(default)]
     pub(super) value_encoding: ValueEncoding,
@@ -206,7 +207,7 @@ where
     QueryResultLimits::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct QueryResultLimits {
     #[serde(default, deserialize_with = "deserialize_optional_u64")]
@@ -222,13 +223,13 @@ where
     u64::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct BroadcastRequest {
     pub(super) sql: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, ToSchema)]
 pub(super) struct EmptyRequest;
 
 impl<'de> Deserialize<'de> for EmptyRequest {
@@ -328,6 +329,7 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum TransportError {
     InvalidRequest,
     BodyTooLarge,
@@ -336,55 +338,79 @@ pub(super) enum TransportError {
     MethodNotAllowed,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct TransportErrorMapping {
+    pub(super) status: u16,
+    pub(super) code: &'static str,
+    pub(super) problem_type: &'static str,
+    pub(super) title: &'static str,
+    pub(super) detail: &'static str,
+}
+
+impl TransportError {
+    pub(super) const ALL: [Self; 5] = [
+        Self::InvalidRequest,
+        Self::BodyTooLarge,
+        Self::MediaType,
+        Self::NotFound,
+        Self::MethodNotAllowed,
+    ];
+
+    pub(super) const fn mapping(self) -> TransportErrorMapping {
+        match self {
+            Self::InvalidRequest => {
+                let mapping = crate::protocol::error::http_error(
+                    crate::core::EngineErrorKind::InvalidArgument,
+                );
+                TransportErrorMapping {
+                    status: mapping.status,
+                    code: "invalid_argument",
+                    problem_type: mapping.problem_type,
+                    title: mapping.title,
+                    detail: mapping.detail,
+                }
+            }
+            Self::BodyTooLarge => TransportErrorMapping {
+                status: 413,
+                code: "request_too_large",
+                problem_type: "urn:briskdb:http:v1:request-too-large",
+                title: "Request too large",
+                detail: "The request body exceeds the HTTP API limit.",
+            },
+            Self::MediaType => TransportErrorMapping {
+                status: 415,
+                code: "unsupported_media_type",
+                problem_type: "urn:briskdb:http:v1:unsupported-media-type",
+                title: "Unsupported media type",
+                detail: "The request requires a JSON content type.",
+            },
+            Self::NotFound => TransportErrorMapping {
+                status: 404,
+                code: "not_found",
+                problem_type: "urn:briskdb:http:v1:not-found",
+                title: "Not found",
+                detail: "The requested API endpoint does not exist.",
+            },
+            Self::MethodNotAllowed => TransportErrorMapping {
+                status: 405,
+                code: "method_not_allowed",
+                problem_type: "urn:briskdb:http:v1:method-not-allowed",
+                title: "Method not allowed",
+                detail: "The method is not supported by this API endpoint.",
+            },
+        }
+    }
+}
+
 impl IntoResponse for TransportError {
     fn into_response(self) -> Response {
-        let (status, code, title, detail) = match self {
-            Self::InvalidRequest => (
-                400,
-                "invalid_argument",
-                "Invalid argument",
-                "The request contains an invalid argument.",
-            ),
-            Self::BodyTooLarge => (
-                413,
-                "request_too_large",
-                "Request too large",
-                "The request body exceeds the HTTP API limit.",
-            ),
-            Self::MediaType => (
-                415,
-                "unsupported_media_type",
-                "Unsupported media type",
-                "The request requires a JSON content type.",
-            ),
-            Self::NotFound => (
-                404,
-                "not_found",
-                "Not found",
-                "The requested API endpoint does not exist.",
-            ),
-            Self::MethodNotAllowed => (
-                405,
-                "method_not_allowed",
-                "Method not allowed",
-                "The method is not supported by this API endpoint.",
-            ),
-        };
-        let problem_type = match self {
-            Self::InvalidRequest => {
-                super::http_error(crate::core::EngineErrorKind::InvalidArgument).problem_type
-            }
-            Self::BodyTooLarge => "urn:briskdb:http:v1:request-too-large",
-            Self::MediaType => "urn:briskdb:http:v1:unsupported-media-type",
-            Self::NotFound => "urn:briskdb:http:v1:not-found",
-            Self::MethodNotAllowed => "urn:briskdb:http:v1:method-not-allowed",
-        };
+        let mapping = self.mapping();
         problem_response(ProblemDetails {
-            problem_type,
-            title,
-            status,
-            detail,
-            code,
+            problem_type: mapping.problem_type,
+            title: mapping.title,
+            status: mapping.status,
+            detail: mapping.detail,
+            code: mapping.code,
         })
     }
 }

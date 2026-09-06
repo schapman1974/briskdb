@@ -28,7 +28,7 @@ Command, BSON, plan, and result types live under `briskdb::document`.
 | Feature | Adds | Tier |
 | --- | --- | --- |
 | `embedded` | Listener-free `BriskDb` and `BriskSession` SQL APIs | Alpha-supported |
-| `http` | Separate Axum data/admin routers, versioned materialized/streamed data and operational APIs, request correlation, eligible-write replay, active-query cancellation, and admin browser; combined compatibility router retained | Alpha-supported |
+| `http` | Separate Axum data/admin routers, versioned materialized/streamed data and operational APIs, request correlation, eligible-write replay, active-query cancellation, code-first OpenAPI, and admin browser; combined compatibility router retained | Alpha-supported |
 | `postgres` | PostgreSQL wire adapter, including TLS/SCRAM implementation | Alpha-supported, bounded SQL subset |
 | `listeners` | Host-controlled data HTTP, optional admin HTTP, and optional PostgreSQL listeners, selecting `tls`, without signals or engine ownership | Alpha-supported |
 | `server` | Daemon listener assembly, signal handling, and engine ownership | Process integration |
@@ -45,6 +45,11 @@ Command, BSON, plan, and result types live under `briskdb::document`.
 `embedded`, `http`, and `postgres`; `server` adds process signal handling.
 Applications using adapters directly may select `http` or `postgres` without
 listener assembly.
+The public `briskdb::api::openapi_v1()` function and its optional normal
+OpenAPI dependencies are selected only by `http`; they are absent from an
+`embedded`-only normal dependency graph. CI rejects `utoipa`, `utoipa-axum`,
+or `utoipa-gen` on that edge. Independent document/schema validators remain
+test-only dependencies. See the [OpenAPI artifact contract](OPENAPI.md).
 
 ## Public API tiers
 

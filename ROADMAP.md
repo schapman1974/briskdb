@@ -336,7 +336,10 @@ protocol-specific golden tests only for encoding and state-machine behavior.
   request-local result limits, and bounded HTTP row streaming with stable
   problem-detail errors (issue #54). Retained pagination and global SQL ordering
   remain in Phase 7 issues #58 and #59.
-- [ ] Generate and test an OpenAPI document from the implementation.
+- [x] Generate and test the deterministic code-first OpenAPI 3.1 document for
+  the exact 17-path, 28-operation HTTP v1 machine surface, including explicit
+  listener ownership and shipped Cargo/native/Debian artifact contracts; see
+  [the OpenAPI contract](docs/OPENAPI.md) (issue #55).
 - [ ] Require authentication and role checks; apply TLS or explicitly document
   trusted reverse-proxy termination.
 

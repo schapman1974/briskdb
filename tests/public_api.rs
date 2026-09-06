@@ -325,6 +325,7 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _description: Option<core::PreparedStatementDescription> = None;
     let _prepared_execution: Option<core::PreparedExecution> = None;
     let _legacy_router: fn(Arc<storage::Database>) -> Router = api::router;
+    let _openapi_document: fn() -> serde_json::Value = api::openapi_v1;
     let _http_router: fn(Arc<core::Database>) -> Router = http::router;
     let _engine_router: fn(core::Engine) -> Router = http::router_with_engine;
     let _data_router: fn(Arc<core::Database>) -> Router = http::data_router;

@@ -1,6 +1,7 @@
 //! Versioned HTTP adapter over the protocol-neutral engine.
 
 mod admin;
+mod openapi;
 mod v1;
 
 use std::{
@@ -25,6 +26,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as STANDARD_BASE64};
 use futures::{StreamExt as _, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
+use utoipa::ToSchema;
 use v1::{
     BroadcastRequest, EmptyRequest, ExecuteRequest, QueryRequest, QueryResultLimits,
     RawJsonParameter, TransportError, V1EmptyBody, V1Json, V1Path, ValueEncoding,
@@ -44,6 +46,15 @@ use crate::{
 pub(super) const REQUEST_ID_HEADER_NAME: &str = "BriskDB-Request-ID";
 pub(super) const IDEMPOTENCY_KEY_HEADER_NAME: &str = "BriskDB-Idempotency-Key";
 pub(super) const STREAM_MEDIA_TYPE: &str = "application/x-ndjson; charset=utf-8";
+
+/// Return the deterministic OpenAPI 3.1 document for the versioned HTTP API.
+///
+/// The document describes only `/v1` machine endpoints. It does not describe
+/// the unversioned probes, Prometheus metrics, or embedded administration
+/// browser.
+pub fn openapi_v1() -> JsonValue {
+    openapi::document()
+}
 
 const REQUEST_ID_HEADER: &str = "briskdb-request-id";
 const IDEMPOTENCY_KEY_HEADER: &str = "briskdb-idempotency-key";
@@ -299,7 +310,37 @@ impl HttpState {
     }
 }
 
-async fn health(State(state): State<HttpState>) -> Result<Json<JsonValue>, ApiError> {
+#[derive(Debug, Serialize, ToSchema)]
+struct HealthResponse {
+    status: &'static str,
+    shards: u16,
+    global_indexes: HealthGlobalIndexesResponse,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct HealthGlobalIndexesResponse {
+    state: &'static str,
+    total: usize,
+    healthy: usize,
+    degraded: usize,
+    unavailable: usize,
+    async_lag: u64,
+    retained_outbox_events: u64,
+    retained_outbox_bytes: u64,
+    backpressured_outbox_shards: u16,
+}
+
+#[utoipa::path(
+    get,
+    path = "/health",
+    operation_id = "getHealth",
+    tag = "administration",
+    responses(
+        (status = 200, description = "Engine and global-index health", body = HealthResponse),
+        (status = 500, description = "Engine error", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
+async fn health(State(state): State<HttpState>) -> Result<Json<HealthResponse>, ApiError> {
     let engine = state.engine;
     let session = engine.session();
     let status = engine.status(&session).await?;
@@ -321,24 +362,24 @@ async fn health(State(state): State<HttpState>) -> Result<Json<JsonValue>, ApiEr
         "global-index operational health"
     );
 
-    Ok(Json(json!({
-        "status": service_status,
-        "shards": status.shard_count(),
-        "global_indexes": {
-            "state": indexes.state().code(),
-            "total": indexes.indexes().len(),
-            "healthy": indexes.healthy_indexes(),
-            "degraded": indexes.degraded_indexes(),
-            "unavailable": indexes.unavailable_indexes(),
-            "async_lag": indexes.async_lag(),
-            "retained_outbox_events": indexes.retained_outbox_events(),
-            "retained_outbox_bytes": indexes.retained_outbox_bytes(),
-            "backpressured_outbox_shards": indexes.backpressured_outbox_shards(),
+    Ok(Json(HealthResponse {
+        status: service_status,
+        shards: status.shard_count(),
+        global_indexes: HealthGlobalIndexesResponse {
+            state: indexes.state().code(),
+            total: indexes.indexes().len(),
+            healthy: indexes.healthy_indexes(),
+            degraded: indexes.degraded_indexes(),
+            unavailable: indexes.unavailable_indexes(),
+            async_lag: indexes.async_lag(),
+            retained_outbox_events: indexes.retained_outbox_events(),
+            retained_outbox_bytes: indexes.retained_outbox_bytes(),
+            backpressured_outbox_shards: indexes.backpressured_outbox_shards(),
         },
-    })))
+    }))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ReadinessResponse {
     status: &'static str,
     ready: bool,
@@ -349,6 +390,16 @@ struct ReadinessResponse {
     active_schema_operations: usize,
 }
 
+#[utoipa::path(
+    get,
+    path = "/ready",
+    operation_id = "getReadiness",
+    tag = "administration",
+    responses(
+        (status = 200, description = "Ready", body = ReadinessResponse),
+        (status = 503, description = "Not ready", body = ReadinessResponse)
+    )
+)]
 async fn ready(State(state): State<HttpState>) -> Response {
     let readiness = state.engine.readiness();
     let engine_state = readiness.lifecycle_state();
@@ -403,7 +454,7 @@ async fn metrics(State(state): State<HttpState>) -> Result<Response, ApiError> {
     Ok(response)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CatalogResponse {
     identifier_encoding_version: u32,
     schema_generation: String,
@@ -413,13 +464,13 @@ struct CatalogResponse {
     global_indexes: Vec<CatalogGlobalIndex>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CatalogDb {
     id: String,
     name: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CatalogTable {
     id: String,
     database_id: String,
@@ -428,20 +479,20 @@ struct CatalogTable {
     generated_id: CatalogGeneratedId,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CatalogPlacement {
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     shard_key: Option<CatalogShardKey>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CatalogShardKey {
     column: String,
     data_type: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CatalogGeneratedId {
     policy: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -450,7 +501,7 @@ struct CatalogGeneratedId {
     encoding_version: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CatalogGlobalIndex {
     id: String,
     table_id: String,
@@ -461,6 +512,13 @@ struct CatalogGlobalIndex {
     key_encoding_version: u32,
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/catalog",
+    operation_id = "getCatalog",
+    tag = "administration",
+    responses((status = 200, description = "Relational catalog", body = CatalogResponse))
+)]
 async fn catalog(State(state): State<HttpState>) -> Json<CatalogResponse> {
     let catalog = state.engine.catalog();
     let databases = catalog
@@ -555,14 +613,14 @@ fn catalog_generated_id(policy: &GeneratedIdPolicy) -> CatalogGeneratedId {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct MigrationsResponse {
     schema_generation: String,
     active: Option<MigrationResponse>,
     latest_complete: Option<MigrationResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct MigrationResponse {
     generation: String,
     source_generation: String,
@@ -574,6 +632,16 @@ struct MigrationResponse {
     sql_bytes: usize,
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/migrations",
+    operation_id = "listMigrations",
+    tag = "administration",
+    responses(
+        (status = 200, description = "Migration summary", body = MigrationsResponse),
+        (status = 500, description = "Engine error", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
 async fn migrations(State(state): State<HttpState>) -> Result<Json<MigrationsResponse>, ApiError> {
     let summary = state
         .engine
@@ -586,6 +654,18 @@ async fn migrations(State(state): State<HttpState>) -> Result<Json<MigrationsRes
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/migrations/{target_generation}",
+    operation_id = "getMigration",
+    tag = "administration",
+    params(("target_generation" = String, Path, description = "Canonical positive decimal schema generation")),
+    responses(
+        (status = 200, description = "Migration", body = MigrationResponse),
+        (status = 404, description = "Migration not found", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 500, description = "Engine error", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
 async fn migration(
     State(state): State<HttpState>,
     V1Path(raw_generation): V1Path<String>,
@@ -629,18 +709,28 @@ fn parse_canonical_generation(value: &str) -> Option<u64> {
         .filter(|generation| *generation > 0)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ShardStatusResponse {
     schema_generation: String,
     shards: Vec<ShardStatus>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ShardStatus {
     id: u16,
     state: &'static str,
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/shards",
+    operation_id = "listShards",
+    tag = "administration",
+    responses(
+        (status = 200, description = "Validated physical shards", body = ShardStatusResponse),
+        (status = 500, description = "Engine error", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
 async fn shard_status(
     State(state): State<HttpState>,
 ) -> Result<Json<ShardStatusResponse>, ApiError> {
@@ -662,12 +752,12 @@ async fn shard_status(
     }))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ActiveQueriesResponse {
     queries: Vec<ActiveQueryResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ActiveQueryResponse {
     operation_id: String,
     elapsed_ms: u64,
@@ -675,6 +765,13 @@ struct ActiveQueryResponse {
     cancellation_requested: bool,
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/queries",
+    operation_id = "listActiveQueries",
+    tag = "administration",
+    responses((status = 200, description = "Active HTTP queries", body = ActiveQueriesResponse))
+)]
 async fn active_queries(State(state): State<HttpState>) -> Json<ActiveQueriesResponse> {
     let mut queries = state
         .engine
@@ -691,18 +788,29 @@ async fn active_queries(State(state): State<HttpState>) -> Json<ActiveQueriesRes
     Json(ActiveQueriesResponse { queries })
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CancelQueryResponse {
     operation_id: String,
     newly_requested: bool,
 }
 
+#[utoipa::path(
+    post,
+    path = "/admin/queries/{operation_id}/cancel",
+    operation_id = "cancelQuery",
+    tag = "administration",
+    params(("operation_id" = String, Path, description = "Active query operation ID")),
+    responses(
+        (status = 202, description = "Cancellation requested", body = CancelQueryResponse),
+        (status = 404, description = "Active query not found", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
 async fn cancel_query(
     State(state): State<HttpState>,
-    V1Path(raw_query_id): V1Path<String>,
+    V1Path(raw_operation_id): V1Path<String>,
     _body: V1EmptyBody,
 ) -> Response {
-    let Ok(query_id) = raw_query_id.parse() else {
+    let Ok(query_id) = raw_operation_id.parse() else {
         return TransportError::NotFound.into_response();
     };
     match state.engine.cancel_query(query_id) {
@@ -718,7 +826,7 @@ async fn cancel_query(
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct BackupCapabilityResponse {
     mode: &'static str,
     online: bool,
@@ -728,6 +836,13 @@ struct BackupCapabilityResponse {
     checkpoint_is_recovery_point: bool,
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/backup",
+    operation_id = "getBackupCapability",
+    tag = "administration",
+    responses((status = 200, description = "Backup capability", body = BackupCapabilityResponse))
+)]
 async fn backup_capability() -> Json<BackupCapabilityResponse> {
     Json(BackupCapabilityResponse {
         mode: "stopped_directory_copy",
@@ -739,7 +854,7 @@ async fn backup_capability() -> Json<BackupCapabilityResponse> {
     })
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CheckpointResponse {
     operation: &'static str,
     busy: bool,
@@ -749,7 +864,7 @@ struct CheckpointResponse {
     databases: Vec<CheckpointDbResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CheckpointShardResponse {
     shard: u16,
     busy: bool,
@@ -759,7 +874,7 @@ struct CheckpointShardResponse {
     complete: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CheckpointDbResponse {
     database: &'static str,
     busy: bool,
@@ -769,6 +884,17 @@ struct CheckpointDbResponse {
     complete: bool,
 }
 
+#[utoipa::path(
+    post,
+    path = "/admin/maintenance/checkpoint",
+    operation_id = concat!("checkpoint", "Data", "bases"),
+    tag = "administration",
+    request_body(content = EmptyRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Passive checkpoint report", body = CheckpointResponse),
+        (status = 500, description = "Engine error", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
 async fn checkpoint(
     State(state): State<HttpState>,
     V1Json(_request): V1Json<EmptyRequest>,
@@ -811,7 +937,7 @@ async fn checkpoint(
     }))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct GlobalIndexesResponse {
     state: &'static str,
     retained_outbox_events: u64,
@@ -820,7 +946,7 @@ struct GlobalIndexesResponse {
     indexes: Vec<GlobalIndexStatus>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct GlobalIndexStatus {
     id: String,
     name: String,
@@ -847,7 +973,7 @@ struct GlobalIndexStatus {
     summary_saturated_shards: u16,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ExecuteResponse {
     shard: u16,
     rows_affected: usize,
@@ -855,14 +981,14 @@ struct ExecuteResponse {
     generated_key: Option<ExecuteGeneratedKey>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ExecuteGeneratedKey {
     column: String,
     data_type: &'static str,
     value: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct QueryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     shard: Option<u16>,
@@ -874,13 +1000,13 @@ struct QueryResponse {
     rows: Vec<Vec<JsonValue>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct QueryColumn {
     name: String,
     data_type: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct QueryStreamMeta {
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -892,19 +1018,19 @@ struct QueryStreamMeta {
     columns: Vec<QueryColumn>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct QueryStreamRow {
     kind: &'static str,
     values: Vec<JsonValue>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct QueryStreamComplete {
     kind: &'static str,
     rows: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct QueryStreamError {
     kind: &'static str,
     #[serde(rename = "type")]
@@ -922,6 +1048,17 @@ struct QueryStreamState {
     rows: u64,
 }
 
+#[utoipa::path(
+    post,
+    path = "/execute",
+    operation_id = "executeStatement",
+    tag = "data",
+    request_body(content = ExecuteRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Routed write result", body = ExecuteResponse),
+        (status = 500, description = "Engine or transport error", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
 async fn execute(
     State(state): State<HttpState>,
     Extension(RequestIdempotency(idempotency)): Extension<RequestIdempotency>,
@@ -996,6 +1133,17 @@ fn execute_generated_key(generated: GeneratedKey) -> Result<ExecuteGeneratedKey,
     })
 }
 
+#[utoipa::path(
+    post,
+    path = "/query",
+    operation_id = "queryRows",
+    tag = "data",
+    request_body(content = QueryRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Materialized query result", body = QueryResponse),
+        (status = 500, description = "Engine or transport error", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
 async fn query(
     State(state): State<HttpState>,
     V1Json(request): V1Json<QueryRequest>,
@@ -1029,6 +1177,17 @@ async fn query(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    post,
+    path = "/query/stream",
+    operation_id = "streamQueryRows",
+    tag = "data",
+    request_body(content = QueryRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Bounded NDJSON query stream", body = String, content_type = "application/x-ndjson"),
+        (status = 500, description = "Pre-stream engine or transport error", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
 async fn query_stream(
     State(state): State<HttpState>,
     V1Json(request): V1Json<QueryRequest>,
@@ -1176,16 +1335,44 @@ fn ndjson_line(value: &impl Serialize) -> Bytes {
     Bytes::from(encoded)
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+struct BroadcastResponse {
+    completed_shards: Vec<u16>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/broadcast",
+    operation_id = "broadcastMigration",
+    tag = "administration",
+    request_body(content = BroadcastRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Completed migration shards", body = BroadcastResponse),
+        (status = 500, description = "Engine or transport error", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
 async fn broadcast(
     State(state): State<HttpState>,
     V1Json(request): V1Json<BroadcastRequest>,
-) -> Result<Json<JsonValue>, ApiError> {
+) -> Result<Json<BroadcastResponse>, ApiError> {
     let engine = state.engine;
     let session = engine.session();
     let shards = engine.migrate(&session, request.sql).await?;
-    Ok(Json(json!({"completed_shards": shards})))
+    Ok(Json(BroadcastResponse {
+        completed_shards: shards,
+    }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/global-indexes",
+    operation_id = "getGlobalIndexes",
+    tag = "administration",
+    responses(
+        (status = 200, description = "Global-index operational report", body = GlobalIndexesResponse),
+        (status = 500, description = "Engine error", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
 async fn global_indexes(
     State(state): State<HttpState>,
 ) -> Result<Json<GlobalIndexesResponse>, ApiError> {
@@ -1656,7 +1843,7 @@ impl From<EngineError> for ApiError {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ProblemDetails {
     #[serde(rename = "type")]
     problem_type: &'static str,
@@ -3408,7 +3595,12 @@ mod tests {
         let (production_source, _) = include_str!("http.rs")
             .split_once(&test_module_marker)
             .expect("the HTTP unit-test module has a cfg(test) boundary");
-        let production_source = [production_source, include_str!("http/v1.rs")].concat();
+        let production_source = [
+            production_source,
+            include_str!("http/v1.rs"),
+            include_str!("http/openapi.rs"),
+        ]
+        .concat();
 
         assert_eq!(
             production_source.matches("Database").count(),

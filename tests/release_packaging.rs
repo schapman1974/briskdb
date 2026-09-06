@@ -27,6 +27,8 @@ fn alpha_release_contract_covers_every_native_archive_and_safety_boundary() {
         "Install and smoke-test Debian service",
         "packaging/debian/build-deb.sh",
         "docs/OFFLINE_BACKUP.md",
+        "test -s docs/openapi-v1.json",
+        "$archive/docs/openapi-v1.json",
         "SHA256SUMS",
         "--prerelease",
     ] {
@@ -69,6 +71,33 @@ fn alpha_release_contract_covers_every_native_archive_and_safety_boundary() {
             "current release notes are missing critical boundary: {required}"
         );
     }
+}
+
+#[test]
+fn openapi_artifact_and_generator_are_part_of_the_cargo_contract() {
+    let manifest = include_str!("../Cargo.toml");
+    for required in [
+        "name = \"generate-openapi-v1\"",
+        "path = \"examples/openapi.rs\"",
+        "required-features = [\"http\"]",
+        "\"dep:utoipa\"",
+        "\"dep:utoipa-axum\"",
+        "utoipa = { version = \"=5.5.0\", default-features = false, features = [\"macros\"], optional = true }",
+        "utoipa-axum = { version = \"=0.2.0\", default-features = false, optional = true }",
+        "jsonschema = { version = \"=0.54.0\", default-features = false, features = [\"arbitrary-precision\"] }",
+        "oas3 = \"=0.21.0\"",
+    ] {
+        assert!(
+            manifest.contains(required),
+            "Cargo OpenAPI contract is missing: {required}"
+        );
+    }
+
+    let continuous_integration = include_str!("../.github/workflows/ci.yml");
+    assert!(continuous_integration.contains("cargo package --locked --allow-dirty"));
+    assert!(continuous_integration.contains("utoipa|utoipa-axum|utoipa-gen"));
+    assert!(!include_bytes!("../docs/openapi-v1.json").is_empty());
+    assert!(!include_bytes!("../examples/openapi.rs").is_empty());
 }
 
 #[test]

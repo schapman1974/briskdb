@@ -136,7 +136,9 @@ cancellation, backup-capability, and checkpoint-maintenance endpoints. Issue
 #54 adds plane-wide request IDs, eligible-write idempotency, request-local query
 limits, and bounded HTTP row streaming. It deliberately adds no retained
 pagination cursor or global ordering; those semantics remain in Phase 7 issues
-#58 and #59. Issue #55 owns OpenAPI.
+#58 and #59. The checked [OpenAPI v1 artifact](OPENAPI.md) identifies the owner
+of every versioned operation without describing the excluded unversioned and
+browser routes.
 Issue #56 owns the HTTP authentication and role-check boundary, issue #64 owns
 the durable user/role and credential model, and issue #65 owns listener TLS and
 safe remote activation. Until those land, the separate loopback listeners are

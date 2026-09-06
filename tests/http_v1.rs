@@ -240,6 +240,7 @@ async fn discovery_health_alias_and_head_identify_the_contract() {
         let (status, headers, body) = request(&app, Method::HEAD, uri, None, Body::empty()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers["briskdb-api-version"], "1");
+        assert_eq!(headers["content-type"], "application/json");
         assert_eq!(headers["content-length"], representation_length);
         request_id(&headers);
         assert!(body.is_empty());
@@ -546,6 +547,7 @@ async fn readiness_has_one_exact_versioned_and_unversioned_probe_shape() {
     let head = request(&app, Method::HEAD, "/v1/ready", None, Body::empty()).await;
     assert_eq!(head.0, StatusCode::OK);
     assert_eq!(head.1["briskdb-api-version"], "1");
+    assert_eq!(head.1["content-type"], "application/json");
     assert!(head.2.is_empty());
 
     assert_eq!(
@@ -568,6 +570,16 @@ async fn readiness_has_one_exact_versioned_and_unversioned_probe_shape() {
             "active_schema_operations": 0
         })
     );
+    let unavailable_representation_length = unavailable.2.len().to_string();
+    let unavailable_head = request(&app, Method::HEAD, "/v1/ready", None, Body::empty()).await;
+    assert_eq!(unavailable_head.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(unavailable_head.1["briskdb-api-version"], "1");
+    assert_eq!(unavailable_head.1["content-type"], "application/json");
+    assert_eq!(
+        unavailable_head.1["content-length"],
+        unavailable_representation_length
+    );
+    assert!(unavailable_head.2.is_empty());
     engine.shutdown().await.unwrap();
 }
 
@@ -776,6 +788,7 @@ async fn operational_reports_are_bounded_redacted_and_checkpoint_input_is_strict
         let (status, headers, body) = request(&app, Method::HEAD, uri, None, Body::empty()).await;
         assert_eq!(status, StatusCode::OK, "{uri}");
         assert_eq!(headers["briskdb-api-version"], "1", "{uri}");
+        assert_eq!(headers["content-type"], "application/json", "{uri}");
         assert!(body.is_empty(), "{uri}");
     }
 

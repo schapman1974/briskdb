@@ -71,6 +71,7 @@ PY
 dpkg-deb --info "$package"
 dpkg-deb --contents "$package" | grep -F ./lib/systemd/system/briskdb.service
 dpkg-deb --contents "$package" | grep -F ./etc/default/briskdb
+dpkg-deb --contents "$package" | grep -F ./usr/share/doc/briskdb/docs/openapi-v1.json
 
 sudo env DEBIAN_FRONTEND=noninteractive dpkg -i "$package"
 sudo systemd-analyze verify /lib/systemd/system/briskdb.service

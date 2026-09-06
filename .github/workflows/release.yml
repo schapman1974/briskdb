@@ -142,6 +142,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test -s docs/openapi-v1.json
           archive="briskdb-v${VERSION}-${{ matrix.platform }}"
           mkdir -p "dist/$archive"
           cp "target/${{ matrix.target }}/release/briskdb" "dist/$archive/"
@@ -150,6 +151,7 @@ jobs:
           cp -R docs "dist/$archive/docs"
           tar -C dist -czf "dist/$archive.tar.gz" "$archive"
           tar -tzf "dist/$archive.tar.gz" | grep -F "$archive/docs/OFFLINE_BACKUP.md"
+          tar -tzf "dist/$archive.tar.gz" | grep -F "$archive/docs/openapi-v1.json"
 
       - name: Build Debian package
         if: matrix.deb_architecture != 'none'

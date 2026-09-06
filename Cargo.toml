@@ -30,6 +30,8 @@ http = [
     "dep:serde_json",
     "dep:tower",
     "dep:tracing",
+    "dep:utoipa",
+    "dep:utoipa-axum",
 ]
 postgres = [
     "dep:async-trait",
@@ -130,9 +132,13 @@ tokio-util = { version = "0.7", features = ["codec"], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
+utoipa = { version = "=5.5.0", default-features = false, features = ["macros"], optional = true }
+utoipa-axum = { version = "=0.2.0", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false }
+jsonschema = { version = "=0.54.0", default-features = false, features = ["arbitrary-precision"] }
+oas3 = "=0.21.0"
 postgres-protocol = "=0.6.12"
 proptest = "1.7"
 tempfile = "3.23"
@@ -155,3 +161,8 @@ required-features = ["sqlite-import-cli"]
 [[example]]
 name = "embedded"
 required-features = ["embedded"]
+
+[[example]]
+name = "generate-openapi-v1"
+path = "examples/openapi.rs"
+required-features = ["http"]
