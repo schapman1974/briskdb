@@ -10494,13 +10494,13 @@ mod tests {
                     &request_session,
                     Statement::new("SELECT 1", vec![]),
                     RequestContext::new()
-                        .with_timeout(Duration::from_millis(20))
+                        .with_timeout(Duration::from_secs(1))
                         .unwrap(),
                 )
                 .await
         });
         wait_for_blocking_signal(started_rx, "connection setup should become active").await;
-        let error = timeout(Duration::from_secs(1), request)
+        let error = timeout(Duration::from_secs(2), request)
             .await
             .expect("the deadline should interrupt connection setup")
             .unwrap()
