@@ -397,6 +397,20 @@ struct SourceEntry {
 }
 
 #[derive(Debug)]
+struct SnapshotEntry {
+    source_ordinal: u64,
+    encoded_key: Vec<u8>,
+    source_locator: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotRefresh {
+    Unchanged,
+    Appended(u64),
+    Rebuilt,
+}
+
+#[derive(Debug)]
 struct PhysicalEntry {
     source_shard: u16,
     source_ordinal: u64,
@@ -1427,6 +1441,161 @@ pub(super) fn refresh_unique_write_indexes(
     transaction.commit().map_err(sqlite_error::storage)
 }
 
+/// Repair snapshot-only unique-index changes left behind when a writer dies
+/// after committing its shard transaction but before refreshing global
+/// storage. Coherent checkpoints return without starting a global write
+/// transaction; only observed mismatches enter the serialized repair path.
+pub(super) fn repair_stale_unique_write_snapshots(
+    storage: &Storage,
+    index_ids: &[GlobalIndexId],
+    shard: u16,
+    cancellation: &CancellationToken,
+) -> EngineResult<usize> {
+    if index_ids.is_empty() {
+        return Ok(0);
+    }
+    ensure_authority_not_cancelled(cancellation, "before checking indexed write snapshots")?;
+    if shard >= storage.shard_count() {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            format!(
+                "global-index snapshot shard {shard} is outside 0..{}",
+                storage.shard_count()
+            ),
+        ));
+    }
+    let (mut connection, _) = open_existing(&storage.root)?
+        .ok_or_else(|| corrupt("ready global index has no physical storage"))?;
+    let mut stale = Vec::new();
+    let mut seen = HashSet::new();
+    for index_id in index_ids {
+        if !seen.insert(*index_id) {
+            continue;
+        }
+        ensure_authority_not_cancelled(cancellation, "while checking indexed write snapshots")?;
+        let index = ready_unique_write_index(storage, *index_id)?;
+        validate_physical_authority(&connection, index, storage.shard_count())?;
+        if !source_snapshot_matches(storage, &connection, index, shard, cancellation)? {
+            stale.push(*index_id);
+        }
+    }
+    ensure_authority_not_cancelled(cancellation, "after checking indexed write snapshots")?;
+    if stale.is_empty() {
+        return Ok(0);
+    }
+
+    ensure_authority_not_cancelled(cancellation, "before repairing indexed write snapshots")?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error::storage)?;
+    for index_id in &stale {
+        let index = ready_unique_write_index(storage, *index_id)?;
+        validate_physical_authority(&transaction, index, storage.shard_count())?;
+        refresh_unique_shard_snapshot(storage, &transaction, index, shard, cancellation)?;
+    }
+    ensure_authority_not_cancelled(cancellation, "before committing indexed snapshot repairs")?;
+    transaction.commit().map_err(sqlite_error::storage)?;
+    Ok(stale.len())
+}
+
+fn ready_unique_write_index(
+    storage: &Storage,
+    index_id: GlobalIndexId,
+) -> EngineResult<&GlobalIndexMetadata> {
+    let index = storage
+        .catalog
+        .logical()
+        .global_index_by_id(index_id)
+        .ok_or_else(|| corrupt("indexed write references a missing global index"))?;
+    if !index.is_unique() || index.lifecycle() != GlobalIndexLifecycle::Ready {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            format!(
+                "global index {} is not ready for authoritative snapshot maintenance",
+                index.id()
+            ),
+        ));
+    }
+    Ok(index)
+}
+
+fn source_snapshot_matches(
+    storage: &Storage,
+    connection: &Connection,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+    cancellation: &CancellationToken,
+) -> EngineResult<bool> {
+    let checkpoint = connection
+        .query_row(
+            "SELECT source_digest, indexed_rows, unique_rows
+             FROM briskdb_global_index_checkpoints
+             WHERE index_id = ?1 AND source_shard = ?2",
+            params![to_sqlite_id(index.id())?, i64::from(shard)],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error::storage)?;
+    let Some((digest, indexed_rows, unique_rows)) = checkpoint else {
+        return Ok(false);
+    };
+    let source_digest: [u8; 32] = digest
+        .try_into()
+        .map_err(|_| corrupt("global-index checkpoint has an invalid source digest"))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT source_ordinal, encoded_key, source_locator
+             FROM briskdb_global_index_entries
+             WHERE index_id = ?1 AND source_shard = ?2
+             ORDER BY source_ordinal",
+        )
+        .map_err(sqlite_error::storage)?;
+    let mut stored = statement
+        .query(params![to_sqlite_id(index.id())?, i64::from(shard)])
+        .map_err(sqlite_error::storage)?;
+    let mut entries_match = true;
+    let observed = scan_source_shard_with_visitor(
+        storage,
+        index,
+        shard,
+        cancellation,
+        |source_ordinal, source| {
+            ensure_authority_not_cancelled(
+                cancellation,
+                "while checking an indexed write snapshot",
+            )?;
+            if !entries_match {
+                return Ok(());
+            }
+            let entry = stored
+                .next()
+                .map_err(sqlite_error::storage)?
+                .map(read_snapshot_entry)
+                .transpose()?;
+            entries_match = entry.is_some_and(|entry| {
+                entry.source_ordinal == source_ordinal
+                    && entry.encoded_key.as_slice() == source.encoded_key.as_bytes()
+                    && entry.source_locator == source.encoded_locator
+            });
+            Ok(())
+        },
+    )?;
+    if entries_match {
+        ensure_authority_not_cancelled(cancellation, "while checking an indexed write snapshot")?;
+        entries_match = stored.next().map_err(sqlite_error::storage)?.is_none();
+    }
+    Ok(entries_match
+        && source_digest == observed.source_digest
+        && from_sqlite_u64(indexed_rows, "checkpoint row count")? == observed.indexed_rows
+        && from_sqlite_u64(unique_rows, "checkpoint unique row count")? == observed.unique_rows)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OrphanedUniqueWriteDecision {
     Finalize,
@@ -2163,11 +2332,11 @@ fn validate_physical_build_complete(
 }
 
 pub(super) fn validate_physical_authority(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     index: &GlobalIndexMetadata,
     shard_count: u16,
 ) -> EngineResult<()> {
-    let build = transaction
+    let build = connection
         .query_row(
             "SELECT definition_digest, schema_generation, shard_count, build_state
              FROM briskdb_global_index_builds WHERE index_id = ?1",
@@ -4213,6 +4382,119 @@ fn refresh_unique_shard_snapshot(
     shard: u16,
     cancellation: &CancellationToken,
 ) -> EngineResult<()> {
+    refresh_unique_shard_snapshot_with_scan(transaction, index, shard, cancellation, |visitor| {
+        scan_source_shard_with_visitor(storage, index, shard, cancellation, visitor)
+    })?;
+    Ok(())
+}
+
+fn refresh_unique_shard_snapshot_with_scan<S>(
+    transaction: &Transaction<'_>,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+    cancellation: &CancellationToken,
+    mut scan: S,
+) -> EngineResult<SnapshotRefresh>
+where
+    S: FnMut(&mut dyn FnMut(u64, &SourceEntry) -> EngineResult<()>) -> EngineResult<ScanOutcome>,
+{
+    let mut statement = transaction
+        .prepare(
+            "SELECT source_ordinal, encoded_key, source_locator
+             FROM briskdb_global_index_entries
+             WHERE index_id = ?1 AND source_shard = ?2
+             ORDER BY source_ordinal",
+        )
+        .map_err(sqlite_error::storage)?;
+    let mut current = statement
+        .query(params![to_sqlite_id(index.id())?, i64::from(shard)])
+        .map_err(sqlite_error::storage)?;
+    let mut stored_exhausted = false;
+    let mut mismatch = false;
+    let mut appended = 0_u64;
+    // Keep comparison streaming and the target untouched until the stored
+    // cursor is exhausted. A non-append mutation intentionally pays for a
+    // second frozen source scan so fallback remains bounded in memory.
+    let outcome = scan(&mut |source_ordinal, entry| {
+        ensure_authority_not_cancelled(
+            cancellation,
+            "while validating an indexed write snapshot prefix",
+        )?;
+        if mismatch {
+            return Ok(());
+        }
+        if !stored_exhausted {
+            let stored = current
+                .next()
+                .map_err(sqlite_error::storage)?
+                .map(read_snapshot_entry)
+                .transpose()?;
+            if let Some(stored) = stored {
+                if stored.source_ordinal != source_ordinal
+                    || stored.encoded_key.as_slice() != entry.encoded_key.as_bytes()
+                    || stored.source_locator != entry.encoded_locator
+                {
+                    mismatch = true;
+                }
+                return Ok(());
+            }
+            stored_exhausted = true;
+        }
+        insert_snapshot_entry(transaction, index, shard, source_ordinal, entry)?;
+        appended = appended.checked_add(1).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::NumericOutOfRange,
+                "global-index appended row count overflowed",
+            )
+        })?;
+        Ok(())
+    })?;
+    if !mismatch && !stored_exhausted {
+        ensure_authority_not_cancelled(
+            cancellation,
+            "while validating an indexed write snapshot prefix",
+        )?;
+        mismatch = current.next().map_err(sqlite_error::storage)?.is_some();
+    }
+    drop(current);
+    drop(statement);
+    let refresh = if !mismatch {
+        if appended == 0 {
+            SnapshotRefresh::Unchanged
+        } else {
+            SnapshotRefresh::Appended(appended)
+        }
+    } else {
+        debug_assert_eq!(appended, 0);
+        rebuild_unique_shard_snapshot(transaction, index, shard, cancellation, &mut scan)?;
+        return Ok(SnapshotRefresh::Rebuilt);
+    };
+    write_refreshed_checkpoint(transaction, index.id(), shard, &outcome)?;
+    update_build_indexed_rows(transaction, index.id())?;
+    Ok(refresh)
+}
+
+fn read_snapshot_entry(row: &rusqlite::Row<'_>) -> EngineResult<SnapshotEntry> {
+    Ok(SnapshotEntry {
+        source_ordinal: from_sqlite_u64(
+            row.get::<_, i64>(0).map_err(sqlite_error::storage)?,
+            "global-index source ordinal",
+        )?,
+        encoded_key: row.get(1).map_err(sqlite_error::storage)?,
+        source_locator: row.get(2).map_err(sqlite_error::storage)?,
+    })
+}
+
+fn rebuild_unique_shard_snapshot<S>(
+    transaction: &Transaction<'_>,
+    index: &GlobalIndexMetadata,
+    shard: u16,
+    cancellation: &CancellationToken,
+    scan: &mut S,
+) -> EngineResult<()>
+where
+    S: FnMut(&mut dyn FnMut(u64, &SourceEntry) -> EngineResult<()>) -> EngineResult<ScanOutcome>,
+{
     transaction
         .execute(
             "DELETE FROM briskdb_global_index_entries
@@ -4227,29 +4509,61 @@ fn refresh_unique_shard_snapshot(
             params![to_sqlite_id(index.id())?, i64::from(shard)],
         )
         .map_err(sqlite_error::storage)?;
-    let outcome = scan_source_shard_with_visitor(
-        storage,
-        index,
-        shard,
-        cancellation,
-        |source_ordinal, entry| {
-            insert_snapshot_entry(transaction, index, shard, source_ordinal, entry)
-        },
-    )?;
+    let outcome = scan(&mut |source_ordinal, entry| {
+        ensure_authority_not_cancelled(cancellation, "while rebuilding an indexed write snapshot")?;
+        insert_snapshot_entry(transaction, index, shard, source_ordinal, entry)
+    })?;
     write_checkpoint(transaction, index.id(), shard, &outcome)?;
+    update_build_indexed_rows(transaction, index.id())
+}
+
+fn write_refreshed_checkpoint(
+    transaction: &Transaction<'_>,
+    index_id: GlobalIndexId,
+    shard: u16,
+    outcome: &ScanOutcome,
+) -> EngineResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO briskdb_global_index_checkpoints (
+                 index_id, source_shard, source_digest, indexed_rows, unique_rows
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (index_id, source_shard) DO UPDATE SET
+                 source_digest = excluded.source_digest,
+                 indexed_rows = excluded.indexed_rows,
+                 unique_rows = excluded.unique_rows
+             WHERE source_digest != excluded.source_digest
+                OR indexed_rows != excluded.indexed_rows
+                OR unique_rows != excluded.unique_rows",
+            params![
+                to_sqlite_id(index_id)?,
+                i64::from(shard),
+                outcome.source_digest.as_slice(),
+                to_sqlite_u64(outcome.indexed_rows, "checkpoint row count")?,
+                to_sqlite_u64(outcome.unique_rows, "checkpoint unique row count")?,
+            ],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
+fn update_build_indexed_rows(
+    transaction: &Transaction<'_>,
+    index_id: GlobalIndexId,
+) -> EngineResult<()> {
     let indexed_rows = transaction
         .query_row(
             "SELECT COALESCE(SUM(indexed_rows), 0)
              FROM briskdb_global_index_checkpoints WHERE index_id = ?1",
-            [to_sqlite_id(index.id())?],
+            [to_sqlite_id(index_id)?],
             |row| row.get::<_, i64>(0),
         )
         .map_err(sqlite_error::storage)?;
     transaction
         .execute(
             "UPDATE briskdb_global_index_builds SET indexed_rows = ?1
-             WHERE index_id = ?2 AND build_state = ?3",
-            params![indexed_rows, to_sqlite_id(index.id())?, COMPLETE],
+             WHERE index_id = ?2 AND build_state = ?3 AND indexed_rows != ?1",
+            params![indexed_rows, to_sqlite_id(index_id)?, COMPLETE],
         )
         .map_err(sqlite_error::storage)?;
     Ok(())
@@ -5376,6 +5690,94 @@ mod tests {
         )
     }
 
+    fn snapshot_source_entry(label: &str, locator: i64, reserves_unique_key: bool) -> SourceEntry {
+        let value = IndexKeyValue::Text(label.to_owned());
+        let encoded_key = CanonicalIndexKey::encode(&[IndexKeyPart::ascending(value.as_ref())])
+            .expect("encode snapshot test key");
+        SourceEntry {
+            encoded_key,
+            encoded_locator: encode_locator(&[ValueRef::Integer(locator)])
+                .expect("encode snapshot test locator"),
+            reserves_unique_key,
+        }
+    }
+
+    fn scan_snapshot_entries(
+        index: &GlobalIndexMetadata,
+        shard: u16,
+        entries: &[SourceEntry],
+        visitor: &mut dyn FnMut(u64, &SourceEntry) -> EngineResult<()>,
+    ) -> EngineResult<ScanOutcome> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(SOURCE_DIGEST_DOMAIN);
+        hasher.update(&index.id().get().to_le_bytes());
+        hasher.update(&shard.to_le_bytes());
+        let mut unique_rows = 0_u64;
+        for (source_ordinal, entry) in entries.iter().enumerate() {
+            update_framed(&mut hasher, entry.encoded_key.as_bytes());
+            update_framed(&mut hasher, &entry.encoded_locator);
+            visitor(source_ordinal as u64, entry)?;
+            unique_rows += u64::from(entry.reserves_unique_key);
+        }
+        Ok(ScanOutcome {
+            source_digest: *hasher.finalize().as_bytes(),
+            indexed_rows: entries.len() as u64,
+            unique_rows,
+        })
+    }
+
+    fn seed_snapshot(
+        connection: &mut Connection,
+        index: &GlobalIndexMetadata,
+        entries: &[SourceEntry],
+    ) {
+        connection.execute_batch(SCHEMA_SQL).unwrap();
+        connection
+            .execute(
+                "INSERT INTO briskdb_global_index_builds (
+                     index_id, definition_digest, schema_generation, shard_count,
+                     build_state, indexed_rows
+                 ) VALUES (?1, ?2, ?3, 2, ?4, 0)",
+                params![
+                    to_sqlite_id(index.id()).unwrap(),
+                    definition_digest(index).as_slice(),
+                    to_sqlite_u64(index.schema_generation(), "schema generation").unwrap(),
+                    COMPLETE,
+                ],
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        let outcome = scan_snapshot_entries(index, 0, entries, &mut |ordinal, entry| {
+            insert_entry(&transaction, index, 0, ordinal, entry)
+        })
+        .unwrap();
+        write_checkpoint(&transaction, index.id(), 0, &outcome).unwrap();
+        update_build_indexed_rows(&transaction, index.id()).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    fn total_changes(transaction: &Transaction<'_>) -> i64 {
+        transaction
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn stored_snapshot_rows(connection: &Connection) -> Vec<(i64, Vec<u8>, Vec<u8>)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT source_ordinal, encoded_key, source_locator
+                 FROM briskdb_global_index_entries
+                 WHERE index_id = 1 AND source_shard = 0
+                 ORDER BY source_ordinal",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
     #[test]
     fn source_locator_encoding_is_typed_framed_and_stable() {
         let encoded = encode_locator(&[
@@ -5494,6 +5896,315 @@ mod tests {
                 )
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn append_snapshot_refresh_changes_only_the_suffix_and_metadata() {
+        let index = unique_metadata();
+        let initial = vec![
+            snapshot_source_entry("a", 1, true),
+            snapshot_source_entry("b", 2, true),
+        ];
+        let mut connection = Connection::open_in_memory().unwrap();
+        seed_snapshot(&mut connection, &index, &initial);
+        let transaction = connection.transaction().unwrap();
+        let cancellation = CancellationToken::new();
+
+        let before = total_changes(&transaction);
+        let unchanged = refresh_unique_shard_snapshot_with_scan(
+            &transaction,
+            &index,
+            0,
+            &cancellation,
+            |visitor| scan_snapshot_entries(&index, 0, &initial, visitor),
+        )
+        .unwrap();
+        assert_eq!(unchanged, SnapshotRefresh::Unchanged);
+        assert_eq!(total_changes(&transaction) - before, 0);
+
+        // This models a NULL-distinct or newly qualifying partial-index row:
+        // it belongs in the physical snapshot without changing unique authority.
+        let appended = vec![
+            snapshot_source_entry("a", 1, true),
+            snapshot_source_entry("b", 2, true),
+            snapshot_source_entry("null", 3, false),
+        ];
+        let before = total_changes(&transaction);
+        let refresh = refresh_unique_shard_snapshot_with_scan(
+            &transaction,
+            &index,
+            0,
+            &cancellation,
+            |visitor| scan_snapshot_entries(&index, 0, &appended, visitor),
+        )
+        .unwrap();
+        assert_eq!(refresh, SnapshotRefresh::Appended(1));
+        assert_eq!(
+            total_changes(&transaction) - before,
+            3,
+            "one suffix insert, one checkpoint update, and one build-count update"
+        );
+        assert_eq!(
+            transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_global_index_unique_keys WHERE index_id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        transaction.commit().unwrap();
+        assert_eq!(stored_snapshot_rows(&connection).len(), 3);
+    }
+
+    #[test]
+    fn non_append_snapshot_changes_fall_back_to_a_full_rebuild() {
+        let cases = [
+            (
+                "middle insert",
+                vec![
+                    snapshot_source_entry("a", 1, false),
+                    snapshot_source_entry("b", 2, false),
+                    snapshot_source_entry("c", 3, false),
+                ],
+                8,
+            ),
+            ("delete", vec![snapshot_source_entry("a", 1, false)], 6),
+            (
+                "key move",
+                vec![
+                    snapshot_source_entry("a", 1, false),
+                    snapshot_source_entry("moved", 3, false),
+                ],
+                6,
+            ),
+        ];
+        for (name, source, expected_changes) in cases {
+            let index = unique_metadata();
+            let initial = vec![
+                snapshot_source_entry("a", 1, false),
+                snapshot_source_entry("c", 3, false),
+            ];
+            let mut connection = Connection::open_in_memory().unwrap();
+            seed_snapshot(&mut connection, &index, &initial);
+            let transaction = connection.transaction().unwrap();
+            let mut scans = 0;
+            let before = total_changes(&transaction);
+            let refresh = refresh_unique_shard_snapshot_with_scan(
+                &transaction,
+                &index,
+                0,
+                &CancellationToken::new(),
+                |visitor| {
+                    scans += 1;
+                    scan_snapshot_entries(&index, 0, &source, visitor)
+                },
+            )
+            .unwrap();
+            assert_eq!(refresh, SnapshotRefresh::Rebuilt, "{name}");
+            assert_eq!(scans, 2, "{name}");
+            assert_eq!(
+                total_changes(&transaction) - before,
+                expected_changes,
+                "{name} made writes before fallback or outside its exact rebuild"
+            );
+            transaction.commit().unwrap();
+
+            let stored = stored_snapshot_rows(&connection);
+            assert_eq!(stored.len(), source.len(), "{name}");
+            for ((ordinal, key, locator), expected) in stored.iter().zip(&source) {
+                assert_eq!(
+                    *ordinal as usize,
+                    stored.iter().position(|row| row.0 == *ordinal).unwrap()
+                );
+                assert_eq!(key.as_slice(), expected.encoded_key.as_bytes(), "{name}");
+                assert_eq!(locator, &expected.encoded_locator, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn appended_snapshot_rows_roll_back_with_the_authority_transaction() {
+        let index = unique_metadata();
+        let initial = vec![snapshot_source_entry("a", 1, false)];
+        let appended = [
+            snapshot_source_entry("a", 1, false),
+            snapshot_source_entry("b", 2, false),
+        ];
+        let mut connection = Connection::open_in_memory().unwrap();
+        seed_snapshot(&mut connection, &index, &initial);
+        {
+            let transaction = connection.transaction().unwrap();
+            assert_eq!(
+                refresh_unique_shard_snapshot_with_scan(
+                    &transaction,
+                    &index,
+                    0,
+                    &CancellationToken::new(),
+                    |visitor| scan_snapshot_entries(&index, 0, &appended, visitor),
+                )
+                .unwrap(),
+                SnapshotRefresh::Appended(1)
+            );
+            assert_eq!(stored_snapshot_rows(&transaction).len(), 2);
+        }
+        assert_eq!(stored_snapshot_rows(&connection).len(), 1);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT indexed_rows FROM briskdb_global_index_builds WHERE index_id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn snapshot_prefix_scan_honors_cancellation_without_writes() {
+        let index = unique_metadata();
+        let initial = vec![snapshot_source_entry("a", 1, false)];
+        let mut connection = Connection::open_in_memory().unwrap();
+        seed_snapshot(&mut connection, &index, &initial);
+        let transaction = connection.transaction().unwrap();
+        let cancellation = CancellationToken::new();
+        assert!(cancellation.cancel());
+        let before = total_changes(&transaction);
+        let error = refresh_unique_shard_snapshot_with_scan(
+            &transaction,
+            &index,
+            0,
+            &cancellation,
+            |visitor| scan_snapshot_entries(&index, 0, &initial, visitor),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+        assert_eq!(total_changes(&transaction) - before, 0);
+    }
+
+    #[test]
+    fn snapshot_scan_error_rolls_back_an_inserted_suffix() {
+        let index = unique_metadata();
+        let initial = vec![snapshot_source_entry("a", 1, false)];
+        let appended = [
+            snapshot_source_entry("a", 1, false),
+            snapshot_source_entry("b", 2, false),
+        ];
+        let mut connection = Connection::open_in_memory().unwrap();
+        seed_snapshot(&mut connection, &index, &initial);
+        {
+            let transaction = connection.transaction().unwrap();
+            let error = refresh_unique_shard_snapshot_with_scan(
+                &transaction,
+                &index,
+                0,
+                &CancellationToken::new(),
+                |visitor| {
+                    visitor(0, &appended[0])?;
+                    visitor(1, &appended[1])?;
+                    Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "injected source scan failure",
+                    ))
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+            assert_eq!(stored_snapshot_rows(&transaction).len(), 2);
+        }
+        assert_eq!(stored_snapshot_rows(&connection).len(), 1);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT indexed_rows FROM briskdb_global_index_checkpoints
+                     WHERE index_id = 1 AND source_shard = 0",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_snapshot_refreshes_serialize_before_extending_the_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("authority.sqlite");
+        let index = unique_metadata();
+        let initial = vec![snapshot_source_entry("a", 1, false)];
+        let mut setup = Connection::open(&path).unwrap();
+        seed_snapshot(&mut setup, &index, &initial);
+        drop(setup);
+
+        let mut first = Connection::open(&path).unwrap();
+        first
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let first_transaction = first
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let first_source = vec![
+            snapshot_source_entry("a", 1, false),
+            snapshot_source_entry("b", 2, false),
+        ];
+        assert_eq!(
+            refresh_unique_shard_snapshot_with_scan(
+                &first_transaction,
+                &index,
+                0,
+                &CancellationToken::new(),
+                |visitor| scan_snapshot_entries(&index, 0, &first_source, visitor),
+            )
+            .unwrap(),
+            SnapshotRefresh::Appended(1)
+        );
+
+        let path_for_second = path.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let second = std::thread::spawn(move || {
+            let mut connection = Connection::open(path_for_second).unwrap();
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            started_tx.send(()).unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let index = unique_metadata();
+            let source = vec![
+                snapshot_source_entry("a", 1, false),
+                snapshot_source_entry("b", 2, false),
+                snapshot_source_entry("c", 3, false),
+            ];
+            let refresh = refresh_unique_shard_snapshot_with_scan(
+                &transaction,
+                &index,
+                0,
+                &CancellationToken::new(),
+                |visitor| scan_snapshot_entries(&index, 0, &source, visitor),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            refresh
+        });
+        started_rx.recv().unwrap();
+        first_transaction.commit().unwrap();
+        assert_eq!(second.join().unwrap(), SnapshotRefresh::Appended(1));
+
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(stored_snapshot_rows(&connection).len(), 3);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT indexed_rows FROM briskdb_global_index_builds WHERE index_id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
         );
     }
 }

@@ -84,6 +84,16 @@ restore test covering reservations, value sequences, outboxes, watermarks, and
 summaries. Dedicated fault, clock, disk-full, crash-boundary, and mixed
 multi-process soak suites run through a manual GitHub workflow.
 
+Indexed writes continue to omit unchanged non-unique outbox events and now also
+omit summary and unique-snapshot mutations when a captured update leaves every
+canonical index key and row locator unchanged.
+Unique snapshot publication validates the existing ordered prefix and appends
+only a new suffix, while deletions and middle/key/locator changes retain the
+full rebuild fallback. This removes repeated whole-shard snapshot rewrites from
+append-heavy inserts. Unchanged unique indexes receive a compare-first coherence
+check that starts no global write transaction when clean and repairs markerless
+snapshot-only crash residue when stale, preserving recovery and rollback.
+
 The same-host 2/4/10/64-shard before/after matrix confirms identical results
 and constraints while indexed hits/misses execute on one shard. It also finds
 that current freshness/summary inspection and write coordination are slower

@@ -44,6 +44,19 @@ an event for a rolled-back row. Fenced asynchronous consumers now apply those
 events and publish durable per-shard freshness watermarks; see
 [asynchronous global indexes](GLOBAL_INDEX_ASYNC.md).
 
+The write planner compares each captured row's old and new canonical index key
+and stable locator. A payload-only update still performs the orphan probe shown
+above and checks every touched unchanged unique snapshot against a frozen source
+scan. A coherent check starts no global write transaction; a mismatch left by a
+markerless crash is repaired before the new shard write commits. The update does
+not rewrite shard summaries or enqueue an outbox event. When a unique snapshot
+does change, the publisher streams and validates its existing rows against one
+frozen source scan. An exact prefix is extended with only the new suffix; a
+deletion, middle insertion, key change, or locator change falls back to a bounded
+second scan and full snapshot rebuild. Publication and repair writes remain
+inside immediate global transactions, so a failed write never exposes a partial
+snapshot.
+
 ## Transactional non-unique outbox
 
 ```mermaid

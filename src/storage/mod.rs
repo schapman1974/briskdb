@@ -1700,6 +1700,17 @@ impl Storage {
         self.fail_closed_on_corruption(result)
     }
 
+    pub(crate) fn repair_stale_global_unique_write_snapshots(
+        &self,
+        index_ids: &[GlobalIndexId],
+        shard: u16,
+        cancellation: &crate::core::CancellationToken,
+    ) -> EngineResult<usize> {
+        let result =
+            global_index::repair_stale_unique_write_snapshots(self, index_ids, shard, cancellation);
+        self.fail_closed_on_corruption(result)
+    }
+
     pub(crate) fn global_index_read_resolution(
         &self,
         index_id: GlobalIndexId,
@@ -7263,6 +7274,30 @@ mod tests {
         (unique_id, value_id)
     }
 
+    fn setup_snapshot_only_authority_crash_root(root: &Path) -> GlobalIndexId {
+        let mut database = setup_global_index_root(root);
+        let table_id = database
+            .catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap()
+            .id();
+        let declaration = crate::core::GlobalIndexDeclaration::new(
+            table_id,
+            "events_null_distinct_unique",
+            vec![crate::core::GlobalIndexKeyPart::new(
+                crate::core::GlobalIndexKeySource::expression("NULL").unwrap(),
+                crate::core::GlobalIndexKeyType::Binary,
+            )],
+        )
+        .unwrap()
+        .unique(crate::core::UniqueNullSemantics::Distinct)
+        .with_topology(crate::core::GlobalIndexStorageTopology::SharedSqliteV1);
+        let index_id = database.create_global_index(declaration).unwrap();
+        database.build_global_index(index_id).unwrap();
+        index_id
+    }
+
     fn authority_operation_state(root: &Path) -> Option<i64> {
         Connection::open(root.join("global-indexes/global.sqlite"))
             .unwrap()
@@ -7479,6 +7514,151 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn markerless_null_distinct_snapshot_crash_is_repaired_on_the_next_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_id = setup_snapshot_only_authority_crash_root(temp.path());
+        abort_global_index_child(
+            temp.path(),
+            "authority-coordinator-write",
+            "unique-write-physical-after-commit",
+            Some(index_id),
+        );
+
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let cancellation = crate::core::CancellationToken::new();
+        assert_eq!(
+            storage.recover_global_unique_writes(&cancellation).unwrap(),
+            0,
+            "NULL-distinct snapshot changes have no unique-operation marker"
+        );
+        drop(storage);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(async {
+                let brisk = crate::BriskDb::open(temp.path()).await?;
+                let session = brisk.session();
+                session.set_routing_key("crash-writer").await?;
+                brisk
+                    .execute_write(
+                        &session,
+                        crate::Statement::new(
+                            "UPDATE events SET payload = ?1
+                             WHERE id = 1 AND tenant_id = ?2",
+                            vec![
+                                crate::core::Value::from(vec![9_u8, 8, 7]),
+                                crate::core::Value::from("crash-writer"),
+                            ],
+                        ),
+                    )
+                    .await?;
+                EngineResult::Ok(())
+            })
+            .unwrap();
+
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        let report = database.validate_global_index(index_id).unwrap();
+        assert!(report.is_valid(), "{report:?}");
+        let result = database
+            .query(
+                "crash-writer",
+                "SELECT payload FROM events WHERE id = 1 AND tenant_id = ?1",
+                &[crate::core::Value::from("crash-writer")],
+            )
+            .unwrap();
+        assert_eq!(
+            result.rows().len(),
+            1,
+            "the crashed insert must remain committed"
+        );
+        assert_eq!(
+            result.rows()[0].get(0).unwrap().as_bytes(),
+            Some(&[9_u8, 8, 7][..]),
+            "the next payload-only write must commit after repairing the stale snapshot"
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_probe_skips_coherent_state_and_repairs_entry_only_divergence() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_id = setup_snapshot_only_authority_crash_root(temp.path());
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        let cancellation = crate::core::CancellationToken::new();
+        let shard = storage.shard_for_key(&crate::core::canonical_shard_key_bytes(
+            crate::core::CanonicalShardKeyRef::Text("crash-writer"),
+        ));
+        storage
+            .open_shard(shard)
+            .unwrap()
+            .execute(
+                "INSERT INTO events (id, tenant_id, payload) VALUES (1, ?1, X'01')",
+                ["crash-writer"],
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .repair_stale_global_unique_write_snapshots(&[index_id], shard, &cancellation)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .repair_stale_global_unique_write_snapshots(&[index_id], shard, &cancellation)
+                .unwrap(),
+            0,
+            "a coherent snapshot check must not enter the repair path"
+        );
+        let sqlite_index_id = i64::try_from(index_id.get()).unwrap();
+        let authority = Connection::open(temp.path().join("global-indexes/global.sqlite")).unwrap();
+        authority
+            .execute(
+                "UPDATE briskdb_global_index_entries SET encoded_key = X'00'
+                 WHERE index_id = ?1",
+                [sqlite_index_id],
+            )
+            .unwrap();
+        drop(authority);
+        assert_eq!(
+            storage
+                .repair_stale_global_unique_write_snapshots(&[index_id], shard, &cancellation)
+                .unwrap(),
+            1,
+            "stored entries must be compared even when checkpoint and source agree"
+        );
+
+        let authority = Connection::open(temp.path().join("global-indexes/global.sqlite")).unwrap();
+        assert_eq!(
+            authority
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_global_index_entries WHERE index_id = ?1",
+                    [sqlite_index_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            authority
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_global_index_unique_keys WHERE index_id = ?1",
+                    [sqlite_index_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(authority);
+        drop(storage);
+
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        let report = database.validate_global_index(index_id).unwrap();
+        assert!(report.is_valid(), "{report:?}");
     }
 
     const fn target_code(state: crate::core::GlobalOperationState) -> i64 {
