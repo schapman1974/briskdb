@@ -1,5 +1,7 @@
 //! Writable coordinator execution and one-shard transaction state.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -76,6 +78,67 @@ fn abort_at_global_write_test_boundary(boundary: &str) {
 
 #[cfg(not(test))]
 fn abort_at_global_write_test_boundary(_boundary: &str) {}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GlobalAuthorityCallCounts {
+    unique_recoveries: usize,
+    unique_snapshot_repair_checks: usize,
+    unique_snapshot_refreshes: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static GLOBAL_AUTHORITY_CALL_COUNTS: Cell<GlobalAuthorityCallCounts> =
+        const { Cell::new(GlobalAuthorityCallCounts {
+            unique_recoveries: 0,
+            unique_snapshot_repair_checks: 0,
+            unique_snapshot_refreshes: 0,
+        }) };
+}
+
+#[cfg(test)]
+fn reset_global_authority_call_counts() {
+    GLOBAL_AUTHORITY_CALL_COUNTS.set(GlobalAuthorityCallCounts::default());
+}
+
+#[cfg(test)]
+fn global_authority_call_counts() -> GlobalAuthorityCallCounts {
+    GLOBAL_AUTHORITY_CALL_COUNTS.get()
+}
+
+#[cfg(test)]
+fn record_global_unique_recovery_call() {
+    GLOBAL_AUTHORITY_CALL_COUNTS.with(|slot| {
+        let counts = slot.get();
+        slot.set(GlobalAuthorityCallCounts {
+            unique_recoveries: counts.unique_recoveries + 1,
+            ..counts
+        });
+    });
+}
+
+#[cfg(test)]
+fn record_global_unique_snapshot_repair_check() {
+    GLOBAL_AUTHORITY_CALL_COUNTS.with(|slot| {
+        let counts = slot.get();
+        slot.set(GlobalAuthorityCallCounts {
+            unique_snapshot_repair_checks: counts.unique_snapshot_repair_checks + 1,
+            ..counts
+        });
+    });
+}
+
+#[cfg(test)]
+fn record_global_unique_snapshot_refresh_call() {
+    GLOBAL_AUTHORITY_CALL_COUNTS.with(|slot| {
+        let counts = slot.get();
+        slot.set(GlobalAuthorityCallCounts {
+            unique_snapshot_refreshes: counts.unique_snapshot_refreshes + 1,
+            ..counts
+        });
+    });
+}
 
 #[derive(Debug, Clone)]
 struct CapturedPhysicalRow {
@@ -198,11 +261,27 @@ struct CapturedOwnerState {
     current: Option<CanonicalIndexKey>,
 }
 
-fn touched_global_unique_indexes(
+#[derive(Debug)]
+struct CapturedIndexStates {
+    unique: bool,
+    owners: BTreeMap<Vec<u8>, CapturedOwnerState>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct GlobalIndexWriteImpact {
+    summary_additions: Vec<(GlobalIndexId, CanonicalIndexKey)>,
+    unique_snapshot_indexes: Vec<GlobalIndexId>,
+    unchanged_unique_indexes: Vec<GlobalIndexId>,
+    needs_unique_recovery: bool,
+}
+
+fn plan_global_index_write_impact(
     registry: &Registry,
+    shard: u16,
+    connection: &Connection,
     changes: &[CapturedPhysicalChange],
-) -> EngineResult<Vec<GlobalIndexId>> {
-    let mut touched = BTreeSet::new();
+) -> EngineResult<GlobalIndexWriteImpact> {
+    let mut by_index = BTreeMap::<GlobalIndexId, CapturedIndexStates>::new();
     for change in changes {
         let spec = registry.table_named(&change.table).ok_or_else(|| {
             EngineError::new(
@@ -213,14 +292,82 @@ fn touched_global_unique_indexes(
                 ),
             )
         })?;
-        touched.extend(
-            spec.global_indexes
-                .iter()
-                .filter(|index| index.metadata.is_unique())
-                .map(|index| index.metadata.id()),
-        );
+        if change
+            .old
+            .iter()
+            .chain(change.new.iter())
+            .any(|row| row.values.len() != spec.columns.len())
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::DataCorruption,
+                format!(
+                    "physical table {} changed column count during global-index impact capture",
+                    spec.name
+                ),
+            ));
+        }
+        for index in &spec.global_indexes {
+            let index_id = index.metadata.id();
+            let unique = index.metadata.is_unique();
+            let states = &mut by_index
+                .entry(index_id)
+                .or_insert_with(|| CapturedIndexStates {
+                    unique,
+                    owners: BTreeMap::new(),
+                })
+                .owners;
+            if let Some(old) = &change.old {
+                if let Some(key) = evaluate_captured_index_key(connection, index, shard, old)? {
+                    apply_captured_old(
+                        states,
+                        captured_global_owner(spec, shard, old)?,
+                        Some(key),
+                    )?;
+                }
+            }
+            if let Some(new) = &change.new {
+                if let Some(key) = evaluate_captured_index_key(connection, index, shard, new)? {
+                    apply_captured_new(
+                        states,
+                        captured_global_owner(spec, shard, new)?,
+                        Some(key),
+                    )?;
+                }
+            }
+        }
     }
-    Ok(touched.into_iter().collect())
+    Ok(collapse_global_index_write_impact(by_index))
+}
+
+fn collapse_global_index_write_impact(
+    by_index: BTreeMap<GlobalIndexId, CapturedIndexStates>,
+) -> GlobalIndexWriteImpact {
+    let mut impact = GlobalIndexWriteImpact::default();
+    for (index_id, states) in by_index {
+        impact.needs_unique_recovery |= states.unique;
+        let mut changed = false;
+        for state in states.owners.into_values() {
+            if state.initial == state.current {
+                continue;
+            }
+            changed = true;
+            if let Some(key) = state.current {
+                impact.summary_additions.push((index_id, key));
+            }
+        }
+        if changed && states.unique {
+            impact.unique_snapshot_indexes.push(index_id);
+        } else if states.unique {
+            impact.unchanged_unique_indexes.push(index_id);
+        }
+    }
+    impact.summary_additions.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+    });
+    impact.summary_additions.dedup();
+    impact
 }
 
 fn plan_global_unique_mutations(
@@ -578,50 +725,6 @@ fn plan_global_nonunique_outbox_events(
         }
     }
     Ok(events)
-}
-
-fn plan_global_summary_additions(
-    registry: &Registry,
-    shard: u16,
-    connection: &Connection,
-    changes: &[CapturedPhysicalChange],
-) -> EngineResult<Vec<(GlobalIndexId, CanonicalIndexKey)>> {
-    let mut additions = Vec::new();
-    for change in changes {
-        let Some(row) = change.new.as_ref() else {
-            continue;
-        };
-        let spec = registry.table_named(&change.table).ok_or_else(|| {
-            EngineError::new(
-                EngineErrorKind::DataCorruption,
-                format!(
-                    "global-index capture references unregistered physical table {}",
-                    change.table
-                ),
-            )
-        })?;
-        if row.values.len() != spec.columns.len() {
-            return Err(EngineError::new(
-                EngineErrorKind::DataCorruption,
-                format!(
-                    "physical table {} changed column count during shard-summary capture",
-                    spec.name
-                ),
-            ));
-        }
-        for index in &spec.global_indexes {
-            if let Some(key) = evaluate_captured_index_key(connection, index, shard, row)? {
-                additions.push((index.metadata.id(), key));
-            }
-        }
-    }
-    additions.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
-    });
-    additions.dedup();
-    Ok(additions)
 }
 
 fn validate_allocation_sequence_capacity(
@@ -2779,9 +2882,9 @@ impl WriteTransaction {
             return Err(cancelled_error());
         }
 
-        let summary_additions =
-            plan_global_summary_additions(registry, child.shard, &child.connection, &changes)?;
-        shard_summary::record_additions(&child.connection, &summary_additions)?;
+        let impact =
+            plan_global_index_write_impact(registry, child.shard, &child.connection, &changes)?;
+        shard_summary::record_additions(&child.connection, &impact.summary_additions)?;
 
         let outbox_events = plan_global_nonunique_outbox_events(
             registry,
@@ -2809,16 +2912,35 @@ impl WriteTransaction {
                 &outbox_events,
             )?;
         }
-        self.global_snapshot_indexes = touched_global_unique_indexes(registry, &changes)?;
+        if impact.needs_unique_recovery {
+            #[cfg(test)]
+            record_global_unique_recovery_call();
+            registry
+                .storage
+                .recover_global_unique_writes(&self.authority_cancellation)?;
+        }
+        if !impact.unchanged_unique_indexes.is_empty() {
+            #[cfg(test)]
+            record_global_unique_snapshot_repair_check();
+            registry
+                .storage
+                .repair_stale_global_unique_write_snapshots(
+                    &impact.unchanged_unique_indexes,
+                    child.shard,
+                    &self.authority_cancellation,
+                )?;
+        }
+        self.global_snapshot_indexes = impact.unique_snapshot_indexes;
         if self.global_snapshot_indexes.is_empty() {
             self.global_authority_prepared = true;
             return Ok(());
         }
-        registry
-            .storage
-            .recover_global_unique_writes(&self.authority_cancellation)?;
         let mutations =
             plan_global_unique_mutations(registry, child.shard, &child.connection, &changes)?;
+        if mutations.is_empty() {
+            self.global_authority_prepared = true;
+            return Ok(());
+        }
         let mut reservations = Vec::new();
         reservations
             .try_reserve_exact(mutations.len())
@@ -3892,12 +4014,16 @@ impl WriteTransaction {
         self.global_snapshot_indexes
             .retain(|index| !self.global_reserved_indexes.contains(index));
         self.global_reserved_indexes.clear();
-        if let Some(shard) = self.statement_shard {
-            self.authority_storage.refresh_global_unique_write_indexes(
-                &self.global_snapshot_indexes,
-                shard,
-                &completion,
-            )?;
+        if !self.global_snapshot_indexes.is_empty() {
+            if let Some(shard) = self.statement_shard {
+                #[cfg(test)]
+                record_global_unique_snapshot_refresh_call();
+                self.authority_storage.refresh_global_unique_write_indexes(
+                    &self.global_snapshot_indexes,
+                    shard,
+                    &completion,
+                )?;
+            }
         }
         self.global_snapshot_indexes.clear();
         Ok(WriteOutcome {
@@ -4013,7 +4139,189 @@ mod tests {
         thread,
     };
 
+    use crate::core::{
+        GlobalIndexDeclaration, GlobalIndexKeyPart, GlobalIndexKeySource, GlobalIndexKeyType,
+        GlobalIndexStorageTopology, ShardKeyMetadata, ShardKeyType, TableDeclaration,
+        UniqueNullSemantics,
+    };
+
     use super::*;
+
+    type SqliteRows = Vec<Vec<rusqlite::types::Value>>;
+
+    #[derive(Debug, PartialEq)]
+    struct DurableGlobalIndexState {
+        builds: SqliteRows,
+        checkpoints: SqliteRows,
+        entries: SqliteRows,
+        unique_keys: SqliteRows,
+        operations: SqliteRows,
+        unique_mutations: SqliteRows,
+        unique_reservations: SqliteRows,
+        shard_summaries: Vec<SqliteRows>,
+    }
+
+    struct IndexedWriteFixture {
+        temp: tempfile::TempDir,
+        storage: Storage,
+        index_id: GlobalIndexId,
+        tenant: String,
+        shard: u16,
+    }
+
+    impl IndexedWriteFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let mut storage = Storage::open(temp.path(), 2).unwrap();
+            let mut migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            storage
+                .apply_schema_migration(
+                    "CREATE TABLE indexed_accounts (
+                         tenant_id TEXT PRIMARY KEY NOT NULL,
+                         email TEXT,
+                         active INTEGER NOT NULL,
+                         payload TEXT NOT NULL
+                     ) STRICT;",
+                    &mut migration,
+                    None,
+                )
+                .unwrap();
+            migration.publish_ready().unwrap();
+            let database_id = storage.logical_catalog().default_database().id();
+            storage
+                .register_tables(vec![
+                    TableDeclaration::sharded(
+                        database_id,
+                        "indexed_accounts",
+                        ShardKeyMetadata::new("tenant_id", ShardKeyType::Text).unwrap(),
+                    )
+                    .unwrap(),
+                ])
+                .unwrap();
+            let table_id = storage
+                .logical_catalog()
+                .table("default", "indexed_accounts")
+                .unwrap()
+                .unwrap()
+                .id();
+            let declaration = GlobalIndexDeclaration::new(
+                table_id,
+                "indexed_accounts_email_unique",
+                vec![GlobalIndexKeyPart::new(
+                    GlobalIndexKeySource::column("email").unwrap(),
+                    GlobalIndexKeyType::Text,
+                )],
+            )
+            .unwrap()
+            .unique(UniqueNullSemantics::Distinct)
+            .with_predicate("active = 1")
+            .unwrap()
+            .with_topology(GlobalIndexStorageTopology::selected_v1());
+            let index_id = storage.create_global_index(declaration).unwrap();
+            let tenant = "payload-only-tenant".to_owned();
+            let shard = storage.shard_for_key(tenant.as_bytes());
+            storage
+                .open_shard(shard)
+                .unwrap()
+                .execute(
+                    "INSERT INTO indexed_accounts
+                     (tenant_id, email, active, payload)
+                     VALUES (?1, 'same@example.test', 1, 'before')",
+                    [&tenant],
+                )
+                .unwrap();
+            storage
+                .build_global_index(index_id, &CancellationToken::new())
+                .unwrap();
+            Self {
+                temp,
+                storage,
+                index_id,
+                tenant,
+                shard,
+            }
+        }
+
+        fn durable_state(&self) -> DurableGlobalIndexState {
+            let authority =
+                Connection::open(self.temp.path().join("global-indexes/global.sqlite")).unwrap();
+            let index_id = i64::try_from(self.index_id.get()).unwrap();
+            let shard_summaries = (0..self.storage.shard_count())
+                .map(|shard| {
+                    let connection = self.storage.open_shard(shard).unwrap();
+                    sqlite_rows(
+                        &connection,
+                        "SELECT * FROM briskdb_global_index_shard_summaries
+                         WHERE index_id = ?1 ORDER BY index_id",
+                        [index_id],
+                    )
+                })
+                .collect();
+            DurableGlobalIndexState {
+                builds: sqlite_rows(
+                    &authority,
+                    "SELECT * FROM briskdb_global_index_builds
+                     WHERE index_id = ?1 ORDER BY index_id",
+                    [index_id],
+                ),
+                checkpoints: sqlite_rows(
+                    &authority,
+                    "SELECT * FROM briskdb_global_index_checkpoints
+                     WHERE index_id = ?1 ORDER BY index_id, source_shard",
+                    [index_id],
+                ),
+                entries: sqlite_rows(
+                    &authority,
+                    "SELECT * FROM briskdb_global_index_entries
+                     WHERE index_id = ?1
+                     ORDER BY index_id, encoded_key, source_shard, source_locator",
+                    [index_id],
+                ),
+                unique_keys: sqlite_rows(
+                    &authority,
+                    "SELECT * FROM briskdb_global_index_unique_keys
+                     WHERE index_id = ?1 ORDER BY index_id, encoded_key",
+                    [index_id],
+                ),
+                operations: sqlite_rows(
+                    &authority,
+                    "SELECT * FROM briskdb_global_operations ORDER BY operation_id",
+                    [],
+                ),
+                unique_mutations: sqlite_rows(
+                    &authority,
+                    "SELECT * FROM briskdb_global_unique_mutations ORDER BY operation_id",
+                    [],
+                ),
+                unique_reservations: sqlite_rows(
+                    &authority,
+                    "SELECT * FROM briskdb_global_unique_reservations
+                     ORDER BY index_id, encoded_key",
+                    [],
+                ),
+                shard_summaries,
+            }
+        }
+
+        fn coordinator(&self) -> WriteCoordinator {
+            WriteCoordinator::open(self.storage.clone()).unwrap()
+        }
+    }
+
+    fn sqlite_rows<P: Params>(connection: &Connection, sql: &str, parameters: P) -> SqliteRows {
+        let mut statement = connection.prepare(sql).unwrap();
+        let column_count = statement.column_count();
+        statement
+            .query_map(parameters, move |row| {
+                (0..column_count)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
 
     fn write_cancellation_fixture() -> (
         Connection,
@@ -4181,6 +4489,272 @@ mod tests {
             Some((&released_key, &released_owner))
         );
         assert_eq!(planned[0].new_entry(), None);
+    }
+
+    fn captured_index_states(
+        unique: bool,
+        states: impl IntoIterator<Item = CapturedOwnerState>,
+    ) -> CapturedIndexStates {
+        CapturedIndexStates {
+            unique,
+            owners: states
+                .into_iter()
+                .map(|state| (state.owner.locator().to_vec(), state))
+                .collect(),
+        }
+    }
+
+    fn captured_owner_state(
+        owner: GlobalIndexOwner,
+        initial: Option<CanonicalIndexKey>,
+        current: Option<CanonicalIndexKey>,
+    ) -> CapturedOwnerState {
+        CapturedOwnerState {
+            owner,
+            initial,
+            current,
+        }
+    }
+
+    #[test]
+    fn unchanged_index_keys_and_owners_have_no_write_impact() {
+        let unique_id = GlobalIndexId::new(11).unwrap();
+        let nonunique_id = GlobalIndexId::new(12).unwrap();
+        let key = CanonicalIndexKey::encode_values(&[Value::from("same")]).unwrap();
+        let owner = GlobalIndexOwner::new(1, b"row".to_vec()).unwrap();
+        let mut by_index = BTreeMap::new();
+        by_index.insert(
+            unique_id,
+            captured_index_states(
+                true,
+                [captured_owner_state(
+                    owner.clone(),
+                    Some(key.clone()),
+                    Some(key.clone()),
+                )],
+            ),
+        );
+        by_index.insert(
+            nonunique_id,
+            captured_index_states(
+                false,
+                [captured_owner_state(owner, Some(key.clone()), Some(key))],
+            ),
+        );
+
+        assert_eq!(
+            collapse_global_index_write_impact(by_index),
+            GlobalIndexWriteImpact {
+                unchanged_unique_indexes: vec![unique_id],
+                needs_unique_recovery: true,
+                ..GlobalIndexWriteImpact::default()
+            }
+        );
+    }
+
+    #[test]
+    fn partial_and_null_distinct_entries_keep_required_snapshot_impacts() {
+        let excluded_id = GlobalIndexId::new(13).unwrap();
+        let included_id = GlobalIndexId::new(14).unwrap();
+        let null_distinct_id = GlobalIndexId::new(15).unwrap();
+        let included_key = CanonicalIndexKey::encode_values(&[Value::from("included")]).unwrap();
+        let null_key = CanonicalIndexKey::encode_values(&[Value::Null]).unwrap();
+        let changed_null_key =
+            CanonicalIndexKey::encode_values(&[Value::Null, Value::from("changed")]).unwrap();
+        let owner = GlobalIndexOwner::new(2, b"row".to_vec()).unwrap();
+        let mut by_index = BTreeMap::new();
+        by_index.insert(excluded_id, captured_index_states(true, []));
+        by_index.insert(
+            included_id,
+            captured_index_states(
+                true,
+                [captured_owner_state(
+                    owner.clone(),
+                    None,
+                    Some(included_key.clone()),
+                )],
+            ),
+        );
+        by_index.insert(
+            null_distinct_id,
+            captured_index_states(
+                true,
+                [captured_owner_state(
+                    owner,
+                    Some(null_key),
+                    Some(changed_null_key.clone()),
+                )],
+            ),
+        );
+
+        let impact = collapse_global_index_write_impact(by_index);
+        assert_eq!(
+            impact.summary_additions,
+            vec![
+                (included_id, included_key),
+                (null_distinct_id, changed_null_key),
+            ]
+        );
+        assert_eq!(
+            impact.unique_snapshot_indexes,
+            vec![included_id, null_distinct_id]
+        );
+        assert_eq!(impact.unchanged_unique_indexes, vec![excluded_id]);
+        assert!(impact.needs_unique_recovery);
+    }
+
+    #[test]
+    fn locator_changes_remain_index_relevant_even_when_the_key_is_unchanged() {
+        let index_id = GlobalIndexId::new(16).unwrap();
+        let key = CanonicalIndexKey::encode_values(&[Value::from("same")]).unwrap();
+        let old_owner = GlobalIndexOwner::new(3, b"old-row".to_vec()).unwrap();
+        let new_owner = GlobalIndexOwner::new(3, b"new-row".to_vec()).unwrap();
+        let mut by_index = BTreeMap::new();
+        by_index.insert(
+            index_id,
+            captured_index_states(
+                true,
+                [
+                    captured_owner_state(old_owner, Some(key.clone()), None),
+                    captured_owner_state(new_owner, None, Some(key.clone())),
+                ],
+            ),
+        );
+
+        let impact = collapse_global_index_write_impact(by_index);
+        assert_eq!(impact.summary_additions, vec![(index_id, key)]);
+        assert_eq!(impact.unique_snapshot_indexes, vec![index_id]);
+        assert!(impact.unchanged_unique_indexes.is_empty());
+        assert!(impact.needs_unique_recovery);
+    }
+
+    #[test]
+    fn multi_change_history_collapses_back_to_no_index_impact() {
+        let index_id = GlobalIndexId::new(17).unwrap();
+        let first_key = CanonicalIndexKey::encode_values(&[Value::from("first")]).unwrap();
+        let second_key = CanonicalIndexKey::encode_values(&[Value::from("second")]).unwrap();
+        let owner = GlobalIndexOwner::new(4, b"row".to_vec()).unwrap();
+        let mut owners = BTreeMap::new();
+        apply_captured_old(&mut owners, owner.clone(), Some(first_key.clone())).unwrap();
+        apply_captured_new(&mut owners, owner.clone(), Some(second_key.clone())).unwrap();
+        apply_captured_old(&mut owners, owner.clone(), Some(second_key)).unwrap();
+        apply_captured_new(&mut owners, owner, Some(first_key)).unwrap();
+        let mut by_index = BTreeMap::new();
+        by_index.insert(
+            index_id,
+            CapturedIndexStates {
+                unique: true,
+                owners,
+            },
+        );
+
+        assert_eq!(
+            collapse_global_index_write_impact(by_index),
+            GlobalIndexWriteImpact {
+                unchanged_unique_indexes: vec![index_id],
+                needs_unique_recovery: true,
+                ..GlobalIndexWriteImpact::default()
+            }
+        );
+    }
+
+    #[test]
+    fn payload_only_update_leaves_global_authority_and_summary_bytes_unchanged() {
+        let fixture = IndexedWriteFixture::new();
+        let before = fixture.durable_state();
+        let mut coordinator = fixture.coordinator();
+        reset_global_authority_call_counts();
+
+        let result = coordinator
+            .execute_dml(
+                "UPDATE indexed_accounts SET payload = 'after'
+                 WHERE tenant_id = ?1",
+                [&fixture.tenant],
+            )
+            .unwrap();
+
+        assert_eq!(result.affected_rows(), 1);
+        assert_eq!(result.shard(), Some(fixture.shard));
+        assert_eq!(
+            global_authority_call_counts(),
+            GlobalAuthorityCallCounts {
+                unique_recoveries: 1,
+                unique_snapshot_repair_checks: 1,
+                unique_snapshot_refreshes: 0,
+            },
+            "an index-irrelevant update must preserve orphan recovery without refreshing a snapshot"
+        );
+        assert_eq!(fixture.durable_state(), before);
+        assert_eq!(
+            fixture
+                .storage
+                .open_shard(fixture.shard)
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM indexed_accounts WHERE tenant_id = ?1",
+                    [&fixture.tenant],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "after"
+        );
+    }
+
+    #[test]
+    fn coordinator_preserves_partial_membership_and_null_distinct_snapshots() {
+        let fixture = IndexedWriteFixture::new();
+        let mut coordinator = fixture.coordinator();
+
+        coordinator
+            .execute_dml(
+                "UPDATE indexed_accounts SET active = 0 WHERE tenant_id = ?1",
+                [&fixture.tenant],
+            )
+            .unwrap();
+        let excluded = fixture.durable_state();
+        assert!(excluded.entries.is_empty());
+        assert!(excluded.unique_keys.is_empty());
+
+        reset_global_authority_call_counts();
+        coordinator
+            .execute_dml(
+                "UPDATE indexed_accounts SET active = 1, email = NULL
+                 WHERE tenant_id = ?1",
+                [&fixture.tenant],
+            )
+            .unwrap();
+        assert_eq!(
+            global_authority_call_counts(),
+            GlobalAuthorityCallCounts {
+                unique_recoveries: 1,
+                unique_snapshot_repair_checks: 0,
+                unique_snapshot_refreshes: 1,
+            },
+            "a NULL-distinct entry needs a snapshot refresh and preserves orphan recovery"
+        );
+        let null_distinct = fixture.durable_state();
+        assert_eq!(null_distinct.entries.len(), 1);
+        assert!(null_distinct.unique_keys.is_empty());
+        assert_ne!(null_distinct.checkpoints, excluded.checkpoints);
+
+        let before_payload = fixture.durable_state();
+        reset_global_authority_call_counts();
+        coordinator
+            .execute_dml(
+                "UPDATE indexed_accounts SET payload = 'null-payload'
+                 WHERE tenant_id = ?1",
+                [&fixture.tenant],
+            )
+            .unwrap();
+        assert_eq!(
+            global_authority_call_counts(),
+            GlobalAuthorityCallCounts {
+                unique_recoveries: 1,
+                unique_snapshot_repair_checks: 1,
+                unique_snapshot_refreshes: 0,
+            }
+        );
+        assert_eq!(fixture.durable_state(), before_payload);
     }
 
     #[test]
