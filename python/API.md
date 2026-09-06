@@ -121,5 +121,7 @@ native streaming through `fetchone()`, `fetchmany()`, `fetchall()`, iteration,
 and deterministic cancellation on close.
 
 All native failures derive from `BriskDBError`; each has stable `code` and
-`retryable` class attributes. See [value and error conversions](VALUE_CONVERSIONS.md)
-and [sync/async lifecycle details](ASYNC_API.md).
+`retryable` class attributes. Durable key reuse for a different operation maps
+to the non-retryable `IdempotencyConflictError`, which derives from
+`IntegrityError`. See [value and error conversions](VALUE_CONVERSIONS.md) and
+[sync/async lifecycle details](ASYNC_API.md).

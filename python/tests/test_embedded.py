@@ -263,6 +263,13 @@ class EmbeddedBriskDbTests(unittest.TestCase):
             self.assertEqual(invalid.exception.code, "invalid_query")
             self.assertTrue(str(invalid.exception))
             self.assertTrue(briskdb.BusyError.retryable)
+            self.assertTrue(
+                issubclass(briskdb.IdempotencyConflictError, briskdb.IntegrityError)
+            )
+            self.assertEqual(
+                briskdb.IdempotencyConflictError.code, "idempotency_conflict"
+            )
+            self.assertFalse(briskdb.IdempotencyConflictError.retryable)
 
             session.close()
             database.close()

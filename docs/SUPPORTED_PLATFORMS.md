@@ -37,7 +37,10 @@ registry disappearance and later query usability after a data-client
 disconnect, disabled administration/PostgreSQL binding, bind-failure cleanup,
 TLS/SCRAM exchange, and shutdown of every listener. HTTP tests also freeze the
 readiness, relational catalog, migration, validated-shard, backup-capability,
-and checkpoint representations over real sockets.
+and checkpoint representations over real sockets. Issue #54 coverage adds the
+plane-wide request-ID header, strict idempotency-key validation, eligible-write
+create/replay/conflict behavior across restart, request-local result limits,
+and bounded NDJSON metadata/row/completion or terminal-error framing.
 It also starts a real imported two-shard server and gates releases on
 transaction CRUD, error recovery, close, and reconnect through Ubuntu's
 `psql`, tokio-postgres 0.7.18, psycopg 3.2.13, and SQLAlchemy 2.0.43.
@@ -84,9 +87,10 @@ on these GitHub-hosted runners:
 - macOS Apple Silicon ARM64 (`aarch64-apple-darwin`).
 
 Those release artifacts are previews outside Ubuntu 24.04 x86-64. Their native
-jobs verify the locked release build, CLI version, data discovery, an HTTP 200
-administration readiness probe, the admin endpoint, and clean termination, but
-do not run the full storage and integration suite.
+jobs verify the locked release build, CLI version, a canonical request ID on
+data discovery and administration readiness, one bounded stream ending in a
+completion record, the admin endpoint, and clean termination, but do not run
+the full storage and integration suite.
 Windows, the musl target, 32-bit targets, big-endian targets, mobile platforms,
 and WebAssembly are not currently tested or supported.
 

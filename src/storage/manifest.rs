@@ -47,7 +47,8 @@ const V11_SCHEMA_VERSION: u32 = 11;
 const V12_SCHEMA_VERSION: u32 = 12;
 const V13_SCHEMA_VERSION: u32 = 13;
 const V14_SCHEMA_VERSION: u32 = 14;
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = V14_SCHEMA_VERSION;
+const V15_SCHEMA_VERSION: u32 = 15;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = V15_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
 
 pub(super) const DOCUMENT_CATALOG_VERSION: u32 = 1;
@@ -256,6 +257,10 @@ const V13_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
 const V14_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
         CHECK (requires_manifest_version >= 14)
+) STRICT";
+const V15_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 15)
 ) STRICT";
 const V3_ROUTING_TABLE_SQL: &str = "CREATE TABLE briskdb_routing (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1370,6 +1375,13 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v13_to_v14,
         validate: validate_v14,
     },
+    Migration {
+        from: V14_SCHEMA_VERSION,
+        to: V15_SCHEMA_VERSION,
+        name: "idempotency_receipt_format_fence",
+        apply: migrate_v14_to_v15,
+        validate: validate_v15,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -1383,8 +1395,8 @@ struct MigrationPlan<'a> {
 const CURRENT_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: CURRENT_SCHEMA_VERSION,
     migrations: MIGRATIONS,
-    initialize_current: create_v14_schema,
-    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v14,
+    initialize_current: create_v15_schema,
+    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v15,
 };
 
 // Startup uses this frozen plan only to finish an already-active v6 journal
@@ -3111,7 +3123,7 @@ fn downgrade_v12_manifest_to_v11_for_test(
     connection: &Connection,
     shard_count: u16,
 ) -> EngineResult<()> {
-    if read_identity(connection)?.1 == i64::from(V14_SCHEMA_VERSION) {
+    if read_identity(connection)?.1 >= i64::from(V14_SCHEMA_VERSION) {
         downgrade_v14_manifest_to_v13_for_test(connection, shard_count)?;
     }
     if read_identity(connection)?.1 == i64::from(V13_SCHEMA_VERSION) {
@@ -3149,6 +3161,9 @@ fn downgrade_v14_manifest_to_v13_for_test(
     connection: &Connection,
     shard_count: u16,
 ) -> EngineResult<()> {
+    if read_identity(connection)?.1 == i64::from(V15_SCHEMA_VERSION) {
+        downgrade_v15_manifest_to_v14_for_test(connection, shard_count)?;
+    }
     connection
         .execute_batch(
             "DROP TABLE briskdb_document_provisioning;
@@ -3180,11 +3195,34 @@ fn downgrade_v14_manifest_to_v13_for_test(
 }
 
 #[cfg(test)]
+fn downgrade_v15_manifest_to_v14_for_test(
+    connection: &Connection,
+    shard_count: u16,
+) -> EngineResult<()> {
+    connection
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(V14_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V14_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    set_identity(connection, V14_SCHEMA_VERSION)?;
+    refresh_manifest_digest(connection)?;
+    validate_v14(connection, shard_count, &schema_objects(connection)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn downgrade_v13_manifest_to_v12_for_test(
     connection: &Connection,
     shard_count: u16,
 ) -> EngineResult<()> {
-    if read_identity(connection)?.1 == i64::from(V14_SCHEMA_VERSION) {
+    if read_identity(connection)?.1 >= i64::from(V14_SCHEMA_VERSION) {
         downgrade_v14_manifest_to_v13_for_test(connection, shard_count)?;
     }
     connection
@@ -5146,6 +5184,11 @@ fn create_v14_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineR
     migrate_v13_to_v14(transaction, shard_count)
 }
 
+fn create_v15_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
+    create_v14_schema(transaction, shard_count)?;
+    migrate_v14_to_v15(transaction, shard_count)
+}
+
 fn migrate_interrupted_legacy_to_v6(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -5235,6 +5278,7 @@ fn migrate_interrupted_legacy_to_v13(
     create_v13_schema(transaction, shard_count)
 }
 
+#[cfg(test)]
 fn migrate_interrupted_legacy_to_v14(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -5243,6 +5287,16 @@ fn migrate_interrupted_legacy_to_v14(
         .execute_batch("DROP TABLE briskdb_metadata;")
         .map_err(sqlite_error::storage)?;
     create_v14_schema(transaction, shard_count)
+}
+
+fn migrate_interrupted_legacy_to_v15(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v15_schema(transaction, shard_count)
 }
 
 #[cfg(test)]
@@ -5787,6 +5841,22 @@ fn migrate_v13_to_v14(transaction: &Transaction<'_>, _shard_count: u16) -> Engin
     Ok(())
 }
 
+fn migrate_v14_to_v15(transaction: &Transaction<'_>, _shard_count: u16) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V15_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V15_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
 fn add_v5_schema(transaction: &Transaction<'_>, state: ShardLayoutState) -> EngineResult<()> {
     transaction
         .execute_batch("DROP TABLE briskdb_metadata;")
@@ -6166,6 +6236,10 @@ fn v14_objects() -> Vec<SchemaObject> {
         (&left.object_type, &left.name).cmp(&(&right.object_type, &right.name))
     });
     objects
+}
+
+fn v15_objects() -> Vec<SchemaObject> {
+    v14_objects()
 }
 
 fn schema_objects(connection: &Connection) -> EngineResult<Vec<SchemaObject>> {
@@ -6981,6 +7055,35 @@ fn validate_v14(
             version: V14_SCHEMA_VERSION,
             downgrade_fence_sql: V14_DOWNGRADE_FENCE_SQL,
             expected_objects: &v14_objects(),
+            expected_manifest_digest_version: V7_MANIFEST_DIGEST_VERSION,
+            generated_ids: true,
+        },
+    )?;
+    let catalog = snapshot.logical_catalog.take().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "global-index validation omitted the logical table catalog",
+        )
+    })?;
+    let indexes = validate_global_indexes(connection, &catalog)?;
+    snapshot.logical_catalog = Some(catalog.with_global_indexes(indexes));
+    validate_document_catalog(connection, snapshot.shard_count)?;
+    Ok(snapshot)
+}
+
+fn validate_v15(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    let mut snapshot = validate_v12_features(
+        connection,
+        requested_shards,
+        objects,
+        IntegrityManifestDefinition {
+            version: V15_SCHEMA_VERSION,
+            downgrade_fence_sql: V15_DOWNGRADE_FENCE_SQL,
+            expected_objects: &v15_objects(),
             expected_manifest_digest_version: V7_MANIFEST_DIGEST_VERSION,
             generated_ids: true,
         },
@@ -9049,7 +9152,8 @@ fn refresh_manifest_digest_if_checksummed(connection: &Connection) -> EngineResu
                 | V11_SCHEMA_VERSION
                 | V12_SCHEMA_VERSION
                 | V13_SCHEMA_VERSION
-                | V14_SCHEMA_VERSION)
+                | V14_SCHEMA_VERSION
+                | V15_SCHEMA_VERSION)
         )
     {
         let _ = refresh_manifest_digest(connection)?;
@@ -11250,6 +11354,13 @@ mod tests {
         initialize_interrupted_legacy: migrate_interrupted_legacy_to_v13,
     };
 
+    const V14_PLAN: MigrationPlan<'static> = MigrationPlan {
+        current_version: V14_SCHEMA_VERSION,
+        migrations: MIGRATIONS,
+        initialize_current: create_v14_schema,
+        initialize_interrupted_legacy: migrate_interrupted_legacy_to_v14,
+    };
+
     fn create_legacy_manifest(connection: &Connection, shards: u16, version: u32) {
         create_empty_legacy_manifest(connection);
         connection
@@ -11717,7 +11828,7 @@ mod tests {
             identity(connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(connection).unwrap(), v14_objects());
+        assert_eq!(schema_objects(connection).unwrap(), v15_objects());
         assert_eq!(
             connection
                 .query_row(
@@ -11905,6 +12016,7 @@ mod tests {
                 (11, 12),
                 (12, 13),
                 (13, 14),
+                (14, 15),
             ]
         );
         assert_generation_one_catalog(&connection, 4);
@@ -11975,7 +12087,7 @@ mod tests {
 
                 load_or_create_manifest(&mut connection, 4).unwrap();
                 assert_eq!(identity(&connection).1, i64::from(CURRENT_SCHEMA_VERSION));
-                assert_eq!(schema_objects(&connection).unwrap(), v14_objects());
+                assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
                 assert_eq!(
                     connection
                         .query_row(
@@ -12525,7 +12637,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v14_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
         assert_eq!(table_metadata_rows(&connection), tables_before);
         assert_eq!(logical_databases(&connection), databases_before);
         assert_eq!(routing_configuration(&connection), routing_before);
@@ -13108,7 +13220,7 @@ mod tests {
                     identity(&connection),
                     (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
                 );
-                assert_eq!(schema_objects(&connection).unwrap(), v14_objects());
+                assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
                 assert_eq!(
                     manifest_semantic_digest(&connection).unwrap(),
                     stored_manifest_digest(&connection)
@@ -13474,7 +13586,7 @@ mod tests {
     fn semantic_root_covers_every_authoritative_manifest_table_and_integrity_state() {
         let mutations = [
             "UPDATE briskdb_manifest SET singleton = 2 WHERE singleton = 1",
-            "UPDATE briskdb_metadata SET requires_manifest_version = 15",
+            "UPDATE briskdb_metadata SET requires_manifest_version = 14",
             "UPDATE briskdb_routing SET hash_version = 2 WHERE singleton = 1",
             "UPDATE briskdb_physical_shards SET lifecycle_state = 'retired' WHERE shard_id = 0",
             "UPDATE briskdb_allocation_owners SET owner_slot = 100 WHERE owner_slot = 0",
@@ -13929,7 +14041,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v14_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
         assert_eq!(
             shard_layout_row(&connection).3,
             ShardLayoutState::Adopting.code()
@@ -13953,7 +14065,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v14_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
         assert_eq!(layout.state(), ShardLayoutState::Ready);
         assert_eq!(shard_layout_row(&connection), layout_before);
         assert_eq!(catalog.logical().schema_generation(), 0);
@@ -14045,7 +14157,7 @@ mod tests {
                 identity(&connection),
                 (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
             );
-            assert_eq!(schema_objects(&connection).unwrap(), v14_objects());
+            assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
         }
 
         let mut connection = Connection::open_in_memory().unwrap();
@@ -15665,7 +15777,7 @@ mod tests {
         for mutation in [
             "DELETE FROM briskdb_metadata",
             "DELETE FROM briskdb_manifest",
-            "INSERT INTO briskdb_metadata VALUES (14)",
+            "UPDATE briskdb_metadata SET requires_manifest_version = 16",
             "DELETE FROM briskdb_routing",
             "DELETE FROM briskdb_virtual_buckets WHERE bucket_id = 4095",
             "DELETE FROM briskdb_physical_shards WHERE shard_id = 3",
@@ -16385,7 +16497,7 @@ mod tests {
     }
 
     #[test]
-    fn v13_to_v14_document_catalog_upgrade_is_atomic_and_downgrade_fenced() {
+    fn v13_document_catalog_upgrade_is_atomic_and_downgrade_fenced() {
         for phase in [
             MigrationPhase::AfterSchemaChange,
             MigrationPhase::AfterVersionStamp,
@@ -16412,8 +16524,8 @@ mod tests {
             assert_eq!(stored_manifest_digest(&connection), root_before);
 
             load_or_create_manifest(&mut connection, 4).unwrap();
-            assert_eq!(identity(&connection).1, i64::from(V14_SCHEMA_VERSION));
-            assert_eq!(schema_objects(&connection).unwrap(), v14_objects());
+            assert_eq!(identity(&connection).1, i64::from(CURRENT_SCHEMA_VERSION));
+            assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
             assert_eq!(
                 connection
                     .query_row(
@@ -16425,7 +16537,7 @@ mod tests {
                     )
                     .unwrap(),
                 (
-                    i64::from(V14_SCHEMA_VERSION),
+                    i64::from(CURRENT_SCHEMA_VERSION),
                     i64::from(V7_MANIFEST_DIGEST_VERSION)
                 )
             );
@@ -16446,6 +16558,70 @@ mod tests {
             }
             assert_eq!(
                 inspect_with_plan(&connection, 4, V13_PLAN)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition
+            );
+        }
+    }
+
+    #[test]
+    fn v14_to_v15_idempotency_format_fence_is_atomic_and_rejects_old_readers() {
+        for phase in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_ready_current_manifest(&mut connection, 4);
+            downgrade_v15_manifest_to_v14_for_test(&connection, 4).unwrap();
+            let objects_before = schema_objects(&connection).unwrap();
+            let root_before = stored_manifest_digest(&connection);
+
+            let error = load_or_create_with_hook(&mut connection, 4, |point| {
+                if point.from == V14_SCHEMA_VERSION && point.phase == phase {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "injected v14 to v15 migration failure",
+                    ));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+            assert_eq!(identity(&connection).1, i64::from(V14_SCHEMA_VERSION));
+            assert_eq!(schema_objects(&connection).unwrap(), objects_before);
+            assert_eq!(stored_manifest_digest(&connection), root_before);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT requires_manifest_version FROM briskdb_metadata",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                i64::from(V14_SCHEMA_VERSION)
+            );
+
+            load_or_create_manifest(&mut connection, 4).unwrap();
+            assert_eq!(identity(&connection).1, i64::from(V15_SCHEMA_VERSION));
+            assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT requires_manifest_version, manifest_digest_version
+                         FROM briskdb_metadata
+                         JOIN briskdb_integrity ON briskdb_integrity.singleton = 1",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .unwrap(),
+                (
+                    i64::from(V15_SCHEMA_VERSION),
+                    i64::from(V7_MANIFEST_DIGEST_VERSION)
+                )
+            );
+            assert_eq!(
+                inspect_with_plan(&connection, 4, V14_PLAN)
                     .unwrap_err()
                     .kind(),
                 EngineErrorKind::FailedPrecondition

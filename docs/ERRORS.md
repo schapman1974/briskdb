@@ -16,8 +16,10 @@ startup timeout closes without a frame because no session was established.
 The current data and administration HTTP listeners reject non-loopback
 addresses. Equal nonzero data/admin socket addresses are rejected as a
 configuration error; port zero may be requested for both because the operating
-system resolves them to distinct sockets. A path sent to the wrong HTTP plane
-is an ordinary 404 and never reaches the hidden handler.
+system resolves them to distinct sockets. A path with ordinary request controls
+sent to the wrong HTTP plane is an ordinary 404 and never reaches the hidden
+handler. Malformed controls or an idempotency key on an unsupported route can
+fail before route dispatch.
 Within HTTP v1, a malformed or absent exact migration generation and a
 malformed, unknown, completed, or stale active-query operation ID use the same
 fixed `not_found` transport problem. These resource lookups do not add an
@@ -44,6 +46,7 @@ the human-readable text to identify an error.
 | <a id="invalid-query"></a>`InvalidQuery` | `invalid_query` | 422 | Invalid query | The query could not be processed. | `42000` | 1105 | `HY000` | No |
 | <a id="unsupported"></a>`Unsupported` | `unsupported` | 501 | Unsupported operation | The requested operation is not supported. | `0A000` | 1235 | `42000` | No |
 | <a id="failed-precondition"></a>`FailedPrecondition` | `failed_precondition` | 409 | Failed precondition | The operation cannot run in the current state. | `55000` | 1105 | `HY000` | No |
+| <a id="idempotency-conflict"></a>`IdempotencyConflict` | `idempotency_conflict` | 409 | Idempotency key conflict | The idempotency key was already used for a different operation. | `23000` | 1105 | `HY000` | No |
 | <a id="transaction-aborted"></a>`TransactionAborted` | `transaction_aborted` | 409 | Transaction aborted | The transaction is aborted; roll it back before continuing. | `25P02` | 1105 | `HY000` | No |
 | <a id="type-mismatch"></a>`TypeMismatch` | `type_mismatch` | 422 | Type mismatch | A value has an incompatible type. | `42804` | 1366 | `HY000` | No |
 | <a id="constraint-violation"></a>`ConstraintViolation` | `constraint_violation` | 409 | Constraint violation | A database constraint was violated. | `23000` | 1105 | `HY000` | No |
@@ -180,15 +183,25 @@ The [HTTP v1 transport contract](HTTP_API.md#errors) also defines fixed problems
 for malformed envelopes, missing routes, wrong methods, oversized bodies, and
 non-JSON media types. These failures happen before engine execution and do not
 add protocol-specific kinds to `EngineErrorKind`. Every v1 error carries the
-`BriskDB-API-Version: 1` header.
+`BriskDB-API-Version: 1` header, and every HTTP response carries one canonical
+`BriskDB-Request-ID` header. Invalid or duplicate request-ID and idempotency-key
+headers are transport `invalid_argument` failures and never echo their input.
 
 Engine failures returned by HTTP use
 [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457.html) and the
 `application/problem+json` media type. The response has `type`, `title`,
 `status`, `detail`, and the BriskDB extension member `code`. `type`, `title`,
 `status`, `detail`, and `code` are selected from the adapter's fixed table for
-the error kind. In particular, `detail` is safe, fixed text rather than the
-underlying SQLite message, SQL text, filesystem path, or error source.
+the error kind. The request ID remains in its response header rather than
+adding a sixth member. In particular, `detail` is safe, fixed text rather than
+the underlying SQLite message, SQL text, filesystem path, or error source.
+
+After an HTTP NDJSON query has emitted metadata under status 200, a later
+Engine error cannot change the HTTP status or media type. The adapter emits one
+terminal stream record with `kind:"error"` and these same five fixed problem
+members, then no completion record. That record is a redacted in-band result,
+not an RFC 9457 response document. A failure before metadata remains an
+ordinary Problem Details response.
 
 Each `type` is this document's URL followed by the stable code with underscores
 changed to hyphens. For example, `invalid_argument` uses

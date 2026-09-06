@@ -28,7 +28,7 @@ Command, BSON, plan, and result types live under `briskdb::document`.
 | Feature | Adds | Tier |
 | --- | --- | --- |
 | `embedded` | Listener-free `BriskDb` and `BriskSession` SQL APIs | Alpha-supported |
-| `http` | Separate Axum data/admin routers, versioned data and operational APIs, active-query cancellation, and admin browser; combined compatibility router retained | Alpha-supported |
+| `http` | Separate Axum data/admin routers, versioned materialized/streamed data and operational APIs, request correlation, eligible-write replay, active-query cancellation, and admin browser; combined compatibility router retained | Alpha-supported |
 | `postgres` | PostgreSQL wire adapter, including TLS/SCRAM implementation | Alpha-supported, bounded SQL subset |
 | `listeners` | Host-controlled data HTTP, optional admin HTTP, and optional PostgreSQL listeners, selecting `tls`, without signals or engine ownership | Alpha-supported |
 | `server` | Daemon listener assembly, signal handling, and engine ownership | Process integration |

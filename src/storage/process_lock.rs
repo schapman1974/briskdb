@@ -5,18 +5,24 @@ use std::{
     fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use crate::{
-    core::{EngineError, EngineErrorKind, EngineResult, GlobalOperationId},
+    core::{
+        EngineError, EngineErrorKind, EngineResult, GlobalOperationId, IDEMPOTENCY_LOCK_STRIPES,
+    },
     sqlite_error,
 };
 
 pub(super) const PROCESS_LEASE_FILE_NAME: &str = ".briskdb-process.lock";
 pub(super) const STARTUP_LOCK_FILE_NAME: &str = ".briskdb-startup.lock";
 const GLOBAL_WRITE_LOCK_PREFIX: &str = ".briskdb-global-write-";
+const IDEMPOTENCY_LOCK_PREFIX: &str = ".briskdb-idempotency-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaseMode {
@@ -175,6 +181,83 @@ pub(super) struct GlobalWriteOperationLease {
     _file: File,
 }
 
+/// One of 256 retained cross-process idempotency-key serialization stripes.
+pub(crate) struct IdempotencyStripeGuard {
+    _file: File,
+    _local: IdempotencyLocalClaim,
+}
+
+impl std::fmt::Debug for IdempotencyStripeGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IdempotencyStripeGuard")
+            .finish_non_exhaustive()
+    }
+}
+
+impl IdempotencyStripeGuard {
+    pub(super) fn try_acquire(
+        root: &Path,
+        key_digest: [u8; 32],
+        local_stripes: Arc<[AtomicBool; IDEMPOTENCY_LOCK_STRIPES]>,
+    ) -> EngineResult<Self> {
+        let stripe = usize::from(key_digest[0]);
+        let local = IdempotencyLocalClaim::try_acquire(local_stripes, stripe)?;
+        let path = idempotency_lock_path(root, key_digest);
+        let file = open_regular_lock_file(&path)?;
+        lock_nonblocking(&file, LockRequest::Exclusive).map_err(|error| {
+            map_lock_error(
+                error,
+                &path,
+                "another process is handling an idempotency key in this lock stripe",
+            )
+        })?;
+        Ok(Self {
+            _file: file,
+            _local: local,
+        })
+    }
+}
+
+impl Drop for IdempotencyStripeGuard {
+    fn drop(&mut self) {
+        // Closing the descriptor also releases flock, but an explicit unlock
+        // makes release ordering deterministic before the local stripe claim
+        // is dropped and another thread can reopen the retained file.
+        let _ = unlock(&self._file);
+    }
+}
+
+#[derive(Debug)]
+struct IdempotencyLocalClaim {
+    stripes: Arc<[AtomicBool; IDEMPOTENCY_LOCK_STRIPES]>,
+    stripe: usize,
+}
+
+impl IdempotencyLocalClaim {
+    fn try_acquire(
+        stripes: Arc<[AtomicBool; IDEMPOTENCY_LOCK_STRIPES]>,
+        stripe: usize,
+    ) -> EngineResult<Self> {
+        if stripes[stripe]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::Busy,
+                "another local operation is handling an idempotency key in this lock stripe",
+            ));
+        }
+        Ok(Self { stripes, stripe })
+    }
+}
+
+impl Drop for IdempotencyLocalClaim {
+    fn drop(&mut self) {
+        self.stripes[self.stripe].store(false, Ordering::Release);
+    }
+}
+
 impl GlobalWriteOperationLease {
     pub(super) fn acquire(root: &Path, operation_id: GlobalOperationId) -> EngineResult<Self> {
         let path = global_write_lock_path(root, operation_id);
@@ -219,6 +302,13 @@ fn global_write_lock_path(root: &Path, operation_id: GlobalOperationId) -> PathB
     }
     name.push_str(".lock");
     root.join(name)
+}
+
+fn idempotency_lock_path(root: &Path, key_digest: [u8; 32]) -> PathBuf {
+    root.join(format!(
+        "{IDEMPOTENCY_LOCK_PREFIX}{:02x}.lock",
+        key_digest[0]
+    ))
 }
 
 pub(super) fn remove_global_write_marker(root: &Path, operation_id: GlobalOperationId) {
@@ -396,6 +486,11 @@ fn lock_blocking(file: &File, request: LockRequest) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn unlock(file: &File) -> io::Result<()> {
+    flock(file, libc::LOCK_UN)
+}
+
+#[cfg(unix)]
 fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -418,6 +513,14 @@ fn lock_nonblocking(_file: &File, _request: LockRequest) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn lock_blocking(_file: &File, _request: LockRequest) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cross-process BriskDB root leases require a supported Unix host",
+    ))
+}
+
+#[cfg(not(unix))]
+fn unlock(_file: &File) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "cross-process BriskDB root leases require a supported Unix host",
@@ -483,6 +586,42 @@ mod tests {
         drop(RootStartupGuard::acquire(temp.path(), Duration::ZERO).unwrap());
     }
 
+    #[test]
+    fn idempotency_locks_have_256_retained_nonblocking_stripes() {
+        let temp = TempDir::new().unwrap();
+        let stripes = Arc::new(std::array::from_fn(|_| AtomicBool::new(false)));
+        let first_digest = [0x2a; 32];
+        let mut same_stripe = [0; 32];
+        same_stripe[0] = 0x2a;
+        let mut other_stripe = [0; 32];
+        other_stripe[0] = 0x2b;
+
+        let first =
+            IdempotencyStripeGuard::try_acquire(temp.path(), first_digest, Arc::clone(&stripes))
+                .unwrap();
+        assert_eq!(
+            IdempotencyStripeGuard::try_acquire(temp.path(), same_stripe, Arc::clone(&stripes),)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Busy
+        );
+        drop(
+            IdempotencyStripeGuard::try_acquire(temp.path(), other_stripe, Arc::clone(&stripes))
+                .unwrap(),
+        );
+        let path = temp.path().join(".briskdb-idempotency-2a.lock");
+        assert!(path.is_file());
+        drop(first);
+        drop(
+            IdempotencyStripeGuard::try_acquire(temp.path(), same_stripe, Arc::clone(&stripes))
+                .unwrap(),
+        );
+        assert!(
+            path.is_file(),
+            "stripe files remain after releasing their locks"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn lock_paths_reject_symbolic_links_and_non_files() {
@@ -501,6 +640,23 @@ mod tests {
         fs::create_dir(other.path().join(PROCESS_LEASE_FILE_NAME)).unwrap();
         assert_eq!(
             RootProcessLease::acquire(other.path()).unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+
+        let stripe_target = temp.path().join("stripe-target");
+        fs::write(&stripe_target, b"not a lock").unwrap();
+        symlink(
+            &stripe_target,
+            temp.path().join(".briskdb-idempotency-01.lock"),
+        )
+        .unwrap();
+        let mut digest = [0; 32];
+        digest[0] = 1;
+        let stripes = Arc::new(std::array::from_fn(|_| AtomicBool::new(false)));
+        assert_eq!(
+            IdempotencyStripeGuard::try_acquire(temp.path(), digest, stripes)
+                .unwrap_err()
+                .kind(),
             EngineErrorKind::FailedPrecondition
         );
     }
@@ -567,6 +723,38 @@ mod tests {
         drop(RootStartupGuard::acquire(temp.path(), Duration::ZERO).unwrap());
     }
 
+    #[test]
+    fn idempotency_stripe_is_visible_across_processes_and_released_on_exit() {
+        let temp = TempDir::new().unwrap();
+        let ready = temp.path().join("ready");
+        let release = temp.path().join("release");
+        let child = spawn_holder(temp.path(), &ready, &release, "idempotency");
+        wait_for_path(&ready);
+        let stripes = Arc::new(std::array::from_fn(|_| AtomicBool::new(false)));
+        let digest = [0x4d; 32];
+
+        // The lock identity deliberately excludes the routed target. Both a
+        // same-target retry and a changed-target retry for this key contend on
+        // the same cross-process file before either can mutate a shard.
+        for target_shard in [0_u16, 1] {
+            assert_eq!(
+                IdempotencyStripeGuard::try_acquire(temp.path(), digest, Arc::clone(&stripes),)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::Busy,
+                "target shard {target_shard} must not affect key serialization"
+            );
+        }
+        fs::write(&release, b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(IdempotencyStripeGuard::try_acquire(temp.path(), digest, stripes).unwrap());
+    }
+
     fn spawn_holder(root: &Path, ready: &Path, release: &Path, kind: &str) -> std::process::Child {
         Command::new(env::current_exe().unwrap())
             .arg("--exact")
@@ -608,7 +796,15 @@ mod tests {
         } else {
             None
         };
-        assert!(matches!(kind.as_str(), "lease" | "startup"));
+        let stripes = Arc::new(std::array::from_fn(|_| AtomicBool::new(false)));
+        let _idempotency = if kind == "idempotency" {
+            Some(
+                IdempotencyStripeGuard::try_acquire(Path::new(&root), [0x4d; 32], stripes).unwrap(),
+            )
+        } else {
+            None
+        };
+        assert!(matches!(kind.as_str(), "lease" | "startup" | "idempotency"));
         fs::write(ready, b"ready").unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !release.exists() && Instant::now() < deadline {

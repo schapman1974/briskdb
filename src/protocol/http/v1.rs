@@ -18,9 +18,10 @@ use serde::{
 use serde_json::value::RawValue;
 
 use super::{
-    HttpState, ProblemDetails, active_queries, backup_capability, broadcast, cancel_query, catalog,
+    HttpState, IDEMPOTENCY_KEY_HEADER_NAME, ProblemDetails, REQUEST_ID_HEADER_NAME,
+    STREAM_MEDIA_TYPE, active_queries, backup_capability, broadcast, cancel_query, catalog,
     checkpoint, execute, global_indexes, health, migration, migrations, problem_response, query,
-    ready, shard_status,
+    query_stream, ready, shard_status,
 };
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -33,6 +34,7 @@ pub(super) fn routes() -> Router<HttpState> {
             .route("/ready", get(ready))
             .route("/execute", post(execute))
             .route("/query", post(query))
+            .route("/query/stream", post(query_stream))
             .route("/admin/broadcast", post(broadcast))
             .route("/admin/global-indexes", get(global_indexes))
             .route("/admin/catalog", get(catalog))
@@ -52,7 +54,8 @@ pub(super) fn data_routes() -> Router<HttpState> {
         Router::new()
             .route("/", get(discovery))
             .route("/execute", post(execute))
-            .route("/query", post(query)),
+            .route("/query", post(query))
+            .route("/query/stream", post(query_stream)),
         true,
     )
 }
@@ -111,9 +114,18 @@ struct ApiVersion {
     session_scope: &'static str,
     sql_dialect: &'static str,
     max_request_bytes: usize,
+    max_result_rows: u64,
+    max_result_logical_bytes: u64,
+    stream_buffer_rows: usize,
+    request_id_header: &'static str,
+    idempotency_key_header: &'static str,
+    stream_media_type: &'static str,
 }
 
-async fn discovery() -> Json<ApiVersion> {
+async fn discovery(
+    axum::extract::State(state): axum::extract::State<HttpState>,
+) -> Json<ApiVersion> {
+    let result_limits = state.engine.options().result_limits();
     Json(ApiVersion {
         api_version: "1",
         value_encoding: ValueEncoding::LegacyJsonV1,
@@ -121,6 +133,12 @@ async fn discovery() -> Json<ApiVersion> {
         session_scope: "request",
         sql_dialect: "sqlite",
         max_request_bytes: MAX_REQUEST_BYTES,
+        max_result_rows: result_limits.max_rows(),
+        max_result_logical_bytes: result_limits.max_bytes(),
+        stream_buffer_rows: crate::core::DEFAULT_STREAM_BUFFER_ROWS,
+        request_id_header: REQUEST_ID_HEADER_NAME,
+        idempotency_key_header: IDEMPOTENCY_KEY_HEADER_NAME,
+        stream_media_type: STREAM_MEDIA_TYPE,
     })
 }
 
@@ -151,12 +169,12 @@ impl RawJsonParameter {
     }
 }
 
-/// Shared SQL envelope; each handler creates a fresh core Session and Statement.
+/// Execute envelope; each handler creates a fresh core Session and Statement.
 /// Unknown fields must fail rather than silently ignoring a client's routing,
-/// transaction, dialect, or value-encoding expectations.
+/// transaction, dialect, value-encoding, or request-control expectations.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SqlRequest {
+pub(super) struct ExecuteRequest {
     #[serde(default)]
     pub(super) shard_key: Option<String>,
     pub(super) sql: String,
@@ -164,6 +182,44 @@ pub(super) struct SqlRequest {
     pub(super) params: Vec<RawJsonParameter>,
     #[serde(default)]
     pub(super) value_encoding: ValueEncoding,
+}
+
+/// Query envelope with optional protocol-neutral result-limit narrowing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct QueryRequest {
+    #[serde(default)]
+    pub(super) shard_key: Option<String>,
+    pub(super) sql: String,
+    #[serde(default)]
+    pub(super) params: Vec<RawJsonParameter>,
+    #[serde(default)]
+    pub(super) value_encoding: ValueEncoding,
+    #[serde(default, deserialize_with = "deserialize_result_limits")]
+    pub(super) result_limits: Option<QueryResultLimits>,
+}
+
+fn deserialize_result_limits<'de, D>(deserializer: D) -> Result<Option<QueryResultLimits>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    QueryResultLimits::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct QueryResultLimits {
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    pub(super) max_rows: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    pub(super) max_logical_bytes: Option<u64>,
+}
+
+fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u64::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -343,7 +399,7 @@ async fn method_not_allowed() -> TransportError {
 
 #[cfg(test)]
 mod tests {
-    use super::{SqlRequest, ValueEncoding};
+    use super::{ExecuteRequest, QueryRequest, ValueEncoding};
 
     #[test]
     fn sql_request_defaults_and_explicit_legacy_selection_preserve_raw_parameters() {
@@ -357,11 +413,36 @@ mod tests {
                 "[ 1, 2 ]",
             ),
         ] {
-            let request = serde_json::from_str::<SqlRequest>(raw).unwrap();
+            let request = serde_json::from_str::<ExecuteRequest>(raw).unwrap();
 
             assert_eq!(request.value_encoding, ValueEncoding::LegacyJsonV1);
             assert_eq!(request.params.len(), 1);
             assert_eq!(request.params[0].get(), expected_parameter);
+        }
+    }
+
+    #[test]
+    fn only_query_envelopes_accept_nonnull_result_limits() {
+        let query = serde_json::from_str::<QueryRequest>(
+            r#"{"sql":"SELECT 1","result_limits":{"max_rows":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(query.result_limits.unwrap().max_rows, Some(1));
+        assert!(
+            serde_json::from_str::<QueryRequest>(r#"{"sql":"SELECT 1","result_limits":null}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ExecuteRequest>(
+                r#"{"sql":"DELETE FROM t","result_limits":{"max_rows":1}}"#
+            )
+            .is_err()
+        );
+        for raw in [
+            r#"{"sql":"SELECT 1","result_limits":{"max_rows":null,"max_logical_bytes":1}}"#,
+            r#"{"sql":"SELECT 1","result_limits":{"max_rows":1,"max_logical_bytes":null}}"#,
+        ] {
+            assert!(serde_json::from_str::<QueryRequest>(raw).is_err(), "{raw}");
         }
     }
 }

@@ -25,11 +25,11 @@ server
 
 | Module | Responsibility | Must not own |
 | --- | --- | --- |
-| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, generated-ID policy and codec types, canonical global-index keys, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, logical Sharded read target selection and scatter/gather, and sharded routing policy; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
-| `storage` | Versioned routing and authoritative logical/global-index manifest, persisted generated-ID policy/activation, stable active/retired allocation-owner slots, durable per-table hi/lo block leases, recoverable one-time table provisioning, shard layout, migration journals and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
+| `core` | Protocol-neutral `Engine`, `Session`, statements, immutable bound portals, values, results, errors, read-only catalog views and initialization declarations, generated-ID policy and codec types, canonical global-index keys, synchronous bound-value-aware plans, prepared lifecycle, explicit-shard read-only inspection, logical Sharded read target selection and scatter/gather, sharded routing policy, and database-wide idempotent-write coordination; stable key routing; bounded per-session and per-shard admission; routed execution and journaled schema migration | JSON/HTTP types, listeners, or Axum handlers |
+| `storage` | Versioned routing and authoritative logical/global-index manifest, persisted generated-ID policy/activation, stable active/retired allocation-owner slots, durable per-table hi/lo block leases, recoverable one-time table provisioning, shard-local idempotency receipts, shard layout, migration journals and recovery, SQLite connection opening, WAL/durability configuration | Network requests or response serialization |
 | `import` | Offline source-schema preflight, explicit placement and generated-ID plan validation, exact-value row routing into private staging, independent verification, durable receipt creation, and atomic publication | Network handlers, live/incremental migration, generated-ID inference, implicit Global placement, or protocol-specific behavior |
 | `sql` | Dialect-explicit SQL syntax parsing, recursive common-subset validation, protocol-neutral statement/batch classification, source-preserving placeholder normalization, explicit strict/compatibility translation, catalog-aware typed shard-key inference, and narrow crate-private DML-shape inspection behind BriskDB-owned boundaries; exact source retention; SQLite statement execution and conversion between SQLite storage classes and BriskDB values | JSON, key hashing or shard selection, mutable session state, physical write-routing policy, filesystem layout, protocol responses, protocol-buffer ownership, or protocol-specific support policy |
-| `protocol::http` | Separate data/admin Axum routers, versioned HTTP request extraction, legacy and lossless JSON/BriskDB value codecs, RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | Listener binding, BLAKE3 routing, shard files, direct SQLite access, or rusqlite calls |
+| `protocol::http` | Separate data/admin Axum routers, plane-wide request correlation, versioned HTTP request extraction, legacy and lossless JSON/BriskDB value codecs, materialized and bounded NDJSON query delivery, RFC 9457 problem-detail encoding, and the embedded admin shell/assets, temporary browser sessions, metadata-driven logical discovery, exact logical counts, and bounded shard-major page handlers | Listener binding, write fingerprinting or shard coordination, shard files, direct SQLite access, or rusqlite calls |
 | `protocol::postgres` | BriskDB-owned bounded protocol-3.0 baseline and newer-minor downgrade, selected identity/status, per-connection core-session ownership, simple query execution, bounded parameterized text/binary extended lifecycle, fixed error recovery, and private compile/query-parser seam around exactly pinned `pgwire` | Listener binding, direct SQLite access, routing, unbounded authoritative prepared state, or public dependency-owned types |
 | `protocol::error` | Exhaustive HTTP, PostgreSQL, and MySQL mappings from stable engine error kinds | SQLite errors, routing decisions, or wire-protocol session state |
 | `server` | Process configuration, database assembly, loopback validation, separate data HTTP, administration HTTP, and PostgreSQL listener binding, finite connection-task supervision, and shared graceful/forced draining | HTTP route selection, SQL parsing, PostgreSQL wire framing, or storage implementation details |
@@ -139,6 +139,35 @@ normal `RequestContext` and `OperationControl` path. Registration and removal
 use the exact opaque ID, completion keeps the established close-race rule, and
 listing returns only bounded redaction-safe metadata. The handles are neither
 general request IDs nor durable records.
+
+Issue #54 keeps three identity domains separate. The HTTP adapter generates or
+validates a `BriskDB-Request-ID` for correlation and attaches it to every
+response without putting it into Engine state. The existing active-query ID is
+a process-local cancellation capability. A public `IdempotencyKey` instead
+enters a dedicated Engine write operation and is represented internally only
+by its digest.
+That digest currently represents one unauthenticated namespace for the entire
+database root. Later authentication work must authorize before receipt lookup
+and make any principal-scoping change explicit.
+
+The Engine proves the keyed write is one exact-shard direct autocommit DML
+operation, builds a versioned semantic digest from protocol-neutral SQL,
+parameters, routing, catalog, and target identity, and coordinates the complete
+shard set. One of 256 fixed root lock stripes serializes the key across
+processes. The Engine then checks the optional receipt table on every shard
+through normal connection and worker admission. A matching record replays its
+bounded write result, a different digest fails with `IdempotencyConflict`, and
+absence permits the target shard to commit its DML and receipt in one SQLite
+transaction. The HTTP adapter neither chooses the shard nor computes this
+identity.
+
+`/v1/query/stream` is an adapter framing of the existing protocol-neutral
+`RowStream`. The HTTP body retains both the stream and active-query guard, emits
+ordered NDJSON metadata and rows under backpressure, and converts a late Engine
+failure into one terminal redacted record after status 200. Request-local HTTP
+result limits become a `RequestContext` and can only narrow Engine policy.
+Neither the adapter nor Engine keeps a cursor between requests or rewrites SQL;
+global ordering and pagination remain Phase 7 work.
 
 The independent `Config::postgres_listen` is also either a numeric socket
 address or disabled with `None`. The process default disables PostgreSQL;
@@ -637,9 +666,10 @@ placement. Creation publishes an active collection only after the cursor has
 installed or verified that table on every shard. Startup resumes a durable
 prefix under sole-process ownership and validates stored document checksums,
 canonical IDs, routes, and natural-order uniqueness before serving work. Builds
-without the optional `documents` feature still understand and checksum version
-14 metadata and recognize its exact shard schema; they refuse to activate a
-store with document collections.
+without the optional `documents` feature still understand and checksum the
+document metadata introduced in version 14 and retained by current version 15;
+they recognize its exact shard schema and refuse to activate a store with
+document collections.
 
 The optional document engine sits above that persistence boundary. Owned
 `DocumentRequest` values carry request identity, cancellation, deadline, read
@@ -688,6 +718,11 @@ fence, and installs checksum version 6 without changing a shard.
 The v13-to-v14 step adds the empty durable document catalog, raises the fence,
 and installs checksum version 7 without changing a shard. Fixed document
 storage is provisioned only after a collection-creation journal is committed.
+The v14-to-v15 step changes only the manifest header and downgrade fence. It
+keeps checksum version 7 and the same manifest objects, while allowing eligible
+keyed writes to create the exact optional receipt table atomically in a target
+shard. A version-14 reader therefore refuses the root before it could ignore
+that storage-owned shard namespace.
 There is no automatic downgrade; an older binary requires a backup from before
 the newer format.
 
@@ -716,7 +751,7 @@ lock through independently durable per-shard work and `Ready` publication. A
 lagging opener re-reads `Ready` and strictly validates instead of provisioning
 from a stale `Creating` observation. Only a locked, durable `Creating` state
 permits missing canonical shard files to be created and WAL to be enabled. The
-validated v14 manifest may also retain one generated-table DDL bridge and one
+validated v15 manifest may also retain one generated-table DDL bridge and one
 matching active table-provisioning record. Startup first resumes any
 `Applying` physical migration under its ordinary exact-prefix rules. It then
 keeps admission `Pending`, advances the bridge from `ApplyingPhysical` to

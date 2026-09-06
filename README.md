@@ -122,7 +122,7 @@ experimental and opt-in; the exact contract lives in
 | --- | --- |
 | Durable virtual-bucket routing over independent SQLite WAL files | Working |
 | Exact-key routing and bounded scatter/gather reads | Working |
-| HTTP query/write API, operational API, and admin data browser | Working on separate data/admin listeners, loopback-only; readiness, catalog/migration/shard inspection, active-query cancellation, stopped-copy capability, and passive checkpoint are versioned |
+| HTTP query/write API, operational API, and admin data browser | Working on separate loopback-only data/admin listeners; request correlation, bounded NDJSON rows, request-local result limits, eligible-write durable replay, readiness, inspection, cancellation, stopped-copy capability, and passive checkpoint are versioned |
 | PostgreSQL wire protocol | TLS/SCRAM, backpressured row streaming, SQLite-interrupt cancellation, text/binary CRUD, real single-shard transactions, and a live psql/tokio-postgres/psycopg/SQLAlchemy matrix |
 | Offline import from a standard SQLite database | Working |
 | Native-range and hi/lo generated IDs | Experimental, opt-in |
@@ -211,7 +211,9 @@ curl -X POST http://127.0.0.1:7654/v1/query \
 ```
 
 The [versioned HTTP contract](docs/HTTP_API.md) defines requests, response
-shapes, value encodings, and errors. `GET /v1` reports the supported API version.
+shapes, value encodings, request IDs, eligible-write idempotency, bounded row
+streaming, limits, and errors. `GET /v1` reports the supported API version and
+configured result ceilings.
 The [HTTP listener contract](docs/HTTP_LISTENERS.md) defines the strict route
 split, configuration, and shared startup/shutdown behavior. The data listener
 defaults to `127.0.0.1:7654`; administration defaults to
@@ -332,6 +334,8 @@ more valuable than a star. Start with the
   listeners remain loopback-only development surfaces.
 - No general atomic transaction across multiple shard files.
 - Global ordering/pagination and general aggregate pushdown are still limited.
+- HTTP offers bounded row streaming but no retained cursor, continuation token,
+  cross-shard snapshot, or new global `ORDER BY`/`OFFSET`/`LIMIT` semantics.
 - The supported backup today is a stopped-server copy of the complete data
   directory after every server and embedder exits. Passive checkpoints now
   report shards, manifest, and global-index storage through both Rust and the

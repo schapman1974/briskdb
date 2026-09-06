@@ -93,6 +93,7 @@ set, every shard for an unconstrained Sharded read, or shard 0 once for a
 | --- | --- | --- | --- |
 | Data HTTP `/v1/execute` | Experimental | Empty catalog: legacy SQLite statement. Populated catalog: exactly one SQLite common-subset write with normalized positional parameters and strict SQLite translation | Empty catalog requires caller `shard_key`; a populated catalog requires authoritative finite single-shard inference except for one active-policy omitted generated key, and rejects Global/Catalog writes |
 | Data HTTP `/v1/query` | Experimental | Empty catalog: legacy raw SQLite query. Populated catalog: exactly one SQLite common-subset read; no session cache; multi-shard execution is limited to the row-local scatter-safe subset | Empty catalog requires caller `shard_key`; populated catalog derives targets from registered metadata, reads Global data once on shard 0, and denies Catalog/undeclared tables |
+| Data HTTP `/v1/query/stream` | Experimental | The same SQL and routing contract as `/v1/query`, incrementally framed over the existing bounded Engine row stream | Same selected targets and ascending shard-major concatenation; no retained cursor, SQL rewrite, global ordering, or cross-shard snapshot |
 | Admin HTTP `/v1/admin/broadcast` | Experimental | A journaled parameterless SQLite schema batch; populated catalogs reject row-moving DML, table drops, and trigger creation | Preflight on every shard, then ascending resumable apply |
 | Admin HTTP `/admin` browser | Experimental, read-only | No caller SQL; metadata-driven logical table discovery, specialized exact logical `COUNT(*)`, and bounded deterministic `SELECT *` page slices | Sharded tables visit all files; Global tables visit shard 0 once; no browser shard selector or arbitrary SQL |
 | PostgreSQL wire protocol | Protocol 3.0, newer-minor downgrade, TLS/SCRAM, cancellation, simple and extended flow; live psql/tokio-postgres/psycopg/SQLAlchemy matrix | Registered-table CRUD, basic OIDs/formats, single-shard transactions, and exact placeholder `::VARCHAR` adaptation; general casts and DDL remain unsupported | Secure startup authenticates before database/session creation; queries use Engine prepare/bind/logical execution and fixed SQLSTATE mapping |
@@ -293,6 +294,14 @@ forms such as DML `RETURNING`; callers must use the execute surface, whose
 result is rows affected rather than returned rows. Exact accounting and
 configuration semantics are in [request controls](REQUEST_CONTROLS.md).
 
+An optional HTTP idempotency key does not widen that SQL subset. The Engine
+accepts it only for a populated-catalog, direct, exact-shard autocommit
+`INSERT`, `UPDATE`, or `DELETE` whose application DML and receipt can commit in
+one SQLite transaction. Generated-key targets, global-index definitions,
+experimental writable-vtable coordination, raw empty-catalog statements,
+schema/session statements, and DML `RETURNING` are rejected before mutation.
+The ordinary unkeyed SQL path remains unchanged.
+
 A supported logical multi-shard query schedules at most eight shard tasks. All
 targets share one absolute request deadline, cancellation source, and combined
 row/logical-byte budget. Rows are concatenated in ascending shard order and
@@ -443,8 +452,9 @@ contract.
 
 The 2 MiB request-body limit counts encoded JSON. Engine result limits account
 protocol-neutral values before tag and base64 expansion, so encoded response
-size can exceed the logical byte count. The current response remains buffered;
-HTTP output-byte limits and streaming are separate roadmap work.
+size can exceed the logical byte count. `/v1/query` remains buffered;
+`/v1/query/stream` emits the same values in bounded NDJSON records. Neither has
+a separate encoded-response-byte ceiling.
 
 The admin row-page response keeps its separate browser-oriented encoding. It
 uses direct JSON integers within `-9007199254740991..=9007199254740991` and
@@ -452,8 +462,9 @@ tags only larger signed or unsigned values with exact decimal text. Blobs remain
 byte arrays there. The browser does not select or expose the public
 `lossless-json-v1` codec.
 
-These conversions change only HTTP serialization. Routing, configuration, the
-manifest, shard files, and stored data are unchanged.
+These conversions change only HTTP serialization. The separate idempotent-write
+feature has its own manifest-v15 fence and optional shard receipt table; value
+encoding itself still changes no routing, manifest, shard file, or stored data.
 
 ### Current error contract
 

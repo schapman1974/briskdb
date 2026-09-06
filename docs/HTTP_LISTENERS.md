@@ -35,7 +35,8 @@ operator or browser paths at `127.0.0.1:7654` must use
 | --- | --- |
 | `GET /v1`, `GET /v1/` | `GET /health` |
 | `POST /v1/query` | `GET /metrics` |
-| `POST /v1/execute` | `GET /v1/health` |
+| `POST /v1/query/stream` | `GET /v1/health` |
+| `POST /v1/execute` |  |
 |  | `GET /ready`, `GET /v1/ready` |
 |  | `POST /v1/admin/broadcast` |
 |  | `GET /v1/admin/catalog` |
@@ -48,9 +49,13 @@ operator or browser paths at `127.0.0.1:7654` must use
 |  | `/admin`, `/admin/`, assets, and `/admin/api/*` |
 
 Each production router omits the other plane's handlers. A cross-plane request
-therefore receives HTTP 404 and cannot execute the hidden operation. Responses
-under an omitted `/v1` path retain the version-1 problem-detail and version
-header behavior; unversioned missing paths use the ordinary HTTP 404 response.
+with ordinary request controls therefore receives HTTP 404 and cannot execute
+the hidden operation. Malformed request-control headers or an idempotency key on
+an unsupported route can fail before dispatch. Responses under an omitted `/v1`
+path retain the version-1 problem-detail and version header behavior;
+unversioned missing paths use the ordinary HTTP 404 response.
+Every response from both planes, including unversioned fallbacks, carries one
+`BriskDB-Request-ID`; this correlation header does not change route ownership.
 The embedded browser and its JSON endpoints stay together on the administration
 listener, so its same-origin cookie and asset rules do not change. Its temporary
 cookie does not authenticate the operator endpoints above.
@@ -111,11 +116,11 @@ against the configured grace period. An attached server performs the same
 listener drain without beginning shutdown of its borrowed database.
 
 Active HTTP query handles are likewise stored in the shared Engine rather than
-one router. A data-plane `/v1/query` can therefore be listed and cancelled from
-the administration listener even though neither plane forwards requests to the
-other. Closing a data socket drops its handler and removes the query handle;
-the engine's operation guard retains its own lifecycle and pool leases until
-SQLite interruption and cleanup finish.
+one router. A data-plane `/v1/query` or `/v1/query/stream` can therefore be
+listed and cancelled from the administration listener even though neither
+plane forwards requests to the other. Closing a data socket drops its handler
+and removes the query handle; the engine's operation guard retains its own
+lifecycle and pool leases until SQLite interruption and cleanup finish.
 
 ## Compatibility and deferred work
 
@@ -126,10 +131,12 @@ administration address. `/v1/query`, `/v1/execute`, and version discovery stay
 on the established data address. The move changes no SQL semantics, JSON value
 codec, error mapping, manifest or shard format, migration, or dependency.
 
-Issue #53 adds readiness, catalog, migration, shard, active-query cancellation,
-backup-capability, and checkpoint-maintenance endpoints. Issue #54 owns general
-request IDs, idempotency, pagination/streaming, and further transport limits.
-Issue #55 owns OpenAPI.
+Issue #53 added readiness, catalog, migration, shard, active-query
+cancellation, backup-capability, and checkpoint-maintenance endpoints. Issue
+#54 adds plane-wide request IDs, eligible-write idempotency, request-local query
+limits, and bounded HTTP row streaming. It deliberately adds no retained
+pagination cursor or global ordering; those semantics remain in Phase 7 issues
+#58 and #59. Issue #55 owns OpenAPI.
 Issue #56 owns the HTTP authentication and role-check boundary, issue #64 owns
 the durable user/role and credential model, and issue #65 owns listener TLS and
 safe remote activation. Until those land, the separate loopback listeners are

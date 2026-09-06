@@ -268,6 +268,8 @@ fn legacy_and_explicit_module_paths_are_both_available() {
 
     assert_owned_public::<core::GeneratedKey>();
     assert_owned_public::<core::WriteResult>();
+    assert_owned_public::<core::IdempotencyKey>();
+    assert_owned_public::<core::IdempotentWriteResult>();
     let _legacy_database: Option<storage::Database> = None;
     let _core_database: Option<core::Database> = None;
     let _engine: Option<core::Engine> = None;
@@ -283,6 +285,9 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _migration_complete = core::SchemaMigrationState::Complete;
     let _query_id: Option<core::QueryId> = None;
     let _query_id_error: Option<core::ParseQueryIdError> = None;
+    let _idempotency_error: Option<core::ParseIdempotencyKeyError> = None;
+    let _idempotency_created = core::IdempotencyStatus::Created;
+    let _idempotency_replayed = core::IdempotencyStatus::Replayed;
     let _tracked_query: Option<core::TrackedQuery> = None;
     let _active_query: Option<core::ActiveQueryStatus> = None;
     let _readiness: Option<core::ReadinessSnapshot> = None;
@@ -291,11 +296,25 @@ fn legacy_and_explicit_module_paths_are_both_available() {
     let _migration_status: Option<core::SchemaMigrationStatus> = None;
     let _migration_summary: Option<core::SchemaMigrationSummary> = None;
     assert_eq!(core::MAX_ACTIVE_QUERIES, 1_024);
+    assert_eq!(core::IDEMPOTENCY_FINGERPRINT_VERSION, 1);
+    assert_eq!(core::IDEMPOTENCY_LOCK_STRIPES, 256);
+    assert_eq!(core::MAX_IDEMPOTENCY_RECEIPTS_PER_SHARD, 4_096);
+    assert_eq!(
+        core::IDEMPOTENCY_RECEIPT_RETENTION,
+        Duration::from_secs(24 * 60 * 60)
+    );
     let _shutdown_report: Option<core::ShutdownReport> = None;
     let _session: Option<core::Session> = None;
     let _ready = core::SessionState::Ready;
     let _closed = core::SessionState::Closed;
     let _statement = core::Statement::new("SELECT ?1", vec![core::Value::from(42_i64)]);
+    let idempotency: core::IdempotencyKey = "000102030405060708090a0b0c0d0e0f".parse().unwrap();
+    let root_idempotency: briskdb::IdempotencyKey = idempotency;
+    assert_eq!(
+        root_idempotency.to_string(),
+        "000102030405060708090a0b0c0d0e0f"
+    );
+    assert!(!format!("{root_idempotency:?}").contains(&root_idempotency.to_string()));
     let generated_key = core::GeneratedKey::new("id", core::Value::Int64(41));
     let write_result = core::WriteResult::with_generated_key(1, generated_key);
     assert_eq!(write_result.rows_affected, 1);
@@ -352,6 +371,10 @@ fn legacy_and_explicit_module_paths_are_both_available() {
 
     let engine_error = core::EngineError::new(core::EngineErrorKind::InvalidArgument, "diagnostic");
     let _engine_result: core::EngineResult<()> = Err(engine_error);
+    assert_eq!(
+        core::EngineErrorKind::IdempotencyConflict.code(),
+        "idempotency_conflict"
+    );
     assert_eq!(
         error::http_error(core::EngineErrorKind::InvalidArgument).status,
         400
@@ -426,6 +449,99 @@ async fn operational_engine_api_is_public_shared_bounded_and_redacted() {
 
     engine.shutdown().await.unwrap();
     assert_eq!(engine.readiness().lifecycle_state().code(), "stopped");
+}
+
+#[tokio::test]
+async fn idempotent_write_api_creates_replays_and_rejects_changed_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut database = core::Database::open(temp.path(), 2).unwrap();
+    register_catalog_fixture(&mut database);
+    let engine = core::Engine::from_database(Arc::new(database));
+    let session = engine.session();
+    let key: core::IdempotencyKey = "102132435465768798a9bacbdcedfe0f".parse().unwrap();
+    let statement = core::Statement::new(
+        "INSERT INTO accounts (id, tenant_id, payload) VALUES (?1, ?2, ?3)",
+        vec![
+            core::Value::Int64(1),
+            core::Value::Text("idempotent-public-api".to_owned()),
+            core::Value::Text("original".to_owned()),
+        ],
+    );
+    let restart_statement = statement.clone();
+
+    let created = engine
+        .execute_idempotent_write(&session, key, statement.clone())
+        .await
+        .unwrap();
+    assert_eq!(created.status(), core::IdempotencyStatus::Created);
+    assert_eq!(created.rows_affected(), 1);
+    assert_eq!(created.generated_key(), None);
+
+    let replayed = engine
+        .execute_idempotent_write_with_context(
+            &session,
+            key,
+            statement,
+            core::RequestContext::new().with_deadline(Instant::now() + Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed.status(), core::IdempotencyStatus::Replayed);
+    assert_eq!(replayed.shard(), created.shard());
+    assert_eq!(replayed.write_result(), created.write_result());
+
+    let conflict = engine
+        .execute_idempotent_write(
+            &session,
+            key,
+            core::Statement::new(
+                "INSERT INTO accounts (id, tenant_id, payload) VALUES (?1, ?2, ?3)",
+                vec![
+                    core::Value::Int64(1),
+                    core::Value::Text("idempotent-public-api".to_owned()),
+                    core::Value::Text("changed".to_owned()),
+                ],
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.kind(), core::EngineErrorKind::IdempotencyConflict);
+
+    session
+        .set_routing_key("idempotent-public-api")
+        .await
+        .unwrap();
+    let query = engine
+        .query(
+            &session,
+            core::Statement::new(
+                "SELECT payload FROM accounts WHERE tenant_id = ?1 AND id = ?2",
+                vec![
+                    core::Value::Text("idempotent-public-api".to_owned()),
+                    core::Value::Int64(1),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(query.value.rows().len(), 1);
+    assert_eq!(
+        query.value.rows()[0].get(0),
+        Some(&core::Value::Text("original".to_owned()))
+    );
+
+    drop(session);
+    drop(engine);
+    let reopened = core::Engine::open(temp.path(), 2).await.unwrap();
+    let replay_after_restart = reopened
+        .execute_idempotent_write(&reopened.session(), key, restart_statement)
+        .await
+        .unwrap();
+    assert_eq!(
+        replay_after_restart.status(),
+        core::IdempotencyStatus::Replayed
+    );
+    assert_eq!(replay_after_restart.rows_affected(), 1);
 }
 
 #[test]

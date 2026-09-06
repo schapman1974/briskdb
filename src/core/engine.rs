@@ -9,7 +9,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
@@ -19,9 +19,10 @@ use tokio::{
 
 use super::session::TransactionState;
 use super::{
-    ActiveQueryRegistry, ActiveQueryStatus, BlockingPool, BoundStatementPlan, CancelOnDrop,
-    CancellationReason, CancellationToken, Database, DescribeTarget, EngineError, EngineErrorKind,
-    EngineOptions, EngineResult, EngineState, Executed, GlobalIndexOperationalReport, Lifecycle,
+    ActiveIdempotencyKeyGuard, ActiveIdempotencyKeys, ActiveQueryRegistry, ActiveQueryStatus,
+    BlockingPool, BoundStatementPlan, CancelOnDrop, CancellationReason, CancellationToken,
+    Database, DescribeTarget, EngineError, EngineErrorKind, EngineOptions, EngineResult,
+    EngineState, Executed, GlobalIndexOperationalReport, IdempotencyDigests, Lifecycle,
     LogicalDatabaseId, OperationControl, OperationLease, PortalId, PrepareRequest,
     PreparedExecution, PreparedStatementDescription, PreparedStatementId, PreparedStatementLimits,
     QueryId, RawDataOperation, RawDataTarget, ReadinessSnapshot, RequestContext, ResultLimits,
@@ -33,7 +34,8 @@ use super::{
 use crate::{
     sql,
     storage::{
-        ConnectionOwner, ConnectionPools, PooledConnection, SchemaGateState, SchemaOperationGuard,
+        ConnectionOwner, ConnectionPools, IdempotencyReceipt, IdempotentExecuteOutcome,
+        NewIdempotencyReceipt, PooledConnection, SchemaGateState, SchemaOperationGuard,
     },
 };
 
@@ -380,6 +382,7 @@ struct EngineInner {
     connections: ConnectionPools,
     lifecycle: Arc<Lifecycle>,
     active_queries: Arc<ActiveQueryRegistry>,
+    active_idempotency_keys: Arc<ActiveIdempotencyKeys>,
     shutdown_cancel: CancellationToken,
     shutdown_gate: Arc<tokio::sync::Mutex<()>>,
     #[cfg(feature = "experimental-vtab")]
@@ -606,6 +609,7 @@ impl Engine {
                 connections,
                 lifecycle: Lifecycle::new(),
                 active_queries: ActiveQueryRegistry::new(),
+                active_idempotency_keys: Arc::new(ActiveIdempotencyKeys::default()),
                 shutdown_cancel: CancellationToken::new(),
                 shutdown_gate: Arc::new(tokio::sync::Mutex::new(())),
                 #[cfg(feature = "experimental-vtab")]
@@ -2428,6 +2432,132 @@ impl Engine {
             .await
     }
 
+    /// Execute one eligible autocommit write with a durable database-wide key.
+    ///
+    /// Eligibility requires a populated catalog and one planner-proven,
+    /// exact-target INSERT, UPDATE, or DELETE that uses the direct pooled
+    /// execution path. Generated targets, explicit transactions, global-index
+    /// tables, and the experimental writable-vtable coordinator are rejected
+    /// before application data can change.
+    pub async fn execute_idempotent_write(
+        &self,
+        session: &Session,
+        key: super::IdempotencyKey,
+        statement: Statement,
+    ) -> EngineResult<super::IdempotentWriteResult> {
+        self.execute_idempotent_write_with_context(session, key, statement, RequestContext::new())
+            .await
+    }
+
+    /// Execute one eligible durable idempotent write with request controls.
+    ///
+    /// A successful first invocation commits its application write and bounded
+    /// receipt in the same target-shard SQLite transaction. A matching retry
+    /// within [`super::IDEMPOTENCY_RECEIPT_RETENTION`] returns the stored logical
+    /// result without executing the statement again. Reusing the key for a
+    /// different semantic request returns
+    /// [`EngineErrorKind::IdempotencyConflict`].
+    pub async fn execute_idempotent_write_with_context(
+        &self,
+        session: &Session,
+        key: super::IdempotencyKey,
+        statement: Statement,
+        context: RequestContext,
+    ) -> EngineResult<super::IdempotentWriteResult> {
+        let mut operation = self.operation(context)?;
+        let schema_operation = match self.inner.database.storage.enter_schema_operation() {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let guard = match operation.wait_pending(self.ready_session(session)).await {
+            Ok(guard) => guard,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        if guard.state() == super::SessionState::FailedTransaction {
+            return operation.finish(Err(transaction_aborted()));
+        }
+        if guard.state() != super::SessionState::Ready {
+            return operation.finish(Err(unsupported_idempotent_write(
+                "durable idempotent writes require direct autocommit execution",
+            )));
+        }
+
+        let routing_key = guard.routing_key().map(str::to_owned);
+        let (exact_sql, params) = statement.into_parts();
+        let plan = match self.inner.database.raw_data_plan(
+            routing_key.as_deref(),
+            &exact_sql,
+            &params,
+            RawDataOperation::IdempotentExecute,
+        ) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => {
+                return operation.finish(Err(unsupported_idempotent_write(
+                    "durable idempotent writes require a populated authoritative catalog",
+                )));
+            }
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let RawDataTarget::Exact(target_shard) = plan.target else {
+            return operation.finish(Err(unsupported_idempotent_write(
+                "durable idempotent writes do not support generated targets",
+            )));
+        };
+        let Some(table) = plan.table_id else {
+            return operation.finish(Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "catalog-routed idempotent write lost its target table identity",
+            )));
+        };
+        if self
+            .catalog()
+            .global_indexes()
+            .iter()
+            .any(|index| index.table_id() == table)
+        {
+            return operation.finish(Err(unsupported_idempotent_write(
+                "durable idempotent writes do not support tables with global indexes",
+            )));
+        }
+        if let Err(error) = sql::validate_parameters(&params) {
+            return operation.finish(Err(error));
+        }
+        #[cfg(feature = "experimental-vtab")]
+        if self.inner.options.experimental_vtab_writes() {
+            return operation.finish(Err(unsupported_idempotent_write(
+                "durable idempotent writes require the direct pooled execution path",
+            )));
+        }
+
+        let digests = super::write_digests(
+            key,
+            &exact_sql,
+            &params,
+            routing_key.as_deref(),
+            self.catalog().default_database().id(),
+            table,
+            target_shard,
+        );
+        let active_key = match self.inner.active_idempotency_keys.try_acquire(digests.key) {
+            Ok(active_key) => active_key,
+            Err(error) => return operation.finish(Err(error)),
+        };
+        let result = self
+            .run_idempotent_write(
+                &mut operation,
+                target_shard,
+                ConnectionOwner::new(session.id().get()),
+                schema_operation,
+                guard,
+                plan.sqlite_sql,
+                params,
+                digests,
+                active_key,
+            )
+            .await;
+        operation.finish_started(result)
+    }
+
     /// Execute one ephemeral HTTP write while allowing safe physical-handle
     /// reuse after authoritative catalog validation.
     ///
@@ -4077,6 +4207,150 @@ impl Engine {
         operation.wait_started(join).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn run_idempotent_write(
+        &self,
+        operation: &mut Operation,
+        target_shard: u16,
+        owner: ConnectionOwner,
+        schema_operation: SchemaOperationGuard,
+        session: OwnedMutexGuard<SessionInner>,
+        statement: String,
+        parameters: Vec<Value>,
+        digests: IdempotencyDigests,
+        active_key: ActiveIdempotencyKeyGuard,
+    ) -> EngineResult<super::IdempotentWriteResult> {
+        // Every shard receipt is consulted while this operation owns one real
+        // pool slot on that shard. Ordered acquisition avoids cycles between
+        // concurrent database-wide scans and keeps ordinary pool/queue limits
+        // authoritative.
+        let mut permits = Vec::with_capacity(usize::from(self.shard_count()));
+        for shard in 0..self.shard_count() {
+            match operation
+                .wait_pending(self.inner.connections.acquire_for_owner(shard, owner))
+                .await
+            {
+                Ok(permit) => permits.push(permit),
+                Err(error) => return operation.control.complete(Err(error)),
+            }
+        }
+        let worker = match operation.wait_pending(self.inner.workers.acquire()).await {
+            Ok(worker) => worker,
+            Err(error) => return operation.control.complete(Err(error)),
+        };
+        if let Err(error) = operation.check_before_start() {
+            return operation.control.complete(Err(error));
+        }
+
+        let lease = operation.take_lease();
+        let worker_control = Arc::clone(&operation.control);
+        let storage = self.inner.database.storage.clone();
+        let storage_for_corruption = storage.clone();
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _schema_operation = schema_operation;
+            let _session = session;
+            let _active_key = active_key;
+            let result = (|| {
+                let _stripe = storage.try_acquire_idempotency_stripe(digests.key)?;
+                let lookup_time = unix_time_ms()?;
+                let mut connections = Vec::with_capacity(permits.len());
+                for permit in permits {
+                    connections.push(
+                        permit.checkout_controlled(Arc::clone(&worker_control))?,
+                    );
+                }
+
+                let mut found = None;
+                for (physical_shard, connection) in (0_u16..).zip(connections.iter_mut()) {
+                    let receipt = connection.find_idempotency_receipt(
+                        digests.key,
+                        lookup_time,
+                        Arc::clone(&worker_control),
+                    );
+                    retire_if_broken(connection, &receipt);
+                    if let Some(receipt) = receipt? {
+                        if receipt.key_digest() != digests.key {
+                            return Err(EngineError::new(
+                                EngineErrorKind::DataCorruption,
+                                "idempotency receipt lookup returned a different key digest",
+                            ));
+                        }
+                        if receipt.target_shard() != physical_shard {
+                            return Err(EngineError::new(
+                                EngineErrorKind::DataCorruption,
+                                "idempotency receipt is stored on a different physical shard than it records",
+                            ));
+                        }
+                        if found.replace(receipt).is_some() {
+                            return Err(EngineError::new(
+                                EngineErrorKind::DataCorruption,
+                                "one database-wide idempotency key has receipts on multiple shards",
+                            ));
+                        }
+                    }
+                }
+
+                if let Some(receipt) = found {
+                    return idempotency_result_from_receipt(
+                        receipt,
+                        digests,
+                        target_shard,
+                        super::IdempotencyStatus::Replayed,
+                    );
+                }
+
+                let target = connections.get_mut(usize::from(target_shard)).ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "idempotent write target is outside the admitted shard connections",
+                    )
+                })?;
+                let isolated = target.isolate_foreign_sql_controlled(
+                    Arc::clone(&worker_control),
+                    &statement,
+                );
+                retire_if_broken(target, &isolated);
+                isolated?;
+                let new_receipt = NewIdempotencyReceipt::new(
+                    digests.key,
+                    digests.request,
+                    target_shard,
+                    lookup_time,
+                )?;
+                let outcome = target.execute_idempotent(
+                    &statement,
+                    &parameters,
+                    new_receipt,
+                    Arc::clone(&worker_control),
+                );
+                retire_if_broken(target, &outcome);
+                match outcome? {
+                    IdempotentExecuteOutcome::Executed(receipt) => idempotency_result_from_receipt(
+                        receipt,
+                        digests,
+                        target_shard,
+                        super::IdempotencyStatus::Created,
+                    ),
+                    IdempotentExecuteOutcome::Existing(receipt) => idempotency_result_from_receipt(
+                        receipt,
+                        digests,
+                        target_shard,
+                        super::IdempotencyStatus::Replayed,
+                    ),
+                }
+            })();
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                storage_for_corruption.record_schema_degraded();
+            }
+            worker_control.complete(result)
+        });
+        operation.wait_started(join).await
+    }
+
     async fn run_on_shard<T, F>(
         &self,
         operation: &mut Operation,
@@ -4694,6 +4968,76 @@ fn unsupported_prepared_behavior() -> EngineError {
     )
 }
 
+fn unsupported_idempotent_write(diagnostic: &'static str) -> EngineError {
+    EngineError::new(EngineErrorKind::Unsupported, diagnostic)
+}
+
+fn idempotency_result_from_receipt(
+    receipt: IdempotencyReceipt,
+    digests: IdempotencyDigests,
+    expected_shard: u16,
+    status: super::IdempotencyStatus,
+) -> EngineResult<super::IdempotentWriteResult> {
+    if receipt.key_digest() != digests.key {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "idempotency receipt contains a different key digest",
+        ));
+    }
+    if receipt.request_digest() != digests.request {
+        return Err(EngineError::new(
+            EngineErrorKind::IdempotencyConflict,
+            "the idempotency key already belongs to a different semantic write request",
+        ));
+    }
+    if receipt.target_shard() != expected_shard {
+        return Err(EngineError::new(
+            EngineErrorKind::DataCorruption,
+            "matching idempotency receipt records an inconsistent target shard",
+        ));
+    }
+    Ok(super::IdempotentWriteResult::new(
+        receipt.target_shard(),
+        super::WriteResult::without_generated_key(receipt.rows_affected()),
+        status,
+    ))
+}
+
+fn unix_time_ms() -> EngineResult<i64> {
+    unix_time_ms_at(SystemTime::now())
+}
+
+fn unix_time_ms_at(now: SystemTime) -> EngineResult<i64> {
+    let elapsed = now.duration_since(UNIX_EPOCH).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::StorageUnavailable,
+            "the system clock is before the Unix epoch",
+            error,
+        )
+    })?;
+    let milliseconds = i64::try_from(elapsed.as_millis()).map_err(|error| {
+        EngineError::from_source(
+            EngineErrorKind::StorageUnavailable,
+            "the system clock exceeds the idempotency receipt timestamp range",
+            error,
+        )
+    })?;
+    validate_idempotency_time_ms(milliseconds)
+}
+
+fn validate_idempotency_time_ms(milliseconds: i64) -> EngineResult<i64> {
+    if milliseconds
+        .checked_add(super::IDEMPOTENCY_RECEIPT_RETENTION_MS)
+        .is_none()
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::StorageUnavailable,
+            "the system clock leaves no room for the idempotency retention window",
+        ));
+    }
+    Ok(milliseconds)
+}
+
 fn transaction_aborted() -> EngineError {
     EngineError::new(
         EngineErrorKind::TransactionAborted,
@@ -4790,7 +5134,12 @@ fn retire_if_broken<T>(connection: &mut PooledConnection, result: &EngineResult<
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error as _, sync::mpsc, time::Duration};
+    use std::{
+        error::Error as _,
+        process::{Child, Command, Stdio},
+        sync::mpsc,
+        time::Duration,
+    };
 
     use tokio::{sync::oneshot, time::timeout};
 
@@ -4798,9 +5147,25 @@ mod tests {
     #[cfg(feature = "experimental-vtab")]
     use crate::core::GeneratedIdPolicy;
     use crate::core::{
-        Column, DataType, Row, SchemaMigrationState, SessionState, ShardKeyMetadata, ShardKeyType,
-        TableDeclaration,
+        Column, DataType, GlobalIndexDeclaration, GlobalIndexKeyPart, GlobalIndexKeySource,
+        GlobalIndexKeyType, Row, SchemaMigrationState, SessionState, ShardKeyMetadata,
+        ShardKeyType, TableDeclaration,
     };
+
+    #[test]
+    fn idempotency_clock_snapshot_preserves_the_full_retention_range() {
+        let latest = i64::MAX - super::super::IDEMPOTENCY_RECEIPT_RETENTION_MS;
+        assert_eq!(validate_idempotency_time_ms(latest).unwrap(), latest);
+        assert_eq!(
+            validate_idempotency_time_ms(latest + 1).unwrap_err().kind(),
+            EngineErrorKind::StorageUnavailable
+        );
+        let before_epoch = UNIX_EPOCH - Duration::from_millis(1);
+        assert_eq!(
+            unix_time_ms_at(before_epoch).unwrap_err().kind(),
+            EngineErrorKind::StorageUnavailable
+        );
+    }
 
     #[test]
     fn competing_checkpoint_sentinel_is_a_busy_report_without_invented_counts() {
@@ -4824,6 +5189,627 @@ mod tests {
             checkpoint_shard_report(0, 0, -1, -1).unwrap_err().kind(),
             EngineErrorKind::DataCorruption
         );
+    }
+
+    #[tokio::test]
+    async fn idempotent_write_eligibility_requires_catalog_exact_dml_and_autocommit() {
+        let key = "00112233445566778899aabbccddeeff"
+            .parse::<super::super::IdempotencyKey>()
+            .unwrap();
+        let (_empty_temp, empty) = engine();
+        let empty_session = empty.session();
+        empty_session.set_routing_key("empty").await.unwrap();
+        assert_eq!(
+            empty
+                .execute_idempotent_write(
+                    &empty_session,
+                    key,
+                    Statement::new("INSERT INTO events VALUES (1)", vec![]),
+                )
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Unsupported
+        );
+
+        let (_temp, engine) = engine_with_sharded_events(2, EngineOptions::default());
+        let session = engine.session();
+        let read = engine
+            .execute_idempotent_write(
+                &session,
+                key,
+                Statement::new(
+                    "SELECT payload FROM events WHERE tenant_id = ?1",
+                    vec![Value::Int64(1)],
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(read.kind(), EngineErrorKind::Unsupported, "{read:?}");
+
+        session.set_routing_key("eligibility").await.unwrap();
+        let unconstrained = engine
+            .execute_idempotent_write(
+                &session,
+                key,
+                Statement::new(
+                    "UPDATE events SET payload = ?1",
+                    vec![Value::Text("unconstrained".to_owned())],
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unconstrained.kind(),
+            EngineErrorKind::Unsupported,
+            "{unconstrained:?}"
+        );
+
+        let database = engine.catalog().default_database().id();
+        execute_prepared_sql(&engine, &session, database, "BEGIN", vec![])
+            .await
+            .unwrap();
+        let transaction_error = engine
+            .execute_idempotent_write(
+                &session,
+                key,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                    vec![Value::Int64(1), Value::Text("must-not-run".to_owned())],
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(transaction_error.kind(), EngineErrorKind::Unsupported);
+        execute_prepared_sql(&engine, &session, database, "ROLLBACK", vec![])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idempotent_write_rejects_global_generated_and_coordinator_paths_before_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(temp.path(), 2).unwrap();
+        database
+            .broadcast(
+                "CREATE TABLE events (
+                    tenant_id INTEGER PRIMARY KEY,
+                    payload TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        let logical_database = database.catalog().default_database().id();
+        database
+            .register_tables(vec![
+                TableDeclaration::sharded(
+                    logical_database,
+                    "events",
+                    ShardKeyMetadata::new("tenant_id", ShardKeyType::Int64).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let table = database
+            .catalog()
+            .table("default", "events")
+            .unwrap()
+            .unwrap()
+            .id();
+        database
+            .create_global_index(
+                GlobalIndexDeclaration::new(
+                    table,
+                    "events_payload",
+                    vec![GlobalIndexKeyPart::new(
+                        GlobalIndexKeySource::column("payload").unwrap(),
+                        GlobalIndexKeyType::Text,
+                    )],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let engine = Engine::from_database(Arc::new(database));
+        let tenant = integer_key_for_shard(&engine, 0, None);
+        let error = engine
+            .execute_idempotent_write(
+                &engine.session(),
+                "60718293a4b5c6d7e8f90a1b2c3d4e5f".parse().unwrap(),
+                idempotent_event_statement(tenant, "must-not-run"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Unsupported);
+        assert_eq!(physical_event_count(temp.path()), 0);
+
+        #[cfg(feature = "experimental-vtab")]
+        {
+            let (native_temp, native, _table) = engine_with_native_events(2);
+            let generated = native
+                .execute_idempotent_write(
+                    &native.session(),
+                    "708192a3b4c5d6e7f8091a2b3c4d5e6f".parse().unwrap(),
+                    Statement::new(
+                        "INSERT INTO native_events (payload) VALUES (?1)",
+                        vec![Value::Text("must-not-run".to_owned())],
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(generated.kind(), EngineErrorKind::Unsupported);
+
+            let exact_id = integer_key_for_shard(&native, 0, None);
+            let coordinator = native
+                .execute_idempotent_write(
+                    &native.session(),
+                    "8091a2b3c4d5e6f708192a3b4c5d6e7f".parse().unwrap(),
+                    Statement::new(
+                        "INSERT INTO ordinary_events (id, payload) VALUES (?1, ?2)",
+                        vec![
+                            Value::Int64(exact_id),
+                            Value::Text("must-not-run".to_owned()),
+                        ],
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(coordinator.kind(), EngineErrorKind::Unsupported);
+            for table in ["native_events", "ordinary_events"] {
+                assert_eq!(physical_table_count(native_temp.path(), table), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn database_wide_key_reuse_conflicts_before_a_different_shard_mutates() {
+        let (temp, engine) = engine_with_sharded_events(2, EngineOptions::default());
+        let first_key = integer_key_for_shard(&engine, 0, None);
+        let second_key = integer_key_for_shard(&engine, 1, None);
+        let idempotency = "102132435465768798a9bacbdcedfe0f"
+            .parse::<super::super::IdempotencyKey>()
+            .unwrap();
+        let session = engine.session();
+
+        let created = engine
+            .execute_idempotent_write(
+                &session,
+                idempotency,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                    vec![Value::Int64(first_key), Value::Text("first".to_owned())],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.shard(), 0);
+        assert_eq!(created.status(), super::super::IdempotencyStatus::Created);
+
+        let conflict = engine
+            .execute_idempotent_write(
+                &session,
+                idempotency,
+                Statement::new(
+                    "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                    vec![
+                        Value::Int64(second_key),
+                        Value::Text("must-not-run".to_owned()),
+                    ],
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.kind(), EngineErrorKind::IdempotencyConflict);
+
+        let second_shard =
+            rusqlite::Connection::open(temp.path().join("shards/0001.sqlite")).unwrap();
+        assert_eq!(
+            second_shard
+                .query_row("SELECT count(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn same_key_contention_is_busy_before_waiting_for_pool_capacity() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_sharded_events(2, options);
+        let tenant = integer_key_for_shard(&engine, 1, None);
+        let key = "2031425364758697a8b9cadbecfd0e1f"
+            .parse::<super::super::IdempotencyKey>()
+            .unwrap();
+        let statement = Statement::new(
+            "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+            vec![Value::Int64(tenant), Value::Text("one".to_owned())],
+        );
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        engine
+            .inner
+            .connections
+            .block_next_connection_setup(0, started_tx, release_rx)
+            .unwrap();
+
+        let first_engine = engine.clone();
+        let first_statement = statement.clone();
+        let first = tokio::spawn(async move {
+            first_engine
+                .execute_idempotent_write(&first_engine.session(), key, first_statement)
+                .await
+        });
+        wait_for_blocking_signal(started_rx, "first idempotent write should own its key").await;
+
+        let busy = engine
+            .execute_idempotent_write(&engine.session(), key, statement.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(busy.kind(), EngineErrorKind::Busy);
+        assert!(busy.is_retryable());
+
+        release_tx.send(()).unwrap();
+        let created = timeout(Duration::from_secs(2), first)
+            .await
+            .expect("the admitted write should finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(created.status(), super::super::IdempotencyStatus::Created);
+        let replayed = engine
+            .execute_idempotent_write(&engine.session(), key, statement)
+            .await
+            .unwrap();
+        assert_eq!(replayed.status(), super::super::IdempotencyStatus::Replayed);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_storage_start_releases_the_key_without_a_receipt() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_sharded_events(2, options);
+        let tenant = integer_key_for_shard(&engine, 0, None);
+        let key = "30415263748596a7b8c9daebfc0d1e2f"
+            .parse::<super::super::IdempotencyKey>()
+            .unwrap();
+        let statement = Statement::new(
+            "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+            vec![Value::Int64(tenant), Value::Text("one".to_owned())],
+        );
+        let (started_tx, started_rx) = mpsc::channel();
+        let (_release_tx, release_rx) = mpsc::channel();
+        engine
+            .inner
+            .connections
+            .block_next_connection_setup(0, started_tx, release_rx)
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let request_engine = engine.clone();
+        let request_statement = statement.clone();
+        let request_cancellation = cancellation.clone();
+        let request = tokio::spawn(async move {
+            request_engine
+                .execute_idempotent_write_with_context(
+                    &request_engine.session(),
+                    key,
+                    request_statement,
+                    RequestContext::new().with_cancellation_token(request_cancellation),
+                )
+                .await
+        });
+        wait_for_blocking_signal(started_rx, "connection setup should become cancellable").await;
+        assert!(cancellation.cancel());
+        let cancelled = timeout(Duration::from_secs(2), request)
+            .await
+            .expect("pre-start cancellation should finish promptly")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(cancelled.kind(), EngineErrorKind::Cancelled);
+
+        let retry = engine
+            .execute_idempotent_write(&engine.session(), key, statement)
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), super::super::IdempotencyStatus::Created);
+    }
+
+    #[tokio::test]
+    async fn ordered_all_shard_admission_avoids_cross_target_deadlock() {
+        let options = EngineOptions::new(1, 1)
+            .unwrap()
+            .with_request_timeout(None)
+            .unwrap();
+        let (_temp, engine) = engine_with_sharded_events(2, options);
+        let tenants = [
+            integer_key_for_shard(&engine, 0, None),
+            integer_key_for_shard(&engine, 1, None),
+        ];
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut writes = Vec::new();
+        for (ordinal, tenant) in tenants.into_iter().enumerate() {
+            let task_engine = engine.clone();
+            let task_barrier = Arc::clone(&barrier);
+            writes.push(tokio::spawn(async move {
+                task_barrier.wait().await;
+                let mut key = [0_u8; 16];
+                key[0] = u8::try_from(ordinal + 1).unwrap();
+                task_engine
+                    .execute_idempotent_write(
+                        &task_engine.session(),
+                        super::super::IdempotencyKey::new(key).unwrap(),
+                        Statement::new(
+                            "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+                            vec![
+                                Value::Int64(tenant),
+                                Value::Text(format!("target-{ordinal}")),
+                            ],
+                        ),
+                    )
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        for write in writes {
+            let outcome = timeout(Duration::from_secs(3), write)
+                .await
+                .expect("ordered all-shard admission must not deadlock")
+                .unwrap()
+                .unwrap();
+            assert_eq!(outcome.status(), super::super::IdempotencyStatus::Created);
+        }
+    }
+
+    const IDEMPOTENT_ENGINE_ROOT_ENV: &str = "BRISKDB_TEST_IDEMPOTENT_ENGINE_ROOT";
+    const IDEMPOTENT_ENGINE_READY_ENV: &str = "BRISKDB_TEST_IDEMPOTENT_ENGINE_READY";
+    const IDEMPOTENT_ENGINE_GO_ENV: &str = "BRISKDB_TEST_IDEMPOTENT_ENGINE_GO";
+    const IDEMPOTENT_ENGINE_RESULT_ENV: &str = "BRISKDB_TEST_IDEMPOTENT_ENGINE_RESULT";
+    const IDEMPOTENT_ENGINE_KEY_ENV: &str = "BRISKDB_TEST_IDEMPOTENT_ENGINE_KEY";
+    const IDEMPOTENT_ENGINE_TENANT_ENV: &str = "BRISKDB_TEST_IDEMPOTENT_ENGINE_TENANT";
+    const IDEMPOTENT_ENGINE_PAYLOAD_ENV: &str = "BRISKDB_TEST_IDEMPOTENT_ENGINE_PAYLOAD";
+
+    #[tokio::test]
+    async fn two_process_same_key_execution_serializes_replay_and_conflict() {
+        let (temp, seed) = engine_with_sharded_events(2, EngineOptions::default());
+        let first_zero = integer_key_for_shard(&seed, 0, None);
+        let second_zero = integer_key_for_shard(&seed, 0, Some(first_zero));
+        let first_one = integer_key_for_shard(&seed, 1, None);
+        drop(seed);
+
+        let same_key = "405162738495a6b7c8d9eafb0c1d2e3f";
+        let same_outcomes = run_idempotent_engine_process_pair(
+            temp.path(),
+            "same",
+            [
+                (same_key, first_zero, "same"),
+                (same_key, first_zero, "same"),
+            ],
+        );
+        assert_eq!(
+            same_outcomes
+                .iter()
+                .filter(|outcome| *outcome == "created")
+                .count(),
+            1,
+            "same-request outcomes: {same_outcomes:?}"
+        );
+        assert!(
+            same_outcomes
+                .iter()
+                .all(|outcome| matches!(outcome.as_str(), "created" | "busy" | "replayed")),
+            "same-request outcomes: {same_outcomes:?}"
+        );
+
+        let engine = Engine::open(temp.path(), 2).await.unwrap();
+        let replay = engine
+            .execute_idempotent_write(
+                &engine.session(),
+                same_key.parse().unwrap(),
+                idempotent_event_statement(first_zero, "same"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), super::super::IdempotencyStatus::Replayed);
+        assert_eq!(physical_event_count(temp.path()), 1);
+        drop(engine);
+
+        let conflicting_key = "5061728394a5b6c7d8e9fa0b1c2d3e4f";
+        let conflicting_requests = [
+            (conflicting_key, second_zero, "left"),
+            (conflicting_key, first_one, "right"),
+        ];
+        let conflicting_outcomes =
+            run_idempotent_engine_process_pair(temp.path(), "conflict", conflicting_requests);
+        let created = conflicting_outcomes
+            .iter()
+            .position(|outcome| outcome == "created")
+            .unwrap_or_else(|| panic!("one request must create: {conflicting_outcomes:?}"));
+        let loser = 1 - created;
+        assert!(
+            matches!(
+                conflicting_outcomes[loser].as_str(),
+                "busy" | "idempotency_conflict"
+            ),
+            "different-request outcomes: {conflicting_outcomes:?}"
+        );
+
+        let engine = Engine::open(temp.path(), 2).await.unwrap();
+        let winner_request = conflicting_requests[created];
+        let winner = engine
+            .execute_idempotent_write(
+                &engine.session(),
+                conflicting_key.parse().unwrap(),
+                idempotent_event_statement(winner_request.1, winner_request.2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(winner.status(), super::super::IdempotencyStatus::Replayed);
+        let loser_request = conflicting_requests[loser];
+        let conflict = engine
+            .execute_idempotent_write(
+                &engine.session(),
+                conflicting_key.parse().unwrap(),
+                idempotent_event_statement(loser_request.1, loser_request.2),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.kind(), EngineErrorKind::IdempotencyConflict);
+        assert_eq!(physical_event_count(temp.path()), 2);
+        assert_eq!(physical_tenant_count(temp.path(), loser_request.1), 0);
+    }
+
+    #[tokio::test]
+    async fn subprocess_idempotent_engine_writer() {
+        let Ok(root) = std::env::var(IDEMPOTENT_ENGINE_ROOT_ENV) else {
+            return;
+        };
+        let ready = PathBuf::from(std::env::var(IDEMPOTENT_ENGINE_READY_ENV).unwrap());
+        let go = PathBuf::from(std::env::var(IDEMPOTENT_ENGINE_GO_ENV).unwrap());
+        let result = PathBuf::from(std::env::var(IDEMPOTENT_ENGINE_RESULT_ENV).unwrap());
+        let key = std::env::var(IDEMPOTENT_ENGINE_KEY_ENV)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let tenant = std::env::var(IDEMPOTENT_ENGINE_TENANT_ENV)
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        let payload = std::env::var(IDEMPOTENT_ENGINE_PAYLOAD_ENV).unwrap();
+        let engine = Engine::open(root, 2).await.unwrap();
+        std::fs::write(&ready, b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !go.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(go.exists(), "parent did not release the process writer");
+        let outcome = match engine
+            .execute_idempotent_write(
+                &engine.session(),
+                key,
+                idempotent_event_statement(tenant, &payload),
+            )
+            .await
+        {
+            Ok(result) => result.status().as_str(),
+            Err(error) => error.kind().code(),
+        };
+        std::fs::write(result, outcome).unwrap();
+    }
+
+    fn run_idempotent_engine_process_pair(
+        root: &Path,
+        phase: &str,
+        requests: [(&str, i64, &str); 2],
+    ) -> [String; 2] {
+        let ready = [
+            root.join(format!("{phase}-ready-0")),
+            root.join(format!("{phase}-ready-1")),
+        ];
+        let results = [
+            root.join(format!("{phase}-result-0")),
+            root.join(format!("{phase}-result-1")),
+        ];
+        let go = root.join(format!("{phase}-go"));
+        let mut children = [
+            spawn_idempotent_engine_writer(root, &ready[0], &go, &results[0], requests[0]),
+            spawn_idempotent_engine_writer(root, &ready[1], &go, &results[1], requests[1]),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ready.iter().any(|path| !path.exists()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if ready.iter().any(|path| !path.exists()) {
+            for child in &mut children {
+                let _ = child.kill();
+            }
+            panic!("idempotent Engine subprocesses did not reach their start barrier");
+        }
+        std::fs::write(&go, b"go").unwrap();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "idempotent Engine subprocess failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::array::from_fn(|index| std::fs::read_to_string(&results[index]).unwrap())
+    }
+
+    fn spawn_idempotent_engine_writer(
+        root: &Path,
+        ready: &Path,
+        go: &Path,
+        result: &Path,
+        request: (&str, i64, &str),
+    ) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("core::engine::tests::subprocess_idempotent_engine_writer")
+            .arg("--nocapture")
+            .env(IDEMPOTENT_ENGINE_ROOT_ENV, root)
+            .env(IDEMPOTENT_ENGINE_READY_ENV, ready)
+            .env(IDEMPOTENT_ENGINE_GO_ENV, go)
+            .env(IDEMPOTENT_ENGINE_RESULT_ENV, result)
+            .env(IDEMPOTENT_ENGINE_KEY_ENV, request.0)
+            .env(IDEMPOTENT_ENGINE_TENANT_ENV, request.1.to_string())
+            .env(IDEMPOTENT_ENGINE_PAYLOAD_ENV, request.2)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    fn idempotent_event_statement(tenant: i64, payload: &str) -> Statement {
+        Statement::new(
+            "INSERT INTO events (tenant_id, payload) VALUES (?1, ?2)",
+            vec![Value::Int64(tenant), Value::Text(payload.to_owned())],
+        )
+    }
+
+    fn physical_event_count(root: &Path) -> i64 {
+        (0_u16..2)
+            .map(|shard| {
+                rusqlite::Connection::open(root.join(format!("shards/{shard:04}.sqlite")))
+                    .unwrap()
+                    .query_row("SELECT count(*) FROM events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+            .sum()
+    }
+
+    fn physical_tenant_count(root: &Path, tenant: i64) -> i64 {
+        (0_u16..2)
+            .map(|shard| {
+                rusqlite::Connection::open(root.join(format!("shards/{shard:04}.sqlite")))
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(*) FROM events WHERE tenant_id = ?1",
+                        [tenant],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap()
+            })
+            .sum()
+    }
+
+    #[cfg(feature = "experimental-vtab")]
+    fn physical_table_count(root: &Path, table: &str) -> i64 {
+        assert!(matches!(table, "native_events" | "ordinary_events"));
+        (0_u16..2)
+            .map(|shard| {
+                rusqlite::Connection::open(root.join(format!("shards/{shard:04}.sqlite")))
+                    .unwrap()
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+            .sum()
     }
 
     fn engine() -> (tempfile::TempDir, Engine) {

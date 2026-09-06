@@ -40,6 +40,7 @@ pub const fn http_error(kind: EngineErrorKind) -> HttpErrorMapping {
         | EngineErrorKind::TypeMismatch => 422,
         EngineErrorKind::Unsupported => 501,
         EngineErrorKind::FailedPrecondition
+        | EngineErrorKind::IdempotencyConflict
         | EngineErrorKind::TransactionAborted
         | EngineErrorKind::ConstraintViolation
         | EngineErrorKind::UniqueViolation
@@ -75,6 +76,7 @@ pub const fn postgres_error(kind: EngineErrorKind) -> PostgresErrorMapping {
         EngineErrorKind::InvalidQuery => "42000",
         EngineErrorKind::Unsupported => "0A000",
         EngineErrorKind::FailedPrecondition => "55000",
+        EngineErrorKind::IdempotencyConflict => "23000",
         EngineErrorKind::TransactionAborted => "25P02",
         EngineErrorKind::TypeMismatch => "42804",
         EngineErrorKind::ConstraintViolation => "23000",
@@ -111,6 +113,7 @@ pub const fn mysql_error(kind: EngineErrorKind) -> MysqlErrorMapping {
         EngineErrorKind::InvalidQuery => (1105, "HY000"),
         EngineErrorKind::Unsupported => (1235, "42000"),
         EngineErrorKind::FailedPrecondition => (1105, "HY000"),
+        EngineErrorKind::IdempotencyConflict => (1105, "HY000"),
         EngineErrorKind::TransactionAborted => (1105, "HY000"),
         EngineErrorKind::TypeMismatch => (1366, "HY000"),
         EngineErrorKind::ConstraintViolation => (1105, "HY000"),
@@ -160,6 +163,9 @@ const fn problem_type(kind: EngineErrorKind) -> &'static str {
         }
         EngineErrorKind::FailedPrecondition => {
             "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#failed-precondition"
+        }
+        EngineErrorKind::IdempotencyConflict => {
+            "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#idempotency-conflict"
         }
         EngineErrorKind::TransactionAborted => {
             "https://github.com/schapman1974/briskdb/blob/main/docs/ERRORS.md#transaction-aborted"
@@ -229,6 +235,7 @@ const fn title(kind: EngineErrorKind) -> &'static str {
         EngineErrorKind::InvalidQuery => "Invalid query",
         EngineErrorKind::Unsupported => "Unsupported operation",
         EngineErrorKind::FailedPrecondition => "Failed precondition",
+        EngineErrorKind::IdempotencyConflict => "Idempotency key conflict",
         EngineErrorKind::TransactionAborted => "Transaction aborted",
         EngineErrorKind::TypeMismatch => "Type mismatch",
         EngineErrorKind::ConstraintViolation => "Constraint violation",
@@ -259,6 +266,9 @@ const fn detail(kind: EngineErrorKind) -> &'static str {
         EngineErrorKind::InvalidQuery => "The query could not be processed.",
         EngineErrorKind::Unsupported => "The requested operation is not supported.",
         EngineErrorKind::FailedPrecondition => "The operation cannot run in the current state.",
+        EngineErrorKind::IdempotencyConflict => {
+            "The idempotency key was already used for a different operation."
+        }
         EngineErrorKind::TransactionAborted => {
             "The transaction is aborted; roll it back before continuing."
         }
@@ -321,6 +331,13 @@ mod tests {
                 EngineErrorKind::FailedPrecondition,
                 409,
                 "55000",
+                1105,
+                "HY000",
+            ),
+            (
+                EngineErrorKind::IdempotencyConflict,
+                409,
+                "23000",
                 1105,
                 "HY000",
             ),

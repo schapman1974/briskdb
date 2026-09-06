@@ -13,6 +13,7 @@ from ._briskdb import (
     DeadlineExceededError as DeadlineExceededError,
     FailedPreconditionError as FailedPreconditionError,
     ForeignKeyViolationError as ForeignKeyViolationError,
+    IdempotencyConflictError as IdempotencyConflictError,
     IntegrityError as IntegrityError,
     InternalError as InternalError,
     InvalidArgumentError as InvalidArgumentError,
