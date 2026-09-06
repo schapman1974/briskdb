@@ -14,9 +14,12 @@ comparison across numeric and extended BSON values, and exposes versioned
 `BBKY` semantic keys. Codec validation is bounded to MongoDB's 16 MiB document
 and 100-level nesting limits and is covered by frozen comparison vectors,
 official BSON corpus cases, property tests, and cargo-fuzz targets. This release
-does not yet add document storage, commands, a MongoDB listener, or the public
-Rust/Python collection APIs tracked by the following roadmap issues. See
-[the BSON contract](docs/BSON.md).
+also adds manifest-v14 document namespaces, exact sharded BSON records,
+canonical `_id` routing and uniqueness, restart-safe collection provisioning,
+and an atomic TinyMongo v1.3 SQLite importer. It does not yet add document
+commands, a MongoDB listener, or the public Rust/Python collection APIs tracked
+by the following roadmap issues. See [the BSON contract](docs/BSON.md) and
+[the document storage contract](docs/DOCUMENT_STORAGE.md).
 
 HTTP now has an explicit version-1 contract, discovery at `/v1`, a versioned
 `/v1/health` alias, and `BriskDB-API-Version: 1` on v1 responses. Existing valid

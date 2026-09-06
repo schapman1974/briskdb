@@ -2,6 +2,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,6 +37,64 @@ def imported_roots(path):
         elif isinstance(node, ast.ImportFrom) and node.module:
             imports.append(node.module.split(".", 1)[0])
     return imports
+
+
+def cargo_manifest_declares_dependency(contents, dependency):
+    dependency = dependency.lower()
+    section = ""
+    dependency_section = False
+
+    for raw_line in contents.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line.strip("[]").strip().lower()
+            components = section.split(".")
+            dependency_section = any(
+                component in {"dependencies", "dev-dependencies", "build-dependencies"}
+                for component in components
+            )
+            if dependency_section and components[-1] == dependency:
+                return True
+            continue
+        if not dependency_section:
+            continue
+
+        assignment = re.match(r"""^["']?([a-z0-9_-]+)["']?\s*=""", line.lower())
+        if assignment and assignment.group(1) == dependency:
+            return True
+        if re.search(
+            r"""\bpackage\s*=\s*["']{}["']""".format(re.escape(dependency)),
+            line,
+            flags=re.IGNORECASE,
+        ):
+            return True
+
+    return False
+
+
+def cargo_lock_contains_package(contents, dependency):
+    return bool(
+        re.search(
+            r"""(?m)^name\s*=\s*["']{}["']\s*$""".format(re.escape(dependency)),
+            contents,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def pyproject_declares_dependency(contents, dependency):
+    dependency = re.escape(dependency)
+    requirement = re.compile(
+        r"""["']{}(?=[<>=!~;\[\]\s"'])""".format(dependency),
+        flags=re.IGNORECASE,
+    )
+    poetry_key = re.compile(
+        r"""(?m)^\s*["']?{}["']?\s*=""".format(dependency),
+        flags=re.IGNORECASE,
+    )
+    return bool(requirement.search(contents) or poetry_key.search(contents))
 
 
 class MongoContractProvenanceTests(unittest.TestCase):
@@ -195,14 +254,50 @@ class MongoContractImportBoundaryTests(unittest.TestCase):
         self.assertEqual(importers, [TINYMONGO_ADAPTER])
 
     def test_runtime_package_manifests_do_not_depend_on_tinymongo(self):
-        for relative in (
-            "Cargo.toml",
-            "Cargo.lock",
-            "python/Cargo.toml",
+        cargo_manifests = ("Cargo.toml", "python/Cargo.toml")
+        for relative in cargo_manifests:
+            contents = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertFalse(
+                cargo_manifest_declares_dependency(contents, "tinymongo"), relative
+            )
+
+        lock = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+        self.assertFalse(cargo_lock_contains_package(lock, "tinymongo"), "Cargo.lock")
+
+        pyproject = (ROOT / "python/pyproject.toml").read_text(encoding="utf-8")
+        self.assertFalse(
+            pyproject_declares_dependency(pyproject, "tinymongo"),
             "python/pyproject.toml",
-        ):
-            contents = (ROOT / relative).read_text(encoding="utf-8").lower()
-            self.assertNotIn("tinymongo", contents, relative)
+        )
+
+    def test_dependency_checks_distinguish_features_from_packages(self):
+        feature_only = """
+[features]
+# Strict offline migration from TinyMongo's SQLite formats.
+tinymongo-import = ["documents", "sqlite-import"]
+"""
+        self.assertFalse(cargo_manifest_declares_dependency(feature_only, "tinymongo"))
+        self.assertTrue(
+            cargo_manifest_declares_dependency(
+                '[dependencies]\ntinymongo = "1.3"', "tinymongo"
+            )
+        )
+        self.assertTrue(
+            cargo_manifest_declares_dependency(
+                '[dependencies]\noracle = { package = "tinymongo", version = "1.3" }',
+                "tinymongo",
+            )
+        )
+        self.assertTrue(
+            cargo_lock_contains_package(
+                '[[package]]\nname = "tinymongo"\nversion = "1.3.0"', "tinymongo"
+            )
+        )
+        self.assertTrue(
+            pyproject_declares_dependency(
+                '[project]\ndependencies = ["tinymongo>=1.3"]', "tinymongo"
+            )
+        )
 
     def test_pinned_runner_requirements_exclude_the_oracle_package(self):
         requirements = RUNNER / "requirements.txt"

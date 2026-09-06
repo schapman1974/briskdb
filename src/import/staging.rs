@@ -250,11 +250,11 @@ fn canonical_source(source: &Path) -> EngineResult<PathBuf> {
             ),
         )
     })?;
-    if !metadata.is_file() {
+    if !metadata.is_file() && !metadata.is_dir() {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             format!(
-                "SQLite import source {} is not a regular file",
+                "SQLite import source {} is neither a regular file nor a directory",
                 source.display()
             ),
         ));
@@ -289,6 +289,12 @@ fn canonical_destination(destination: &Path) -> EngineResult<(PathBuf, PathBuf)>
 }
 
 fn reject_existing_destination(source: &Path, destination: &Path) -> EngineResult<()> {
+    if source.is_dir() && destination.starts_with(source) {
+        return Err(EngineError::new(
+            EngineErrorKind::FailedPrecondition,
+            "SQLite import destination must not be inside its source directory",
+        ));
+    }
     match fs::symlink_metadata(destination) {
         Ok(metadata) => {
             let aliases_source = fs::canonicalize(destination)
@@ -298,7 +304,7 @@ fn reject_existing_destination(source: &Path, destination: &Path) -> EngineResul
             if aliases_source {
                 return Err(EngineError::new(
                     EngineErrorKind::FailedPrecondition,
-                    "SQLite import source and destination resolve to the same file",
+                    "SQLite import source and destination resolve to the same path",
                 ));
             }
             let kind = if metadata.file_type().is_symlink() {
@@ -318,7 +324,7 @@ fn reject_existing_destination(source: &Path, destination: &Path) -> EngineResul
             if source == destination {
                 Err(EngineError::new(
                     EngineErrorKind::FailedPrecondition,
-                    "SQLite import source and destination resolve to the same file",
+                    "SQLite import source and destination resolve to the same path",
                 ))
             } else {
                 Ok(())
@@ -904,6 +910,26 @@ mod tests {
             let error = StagingLayout::create(&source, &link).unwrap_err();
             assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
         }
+    }
+
+    #[test]
+    fn rejects_a_destination_inside_a_directory_source() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source.sqlite-sharded");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("source-marker"), b"untouched").unwrap();
+
+        let destination = source.join("imported");
+        let error = StagingLayout::create(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::FailedPrecondition);
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read_dir(&source)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            [std::ffi::OsString::from("source-marker")]
+        );
     }
 
     #[test]

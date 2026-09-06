@@ -8,6 +8,11 @@ not an in-place conversion. The source is opened read-only, the destination
 must not exist, and no running BriskDB process may use the destination while it
 is being published.
 
+TinyMongo's document-oriented SQLite formats use a separate, opt-in library
+path because their catalog, tagged JSON, and shard identity rules are not
+ordinary relational schemas. See
+[document storage and TinyMongo import](DOCUMENT_STORAGE.md).
+
 ```bash
 cargo run --bin briskdb-import -- \
   --source /path/to/source.db \

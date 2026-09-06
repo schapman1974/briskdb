@@ -122,6 +122,7 @@ jobs:
           - http
           - postgres
           - sqlite-import
+          - tinymongo-import
           - default
     steps:
       - name: Check out source

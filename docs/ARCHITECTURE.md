@@ -590,6 +590,24 @@ service or embedded process receives retryable `Busy`. Cancellation restores
 ordinary admission while retaining only complete shard checkpoints. Online
 construction remains later work.
 
+Version 14 adds the separate `briskdb_document_databases`,
+`briskdb_document_collections`, `briskdb_document_indexes`, and
+`briskdb_document_provisioning` authority plus manifest digest version 7.
+Document namespaces remain case-sensitive and independent of the SQL catalog;
+collections are never inferred from SQLite application tables. The catalog
+records exact BSON options, format and placement versions, the monotonic
+natural-order allocator, one built-in unique `_id_` definition, secondary-index
+lifecycle, and a checksummed one-collection provisioning cursor. Every shard
+uses one exact storage-owned `briskdb_documents_v1` table, outside the SQL table
+inventory, and routes canonical `_id` keys through immutable `HashByIdV1`
+placement. Creation publishes an active collection only after the cursor has
+installed or verified that table on every shard. Startup resumes a durable
+prefix under sole-process ownership and validates stored document checksums,
+canonical IDs, routes, and natural-order uniqueness before serving work. Builds
+without the optional `documents` feature still understand and checksum version
+14 metadata and recognize its exact shard schema; they refuse to activate a
+store with document collections.
+
 Each manifest version retains an intentionally incompatible
 `briskdb_metadata` definition and row as a downgrade fence. The v3-to-v4
 migration remains manifest-atomic. The v4-to-v5 step first validates the v4
@@ -619,6 +637,9 @@ The v11-to-v12 step adds the empty durable generated-table DDL bridge, raises
 the fence, and installs checksum version 5 without changing a shard.
 The v12-to-v13 step adds the empty durable global-index catalog, raises the
 fence, and installs checksum version 6 without changing a shard.
+The v13-to-v14 step adds the empty durable document catalog, raises the fence,
+and installs checksum version 7 without changing a shard. Fixed document
+storage is provisioned only after a collection-creation journal is committed.
 There is no automatic downgrade; an older binary requires a backup from before
 the newer format.
 
@@ -647,7 +668,7 @@ lock through independently durable per-shard work and `Ready` publication. A
 lagging opener re-reads `Ready` and strictly validates instead of provisioning
 from a stale `Creating` observation. Only a locked, durable `Creating` state
 permits missing canonical shard files to be created and WAL to be enabled. The
-validated v13 manifest may also retain one generated-table DDL bridge and one
+validated v14 manifest may also retain one generated-table DDL bridge and one
 matching active table-provisioning record. Startup first resumes any
 `Applying` physical migration under its ordinary exact-prefix rules. It then
 keeps admission `Pending`, advances the bridge from `ApplyingPhysical` to
@@ -661,6 +682,15 @@ record the stable table ID, seal the bridge `Complete`, reseal digest version 5,
 and publish the replacement catalog. A standalone table-provisioning journal
 retains its existing recovery path. A conflict never causes BriskDB to infer a
 new request from partial shard state.
+
+After those SQL-schema recovery paths, startup resumes any checksummed document
+collection provisioning cursor from its exact ascending shard prefix. It
+creates or verifies only the fixed storage-owned document table and advances
+the manifest cursor after each durable shard. The final manifest transaction
+activates the collection and built-in `_id_` index, removes the cursor, and
+reseals digest version 7. Existing active collections require the exact table
+and validated record set on every shard; missing, orphaned, misrouted, or
+checksum-invalid records fail closed.
 
 The final strict shard opens and catalog reconciliation complete before the
 startup guard publishes `Ready`; ordinary work is never served against a

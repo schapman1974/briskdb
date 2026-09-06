@@ -408,6 +408,12 @@ pub(super) fn calculate_schema_digest(
                 &table_name,
                 sql.as_deref(),
             )
+            || super::document::is_exact_schema_object(
+                &object_type,
+                &name,
+                &table_name,
+                sql.as_deref(),
+            )
         {
             continue;
         }
@@ -1863,6 +1869,7 @@ pub(super) fn validate_stateless_catalog_schema(connection: &Connection) -> Engi
                 &table_name,
                 Some(&sql),
             )
+            || super::document::is_exact_schema_object(&object_type, &name, &table_name, Some(&sql))
         {
             continue;
         }
@@ -2108,6 +2115,7 @@ fn application_table_names(connection: &Connection) -> EngineResult<BTreeSet<Str
                AND name <> 'briskdb_shard_metadata'
                AND name NOT GLOB 'briskdb_global_index_outbox_*'
                AND name <> 'briskdb_global_index_shard_summaries'
+               AND name <> 'briskdb_documents_v1'
              ORDER BY name COLLATE BINARY",
         )
         .map_err(sqlite_error::storage)?;
@@ -3176,6 +3184,7 @@ fn validate_exact_shard(
     require_wal(connection, path)?;
     validate_metadata(connection, shard_id, layout.layout_id())?;
     super::index_outbox::validate_optional_schema(connection)?;
+    super::document::validate_optional_schema(connection)?;
     Ok(())
 }
 
@@ -3675,6 +3684,7 @@ fn is_metadata_table(name: &str) -> bool {
 
 fn is_storage_owned_table(name: &str) -> bool {
     is_metadata_table(name)
+        || name.eq_ignore_ascii_case(super::document::RECORDS_TABLE)
         || name
             .as_bytes()
             .get(.."briskdb_global_index_outbox_".len())
