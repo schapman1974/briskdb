@@ -4,8 +4,9 @@ Status: implemented by roadmap issue #163
 
 The opt-in `documents` feature stores ordered BSON documents in BriskDB's
 ordinary sharded SQLite layout. This is the persistence boundary below the
-protocol-neutral document engine tracked by issue #162. It does not expose a
-MongoDB listener or a public collection command API.
+[protocol-neutral document engine](DOCUMENT_ENGINE.md). Protocol adapters use
+that engine rather than this storage API. This layer does not expose a MongoDB
+listener or a high-level embedded collection API.
 
 ## Logical catalog
 

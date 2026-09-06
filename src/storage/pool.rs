@@ -1,11 +1,14 @@
 //! Bounded per-shard SQLite connection pools.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ops::Deref,
     sync::{Arc, Mutex, MutexGuard, atomic::Ordering},
     time::{Duration, Instant},
 };
+
+#[cfg(feature = "documents")]
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
@@ -22,6 +25,32 @@ use super::{CONNECTION_BUSY_TIMEOUT, ConnectionHygiene, Storage};
 
 thread_local! {
     static BUSY_OPERATION: RefCell<Option<BusyOperation>> = const { RefCell::new(None) };
+    static DOCUMENT_STORAGE_OPERATION: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) fn document_storage_operation_active() -> bool {
+    DOCUMENT_STORAGE_OPERATION.get()
+}
+
+#[cfg(feature = "documents")]
+struct DocumentStorageOperationGuard;
+
+#[cfg(feature = "documents")]
+impl DocumentStorageOperationGuard {
+    fn install() -> Self {
+        DOCUMENT_STORAGE_OPERATION.with(|active| {
+            let previous = active.replace(true);
+            debug_assert!(!previous, "document storage operations cannot be nested");
+        });
+        Self
+    }
+}
+
+#[cfg(feature = "documents")]
+impl Drop for DocumentStorageOperationGuard {
+    fn drop(&mut self) {
+        DOCUMENT_STORAGE_OPERATION.set(false);
+    }
 }
 
 struct BusyOperation {
@@ -862,6 +891,28 @@ impl PooledConnection {
         self.finish_controlled(result)
     }
 
+    /// Run an engine-owned document operation against the reserved document
+    /// table while retaining the ordinary cancellation and pool-hygiene
+    /// boundary.
+    ///
+    /// The pool authorizer consults the thread-local guard only for the exact
+    /// storage-owned document table. It continues to deny every other reserved
+    /// object, and the guard is cleared on both return and unwind.
+    #[cfg(feature = "documents")]
+    pub(crate) fn run_document_controlled<T, F>(
+        &mut self,
+        control: Arc<OperationControl>,
+        work: F,
+    ) -> EngineResult<T>
+    where
+        F: FnOnce(&mut Self) -> EngineResult<T>,
+    {
+        self.run_controlled(control, |connection| {
+            let _document_operation = DocumentStorageOperationGuard::install();
+            work(connection)
+        })
+    }
+
     fn finish_controlled<T>(&mut self, result: EngineResult<T>) -> EngineResult<T> {
         let control = self
             .operation
@@ -1075,6 +1126,69 @@ fn run_connection_validation_controlled<T>(
     }
 }
 
+/// Run work on one dedicated SQLite handle while the request owns every
+/// blocking and interruptible SQLite boundary.
+///
+/// Unlike [`PooledConnection::run_controlled`], this restores the ordinary
+/// fixed busy timeout for a caller-owned handle instead of deciding whether a
+/// pool should retire it. One [`OperationControl`] may use this helper
+/// repeatedly for sequential manifest and shard work; each invocation arms
+/// exactly the handle currently executing SQLite.
+#[cfg(feature = "documents")]
+pub(super) fn run_dedicated_connection_controlled<T>(
+    connection: &mut Connection,
+    control: Arc<OperationControl>,
+    work: impl FnOnce(&mut Connection) -> EngineResult<T>,
+) -> EngineResult<T> {
+    let _busy_operation = BusyOperationGuard::install(Arc::clone(&control));
+    connection
+        .busy_handler(Some(cancellable_busy_handler))
+        .map_err(sqlite_error::storage)?;
+    let progress_control = Arc::clone(&control);
+    if let Err(error) =
+        connection.progress_handler(1_000, Some(move || progress_control.should_stop()))
+    {
+        let _ = connection.busy_timeout(CONNECTION_BUSY_TIMEOUT);
+        return Err(sqlite_error::storage(error)
+            .context("failed to install the dedicated SQLite request progress hook"));
+    }
+    let interrupt_handle = connection.get_interrupt_handle();
+    if let Err(reason) = control.arm(Arc::new(move || interrupt_handle.interrupt())) {
+        let _ = connection.progress_handler(0, None::<fn() -> bool>);
+        let _ = connection.busy_timeout(CONNECTION_BUSY_TIMEOUT);
+        return Err(reason.error());
+    }
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| work(connection)));
+    let progress_cleanup = connection
+        .progress_handler(0, None::<fn() -> bool>)
+        .map_err(sqlite_error::storage);
+    let busy_cleanup = connection
+        .busy_timeout(CONNECTION_BUSY_TIMEOUT)
+        .map_err(sqlite_error::storage);
+    let reason = control.disarm();
+    let result = match outcome {
+        Ok(result) => result,
+        Err(payload) => {
+            let _ = progress_cleanup;
+            let _ = busy_cleanup;
+            resume_unwind(payload)
+        }
+    };
+    match (result, progress_cleanup, busy_cleanup, reason) {
+        (Ok(_), Err(error), _, _) => {
+            Err(error.context("failed to remove the dedicated SQLite request progress hook"))
+        }
+        (Ok(_), Ok(()), Err(error), _) => {
+            Err(error.context("failed to restore the dedicated SQLite busy timeout"))
+        }
+        (Ok(value), Ok(()), Ok(()), _) => Ok(value),
+        (Err(error), _, _, _) if error.kind() == EngineErrorKind::DataCorruption => Err(error),
+        (Err(_), _, _, Some(reason)) => Err(reason.error()),
+        (Err(error), _, _, None) => Err(error),
+    }
+}
+
 impl Deref for PooledConnection {
     type Target = Connection;
 
@@ -1163,6 +1277,60 @@ mod tests {
         migration.publish_ready().unwrap();
         let pools = ConnectionPools::new(storage, pool_size, queue_capacity).unwrap();
         (temp, pools)
+    }
+
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn document_authority_is_narrow_and_cleared_before_pool_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp.path(), 2).unwrap();
+        storage
+            .create_document_collection(
+                "app",
+                "events",
+                &crate::document::DocumentCollectionOptions::empty(),
+            )
+            .unwrap();
+        let pools = ConnectionPools::new(storage, 1, 0).unwrap();
+        let mut connection = pools.acquire(0).await.unwrap().checkout().unwrap();
+
+        assert!(
+            connection
+                .query_row("SELECT count(*) FROM briskdb_documents_v1", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ),)
+                .is_err(),
+            "ordinary pooled SQL must not read document storage"
+        );
+
+        let count = connection
+            .run_document_controlled(OperationControl::new(None), |connection| {
+                connection
+                    .query_row("SELECT count(*) FROM briskdb_documents_v1", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(sqlite_error::statement)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+
+        assert!(
+            connection
+                .query_row("SELECT count(*) FROM briskdb_documents_v1", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ),)
+                .is_err(),
+            "document authority must be cleared before the connection is reused"
+        );
+        assert!(
+            connection
+                .query_row("SELECT count(*) FROM briskdb_shard_metadata", [], |row| row
+                    .get::<_, i64>(0),)
+                .is_err(),
+            "document authority must not grant access to other storage tables"
+        );
     }
 
     fn advance_schema_generation(
