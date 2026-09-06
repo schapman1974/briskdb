@@ -12,13 +12,17 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use serde::Serialize;
+use base64::{Engine as _, engine::general_purpose::STANDARD as STANDARD_BASE64};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use v1::{BroadcastRequest, SqlRequest as QueryRequest, SqlRequest as RoutedSqlRequest, V1Json};
+use v1::{
+    BroadcastRequest, RawJsonParameter, SqlRequest as QueryRequest, SqlRequest as RoutedSqlRequest,
+    V1Json, ValueEncoding,
+};
 
 use crate::{
     core::{
-        DataType, Database, Engine, EngineError, EngineErrorKind, Executed, GeneratedKey,
+        DataType, Database, Decimal, Engine, EngineError, EngineErrorKind, Executed, GeneratedKey,
         GlobalIndexHealthState, GlobalIndexLifecycle, GlobalIndexOperationalReport,
         GlobalIndexOperationalStatus, ResultSet, Routed, Statement, Value,
     },
@@ -160,6 +164,8 @@ struct QueryResponse {
     shard: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     shards: Option<Vec<u16>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_encoding: Option<ValueEncoding>,
     columns: Vec<QueryColumn>,
     rows: Vec<Vec<JsonValue>>,
 }
@@ -175,10 +181,11 @@ async fn execute(
     V1Json(request): V1Json<RoutedSqlRequest>,
 ) -> Result<Json<ExecuteResponse>, ApiError> {
     let engine = state.engine;
+    let value_encoding = request.value_encoding;
     let params = request
         .params
         .into_iter()
-        .map(json_to_value)
+        .map(|value| parameter_to_value(value, value_encoding))
         .collect::<Result<Vec<_>, _>>()?;
     let session = engine.session();
     if let Some(shard_key) = request.shard_key {
@@ -226,10 +233,11 @@ async fn query(
     V1Json(request): V1Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let engine = state.engine;
+    let value_encoding = request.value_encoding;
     let params = request
         .params
         .into_iter()
-        .map(json_to_value)
+        .map(|value| parameter_to_value(value, value_encoding))
         .collect::<Result<Vec<_>, _>>()?;
     let session = engine.session();
     if engine.catalog().tables().is_empty() {
@@ -243,7 +251,7 @@ async fn query(
     } = engine
         .query_logical(&session, Statement::new(request.sql, params))
         .await?;
-    let response = result_set_to_query_response(shards, result);
+    let response = result_set_to_query_response(shards, result, value_encoding);
 
     Ok(Json(response))
 }
@@ -419,6 +427,41 @@ fn write_index_metrics(output: &mut String, index: &GlobalIndexOperationalStatus
     );
 }
 
+fn parameter_to_value(
+    value: RawJsonParameter,
+    encoding: ValueEncoding,
+) -> Result<Value, EngineError> {
+    match encoding {
+        ValueEncoding::LegacyJsonV1 => legacy_json_to_value(value.get()),
+        ValueEncoding::LosslessJsonV1 => lossless_json_to_value(value.get()),
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyParameterEnvelope {
+    params: [JsonValue; 1],
+}
+
+fn legacy_json_to_value(raw: &str) -> Result<Value, EngineError> {
+    // RawValue is required so lossless tags retain duplicate members for strict
+    // rejection. Reparse each legacy value beneath the same root-object and
+    // params-array nesting as the original Vec<JsonValue> envelope so opting
+    // into RawValue does not relax serde_json's established recursion limit.
+    let mut envelope = String::with_capacity(raw.len().saturating_add(13));
+    envelope.push_str("{\"params\":[");
+    envelope.push_str(raw);
+    envelope.push_str("]}");
+    let LegacyParameterEnvelope { params: [value] } =
+        serde_json::from_str(&envelope).map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::InvalidArgument,
+                "an HTTP JSON parameter could not be decoded",
+                error,
+            )
+        })?;
+    json_to_value(value)
+}
+
 fn json_to_value(value: JsonValue) -> Result<Value, EngineError> {
     validate_json_numbers(&value)?;
     Ok(match value {
@@ -506,7 +549,139 @@ fn value_to_json(value: Value) -> JsonValue {
     }
 }
 
-fn result_set_to_query_response(shards: Vec<u16>, result: ResultSet) -> QueryResponse {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LosslessTaggedValue {
+    #[serde(rename = "$briskdb_type")]
+    kind: LosslessValueKind,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+enum LosslessValueKind {
+    #[serde(rename = "int64")]
+    Int64,
+    #[serde(rename = "uint64")]
+    UInt64,
+    #[serde(rename = "float64")]
+    Float64,
+    #[serde(rename = "decimal")]
+    Decimal,
+    #[serde(rename = "binary")]
+    Binary,
+    #[serde(rename = "invalid_text")]
+    InvalidText,
+}
+
+fn lossless_json_to_value(raw: &str) -> Result<Value, EngineError> {
+    let value = serde_json::from_str::<JsonValue>(raw).map_err(|_| invalid_lossless_value())?;
+    match value {
+        JsonValue::Null => Ok(Value::Null),
+        JsonValue::Bool(value) => Ok(Value::Boolean(value)),
+        JsonValue::String(value) => Ok(Value::Text(value)),
+        JsonValue::Object(_) => {
+            // Deserialize the raw object again so serde observes repeated fields
+            // instead of accepting serde_json::Map's last-value-wins projection.
+            let tagged = serde_json::from_str::<LosslessTaggedValue>(raw)
+                .map_err(|_| invalid_lossless_value())?;
+            decode_lossless_tag(tagged)
+        }
+        JsonValue::Number(_) | JsonValue::Array(_) => Err(invalid_lossless_value()),
+    }
+}
+
+fn decode_lossless_tag(tagged: LosslessTaggedValue) -> Result<Value, EngineError> {
+    let LosslessTaggedValue { kind, value } = tagged;
+    match kind {
+        LosslessValueKind::Int64 => value
+            .parse::<i64>()
+            .ok()
+            .filter(|parsed| parsed.to_string() == value)
+            .map(Value::Int64)
+            .ok_or_else(invalid_lossless_value),
+        LosslessValueKind::UInt64 => value
+            .parse::<u64>()
+            .ok()
+            .filter(|parsed| parsed.to_string() == value)
+            .map(Value::UInt64)
+            .ok_or_else(invalid_lossless_value),
+        LosslessValueKind::Float64 => decode_float64_bits(&value).map(Value::Float64),
+        LosslessValueKind::Decimal => Decimal::parse(value)
+            .map(Value::Decimal)
+            .map_err(|_| invalid_lossless_value()),
+        LosslessValueKind::Binary => decode_canonical_base64(&value).map(Value::Binary),
+        LosslessValueKind::InvalidText => decode_canonical_base64(&value).map(Value::InvalidText),
+    }
+}
+
+fn decode_float64_bits(value: &str) -> Result<f64, EngineError> {
+    if value.len() != 16
+        || !value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(invalid_lossless_value());
+    }
+    u64::from_str_radix(value, 16)
+        .map(f64::from_bits)
+        .map_err(|_| invalid_lossless_value())
+}
+
+fn decode_canonical_base64(value: &str) -> Result<Vec<u8>, EngineError> {
+    let decoded = STANDARD_BASE64
+        .decode(value)
+        .map_err(|_| invalid_lossless_value())?;
+    if STANDARD_BASE64.encode(&decoded) != value {
+        return Err(invalid_lossless_value());
+    }
+    Ok(decoded)
+}
+
+fn invalid_lossless_value() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::InvalidArgument,
+        "an HTTP JSON parameter does not match lossless-json-v1",
+    )
+}
+
+fn lossless_value_to_json(value: Value) -> JsonValue {
+    match value {
+        Value::Null => JsonValue::Null,
+        Value::Boolean(value) => JsonValue::Bool(value),
+        Value::Text(value) => JsonValue::String(value),
+        Value::Int64(value) => tagged_lossless_value("int64", value.to_string()),
+        Value::UInt64(value) => tagged_lossless_value("uint64", value.to_string()),
+        Value::Float64(value) => {
+            tagged_lossless_value("float64", format!("{:016x}", value.to_bits()))
+        }
+        Value::Decimal(value) => tagged_lossless_value("decimal", value.into_string()),
+        Value::Binary(value) => tagged_lossless_value("binary", STANDARD_BASE64.encode(value)),
+        Value::InvalidText(value) => {
+            tagged_lossless_value("invalid_text", STANDARD_BASE64.encode(value))
+        }
+    }
+}
+
+fn tagged_lossless_value(kind: &'static str, value: String) -> JsonValue {
+    json!({
+        "$briskdb_type": kind,
+        "value": value,
+    })
+}
+
+fn value_to_json_with_encoding(value: Value, encoding: ValueEncoding) -> JsonValue {
+    match encoding {
+        ValueEncoding::LegacyJsonV1 => value_to_json(value),
+        ValueEncoding::LosslessJsonV1 => lossless_value_to_json(value),
+    }
+}
+
+fn result_set_to_query_response(
+    shards: Vec<u16>,
+    result: ResultSet,
+    value_encoding: ValueEncoding,
+) -> QueryResponse {
     let (shard, shards) = match shards.as_slice() {
         [shard] => (Some(*shard), None),
         _ => (None, Some(shards)),
@@ -521,12 +696,18 @@ fn result_set_to_query_response(shards: Vec<u16>, result: ResultSet) -> QueryRes
         .collect();
     let rows = rows
         .into_iter()
-        .map(|row| row.into_values().into_iter().map(value_to_json).collect())
+        .map(|row| {
+            row.into_values()
+                .into_iter()
+                .map(|value| value_to_json_with_encoding(value, value_encoding))
+                .collect()
+        })
         .collect();
 
     QueryResponse {
         shard,
         shards,
+        value_encoding: (!value_encoding.is_legacy()).then_some(value_encoding),
         columns,
         rows,
     }
@@ -2338,6 +2519,34 @@ mod tests {
     }
 
     #[test]
+    fn raw_parameter_capture_preserves_the_legacy_envelope_recursion_limit() {
+        #[derive(Deserialize)]
+        struct PreviousSqlRequest {
+            #[serde(rename = "sql")]
+            _sql: String,
+            params: Vec<JsonValue>,
+        }
+
+        for depth in 120..=132 {
+            let nested = format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
+            let body = format!(r#"{{"sql":"SELECT ?1","params":[{nested}]}}"#);
+            let previous_accepts = serde_json::from_str::<PreviousSqlRequest>(&body)
+                .is_ok_and(|request| request.params.len() == 1);
+            let current_accepts = serde_json::from_str::<RoutedSqlRequest>(&body)
+                .ok()
+                .and_then(|mut request| request.params.pop())
+                .is_some_and(|parameter| {
+                    parameter_to_value(parameter, ValueEncoding::LegacyJsonV1).is_ok()
+                });
+
+            assert_eq!(
+                current_accepts, previous_accepts,
+                "legacy recursion-depth behavior changed at parameter depth {depth}"
+            );
+        }
+    }
+
+    #[test]
     fn http_parameters_use_the_shared_canonical_index_key_encoding() {
         let through_http = [
             json_to_value(json!(true)).unwrap(),
@@ -2455,6 +2664,155 @@ mod tests {
         );
     }
 
+    fn decode_lossless_parameter(raw: &str) -> Result<Value, EngineError> {
+        let parameter = serde_json::from_str::<RawJsonParameter>(raw).unwrap();
+        parameter_to_value(parameter, ValueEncoding::LosslessJsonV1)
+    }
+
+    #[test]
+    fn lossless_json_round_trips_every_protocol_neutral_value_representation() {
+        for value in [
+            Value::Null,
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Int64(i64::MIN),
+            Value::Int64(i64::MAX),
+            Value::UInt64(u64::MAX),
+            Value::decimal("+0012.3400E-02").unwrap(),
+            Value::Text("plain text".to_owned()),
+            Value::Text("{\"$briskdb_type\":\"binary\"}".to_owned()),
+            Value::InvalidText(vec![b'f', 0x80, 0xff]),
+            Value::Binary(vec![]),
+            Value::Binary(vec![0, 0xff]),
+            Value::Binary((0..=u8::MAX).collect()),
+        ] {
+            let encoded = lossless_value_to_json(value.clone()).to_string();
+            let decoded = decode_lossless_parameter(&encoded)
+                .unwrap_or_else(|error| panic!("failed to decode {encoded}: {error:?}"));
+            assert_eq!(decoded, value);
+        }
+
+        for bits in [
+            0_u64,
+            (-0.0_f64).to_bits(),
+            1.5_f64.to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            0x7ff8_0000_0000_0042,
+        ] {
+            let encoded = lossless_value_to_json(Value::Float64(f64::from_bits(bits))).to_string();
+            let Value::Float64(decoded) = decode_lossless_parameter(&encoded).unwrap() else {
+                panic!("float64 tag decoded as another value type");
+            };
+            assert_eq!(decoded.to_bits(), bits);
+        }
+    }
+
+    #[test]
+    fn lossless_json_has_stable_exact_tag_shapes() {
+        for (value, expected) in [
+            (
+                Value::Int64(i64::MIN),
+                json!({"$briskdb_type": "int64", "value": "-9223372036854775808"}),
+            ),
+            (
+                Value::UInt64(u64::MAX),
+                json!({"$briskdb_type": "uint64", "value": "18446744073709551615"}),
+            ),
+            (
+                Value::Float64(-0.0),
+                json!({"$briskdb_type": "float64", "value": "8000000000000000"}),
+            ),
+            (
+                Value::decimal("12.3400").unwrap(),
+                json!({"$briskdb_type": "decimal", "value": "12.3400"}),
+            ),
+            (
+                Value::Binary(vec![0, 255]),
+                json!({"$briskdb_type": "binary", "value": "AP8="}),
+            ),
+            (
+                Value::InvalidText(vec![b'f', 0x80]),
+                json!({"$briskdb_type": "invalid_text", "value": "ZoA="}),
+            ),
+        ] {
+            assert_eq!(lossless_value_to_json(value), expected);
+        }
+    }
+
+    #[test]
+    fn lossless_json_rejects_ambiguous_or_noncanonical_parameters() {
+        for raw in [
+            "0",
+            "1.5",
+            "[]",
+            "{}",
+            r#"{"value":"0","$briskdb_type":"int64","extra":true}"#,
+            r#"{"$briskdb_type":"int64"}"#,
+            r#"{"value":"0"}"#,
+            r#"{"$briskdb_type":"unknown","value":"0"}"#,
+            r#"{"$briskdb_type":1,"value":"0"}"#,
+            r#"{"$briskdb_type":"int64","value":0}"#,
+            r#"{"$briskdb_type":"int64","$briskdb_type":"int64","value":"0"}"#,
+            r#"{"$briskdb_type":"int64","value":"0","value":"0"}"#,
+            r#"{"$briskdb_type":"int64","value":"00"}"#,
+            r#"{"$briskdb_type":"int64","value":"-0"}"#,
+            r#"{"$briskdb_type":"int64","value":"9223372036854775808"}"#,
+            r#"{"$briskdb_type":"uint64","value":"+1"}"#,
+            r#"{"$briskdb_type":"uint64","value":"18446744073709551616"}"#,
+            r#"{"$briskdb_type":"decimal","value":"NaN"}"#,
+            r#"{"$briskdb_type":"float64","value":"000000000000000"}"#,
+            r#"{"$briskdb_type":"float64","value":"3FF0000000000000"}"#,
+            r#"{"$briskdb_type":"float64","value":"xxxxxxxxxxxxxxxx"}"#,
+            r#"{"$briskdb_type":"binary","value":"AA"}"#,
+            r#"{"$briskdb_type":"binary","value":"AB=="}"#,
+            r#"{"$briskdb_type":"invalid_text","value":"!"}"#,
+        ] {
+            let error = decode_lossless_parameter(raw).unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::InvalidArgument, "{raw}");
+            assert_eq!(
+                error.diagnostic(),
+                "an HTTP JSON parameter does not match lossless-json-v1"
+            );
+        }
+    }
+
+    #[test]
+    fn lossless_query_response_echoes_encoding_and_keeps_ordered_rows() {
+        let result = ResultSet::new(
+            vec![
+                Column::new("duplicate", DataType::Int64),
+                Column::new("duplicate", DataType::Binary),
+            ],
+            vec![Row::new(vec![
+                Value::Int64(9_007_199_254_740_993),
+                Value::Binary(vec![0, 255]),
+            ])],
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(result_set_to_query_response(
+                vec![3],
+                result,
+                ValueEncoding::LosslessJsonV1,
+            ))
+            .unwrap(),
+            json!({
+                "shard": 3,
+                "value_encoding": "lossless-json-v1",
+                "columns": [
+                    {"name": "duplicate", "data_type": "int64"},
+                    {"name": "duplicate", "data_type": "binary"}
+                ],
+                "rows": [[
+                    {"$briskdb_type": "int64", "value": "9007199254740993"},
+                    {"$briskdb_type": "binary", "value": "AP8="}
+                ]]
+            })
+        );
+    }
+
     #[test]
     fn every_data_type_has_a_stable_http_metadata_name() {
         assert_eq!(
@@ -2507,7 +2865,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            serde_json::to_value(result_set_to_query_response(vec![3], result)).unwrap(),
+            serde_json::to_value(result_set_to_query_response(
+                vec![3],
+                result,
+                ValueEncoding::LegacyJsonV1,
+            ))
+            .unwrap(),
             json!({
                 "shard": 3,
                 "columns": [
@@ -2529,13 +2892,23 @@ mod tests {
     fn result_encoding_keeps_valid_zero_column_shapes() {
         let empty = ResultSet::new(Vec::new(), Vec::new()).unwrap();
         assert_eq!(
-            serde_json::to_value(result_set_to_query_response(vec![1], empty)).unwrap(),
+            serde_json::to_value(result_set_to_query_response(
+                vec![1],
+                empty,
+                ValueEncoding::LegacyJsonV1,
+            ))
+            .unwrap(),
             json!({"shard": 1, "columns": [], "rows": []})
         );
 
         let empty_row = ResultSet::new(Vec::new(), vec![Row::new(Vec::new())]).unwrap();
         assert_eq!(
-            serde_json::to_value(result_set_to_query_response(vec![2], empty_row)).unwrap(),
+            serde_json::to_value(result_set_to_query_response(
+                vec![2],
+                empty_row,
+                ValueEncoding::LegacyJsonV1,
+            ))
+            .unwrap(),
             json!({"shard": 2, "columns": [], "rows": [[]]})
         );
     }
@@ -2552,7 +2925,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            serde_json::to_value(result_set_to_query_response(vec![0, 1], result)).unwrap(),
+            serde_json::to_value(result_set_to_query_response(
+                vec![0, 1],
+                result,
+                ValueEncoding::LegacyJsonV1,
+            ))
+            .unwrap(),
             json!({
                 "shards": [0, 1],
                 "columns": [{"name": "payload", "data_type": "text"}],

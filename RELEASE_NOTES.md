@@ -1,3 +1,22 @@
+# Unreleased
+
+HTTP v1 now offers the opt-in `lossless-json-v1` value encoding while retaining
+`legacy-json-v1` as the byte-compatible default. Lossless query rows keep the
+existing ordered columns and positional arrays, tag every signed and unsigned
+integer with exact decimal text, preserve binary64 values as their 16-digit
+lowercase hexadecimal bits, and carry blobs or invalid SQLite text as canonical
+padded base64. The same tags are accepted as execute/query parameters, so a
+returned blob can be reused without becoming JSON text. Discovery advertises
+both encodings, and malformed or unknown selections and tags fail before engine
+execution.
+
+The codec preserves the current protocol-neutral values; it does not add a
+SQLite storage class. Existing decimal, oversized unsigned-integer,
+invalid-text, and NaN binding rejections remain. Relational timestamps still use
+an application-chosen ordinary `Text` or `Int64` representation and have no
+native BriskDB HTTP tag. The change adds no manifest, shard-file, listener,
+routing, or other on-disk change.
+
 # BriskDB 0.1.0-alpha.6 — 2026-09-06
 
 Alpha 6 expands the supported PostgreSQL and embedded Python surfaces while

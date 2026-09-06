@@ -150,8 +150,12 @@ unsigned integers use
 `uint64` tag in this admin-only response so the browser never rounds the
 displayed value. Blobs are
 arrays of byte-valued integers; decimals use strings; invalid UTF-8 text is
-rendered lossily; and non-finite floats become JSON `null`. This tagged integer
-addition does not change the experimental `/v1/query` response.
+rendered lossily; and non-finite floats become JSON `null`.
+
+This browser representation is separate from the public API's opt-in
+`lossless-json-v1` codec. The browser neither accepts a `value_encoding`
+selection nor returns its fully tagged integers, float bits, or base64 byte
+values. Adding the public codec changes no `/admin/api/*` request or response.
 
 Engine failures use the same fixed, redacted HTTP problem details as other HTTP
 operations. Login or session rejection returns HTTP 401 without echoing the

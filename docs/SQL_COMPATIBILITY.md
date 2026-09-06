@@ -343,20 +343,24 @@ is reconciled from the retained journal prefix.
 
 ### Current HTTP parameter and result conversion
 
-The [HTTP v1 contract](HTTP_API.md) versions the existing representation as
-`legacy-json-v1`. Request envelopes are strict and decoding failures use fixed
-problem details. Versioning this encoding does not make it lossless; the
-conversion rules and limitations below remain part of v1.
+The [HTTP v1 contract](HTTP_API.md) supports two explicitly named value
+encodings. `legacy-json-v1` remains the default and preserves the original
+conversion exactly. A request may select `lossless-json-v1` to use a canonical
+tagged representation for every current protocol-neutral value that JSON cannot
+otherwise distinguish or preserve. Request envelopes and tag objects are
+strict, and decoding failures use fixed problem details before engine work.
 
 Use SQLite positional placeholders such as `?1` and `?2`. Values are never
-interpolated into SQL text. The HTTP adapter converts JSON parameters into
-protocol-neutral BriskDB values; the SQL layer binds only those typed values.
-An empty catalog binds the caller's SQLite markers on the legacy path. A
-populated catalog runs `normalize_placeholders(CommonSql)` and executes its
-strict translated `?N` SQL; named SQLite markers accepted by the legacy path
-are therefore not part of the registered-catalog contract.
+interpolated into SQL text. The HTTP adapter converts the selected JSON
+representation into protocol-neutral BriskDB values; the SQL layer binds only
+those typed values. An empty catalog binds the caller's SQLite markers on the
+legacy path. A populated catalog runs `normalize_placeholders(CommonSql)` and
+executes its strict translated `?N` SQL; named SQLite markers accepted by the
+legacy path are therefore not part of the registered-catalog contract.
 
-| JSON input | SQLite binding |
+The default legacy parameter conversion is:
+
+| `legacy-json-v1` input | SQLite binding |
 | --- | --- |
 | `null` | `NULL` |
 | `true` / `false` | `INTEGER` `1` / `0` |
@@ -373,67 +377,80 @@ SQLite results map to protocol-neutral BriskDB `Null`, `Int64`, `Float64`,
 UTF-8 remains byte-for-byte intact in `InvalidText`. The wider value model also
 has `UInt64` and a validated, exact string-backed `Decimal` variant for protocol
 inputs. Decimal construction accepts SQL-style signed decimal and exponent
-syntax and preserves its original digits and scale.
-SQLite binding accepts `UInt64` only through a checked conversion to `i64` and
-rejects larger values, `Decimal`, `InvalidText`, and `Float64(NaN)` instead of
-rounding, rewriting, or allowing SQLite to turn `NaN` into `NULL`. Infinite
-`Float64` values remain SQLite `REAL` values. Ordered column metadata and
-positional rows are preserved inside `ResultSet`; SQLite result-column metadata
-is marked `Unknown` because dynamic SQLite values do not guarantee one static
-type.
+syntax and preserves its original digits and scale. SQLite binding accepts
+`UInt64` only through a checked conversion to `i64` and rejects larger values,
+`Decimal`, `InvalidText`, and `Float64(NaN)` instead of rounding, rewriting, or
+allowing SQLite to turn `NaN` into `NULL`. Infinite `Float64` values remain
+SQLite `REAL` values.
 
-The experimental `/v1/query` response exposes the ordered result directly. The
-admin row-page endpoint reuses the same ordered columns and positional rows and
-wraps them with physical-shard and pagination metadata. Its large-integer
-display encoding differs as described below. For example, the existing query
-shape is:
+Both HTTP encodings expose the same ordered query shape. A successful one-target
+query contains `"shard": N`; a logical query that visits multiple targets uses
+the unique, sorted `"shards": [N, ...]` array and concatenates rows in that
+physical-shard order. For every row,
+`rows[row_index][column_index]` is described by `columns[column_index]`. Column
+names may be duplicated or empty and are never used as JSON object keys. A
+query that produces no rows still returns all ordered column metadata with
+`"rows": []`. The `data_type` label is one of `unknown`, `null`, `boolean`,
+`int64`, `uint64`, `float64`, `decimal`, `text`, or `binary`. Direct SQLite
+columns retain the conservative declared-type mapping documented for
+PostgreSQL; expressions and unrecognized declarations remain `unknown` because
+SQLite does not guarantee one static result type.
 
-```json
-{
-  "shard": 0,
-  "columns": [
-    {"name": "value", "data_type": "unknown"},
-    {"name": "value", "data_type": "unknown"}
-  ],
-  "rows": [[1, 2]]
-}
-```
+Legacy results use direct JSON for nulls, Booleans, integers, finite floats, and
+valid text. Binary data is an array of byte-valued integers, exact decimals are
+strings, invalid UTF-8 is rendered with U+FFFD replacement, and non-finite
+floats become null. This is intentionally lossy and remains unchanged.
 
-A successful one-target query contains `"shard": N`. A logical query that
-visits multiple targets replaces that member with `"shards": [N, ...]`; the
-array is unique and sorted in physical-shard order, matching the order used to
-concatenate its per-shard rows.
+Lossless nulls, Booleans, and valid text remain native JSON. Every other value
+uses an object containing exactly `$briskdb_type` and a string `value`:
 
-For every row, `rows[row_index][column_index]` is described by
-`columns[column_index]`. Column names may be duplicated or empty and are never
-used as JSON object keys. A query that produces no rows still returns all of its
-ordered column metadata with `"rows": []`. The `data_type` label is one of
-`unknown`, `null`, `boolean`, `int64`, `uint64`, `float64`, `decimal`, `text`,
-or `binary`. Direct SQLite columns now retain the conservative declared-type
-mapping documented for PostgreSQL; expressions and unrecognized declarations
-remain `unknown` because SQLite does not guarantee one static result type.
+| Type | `lossless-json-v1` value |
+| --- | --- |
+| Signed integer | `{"$briskdb_type":"int64","value":"-9223372036854775808"}` |
+| Unsigned integer | `{"$briskdb_type":"uint64","value":"18446744073709551615"}` |
+| Decimal | `{"$briskdb_type":"decimal","value":"12.3400"}` |
+| Binary64 float | `{"$briskdb_type":"float64","value":"3ff8000000000000"}` |
+| BLOB bytes | `{"$briskdb_type":"binary","value":"AP8="}` |
+| Invalid SQLite `TEXT` bytes | `{"$briskdb_type":"invalid_text","value":"ZoA="}` |
 
-The `/v1/query` cell encoding retains the existing HTTP policy: nulls, booleans,
-signed and unsigned integers, finite floats, and valid text use their direct
-JSON forms; binary data is an array of byte-valued JSON integers; and exact
-decimals are JSON strings. `InvalidText` is rendered lossily with invalid UTF-8
-byte sequences replaced by U+FFFD. Because JSON has no non-finite number syntax,
-infinite or `NaN` `Float64` values become `null`. Consumers that decode every
-`/v1/query` JSON number through binary floating point must also account for
-precision loss when reading large integer cells.
+Integer strings are canonical base-10 values. Float strings are exactly 16
+lowercase hexadecimal digits containing the IEEE-754 bits, which preserves
+signed zero, infinities, and NaN payloads. Binary strings use canonical RFC 4648
+standard-alphabet base64, with `=` padding whenever required and no whitespace.
+Decimal strings retain their valid source representation, including sign,
+scale, exponent case, and exponent sign. Raw numbers, arrays, untagged objects,
+and malformed or noncanonical tags are not lossless parameter forms and fail
+before execution.
+The complete tag grammar and negotiation rules are in
+[HTTP_API.md](HTTP_API.md#lossless-value-encoding).
 
-The admin row-page response keeps direct JSON integers within
-`-9007199254740991..=9007199254740991`. It represents larger signed or unsigned
-values as
-`{"$briskdb_type":"int64","value":"exact decimal text"}` or the equivalent
-`uint64` tag, and the embedded browser displays that text verbatim. This
-admin-only tag avoids JavaScript rounding without changing `/v1/query`.
+The codec is lossless at the HTTP/core boundary; it does not add SQLite storage
+classes. In particular, SQL binding still rejects decimal parameters, unsigned
+integers above `i64::MAX`, invalid-text parameters, and NaN. Binary is supported:
+a returned `binary` tag can be reused as a parameter and binds to BLOB bytes
+rather than JSON text.
 
-This ordered response intentionally replaces the earlier experimental
-object-per-row shape, which collapsed duplicate names. Admin pages preserve the
-same indexed relationship instead of converting rows into name-keyed objects.
-The conversion changes only HTTP serialization; request fields, routing,
-configuration, the manifest, shard files, and stored data are unchanged.
+There is no relational timestamp `Value`, `DataType`, or HTTP tag. SQLite has no
+dedicated temporal storage class, so applications store a documented canonical
+timestamp as ordinary `Text` or `Int64`. An application choosing integer Unix
+microseconds can use the ordinary lossless `int64` tag, but BriskDB does not
+infer that semantic type, normalize time zones, or promise cross-protocol
+temporal compatibility. Issue #298 tracks the shared relational timestamp
+contract.
+
+The 2 MiB request-body limit counts encoded JSON. Engine result limits account
+protocol-neutral values before tag and base64 expansion, so encoded response
+size can exceed the logical byte count. The current response remains buffered;
+HTTP output-byte limits and streaming are separate roadmap work.
+
+The admin row-page response keeps its separate browser-oriented encoding. It
+uses direct JSON integers within `-9007199254740991..=9007199254740991` and
+tags only larger signed or unsigned values with exact decimal text. Blobs remain
+byte arrays there. The browser does not select or expose the public
+`lossless-json-v1` codec.
+
+These conversions change only HTTP serialization. Routing, configuration, the
+manifest, shard files, and stored data are unchanged.
 
 ### Current error contract
 
