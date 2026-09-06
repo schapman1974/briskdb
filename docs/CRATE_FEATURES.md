@@ -9,14 +9,14 @@ handling dependencies:
 
 ```toml
 [dependencies]
-briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["embedded"] }
+briskdb = { git = "https://github.com/schapman1974/briskdb", tag = "v0.1.0-alpha.6", default-features = false, features = ["embedded"] }
 ```
 
 For the same facade plus native BSON/document commands:
 
 ```toml
 [dependencies]
-briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["documents"] }
+briskdb = { git = "https://github.com/schapman1974/briskdb", tag = "v0.1.0-alpha.6", default-features = false, features = ["documents"] }
 ```
 
 The `documents` feature selects `embedded`; each database handle must still be

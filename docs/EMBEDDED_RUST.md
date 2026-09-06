@@ -84,7 +84,7 @@ the feature includes the embedded facade and BSON dependencies:
 
 ```toml
 [dependencies]
-briskdb = { version = "0.1.0-alpha.5", default-features = false, features = ["documents"] }
+briskdb = { git = "https://github.com/schapman1974/briskdb", tag = "v0.1.0-alpha.6", default-features = false, features = ["documents"] }
 ```
 
 The embedded document facade must also be enabled on each database handle.

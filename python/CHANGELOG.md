@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.0-alpha.6 — 2026-09-06
+
 - Added opt-in synchronous and asyncio document commands for the currently
   executable collection, index, insert, find, count, and delete engine slice.
 - Added lossless conversion for ordered mappings and PyMongo's BSON value

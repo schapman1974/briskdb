@@ -423,7 +423,7 @@ requires an earlier dependency:
 4. [x] **Finish the embedded Rust API.** Make sessions, transactions,
    cancellation, concurrency, document commands, and shutdown safe for a host
    process.
-5. [ ] **Finish the Python API and wheels.** Provide matching synchronous and
+5. [x] **Finish the Python API and wheels.** Provide matching synchronous and
    asynchronous APIs, lossless values and exceptions, typing, documentation,
    and tested Linux/macOS ARM64/x86-64 wheels.
 6. [ ] **Complete HTTP administration and the data browser.** Version the API,
@@ -459,7 +459,7 @@ requires an earlier dependency:
       embedded Rust facade over protocol-neutral document commands
     - [x] [#198](https://github.com/schapman1974/briskdb/issues/198) — Python
       BSON conversions and document API
-    - [ ] [#200](https://github.com/schapman1974/briskdb/issues/200) — release
+    - [x] [#200](https://github.com/schapman1974/briskdb/issues/200) — release
       wheels and Mongo smoke coverage
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
