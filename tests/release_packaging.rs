@@ -30,16 +30,15 @@ fn alpha_release_contract_covers_every_native_archive_and_safety_boundary() {
 
     let notes = include_str!("../RELEASE_NOTES.md");
     for required in [
-        "HTTP remains unauthenticated and loopback-only",
-        "general users, roles, or authorization policy",
-        "PostgreSQL supports bounded simple and parameterized text/binary extended",
-        "DDL, `COPY`, broad type coverage",
+        "no authentication, authorization, or TLS",
+        "PostgreSQL extended-query protocol is unsupported",
+        "psycopg.ClientCursor",
         "General cross-shard transactions are unsupported",
         "complete data-directory copy",
         "There is no stable pre-1.0 on-disk compatibility promise",
-        "manifest version 14",
+        "manifest version 12",
         "In-place downgrade is unsupported",
-        "Unknown, malformed, partially migrated, or newer layouts fail closed",
+        "no on-disk format change",
     ] {
         assert!(
             notes.contains(required),
