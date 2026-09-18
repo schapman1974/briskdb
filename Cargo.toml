@@ -86,6 +86,14 @@ documents = [
     "dep:num-bigint",
     "dep:time",
 ]
+# Opt-in Mongo transport foundation. No listener is enabled by default.
+mongo = [
+    "documents",
+    "dep:bytes",
+    "dep:tokio-util",
+    "tokio/io-util",
+    "tokio/net",
+]
 # This reserved name establishes the intended package boundary without
 # claiming that the listener is implemented.
 mysql = []

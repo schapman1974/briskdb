@@ -104,6 +104,47 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  mongo-wire:
+    name: Mongo real-wire discovery (PyMongo 4.17.0)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Select Rust 1.85
+        run: rustup default 1.85.0
+
+      - name: Install Python 3.13
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mongo-wire-1.85
+
+      - name: Install pinned driver
+        run: python -m pip install pymongo==4.17.0
+
+      - name: Test framing and loopback lifecycle
+        run: |
+          cargo test --locked --no-default-features --features mongo,tokio/rt-multi-thread --lib protocol::mongo
+          cargo test --locked --no-default-features --features mongo --test mongo_wire
+
+      - name: Require real PyMongo sync and async discovery
+        env:
+          BRISKDB_MONGO_WIRE_PYTHON: python
+        run: >-
+          cargo test --locked --no-default-features --features mongo --test mongo_wire
+          real_pymongo_sync_async_discovery -- --ignored --exact
+
   features:
     name: Features (${{ matrix.surface }}, Rust ${{ matrix.rust }})
     runs-on: ubuntu-24.04
@@ -117,6 +158,7 @@ jobs:
         surface:
           - core
           - documents
+          - mongo
           - embedded
           - listeners
           - http

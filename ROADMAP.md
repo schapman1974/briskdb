@@ -472,6 +472,26 @@ requires an earlier dependency:
       BSON conversions and document API
     - [x] [#200](https://github.com/schapman1974/briskdb/issues/200) — release
       wheels and Mongo smoke coverage
+    - [ ] [#165](https://github.com/schapman1974/briskdb/issues/165) — Mongo
+      listener and framing. In progress: opt-in `mongo` feature, bounded envelope
+      and BSON body/document-sequence parsing, CRC-32C verification, and legacy
+      handshake parsing. Host-owned `MongoServer::start` explicitly binds a
+      loopback-only discovery listener; defaults still enable no Mongo socket.
+      Bootstrap budgets are 1 MiB messages, 512 KiB BSON documents, 4 MiB decoded
+      heap per document, eight connections, bounded sequences/batches, and an
+      absolute 15-second frame-read deadline. Shutdown joins connection/parser
+      work without closing the borrowed engine. CLI/common listener assembly,
+      negotiated compression, expanded resource/fuzz gates, and data dispatch
+      remain; this is not a completed Mongo compatibility milestone.
+    - [ ] [#170](https://github.com/schapman1974/briskdb/issues/170) and
+      [#169](https://github.com/schapman1974/briskdb/issues/169) — standalone
+      hello/isMaster, ping, buildInfo, correlated replies, and initial strict
+      option validation implemented. No sessions, retryable writes, replication,
+      change streams, or compression are advertised. Data commands fail
+      explicitly. Required CI smoke exercises real PyMongo 4.17.0 sync/async
+      discovery, pooling, reconnect, and unsupported-command errors (#184).
+      Next: connect supported exact-ID document commands and extend command/error
+      contracts; cursor and broad semantic compatibility remain later work.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.
