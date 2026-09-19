@@ -40,6 +40,216 @@ fn set(fields: BsonDocument) -> BsonDocument {
     doc([("$set", BsonValue::Document(fields))])
 }
 
+fn extrema(low: i32, high: i32) -> BsonDocument {
+    doc([
+        (
+            "$min",
+            BsonValue::Document(doc([("low", BsonValue::Int32(low))])),
+        ),
+        (
+            "$max",
+            BsonValue::Document(doc([("high", BsonValue::Int32(high))])),
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn min_max_share_counts_images_preflight_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    many_counts(
+        &engine,
+        &session,
+        BsonDocument::new(),
+        set(doc([
+            ("low", BsonValue::Double(5.0)),
+            ("high", BsonValue::Double(5.0)),
+        ])),
+    )
+    .await;
+    let id = doc([("_id", BsonValue::Double(1.0))]);
+    assert_eq!(
+        update_counts(&engine, &session, id.clone(), extrema(5, 5)).await,
+        (1, 0)
+    );
+    assert!(matches!(
+        rows(&engine, &session).await[1].get_first("low"),
+        Some(BsonValue::Double(5.0))
+    ));
+    assert_eq!(
+        update_counts(&engine, &session, id.clone(), extrema(4, 6)).await,
+        (1, 1)
+    );
+    assert_eq!(
+        many_counts(&engine, &session, BsonDocument::new(), extrema(4, 6)).await,
+        (24, 23)
+    );
+    assert_eq!(
+        many_counts(&engine, &session, BsonDocument::new(), extrema(4, 6)).await,
+        (24, 0)
+    );
+    let options = DocumentReadOptions::new()
+        .with_sort(DocumentSort::new(doc([("_id", BsonValue::Int32(-1))])).unwrap())
+        .with_projection(
+            DocumentProjection::new(doc([
+                ("low", BsonValue::Int32(1)),
+                ("_id", BsonValue::Int32(0)),
+            ]))
+            .unwrap(),
+        );
+    for (after, low, image) in [(true, 3, 3), (false, 2, 3)] {
+        let result = engine
+            .execute_document(
+                &session,
+                request(
+                    find_update(BsonDocument::new(), extrema(low, 6), options.clone(), after),
+                    RequestContext::new(),
+                ),
+            )
+            .await
+            .unwrap()
+            .into_parts()
+            .2;
+        assert_eq!(
+            result,
+            DocumentResult::Document(Some(doc([("low", BsonValue::Int32(image))])))
+        );
+    }
+    assert_eq!(
+        update_counts(
+            &engine,
+            &session,
+            doc([("_id", BsonValue::Int32(-1))]),
+            extrema(0, 9)
+        )
+        .await,
+        (0, 0)
+    );
+    let before = rows(&engine, &session).await;
+    for expression in [
+        doc([(
+            "$min",
+            BsonValue::Document(doc([("group.x", BsonValue::Int32(0))])),
+        )]),
+        doc([(
+            "$max",
+            BsonValue::Document(doc([("_id", BsonValue::Int32(99))])),
+        )]),
+        doc([
+            (
+                "$min",
+                BsonValue::Document(doc([("low", BsonValue::Int32(0))])),
+            ),
+            (
+                "$max",
+                BsonValue::Document(doc([("low", BsonValue::Int32(9))])),
+            ),
+        ]),
+    ] {
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    request(
+                        DocumentCommand::Update(update(id.clone(), expression)),
+                        RequestContext::new()
+                    )
+                )
+                .await
+                .is_err()
+        );
+    }
+    let large = doc([(
+        "$max",
+        BsonValue::Document(doc([("large", BsonValue::from("x".repeat(1000)))])),
+    )]);
+    let capped = update(id.clone(), large.clone())
+        .with_max_document_bytes(128)
+        .unwrap();
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(DocumentCommand::Update(capped), RequestContext::new())
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    find_update(id.clone(), large, DocumentReadOptions::new(), true),
+                    RequestContext::new().with_result_limits(ResultLimits::new(1, 128).unwrap())
+                )
+            )
+            .await
+            .is_err()
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    DocumentCommand::Update(update(id, extrema(0, 9))),
+                    RequestContext::new().with_cancellation_token(cancellation)
+                )
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(rows(&engine, &session).await, before);
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(rows(&engine, &engine.session()).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_min_max_many_never_lose_extremes_or_untouched_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(root.path(), 4).await.unwrap());
+    seed(&engine, &engine.session()).await;
+    let mut tasks = Vec::new();
+    for worker in 0..4 {
+        let engine = Arc::clone(&engine);
+        tasks.push(tokio::spawn(async move {
+            let session = engine.session();
+            for step in 1..=12 {
+                let value = worker * 12 + step;
+                let counts = many_counts(
+                    &engine,
+                    &session,
+                    BsonDocument::new(),
+                    extrema(-value, value),
+                )
+                .await;
+                assert_eq!(counts.0, 24);
+                assert!(counts.1 <= 24);
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    for (index, row) in rows(&engine, &engine.session()).await.iter().enumerate() {
+        assert_eq!(row.get_first("_id"), Some(&BsonValue::Int32(index as i32)));
+        assert_eq!(
+            row.get_first("group"),
+            Some(&BsonValue::Int32(index as i32 % 2))
+        );
+        assert_eq!(row.get_first("done"), Some(&BsonValue::Boolean(false)));
+        assert_eq!(row.get_first("low"), Some(&BsonValue::Int32(-48)));
+        assert_eq!(row.get_first("high"), Some(&BsonValue::Int32(48)));
+    }
+}
+
 fn update_many(filter: BsonDocument, expression: BsonDocument) -> DocumentCommand {
     DocumentCommand::Update(DocumentUpdateRequest::new(
         ns(),

@@ -1,6 +1,6 @@
 //! Bounded, eagerly validated field updates. No storage or protocol policy.
 
-use std::{error::Error, fmt};
+use std::{cmp::Ordering, error::Error, fmt};
 
 use super::{
     BsonCodecOptions, BsonDocument, BsonErrorContext, BsonValue, CanonicalBsonKey,
@@ -12,6 +12,7 @@ const MAX_SPEC_BYTES: usize = 1024 * 1024;
 const MAX_OPERATIONS: usize = 4096;
 const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STEPS: usize = 1_000_000;
+const MAX_COMPARISON_BYTES: usize = 64 * 1024 * 1024;
 
 /// Payload-free validation errors, shared by embedded and wire callers.
 #[non_exhaustive]
@@ -60,11 +61,50 @@ impl Error for DocumentUpdateError {}
 
 struct Operation {
     path: Vec<String>,
-    value: Option<BsonValue>,
+    action: Action,
 }
 
-/// `$set`/`$unset` transformation preserving untouched BSON representations and
-/// field order. Paths are non-positional; missing set parents become documents.
+enum Action {
+    Set(BsonValue),
+    Unset,
+    Min(BsonValue),
+    Max(BsonValue),
+}
+
+impl Action {
+    fn value(&self) -> Option<&BsonValue> {
+        match self {
+            Self::Set(value) | Self::Min(value) | Self::Max(value) => Some(value),
+            Self::Unset => None,
+        }
+    }
+
+    fn replaces(&self, current: &BsonValue, budget: &mut Budget<'_>) -> EngineResult<bool> {
+        match self {
+            Self::Set(_) => Ok(true),
+            Self::Unset => Ok(false),
+            Self::Min(value) | Self::Max(value) => {
+                // Whole-value BSON order, not query-sort array element order.
+                // Charge traversal and comparison work even when no clone/write
+                // follows, and check cancellation before/after comparison.
+                budget.comparison_value(current)?;
+                budget.comparison_value(value)?;
+                let order = value.cmp(current);
+                budget.step()?;
+                Ok(order
+                    == if matches!(self, Self::Min(_)) {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    })
+            }
+        }
+    }
+}
+
+/// `$set`/`$unset`/`$min`/`$max` transformations preserving untouched BSON
+/// representations and field order. Paths are non-positional; missing write
+/// parents become documents. Equal min/max values preserve their stored type.
 /// Operations follow specification order, as in the frozen TinyMongo contract.
 pub struct DocumentUpdater {
     operations: Vec<Operation>,
@@ -99,9 +139,11 @@ impl DocumentUpdater {
         let mut operations = Vec::new();
         for (operator, operand) in spec.iter() {
             check()?;
-            let set = match operator {
-                "$set" => true,
-                "$unset" => false,
+            let action: fn(&BsonValue) -> Action = match operator {
+                "$set" => |value| Action::Set(value.clone()),
+                "$unset" => |_| Action::Unset,
+                "$min" => |value| Action::Min(value.clone()),
+                "$max" => |value| Action::Max(value.clone()),
                 name if name.starts_with('$') => {
                     return Err(DocumentUpdateError::UnsupportedOperator.error());
                 }
@@ -132,7 +174,7 @@ impl DocumentUpdater {
                 }
                 operations.push(Operation {
                     path,
-                    value: set.then(|| value.clone()),
+                    action: action(value),
                 });
             }
         }
@@ -165,6 +207,7 @@ impl DocumentUpdater {
         let input_bytes = memory::document_bytes(document, MAX_RETAINED_BYTES, check)?;
         let mut budget = Budget {
             bytes: self.retained_bytes,
+            comparison_bytes: 0,
             steps: 0,
             check,
         };
@@ -173,12 +216,7 @@ impl DocumentUpdater {
         budget.charge(input_bytes.checked_mul(2).ok_or_else(limit)?)?;
         let mut result = document.clone();
         for operation in &self.operations {
-            write_document(
-                &mut result,
-                &operation.path,
-                operation.value.as_ref(),
-                &mut budget,
-            )?;
+            write_document(&mut result, &operation.path, &operation.action, &mut budget)?;
         }
         if let Some(original_id) = document.get_first("_id") {
             let id = result
@@ -215,6 +253,7 @@ fn limit() -> EngineError {
 
 struct Budget<'a> {
     bytes: usize,
+    comparison_bytes: usize,
     steps: usize,
     check: &'a mut dyn FnMut() -> EngineResult<()>,
 }
@@ -240,12 +279,19 @@ impl Budget<'_> {
         self.charge(bytes)?;
         Ok(value.clone())
     }
+
+    fn comparison_value(&mut self, value: &BsonValue) -> EngineResult<()> {
+        let remaining = MAX_COMPARISON_BYTES - self.comparison_bytes;
+        let bytes = memory::value_bytes(value, remaining, &mut || self.step())?;
+        self.comparison_bytes += bytes;
+        Ok(())
+    }
 }
 
 fn write_document(
     document: &mut BsonDocument,
     path: &[String],
-    value: Option<&BsonValue>,
+    action: &Action,
     budget: &mut Budget<'_>,
 ) -> EngineResult<()> {
     budget.step()?;
@@ -258,9 +304,11 @@ fn write_document(
         }
     }
     if path.len() == 1 {
-        match (position, value) {
+        match (position, action.value()) {
             (Some(index), Some(value)) => {
-                document.entries_mut()[index].1 = budget.clone_value(value)?
+                if action.replaces(&document.entries_mut()[index].1, budget)? {
+                    document.entries_mut()[index].1 = budget.clone_value(value)?;
+                }
             }
             (Some(index), None) => {
                 document.entries_mut().remove(index);
@@ -278,7 +326,7 @@ fn write_document(
     }
     let position = match position {
         Some(index) => index,
-        None if value.is_none() => return Ok(()),
+        None if action.value().is_none() => return Ok(()),
         None => {
             budget.charge(path[0].len() + 256)?;
             document
@@ -290,7 +338,7 @@ fn write_document(
     write_value(
         &mut document.entries_mut()[position].1,
         &path[1..],
-        value,
+        action,
         budget,
     )
 }
@@ -298,18 +346,18 @@ fn write_document(
 fn write_value(
     target: &mut BsonValue,
     path: &[String],
-    value: Option<&BsonValue>,
+    action: &Action,
     budget: &mut Budget<'_>,
 ) -> EngineResult<()> {
     budget.step()?;
     match target {
-        BsonValue::Document(document) => write_document(document, path, value, budget),
+        BsonValue::Document(document) => write_document(document, path, action, budget),
         BsonValue::Array(array) => {
             let component = &path[0];
             if component != "0"
                 && (component.starts_with('0') || !component.bytes().all(|b| b.is_ascii_digit()))
             {
-                return if value.is_none() {
+                return if action.value().is_none() {
                     Ok(())
                 } else {
                     Err(DocumentUpdateError::PathNotViable.error())
@@ -317,11 +365,12 @@ fn write_value(
             }
             let index = match component.parse::<usize>() {
                 Ok(index) => index,
-                Err(_) if value.is_none() => return Ok(()),
+                Err(_) if action.value().is_none() => return Ok(()),
                 Err(_) => return Err(limit()),
             };
-            if index >= array.len() {
-                if value.is_none() {
+            let missing = index >= array.len();
+            if missing {
+                if action.value().is_none() {
                     return Ok(());
                 }
                 let added = index
@@ -336,16 +385,19 @@ fn write_value(
                 }
             }
             if path.len() == 1 {
-                array[index] = match value {
-                    Some(value) => budget.clone_value(value)?,
-                    None => BsonValue::Null,
-                };
+                match action.value() {
+                    Some(value) if missing || action.replaces(&array[index], budget)? => {
+                        array[index] = budget.clone_value(value)?;
+                    }
+                    None => array[index] = BsonValue::Null,
+                    _ => {}
+                }
                 Ok(())
             } else {
-                write_value(&mut array[index], &path[1..], value, budget)
+                write_value(&mut array[index], &path[1..], action, budget)
             }
         }
-        _ if value.is_none() => Ok(()),
+        _ if action.value().is_none() => Ok(()),
         _ => Err(DocumentUpdateError::PathNotViable.error()),
     }
 }
@@ -372,6 +424,162 @@ mod tests {
             source = cause.source();
         }
         panic!("missing typed error: {error}")
+    }
+
+    #[test]
+    fn min_max_compare_whole_values_and_preserve_equal_representations() {
+        let original = doc([
+            ("_id", BsonValue::Int64(5)),
+            ("equal", BsonValue::Double(1.0)),
+            ("array", BsonValue::Array(vec![BsonValue::Int32(2)])),
+            ("slots", BsonValue::Array(vec![BsonValue::Null])),
+            ("low", BsonValue::Null),
+            ("high", BsonValue::Null),
+        ]);
+        let update = doc([
+            (
+                "$min",
+                BsonValue::Document(doc([
+                    ("_id", BsonValue::Int32(7)),
+                    ("equal", BsonValue::Int32(1)),
+                    (
+                        "array",
+                        BsonValue::Array(vec![BsonValue::Int32(1), BsonValue::Int32(99)]),
+                    ),
+                    ("slots.0", BsonValue::Int32(3)),
+                    ("slots.3", BsonValue::Int32(3)),
+                    ("low", BsonValue::Int32(1)),
+                ])),
+            ),
+            (
+                "$max",
+                BsonValue::Document(doc([("high", BsonValue::Int32(1))])),
+            ),
+        ]);
+        let updater = DocumentUpdater::compile(&update).unwrap();
+        let result = updater.apply(&original).unwrap();
+        assert!(matches!(result.get_first("_id"), Some(BsonValue::Int64(5))));
+        assert!(matches!(
+            result.get_first("equal"),
+            Some(BsonValue::Double(1.0))
+        ));
+        assert_eq!(
+            result.get_first("array"),
+            Some(&BsonValue::Array(vec![
+                BsonValue::Int32(1),
+                BsonValue::Int32(99)
+            ]))
+        );
+        assert_eq!(
+            result.get_first("slots"),
+            Some(&BsonValue::Array(vec![
+                BsonValue::Null,
+                BsonValue::Null,
+                BsonValue::Null,
+                BsonValue::Int32(3)
+            ]))
+        );
+        assert_eq!(result.get_first("low"), Some(&BsonValue::Null));
+        assert_eq!(result.get_first("high"), Some(&BsonValue::Int32(1)));
+        assert_eq!(
+            encode_document(&updater.apply(&result).unwrap()).unwrap(),
+            encode_document(&result).unwrap()
+        );
+        for operator in ["$min", "$max"] {
+            assert_eq!(
+                code(
+                    DocumentUpdater::compile(&spec(
+                        operator,
+                        doc([(
+                            "_id",
+                            BsonValue::Int32(if operator == "$min" { 4 } else { 6 })
+                        )])
+                    ))
+                    .unwrap()
+                    .apply(&original)
+                    .unwrap_err()
+                ),
+                66
+            );
+            for path in ["equal.x", "slots.0.x", "slots.01", "slots.x"] {
+                assert_eq!(
+                    code(
+                        DocumentUpdater::compile(&spec(
+                            operator,
+                            doc([(path, BsonValue::Int32(0))])
+                        ))
+                        .unwrap()
+                        .apply(&original)
+                        .unwrap_err()
+                    ),
+                    28
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn comparison_noops_charge_work_and_observe_cancellation() {
+        let value = BsonValue::Array(vec![BsonValue::Int32(1); 1024]);
+        let action = Action::Min(value.clone());
+        let mut check = || Ok(());
+        let mut budget = Budget {
+            bytes: 0,
+            comparison_bytes: MAX_COMPARISON_BYTES - 1,
+            steps: 0,
+            check: &mut check,
+        };
+        assert_eq!(
+            action.replaces(&value, &mut budget).unwrap_err().kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        let mut budget = Budget {
+            bytes: 0,
+            comparison_bytes: 0,
+            steps: MAX_STEPS - 1,
+            check: &mut check,
+        };
+        assert_eq!(
+            action.replaces(&value, &mut budget).unwrap_err().kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        let mut visited = 0;
+        let mut cancelled = || {
+            visited += 1;
+            if visited == 500 {
+                Err(EngineError::new(
+                    EngineErrorKind::Cancelled,
+                    "test cancellation",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        let mut budget = Budget {
+            bytes: 0,
+            comparison_bytes: 0,
+            steps: 0,
+            check: &mut cancelled,
+        };
+        assert_eq!(
+            action.replaces(&value, &mut budget).unwrap_err().kind(),
+            EngineErrorKind::Cancelled
+        );
+        assert_eq!(visited, 500);
+        for operator in ["$min", "$max"] {
+            let update = spec(
+                operator,
+                doc([("a.9999999999999999999999999", BsonValue::Int32(1))]),
+            );
+            assert_eq!(
+                DocumentUpdater::compile(&update)
+                    .unwrap()
+                    .apply(&doc([("a", BsonValue::Array(vec![]))]))
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::LimitExceeded
+            );
+        }
     }
 
     #[test]

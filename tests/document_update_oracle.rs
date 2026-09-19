@@ -1,13 +1,14 @@
 #![cfg(feature = "documents")]
 
 use briskdb::document::{
-    BsonValue, DocumentUpdateError, DocumentUpdater, decode_document, encode_document,
+    BsonValue, DocumentMutationError, DocumentUpdateError, DocumentUpdater, decode_document,
+    encode_document,
 };
 use std::{error::Error, process::Command};
 
 #[test]
 #[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
-fn field_updates_match_locked_object_path_oracle() {
+fn field_updates_match_locked_oracle() {
     let python = std::env::var("BRISKDB_MONGO_ORACLE_PYTHON").unwrap_or_else(|_| "python3".into());
     let output = Command::new(python)
         .arg(concat!(
@@ -41,7 +42,13 @@ fn field_updates_match_locked_object_path_oracle() {
             let actual = error
                 .source()
                 .and_then(|e| e.downcast_ref::<DocumentUpdateError>())
-                .map(|e| e.mongo_code());
+                .map(|e| e.mongo_code())
+                .or_else(|| {
+                    error
+                        .source()
+                        .and_then(|e| e.downcast_ref::<DocumentMutationError>())
+                        .map(|e| e.mongo_code())
+                });
             assert_eq!(actual, Some(*expected), "case {count}: {error}");
         } else {
             let Some(BsonValue::Document(expected)) = case.get_first("result") else {
@@ -56,6 +63,8 @@ fn field_updates_match_locked_object_path_oracle() {
         assert_eq!(encode_document(document).unwrap(), before);
         count += 1;
     }
-    assert_eq!(count, 4008);
-    println!("{count} source-locked object-path field update cases passed");
+    assert_eq!(count, 8727);
+    println!(
+        "{count} source-locked field update cases passed (4008 object-only set/unset; 4719 min/max)"
+    );
 }

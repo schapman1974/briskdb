@@ -516,10 +516,13 @@ requires an earlier dependency:
       timestamps are stamped, nested values are preserved. Rust, native sync/async
       Python, and ordered/unordered wire replacement batches share this path.
       Result/post-image limits and immutable-ID checks precede commit. No global
-      snapshot is claimed. Shared `update_one`/`update_many` support `$set`/`$unset`
+      snapshot is claimed. Shared `update_one`/`update_many` support `$set`/`$unset`/`$min`/`$max`
       across all three adapters, with object/array paths, eager conflict checks,
       immutable IDs, exact modified counts, bounded growth, and literal timestamps.
-      4,008 source-locked object-path cases supplement transaction/wire tests.
+      8,727 source-locked update cases supplement transaction/wire tests: 4,008
+      object-only set/unset cases and 4,719 min/max comparisons/path/error cases.
+      Min/max use whole BSON order, preserve equal stored types, distinguish
+      missing array slots from null, and bound comparison work even on no-ops.
       Update-many streams one transaction per shard: a failing shard rolls back,
       earlier commits survive, and runtime wire errors abort without fabricated
       partial counts. Cancellation/task-abort and continued-session tests cover
@@ -541,7 +544,7 @@ requires an earlier dependency:
       covered. Find-one-and-replace now uses the same shared path with
       projected before/after images, sort, immutable-ID validation, and exact
       return/post-image preflight before commit. Find-one-and-update now shares
-      this path for `$set`/`$unset`, preserving untouched fields and supporting
+      this path for `$set`/`$unset`/`$min`/`$max`, preserving untouched fields and supporting
       sorted before/after images across Rust, native Python, and wire clients.
       Concurrent consumers, no-op/no-match/projected-empty replies, depth/size
       rejection before writes, cancellation, and restart are tested. Other
@@ -621,8 +624,8 @@ requires an earlier dependency:
       now pass through the real four-shard endpoint in both API modes. Combined
       with the basic/group-accumulator suites, replacement, and three additional
       application write/identity contracts, nested unsetting, configured-client
-      read fidelity, and three cross-CRUD query-validation cases, required CI
-      checks exactly 162 frozen executions and
+      read fidelity, three cross-CRUD query-validation cases, and two min/max
+      contracts, required CI checks exactly 166 frozen executions and
       rejects missing, duplicated, substituted, or skipped cases. The full
       456-execution corpus remains separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared

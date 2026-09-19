@@ -52,6 +52,31 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_min_max_counts_images_bson_identity_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for i in range(4):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": Int64(i), "low": 5.0, "high": 5.0, "keep": True, "a": [None]})
+                    self.assertEqual(session.update_one(DATABASE, COLLECTION, {"_id": 0}, {"$min": {"low": Decimal128("5")}, "$max": {"high": Int64(5)}})["modified_count"], 0)
+                    expression = {"$min": {"low": 4, "a.3": 2}, "$max": {"high": 6}}
+                    result = session.update_many(DATABASE, COLLECTION, {}, expression)
+                    self.assertEqual((result["matched_count"], result["modified_count"]), (4, 4))
+                    self.assertEqual(session.update_many(DATABASE, COLLECTION, {}, expression)["modified_count"], 0)
+                    self.assertEqual(session.find_one_and_update(DATABASE, COLLECTION, {}, {"$min": {"low": 3}}, sort={"_id": -1}, projection={"low": 1, "_id": 0})["document"], {"low": 4})
+                    self.assertEqual(session.find_one_and_update(DATABASE, COLLECTION, {"_id": 3}, {"$max": {"high": 7}}, return_document=True, projection={"high": 1, "_id": 0})["document"], {"high": 7})
+                    before = session.find(DATABASE, COLLECTION)["documents"]
+                    for expression in [{"$min": {"keep.x": 1}}, {"$max": {"_id": 99}}, {"$min": {"low": 1}, "$max": {"low": 2}}]:
+                        with self.assertRaises(briskdb.InvalidArgumentError):
+                            session.update_one(DATABASE, COLLECTION, {"_id": 0}, expression)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.find_one_and_update(DATABASE, COLLECTION, {"_id": 0}, {"$max": {"large": "x" * 1000}}, return_document=True, max_result_bytes=128)
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION)["documents"]], [bson_bytes(row) for row in before])
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION)["documents"]], [bson_bytes(row) for row in before])
+
     def test_find_one_and_update_images_projection_limits_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -1452,6 +1477,22 @@ class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(briskdb.CancelledError):
                         await session.find_one_and_replace(DATABASE, COLLECTION, {}, {}, cancellation=token)
                     self.assertIsNone((await session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 99}, {}))["document"])
+
+    async def test_async_min_max_counts_images_and_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for i in range(4):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": Int64(i), "v": 5.0})
+                    self.assertEqual((await session.update_one(DATABASE, COLLECTION, {"_id": 0}, {"$min": {"v": Int64(5)}}))["modified_count"], 0)
+                    result = await session.update_many(DATABASE, COLLECTION, {}, {"$max": {"v": 6}})
+                    self.assertEqual((result["matched_count"], result["modified_count"]), (4, 4))
+                    self.assertEqual((await session.find_one_and_update(DATABASE, COLLECTION, {}, {"$min": {"v": 4}}, sort={"_id": -1}, projection={"v": 1, "_id": 0}, return_document=True))["document"], {"v": 4})
+                    token = briskdb.CancellationToken(); token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        await session.update_many(DATABASE, COLLECTION, {}, {"$min": {"v": 0}}, cancellation=token)
+                    self.assertEqual([row["v"] for row in (await session.find(DATABASE, COLLECTION))["documents"]], [6, 6, 6, 4])
 
     async def test_async_find_one_and_update_forwards_images_options_and_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
