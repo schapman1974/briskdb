@@ -15,14 +15,14 @@ use crate::{
     BriskDb, CancellationToken, DocumentSupport,
     core::{EngineError, EngineErrorKind, RequestContext, ResultLimits, Session},
     document::{
-        BsonCodecOptions, BsonDocument, BsonValue, DocumentCollectionOptions, DocumentCommand,
-        DocumentContinueCursorRequest, DocumentCreateCollectionRequest, DocumentCursorError,
+        BsonCodecOptions, BsonDocument, BsonValue, DocumentCollectionExistsRequest,
+        DocumentCollectionOptions, DocumentCommand, DocumentContinueCursorRequest,
+        DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCursorError,
         DocumentCursorId, DocumentFilter, DocumentFindRequest, DocumentInsertRequest,
-        DocumentKillCursorRequest, DocumentListCollectionsRequest, DocumentMatcher,
-        DocumentNamespace, DocumentProjection, DocumentProjector, DocumentQueryError,
-        DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort,
-        DocumentSorter, DocumentWriteOptions, decode_document_batch_with_options,
-        encode_document_with_options,
+        DocumentKillCursorRequest, DocumentMatcher, DocumentNamespace, DocumentProjection,
+        DocumentProjector, DocumentQueryError, DocumentReadOptions, DocumentRequest,
+        DocumentRequestId, DocumentResult, DocumentSort, DocumentSorter, DocumentWriteOptions,
+        decode_document_batch_with_options, encode_document_with_options,
     },
 };
 
@@ -150,6 +150,7 @@ fn fields<const N: usize>(entries: [(&str, BsonValue); N]) -> BsonDocument {
 
 pub(super) enum Command {
     Insert(DocumentInsertRequest),
+    Count(DocumentCountRequest),
     Find(DocumentFindRequest, bool, Option<Duration>),
     GetMore(DocumentContinueCursorRequest),
     KillCursors(DocumentNamespace, Vec<DocumentCursorId>),
@@ -163,7 +164,10 @@ pub(super) struct Prepared {
 /// Called on the bounded blocking parser, before any engine work is admitted.
 pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
     let (name, value) = request.body.iter().next()?;
-    if !matches!(name, "insert" | "find" | "getMore" | "killCursors") {
+    if !matches!(
+        name,
+        "insert" | "find" | "count" | "getMore" | "killCursors"
+    ) {
         return None;
     }
     Some((|| {
@@ -211,6 +215,11 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 }
                 "writeConcern" if name == "insert" => valid_write_concern(value),
                 "filter" if name == "find" => matches!(value, BsonValue::Document(_)),
+                "query" if name == "count" => matches!(value, BsonValue::Document(_)),
+                "limit" | "skip" if name == "count" => {
+                    unsigned(value)?;
+                    true
+                }
                 "projection" | "sort" if name == "find" => matches!(value, BsonValue::Document(_)),
                 "limit" | "skip" | "batchSize" if name == "find" => {
                     unsigned(value)?;
@@ -322,6 +331,39 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 single_batch,
                 cursor_budget,
             )
+        } else if name == "count" {
+            if !request.sequences.is_empty() {
+                return Err(CommandError::options());
+            }
+            let filter = match request.body.get_first("query") {
+                Some(BsonValue::Document(filter)) => filter.clone(),
+                None => BsonDocument::new(),
+                _ => return Err(CommandError::invalid()),
+            };
+            DocumentMatcher::compile_with_check(&filter, &mut || {
+                if started.elapsed() >= timeout {
+                    Err(EngineError::deadline_exceeded(
+                        "Mongo count parsing deadline exceeded",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })?;
+            let mut options = DocumentReadOptions::new();
+            if let Some(value) = request.body.get_first("skip") {
+                options = options.with_skip(unsigned(value)?);
+            }
+            if let Some(value) = request.body.get_first("limit") {
+                let limit = unsigned(value)?;
+                if limit != 0 {
+                    options = options.with_limit(limit)?;
+                }
+            }
+            Command::Count(DocumentCountRequest::new(
+                namespace,
+                DocumentFilter::new(filter)?,
+                options,
+            ))
         } else if name == "getMore" {
             if !request.sequences.is_empty() {
                 return Err(CommandError::options());
@@ -540,14 +582,11 @@ impl Executor {
         context: &RequestContext,
         namespace: &DocumentNamespace,
     ) -> Result<bool> {
-        let command = DocumentCommand::ListCollections(DocumentListCollectionsRequest::new(
-            namespace.database(),
-            DocumentReadOptions::new(),
-        )?);
+        let command = DocumentCommand::CollectionExists(DocumentCollectionExistsRequest::new(
+            namespace.clone(),
+        ));
         match self.call(session, identity, context, command).await? {
-            DocumentResult::Collections(collections) => Ok(collections
-                .iter()
-                .any(|item| item.name() == namespace.collection())),
+            DocumentResult::CollectionExists(exists) => Ok(exists),
             _ => Err(CommandError::new(
                 1,
                 "InternalError",
@@ -634,6 +673,36 @@ impl Executor {
                         ),
                     ])),
                     Err(error) => Err(error),
+                    _ => Err(CommandError::new(
+                        1,
+                        "InternalError",
+                        "unexpected engine result",
+                    )),
+                }
+            }
+            Command::Count(count) => {
+                if !self
+                    .exists(session, identity, &context, count.namespace())
+                    .await?
+                {
+                    return Ok(fields([
+                        ("ok", BsonValue::Double(1.0)),
+                        ("n", BsonValue::Int64(0)),
+                    ]));
+                }
+                match self
+                    .call(session, identity, &context, DocumentCommand::Count(count))
+                    .await?
+                {
+                    DocumentResult::Count(count) => Ok(fields([
+                        ("ok", BsonValue::Double(1.0)),
+                        (
+                            "n",
+                            BsonValue::Int64(
+                                i64::try_from(count).map_err(|_| CommandError::invalid())?,
+                            ),
+                        ),
+                    ])),
                     _ => Err(CommandError::new(
                         1,
                         "InternalError",

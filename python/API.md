@@ -49,6 +49,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 `Session` exposes this current protocol-neutral engine slice:
 
 - `create_collection(database, collection, *, options=None, ...)`
+- `collection_exists(database, collection, ...)`
 - `list_collections(database, *, skip=0, limit=None, batch_size=101, ...)`
 - `create_index(database, collection, keys, *, name, unique=False, ...)`
 - `list_indexes(database, collection, *, skip=0, limit=None, batch_size=101, ...)`
@@ -73,6 +74,7 @@ plan. Payload keys are:
 | Result kind | Payload |
 | --- | --- |
 | `collection` | `collection` metadata |
+| `collection_exists` | `exists` boolean |
 | `collections` | ordered `collections` list |
 | `index_name` | `index_name` and `lifecycle="pending_build"` |
 | `indexes` | ordered `indexes` list |
@@ -81,6 +83,10 @@ plan. Payload keys are:
 | `cursor_killed` | `killed` boolean |
 | `count` | `count` |
 | `delete` | `acknowledged`, `deleted_count` |
+
+`collection_exists` checks one exact namespace without enumerating the catalog,
+creating missing metadata, or returning collection options/indexes. It has a
+null plan and scalar result accounting, even with large catalogs.
 
 Collection metadata contains `id`, `database_id`, `database`, `name`,
 `namespace`, exact BSON `options`, placement `code`/`version`, and index
@@ -126,7 +132,10 @@ part of the embedded API; ordinary PyMongo chaining works through the wire API.
 Delete still requires an exact `_id`. Updates, replacements,
 aggregation and bulk-write helpers remain unsupported. There is no Python collection
 object or Python-hosted MongoDB network listener in this slice. The separate
-opt-in Rust Mongo listener also exposes batch inserts and retained finds through PyMongo.
+opt-in Rust Mongo listener also exposes batch inserts, retained finds, and
+`estimated_document_count()` through PyMongo. PyMongo's wire `count_documents()`
+uses aggregation and is still unsupported; this differs from the implemented
+native `Session.count_documents()` method above.
 
 ## Attached listeners
 

@@ -52,6 +52,30 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_collection_existence_uses_scalar_result_and_request_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    missing = session.collection_exists(DATABASE, COLLECTION)
+                    self.assertFalse(missing["exists"])
+                    self.assertEqual(session.list_collections(DATABASE)["collections"], [])
+                    session.create_collection(DATABASE, COLLECTION, options={"opaque": "x" * 10000})
+                    identifier = uuid.uuid4()
+                    exists = session.collection_exists(DATABASE, COLLECTION, request_id=identifier,
+                                                       max_result_rows=1, max_result_bytes=34)
+                    self.assertEqual(exists, {"kind": "collection_exists", "exists": True,
+                                              "request_id": identifier, "plan": None})
+                    self.assertFalse(session.collection_exists("other", COLLECTION)["exists"])
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.collection_exists(DATABASE, COLLECTION, cancellation=token)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.collection_exists(DATABASE, COLLECTION, max_result_bytes=33)
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    self.assertTrue(session.collection_exists(DATABASE, COLLECTION)["exists"])
+
     def test_sorted_cursors_use_original_fields_and_keep_stable_ties(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             database, session = self.open_session(root)
@@ -887,6 +911,22 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_collection_existence_forwards_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    self.assertFalse((await session.collection_exists(DATABASE, COLLECTION))["exists"])
+                    await session.create_collection(DATABASE, COLLECTION)
+                    identifier = uuid.uuid4()
+                    result = await session.collection_exists(DATABASE, COLLECTION, request_id=identifier,
+                                                             max_result_rows=1, max_result_bytes=34)
+                    self.assertEqual(result["request_id"], identifier)
+                    self.assertTrue(result["exists"])
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        await session.collection_exists(DATABASE, COLLECTION, cancellation=token)
+
     async def test_async_sorting_precedes_projection_and_continues(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=4, documents=True) as database:

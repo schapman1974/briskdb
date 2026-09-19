@@ -11,10 +11,10 @@ use std::{
 };
 
 use briskdb::document::{
-    DocumentCollectionOptions, DocumentCommand, DocumentContinueCursorRequest,
-    DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
-    DocumentCursorId, DocumentDeleteRequest, DocumentFilter, DocumentFindRequest,
-    DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
+    DocumentCollectionExistsRequest, DocumentCollectionOptions, DocumentCommand,
+    DocumentContinueCursorRequest, DocumentCountRequest, DocumentCreateCollectionRequest,
+    DocumentCreateIndexRequest, DocumentCursorId, DocumentDeleteRequest, DocumentFilter,
+    DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
     DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
     DocumentNamespace, DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId,
     DocumentSort, DocumentWriteOptions,
@@ -1416,6 +1416,43 @@ impl Session {
                 document_read_options(skip, limit, batch_size)?,
             ),
         )?);
+        self.execute_document_command(
+            py,
+            command,
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (
+        database,
+        collection,
+        *,
+        request_id = None,
+        timeout_ms = None,
+        cancellation = None,
+        max_result_rows = None,
+        max_result_bytes = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn collection_exists(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let command = DocumentCommand::CollectionExists(DocumentCollectionExistsRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+        ));
         self.execute_document_command(
             py,
             command,

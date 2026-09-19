@@ -337,6 +337,48 @@ def sorting_smoke(uri):
                     raise AssertionError("invalid sort must fail before missing-collection handling")
 
 
+def count_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        collection = client.wire_count.items
+        assert collection.estimated_document_count() == 0
+        collection.insert_many([{"_id": index, "group": index % 3} for index in range(37)])
+        assert collection.estimated_document_count(maxTimeMS=10000) == 37
+        for arguments, expected in [
+            ({}, 37), ({"limit": 0, "skip": 2}, 35),
+            ({"query": {"group": 1}, "skip": 3, "limit": 5}, 5),
+            ({"query": {"group": 1}, "skip": 3}, 9),
+            ({"query": {"_id": {"$eq": Int64(7)}}}, 1),
+            ({"query": {"_id": 7}, "skip": 1}, 0),
+            ({"skip": Int64(2**63 - 1)}, 0),
+        ]:
+            assert client.wire_count.command("count", "items", **arguments)["n"] == expected
+        assert client.unwritten_count.items.estimated_document_count() == 0
+        for arguments, code in [
+            ({"query": {"$where": "private-data"}}, 115),
+            ({"query": []}, 72), ({"skip": -1}, 2), ({"limit": -1}, 2),
+            ({"skip": True}, 2), ({"limit": 1.5}, 2), ({"maxTimeMS": -1}, 2),
+            ({"hint": "_id_"}, 72), ({"readConcern": {"level": "majority"}}, 72),
+            ({"collation": {"locale": "en"}}, 72), ({"comment": "private-data"}, 72),
+            ({"sort": {"_id": 1}}, 72), ({"batchSize": 1}, 72),
+        ]:
+            for database in [client.wire_count, client.unwritten_count]:
+                try:
+                    database.command("count", "items", **arguments)
+                except OperationFailure as error:
+                    assert error.code == code, (arguments, error.code)
+                    assert "private-data" not in str(error)
+                else:
+                    raise AssertionError("invalid count options must fail before existence handling")
+        # PyMongo count_documents uses an aggregation pipeline; do not pretend
+        # that adding the legacy count command implements that separate API.
+        try:
+            collection.count_documents({})
+        except OperationFailure as error:
+            assert error.code == 59
+        else:
+            raise AssertionError("aggregation count helper is not implemented yet")
+
+
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         assert client.wire_data.items.find_one({"_id": "typed"})["decimal"] == Decimal128("1.250")
@@ -353,12 +395,17 @@ def persisted_smoke(uri):
         assert row == {"_id": 7, "profile": {"name": "name-7"}}
         assert len(client.wire_projection.items.find_one({"_id": 7})["payload"]) == 5000
         assert [row["_id"] for row in client.wire_sorting.items.find({}, {"_id": 1}).sort("_id", -1).batch_size(4)] == list(reversed(range(36)))
+        assert client.wire_count.items.estimated_document_count() == 37
+        assert client.wire_count.command("count", "items", query={"group": 1}, skip=3)["n"] == 9
 
 
 async def async_smoke(uri):
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000, maxPoolSize=3) as client:
         assert (await client.admin.command("ping"))["ok"] == 1
         check_hello(await client.admin.command("hello"))
+        assert await client.wire_count.items.estimated_document_count(maxTimeMS=10000) == 37
+        assert (await client.wire_count.command("count", "items", query={"group": 1}, skip=3, limit=5))["n"] == 5
+        assert await client.unwritten_count.items.estimated_document_count() == 0
         replies = await asyncio.gather(*(client.admin.command("ping") for _ in range(12)))
         assert all(reply["ok"] == 1 for reply in replies)
         try:
@@ -416,5 +463,6 @@ if __name__ == "__main__":
         cursor_smoke(sys.argv[1])
         projection_smoke(sys.argv[1])
         sorting_smoke(sys.argv[1])
+        count_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

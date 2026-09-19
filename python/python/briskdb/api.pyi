@@ -9,6 +9,7 @@ from ._briskdb import (
     CloseReport,
     CheckpointReport,
     ColumnInfo,
+    CollectionExistsResult,
     Config,
     CountDocumentsResult,
     CreateCollectionResult,
@@ -129,6 +130,17 @@ class AsyncSession:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> CreateCollectionResult: ...
+    async def collection_exists(
+        self,
+        database: str,
+        collection: str,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> CollectionExistsResult: ...
     async def list_collections(
         self,
         database: str,

@@ -299,6 +299,28 @@ impl fmt::Debug for DocumentCreateCollectionRequest {
     }
 }
 
+/// Request to check one validated collection namespace without listing metadata.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentCollectionExistsRequest {
+    namespace: DocumentNamespace,
+}
+
+impl DocumentCollectionExistsRequest {
+    /// Check one namespace without enumerating collection metadata.
+    pub fn new(namespace: DocumentNamespace) -> Self {
+        Self { namespace }
+    }
+
+    pub const fn namespace(&self) -> &DocumentNamespace {
+        &self.namespace
+    }
+
+    pub fn into_namespace(self) -> DocumentNamespace {
+        self.namespace
+    }
+}
+
 /// Request to list collections in one validated database name.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1086,6 +1108,7 @@ impl DocumentKillCursorRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DocumentCommandKind {
     CreateCollection,
+    CollectionExists,
     ListCollections,
     DropCollection,
     Find,
@@ -1108,6 +1131,7 @@ pub enum DocumentCommandKind {
 #[derive(Clone, PartialEq, Eq)]
 pub enum DocumentCommand {
     CreateCollection(DocumentCreateCollectionRequest),
+    CollectionExists(DocumentCollectionExistsRequest),
     ListCollections(DocumentListCollectionsRequest),
     DropCollection(DocumentDropCollectionRequest),
     Find(DocumentFindRequest),
@@ -1129,6 +1153,7 @@ impl DocumentCommand {
     pub const fn kind(&self) -> DocumentCommandKind {
         match self {
             Self::CreateCollection(_) => DocumentCommandKind::CreateCollection,
+            Self::CollectionExists(_) => DocumentCommandKind::CollectionExists,
             Self::ListCollections(_) => DocumentCommandKind::ListCollections,
             Self::DropCollection(_) => DocumentCommandKind::DropCollection,
             Self::Find(_) => DocumentCommandKind::Find,

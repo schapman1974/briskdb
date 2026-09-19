@@ -178,6 +178,31 @@ impl Engine {
         let storage = self.inner.database.storage.clone();
         let result_cancellation = cancellation.clone();
         let execution = match command {
+            DocumentCommand::CollectionExists(request) => {
+                let namespace = request.into_namespace();
+                let exists = self
+                    .run_document_storage_task(
+                        cancellation,
+                        deadline,
+                        move |cancellation, control| {
+                            let exists = storage
+                                .document_collection_controlled(
+                                    namespace.database(),
+                                    namespace.collection(),
+                                    Arc::clone(&control),
+                                )?
+                                .is_some();
+                            ensure_document_cpu_active(cancellation, &control)?;
+                            Ok(exists)
+                        },
+                    )
+                    .await?;
+                Ok(DocumentExecution::new(
+                    request_id,
+                    None,
+                    DocumentResult::CollectionExists(exists),
+                ))
+            }
             DocumentCommand::ListCollections(request) => {
                 let (database, options) = request.into_parts();
                 require_catalog_read_options(&options)?;
@@ -1993,7 +2018,9 @@ fn enforce_execution_result_limits_with_check(
         check()?;
     }
     match execution.result() {
-        DocumentResult::Acknowledged(_) | DocumentResult::CursorKilled(_) => {
+        DocumentResult::Acknowledged(_)
+        | DocumentResult::CollectionExists(_)
+        | DocumentResult::CursorKilled(_) => {
             budget.add_rows(1)?;
             budget.add_bytes(DOCUMENT_RESULT_ROW_BYTES + DOCUMENT_RESULT_VALUE_BYTES + 1)?;
         }

@@ -74,6 +74,10 @@ class ListCollectionsResult(DocumentExecution):
     kind: Literal["collections"]
     collections: List[DocumentCollectionInfo]
 
+class CollectionExistsResult(DocumentExecution):
+    kind: Literal["collection_exists"]
+    exists: bool
+
 class CreateIndexResult(DocumentExecution):
     kind: Literal["index_name"]
     index_name: str
@@ -361,6 +365,17 @@ class Session:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> CreateCollectionResult: ...
+    def collection_exists(
+        self,
+        database: str,
+        collection: str,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> CollectionExistsResult: ...
     def list_collections(
         self,
         database: str,

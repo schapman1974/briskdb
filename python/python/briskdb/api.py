@@ -264,6 +264,28 @@ class AsyncSession:
             cancellation=cancellation,
         )
 
+    async def collection_exists(
+        self,
+        database: str,
+        collection: str,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.collection_exists,
+            database,
+            collection,
+            request_id=request_id,
+            max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
     async def list_collections(
         self,
         database: str,

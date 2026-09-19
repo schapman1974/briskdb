@@ -30,6 +30,10 @@ pub(crate) fn execution_to_python(
     }
 
     match result {
+        DocumentResult::CollectionExists(exists) => {
+            output.set_item("kind", "collection_exists")?;
+            output.set_item("exists", exists)?;
+        }
         DocumentResult::Collection(collection) => {
             output.set_item("kind", "collection")?;
             output.set_item(
