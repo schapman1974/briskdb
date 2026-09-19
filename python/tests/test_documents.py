@@ -184,8 +184,15 @@ class PythonDocumentApiTests(unittest.TestCase):
             self.assertEqual(deleted["plan"]["kind"], "point")
             self.assertEqual(session.count_documents(DATABASE, COLLECTION)["count"], 1)
 
-            with self.assertRaisesRegex(briskdb.InvalidArgumentError, "explicit _id"):
-                session.insert_one(DATABASE, COLLECTION, {"body": "missing"})
+            source = {"body": "generated", "stamp": Timestamp(0, 0)}
+            generated = session.insert_one(DATABASE, COLLECTION, source)
+            generated_id = generated["inserted_ids"][0]
+            self.assertIsInstance(generated_id, ObjectId)
+            self.assertEqual(source, {"body": "generated", "stamp": Timestamp(0, 0)})
+            actual = session.find(DATABASE, COLLECTION, {"_id": generated_id})["documents"][0]
+            self.assertEqual(actual["body"], source["body"])
+            self.assertGreater(actual["stamp"].time, 0)
+            self.assertEqual(list(actual), ["_id", "body", "stamp"])
 
             session.close()
             database.close()

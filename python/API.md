@@ -86,12 +86,16 @@ metadata. Each index contains `name`, exact ordered `keys`, `unique`,
 `pending_build`; the ready built-in `_id_` index is authoritative.
 
 This API deliberately mirrors the document engine's implemented boundary:
-one inserted document must carry an explicit `_id`; find/count accept an empty
+`insert_one` generates a missing ObjectId while preserving explicit null and
+leaving the caller's document unchanged. Direct non-ID `Timestamp(0, 0)` fields
+are server-stamped; nested timestamps and timestamp IDs are preserved.
+Find/count accept an empty
 filter or one literal `_id`; delete accepts one literal `_id`; and a find must
 fit in one batch because cursor continuation has not landed. General matchers,
 updates, replacements, projection, sorting, aggregation, bulk writes, and
 retained cursor operations remain unsupported. There is no Python collection
-object or MongoDB network listener in this slice.
+object or Python-hosted MongoDB network listener in this slice. The separate
+opt-in Rust Mongo listener also exposes batch inserts through PyMongo.
 
 ## Attached listeners
 
