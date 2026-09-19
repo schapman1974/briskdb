@@ -93,12 +93,25 @@ mod index_tests {
             ),
         ] {
             assert_eq!(cause.mongo_code(), code);
-            let error = cause
-                .into_engine_error()
-                .context("internal catalog operation");
+            let error = cause.into_engine_error();
             assert_eq!(error.kind(), kind);
             assert_eq!(
                 error.source().unwrap().downcast_ref::<DocumentIndexError>(),
+                Some(&cause)
+            );
+            let contextual = error.context("internal catalog operation");
+            assert_eq!(contextual.kind(), kind);
+            let original = contextual
+                .source()
+                .unwrap()
+                .downcast_ref::<EngineError>()
+                .unwrap();
+            assert_eq!(original.kind(), kind);
+            assert_eq!(
+                original
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<DocumentIndexError>(),
                 Some(&cause)
             );
         }
