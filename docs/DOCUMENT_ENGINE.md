@@ -381,6 +381,11 @@ it follows the frozen cancellation, mixed-number, and nonfinite rules. Empty
 numeric sums return Int32 zero, empty numeric averages null. Newly computed
 double NaNs use a canonical quiet NaN; their arithmetic sign/payload is not
 specified. Pass-through values, keys, extrema, and sets preserve original bits.
+Noncanonical finite Decimal128 BID payloads are interpreted as zero, consistent
+with [shared BSON identity](BSON.md#comparison-and-identity) and MongoDB's BID
+arithmetic. Python's `to_decimal()` recovers some malformed payloads differently;
+this boundary is covered by explicit Rust vectors, not a claim of reference
+agreement on those malformed inputs. Pass-through results retain the raw BID.
 
 Grouping is blocking but retains states, not source documents. The global
 natural or preceding sort order feeds the states, so first/last and ordered

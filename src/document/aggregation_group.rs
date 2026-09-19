@@ -564,6 +564,31 @@ mod tests {
                 .unwrap()
                 .representation_eq(&BsonValue::Double(nan))
         );
+        // Noncanonical BID coefficients are zero, consistently with shared
+        // BSON identity and MongoDB's BID arithmetic. Python's to_decimal()
+        // recovers some malformed payloads differently; it is not the oracle
+        // for this pre-existing BSON-format boundary. Retain raw input bits.
+        for (bits, zero) in [
+            ((6176_u128 << 113) | 10_u128.pow(34), "0"),
+            (
+                (1_u128 << 127) | (6156_u128 << 113) | ((1_u128 << 113) - 1),
+                "0E-20",
+            ),
+            ((3_u128 << 125) | (6176_u128 << 111), "0"),
+        ] {
+            let value = BsonValue::Decimal128(BsonDecimal128::from_bid(bits.to_le_bytes()));
+            let result = run(vec![value.clone()]);
+            let expected = BsonValue::Decimal128(BsonDecimal128::parse(zero).unwrap());
+            for field in ["sum", "avg"] {
+                assert!(
+                    result
+                        .get_first(field)
+                        .unwrap()
+                        .representation_eq(&expected)
+                );
+            }
+            assert!(result.get_first("first").unwrap().representation_eq(&value));
+        }
     }
 
     #[test]
