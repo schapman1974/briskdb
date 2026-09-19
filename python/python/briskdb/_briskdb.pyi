@@ -407,6 +407,13 @@ class Session:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> ListCollectionsResult: ...
+    def list_collection_metadata(
+        self, database: str, filter: Optional[BsonDocument] = None, *, name_only: bool = False,
+        batch_size: int = 101, batch_byte_limit: Optional[int] = None,
+        request_id: Optional[UUID] = None, timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> FindResult: ...
     def create_index(
         self,
         database: str,

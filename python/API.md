@@ -51,6 +51,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `create_collection(database, collection, *, options=None, ...)`
 - `collection_exists(database, collection, ...)`
 - `list_collections(database, *, skip=0, limit=None, batch_size=101, ...)`
+- `list_collection_metadata(database, filter=None, *, name_only=False, batch_size=101, batch_byte_limit=None, ...)`
 - `create_index(database, collection, keys, *, name, unique=False, ...)`
 - `list_indexes(database, collection, *, skip=0, limit=None, batch_size=101, ...)`
 - `insert_one(database, collection, document, ...)`
@@ -60,6 +61,17 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `count_documents(database, collection, filter=None, *, skip=0, limit=None, ...)`
 - `distinct(database, collection, field, filter=None, ...)`
 - `delete_one(database, collection, filter, ...)`
+
+`list_collection_metadata` returns the usual `cursor` result, with a null plan.
+Continue or kill it using collection name `$cmd.listCollections`. Full rows
+contain name/type, persisted options, a stable UUID and read-only flag in `info`,
+and the built-in `_id_` index definition. UUID conversion follows the configured
+representation. `name_only=True` returns/filters only name/type. An absent
+database returns exhausted/empty without creation; a zero-sized initial batch
+on a present database defers scanning. Later creations are excluded and dropped
+rows may disappear; drop/recreate invalidates an old database cursor. No snapshot
+is promised. Soft byte limits carry across pages; hard result limits reject the
+whole request. The existing materialized `list_collections` result is unchanged.
 
 Every method also accepts `request_id`, `timeout_ms`, `cancellation`,
 `max_result_rows`, and `max_result_bytes`. A request ID is a nonzero

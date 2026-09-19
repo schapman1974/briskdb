@@ -15,10 +15,12 @@ use tokio::task::JoinHandle;
 
 mod aggregation;
 mod distinct;
+mod metadata;
 mod sorting;
 
 use super::document_cursor::{
     AggregateCursor, AggregateRow, CursorSource as PreparedFilterRoute, CursorState,
+    MetadataCursorState, RetainedCursorState,
 };
 use super::{Engine, Operation, flatten_join, pending_cancellation_reason, retire_if_broken};
 use crate::{
@@ -212,6 +214,18 @@ impl Engine {
         let storage = self.inner.database.storage.clone();
         let result_cancellation = cancellation.clone();
         let execution = match command {
+            DocumentCommand::ListCollectionMetadata(request) => {
+                self.start_collection_metadata_cursor(
+                    owner,
+                    session,
+                    request_id,
+                    request,
+                    cancellation,
+                    deadline,
+                    result_limits,
+                )
+                .await
+            }
             DocumentCommand::CollectionExists(request) => {
                 let namespace = request.into_namespace();
                 let exists = self
@@ -618,48 +632,81 @@ impl Engine {
                     .inner
                     .document_cursors
                     .checkout(owner, &namespace, id)?;
-                let mut state = lease.state.take().expect("checked-out cursor owns state");
-                let catalog_namespace = namespace.clone();
-                let collection_id = state.collection_id;
-                self.run_document_storage_task(
-                    cancellation.clone(),
-                    deadline,
-                    move |cancellation, control| {
-                        let current = storage.document_collection_controlled(
-                            catalog_namespace.database(),
-                            catalog_namespace.collection(),
-                            Arc::clone(&control),
-                        )?;
-                        if current.is_none_or(|collection| collection.id() != collection_id) {
-                            return Err(DocumentCursorError::NotFound.into_engine_error());
+                match lease.state.take().expect("checked-out cursor owns state") {
+                    RetainedCursorState::Collections(mut state) => {
+                        if let Some(bytes) = options.batch_byte_limit() {
+                            state.batch_byte_limit =
+                                Some(state.batch_byte_limit.unwrap_or(u64::MAX).min(bytes));
                         }
-                        ensure_document_cpu_active(cancellation, &control)
-                    },
-                )
-                .await?;
-                if let Some(bytes) = options.batch_byte_limit() {
-                    state.batch_byte_limit =
-                        Some(state.batch_byte_limit.unwrap_or(u64::MAX).min(bytes));
+                        let (documents, has_more) = self
+                            .read_collection_metadata_page(
+                                &mut state,
+                                cancellation,
+                                deadline,
+                                options.batch_size(),
+                                result_limits,
+                            )
+                            .await?;
+                        let cursor_id = lease.complete(
+                            has_more.then_some(RetainedCursorState::Collections(state)),
+                        )?;
+                        Ok(DocumentExecution::new(
+                            request_id,
+                            None,
+                            DocumentResult::Cursor(
+                                crate::document::DocumentCursorBatch::from_validated(
+                                    namespace, cursor_id, documents,
+                                ),
+                            ),
+                        ))
+                    }
+                    RetainedCursorState::Documents(mut state) => {
+                        let catalog_namespace = namespace.clone();
+                        let collection_id = state.collection_id;
+                        self.run_document_storage_task(
+                            cancellation.clone(),
+                            deadline,
+                            move |cancellation, control| {
+                                let current = storage.document_collection_controlled(
+                                    catalog_namespace.database(),
+                                    catalog_namespace.collection(),
+                                    Arc::clone(&control),
+                                )?;
+                                if current.is_none_or(|collection| collection.id() != collection_id)
+                                {
+                                    return Err(DocumentCursorError::NotFound.into_engine_error());
+                                }
+                                ensure_document_cpu_active(cancellation, &control)
+                            },
+                        )
+                        .await?;
+                        if let Some(bytes) = options.batch_byte_limit() {
+                            state.batch_byte_limit =
+                                Some(state.batch_byte_limit.unwrap_or(u64::MAX).min(bytes));
+                        }
+                        let plan = self.document_cursor_plan(&state)?;
+                        let (documents, has_more) = self
+                            .read_document_page(
+                                owner,
+                                &mut state,
+                                cancellation,
+                                deadline,
+                                &options,
+                                result_limits,
+                            )
+                            .await?;
+                        let cursor_id = lease.complete(has_more.then_some(state.into()))?;
+                        Ok(DocumentExecution::new(
+                            request_id,
+                            Some(plan),
+                            DocumentResult::Cursor(
+                                crate::document::DocumentCursorBatch::from_validated(
+                                    namespace, cursor_id, documents,
+                                ),
+                            ),
+                        ))
+                    }
                 }
-                let plan = self.document_cursor_plan(&state)?;
-                let (documents, has_more) = self
-                    .read_document_page(
-                        owner,
-                        &mut state,
-                        cancellation,
-                        deadline,
-                        &options,
-                        result_limits,
-                    )
-                    .await?;
-                let cursor_id = lease.complete(has_more.then_some(state))?;
-                Ok(DocumentExecution::new(
-                    request_id,
-                    Some(plan),
-                    DocumentResult::Cursor(crate::document::DocumentCursorBatch::from_validated(
-                        namespace, cursor_id, documents,
-                    )),
-                ))
             }
             DocumentCommand::KillCursor(request) => {
                 let (namespace, id, options) = request.into_parts();

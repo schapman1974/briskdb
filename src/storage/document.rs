@@ -385,6 +385,102 @@ mod enabled {
             self.fail_closed_on_corruption(result)
         }
 
+        /// Capture a database identity and collection allocation ceiling in one
+        /// validated snapshot. An absent database is never created by discovery.
+        pub(crate) fn document_metadata_identity_controlled(
+            &self,
+            database: &str,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<Option<(DocumentDatabaseId, u64)>> {
+            let result = (|| {
+                let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+                run_manifest_controlled(&mut connection, control, |connection| {
+                    read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
+                        connection.query_row(
+                            "SELECT database_id, collection_high_water FROM briskdb_document_databases
+                             CROSS JOIN briskdb_document_identities WHERE database_name = ?1 AND singleton = 1",
+                            [database],
+                            |row| Ok((DocumentDatabaseId::from_validated(row.get::<_, i64>(0)? as u64), row.get::<_, i64>(1)? as u64)),
+                        ).optional().map_err(sqlite_error::storage)
+                    })
+                })
+            })();
+            self.fail_closed_on_corruption(result)
+        }
+
+        /// Stream a single metadata page from one manifest snapshot. The visitor
+        /// stops before the first matching row that belongs in the next page.
+        /// No indexes or unrelated collection options are decoded/materialized.
+        pub(crate) fn scan_document_collection_metadata_controlled(
+            &self,
+            database_id: DocumentDatabaseId,
+            bounds: (u64, u64),
+            name_only: bool,
+            control: Arc<OperationControl>,
+            mut visit: impl FnMut(u64, String, Option<BsonDocument>, [u8; 16]) -> EngineResult<bool>,
+        ) -> EngineResult<()> {
+            let result = (|| {
+                let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+                let read_control = Arc::clone(&control);
+                run_manifest_controlled(&mut connection, control, |connection| {
+                    read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
+                        let exists: bool = connection.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM briskdb_document_databases WHERE database_id = ?1)",
+                            [database_id.get() as i64], |row| row.get(0),
+                        ).map_err(sqlite_error::storage)?;
+                        if !exists {
+                            return Err(
+                                crate::document::DocumentCursorError::NotFound.into_engine_error()
+                            );
+                        }
+                        // Preserve rowid order without sorting large BSON options via
+                        // the (database_id, collection_name) secondary index.
+                        let mut statement = connection
+                            .prepare(
+                                "SELECT collection_id, collection_name,
+                                    CASE WHEN ?4 THEN NULL ELSE options_bson END
+                             FROM briskdb_document_collections NOT INDEXED
+                             WHERE database_id = ?1 AND collection_id > ?2 AND collection_id <= ?3
+                               AND lifecycle_state = 2 ORDER BY collection_id",
+                            )
+                            .map_err(sqlite_error::storage)?;
+                        let mut rows = statement
+                            .query(params![
+                                database_id.get() as i64,
+                                bounds.0 as i64,
+                                bounds.1 as i64,
+                                name_only
+                            ])
+                            .map_err(sqlite_error::storage)?;
+                        while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
+                            ensure_control_active(
+                                &read_control,
+                                "while reading collection metadata",
+                            )?;
+                            let id = row.get::<_, i64>(0).map_err(sqlite_error::storage)? as u64;
+                            let name = row.get(1).map_err(sqlite_error::storage)?;
+                            let options: Option<Vec<u8>> =
+                                row.get(2).map_err(sqlite_error::storage)?;
+                            let options = options
+                                .map(|bytes| {
+                                    decode_metadata_document(
+                                        &bytes,
+                                        "stored collection options are invalid",
+                                    )
+                                })
+                                .transpose()?;
+                            let uuid = collection_metadata_uuid(self.shard_layout.layout_id(), id);
+                            if !visit(id, name, options, uuid)? {
+                                break;
+                            }
+                        }
+                        ensure_control_active(&read_control, "after reading collection metadata")
+                    })
+                })
+            })();
+            self.fail_closed_on_corruption(result)
+        }
+
         #[cfg(any(feature = "tinymongo-import", test))]
         fn document_catalog_inner(&self) -> EngineResult<DocumentCatalog> {
             let _operation = self.enter_schema_operation()?;
@@ -2259,7 +2355,39 @@ mod enabled {
         ))
     }
 
+    // Frozen UUIDv8 derivation: domain-separated BLAKE3 over the durable random
+    // root layout ID and never-reused little-endian collection ID. Backups and
+    // reopen preserve identity; drop/recreate and independent roots do not.
+    fn collection_metadata_uuid(layout_id: [u8; 16], collection_id: u64) -> [u8; 16] {
+        let mut hash = blake3::Hasher::new_derive_key("briskdb.collection-metadata.uuid.v1");
+        hash.update(&layout_id);
+        hash.update(&collection_id.to_le_bytes());
+        let mut uuid = [0; 16];
+        uuid.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+        uuid[6] = (uuid[6] & 0x0f) | 0x80;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        uuid
+    }
+
     type StoredCollectionRow = (i64, i64, String, String, Vec<u8>, i64, i64);
+
+    #[test]
+    fn collection_metadata_uuid_v1_is_frozen() {
+        assert_eq!(
+            collection_metadata_uuid([7; 16], 42),
+            [
+                120, 58, 80, 207, 9, 43, 140, 200, 170, 85, 175, 1, 132, 122, 162, 148
+            ]
+        );
+        assert_ne!(
+            collection_metadata_uuid([7; 16], 42),
+            collection_metadata_uuid([8; 16], 42)
+        );
+        assert_ne!(
+            collection_metadata_uuid([7; 16], 42),
+            collection_metadata_uuid([7; 16], 43)
+        );
+    }
 
     fn load_collection_row(
         connection: &Connection,

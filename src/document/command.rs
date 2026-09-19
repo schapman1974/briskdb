@@ -350,6 +350,58 @@ impl DocumentListCollectionsRequest {
     }
 }
 
+/// Paged BSON collection metadata. Unlike `DocumentListCollectionsRequest`,
+/// this returns a cursor and accepts a filter over the returned metadata fields.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentListCollectionMetadataRequest {
+    namespace: DocumentNamespace,
+    filter: DocumentFilter,
+    name_only: bool,
+    read_options: DocumentReadOptions,
+}
+
+impl DocumentListCollectionMetadataRequest {
+    pub fn new(
+        database: impl Into<String>,
+        filter: DocumentFilter,
+        name_only: bool,
+        read_options: DocumentReadOptions,
+    ) -> EngineResult<Self> {
+        Ok(Self {
+            namespace: DocumentNamespace::new(database, "$cmd.listCollections")?,
+            filter,
+            name_only,
+            read_options,
+        })
+    }
+
+    pub const fn namespace(&self) -> &DocumentNamespace {
+        &self.namespace
+    }
+
+    pub const fn filter(&self) -> &DocumentFilter {
+        &self.filter
+    }
+
+    pub const fn name_only(&self) -> bool {
+        self.name_only
+    }
+
+    pub const fn read_options(&self) -> &DocumentReadOptions {
+        &self.read_options
+    }
+
+    pub fn into_parts(self) -> (DocumentNamespace, DocumentFilter, bool, DocumentReadOptions) {
+        (
+            self.namespace,
+            self.filter,
+            self.name_only,
+            self.read_options,
+        )
+    }
+}
+
 /// Request to drop a logical database and all of its document collections.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1136,6 +1188,7 @@ pub enum DocumentCommandKind {
     CreateCollection,
     CollectionExists,
     ListCollections,
+    ListCollectionMetadata,
     DropCollection,
     DropDatabase,
     Find,
@@ -1160,6 +1213,7 @@ pub enum DocumentCommand {
     CreateCollection(DocumentCreateCollectionRequest),
     CollectionExists(DocumentCollectionExistsRequest),
     ListCollections(DocumentListCollectionsRequest),
+    ListCollectionMetadata(DocumentListCollectionMetadataRequest),
     DropCollection(DocumentDropCollectionRequest),
     DropDatabase(DocumentDropDatabaseRequest),
     Find(DocumentFindRequest),
@@ -1183,6 +1237,7 @@ impl DocumentCommand {
             Self::CreateCollection(_) => DocumentCommandKind::CreateCollection,
             Self::CollectionExists(_) => DocumentCommandKind::CollectionExists,
             Self::ListCollections(_) => DocumentCommandKind::ListCollections,
+            Self::ListCollectionMetadata(_) => DocumentCommandKind::ListCollectionMetadata,
             Self::DropCollection(_) => DocumentCommandKind::DropCollection,
             Self::DropDatabase(_) => DocumentCommandKind::DropDatabase,
             Self::Find(_) => DocumentCommandKind::Find,

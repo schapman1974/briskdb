@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added synchronous/async `list_collection_metadata` with shared filtered BSON
+  metadata cursors, stable collection UUIDs, names-only output, normal request
+  controls, and a retained soft batch-byte limit. Existing `list_collections`
+  stays unchanged; use `$cmd.listCollections` for getMore/kill operations.
 - Added synchronous/async `distinct` with shared BSON identity, first-encounter
   representation retention, bounded output, and normal request controls.
 - Added synchronous/async `collection_exists` with targeted engine lookup,

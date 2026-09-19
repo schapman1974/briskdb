@@ -20,11 +20,12 @@ use crate::{
         DocumentContinueCursorRequest, DocumentCountRequest, DocumentCreateCollectionRequest,
         DocumentCursorError, DocumentCursorId, DocumentDistinctRequest,
         DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
-        DocumentFindRequest, DocumentInsertRequest, DocumentKillCursorRequest, DocumentMatcher,
-        DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentProjector,
-        DocumentQueryError, DocumentReadOptions, DocumentRequest, DocumentRequestId,
-        DocumentResult, DocumentSort, DocumentSorter, DocumentWriteOptions,
-        decode_document_batch_with_options, encode_document_with_options,
+        DocumentFindRequest, DocumentInsertRequest, DocumentKillCursorRequest,
+        DocumentListCollectionMetadataRequest, DocumentMatcher, DocumentNamespace,
+        DocumentPipeline, DocumentProjection, DocumentProjector, DocumentQueryError,
+        DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort,
+        DocumentSorter, DocumentWriteOptions, decode_document_batch_with_options,
+        encode_document_with_options,
     },
 };
 
@@ -151,6 +152,8 @@ fn fields<const N: usize>(entries: [(&str, BsonValue); N]) -> BsonDocument {
 }
 
 pub(super) enum Command {
+    CreateCollection(DocumentCreateCollectionRequest),
+    ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
     DropCollection(DocumentDropCollectionRequest),
     DropDatabase(DocumentDropDatabaseRequest),
     Insert(DocumentInsertRequest),
@@ -181,6 +184,8 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             | "killCursors"
             | "drop"
             | "dropDatabase"
+            | "create"
+            | "listCollections"
     ) {
         return None;
     }
@@ -189,11 +194,18 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
         if request.more_to_come && name != "insert" {
             return Err(CommandError::options());
         }
-        let namespace = if name == "dropDatabase" {
+        let namespace = if matches!(name, "dropDatabase" | "listCollections") {
             if !matches!(value, BsonValue::Int32(1) | BsonValue::Int64(1)) {
                 return Err(CommandError::invalid());
             }
-            DocumentNamespace::new(&request.database, "_")?
+            DocumentNamespace::new(
+                &request.database,
+                if name == "listCollections" {
+                    "$cmd.listCollections"
+                } else {
+                    "_"
+                },
+            )?
         } else {
             let collection = if name == "getMore" {
                 request
@@ -223,7 +235,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                             return Err(CommandError::options());
                         }
                         timeout = timeout.min(Duration::from_millis(millis));
-                        if matches!(name, "find" | "aggregate") {
+                        if matches!(name, "find" | "aggregate" | "listCollections") {
                             cursor_budget = Some(Duration::from_millis(millis));
                         }
                     }
@@ -235,16 +247,23 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     matches!(value, BsonValue::Boolean(false))
                 }
                 "writeConcern" if name == "insert" => valid_write_concern(value),
-                "writeConcern" if matches!(name, "drop" | "dropDatabase") => {
+                "writeConcern" if matches!(name, "drop" | "dropDatabase" | "create") => {
                     valid_write_concern(value)
                         && matches!(value, BsonValue::Document(doc)
                         if !matches!(doc.get_first("w"), Some(BsonValue::Int32(0) | BsonValue::Int64(0))))
                 }
                 // PyMongo's drop_database helper always sends its default None.
-                "comment" if matches!(name, "drop" | "dropDatabase") => {
+                "comment"
+                    if matches!(name, "drop" | "dropDatabase" | "create" | "listCollections") =>
+                {
                     matches!(value, BsonValue::Null)
                 }
-                "filter" if name == "find" => matches!(value, BsonValue::Document(_)),
+                "filter" if matches!(name, "find" | "listCollections") => {
+                    matches!(value, BsonValue::Document(_))
+                }
+                "nameOnly" | "authorizedCollections" if name == "listCollections" => {
+                    matches!(value, BsonValue::Boolean(_))
+                }
                 "pipeline" if name == "aggregate" => {
                     if !matches!(value, BsonValue::Array(_)) {
                         return Err(CommandError::new(
@@ -255,7 +274,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     }
                     true
                 }
-                "cursor" if name == "aggregate" => {
+                "cursor" if matches!(name, "aggregate" | "listCollections") => {
                     if !matches!(value, BsonValue::Document(_)) {
                         return Err(CommandError::new(
                             14,
@@ -309,7 +328,61 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 return Err(CommandError::options());
             }
         }
-        let mut command = if matches!(name, "drop" | "dropDatabase") {
+        let mut command = if name == "listCollections" {
+            if !request.sequences.is_empty() {
+                return Err(CommandError::options());
+            }
+            let filter = match request.body.get_first("filter") {
+                Some(BsonValue::Document(filter)) => filter.clone(),
+                None => BsonDocument::new(),
+                _ => return Err(CommandError::invalid()),
+            };
+            DocumentMatcher::compile_with_check(&filter, &mut || {
+                if started.elapsed() >= timeout {
+                    Err(EngineError::deadline_exceeded(
+                        "Mongo metadata parsing deadline exceeded",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })?;
+            let mut options = DocumentReadOptions::new();
+            if let Some(BsonValue::Document(cursor)) = request.body.get_first("cursor") {
+                for (field, value) in cursor.iter() {
+                    if field != "batchSize" {
+                        return Err(CommandError::options());
+                    }
+                    let size = unsigned(value)?;
+                    if size > 1000 {
+                        return Err(CommandError::unsupported());
+                    }
+                    options = options.with_batch_size(size)?;
+                }
+            }
+            options =
+                options.with_batch_byte_limit((wire::MAX_BOOTSTRAP_MESSAGE_BYTES - 8192) as u64)?;
+            Command::ListCollections(
+                DocumentListCollectionMetadataRequest::new(
+                    &request.database,
+                    DocumentFilter::new(filter)?,
+                    matches!(
+                        request.body.get_first("nameOnly"),
+                        Some(BsonValue::Boolean(true))
+                    ),
+                    options,
+                )?,
+                cursor_budget,
+            )
+        } else if name == "create" {
+            if !request.sequences.is_empty() {
+                return Err(CommandError::options());
+            }
+            Command::CreateCollection(DocumentCreateCollectionRequest::new(
+                namespace,
+                DocumentCollectionOptions::empty(),
+                DocumentWriteOptions::new(),
+            ))
+        } else if matches!(name, "drop" | "dropDatabase") {
             if !request.sequences.is_empty() {
                 return Err(CommandError::options());
             }
@@ -570,7 +643,10 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 "command deadline exceeded",
             ));
         }
-        if let Command::Find(_, _, budget) | Command::Aggregate(_, budget) = &mut command {
+        if let Command::Find(_, _, budget)
+        | Command::Aggregate(_, budget)
+        | Command::ListCollections(_, budget) = &mut command
+        {
             *budget = budget.map(|budget| budget.saturating_sub(elapsed));
         }
         Ok(Prepared {
@@ -800,6 +876,20 @@ impl Executor {
             ));
         }
         match command {
+            Command::CreateCollection(request) => {
+                match self
+                    .call(
+                        session,
+                        identity,
+                        &context,
+                        DocumentCommand::CreateCollection(request),
+                    )
+                    .await?
+                {
+                    DocumentResult::Collection(_) => Ok(fields([("ok", BsonValue::Double(1.0))])),
+                    _ => Err(CommandError::unsupported()),
+                }
+            }
             Command::DropCollection(request) => {
                 match self
                     .call(
@@ -942,8 +1032,11 @@ impl Executor {
                     )),
                 }
             }
-            command @ (Command::Find(..) | Command::Aggregate(..)) => {
+            command @ (Command::Find(..)
+            | Command::Aggregate(..)
+            | Command::ListCollections(..)) => {
                 let started = Instant::now();
+                let metadata = matches!(&command, Command::ListCollections(..));
                 let (namespace, command, single_batch, empty_single_batch, budget) = match command {
                     Command::Find(find, single_batch, budget) => {
                         let namespace = find.namespace().clone();
@@ -963,9 +1056,16 @@ impl Executor {
                         false,
                         budget,
                     ),
+                    Command::ListCollections(request, budget) => (
+                        request.namespace().clone(),
+                        DocumentCommand::ListCollectionMetadata(request),
+                        false,
+                        false,
+                        budget,
+                    ),
                     _ => unreachable!("cursor command"),
                 };
-                if !self.exists(session, identity, &context, &namespace).await? {
+                if !metadata && !self.exists(session, identity, &context, &namespace).await? {
                     return Ok(cursor_reply(namespace.to_string(), None, Vec::new(), false));
                 }
                 if empty_single_batch {

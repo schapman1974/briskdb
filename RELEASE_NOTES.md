@@ -1,5 +1,19 @@
 # Unreleased
 
+Plain Mongo `create` and paged `listCollections` now use the shared Rust engine.
+Real sync/async PyMongo can explicitly create collections, list names, and filter
+full collection metadata with retained getMore/killCursors support. Native
+Rust and sync/async Python expose the same metadata cursor; the existing
+materialized `ListCollections` API is unchanged. Pages retain only database
+identity, an allocation ceiling, position, and a quota-accounted filter, not
+catalog rows or SQLite handles. Later creations are excluded; deletions may
+disappear between pages, and drop/recreate cannot revive an old database cursor.
+Full metadata includes persisted options, an opaque stable UUIDv8, and the real
+built-in unique `_id_` definition. No Mongo index format version is invented.
+UUIDs derive from existing durable identities; this adds no storage migration.
+Advanced collection options, database listings/statistics, and index metadata
+cursors remain unsupported; this does not close the full lifecycle milestone.
+
 The required Mongo compatibility job now executes all 112 frozen sync/async
 basic-aggregation, projection-stage, and application-aggregation cases through
 a real four-shard BriskDB endpoint. Exact case/API coverage and zero skips are

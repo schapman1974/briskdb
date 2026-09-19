@@ -35,6 +35,16 @@ as one unit. Startup validates exact table definitions, foreign keys, row and
 byte bounds, supported versions, namespace limits, built-in index state, and
 collection/provisioning lifecycle relationships before publishing Ready.
 
+Collection discovery exposes an opaque UUIDv8 without adding a persisted field
+or changing format 16. Its frozen v1 derivation uses BLAKE3's derive-key mode
+with context `briskdb.collection-metadata.uuid.v1`, then hashes the 16 raw durable
+root layout-ID bytes followed by the collection ID as eight little-endian bytes.
+Take the first 16 hash bytes, set byte 6's high nibble to `8` and byte 8's high two
+bits to `10`, and encode as BSON binary subtype 4. Independent roots and
+non-reused collection IDs distinguish identities; reopen and complete backups
+preserve them. This is an identity, not an authentication token or Mongo storage
+format claim.
+
 ## Shard records and placement
 
 Every shard that serves an active collection has one storage-owned table. Its

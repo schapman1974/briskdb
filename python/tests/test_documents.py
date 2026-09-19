@@ -52,6 +52,44 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_collection_metadata_paging_filters_limits_uuid_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2, documents=True, uuid_representation="standard") as database:
+                with database.session() as session:
+                    session.migrate("CREATE TABLE sql_only (id INTEGER PRIMARY KEY)")
+                    self.assertEqual(session.list_collection_metadata("absent")["documents"], [])
+                    for name in ["a", "b", "c"]:
+                        session.create_collection(DATABASE, name)
+                    request_id = uuid.uuid4()
+                    page = session.list_collection_metadata(DATABASE, batch_size=1, request_id=request_id)
+                    self.assertEqual(page["request_id"], request_id)
+                    self.assertIsNone(page["plan"])
+                    first = page["documents"][0]
+                    identity = first["info"]["uuid"]
+                    self.assertIsInstance(identity, uuid.UUID)
+                    rows = page["documents"][:]
+                    while page["cursor_id"] is not None:
+                        page = session.get_more(DATABASE, "$cmd.listCollections", page["cursor_id"], batch_size=1)
+                        rows.extend(page["documents"])
+                    self.assertEqual([row["name"] for row in rows], ["a", "b", "c"])
+                    self.assertEqual(session.list_collection_metadata(DATABASE, {"name": "b"}, name_only=True)["documents"], [{"name": "b", "type": "collection"}])
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.list_collection_metadata(DATABASE, max_result_rows=1)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.list_collection_metadata(DATABASE, batch_byte_limit=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.list_collection_metadata(DATABASE, cancellation=token)
+                    page = session.list_collection_metadata(DATABASE, batch_size=0)
+                    self.assertTrue(session.kill_cursor(DATABASE, "$cmd.listCollections", page["cursor_id"])["killed"])
+            with briskdb.open(root, shards=2, documents=True, uuid_representation="standard") as database:
+                with database.session() as session:
+                    self.assertEqual(session.list_collection_metadata(DATABASE, {"name": "a"})["documents"], [first])
+                    session.drop_collection(DATABASE, "a")
+                    session.create_collection(DATABASE, "a")
+                    self.assertNotEqual(session.list_collection_metadata(DATABASE, {"name": "a"})["documents"][0]["info"]["uuid"], identity)
+
     def test_namespace_drop_scope_identity_cursor_controls_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -1118,6 +1156,22 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_collection_metadata_forwards_cursor_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    for name in ["a", "b"]:
+                        await session.create_collection(DATABASE, name)
+                    identifier = uuid.uuid4()
+                    page = await session.list_collection_metadata(DATABASE, {"type": "collection"}, name_only=True, batch_size=1, request_id=identifier, batch_byte_limit=1024)
+                    self.assertEqual(page["request_id"], identifier)
+                    self.assertEqual(page["documents"], [{"name": "a", "type": "collection"}])
+                    page = await session.get_more(DATABASE, "$cmd.listCollections", page["cursor_id"], batch_size=1)
+                    self.assertEqual(page["documents"], [{"name": "b", "type": "collection"}])
+                    self.assertIsNone(page["cursor_id"])
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.list_collection_metadata(DATABASE, max_result_bytes=1)
+
     async def test_async_namespace_drop_and_recreate(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=4, documents=True) as database:
