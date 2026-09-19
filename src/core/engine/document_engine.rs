@@ -214,6 +214,21 @@ impl Engine {
         let storage = self.inner.database.storage.clone();
         let result_cancellation = cancellation.clone();
         let execution = match command {
+            DocumentCommand::ListDatabaseNames(request) => {
+                let names = self
+                    .list_document_database_names(
+                        request.into_filter(),
+                        cancellation,
+                        deadline,
+                        result_limits,
+                    )
+                    .await?;
+                Ok(DocumentExecution::new(
+                    request_id,
+                    None,
+                    DocumentResult::DatabaseNames(names.into_boxed_slice()),
+                ))
+            }
             DocumentCommand::ListCollectionMetadata(request) => {
                 self.start_collection_metadata_cursor(
                     owner,
@@ -2213,6 +2228,15 @@ fn enforce_execution_result_limits_with_check(
             budget.add_rows(collections.len())?;
             for collection in collections {
                 budget.add_collection(collection, check)?;
+            }
+        }
+        DocumentResult::DatabaseNames(names) => {
+            budget.add_rows(names.len())?;
+            for name in names {
+                check()?;
+                budget.add_bytes(
+                    DOCUMENT_RESULT_ROW_BYTES + DOCUMENT_RESULT_VALUE_BYTES + name.len() as u64,
+                )?;
             }
         }
         DocumentResult::Document(document) => {

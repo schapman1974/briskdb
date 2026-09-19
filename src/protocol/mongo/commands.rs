@@ -21,11 +21,11 @@ use crate::{
         DocumentCursorError, DocumentCursorId, DocumentDistinctRequest,
         DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
         DocumentFindRequest, DocumentInsertRequest, DocumentKillCursorRequest,
-        DocumentListCollectionMetadataRequest, DocumentMatcher, DocumentNamespace,
-        DocumentPipeline, DocumentProjection, DocumentProjector, DocumentQueryError,
-        DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort,
-        DocumentSorter, DocumentWriteOptions, decode_document_batch_with_options,
-        encode_document_with_options,
+        DocumentListCollectionMetadataRequest, DocumentListDatabaseNamesRequest, DocumentMatcher,
+        DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentProjector,
+        DocumentQueryError, DocumentReadOptions, DocumentRequest, DocumentRequestId,
+        DocumentResult, DocumentSort, DocumentSorter, DocumentWriteOptions,
+        decode_document_batch_with_options, encode_document_with_options,
     },
 };
 
@@ -152,6 +152,7 @@ fn fields<const N: usize>(entries: [(&str, BsonValue); N]) -> BsonDocument {
 }
 
 pub(super) enum Command {
+    ListDatabaseNames(DocumentListDatabaseNamesRequest),
     CreateCollection(DocumentCreateCollectionRequest),
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
     DropCollection(DocumentDropCollectionRequest),
@@ -186,6 +187,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             | "dropDatabase"
             | "create"
             | "listCollections"
+            | "listDatabases"
     ) {
         return None;
     }
@@ -194,7 +196,17 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
         if request.more_to_come && name != "insert" {
             return Err(CommandError::options());
         }
-        let namespace = if matches!(name, "dropDatabase" | "listCollections") {
+        let namespace = if name == "listDatabases" {
+            if request.database != "admin" {
+                return Err(CommandError::new(
+                    13,
+                    "Unauthorized",
+                    "listDatabases must run against admin",
+                ));
+            }
+            // Mongo ignores the command's value; options determine its output.
+            DocumentNamespace::new("admin", "_")?
+        } else if matches!(name, "dropDatabase" | "listCollections") {
             if !matches!(value, BsonValue::Int32(1) | BsonValue::Int64(1)) {
                 return Err(CommandError::invalid());
             }
@@ -254,14 +266,20 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 }
                 // PyMongo's drop_database helper always sends its default None.
                 "comment"
-                    if matches!(name, "drop" | "dropDatabase" | "create" | "listCollections") =>
+                    if matches!(
+                        name,
+                        "drop" | "dropDatabase" | "create" | "listCollections" | "listDatabases"
+                    ) =>
                 {
                     matches!(value, BsonValue::Null)
                 }
-                "filter" if matches!(name, "find" | "listCollections") => {
+                "filter" if matches!(name, "find" | "listCollections" | "listDatabases") => {
                     matches!(value, BsonValue::Document(_))
                 }
                 "nameOnly" | "authorizedCollections" if name == "listCollections" => {
+                    matches!(value, BsonValue::Boolean(_))
+                }
+                "nameOnly" | "authorizedDatabases" if name == "listDatabases" => {
                     matches!(value, BsonValue::Boolean(_))
                 }
                 "pipeline" if name == "aggregate" => {
@@ -328,7 +346,29 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 return Err(CommandError::options());
             }
         }
-        let mut command = if name == "listCollections" {
+        let mut command = if name == "listDatabases" {
+            if !request.sequences.is_empty() {
+                return Err(CommandError::options());
+            }
+            if !matches!(
+                request.body.get_first("nameOnly"),
+                Some(BsonValue::Boolean(true))
+            ) {
+                return Err(CommandError::new(
+                    115,
+                    "CommandNotSupported",
+                    "database statistics are not implemented; use nameOnly: true",
+                ));
+            }
+            let filter = match request.body.get_first("filter") {
+                Some(BsonValue::Document(filter)) => filter.clone(),
+                None => BsonDocument::new(),
+                _ => return Err(CommandError::invalid()),
+            };
+            Command::ListDatabaseNames(DocumentListDatabaseNamesRequest::new(DocumentFilter::new(
+                filter,
+            )?))
+        } else if name == "listCollections" {
             if !request.sequences.is_empty() {
                 return Err(CommandError::options());
             }
@@ -876,6 +916,37 @@ impl Executor {
             ));
         }
         match command {
+            Command::ListDatabaseNames(request) => {
+                match self
+                    .call(
+                        session,
+                        identity,
+                        &context,
+                        DocumentCommand::ListDatabaseNames(request),
+                    )
+                    .await?
+                {
+                    DocumentResult::DatabaseNames(names) => Ok(fields([
+                        (
+                            "databases",
+                            BsonValue::Array(
+                                names
+                                    .into_vec()
+                                    .into_iter()
+                                    .map(|name| {
+                                        BsonValue::Document(fields([(
+                                            "name",
+                                            BsonValue::String(name),
+                                        )]))
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                        ("ok", BsonValue::Double(1.0)),
+                    ])),
+                    _ => Err(CommandError::unsupported()),
+                }
+            }
             Command::CreateCollection(request) => {
                 match self
                     .call(

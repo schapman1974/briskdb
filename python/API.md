@@ -52,6 +52,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `collection_exists(database, collection, ...)`
 - `list_collections(database, *, skip=0, limit=None, batch_size=101, ...)`
 - `list_collection_metadata(database, filter=None, *, name_only=False, batch_size=101, batch_byte_limit=None, ...)`
+- `list_database_names(filter=None, ...)`
 - `create_index(database, collection, keys, *, name, unique=False, ...)`
 - `list_indexes(database, collection, *, skip=0, limit=None, batch_size=101, ...)`
 - `insert_one(database, collection, document, ...)`
@@ -89,6 +90,7 @@ plan. Payload keys are:
 | `collection` | `collection` metadata |
 | `collection_exists` | `exists` boolean |
 | `collections` | ordered `collections` list |
+| `database_names` | `names` list of exact logical document database names |
 | `index_name` | `index_name` and `lifecycle="pending_build"` |
 | `indexes` | ordered `indexes` list |
 | `insert` | `acknowledged`, `inserted_count`, `inserted_ids` |

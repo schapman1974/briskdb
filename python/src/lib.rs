@@ -18,9 +18,9 @@ use briskdb::document::{
     DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
     DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
     DocumentListCollectionMetadataRequest, DocumentListCollectionsRequest,
-    DocumentListIndexesRequest, DocumentMutationScope, DocumentNamespace, DocumentPipeline,
-    DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentSort,
-    DocumentWriteOptions,
+    DocumentListDatabaseNamesRequest, DocumentListIndexesRequest, DocumentMutationScope,
+    DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentReadOptions, DocumentRequest,
+    DocumentRequestId, DocumentSort, DocumentWriteOptions,
 };
 use briskdb::{
     BriskCursor, BriskDb, BriskSession, BriskTransaction,
@@ -1458,6 +1458,31 @@ impl Session {
         self.execute_document_command(
             py,
             DocumentCommand::ListCollectionMetadata(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (filter = None, *, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn list_database_names(
+        &self,
+        py: Python<'_>,
+        filter: Option<Py<PyAny>>,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let filter = document_filter(py, filter.as_ref(), self.shared.uuid_representation)?;
+        self.execute_document_command(
+            py,
+            DocumentCommand::ListDatabaseNames(DocumentListDatabaseNamesRequest::new(filter)),
             request_id,
             timeout_ms,
             cancellation.as_deref(),

@@ -334,6 +334,17 @@ class AsyncSession:
             cancellation=cancellation,
         )
 
+    async def list_database_names(
+        self, filter: Any = None, *, request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.list_database_names, filter, request_id=request_id,
+            timeout_ms=timeout_ms, cancellation=cancellation,
+            max_result_rows=max_result_rows, max_result_bytes=max_result_bytes,
+        )
+
     async def list_collection_metadata(
         self, database: str, filter: Any = None, *, name_only: bool = False,
         batch_size: int = 101, batch_byte_limit: Optional[int] = None,

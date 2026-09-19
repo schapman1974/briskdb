@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added synchronous/async `list_database_names` with typed name results, shared
+  name filters and logical combinations, catalog-only discovery and normal
+  request controls. Full disk statistics and statistics-based filters remain
+  unsupported; physical files are shared across logical databases.
 - Added synchronous/async `list_collection_metadata` with shared filtered BSON
   metadata cursors, stable collection UUIDs, names-only output, normal request
   controls, and a retained soft batch-byte limit. Existing `list_collections`

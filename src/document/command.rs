@@ -316,6 +316,28 @@ impl DocumentCollectionExistsRequest {
     }
 }
 
+/// List logical document database names, optionally filtering the `name` field.
+/// Statistics-dependent filters are unsupported rather than approximated.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentListDatabaseNamesRequest {
+    filter: DocumentFilter,
+}
+
+impl DocumentListDatabaseNamesRequest {
+    pub const fn new(filter: DocumentFilter) -> Self {
+        Self { filter }
+    }
+
+    pub const fn filter(&self) -> &DocumentFilter {
+        &self.filter
+    }
+
+    pub fn into_filter(self) -> DocumentFilter {
+        self.filter
+    }
+}
+
 /// Request to list collections in one validated database name.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1189,6 +1211,7 @@ pub enum DocumentCommandKind {
     CollectionExists,
     ListCollections,
     ListCollectionMetadata,
+    ListDatabaseNames,
     DropCollection,
     DropDatabase,
     Find,
@@ -1214,6 +1237,7 @@ pub enum DocumentCommand {
     CollectionExists(DocumentCollectionExistsRequest),
     ListCollections(DocumentListCollectionsRequest),
     ListCollectionMetadata(DocumentListCollectionMetadataRequest),
+    ListDatabaseNames(DocumentListDatabaseNamesRequest),
     DropCollection(DocumentDropCollectionRequest),
     DropDatabase(DocumentDropDatabaseRequest),
     Find(DocumentFindRequest),
@@ -1238,6 +1262,7 @@ impl DocumentCommand {
             Self::CollectionExists(_) => DocumentCommandKind::CollectionExists,
             Self::ListCollections(_) => DocumentCommandKind::ListCollections,
             Self::ListCollectionMetadata(_) => DocumentCommandKind::ListCollectionMetadata,
+            Self::ListDatabaseNames(_) => DocumentCommandKind::ListDatabaseNames,
             Self::DropCollection(_) => DocumentCommandKind::DropCollection,
             Self::DropDatabase(_) => DocumentCommandKind::DropDatabase,
             Self::Find(_) => DocumentCommandKind::Find,

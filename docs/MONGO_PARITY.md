@@ -110,7 +110,27 @@ and position state. An opening allocation ceiling excludes later creations;
 deleted rows can disappear, and a dropped/recreated database invalidates the
 cursor. There is no cross-batch snapshot promise. Collection UUIDv8 identity
 survives reopen and backup, changes on drop/recreate, and differs for independent
-roots. Database listings/statistics and index metadata cursors remain open.
+roots. Index metadata cursors remain open.
+
+`listDatabases` on `admin` supports `nameOnly: true`, including ordinary
+sync/async PyMongo `list_database_names()` and
+`list_databases(nameOnly=True, filter={"name": ...})`. It returns only
+`databases: [{name: ...}]` and `ok`, without a cursor, size fields, or invented
+admin/local databases. The catalog contains at most 64 logical document
+databases with names up to 63 UTF-8 bytes, so this reply is intrinsically bounded.
+SQL namespaces/internal tables are hidden. Discovery never creates a namespace;
+creation and dropping the last collection determine catalog membership. Each
+request reads one validated snapshot, with the same cancellation/deadline and
+hard result limits as other shared-engine reads.
+
+Filters support shared matcher predicates on `name`, including `$and`/`$or`/
+`$nor` combinations; other output fields are rejected, even on an empty catalog.
+`authorizedDatabases` accepts a boolean with no additional filtering on this
+unauthenticated listener. Comments must be omitted/null. A positive `maxTimeMS`
+narrows the ordinary deadline. Full `listDatabases` (omitted/false `nameOnly`)
+and statistics-dependent filters are unsupported, not empty/zero estimates.
+Mongo defines `sizeOnDisk` as database file bytes; BriskDB's logical databases
+share files, so per-database physical accounting remains separate work.
 
 For these data commands, unknown fields and unsupported option values fail
 before storage admission. The current option contract is:

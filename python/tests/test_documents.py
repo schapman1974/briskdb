@@ -52,6 +52,32 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_database_names_filter_limits_controls_and_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    session.migrate("CREATE TABLE sql_only (id INTEGER PRIMARY KEY)")
+                    self.assertEqual(session.list_database_names()["names"], [])
+                    session.create_collection("one", "items")
+                    session.create_collection("two", "items")
+                    identifier = uuid.uuid4()
+                    result = session.list_database_names({"name": {"$regex": "^o"}}, request_id=identifier, max_result_rows=1, max_result_bytes=64)
+                    self.assertEqual(result, {"kind": "database_names", "names": ["one"], "request_id": identifier, "plan": None})
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.list_database_names(max_result_rows=1)
+                    with self.assertRaises(briskdb.UnsupportedError):
+                        session.list_database_names({"sizeOnDisk": 0})
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.list_database_names(cancellation=token)
+                    session.drop_database("one")
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(session.list_database_names()["names"], ["two"])
+                    session.drop_collection("two", "items")
+                    self.assertEqual(session.list_database_names()["names"], [])
+
     def test_collection_metadata_paging_filters_limits_uuid_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=2, documents=True, uuid_representation="standard") as database:
@@ -1156,6 +1182,21 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_database_names_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    self.assertEqual((await session.list_database_names())["names"], [])
+                    await session.create_collection("async", "one")
+                    identifier = uuid.uuid4()
+                    result = await session.list_database_names({"name": "async"}, request_id=identifier, max_result_rows=1, max_result_bytes=64)
+                    self.assertEqual(result["request_id"], identifier)
+                    self.assertEqual(result["names"], ["async"])
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.list_database_names(max_result_bytes=1)
+                    await session.drop_database("async")
+                    self.assertEqual((await session.list_database_names())["names"], [])
+
     async def test_async_collection_metadata_forwards_cursor_and_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

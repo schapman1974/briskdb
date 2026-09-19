@@ -104,6 +104,10 @@ class FindResult(DocumentExecution):
     exhausted: bool
     documents: List[BsonResultDocument]
 
+class DatabaseNamesResult(DocumentExecution):
+    kind: Literal["database_names"]
+    names: List[str]
+
 class CountDocumentsResult(DocumentExecution):
     kind: Literal["count"]
     count: int
@@ -407,6 +411,11 @@ class Session:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> ListCollectionsResult: ...
+    def list_database_names(
+        self, filter: Optional[BsonDocument] = None, *, request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> DatabaseNamesResult: ...
     def list_collection_metadata(
         self, database: str, filter: Optional[BsonDocument] = None, *, name_only: bool = False,
         batch_size: int = 101, batch_byte_limit: Optional[int] = None,

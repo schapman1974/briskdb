@@ -30,6 +30,10 @@ pub(crate) fn execution_to_python(
     }
 
     match result {
+        DocumentResult::DatabaseNames(names) => {
+            output.set_item("kind", "database_names")?;
+            output.set_item("names", names.into_vec())?;
+        }
         DocumentResult::NamespaceDropped(existed) => {
             output.set_item("kind", "namespace_dropped")?;
             output.set_item("existed", existed)?;
