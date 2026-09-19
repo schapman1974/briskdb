@@ -1,8 +1,8 @@
 #![cfg(feature = "documents")]
 
 use briskdb::document::{
-    BsonValue, DocumentMutationError, DocumentUpdateError, DocumentUpdater, decode_document,
-    encode_document,
+    BsonValue, DocumentMutationError, DocumentQueryError, DocumentUpdateError, DocumentUpdater,
+    decode_document, encode_document,
 };
 use std::{error::Error, process::Command};
 
@@ -48,6 +48,12 @@ fn field_updates_match_locked_oracle() {
                         .source()
                         .and_then(|e| e.downcast_ref::<DocumentMutationError>())
                         .map(|e| e.mongo_code())
+                })
+                .or_else(|| {
+                    error
+                        .source()
+                        .and_then(|e| e.downcast_ref::<DocumentQueryError>())
+                        .map(|e| e.mongo_code())
                 });
             assert_eq!(actual, Some(*expected), "case {count}: {error}");
         } else {
@@ -63,8 +69,8 @@ fn field_updates_match_locked_oracle() {
         assert_eq!(encode_document(document).unwrap(), before);
         count += 1;
     }
-    assert_eq!(count, 20704);
+    assert_eq!(count, 26277);
     println!(
-        "{count} source-locked field update cases passed (4008 object-only set/unset; 4719 min/max; 3078 pop/rename; 4440 non-ID membership with object-only add-to-set; 4459 non-ID push cases)"
+        "{count} source-locked field update cases passed (4008 object-only set/unset; 4719 min/max; 3078 pop/rename; 4440 non-ID membership with object-only add-to-set; 4459 non-ID push; 5573 non-ID pull cases)"
     );
 }

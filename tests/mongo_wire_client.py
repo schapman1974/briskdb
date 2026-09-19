@@ -31,6 +31,44 @@ def rolled_back_batch_smoke(database, collection, expression, code):
     assert [BSON.encode(row) for row in collection.find({})] == before
 
 
+def pull_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_pull.items
+        values = [Int64(1), 1.0, True, [1, 2], {"_id": [1, 2], "x": 1}, {"_id": 3, "x": 3}, "Alpha", "beta"]
+        collection.insert_many([{"_id": Int64(i), "values": values, "keep": True} for i in range(12)])
+        result = collection.update_many({}, {"$pull": {"values": 1}})
+        assert (result.matched_count, result.modified_count) == (12, 12)
+        assert collection.update_many({}, {"$pull": {"missing": 1}}).modified_count == 0
+        assert collection.find_one()["values"] == values[2:]
+        assert collection.find_one_and_update({}, {"$pull": {"values": {"$eq": 1}}}, sort=[("_id", -1)], projection={"values": 1, "_id": 0}) == {"values": values[2:]}
+        assert collection.find_one_and_update({"_id": 11}, {"$pull": {"values": {"_id": 2}}}, return_document=True, projection={"values": 1, "_id": 0}) == {"values": [True, {"_id": 3, "x": 3}, "Alpha", "beta"]}
+        result = collection.update_many({}, {"$pull": {"values": {"$regex": "^a", "$options": "i"}}})
+        assert (result.matched_count, result.modified_count) == (12, 12)
+        for expression, code in [
+            ({"$pull": {"keep": 1}}, 2),
+            ({"$pull": {"values": {"$expr": {"$eq": [1, 1]}}}}, 224),
+            ({"$pull": {"values": {"$regex": "["}}}, 51091),
+            ({"$pull": {"values": {"$regex": "a", "$options": "q"}}}, 51108),
+        ]:
+            rolled_back_batch_smoke(client.wire_pull, collection, expression, code)
+        identity = client.wire_pull.identity
+        identity.insert_one({"_id": {"values": [1, 2]}, "keep": True})
+        try:
+            identity.update_one({}, {"$pull": {"_id.values": {"$gte": 2}}})
+        except WriteError as error:
+            assert error.code == 66
+        else:
+            raise AssertionError("pull must preserve identity")
+        assert identity.find_one()["_id"] == {"values": [1, 2]}
+        queue = client.wire_pull.concurrent
+        queue.insert_one({"_id": 1, "values": list(range(32))})
+        def remove(worker):
+            return sum(queue.update_one({}, {"$pull": {"values": {"$eq": worker * 8 + step}}}).modified_count for step in range(8))
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            assert sum(pool.map(remove, range(4))) == 32
+        assert queue.find_one()["values"] == []
+
+
 def push_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_push.items
@@ -1336,6 +1374,8 @@ def persisted_smoke(uri):
         assert sorted(client.wire_push.concurrent.find_one()["values"]) == list(range(32))
         assert client.wire_push.items.find_one({"_id": 11})["values"] == [[4, 5], Timestamp(0, 0), Binary(b"value", 128)]
         assert client.wire_push.capped.find_one()["values"] == ["y" * 280000]
+        assert client.wire_pull.concurrent.find_one()["values"] == []
+        assert client.wire_pull.items.find_one({"_id": 11})["values"] == [True, {"_id": 3, "x": 3}, "beta"]
         assert client.wire_min_max.items.count_documents({"low": -32, "high": 32, "keep": True}) == 24
         row = client.wire_find_update.items.find_one({"_id": 10})
         assert row["rank"] == -1 and row["done"] is True and "group" not in row and row["stamp"] == Timestamp(0, 0)
@@ -1467,6 +1507,23 @@ def metadata_smoke(uri):
                 raise AssertionError(f"unsupported metadata command accepted: {command}")
         assert "rejected" not in database.list_collection_names()
         assert list(database.list_collections(nameOnly=True, authorizedCollections=True, filter={"info": {"$exists": True}})) == []
+
+
+async def async_pull_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_pull.items
+        await collection.insert_many([{"_id": i, "values": [Int64(1), [1, 2], True, {"x": 3}]} for i in range(4)])
+        result = await collection.update_many({}, {"$pull": {"values": {"$eq": 1}}})
+        assert (result.matched_count, result.modified_count) == (4, 4)
+        assert (await collection.update_one({}, {"$pull": {"missing": 1}})).modified_count == 0
+        assert await collection.find_one_and_update({}, {"$pull": {"values": {"x": {"$gte": 3}}}}, sort=[("_id", -1)], projection={"values": 1, "_id": 0}, return_document=True) == {"values": [True]}
+        for expression, code in [({"$pull": {"_id": 1}}, 2), ({"$pull": {"values": {"$expr": {"$eq": [1, 1]}}}}, 224)]:
+            try:
+                await collection.update_many({}, expression)
+            except WriteError as error:
+                assert error.code == code
+            else:
+                raise AssertionError("async pull error must be a WriteError")
 
 
 async def async_push_smoke(uri):
@@ -1704,11 +1761,13 @@ if __name__ == "__main__":
         pop_rename_smoke(sys.argv[1])
         array_membership_smoke(sys.argv[1])
         push_smoke(sys.argv[1])
+        pull_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
         # Give the added operator cases their own bounded phase; retain the
         # existing discovery/CRUD phase's deadline as the suite grows.
         asyncio.run(asyncio.wait_for(async_pop_rename_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_array_membership_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_push_smoke(sys.argv[1]), timeout=20))
+        asyncio.run(asyncio.wait_for(async_pull_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

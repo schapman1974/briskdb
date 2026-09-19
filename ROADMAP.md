@@ -517,13 +517,13 @@ requires an earlier dependency:
       Python, and ordered/unordered wire replacement batches share this path.
       Result/post-image limits and immutable-ID checks precede commit. No global
       snapshot is claimed. Shared `update_one`/`update_many` support
-      `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`
+      `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`
       across all three adapters, with object/array paths, eager conflict checks,
       immutable IDs, exact modified counts, bounded growth, and literal timestamps.
-      20,704 source-locked update cases supplement transaction/wire tests: 4,008
+      26,277 source-locked update cases supplement transaction/wire tests: 4,008
       object-only set/unset, 4,719 min/max, 3,078 pop/rename, and 4,440 non-ID
-      membership cases (object-only add-to-set paths), and 4,459 non-ID object/array-path
-      push cases. Legacy push/membership helpers
+      membership cases (object-only add-to-set paths), 4,459 push cases, and 5,573
+      pull cases on non-ID object/array paths. Legacy push/pull/membership helpers
       restore changed IDs; add-to-set also overwrites scalar parents. Independent
       tests verify BriskDB's stricter IDs/paths without modifying frozen allowances.
       Add-to-set supports `$each`, retaining existing duplicates/types; pull-all
@@ -535,6 +535,10 @@ requires an earlier dependency:
       Compound sorting follows frozen document-only selectors, not query-sort
       array selection. Concurrent pushes preserve every value; final post-images,
       projected before/after replies, atomic failures, and restart are tested.
+      Pull borrows the shared matcher for literal, field-predicate, and document
+      conditions, with ordinary embedded-ID semantics and eager update-specific
+      errors. Missing paths are no-ops; stable removal, comparison/regex work,
+      path allocations, AST/program retention, and cancellation remain bounded.
       Min/max use whole BSON order, preserve equal stored types, distinguish
       missing array slots from null, and bound comparison work even on no-ops.
       Pop supports front/back removal and numeric paths; rename moves fields
@@ -566,7 +570,7 @@ requires an earlier dependency:
       covered. Find-one-and-replace now uses the same shared path with
       projected before/after images, sort, immutable-ID validation, and exact
       return/post-image preflight before commit. Find-one-and-update now shares
-      this path for all nine supported field/array operators, preserving untouched fields and supporting
+      this path for all ten supported field/array operators, preserving untouched fields and supporting
       sorted before/after images across Rust, native Python, and wire clients.
       Concurrent consumers, no-op/no-match/projected-empty replies, depth/size
       rejection before writes, cancellation, and restart are tested. Other
@@ -647,9 +651,9 @@ requires an earlier dependency:
       with the basic/group-accumulator suites, replacement, and three additional
       application write/identity contracts, nested unsetting, configured-client
       read fidelity, three cross-CRUD query-validation cases, and all nine
-      non-upsert update-operator contracts, two pull-all cases, and the add-to-set
-      non-array atomicity case, plus five push/array-modifier cases,
-      required CI checks exactly 196 frozen executions and
+      non-upsert update-operator contracts, the add-to-set non-array atomicity case,
+      the complete array-update suite, and three pull/BSON-comparison cases,
+      required CI checks exactly 216 frozen executions and
       rejects missing, duplicated, substituted, or skipped cases. The full
       456-execution corpus remains separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared

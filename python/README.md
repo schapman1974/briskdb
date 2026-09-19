@@ -60,12 +60,13 @@ with briskdb.open("./data", shards=4, documents=True) as db:
 
 The document API supports collection/index metadata, single-document insertion
 with generated IDs, BSON find/count/distinct, filtered deletes, replacements,
-`$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push` updates, and retained cursors through synchronous and asyncio
+`$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull` updates, and retained cursors through synchronous and asyncio
 sessions. Find-one-and-delete returns a projected before-image;
 find-one-and-replace/update support sorted projected before/after images.
 Return size/depth checks precede mutation. Push supports `$each`, `$position`, `$sort`,
 and `$slice` in fixed insertion-sort-slice order, with bounded growth and stable
-whole-BSON/document-field sorting. Continue a
+whole-BSON/document-field sorting. Pull removes literal values or applies bounded
+query predicates to array members without creating missing fields. Continue a
 non-null `result["cursor_id"]` with
 `session.get_more(database, collection, cursor_id, batch_size=101)`; stop early
 with `session.kill_cursor(database, collection, cursor_id)`. Cursors belong to

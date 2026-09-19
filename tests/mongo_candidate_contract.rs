@@ -70,15 +70,10 @@ fn run_contract(uri: &str, report: &std::path::Path) -> std::process::Output {
             "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_report_target_and_path_errors_atomically",
             "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_comment_remains_invalid_as_a_field_operator",
             "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_add_to_set_non_array_errors_report_code_2_and_leave_document_atomic",
-            "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_pull_all_uses_literal_bson_equality",
-            "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_push_each_slice_keeps_a_bounded_array",
-            "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_push_modifiers_follow_mongodb_order_and_boundaries",
-            "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_plain_push_and_add_to_set_each_regressions",
-            "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_invalid_array_modifiers_fail_atomically",
-            "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_array_updates_reject_non_array_targets[sync-briskdb-$push-append]",
-            "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_array_updates_reject_non_array_targets[async-briskdb-$push-append]",
-            "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_array_updates_reject_non_array_targets[sync-briskdb-$pullAll-operand2]",
-            "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_array_updates_reject_non_array_targets[async-briskdb-$pullAll-operand2]",
+            "compat/mongo/v1/runner/contracts/test_array_update_contract.py",
+            "compat/mongo/v1/runner/contracts/test_bson_comparison_contract.py::test_tm036_pull_reuses_unbounded_min_max_key_ranges",
+            "compat/mongo/v1/runner/contracts/test_bson_comparison_contract.py::test_pull_reuses_recursive_bson_range_comparison",
+            "compat/mongo/v1/runner/contracts/test_bson_comparison_contract.py::test_pull_document_ranges_share_missing_and_array_path_semantics",
             "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_every_filtering_crud_entrypoint_rejects_invalid_not_operands",
             "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_every_filtering_crud_entrypoint_rejects_operator_typos",
             "compat/mongo/v1/runner/contracts/test_talkpython_contract.py::test_replace_one_preserves_id_and_replaces_the_full_document",
@@ -119,6 +114,7 @@ modules = {
     'tests.contracts.test_aggregation_contract',
     'tests.contracts.test_group_accumulators_contract',
     'tests.contracts.test_client_read_fidelity_contract',
+    'tests.contracts.test_array_update_contract',
 }
 individual = {'tests.contracts.test_talkpython_contract::' + name for name in [
     'test_replace_one_preserves_id_and_replaces_the_full_document',
@@ -143,14 +139,10 @@ individual.update('tests.contracts.test_update_operator_contract::' + name for n
     'test_new_update_operators_preserve_immutable_id_semantics',
     'test_new_update_operators_report_target_and_path_errors_atomically',
 ])
-individual.update('tests.contracts.test_array_update_contract::' + name for name in [
-    'test_pull_all_uses_literal_bson_equality',
-    'test_push_each_slice_keeps_a_bounded_array',
-    'test_push_modifiers_follow_mongodb_order_and_boundaries',
-    'test_plain_push_and_add_to_set_each_regressions',
-    'test_invalid_array_modifiers_fail_atomically',
-    'test_array_updates_reject_non_array_targets[$push-append]',
-    'test_array_updates_reject_non_array_targets[$pullAll-operand2]',
+individual.update('tests.contracts.test_bson_comparison_contract::' + name for name in [
+    'test_tm036_pull_reuses_unbounded_min_max_key_ranges',
+    'test_pull_reuses_recursive_bson_range_comparison',
+    'test_pull_document_ranges_share_missing_and_array_path_semantics',
 ])
 expected = {(case['id'], api) for case in corpus['cases']
             if (case['id'].split('::', 1)[0] in modules or case['id'] in individual or
@@ -158,11 +150,11 @@ expected = {(case['id'], api) for case in corpus['cases']
             for api in case['apis']}
 executions = ingest_junit(Path(sys.argv[1]), 'briskdb', corpus)['executions']
 actual = {(item['case_id'], item['api']) for item in executions}
-assert len(expected) == len(executions) == 196, 'locked suite coverage changed'
+assert len(expected) == len(executions) == 216, 'locked suite coverage changed'
 assert actual == expected, 'candidate suite omitted or substituted locked cases'
 assert all(item['outcome'] == 'passed' and item['target'] == 'briskdb-briskdb'
            for item in executions), 'candidate suite skipped or failed a case'
-print('Verified all 196 exact frozen candidate executions, with no skips.')
+print('Verified all 216 exact frozen candidate executions, with no skips.')
 "#,
             ])
             .arg(report)
