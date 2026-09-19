@@ -101,7 +101,13 @@ Same-name declarations with identical ordered keys and uniqueness are idempotent
 conflicts fail without catalog changes. Legacy numeric direction aliases compare
 semantically without rewriting their original stored BSON. Opaque legacy
 specification envelopes retain byte-exact conflict checks. Existing metadata is
-still readable; new validation does not migrate or activate older declarations.
+still readable; new validation does not rewrite or activate older declarations.
+`DocumentIndexMetadata::id()` exposes a durable `DocumentIndexId`, unique within
+the database root and never reused after committed drops. The version-17 manifest
+migration assigns IDs without altering existing BSON specifications or lifecycles.
+Declarations and ID allocation share one transaction; idempotent calls retain
+the same ID. IDs remain internal to Rust metadata for now: Python/wire result
+shapes are unchanged, and SQL indexes use a separate identity space.
 
 All declared secondary indexes remain `PendingBuild`, including `unique` ones:
 they are not query authorities or uniqueness constraints. Sparse/partial options,

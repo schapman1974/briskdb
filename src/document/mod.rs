@@ -33,7 +33,7 @@ pub(crate) use catalog::validate_namespace;
 pub use catalog::{
     DOCUMENT_CATALOG_VERSION, DOCUMENT_INDEX_FORMAT_VERSION, DOCUMENT_SCHEMA_VERSION,
     DOCUMENT_STORAGE_FORMAT_VERSION, DocumentCatalog, DocumentCollectionId,
-    DocumentCollectionMetadata, DocumentCollectionOptions, DocumentDatabaseId,
+    DocumentCollectionMetadata, DocumentCollectionOptions, DocumentDatabaseId, DocumentIndexId,
     DocumentIndexLifecycle, DocumentIndexMetadata, DocumentPlacement,
     MAX_DOCUMENT_DATABASE_NAME_BYTES, MAX_DOCUMENT_NAMESPACE_BYTES,
 };
