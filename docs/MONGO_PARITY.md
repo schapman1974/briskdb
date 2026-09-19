@@ -263,7 +263,15 @@ hint, let, retryable writes, and stronger write concerns remain unsupported.
 Operational errors abort the command and can follow committed shard writes;
 only prevalidated statement errors participate in ordered/unordered continuation.
 See [delete commit boundaries](DOCUMENT_ENGINE.md#filtered-deletion-and-commit-boundaries).
-Updates, findAndModify, and index metadata cursors remain unimplemented.
+Mongo `findAndModify` now supports `remove: true`: shared filter, sort, projection
+(`fields`), pre-delete `value`, `lastErrorObject.n`, and null on no match.
+Runtime sort checks apply even to exact-ID routes. Return-value budgets fail
+before deletion, including documents inserted through the larger native BSON
+interface. Missing collections return null without creation after eager semantic
+validation. Update/replacement forms, upsert, return-after, hint/collation/let,
+and unacknowledged findAndModify remain unsupported. Native Python exposes
+`find_one_and_delete` with the same shared execution and request controls.
+Updates, the remaining findAndModify forms, and index metadata cursors remain unimplemented.
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required
 real-driver CI also verifies BSON fidelity, ordered/unordered duplicate failures,

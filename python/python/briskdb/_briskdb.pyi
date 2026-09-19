@@ -125,6 +125,10 @@ class DeleteOneResult(DocumentExecution):
     acknowledged: bool
     deleted_count: int
 
+class OneDocumentResult(DocumentExecution):
+    kind: Literal["document"]
+    document: Optional[BsonResultDocument]
+
 class CloseReport(TypedDict):
     already_closed: bool
     forced: bool
@@ -545,6 +549,20 @@ class Session:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> CountDocumentsResult: ...
+    def find_one_and_delete(
+        self,
+        database: str,
+        collection: str,
+        filter: BsonDocument,
+        *,
+        projection: Optional[BsonProjection] = None,
+        sort: Optional[BsonDocument] = None,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> OneDocumentResult: ...
     def delete_one(
         self,
         database: str,

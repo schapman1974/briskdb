@@ -10,6 +10,52 @@ from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timesta
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
 
 
+def find_delete_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_find_delete.items
+        collection.insert_many([{"_id": Int64(i), "group": i % 2, "nested": {"v": i}} for i in reversed(range(12))])
+        assert collection.find_one_and_delete({"group": 0}, sort=[("_id", 1)], projection={"nested.v": 1, "_id": 0}) == {"nested": {"v": 0}}
+        assert collection.find_one({"_id": 0}) is None
+        row = collection.find_one_and_delete({"_id": 11.0})
+        assert isinstance(row["_id"], Int64)
+        assert collection.find_one_and_delete({"_id": -1}) is None
+        reply = client.wire_find_delete.command("findAndModify", "items", query={"_id": -1}, remove=True)
+        assert reply == {"ok": 1, "lastErrorObject": {"n": 0}, "value": None}
+        assert client.absent_find_delete.items.find_one_and_delete({}) is None
+        assert "absent_find_delete" not in client.list_database_names()
+        for options in ({"query": {"$where": "private"}}, {"fields": {"group": 1, "nested": 0}}, {"sort": {"_id": 0}}, {"upsert": True}, {"hint": "_id_"}, {"writeConcern": {"w": 0}}):
+            try:
+                client.absent_find_delete.command("findAndModify", "items", remove=True, **options)
+            except OperationFailure:
+                pass
+            else:
+                raise AssertionError("findAndModify must eagerly reject invalid/unsupported options")
+        assert "absent_find_delete" not in client.list_database_names()
+        assert collection.find_one_and_delete({}, sort=[("group", 1)])["_id"] == 10
+        assert collection.count_documents({}) == 9
+        concurrent = client.wire_find_delete.concurrent
+        concurrent.insert_many([{"_id": i} for i in range(24)])
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            values = list(pool.map(lambda _: concurrent.find_one_and_delete({}, sort=[("_id", 1)]), range(24)))
+        assert sorted(row["_id"] for row in values) == list(range(24))
+        assert concurrent.find_one_and_delete({}) is None
+        empty_projection = client.wire_find_delete.empty_projection
+        empty_projection.insert_one({"_id": 1})
+        reply = client.wire_find_delete.command("findAndModify", "empty_projection", remove=True, fields={"_id": 0})
+        assert reply == {"ok": 1, "lastErrorObject": {"n": 1}, "value": {}}
+        assert empty_projection.find_one_and_delete({}) is None
+        parallel = client.wire_find_delete.parallel
+        parallel.insert_one({"_id": 1, "a": [], "b": []})
+        for query in ({"_id": 1}, {}):
+            try:
+                parallel.find_one_and_delete(query, sort=[("a", 1), ("b", 1)])
+            except OperationFailure as error:
+                assert error.code == 2
+            else:
+                raise AssertionError("runtime sort validation must precede deletion, including point routes")
+        assert parallel.find_one({"_id": 1}) is not None
+
+
 def delete_smoke(uri):
     from pymongo import DeleteMany, DeleteOne
     from pymongo.write_concern import WriteConcern
@@ -753,6 +799,8 @@ def lifecycle_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert [row["_id"] for row in client.wire_find_delete.items.find({})] == list(reversed(range(1, 10)))
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         assert [row["_id"] for row in client.wire_deletes.items.find({})] == list(reversed(range(1, 30, 2)))
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         assert client.wire_data.items.find_one({"_id": "typed"})["decimal"] == Decimal128("1.250")
@@ -874,6 +922,12 @@ def metadata_smoke(uri):
 
 
 async def async_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_find_delete.items
+        await collection.insert_many([{"_id": i, "nested": {"v": Int64(i)}} for i in range(5)])
+        assert await collection.find_one_and_delete({}, sort=[("_id", -1)], projection={"nested": 1, "_id": 0}) == {"nested": {"v": Int64(4)}}
+        assert await collection.find_one_and_delete({"_id": 4}) is None
+        assert await collection.count_documents({}) == 4
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         collection = client.async_deletes.items
         await collection.insert_many([{"_id": i, "v": [i % 2]} for i in range(12)])
@@ -998,5 +1052,6 @@ if __name__ == "__main__":
         lifecycle_smoke(sys.argv[1])
         metadata_smoke(sys.argv[1])
         delete_smoke(sys.argv[1])
+        find_delete_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

@@ -63,6 +63,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `distinct(database, collection, field, filter=None, ...)`
 - `delete_one(database, collection, filter, ...)`
 - `delete_many(database, collection, filter, ...)`
+- `find_one_and_delete(database, collection, filter, *, projection=None, sort=None, ...)`
 
 Both delete methods accept the shared BSON filters and return an acknowledged
 `deleted_count`. Exact `_id` filters route directly; other `delete_one` filters
@@ -71,6 +72,13 @@ recheck. `delete_many` commits one shard at a time. Later errors or cancellation
 can leave earlier commits in place: this is not a cross-shard transaction or
 snapshot. Request/result limits are checked before mutation; existing missing
 collection preconditions are unchanged. See [commit boundaries](../docs/DOCUMENT_ENGINE.md#filtered-deletion-and-commit-boundaries).
+
+`find_one_and_delete` returns `kind="document"` and `document` containing the
+projected pre-delete value, or `None` for no match. Sort precedes projection;
+durable natural order breaks ties. Selection is rechecked under the winning
+shard's write lock, not a global cross-shard transaction/snapshot. Projection,
+sort, and result-budget failures are checked before deletion. Both native API
+styles forward the usual identity, deadline, cancellation, and result controls.
 
 `list_collection_metadata` returns the usual `cursor` result, with a null plan.
 Continue or kill it using collection name `$cmd.listCollections`. Full rows
@@ -108,6 +116,7 @@ plan. Payload keys are:
 | `count` | `count` |
 | `distinct` | ordered `values` list, preserving first BSON representations |
 | `delete` | `acknowledged`, `deleted_count` |
+| `document` | `document` pre-image or `None` |
 
 `collection_exists` checks one exact namespace without enumerating the catalog,
 creating missing metadata, or returning collection options/indexes. It has a
@@ -162,7 +171,7 @@ There is no pagination option or retained cursor. Request budgets apply to uniqu
 output values rather than unrelated input payloads; exceeding a bound fails the
 whole command. See the [distinct contract and limits](../docs/DOCUMENT_ENGINE.md#distinct-values).
 
-Updates, replacements, findAndModify, and native bulk-write helpers remain
+Updates, replacements, the other findAndModify forms, and native bulk-write helpers remain
 unsupported. There is no Python collection
 object or Python-hosted MongoDB network listener in this slice. The separate
 opt-in Rust Mongo listener also exposes batch inserts/deletes, retained finds

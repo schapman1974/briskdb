@@ -73,6 +73,7 @@ The current engine executes:
 | `Count` | Evaluates the same match expressions, then applies global skip/limit |
 | `Distinct` | Uses the same filters and global encounter order, with shared BSON identity and bounded unique values |
 | `Delete` | Deletes one or many matches; exact `_id` routes to one shard, other filters use the shared matcher |
+| `FindOneAndDelete` | Atomically deletes one shard-local selection and returns its projected pre-delete document |
 
 `CollectionExists` uses an admitted, controlled manifest lookup and scalar result
 accounting. Its result is independent of catalog page size and unrelated metadata
@@ -121,6 +122,26 @@ SQLite leases/transactions are released before returning. Namespace schema
 guards exclude concurrent DDL for the admitted shared command. Native Rust and
 Python retain their missing-collection precondition; Mongo wire deletes on an
 absent collection return zero after eager selector validation, without creating it.
+
+`FindOneAndDelete` accepts projection and sort (not cursor/skip/limit options),
+returning `Document(Some(pre_image))` or `Document(None)`. Sort uses original
+fields with durable natural order breaking ties. The scatter scan retains only
+one candidate identity/sort key and visits one record at a time; BSON comparisons
+remain on blocking workers. The winning shard reselects under an immediate
+write transaction. A different identity or sort key triggers a fresh global
+selection, so another newly better row on that shard is not overlooked. This
+makes local selection/deletion atomic, not a global cross-shard snapshot.
+Exact-ID routes use one write transaction and still validate runtime sort rules.
+
+The current pre-image is projected and its exact result/plan budget validated
+inside the transaction **before deletion**. Invalid filters, sort/projection
+errors, and oversized known return values do not delete documents. Shared
+document results reserve one nesting level for their return-value envelope;
+a depth-limit rejection does not delete data or degrade healthy storage. Mongo wire
+also narrows this operation's result budget to fit its advertised BSON limit,
+including reply-envelope headroom, before committing. A successful commit is
+not changed into a late cancellation error. Transport loss can still leave an
+unknown outcome, as with other non-retryable writes. No cursor is retained.
 
 Find cursors retain the compiled query, collection identity, and last consumed
 natural-order position—not SQLite connections, transactions, schema guards, or

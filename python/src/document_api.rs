@@ -30,6 +30,16 @@ pub(crate) fn execution_to_python(
     }
 
     match result {
+        DocumentResult::Document(document) => {
+            output.set_item("kind", "document")?;
+            match document {
+                Some(document) => output.set_item(
+                    "document",
+                    bson_document_to_python(py, &document, uuid_representation, bson_types)?,
+                )?,
+                None => output.set_item("document", py.None())?,
+            }
+        }
         DocumentResult::DatabaseNames(names) => {
             output.set_item("kind", "database_names")?;
             output.set_item("names", names.into_vec())?;
@@ -138,9 +148,7 @@ pub(crate) fn execution_to_python(
         // The Python surface only constructs commands from the currently
         // executable engine slice. Keep future result variants explicit if a
         // core change accidentally routes one through these methods.
-        DocumentResult::Acknowledged(_)
-        | DocumentResult::Document(_)
-        | DocumentResult::Update(_) => {
+        DocumentResult::Acknowledged(_) | DocumentResult::Update(_) => {
             return Err(crate::error::unsupported(
                 "this document result is not exposed by the current Python API",
             ));

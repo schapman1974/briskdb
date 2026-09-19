@@ -615,6 +615,28 @@ class AsyncSession:
             cancellation=cancellation,
         )
 
+    async def find_one_and_delete(
+        self,
+        database: str,
+        collection: str,
+        filter: Any,
+        *,
+        projection: Any = None,
+        sort: Any = None,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.find_one_and_delete,
+            database, collection, filter,
+            projection=projection, sort=sort, request_id=request_id,
+            timeout_ms=timeout_ms, cancellation=cancellation,
+            max_result_rows=max_result_rows, max_result_bytes=max_result_bytes,
+        )
+
     async def delete_many(
         self,
         database: str,

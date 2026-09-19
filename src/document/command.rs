@@ -580,6 +580,14 @@ filter_read_request!(
     /// Request to count matching documents.
     DocumentCountRequest
 );
+filter_read_request!(
+    /// Select, delete, and return one projected pre-delete document.
+    ///
+    /// Only projection and sort read options apply. The selected shard
+    /// reselects under its write lock before committing. There is no global
+    /// cross-shard snapshot; natural order breaks sort ties.
+    DocumentFindOneAndDeleteRequest
+);
 
 /// Request to run an owned aggregation pipeline.
 #[non_exhaustive]
@@ -1221,6 +1229,7 @@ pub enum DocumentCommandKind {
     DropCollection,
     DropDatabase,
     Find,
+    FindOneAndDelete,
     Aggregate,
     Count,
     Distinct,
@@ -1247,6 +1256,7 @@ pub enum DocumentCommand {
     DropCollection(DocumentDropCollectionRequest),
     DropDatabase(DocumentDropDatabaseRequest),
     Find(DocumentFindRequest),
+    FindOneAndDelete(DocumentFindOneAndDeleteRequest),
     Aggregate(DocumentAggregateRequest),
     Count(DocumentCountRequest),
     Distinct(DocumentDistinctRequest),
@@ -1272,6 +1282,7 @@ impl DocumentCommand {
             Self::DropCollection(_) => DocumentCommandKind::DropCollection,
             Self::DropDatabase(_) => DocumentCommandKind::DropDatabase,
             Self::Find(_) => DocumentCommandKind::Find,
+            Self::FindOneAndDelete(_) => DocumentCommandKind::FindOneAndDelete,
             Self::Aggregate(_) => DocumentCommandKind::Aggregate,
             Self::Count(_) => DocumentCommandKind::Count,
             Self::Distinct(_) => DocumentCommandKind::Distinct,

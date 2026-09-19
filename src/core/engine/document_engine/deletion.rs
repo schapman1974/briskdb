@@ -226,7 +226,7 @@ impl Engine {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn next_match(
+pub(super) fn next_match(
     storage: &Storage,
     connection: &Connection,
     collection_id: DocumentCollectionId,

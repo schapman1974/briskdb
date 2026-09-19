@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 mod aggregation;
 mod deletion;
 mod distinct;
+mod find_delete;
 mod metadata;
 mod sorting;
 
@@ -214,6 +215,7 @@ impl Engine {
     ) -> EngineResult<DocumentExecution> {
         let storage = self.inner.database.storage.clone();
         let result_cancellation = cancellation.clone();
+        let mutation_returns_document = matches!(&command, DocumentCommand::FindOneAndDelete(_));
         let execution = match command {
             DocumentCommand::ListDatabaseNames(request) => {
                 let names = self
@@ -866,6 +868,17 @@ impl Engine {
                 )
                 .await
             }
+            DocumentCommand::FindOneAndDelete(request) => {
+                self.run_document_find_delete(
+                    owner,
+                    request_id,
+                    request,
+                    cancellation,
+                    deadline,
+                    result_limits,
+                )
+                .await
+            }
             DocumentCommand::Distinct(request) => {
                 self.run_document_distinct(
                     owner,
@@ -901,7 +914,7 @@ impl Engine {
                 "document namespace mutation reached the data-command coordinator",
             )),
         }?;
-        if execution_result_is_mutation(execution.result()) {
+        if mutation_returns_document || execution_result_is_mutation(execution.result()) {
             // Every supported mutation preflights this exact result shape
             // before its first durable write. Once that write commits, return
             // success even if cancellation wins the race to result delivery.

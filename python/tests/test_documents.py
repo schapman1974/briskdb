@@ -52,6 +52,43 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_find_one_and_delete_projects_before_commit_and_preserves_preimage(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for i in reversed(range(12)):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": Int64(i), "group": i % 2, "nested": {"v": i}})
+                    identifier = uuid.uuid4()
+                    result = session.find_one_and_delete(DATABASE, COLLECTION, {"group": 0}, sort={"_id": 1}, projection={"nested.v": 1, "_id": 0}, request_id=identifier)
+                    self.assertEqual(result["kind"], "document")
+                    self.assertEqual(result["request_id"], identifier)
+                    self.assertEqual(result["document"], {"nested": {"v": 0}})
+                    self.assertEqual(session.find(DATABASE, COLLECTION, {"_id": 0})["documents"], [])
+                    row = session.find_one_and_delete(DATABASE, COLLECTION, {"_id": 11.0})["document"]
+                    self.assertIsInstance(row["_id"], Int64)
+                    self.assertIsNone(session.find_one_and_delete(DATABASE, COLLECTION, {"_id": -1})["document"])
+                    session.insert_one(DATABASE, COLLECTION, {"_id": "large", "value": "x" * 600000})
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.find_one_and_delete(DATABASE, COLLECTION, {"_id": "large"}, max_result_bytes=128)
+                    self.assertEqual(session.find_one_and_delete(DATABASE, COLLECTION, {"_id": "large"}, projection=["_id"], max_result_bytes=128)["document"], {"_id": "large"})
+                    deep = {}
+                    for _ in range(99):
+                        deep = {"nested": deep}
+                    deep["_id"] = "deep"
+                    session.insert_one(DATABASE, COLLECTION, deep)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.find_one_and_delete(DATABASE, COLLECTION, {"_id": "deep"})
+                    self.assertEqual(session.find_one_and_delete(DATABASE, COLLECTION, {"_id": "deep"}, projection=["_id"])["document"], {"_id": "deep"})
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.find_one_and_delete(DATABASE, COLLECTION, {}, cancellation=token)
+                    self.assertEqual(session.count_documents(DATABASE, COLLECTION)["count"], 10)
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(session.find_one_and_delete(DATABASE, COLLECTION, {})["document"]["_id"], 10)
+
     def test_filtered_deletes_order_types_controls_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -1213,6 +1250,23 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_find_one_and_delete_sort_projection_and_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for i in range(5):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": i, "nested": {"v": Int64(i)}})
+                    identifier = uuid.uuid4()
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.find_one_and_delete(DATABASE, COLLECTION, {}, max_result_bytes=1)
+                    result = await session.find_one_and_delete(DATABASE, COLLECTION, {}, projection={"nested": 1, "_id": 0}, sort={"_id": -1}, request_id=identifier)
+                    self.assertEqual(result["request_id"], identifier)
+                    self.assertEqual(result["document"], {"nested": {"v": Int64(4)}})
+                    self.assertIsInstance(result["document"]["nested"]["v"], Int64)
+                    self.assertIsNone((await session.find_one_and_delete(DATABASE, COLLECTION, {"_id": 4}))["document"])
+                    self.assertEqual((await session.count_documents(DATABASE, COLLECTION))["count"], 4)
+
     async def test_async_filtered_deletes_and_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:
