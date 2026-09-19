@@ -596,8 +596,12 @@ requires an earlier dependency:
       collection existence checks now share the engine across Rust, embedded
       sync/async Python, and wire read/write namespace handling. Catalogs beyond
       101 collections and large unrelated metadata no longer break wire data
-      commands. Missing probes create nothing. Full create/drop/list lifecycle,
-      database helpers, and metadata cursors remain open.
+      commands. Missing probes create nothing. Durable collection/database drops
+      now share that engine across all adapters, with checksummed shard-progress
+      recovery and non-reused catalog identities protecting retained cursors.
+      Format 16 upgrades preserve existing data; interrupted accepted drops roll
+      forward on reopen. Explicit wire creation, database listings, and retained
+      collection metadata cursors remain open.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.

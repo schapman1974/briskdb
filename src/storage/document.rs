@@ -239,7 +239,14 @@ mod enabled {
     }
 
     fn require_ready_manifest(connection: &Connection, shard_count: u16) -> EngineResult<()> {
-        match manifest::current_integrity(connection, shard_count)?.state() {
+        let integrity = manifest::current_integrity(connection, shard_count)?;
+        if load_deletion(connection)?.is_some() {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "document deletion is incomplete; reopen the database to recover it",
+            ));
+        }
+        match integrity.state() {
             manifest::DatabaseIntegrityState::Ready => Ok(()),
             manifest::DatabaseIntegrityState::Degraded => Err(corrupt(
                 "document operation found a persistently degraded database",
@@ -258,6 +265,28 @@ mod enabled {
         operation_id: [u8; 32],
         shard_count: u16,
         next_shard: u16,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Deletion {
+        database_id: i64,
+        collection_id: Option<i64>,
+        operation_id: [u8; 32],
+        shard_count: u16,
+        next_shard: u16,
+    }
+
+    // Only the isolated crash-test child configures this hook. Exit without
+    // destructors exercises SQLite/WAL and OS-lock recovery, not an error return.
+    #[cfg(test)]
+    fn deletion_crash_checkpoint(point: &str, shard: u16) {
+        if std::env::var("BRISKDB_TEST_DOCUMENT_DROP_CRASH")
+            .ok()
+            .as_deref()
+            == Some(format!("{point}:{shard}").as_str())
+        {
+            std::process::exit(73);
+        }
     }
 
     enum CreateCollectionStart {
@@ -522,8 +551,7 @@ mod enabled {
                         let database_id = ensure_database(&transaction, database)?;
                         let collection_id = next_positive_id(
                             &transaction,
-                            "briskdb_document_collections",
-                            "collection_id",
+                            "collection_high_water",
                             "document collection",
                         )?;
                         let operation_id = provisioning_id(database, collection, &options_bson);
@@ -604,6 +632,114 @@ mod enabled {
                 }
                 Err(error) => Err(error),
             }
+        }
+
+        /// Journal a namespace drop while holding the same exclusive schema
+        /// admission used by creation. None selects the entire logical database.
+        pub(crate) fn drop_document_namespace_controlled(
+            &self,
+            database: &str,
+            collection: Option<&str>,
+            mut migration: SchemaMigrationGuard,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<bool> {
+            let result = (|| {
+                ensure_control_active(&control, "before dropping document namespace")?;
+                crate::document::validate_namespace(database, collection.unwrap_or("_"))?;
+                migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
+                let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+                let deletion =
+                    run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
+                        configure_journal_mode(connection)?;
+                        let transaction = connection
+                            .transaction_with_behavior(TransactionBehavior::Immediate)
+                            .map_err(sqlite_error::storage)?;
+                        require_ready_manifest(&transaction, self.shard_count())?;
+                        if load_provisioning(&transaction)?.is_some() {
+                            return Err(EngineError::new(
+                                EngineErrorKind::FailedPrecondition,
+                                "document provisioning must finish before deletion",
+                            ));
+                        }
+                        let database_id: Option<i64> = transaction
+                            .query_row(
+                                "SELECT database_id FROM briskdb_document_databases
+                                 WHERE database_name = ?1",
+                                [database],
+                                |row| row.get(0),
+                            )
+                            .optional()
+                            .map_err(sqlite_error::storage)?;
+                        let Some(database_id) = database_id else {
+                            return Ok(None);
+                        };
+                        let collection_id = if let Some(collection) = collection {
+                            let id: Option<i64> = transaction
+                                .query_row(
+                                    "SELECT collection_id FROM briskdb_document_collections
+                                     WHERE database_id = ?1 AND collection_name = ?2
+                                       AND lifecycle_state = 2",
+                                    params![database_id, collection],
+                                    |row| row.get(0),
+                                )
+                                .optional()
+                                .map_err(sqlite_error::storage)?;
+                            let Some(id) = id else {
+                                return Ok(None);
+                            };
+                            Some(id)
+                        } else {
+                            None
+                        };
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update(b"briskdb.document-deletion.v1\0");
+                        hasher.update(&database_id.to_le_bytes());
+                        hasher.update(&collection_id.unwrap_or(0).to_le_bytes());
+                        hasher.update(&self.shard_count().to_le_bytes());
+                        let operation_id = *hasher.finalize().as_bytes();
+                        transaction
+                            .execute(
+                                "INSERT INTO briskdb_document_deletion
+                                     (singleton, database_id, collection_id, operation_id,
+                                      shard_count, next_shard)
+                                 VALUES (1, ?1, ?2, ?3, ?4, 0)",
+                                params![
+                                    database_id,
+                                    collection_id,
+                                    operation_id.as_slice(),
+                                    self.shard_count()
+                                ],
+                            )
+                            .map_err(sqlite_error::storage)?;
+                        manifest::validate_document_catalog(&transaction, self.shard_count())?;
+                        manifest::refresh_manifest_digest(&transaction)?;
+                        manifest::current_integrity(&transaction, self.shard_count())?;
+                        ensure_control_active(
+                            &control,
+                            "before committing document deletion intent",
+                        )?;
+                        migration.mark_pending_on_drop();
+                        #[cfg(test)]
+                        deletion_crash_checkpoint("before-intent", 0);
+                        transaction.commit().map_err(sqlite_error::storage)?;
+                        #[cfg(test)]
+                        deletion_crash_checkpoint("after-intent", 0);
+                        Ok(Some(Deletion {
+                            database_id,
+                            collection_id,
+                            operation_id,
+                            shard_count: self.shard_count(),
+                            next_shard: 0,
+                        }))
+                    })?;
+                let existed = deletion.is_some();
+                if let Some(deletion) = deletion {
+                    recover_deletion(self, &mut connection, deletion, Some(&control))?;
+                }
+                migration.publish_ready()?;
+                Ok(existed)
+            })();
+            self.fail_closed_on_corruption(result)
         }
 
         #[cfg(any(feature = "tinymongo-import", test))]
@@ -1389,7 +1525,7 @@ mod enabled {
             Ok(records)
         }
 
-        #[cfg(feature = "tinymongo-import")]
+        #[cfg(any(feature = "tinymongo-import", test))]
         pub(crate) fn document_count(
             &self,
             collection_id: DocumentCollectionId,
@@ -1398,7 +1534,7 @@ mod enabled {
             self.fail_closed_on_corruption(result)
         }
 
-        #[cfg(feature = "tinymongo-import")]
+        #[cfg(any(feature = "tinymongo-import", test))]
         fn document_count_inner(&self, collection_id: DocumentCollectionId) -> EngineResult<u64> {
             let _operation = self.enter_schema_operation()?;
             self.require_active_document_collection(collection_id)?;
@@ -1524,6 +1660,9 @@ mod enabled {
         manifest_connection: &mut Connection,
     ) -> EngineResult<()> {
         manifest::validate_document_catalog(manifest_connection, storage.shard_count())?;
+        if let Some(deletion) = load_deletion(manifest_connection)? {
+            recover_deletion(storage, manifest_connection, deletion, None)?;
+        }
         if let Some(provisioning) = load_provisioning(manifest_connection)? {
             recover_provisioning(storage, manifest_connection, provisioning)?;
         }
@@ -1542,6 +1681,163 @@ mod enabled {
             }
         }
         Ok(())
+    }
+
+    fn load_deletion(connection: &Connection) -> EngineResult<Option<Deletion>> {
+        let row = connection.query_row(
+            "SELECT database_id, collection_id, operation_id, shard_count, next_shard FROM briskdb_document_deletion WHERE singleton = 1",
+            [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, u16>(3)?, row.get::<_, u16>(4)?)),
+        ).optional().map_err(|error| shard_read_error(error, "failed to load document deletion journal"))?;
+        row.map(
+            |(database_id, collection_id, operation_id, shard_count, next_shard)| {
+                Ok(Deletion {
+                    database_id,
+                    collection_id,
+                    operation_id: operation_id
+                        .try_into()
+                        .map_err(|_| corrupt("invalid document deletion identity"))?,
+                    shard_count,
+                    next_shard,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    fn recover_deletion(
+        storage: &Storage,
+        manifest_connection: &mut Connection,
+        mut deletion: Deletion,
+        control: Option<&Arc<OperationControl>>,
+    ) -> EngineResult<()> {
+        manifest::current_integrity(manifest_connection, storage.shard_count())?;
+        if deletion.shard_count != storage.shard_count() {
+            return Err(corrupt(
+                "document deletion shard count differs from routing metadata",
+            ));
+        }
+        let collections = manifest_connection.prepare(
+            "SELECT collection_id FROM briskdb_document_collections WHERE database_id = ?1 AND (?2 IS NULL OR collection_id = ?2) ORDER BY collection_id"
+        ).and_then(|mut statement| statement.query_map(params![deletion.database_id, deletion.collection_id], |row| row.get::<_, i64>(0))?.collect::<Result<Vec<_>, _>>()).map_err(sqlite_error::storage)?;
+        let total: i64 = manifest_connection
+            .query_row(
+                "SELECT count(*) FROM briskdb_document_collections",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error::storage)?;
+        let remove_schema = total == collections.len() as i64;
+        while deletion.next_shard < deletion.shard_count {
+            let shard = deletion.next_shard;
+            let mut connection = storage.open_unconfigured_shard(shard)?;
+            run_provisioning_step(&mut connection, control, |connection| {
+                storage.validate_unconfigured_shard_nonterminal(connection, shard)?;
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sqlite_error::storage)?;
+                let present = super::validate_optional_schema(&transaction)?;
+                if remove_schema {
+                    // This shard may have committed before its journal cursor.
+                    // The absence of the exact optional table is then success.
+                    if present {
+                        transaction
+                            .execute_batch("DROP TABLE briskdb_documents_v1")
+                            .map_err(sqlite_error::storage)?;
+                    }
+                } else {
+                    require_schema(&transaction)?;
+                    for id in &collections {
+                        if let Some(control) = control {
+                            ensure_control_active(control, "during document shard cleanup")?;
+                        }
+                        transaction
+                            .execute(
+                                "DELETE FROM briskdb_documents_v1 WHERE collection_id = ?1",
+                                [id],
+                            )
+                            .map_err(sqlite_error::storage)?;
+                    }
+                }
+                if let Some(control) = control {
+                    ensure_control_active(control, "before committing document shard cleanup")?;
+                }
+                #[cfg(test)]
+                deletion_crash_checkpoint("before-shard", shard);
+                transaction.commit().map_err(sqlite_error::storage)
+            })?;
+            #[cfg(test)]
+            deletion_crash_checkpoint("after-shard", shard);
+            run_provisioning_step(manifest_connection, control, |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sqlite_error::storage)?;
+                manifest::current_integrity(&transaction, storage.shard_count())?;
+                let changed = transaction.execute(
+                    "UPDATE briskdb_document_deletion SET next_shard = ?1 WHERE singleton = 1 AND operation_id = ?2 AND next_shard = ?3",
+                    params![shard + 1, deletion.operation_id.as_slice(), shard],
+                ).map_err(sqlite_error::storage)?;
+                if changed != 1 {
+                    return Err(corrupt(
+                        "document deletion journal did not advance exactly once",
+                    ));
+                }
+                manifest::validate_document_catalog(&transaction, storage.shard_count())?;
+                manifest::refresh_manifest_digest(&transaction)?;
+                manifest::current_integrity(&transaction, storage.shard_count())?;
+                if let Some(control) = control {
+                    ensure_control_active(control, "before committing document deletion cursor")?;
+                }
+                #[cfg(test)]
+                deletion_crash_checkpoint("before-progress", shard);
+                transaction.commit().map_err(sqlite_error::storage)
+            })?;
+            #[cfg(test)]
+            deletion_crash_checkpoint("after-progress", shard);
+            deletion.next_shard = shard + 1;
+        }
+        run_provisioning_step(manifest_connection, control, |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sqlite_error::storage)?;
+            manifest::current_integrity(&transaction, storage.shard_count())?;
+            let removed = transaction.execute(
+                "DELETE FROM briskdb_document_deletion WHERE singleton = 1 AND operation_id = ?1 AND next_shard = shard_count",
+                [deletion.operation_id.as_slice()],
+            ).map_err(sqlite_error::storage)?;
+            if removed != 1 {
+                return Err(corrupt(
+                    "document deletion journal did not finalize exactly once",
+                ));
+            }
+            transaction.execute(
+                "DELETE FROM briskdb_document_indexes WHERE collection_id IN (
+                    SELECT collection_id FROM briskdb_document_collections WHERE database_id = ?1 AND (?2 IS NULL OR collection_id = ?2))",
+                params![deletion.database_id, deletion.collection_id],
+            ).map_err(sqlite_error::storage)?;
+            let removed = transaction.execute(
+                "DELETE FROM briskdb_document_collections WHERE database_id = ?1 AND (?2 IS NULL OR collection_id = ?2)",
+                params![deletion.database_id, deletion.collection_id],
+            ).map_err(sqlite_error::storage)?;
+            if removed != collections.len() {
+                return Err(corrupt("document deletion target changed during cleanup"));
+            }
+            transaction.execute(
+                "DELETE FROM briskdb_document_databases WHERE database_id = ?1 AND NOT EXISTS (SELECT 1 FROM briskdb_document_collections WHERE database_id = ?1)",
+                [deletion.database_id],
+            ).map_err(sqlite_error::storage)?;
+            manifest::validate_document_catalog(&transaction, storage.shard_count())?;
+            manifest::refresh_manifest_digest(&transaction)?;
+            manifest::current_integrity(&transaction, storage.shard_count())?;
+            if let Some(control) = control {
+                ensure_control_active(control, "before committing document deletion completion")?;
+            }
+            #[cfg(test)]
+            deletion_crash_checkpoint("before-completion", 0);
+            transaction.commit().map_err(sqlite_error::storage)?;
+            #[cfg(test)]
+            deletion_crash_checkpoint("after-completion", 0);
+            Ok(())
+        })
     }
 
     fn recover_provisioning(
@@ -2216,12 +2512,7 @@ mod enabled {
         {
             return Ok(id);
         }
-        let id = next_positive_id(
-            connection,
-            "briskdb_document_databases",
-            "database_id",
-            "document database",
-        )?;
+        let id = next_positive_id(connection, "database_high_water", "document database")?;
         connection
             .execute(
                 "INSERT INTO briskdb_document_databases (
@@ -2233,22 +2524,29 @@ mod enabled {
         Ok(id)
     }
 
-    fn next_positive_id(
-        connection: &Connection,
-        table: &str,
-        column: &str,
-        kind: &str,
-    ) -> EngineResult<i64> {
-        let sql = format!("SELECT COALESCE(MAX({column}), 0) FROM {table}");
+    fn next_positive_id(connection: &Connection, column: &str, kind: &str) -> EngineResult<i64> {
+        // Only these static callers select a column. Allocation and catalog
+        // insertion share the caller's IMMEDIATE manifest transaction.
+        let sql = format!("SELECT {column} FROM briskdb_document_identities WHERE singleton = 1");
         let current = connection
             .query_row(&sql, [], |row| row.get::<_, i64>(0))
             .map_err(sqlite_error::storage)?;
-        current.checked_add(1).ok_or_else(|| {
+        let next = current.checked_add(1).ok_or_else(|| {
             EngineError::new(
                 EngineErrorKind::LimitExceeded,
                 format!("{kind} identity space is exhausted"),
             )
-        })
+        })?;
+        let changed = connection.execute(
+            &format!("UPDATE briskdb_document_identities SET {column} = ?1 WHERE singleton = 1 AND {column} = ?2"),
+            params![next, current],
+        ).map_err(sqlite_error::storage)?;
+        if changed != 1 {
+            return Err(corrupt(
+                "document identity allocation did not advance exactly once",
+            ));
+        }
+        Ok(next)
     }
 
     fn existing_collection(
@@ -2521,6 +2819,209 @@ mod enabled {
 
         fn document(entries: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocument {
             BsonDocument::from_entries(entries).unwrap()
+        }
+
+        #[test]
+        fn document_drop_crash_child() {
+            let Ok(root) = std::env::var("BRISKDB_TEST_DOCUMENT_DROP_ROOT") else {
+                return;
+            };
+            let storage = Storage::open(root, 4).unwrap();
+            let migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            let database = std::env::var("BRISKDB_TEST_DOCUMENT_DROP_MODE").unwrap() == "database";
+            storage
+                .drop_document_namespace_controlled(
+                    "app",
+                    (!database).then_some("one"),
+                    migration,
+                    OperationControl::new(None),
+                )
+                .unwrap();
+            panic!("configured crash checkpoint was not reached");
+        }
+
+        #[test]
+        fn every_document_drop_commit_boundary_recovers_after_process_exit() {
+            let mut checkpoints = vec![
+                "before-intent:0".to_owned(),
+                "after-intent:0".to_owned(),
+                "before-completion:0".to_owned(),
+                "after-completion:0".to_owned(),
+            ];
+            for shard in 0..4 {
+                for point in [
+                    "before-shard",
+                    "after-shard",
+                    "before-progress",
+                    "after-progress",
+                ] {
+                    checkpoints.push(format!("{point}:{shard}"));
+                }
+            }
+            // Both selective deletion and removal of the last optional shard
+            // table must recover; database mode also removes multiple targets.
+            for (database, keep_other) in
+                [(false, true), (true, true), (true, false), (false, false)]
+            {
+                for checkpoint in &checkpoints {
+                    let temp = tempfile::tempdir().unwrap();
+                    let storage = Storage::open(temp.path(), 4).unwrap();
+                    let one = storage
+                        .create_document_collection(
+                            "app",
+                            "one",
+                            &DocumentCollectionOptions::empty(),
+                        )
+                        .unwrap();
+                    for id in 0..8 {
+                        storage
+                            .insert_document(one.id(), &document([("_id", BsonValue::Int32(id))]))
+                            .unwrap();
+                    }
+                    if database {
+                        storage
+                            .create_document_collection(
+                                "app",
+                                "two",
+                                &DocumentCollectionOptions::empty(),
+                            )
+                            .unwrap();
+                    }
+                    let other = keep_other.then(|| {
+                        storage
+                            .create_document_collection(
+                                "other",
+                                "keep",
+                                &DocumentCollectionOptions::empty(),
+                            )
+                            .unwrap()
+                    });
+                    if let Some(other) = &other {
+                        storage
+                            .insert_document(other.id(), &document([("_id", BsonValue::Int32(1))]))
+                            .unwrap();
+                    }
+                    let highest = storage
+                        .document_catalog()
+                        .unwrap()
+                        .collections()
+                        .iter()
+                        .map(|c| c.id().get())
+                        .max()
+                        .unwrap();
+                    drop(storage);
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "storage::document::enabled::tests::document_drop_crash_child",
+                            "--nocapture",
+                        ])
+                        .env("BRISKDB_TEST_DOCUMENT_DROP_ROOT", temp.path())
+                        .env(
+                            "BRISKDB_TEST_DOCUMENT_DROP_MODE",
+                            if database { "database" } else { "collection" },
+                        )
+                        .env("BRISKDB_TEST_DOCUMENT_DROP_CRASH", checkpoint)
+                        .output()
+                        .unwrap();
+                    assert_eq!(
+                        output.status.code(),
+                        Some(73),
+                        "{checkpoint}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let recovered = Storage::open(temp.path(), 4).unwrap();
+                    let catalog = recovered.document_catalog().unwrap();
+                    let before_intent = checkpoint == "before-intent:0";
+                    assert_eq!(
+                        catalog.collection("app", "one").is_some(),
+                        before_intent,
+                        "{checkpoint}"
+                    );
+                    if database {
+                        assert_eq!(catalog.collection("app", "two").is_some(), before_intent);
+                    }
+                    assert_eq!(catalog.collection("other", "keep").is_some(), keep_other);
+                    if let Some(other) = &other {
+                        assert_eq!(recovered.document_count(other.id()).unwrap(), 1);
+                    }
+                    if before_intent {
+                        assert_eq!(recovered.document_count(one.id()).unwrap(), 8);
+                    } else {
+                        let fresh = recovered
+                            .create_document_collection(
+                                "app",
+                                "one",
+                                &DocumentCollectionOptions::empty(),
+                            )
+                            .unwrap();
+                        assert!(fresh.id().get() > highest);
+                        assert_eq!(recovered.document_count(fresh.id()).unwrap(), 0);
+                    }
+                    drop(recovered);
+                    drop(Storage::open(temp.path(), 4).unwrap());
+                }
+            }
+        }
+
+        #[test]
+        fn document_identity_exhaustion_is_atomic_and_never_recycles_a_deleted_maximum() {
+            for column in ["database_high_water", "collection_high_water"] {
+                let temp = tempfile::tempdir().unwrap();
+                let storage = Storage::open(temp.path(), 4).unwrap();
+                let connection = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+                connection
+                    .execute(
+                        &format!("UPDATE briskdb_document_identities SET {column} = ?1"),
+                        [i64::MAX - 1],
+                    )
+                    .unwrap();
+                manifest::refresh_manifest_digest(&connection).unwrap();
+                let last = storage
+                    .create_document_collection("app", "one", &DocumentCollectionOptions::empty())
+                    .unwrap();
+                assert_eq!(
+                    if column == "database_high_water" {
+                        last.database_id().get()
+                    } else {
+                        last.id().get()
+                    },
+                    i64::MAX as u64
+                );
+                let migration = storage.begin_schema_migration().unwrap();
+                migration.wait_for_quiescence_blocking();
+                assert!(
+                    storage
+                        .drop_document_namespace_controlled(
+                            "app",
+                            None,
+                            migration,
+                            OperationControl::new(None)
+                        )
+                        .unwrap()
+                );
+                assert_eq!(
+                    storage
+                        .create_document_collection(
+                            "app",
+                            "one",
+                            &DocumentCollectionOptions::empty()
+                        )
+                        .unwrap_err()
+                        .kind(),
+                    EngineErrorKind::LimitExceeded
+                );
+                assert!(storage.document_catalog().unwrap().collections().is_empty());
+                let value: i64 = connection
+                    .query_row(
+                        &format!("SELECT {column} FROM briskdb_document_identities"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(value, i64::MAX);
+            }
         }
 
         #[test]
@@ -3225,8 +3726,41 @@ mod enabled {
 
             let storage = Storage::open(temp.path(), 2).unwrap();
             assert!(storage.document_catalog().unwrap().collections().is_empty());
+            storage
+                .create_document_collection("app", "sql_only", &DocumentCollectionOptions::empty())
+                .unwrap();
             for shard in 0..storage.shard_count() {
                 let connection = Connection::open(shard_path(temp.path(), shard)).unwrap();
+                connection
+                    .execute("INSERT INTO sql_only VALUES (1, 'preserved')", [])
+                    .unwrap();
+            }
+            let migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            assert!(
+                storage
+                    .drop_document_namespace_controlled(
+                        "app",
+                        None,
+                        migration,
+                        OperationControl::new(None)
+                    )
+                    .unwrap()
+            );
+            drop(storage);
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            assert!(storage.document_catalog().unwrap().collections().is_empty());
+            for shard in 0..storage.shard_count() {
+                let connection = Connection::open(shard_path(temp.path(), shard)).unwrap();
+                assert_eq!(
+                    connection
+                        .query_row("SELECT value FROM sql_only WHERE id = 1", [], |row| row
+                            .get::<_, String>(
+                            0
+                        ))
+                        .unwrap(),
+                    "preserved"
+                );
                 assert_eq!(
                     connection
                         .query_row(
@@ -3436,6 +3970,50 @@ mod enabled {
                 .unwrap_err();
             assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
             assert_root_unchanged(create.path(), &root);
+
+            let deletion = tempfile::tempdir().unwrap();
+            let storage = Storage::open(deletion.path(), 2).unwrap();
+            storage
+                .create_document_collection(
+                    "existing_db",
+                    "events",
+                    &DocumentCollectionOptions::empty(),
+                )
+                .unwrap();
+            let root = tamper_manifest(deletion.path());
+            let migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            let error = storage
+                .drop_document_namespace_controlled(
+                    "existing_db",
+                    None,
+                    migration,
+                    OperationControl::new(None),
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::DataCorruption);
+            assert_root_unchanged(deletion.path(), &root);
+            let connection = Connection::open(deletion.path().join("manifest.sqlite")).unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM briskdb_document_deletion",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM briskdb_document_collections",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
 
             let index = tempfile::tempdir().unwrap();
             let storage = Storage::open(index.path(), 2).unwrap();
@@ -3806,6 +4384,7 @@ mod enabled {
                     [operation_id.as_slice()],
                 )
                 .unwrap();
+            transaction.execute("UPDATE briskdb_document_identities SET database_high_water = 1, collection_high_water = 1 WHERE singleton = 1", []).unwrap();
             manifest::validate_document_catalog(&transaction, 4).unwrap();
             manifest::refresh_manifest_digest(&transaction).unwrap();
             transaction.commit().unwrap();
@@ -3866,7 +4445,8 @@ pub(super) fn recover_or_validate(
     super::manifest::validate_document_catalog(manifest_connection, storage.shard_count())?;
     let has_catalog = manifest_connection
         .query_row(
-            "SELECT EXISTS (SELECT 1 FROM briskdb_document_collections)",
+            "SELECT EXISTS (SELECT 1 FROM briskdb_document_collections)
+                OR EXISTS (SELECT 1 FROM briskdb_document_deletion)",
             [],
             |row| row.get::<_, bool>(0),
         )

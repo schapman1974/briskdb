@@ -299,6 +299,7 @@ impl DocumentDeleteResult {
 pub enum DocumentResultKind {
     Acknowledged,
     CollectionExists,
+    NamespaceDropped,
     Collection,
     Collections,
     Document,
@@ -319,6 +320,8 @@ pub enum DocumentResultKind {
 pub enum DocumentResult {
     Acknowledged(bool),
     CollectionExists(bool),
+    /// Whether the requested logical namespace existed before its durable drop.
+    NamespaceDropped(bool),
     Collection(DocumentCollectionMetadata),
     Collections(Box<[DocumentCollectionMetadata]>),
     Document(Option<BsonDocument>),
@@ -338,6 +341,7 @@ impl DocumentResult {
         match self {
             Self::Acknowledged(_) => DocumentResultKind::Acknowledged,
             Self::CollectionExists(_) => DocumentResultKind::CollectionExists,
+            Self::NamespaceDropped(_) => DocumentResultKind::NamespaceDropped,
             Self::Collection(_) => DocumentResultKind::Collection,
             Self::Collections(_) => DocumentResultKind::Collections,
             Self::Document(_) => DocumentResultKind::Document,
@@ -361,6 +365,7 @@ impl fmt::Debug for DocumentResult {
         match self {
             Self::Acknowledged(value)
             | Self::CollectionExists(value)
+            | Self::NamespaceDropped(value)
             | Self::CursorKilled(value) => {
                 debug.field("value", value);
             }

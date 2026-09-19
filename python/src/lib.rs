@@ -14,7 +14,8 @@ use briskdb::document::{
     BsonValue, DocumentAggregateRequest, DocumentCollectionExistsRequest,
     DocumentCollectionOptions, DocumentCommand, DocumentContinueCursorRequest,
     DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
-    DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest, DocumentFilter,
+    DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
+    DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
     DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
     DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
     DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentReadOptions, DocumentRequest,
@@ -1454,6 +1455,62 @@ impl Session {
         let command = DocumentCommand::CollectionExists(DocumentCollectionExistsRequest::new(
             python_engine_result(DocumentNamespace::new(database, collection))?,
         ));
+        self.execute_document_command(
+            py,
+            command,
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (database, collection, *, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn drop_collection(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let command = DocumentCommand::DropCollection(DocumentDropCollectionRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            DocumentWriteOptions::new(),
+        ));
+        self.execute_document_command(
+            py,
+            command,
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (database, *, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn drop_database(
+        &self,
+        py: Python<'_>,
+        database: String,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let command = DocumentCommand::DropDatabase(python_engine_result(
+            DocumentDropDatabaseRequest::new(database, DocumentWriteOptions::new()),
+        )?);
         self.execute_document_command(
             py,
             command,

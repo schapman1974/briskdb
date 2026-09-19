@@ -44,10 +44,11 @@ pub use command::{
     DocumentCommandKind, DocumentContinueCursorRequest, DocumentCountRequest,
     DocumentCreateCollectionRequest, DocumentCreateIndexRequest, DocumentCursorId,
     DocumentDeleteRequest, DocumentDistinctRequest, DocumentDropCollectionRequest,
-    DocumentDropIndexRequest, DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest,
-    DocumentKillCursorRequest, DocumentListCollectionsRequest, DocumentListIndexesRequest,
-    DocumentMutationScope, DocumentNamespace, DocumentReplaceRequest, DocumentRequest,
-    DocumentRequestId, DocumentUpdateRequest, MAX_DOCUMENT_INDEX_NAME_BYTES,
+    DocumentDropDatabaseRequest, DocumentDropIndexRequest, DocumentFindRequest,
+    DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
+    DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
+    DocumentNamespace, DocumentReplaceRequest, DocumentRequest, DocumentRequestId,
+    DocumentUpdateRequest, MAX_DOCUMENT_INDEX_NAME_BYTES,
 };
 pub use distinct::DocumentDistinct;
 pub use error::{BsonError, BsonErrorContext, BsonErrorKind, BsonResult, DocumentCursorError};

@@ -76,6 +76,16 @@ order. Sorted pages use bounded key windows and rescan until sorted indexes
 exist; large skips may need repeated scans. Secondary indexes remain `pending_build`; updates,
 additional aggregation expressions, and bulk-write Python helpers remain future work.
 
+`session.drop_collection(database, collection)` and
+`session.drop_database(database)` return `{"kind": "namespace_dropped",
+"existed": bool, "request_id": ..., "plan": None}`. Async sessions expose the
+same methods and request controls. Missing targets return false. Drops preserve
+unrelated namespaces and SQL tables; dropping the final collection removes its
+empty logical database. Retained cursors cannot read a recreated collection.
+Drops require sole-process ownership. If interrupted after durable intent, the
+root remains fenced until reopen finishes deletion; cancellation does not promise
+rollback. See [document storage](../docs/DOCUMENT_STORAGE.md#namespace-deletion-and-restart).
+
 `session.aggregate(database, collection, pipeline, batch_size=101)` accepts a list
 of `$match`, `$sort`, `$skip`, `$limit`, `$count`, `$project`, `$set`, `$addFields`,
 `$unset`, and `$group` stages and returns the same

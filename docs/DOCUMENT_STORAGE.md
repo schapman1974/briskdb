@@ -11,7 +11,7 @@ listener or a high-level embedded collection API.
 ## Logical catalog
 
 Manifest format 14 introduced document namespaces separate from the SQL table
-catalog, and the current format 15 retains that contract. A SQL table can
+catalog, and the current format 16 retains that separation. A SQL table can
 never become a collection through schema discovery. The manifest stores:
 
 - exact, case-sensitive database and collection names;
@@ -20,15 +20,16 @@ never become a collection through schema discovery. The manifest stores:
   versions;
 - one mandatory unique `_id_` definition per active collection;
 - user index declarations and their `PendingBuild` or `Ready` lifecycle; and
-- a checksummed, single-operation collection-provisioning cursor.
+- checksummed, mutually exclusive provisioning and deletion journals; and
+- permanent database/collection identity high-water marks, never reset by drops.
 
 Database names contain 1 to 63 UTF-8 bytes. A complete
 `database.collection` namespace contains at most 255 UTF-8 bytes. Names are
 compared byte-for-byte and may not contain NUL. Mongo names are not normalized
 through BriskDB's lowercase SQL identifier rules.
 
-All four document catalog tables participate in semantic manifest digest
-version 7. Every supported mutation uses an immediate SQLite transaction,
+All six document catalog tables participate in semantic manifest digest
+version 8. Every supported mutation uses an immediate SQLite transaction,
 validates the complete catalog, refreshes the digest, and commits the metadata
 as one unit. Startup validates exact table definitions, foreign keys, row and
 byte bounds, supported versions, namespace limits, built-in index state, and
@@ -92,8 +93,34 @@ A retained cursor forces sole-process startup ownership. Restart resumes the
 exact remaining shard prefix idempotently. An active collection with a missing
 or incompatible table is corruption. An exact document table without catalog
 authority is also rejected. Builds without the `documents` feature still
-understand current manifest format 15 and validate its physical schema, but
-refuse to open a root containing active collections.
+understand current manifest format 16 and validate its physical schema, but
+refuse to open a root containing collections or a pending deletion.
+
+## Namespace deletion and restart
+
+Dropping a collection or logical document database requires sole-process schema
+ownership and drains admitted operations before mutation. One manifest transaction
+records the exact database ID, optional collection ID (null means the whole
+database), operation identity, shard count, and `next_shard = 0`. Each shard
+deletes only the targeted collection IDs in one transaction; a separate sealed
+manifest transaction acknowledges its progress. Replay of an unacknowledged
+shard is idempotent. If no collections will remain anywhere, each shard removes
+the exact optional document table instead. SQL tables, shard files, and other
+document databases are untouched.
+
+After all shards commit, one manifest transaction removes the targeted index
+and collection metadata, the now-empty logical database, and the journal.
+Database and collection IDs are allocated from durable high-water marks in the
+same transaction as catalog creation. Exhaustion fails instead of reusing IDs.
+Dropping and recreating a name therefore cannot make a retained cursor read the
+new collection, including cursors held by another in-process engine.
+
+Cancellation before intent commit leaves data unchanged. Interruption after
+that commit leaves the root fenced until reopen completes the authorized drop;
+it is not a rollback guarantee. Startup requires sole-process ownership and
+finishes the remaining shard prefix before publishing Ready. The crash suite
+exits a child process before/after intent, each shard transaction, each progress
+acknowledgement, and finalization, for both drop scopes with/without survivors.
 
 ## TinyMongo SQLite import
 

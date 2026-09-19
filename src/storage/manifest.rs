@@ -48,7 +48,8 @@ const V12_SCHEMA_VERSION: u32 = 12;
 const V13_SCHEMA_VERSION: u32 = 13;
 const V14_SCHEMA_VERSION: u32 = 14;
 const V15_SCHEMA_VERSION: u32 = 15;
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = V15_SCHEMA_VERSION;
+const V16_SCHEMA_VERSION: u32 = 16;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = V16_SCHEMA_VERSION;
 const MAX_TABLE_SQL_BYTES: i64 = 4_096;
 
 pub(super) const DOCUMENT_CATALOG_VERSION: u32 = 1;
@@ -91,6 +92,7 @@ const V4_MANIFEST_DIGEST_VERSION: u32 = 4;
 const V5_MANIFEST_DIGEST_VERSION: u32 = 5;
 const V6_MANIFEST_DIGEST_VERSION: u32 = 6;
 const V7_MANIFEST_DIGEST_VERSION: u32 = 7;
+const V8_MANIFEST_DIGEST_VERSION: u32 = 8;
 pub(super) const SCHEMA_DIGEST_VERSION: u32 = 1;
 const V1_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v1\0";
 const V2_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v2\0";
@@ -99,6 +101,7 @@ const V4_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v4\0";
 const V5_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v5\0";
 const V6_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v6\0";
 const V7_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v7\0";
+const V8_MANIFEST_DIGEST_DOMAIN: &[u8] = b"briskdb.manifest.semantic-root.v8\0";
 const TABLE_PROVISIONING_DIGEST_DOMAIN: &[u8] = b"briskdb.table-provisioning.v1\0";
 const GENERATED_TABLE_DDL_DIGEST_DOMAIN: &[u8] = b"briskdb.generated-table-ddl.v1\0";
 
@@ -261,6 +264,10 @@ const V14_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
 const V15_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
         CHECK (requires_manifest_version >= 15)
+) STRICT";
+const V16_DOWNGRADE_FENCE_SQL: &str = "CREATE TABLE briskdb_metadata (
+    requires_manifest_version INTEGER NOT NULL
+        CHECK (requires_manifest_version >= 16)
 ) STRICT";
 const V3_ROUTING_TABLE_SQL: &str = "CREATE TABLE briskdb_routing (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -784,6 +791,24 @@ const V14_DOCUMENT_PROVISIONING_TABLE_SQL: &str = "CREATE TABLE briskdb_document
     FOREIGN KEY (collection_id)
         REFERENCES briskdb_document_collections (collection_id)
         ON DELETE RESTRICT
+) STRICT";
+const V16_DOCUMENT_IDENTITIES_TABLE_SQL: &str = "CREATE TABLE briskdb_document_identities (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    database_high_water INTEGER NOT NULL CHECK (database_high_water >= 0),
+    collection_high_water INTEGER NOT NULL CHECK (collection_high_water >= 0)
+) STRICT";
+const V16_DOCUMENT_DELETION_TABLE_SQL: &str = "CREATE TABLE briskdb_document_deletion (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    database_id INTEGER NOT NULL CHECK (database_id > 0),
+    collection_id INTEGER CHECK (collection_id > 0),
+    operation_id BLOB NOT NULL
+        CHECK (typeof(operation_id) = 'blob' AND length(operation_id) = 32),
+    shard_count INTEGER NOT NULL CHECK (shard_count BETWEEN 2 AND 64),
+    next_shard INTEGER NOT NULL CHECK (next_shard BETWEEN 0 AND shard_count),
+    FOREIGN KEY (database_id)
+        REFERENCES briskdb_document_databases (database_id) ON DELETE RESTRICT,
+    FOREIGN KEY (collection_id)
+        REFERENCES briskdb_document_collections (collection_id) ON DELETE RESTRICT
 ) STRICT";
 const V5_SHARD_LAYOUT_TABLE_SQL: &str = "CREATE TABLE briskdb_shard_layout (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1382,6 +1407,13 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_v14_to_v15,
         validate: validate_v15,
     },
+    Migration {
+        from: V15_SCHEMA_VERSION,
+        to: V16_SCHEMA_VERSION,
+        name: "durable_document_identities_and_deletion",
+        apply: migrate_v15_to_v16,
+        validate: validate_v16,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -1395,8 +1427,8 @@ struct MigrationPlan<'a> {
 const CURRENT_PLAN: MigrationPlan<'static> = MigrationPlan {
     current_version: CURRENT_SCHEMA_VERSION,
     migrations: MIGRATIONS,
-    initialize_current: create_v15_schema,
-    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v15,
+    initialize_current: create_v16_schema,
+    initialize_interrupted_legacy: migrate_interrupted_legacy_to_v16,
 };
 
 // Startup uses this frozen plan only to finish an already-active v6 journal
@@ -1529,7 +1561,8 @@ pub(super) fn startup_requires_exclusive_ownership(
         .is_none_or(|ddl| ddl.lifecycle() == GeneratedTableDdlLifecycle::Complete);
     let document_catalog_steady = connection
         .query_row(
-            "SELECT NOT EXISTS (SELECT 1 FROM briskdb_document_provisioning)",
+            "SELECT NOT EXISTS (SELECT 1 FROM briskdb_document_provisioning)
+                AND NOT EXISTS (SELECT 1 FROM briskdb_document_deletion)",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -3020,7 +3053,9 @@ pub(super) fn inspect_with_v9_plan_for_test(
 fn downgrade_v10_manifest_to_v9_for_test(connection: &Connection) -> EngineResult<()> {
     connection
         .execute_batch(
-            "DROP TABLE IF EXISTS briskdb_document_provisioning;
+            "DROP TABLE IF EXISTS briskdb_document_deletion;
+             DROP TABLE IF EXISTS briskdb_document_identities;
+             DROP TABLE IF EXISTS briskdb_document_provisioning;
              DROP TABLE IF EXISTS briskdb_document_indexes;
              DROP TABLE IF EXISTS briskdb_document_collections;
              DROP TABLE IF EXISTS briskdb_document_databases;
@@ -3161,7 +3196,7 @@ fn downgrade_v14_manifest_to_v13_for_test(
     connection: &Connection,
     shard_count: u16,
 ) -> EngineResult<()> {
-    if read_identity(connection)?.1 == i64::from(V15_SCHEMA_VERSION) {
+    if read_identity(connection)?.1 >= i64::from(V15_SCHEMA_VERSION) {
         downgrade_v15_manifest_to_v14_for_test(connection, shard_count)?;
     }
     connection
@@ -3199,6 +3234,9 @@ fn downgrade_v15_manifest_to_v14_for_test(
     connection: &Connection,
     shard_count: u16,
 ) -> EngineResult<()> {
+    if read_identity(connection)?.1 == i64::from(V16_SCHEMA_VERSION) {
+        downgrade_v16_manifest_to_v15_for_test(connection, shard_count)?;
+    }
     connection
         .execute_batch("DROP TABLE briskdb_metadata;")
         .map_err(sqlite_error::storage)?;
@@ -3214,6 +3252,39 @@ fn downgrade_v15_manifest_to_v14_for_test(
     set_identity(connection, V14_SCHEMA_VERSION)?;
     refresh_manifest_digest(connection)?;
     validate_v14(connection, shard_count, &schema_objects(connection)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn downgrade_v16_manifest_to_v15_for_test(
+    connection: &Connection,
+    shard_count: u16,
+) -> EngineResult<()> {
+    connection
+        .execute_batch(
+            "DROP TABLE briskdb_document_deletion;
+         DROP TABLE briskdb_document_identities;
+         DROP TABLE briskdb_metadata;",
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute_batch(V15_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V15_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    connection
+        .execute(
+            "UPDATE briskdb_integrity SET manifest_digest_version = ?1 WHERE singleton = 1",
+            [V7_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    set_identity(connection, V15_SCHEMA_VERSION)?;
+    refresh_manifest_digest(connection)?;
+    validate_v15(connection, shard_count, &schema_objects(connection)?)?;
     Ok(())
 }
 
@@ -5189,6 +5260,11 @@ fn create_v15_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineR
     migrate_v14_to_v15(transaction, shard_count)
 }
 
+fn create_v16_schema(transaction: &Transaction<'_>, shard_count: u16) -> EngineResult<()> {
+    create_v15_schema(transaction, shard_count)?;
+    migrate_v15_to_v16(transaction, shard_count)
+}
+
 fn migrate_interrupted_legacy_to_v6(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -5289,6 +5365,7 @@ fn migrate_interrupted_legacy_to_v14(
     create_v14_schema(transaction, shard_count)
 }
 
+#[cfg(test)]
 fn migrate_interrupted_legacy_to_v15(
     transaction: &Transaction<'_>,
     shard_count: u16,
@@ -5297,6 +5374,16 @@ fn migrate_interrupted_legacy_to_v15(
         .execute_batch("DROP TABLE briskdb_metadata;")
         .map_err(sqlite_error::storage)?;
     create_v15_schema(transaction, shard_count)
+}
+
+fn migrate_interrupted_legacy_to_v16(
+    transaction: &Transaction<'_>,
+    shard_count: u16,
+) -> EngineResult<()> {
+    transaction
+        .execute_batch("DROP TABLE briskdb_metadata;")
+        .map_err(sqlite_error::storage)?;
+    create_v16_schema(transaction, shard_count)
 }
 
 #[cfg(test)]
@@ -5857,6 +5944,40 @@ fn migrate_v14_to_v15(transaction: &Transaction<'_>, _shard_count: u16) -> Engin
     Ok(())
 }
 
+fn migrate_v15_to_v16(transaction: &Transaction<'_>, _shard_count: u16) -> EngineResult<()> {
+    transaction
+        .execute_batch(V16_DOCUMENT_IDENTITIES_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V16_DOCUMENT_DELETION_TABLE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(
+            "INSERT INTO briskdb_document_identities
+             (singleton, database_high_water, collection_high_water)
+         SELECT 1, (SELECT COALESCE(MAX(database_id), 0) FROM briskdb_document_databases),
+                   (SELECT COALESCE(MAX(collection_id), 0) FROM briskdb_document_collections);
+         DROP TABLE briskdb_metadata;",
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute_batch(V16_DOWNGRADE_FENCE_SQL)
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO briskdb_metadata (requires_manifest_version) VALUES (?1)",
+            [V16_SCHEMA_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    transaction
+        .execute(
+            "UPDATE briskdb_integrity SET manifest_digest_version = ?1 WHERE singleton = 1",
+            [V8_MANIFEST_DIGEST_VERSION],
+        )
+        .map_err(sqlite_error::storage)?;
+    Ok(())
+}
+
 fn add_v5_schema(transaction: &Transaction<'_>, state: ShardLayoutState) -> EngineResult<()> {
     transaction
         .execute_batch("DROP TABLE briskdb_metadata;")
@@ -6242,6 +6363,20 @@ fn v15_objects() -> Vec<SchemaObject> {
     v14_objects()
 }
 
+fn v16_objects() -> Vec<SchemaObject> {
+    let mut objects = v15_objects();
+    for name in ["briskdb_document_identities", "briskdb_document_deletion"] {
+        objects.push(SchemaObject {
+            object_type: "table".to_owned(),
+            name: name.to_owned(),
+        });
+    }
+    objects.sort_by(|left, right| {
+        (&left.object_type, &left.name).cmp(&(&right.object_type, &right.name))
+    });
+    objects
+}
+
 fn schema_objects(connection: &Connection) -> EngineResult<Vec<SchemaObject>> {
     let mut statement = connection
         .prepare(
@@ -6398,6 +6533,14 @@ fn validate_table(
         "briskdb_document_provisioning" => {
             "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
              FROM pragma_table_xinfo('briskdb_document_provisioning') LIMIT ?1"
+        }
+        "briskdb_document_identities" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_document_identities') LIMIT ?1"
+        }
+        "briskdb_document_deletion" => {
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+             FROM pragma_table_xinfo('briskdb_document_deletion') LIMIT ?1"
         }
         _ => {
             return Err(EngineError::new(
@@ -7100,6 +7243,35 @@ fn validate_v15(
     Ok(snapshot)
 }
 
+fn validate_v16(
+    connection: &Connection,
+    requested_shards: u16,
+    objects: &[SchemaObject],
+) -> EngineResult<ManifestSnapshot> {
+    let mut snapshot = validate_v12_features(
+        connection,
+        requested_shards,
+        objects,
+        IntegrityManifestDefinition {
+            version: V16_SCHEMA_VERSION,
+            downgrade_fence_sql: V16_DOWNGRADE_FENCE_SQL,
+            expected_objects: &v16_objects(),
+            expected_manifest_digest_version: V8_MANIFEST_DIGEST_VERSION,
+            generated_ids: true,
+        },
+    )?;
+    let catalog = snapshot.logical_catalog.take().ok_or_else(|| {
+        EngineError::new(
+            EngineErrorKind::Internal,
+            "document lifecycle validation omitted the logical table catalog",
+        )
+    })?;
+    let indexes = validate_global_indexes(connection, &catalog)?;
+    snapshot.logical_catalog = Some(catalog.with_global_indexes(indexes));
+    validate_document_catalog(connection, snapshot.shard_count)?;
+    Ok(snapshot)
+}
+
 /// Validate the exact document catalog schema and its cross-row lifecycle state.
 ///
 /// Document mutations call this under their own `IMMEDIATE` transaction before
@@ -7493,7 +7665,82 @@ pub(super) fn validate_document_catalog(
             "a provisioning document collection cannot have secondary indexes",
         ));
     }
+    if read_identity(connection)?.1 >= i64::from(V16_SCHEMA_VERSION) {
+        validate_document_lifecycle(connection, shard_count)?;
+    }
     validate_foreign_keys(connection)?;
+    Ok(())
+}
+
+fn validate_document_lifecycle(connection: &Connection, shard_count: u16) -> EngineResult<()> {
+    validate_table(
+        connection,
+        "briskdb_document_identities",
+        &[
+            TableColumn::expected(0, "singleton", "INTEGER", false, 1),
+            TableColumn::expected(1, "database_high_water", "INTEGER", true, 0),
+            TableColumn::expected(2, "collection_high_water", "INTEGER", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_document_identities",
+        V16_DOCUMENT_IDENTITIES_TABLE_SQL,
+    )?;
+    validate_table(
+        connection,
+        "briskdb_document_deletion",
+        &[
+            TableColumn::expected(0, "singleton", "INTEGER", false, 1),
+            TableColumn::expected(1, "database_id", "INTEGER", true, 0),
+            TableColumn::expected(2, "collection_id", "INTEGER", false, 0),
+            TableColumn::expected(3, "operation_id", "BLOB", true, 0),
+            TableColumn::expected(4, "shard_count", "INTEGER", true, 0),
+            TableColumn::expected(5, "next_shard", "INTEGER", true, 0),
+        ],
+        true,
+    )?;
+    validate_table_sql(
+        connection,
+        "briskdb_document_deletion",
+        V16_DOCUMENT_DELETION_TABLE_SQL,
+    )?;
+    let valid: bool = connection.query_row(
+        "SELECT (SELECT count(*) FROM briskdb_document_identities) = 1
+          AND EXISTS (SELECT 1 FROM briskdb_document_identities
+             WHERE singleton = 1 AND typeof(database_high_water) = 'integer'
+               AND typeof(collection_high_water) = 'integer'
+               AND database_high_water >= (SELECT COALESCE(MAX(database_id), 0) FROM briskdb_document_databases)
+               AND collection_high_water >= (SELECT COALESCE(MAX(collection_id), 0) FROM briskdb_document_collections))",
+        [], |row| row.get(0),
+    ).map_err(|error| manifest_read_error(error, "failed to validate document identities"))?;
+    if !valid {
+        return Err(invalid_document_catalog(
+            "document identity high-water marks are missing or inconsistent",
+        ));
+    }
+    let invalid: bool = connection.query_row(
+        "SELECT count(*) > 1 OR COALESCE(MAX(
+             singleton <> 1 OR typeof(database_id) <> 'integer' OR database_id <= 0
+             OR (collection_id IS NOT NULL AND (typeof(collection_id) <> 'integer' OR collection_id <= 0))
+             OR typeof(operation_id) <> 'blob' OR length(operation_id) <> 32
+             OR typeof(shard_count) <> 'integer' OR shard_count <> ?1
+             OR typeof(next_shard) <> 'integer' OR next_shard NOT BETWEEN 0 AND shard_count
+             OR EXISTS (SELECT 1 FROM briskdb_document_provisioning)
+             OR NOT EXISTS (SELECT 1 FROM briskdb_document_databases AS d WHERE d.database_id = briskdb_document_deletion.database_id)
+             OR (collection_id IS NOT NULL AND NOT EXISTS (
+                 SELECT 1 FROM briskdb_document_collections AS c
+                 WHERE c.collection_id = briskdb_document_deletion.collection_id
+                   AND c.database_id = briskdb_document_deletion.database_id AND c.lifecycle_state = 2))
+         ), 0) FROM briskdb_document_deletion",
+        [shard_count], |row| row.get(0),
+    ).map_err(|error| manifest_read_error(error, "failed to validate document deletion journal"))?;
+    if invalid {
+        return Err(invalid_document_catalog(
+            "document deletion journal is inconsistent with its catalog",
+        ));
+    }
     Ok(())
 }
 
@@ -8598,7 +8845,7 @@ fn validate_manifest_semantic_root(
             "manifest checksum version must be positive",
         ));
     }
-    if *version > i64::from(V7_MANIFEST_DIGEST_VERSION) {
+    if *version > i64::from(V8_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -8896,6 +9143,23 @@ const V7_DOCUMENT_PROVISIONING_DIGEST_QUERY: ManifestDigestQuery = ManifestDiges
     ],
     sql: "SELECT singleton, collection_id, operation_id, shard_count, next_shard FROM briskdb_document_provisioning ORDER BY singleton",
 };
+const V8_DOCUMENT_IDENTITIES_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
+    table: "briskdb_document_identities",
+    columns: &["singleton", "database_high_water", "collection_high_water"],
+    sql: "SELECT singleton, database_high_water, collection_high_water FROM briskdb_document_identities ORDER BY singleton",
+};
+const V8_DOCUMENT_DELETION_DIGEST_QUERY: ManifestDigestQuery = ManifestDigestQuery {
+    table: "briskdb_document_deletion",
+    columns: &[
+        "singleton",
+        "database_id",
+        "collection_id",
+        "operation_id",
+        "shard_count",
+        "next_shard",
+    ],
+    sql: "SELECT singleton, database_id, collection_id, operation_id, shard_count, next_shard FROM briskdb_document_deletion ORDER BY singleton",
+};
 
 fn manifest_semantic_digest_for_version(
     connection: &Connection,
@@ -8986,8 +9250,8 @@ fn manifest_semantic_digest_for_version(
             }
             (V6_MANIFEST_DIGEST_DOMAIN, queries)
         }
-        V7_MANIFEST_DIGEST_VERSION => {
-            let mut queries = Vec::with_capacity(V1_MANIFEST_DIGEST_QUERIES.len() + 12);
+        V7_MANIFEST_DIGEST_VERSION | V8_MANIFEST_DIGEST_VERSION => {
+            let mut queries = Vec::with_capacity(V1_MANIFEST_DIGEST_QUERIES.len() + 14);
             for query in V1_MANIFEST_DIGEST_QUERIES {
                 queries.push(query);
                 if query.table == "briskdb_logical_databases" {
@@ -8995,6 +9259,10 @@ fn manifest_semantic_digest_for_version(
                     queries.push(&V7_DOCUMENT_COLLECTIONS_DIGEST_QUERY);
                     queries.push(&V7_DOCUMENT_INDEXES_DIGEST_QUERY);
                     queries.push(&V7_DOCUMENT_PROVISIONING_DIGEST_QUERY);
+                    if digest_version == V8_MANIFEST_DIGEST_VERSION {
+                        queries.push(&V8_DOCUMENT_IDENTITIES_DIGEST_QUERY);
+                        queries.push(&V8_DOCUMENT_DELETION_DIGEST_QUERY);
+                    }
                 }
                 if query.table == "briskdb_physical_shards" {
                     queries.push(&V3_ALLOCATION_OWNERS_DIGEST_QUERY);
@@ -9009,7 +9277,14 @@ fn manifest_semantic_digest_for_version(
                     queries.push(&V3_TABLE_PROVISIONING_DECLARATIONS_DIGEST_QUERY);
                 }
             }
-            (V7_MANIFEST_DIGEST_DOMAIN, queries)
+            (
+                if digest_version == V8_MANIFEST_DIGEST_VERSION {
+                    V8_MANIFEST_DIGEST_DOMAIN
+                } else {
+                    V7_MANIFEST_DIGEST_DOMAIN
+                },
+                queries,
+            )
         }
         0 => {
             return Err(EngineError::new(
@@ -9153,7 +9428,8 @@ fn refresh_manifest_digest_if_checksummed(connection: &Connection) -> EngineResu
                 | V12_SCHEMA_VERSION
                 | V13_SCHEMA_VERSION
                 | V14_SCHEMA_VERSION
-                | V15_SCHEMA_VERSION)
+                | V15_SCHEMA_VERSION
+                | V16_SCHEMA_VERSION)
         )
     {
         let _ = refresh_manifest_digest(connection)?;
@@ -9217,7 +9493,7 @@ fn validate_manifest_integrity(
             "manifest checksum version must be positive",
         ));
     }
-    if *manifest_version > i64::from(V7_MANIFEST_DIGEST_VERSION) {
+    if *manifest_version > i64::from(V8_MANIFEST_DIGEST_VERSION) {
         return Err(EngineError::new(
             EngineErrorKind::FailedPrecondition,
             "manifest checksum version is newer than this BriskDB build supports",
@@ -11361,6 +11637,118 @@ mod tests {
         initialize_interrupted_legacy: migrate_interrupted_legacy_to_v14,
     };
 
+    const V15_PLAN: MigrationPlan<'static> = MigrationPlan {
+        current_version: V15_SCHEMA_VERSION,
+        migrations: MIGRATIONS,
+        initialize_current: create_v15_schema,
+        initialize_interrupted_legacy: migrate_interrupted_legacy_to_v15,
+    };
+
+    #[test]
+    fn v16_document_lifecycle_upgrade_is_atomic_preserves_ids_and_fences_old_readers() {
+        for phase in [
+            MigrationPhase::AfterSchemaChange,
+            MigrationPhase::AfterVersionStamp,
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_ready_current_manifest(&mut connection, 4);
+            insert_active_document_catalog(&connection);
+            downgrade_v16_manifest_to_v15_for_test(&connection, 4).unwrap();
+            let objects = schema_objects(&connection).unwrap();
+            let root = stored_manifest_digest(&connection);
+            let error = load_or_create_with_hook(&mut connection, 4, |point| {
+                if point.from == V15_SCHEMA_VERSION && point.phase == phase {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Internal,
+                        "injected document lifecycle migration failure",
+                    ));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Internal);
+            assert_eq!(identity(&connection).1, 15);
+            assert_eq!(schema_objects(&connection).unwrap(), objects);
+            assert_eq!(stored_manifest_digest(&connection), root);
+            load_or_create_manifest(&mut connection, 4).unwrap();
+            let high_water: (i64, i64) = connection.query_row("SELECT database_high_water, collection_high_water FROM briskdb_document_identities", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            assert_eq!(high_water, (7, 11));
+            assert_eq!(schema_objects(&connection).unwrap(), v16_objects());
+            assert_eq!(
+                inspect_with_plan(&connection, 4, V15_PLAN)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition
+            );
+            assert!(!startup_requires_exclusive_ownership(&connection, 4).unwrap());
+            connection
+                .execute(
+                    "INSERT INTO briskdb_document_deletion VALUES (1, 7, 11, zeroblob(32), 4, 0)",
+                    [],
+                )
+                .unwrap();
+            refresh_manifest_digest(&connection).unwrap();
+            validate_document_catalog(&connection, 4).unwrap();
+            assert!(startup_requires_exclusive_ownership(&connection, 4).unwrap());
+        }
+    }
+
+    #[test]
+    fn document_lifecycle_high_water_and_journal_invariants_are_checksum_authority() {
+        for mutation in [
+            "DELETE FROM briskdb_document_identities",
+            "UPDATE briskdb_document_identities SET database_high_water = 6",
+            "UPDATE briskdb_document_identities SET collection_high_water = 10",
+            "UPDATE briskdb_document_identities SET collection_high_water = -1",
+            "UPDATE briskdb_document_deletion SET database_id = 8",
+            "UPDATE briskdb_document_deletion SET collection_id = 12",
+            "UPDATE briskdb_document_deletion SET next_shard = 5",
+            "UPDATE briskdb_document_deletion SET next_shard = -1",
+            "UPDATE briskdb_document_deletion SET shard_count = 3",
+            "UPDATE briskdb_document_deletion SET operation_id = zeroblob(31)",
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_ready_current_manifest(&mut connection, 4);
+            insert_active_document_catalog(&connection);
+            connection
+                .execute(
+                    "INSERT INTO briskdb_document_deletion VALUES (1, 7, 11, zeroblob(32), 4, 0)",
+                    [],
+                )
+                .unwrap();
+            refresh_manifest_digest(&connection).unwrap();
+            connection
+                .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            connection.execute_batch(mutation).unwrap();
+            assert_document_manifest_corruption(&connection);
+            refresh_manifest_digest(&connection).unwrap();
+            assert_document_manifest_corruption(&connection);
+        }
+        for mutation in [
+            "UPDATE briskdb_document_identities SET database_high_water = 100",
+            "UPDATE briskdb_document_identities SET collection_high_water = 100",
+            "UPDATE briskdb_document_deletion SET collection_id = NULL",
+            "UPDATE briskdb_document_deletion SET next_shard = 1",
+            "UPDATE briskdb_document_deletion SET operation_id = randomblob(32)",
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            create_ready_current_manifest(&mut connection, 4);
+            insert_active_document_catalog(&connection);
+            connection
+                .execute(
+                    "INSERT INTO briskdb_document_deletion VALUES (1, 7, 11, zeroblob(32), 4, 0)",
+                    [],
+                )
+                .unwrap();
+            refresh_manifest_digest(&connection).unwrap();
+            connection.execute_batch(mutation).unwrap();
+            assert_document_manifest_corruption(&connection);
+            refresh_manifest_digest(&connection).unwrap();
+            validate_document_catalog(&connection, 4).unwrap();
+        }
+    }
+
     fn create_legacy_manifest(connection: &Connection, shards: u16, version: u32) {
         create_empty_legacy_manifest(connection);
         connection
@@ -11742,6 +12130,9 @@ mod tests {
                  VALUES (11, '_id_', x'0500000000', 1, 1, 1, 1);",
             )
             .unwrap();
+        if read_identity(connection).unwrap().1 >= i64::from(V16_SCHEMA_VERSION) {
+            connection.execute("UPDATE briskdb_document_identities SET database_high_water = 7, collection_high_water = 11 WHERE singleton = 1", []).unwrap();
+        }
         refresh_manifest_digest(connection).unwrap();
         validate_document_catalog(connection, 4).unwrap();
     }
@@ -11828,7 +12219,7 @@ mod tests {
             identity(connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(connection).unwrap(), v15_objects());
+        assert_eq!(schema_objects(connection).unwrap(), v16_objects());
         assert_eq!(
             connection
                 .query_row(
@@ -11895,7 +12286,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V7_MANIFEST_DIGEST_VERSION)
+            i64::from(V8_MANIFEST_DIGEST_VERSION)
         );
         let (layout_id, application_id, metadata_version, state) = shard_layout_row(connection);
         assert_eq!(layout_id.len(), 16);
@@ -12017,6 +12408,7 @@ mod tests {
                 (12, 13),
                 (13, 14),
                 (14, 15),
+                (15, 16),
             ]
         );
         assert_generation_one_catalog(&connection, 4);
@@ -12087,7 +12479,7 @@ mod tests {
 
                 load_or_create_manifest(&mut connection, 4).unwrap();
                 assert_eq!(identity(&connection).1, i64::from(CURRENT_SCHEMA_VERSION));
-                assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
+                assert_eq!(schema_objects(&connection).unwrap(), v16_objects());
                 assert_eq!(
                     connection
                         .query_row(
@@ -12096,7 +12488,7 @@ mod tests {
                             |row| row.get::<_, i64>(0),
                         )
                         .unwrap(),
-                    i64::from(V7_MANIFEST_DIGEST_VERSION)
+                    i64::from(V8_MANIFEST_DIGEST_VERSION)
                 );
                 assert_eq!(
                     connection
@@ -12637,7 +13029,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v16_objects());
         assert_eq!(table_metadata_rows(&connection), tables_before);
         assert_eq!(logical_databases(&connection), databases_before);
         assert_eq!(routing_configuration(&connection), routing_before);
@@ -12680,7 +13072,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            i64::from(V7_MANIFEST_DIGEST_VERSION)
+            i64::from(V8_MANIFEST_DIGEST_VERSION)
         );
         assert_eq!(
             manifest_semantic_digest(&connection).unwrap(),
@@ -12742,7 +13134,9 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE briskdb_document_provisioning;
+                "DROP TABLE briskdb_document_deletion;
+                 DROP TABLE briskdb_document_identities;
+                 DROP TABLE briskdb_document_provisioning;
                  DROP TABLE briskdb_document_indexes;
                  DROP TABLE briskdb_document_collections;
                  DROP TABLE briskdb_document_databases;
@@ -13220,7 +13614,7 @@ mod tests {
                     identity(&connection),
                     (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
                 );
-                assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
+                assert_eq!(schema_objects(&connection).unwrap(), v16_objects());
                 assert_eq!(
                     manifest_semantic_digest(&connection).unwrap(),
                     stored_manifest_digest(&connection)
@@ -13813,7 +14207,7 @@ mod tests {
     #[test]
     fn integrity_versions_lengths_and_forged_state_invariants_fail_closed() {
         for (version_column, unsupported_version) in
-            [("manifest_digest_version", 8), ("schema_digest_version", 2)]
+            [("manifest_digest_version", 9), ("schema_digest_version", 2)]
         {
             let mut unsupported = Connection::open_in_memory().unwrap();
             create_ready_current_manifest(&mut unsupported, 4);
@@ -14041,7 +14435,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v16_objects());
         assert_eq!(
             shard_layout_row(&connection).3,
             ShardLayoutState::Adopting.code()
@@ -14065,7 +14459,7 @@ mod tests {
             identity(&connection),
             (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
         );
-        assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
+        assert_eq!(schema_objects(&connection).unwrap(), v16_objects());
         assert_eq!(layout.state(), ShardLayoutState::Ready);
         assert_eq!(shard_layout_row(&connection), layout_before);
         assert_eq!(catalog.logical().schema_generation(), 0);
@@ -14157,7 +14551,7 @@ mod tests {
                 identity(&connection),
                 (MANIFEST_APPLICATION_ID, i64::from(CURRENT_SCHEMA_VERSION))
             );
-            assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
+            assert_eq!(schema_objects(&connection).unwrap(), v16_objects());
         }
 
         let mut connection = Connection::open_in_memory().unwrap();
@@ -15777,7 +16171,7 @@ mod tests {
         for mutation in [
             "DELETE FROM briskdb_metadata",
             "DELETE FROM briskdb_manifest",
-            "UPDATE briskdb_metadata SET requires_manifest_version = 16",
+            "UPDATE briskdb_metadata SET requires_manifest_version = 17",
             "DELETE FROM briskdb_routing",
             "DELETE FROM briskdb_virtual_buckets WHERE bucket_id = 4095",
             "DELETE FROM briskdb_physical_shards WHERE shard_id = 3",
@@ -16525,7 +16919,7 @@ mod tests {
 
             load_or_create_manifest(&mut connection, 4).unwrap();
             assert_eq!(identity(&connection).1, i64::from(CURRENT_SCHEMA_VERSION));
-            assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
+            assert_eq!(schema_objects(&connection).unwrap(), v16_objects());
             assert_eq!(
                 connection
                     .query_row(
@@ -16538,7 +16932,7 @@ mod tests {
                     .unwrap(),
                 (
                     i64::from(CURRENT_SCHEMA_VERSION),
-                    i64::from(V7_MANIFEST_DIGEST_VERSION)
+                    i64::from(V8_MANIFEST_DIGEST_VERSION)
                 )
             );
             for table in [
@@ -16603,8 +16997,8 @@ mod tests {
             );
 
             load_or_create_manifest(&mut connection, 4).unwrap();
-            assert_eq!(identity(&connection).1, i64::from(V15_SCHEMA_VERSION));
-            assert_eq!(schema_objects(&connection).unwrap(), v15_objects());
+            assert_eq!(identity(&connection).1, i64::from(CURRENT_SCHEMA_VERSION));
+            assert_eq!(schema_objects(&connection).unwrap(), v16_objects());
             assert_eq!(
                 connection
                     .query_row(
@@ -16616,8 +17010,8 @@ mod tests {
                     )
                     .unwrap(),
                 (
-                    i64::from(V15_SCHEMA_VERSION),
-                    i64::from(V7_MANIFEST_DIGEST_VERSION)
+                    i64::from(CURRENT_SCHEMA_VERSION),
+                    i64::from(V8_MANIFEST_DIGEST_VERSION)
                 )
             );
             assert_eq!(
@@ -16821,6 +17215,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        connection.execute("UPDATE briskdb_document_identities SET database_high_water = 7, collection_high_water = 11 WHERE singleton = 1", []).unwrap();
         refresh_manifest_digest(&connection).unwrap();
         validate_document_catalog(&connection, 4).unwrap();
 

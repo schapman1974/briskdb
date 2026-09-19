@@ -58,6 +58,7 @@ The current engine executes:
 | Command | Current behavior |
 | --- | --- |
 | `CreateCollection` | Provisions the catalog entry and fixed document table on every shard, then returns the active collection metadata |
+| `DropCollection` / `DropDatabase` | Durably removes the exact collection or logical document database; returns `NamespaceDropped(bool)` indicating whether it existed |
 | `CollectionExists` | Checks one exact namespace without enumerating unrelated collections; returns a boolean without creating metadata |
 | `ListCollections` | Returns collection metadata for one exact database name |
 | `CreateIndex` | Declares index metadata and returns its name; non-built-in indexes remain pending until physical index work lands |
@@ -76,6 +77,15 @@ accounting. Its result is independent of catalog page size and unrelated metadat
 size. Missing databases/collections return false; names are exact and case-sensitive.
 The wire adapter uses this same command for absent-collection handling instead of
 listing the catalog. Existence and a later read/write are not one atomic operation.
+
+Namespace drops share the schema-migration gate and require sole-process
+ownership. Preflight errors leave data unchanged; interruption after the durable
+deletion intent requires reopen to finish the drop before ordinary operations
+resume. See [deletion recovery](DOCUMENT_STORAGE.md#namespace-deletion-and-restart).
+Missing targets return false without creating metadata. Dropping the last
+collection removes its empty logical database. Monotonic catalog identities
+prevent stale find/aggregate cursors from reading a recreated namespace; their
+next admitted continuation fails and releases state (or idle expiry cleans it).
 
 An exact `_id` filter, including `{_id: {$eq: value}}`, produces a
 `DocumentPlan::Point` with one collection and one physical shard. Other filters

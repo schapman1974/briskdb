@@ -31,7 +31,7 @@ def _process_worker(
     go: str,
     output: str,
 ) -> None:
-    database = briskdb.open(root, shards=SHARDS)
+    database = briskdb.open(root, shards=SHARDS, documents=mode == "document_hold")
     session = database.session(routing_key=route)
     Path(ready).touch()
     _wait_for(Path(go))
@@ -236,6 +236,37 @@ class MultiprocessBriskDbTests(unittest.TestCase):
             self.assertEqual(session.migrate(migration), list(range(SHARDS)))
             session.close()
             database.close()
+
+    def test_document_drops_are_busy_without_mutation_until_peer_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=SHARDS, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection("app", "items")
+                    session.insert_one("app", "items", {"_id": 1, "v": "preserved"})
+            ready = Path(root) / "document-holder-ready"
+            release = Path(root) / "document-holder-release"
+            output = Path(root) / "document-holder-output"
+            process = self._spawn(root, "document_hold", "holder", 0, ready, release, output)
+            _wait_for(ready)
+            try:
+                with briskdb.open(root, shards=SHARDS, documents=True) as database:
+                    with database.session() as session:
+                        for drop in (
+                            lambda: session.drop_collection("app", "items"),
+                            lambda: session.drop_database("app"),
+                        ):
+                            with self.assertRaises(briskdb.BusyError) as raised:
+                                drop()
+                            self.assertTrue(raised.exception.retryable)
+                            self.assertEqual(session.find("app", "items", {})["documents"],
+                                             [{"_id": 1, "v": "preserved"}])
+                        release.touch()
+                        self.assertEqual(_join_process(process), 0)
+                        self.assertTrue(session.drop_database("app")["existed"])
+                        self.assertFalse(session.drop_database("app")["existed"])
+            finally:
+                release.touch()
+                _join_process(process)
 
 
 if __name__ == "__main__":

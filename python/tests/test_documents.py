@@ -52,6 +52,40 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_namespace_drop_scope_identity_cursor_controls_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertFalse(session.drop_database(DATABASE)["existed"])
+                    first = session.create_collection(DATABASE, COLLECTION)["collection"]["id"]
+                    session.create_collection(DATABASE, "keep")
+                    for index in range(4):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": index})
+                    session.insert_one(DATABASE, "keep", {"_id": 1})
+                    page = session.aggregate(DATABASE, COLLECTION, [{"$sort": {"_id": -1}}], batch_size=1)
+                    identifier = uuid.uuid4()
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.drop_database(DATABASE, cancellation=token)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.drop_collection(DATABASE, COLLECTION, max_result_bytes=1)
+                    result = session.drop_collection(DATABASE, COLLECTION, request_id=identifier)
+                    self.assertEqual(result, {"kind": "namespace_dropped", "existed": True, "request_id": identifier, "plan": None})
+                    self.assertFalse(session.drop_collection(DATABASE, COLLECTION)["existed"])
+                    second = session.create_collection(DATABASE, COLLECTION)["collection"]["id"]
+                    self.assertGreater(second, first)
+                    session.insert_one(DATABASE, COLLECTION, {"_id": 99})
+                    with self.assertRaises(briskdb.FailedPreconditionError):
+                        session.get_more(DATABASE, COLLECTION, page["cursor_id"])
+                    self.assertEqual(session.count_documents(DATABASE, "keep")["count"], 1)
+                    self.assertTrue(session.drop_database(DATABASE)["existed"])
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertFalse(session.collection_exists(DATABASE, COLLECTION)["exists"])
+                    self.assertGreater(session.create_collection(DATABASE, COLLECTION)["collection"]["id"], second)
+                    self.assertEqual(session.count_documents(DATABASE, COLLECTION)["count"], 0)
+
     def test_computed_group_keys_and_literal_count_match_direct_count(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             documents = [{"_id": index, "k": Int64(1) if index == 0 else 1.0} for index in range(9)] + [{"_id": 9}]
@@ -1084,6 +1118,20 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_namespace_drop_and_recreate(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=4, documents=True) as database:
+                async with await database.session() as session:
+                    first = (await session.create_collection(DATABASE, COLLECTION))["collection"]["id"]
+                    await session.insert_one(DATABASE, COLLECTION, {"_id": 1})
+                    identifier = uuid.uuid4()
+                    result = await session.drop_collection(DATABASE, COLLECTION, request_id=identifier, timeout_ms=10000, max_result_rows=1, max_result_bytes=128)
+                    self.assertTrue(result["existed"])
+                    self.assertEqual(result["request_id"], identifier)
+                    self.assertFalse((await session.drop_database(DATABASE))["existed"])
+                    self.assertGreater((await session.create_collection(DATABASE, COLLECTION))["collection"]["id"], first)
+                    self.assertTrue((await session.drop_database(DATABASE))["existed"])
+
     async def test_async_computed_group_key_error_and_literal_count(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=4, documents=True) as database:
