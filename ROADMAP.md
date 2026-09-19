@@ -499,7 +499,7 @@ requires an earlier dependency:
       engine-owned cursors. Tests cover BSON fidelity, numeric-equivalent IDs,
       cross-interface access, restart, host enablement, one-way writes, and
       response limits. Missing collections read empty without creating metadata.
-      Updates/deletes, metadata cursors, and full collection
+      Updates/deletes, index metadata cursors, and full database
       lifecycle remain open.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
@@ -527,7 +527,8 @@ requires an earlier dependency:
       retaining SQLite leases. Required tests exercise real sync/async drivers,
       restart, ownership, byte limits, and exhaustion. Aggregate cursors now
       share the same ownership/cleanup/quotas, retaining streaming stage counters
-      or bounded blocking-stage results. Metadata cursor consumers remain open;
+      or bounded blocking-stage results. Collection metadata now shares these
+      limits with filtered, byte-bounded pages; index metadata cursors remain open;
       no cross-shard or cross-batch snapshot is promised.
     - [ ] [#172](https://github.com/schapman1974/briskdb/issues/172) — basic find
       projection now shares one Rust transform across embedded and wire APIs.
@@ -605,8 +606,10 @@ requires an earlier dependency:
       now share that engine across all adapters, with checksummed shard-progress
       recovery and non-reused catalog identities protecting retained cursors.
       Format 16 upgrades preserve existing data; interrupted accepted drops roll
-      forward on reopen. Explicit wire creation, database listings, and retained
-      collection metadata cursors remain open.
+      forward on reopen. Explicit plain wire creation and retained collection
+      metadata cursors now share the engine. Names/full metadata, filters, stable
+      UUIDs, and pooled getMore work with real sync/async PyMongo. Database
+      listings and advanced creation options remain open.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.

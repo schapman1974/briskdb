@@ -17,9 +17,10 @@ use briskdb::document::{
     DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
     DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
     DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
-    DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
-    DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentReadOptions, DocumentRequest,
-    DocumentRequestId, DocumentSort, DocumentWriteOptions,
+    DocumentListCollectionMetadataRequest, DocumentListCollectionsRequest,
+    DocumentListIndexesRequest, DocumentMutationScope, DocumentNamespace, DocumentPipeline,
+    DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentSort,
+    DocumentWriteOptions,
 };
 use briskdb::{
     BriskCursor, BriskDb, BriskSession, BriskTransaction,
@@ -1421,6 +1422,42 @@ impl Session {
         self.execute_document_command(
             py,
             command,
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (database, filter = None, *, name_only = false, batch_size = 101, batch_byte_limit = None, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn list_collection_metadata(
+        &self,
+        py: Python<'_>,
+        database: String,
+        filter: Option<Py<PyAny>>,
+        name_only: bool,
+        batch_size: u64,
+        batch_byte_limit: Option<u64>,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let filter = document_filter(py, filter.as_ref(), self.shared.uuid_representation)?;
+        let mut options = document_read_options(0, None, batch_size)?;
+        if let Some(bytes) = batch_byte_limit {
+            options = python_engine_result(options.with_batch_byte_limit(bytes))?;
+        }
+        let request = python_engine_result(DocumentListCollectionMetadataRequest::new(
+            database, filter, name_only, options,
+        ))?;
+        self.execute_document_command(
+            py,
+            DocumentCommand::ListCollectionMetadata(request),
             request_id,
             timeout_ms,
             cancellation.as_deref(),

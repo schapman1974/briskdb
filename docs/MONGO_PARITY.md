@@ -85,19 +85,43 @@ integer 1 and succeeds even when absent. Success replies contain `ok: 1.0` only.
 Drops preserve unrelated namespaces and SQL storage, and stale cursors cannot
 read a recreated collection. Interruption after durable intent requires reopen
 to finish deletion before normal operations resume; this is not rollback.
-Explicit wire `create`, database listings, and collection metadata cursors remain
-unimplemented. See [the recovery contract](DOCUMENT_STORAGE.md#namespace-deletion-and-restart).
+Plain explicit wire `create` is also supported: the same name and empty options
+are idempotent; PyMongo's default `check_exists=True` detects duplicates through
+collection discovery. Capped collections, validators, collation, views, time
+series, and other nonempty wire creation options fail before mutation. See
+[the recovery contract](DOCUMENT_STORAGE.md#namespace-deletion-and-restart).
+
+`listCollections` and sync/async PyMongo `list_collections()` /
+`list_collection_names()` return engine-owned metadata cursors. The optional
+`cursor` document accepts `batchSize` (0–1000); for example,
+`db.list_collections(cursor={"batchSize": 1})`. Shared BSON filters are compiled
+even for absent databases and zero-sized initial batches. `nameOnly: true`
+returns only `name`/`type` and filters those fields; full results additionally
+contain persisted `options`, `info.readOnly: false`, `info.uuid`, and the actual
+unique `_id_` index definition (without a fictitious Mongo index format version).
+No SQL or internal catalog tables appear. Missing databases return empty without
+creation. `authorizedCollections` accepts a boolean: this unauthenticated
+standalone listener has no collection-level privileges to filter.
+
+Metadata cursors use namespace `database.$cmd.listCollections`, shared quotas,
+byte limits, expiry/cancellation cleanup, and pooled-socket getMore/killCursors.
+They scan a validated manifest snapshot per page, retaining only bounded filter
+and position state. An opening allocation ceiling excludes later creations;
+deleted rows can disappear, and a dropped/recreated database invalidates the
+cursor. There is no cross-batch snapshot promise. Collection UUIDv8 identity
+survives reopen and backup, changes on drop/recreate, and differs for independent
+roots. Database listings/statistics and index metadata cursors remain open.
 
 For these data commands, unknown fields and unsupported option values fail
 before storage admission. The current option contract is:
 
 | Option | Accepted behavior |
 | --- | --- |
-| `maxTimeMS` | Nonnegative integer; a positive value narrows the 15-second command deadline. Find and aggregate retain the remaining execution budget across batches; client idle time is not charged. Positive getMore values require unsupported tailable/awaitData semantics and are rejected. |
+| `maxTimeMS` | Nonnegative integer; a positive value narrows the 15-second command deadline. Find, aggregate, and collection metadata retain the remaining execution budget across batches; client idle time is not charged. Positive getMore values require unsupported tailable/awaitData semantics and are rejected. |
 | `$readPreference` | A document containing only a recognized `mode`; the standalone engine serves the request |
 | `ordered` | Boolean; defaults to `true`, with ordered/unordered partial-failure behavior |
 | Insert `writeConcern` | Omitted/empty, or `w` equal to 0 or 1, `j: false`, and `wtimeout: 0`; no replication or stronger durability is promised |
-| Drop `writeConcern` / `comment` | Same concern subset except `w: 0` is rejected; comment must be omitted or null (PyMongo's default). No replication or unacknowledged drop. |
+| Drop/create `writeConcern` / `comment` | Same concern subset except `w: 0` is rejected; comment must be omitted or null (PyMongo's default). No replication or unacknowledged namespace mutation. Metadata discovery also accepts only omitted/null comments. |
 | `bypassDocumentValidation` | Only `false` |
 | Find `skip` / `limit` | Nonnegative integers; zero limit means no additional limit |
 | Count `query` / `skip` / `limit` | Shared BSON matcher with global skip/limit; nonnegative integers, zero limit unbounded; absent collection returns zero |

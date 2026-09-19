@@ -12,8 +12,8 @@ use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
     document::{
         BsonDocument, CanonicalBsonKey, DocumentAggregationStream, DocumentCollectionId,
-        DocumentCursorError, DocumentCursorId, DocumentMatcher, DocumentNamespace,
-        DocumentProjector, DocumentSortKey, DocumentSorter,
+        DocumentCursorError, DocumentCursorId, DocumentDatabaseId, DocumentMatcher,
+        DocumentNamespace, DocumentProjector, DocumentSortKey, DocumentSorter,
     },
     storage::ConnectionOwner,
 };
@@ -44,6 +44,52 @@ pub(super) struct CursorState {
     pub remaining: Option<u64>,
     pub batch_byte_limit: Option<u64>,
     pub aggregation: Option<AggregateCursor>,
+}
+
+/// Metadata cursors retain only bounded filter/position state, never catalog rows
+/// or SQLite handles. Identities fence drop/recreate; the ceiling excludes later creations.
+#[derive(Clone)]
+pub(super) struct MetadataCursorState {
+    pub namespace: DocumentNamespace,
+    pub database_id: DocumentDatabaseId,
+    pub upper_id: u64,
+    pub after_id: u64,
+    pub matcher: Arc<DocumentMatcher>,
+    pub name_only: bool,
+    pub batch_byte_limit: Option<u64>,
+}
+
+pub(super) enum RetainedCursorState {
+    Documents(Box<CursorState>),
+    Collections(MetadataCursorState),
+}
+
+impl From<CursorState> for RetainedCursorState {
+    fn from(state: CursorState) -> Self {
+        Self::Documents(Box::new(state))
+    }
+}
+
+impl From<Box<CursorState>> for RetainedCursorState {
+    fn from(state: Box<CursorState>) -> Self {
+        Self::Documents(state)
+    }
+}
+
+impl RetainedCursorState {
+    fn namespace(&self) -> &DocumentNamespace {
+        match self {
+            Self::Documents(state) => &state.namespace,
+            Self::Collections(state) => &state.namespace,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Documents(state) => state.retained_bytes(),
+            Self::Collections(state) => 4096usize.saturating_add(state.matcher.retained_bytes()),
+        }
+    }
 }
 
 pub(super) struct AggregateCursor {
@@ -118,7 +164,7 @@ struct Entry {
     owner: ConnectionOwner,
     namespace: DocumentNamespace,
     touched: Instant,
-    state: Option<CursorState>,
+    state: Option<RetainedCursorState>,
     retained_bytes: usize,
 }
 
@@ -143,8 +189,9 @@ impl CursorRegistry {
     pub fn insert(
         self: &Arc<Self>,
         owner: ConnectionOwner,
-        state: CursorState,
+        state: impl Into<RetainedCursorState>,
     ) -> EngineResult<DocumentCursorId> {
+        let state = state.into();
         let mut inner = self.0.lock().unwrap_or_else(|error| error.into_inner());
         prune(&mut inner, Instant::now());
         if inner.closed {
@@ -191,7 +238,7 @@ impl CursorRegistry {
             id,
             Entry {
                 owner,
-                namespace: state.namespace.clone(),
+                namespace: state.namespace().clone(),
                 touched: Instant::now(),
                 state: Some(state),
                 retained_bytes,
@@ -275,14 +322,14 @@ fn closed() -> EngineError {
 pub(super) struct CursorLease {
     registry: Arc<CursorRegistry>,
     id: DocumentCursorId,
-    pub state: Option<CursorState>,
+    pub state: Option<RetainedCursorState>,
     completed: bool,
 }
 
 impl CursorLease {
     pub fn complete(
         mut self,
-        state: Option<CursorState>,
+        state: Option<RetainedCursorState>,
     ) -> EngineResult<Option<DocumentCursorId>> {
         let mut inner = self
             .registry
@@ -435,6 +482,47 @@ mod tests {
     }
 
     #[test]
+    fn metadata_filters_share_the_document_cursor_memory_quota() {
+        let registry = Arc::new(CursorRegistry::default());
+        let query =
+            BsonDocument::from_entries([("name", BsonValue::String("x".repeat(512 * 1024)))])
+                .unwrap();
+        let matcher = Arc::new(DocumentMatcher::compile(&query).unwrap());
+        let metadata = || {
+            RetainedCursorState::Collections(MetadataCursorState {
+                namespace: DocumentNamespace::new("app", "$cmd.listCollections").unwrap(),
+                database_id: DocumentDatabaseId::from_validated(1),
+                upper_id: 1,
+                after_id: 0,
+                matcher: Arc::clone(&matcher),
+                name_only: true,
+                batch_byte_limit: None,
+            })
+        };
+        for owner in 1..=7 {
+            let retained = if owner % 2 == 0 {
+                let mut cursor = state();
+                cursor.source = CursorSource::Scatter(Some(Arc::clone(&matcher)));
+                cursor.into()
+            } else {
+                metadata()
+            };
+            registry
+                .insert(ConnectionOwner::new(owner), retained)
+                .unwrap();
+        }
+        assert_eq!(
+            registry
+                .insert(ConnectionOwner::new(8), metadata())
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        drop(registry.owner(ConnectionOwner::new(1)));
+        assert!(registry.insert(ConnectionOwner::new(8), metadata()).is_ok());
+    }
+
+    #[test]
     fn aggregate_retention_includes_backing_capacity_and_growth_releases_failed_leases() {
         use crate::document::{DocumentAggregator, DocumentPipeline};
         let registry = Arc::new(CursorRegistry::default());
@@ -454,10 +542,12 @@ mod tests {
         let namespace = cursor.namespace.clone();
         let id = registry.insert(owner, cursor).unwrap();
         let mut lease = registry.checkout(owner, &namespace, id).unwrap();
-        let mut cursor = lease.state.take().unwrap();
+        let RetainedCursorState::Documents(mut cursor) = lease.state.take().unwrap() else {
+            panic!("document cursor")
+        };
         cursor.aggregation.as_mut().unwrap().bytes = MAX_RETAINED_BYTES;
         assert_eq!(
-            lease.complete(Some(cursor)).unwrap_err().kind(),
+            lease.complete(Some(cursor.into())).unwrap_err().kind(),
             EngineErrorKind::LimitExceeded
         );
         assert!(registry.checkout(owner, &namespace, id).is_err());
@@ -528,19 +618,23 @@ mod tests {
         let mut lease = registry
             .checkout(ConnectionOwner::new(1), &state().namespace, ids[0])
             .unwrap();
-        let mut retained = lease.state.take().unwrap();
+        let RetainedCursorState::Documents(mut retained) = lease.state.take().unwrap() else {
+            panic!("document cursor")
+        };
         retained.sort_after = Some(position(8 * 1024 * 1024 - 256));
         assert_eq!(
-            lease.complete(Some(retained)).unwrap_err().kind(),
+            lease.complete(Some(retained.into())).unwrap_err().kind(),
             EngineErrorKind::LimitExceeded
         );
         assert!(!registry.0.lock().unwrap().entries.contains_key(&ids[0]));
         let mut lease = registry
             .checkout(ConnectionOwner::new(2), &state().namespace, ids[1])
             .unwrap();
-        let mut retained = lease.state.take().unwrap();
+        let RetainedCursorState::Documents(mut retained) = lease.state.take().unwrap() else {
+            panic!("document cursor")
+        };
         retained.sort_after = Some(position(1));
-        lease.complete(Some(retained)).unwrap();
+        lease.complete(Some(retained.into())).unwrap();
         assert!(registry.0.lock().unwrap().entries[&ids[1]].retained_bytes < 10_000);
     }
 }

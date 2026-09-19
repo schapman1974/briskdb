@@ -7,7 +7,7 @@ from datetime import datetime
 
 import pymongo
 from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timestamp
-from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
+from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
 
 
 def check_hello(reply):
@@ -744,12 +744,82 @@ def persisted_smoke(uri):
         assert client.wire_lifecycle.recreated.find_one({"_id": 1}) == {"_id": 1, "after_drop": True}
         assert client.wire_lifecycle_keep.one.find_one({"_id": 1}) == {"_id": 1, "keep": True}
         assert client.async_lifecycle.items.count_documents({}) == 0
+        metadata = list(client.wire_metadata.list_collections(filter={"name": "alpha"}))
+        assert len(metadata) == 1
+        assert metadata[0]["info"]["uuid"] == client.wire_metadata.alpha.find_one({"_id": "metadata-uuid"})["value"]
+
+
+def metadata_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        database = client.wire_metadata
+        assert client.absent_metadata.list_collection_names() == []
+        assert list(client.absent_metadata.list_collections()) == []
+        for name in ["alpha", "beta", "gamma"]:
+            assert database.create_collection(name).name == name
+        try:
+            database.create_collection("alpha")
+        except CollectionInvalid:
+            pass
+        else:
+            raise AssertionError("PyMongo must detect an existing collection via discovery")
+        assert database.create_collection("alpha", check_exists=False).name == "alpha"
+        assert database.command("create", "alpha")["ok"] == 1
+        assert sorted(database.list_collection_names()) == ["alpha", "beta", "gamma"]
+        assert database.list_collection_names(filter={"name": "beta"}) == ["beta"]
+        rows = list(database.list_collections(cursor={"batchSize": 1}, filter={"name": {"$regex": "a$"}}))
+        assert {row["name"] for row in rows} == {"alpha", "beta", "gamma"}
+        for row in rows:
+            assert row["type"] == "collection" and row["options"] == {}
+            assert row["info"]["readOnly"] is False
+            assert isinstance(row["info"]["uuid"], Binary) and row["info"]["uuid"].subtype == 4
+            assert row["idIndex"] == {"name": "_id_", "key": {"_id": 1}, "unique": True}
+        identity = rows[0]["info"]["uuid"]
+        database.alpha.insert_one({"_id": "metadata-uuid", "value": identity})
+        first = database.command("listCollections", 1, nameOnly=True, cursor={"batchSize": 0})["cursor"]
+        assert first["ns"] == "wire_metadata.$cmd.listCollections" and first["id"] and first["firstBatch"] == []
+        database.create_collection("later")
+        with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as peer:
+            result = peer.wire_metadata.command("getMore", first["id"], collection="$cmd.listCollections", batchSize=2)["cursor"]
+            names = [row["name"] for row in result["nextBatch"]]
+            while result["id"]:
+                result = peer.wire_metadata.command("getMore", result["id"], collection="$cmd.listCollections", batchSize=2)["cursor"]
+                names.extend(row["name"] for row in result["nextBatch"])
+        assert names == ["alpha", "beta", "gamma"]
+        first = database.command("listCollections", 1, cursor={"batchSize": 0})["cursor"]
+        killed = database.command("killCursors", "$cmd.listCollections", cursors=[first["id"]])
+        assert killed["cursorsKilled"] == [first["id"]]
+        for command in [
+            {"create": "rejected", "capped": True},
+            {"create": "rejected", "collation": {"locale": "en"}},
+            {"create": "rejected", "writeConcern": {"w": 0}},
+            {"create": "rejected", "writeConcern": {"w": "majority"}},
+            {"listCollections": 1, "filter": {"$unsupported": 1}},
+            {"listCollections": 1, "cursor": {"batchSize": -1}},
+            {"listCollections": 1, "cursor": {"unknown": True}},
+        ]:
+            try:
+                database.command(command)
+            except OperationFailure:
+                pass
+            else:
+                raise AssertionError(f"unsupported metadata command accepted: {command}")
+        assert "rejected" not in database.list_collection_names()
+        assert list(database.list_collections(nameOnly=True, authorizedCollections=True, filter={"info": {"$exists": True}})) == []
 
 
 async def async_smoke(uri):
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000, maxPoolSize=3) as client:
         assert (await client.admin.command("ping"))["ok"] == 1
         check_hello(await client.admin.command("hello"))
+        metadata = client.async_metadata
+        await metadata.create_collection("one")
+        await metadata.create_collection("two")
+        assert sorted(await metadata.list_collection_names()) == ["one", "two"]
+        cursor = await metadata.list_collections(cursor={"batchSize": 1})
+        assert [row["name"] async for row in cursor] == ["one", "two"]
+        assert await metadata.list_collection_names(filter={"name": "two"}) == ["two"]
+        await client.drop_database("async_metadata")
+        assert await metadata.list_collection_names() == []
         await client.async_lifecycle.items.insert_one({"_id": 1})
         await client.async_lifecycle.items.drop()
         assert await client.async_lifecycle.items.count_documents({}) == 0
@@ -850,5 +920,6 @@ if __name__ == "__main__":
         distinct_smoke(sys.argv[1])
         aggregation_smoke(sys.argv[1])
         lifecycle_smoke(sys.argv[1])
+        metadata_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")
