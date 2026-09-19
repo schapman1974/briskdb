@@ -107,7 +107,7 @@ batch size and cannot change the original skip or limit.
 ### Field updates and single-record write boundaries
 
 `Update` executes scopes `One` and `Many` with `$set`, `$unset`, `$min`, `$max`,
-`$pop`, `$rename`, `$addToSet`, `$pullAll`, `$push`, and `$pull`, using the same
+`$pop`, `$rename`, `$addToSet`, `$pullAll`, `$push`, `$pull`, and `$inc`, using the same
 locked selection/reselection and preflighted write path as replacement. A shared
 `DocumentUpdater` validates every operator, operand, path, and prefix conflict
 before namespace lookup or matching. It bounds specifications to 1 MiB/4,096
@@ -200,6 +200,24 @@ affects only the private post-image, discarded on any error. See Mongo's
 [$pull](https://www.mongodb.com/docs/manual/reference/operator/update/pull/)
 definition; exact predicate validation follows the frozen input.
 
+`$inc` eagerly requires numeric operands (not booleans); existing null/nonnumeric
+targets fail with code 14. Missing fields/array slots receive the exact operand,
+including Int64 width, signed zero and signaling NaN. Existing Int32 sums promote
+to Int64 on overflow; any Int64 operand retains Int64, and signed-64-bit overflow
+fails atomically with code 2. Double takes precedence over integers; Decimal128
+takes precedence over Double. Update Double-to-Decimal promotion uses 15 significant
+digits, unlike aggregation's exact binary conversion. Decimal arithmetic shares
+the 34-digit half-even clamped context; rounded equal Decimal values retain the
+original BID/quantum. Equal Double results retain original bits, including signed
+zero. Arithmetic on an existing Double or Decimal NaN counts as modified even when
+its stored bytes are identical; newly computed Double NaNs have canonical bits.
+These width/overflow/missing/no-op rules follow MongoDB's
+[numeric implementation](https://github.com/mongodb/mongo/blob/master/src/mongo/util/safe_num.cpp)
+and [arithmetic update node](https://github.com/mongodb/mongo/blob/master/src/mongo/db/update/arithmetic_node.cpp).
+Each increment charges 4 KiB of conservative fixed arithmetic workspace before
+evaluation, with cancellation checks before/after; ordinary path/growth limits
+also apply. This is a logical accounting bound, not a process-RSS claim.
+
 Only changed paths are edited. Untouched fields retain order and exact BSON
 types; new fields follow specification order. Missing `$set` parents become
 objects. Numeric paths traverse existing arrays (zero-based canonical ASCII
@@ -209,14 +227,15 @@ Scalar `$set` parents fail with code 28. Positional paths are unsupported.
 Conflicts/empty path components use codes 40/56; changed or removed `_id` uses
 code 66. Semantically equal ID aliases retain the original representation.
 Operator-assigned zero timestamps remain literal, unlike insert/replacement.
-Stored BSON byte comparison determines modified counts. No-op writes skip SQL.
+Stored BSON byte comparison determines modified counts, except executed NaN
+arithmetic as described above. No-op writes skip SQL.
 
 `DocumentUpdateRequest::with_max_document_bytes` caps the combined post-image,
 including retained fields. Result/plan/post-image checks precede SQL, so validation
 failures leave the record unchanged. Concurrent updates read the current document
 under the write lock rather than applying a stale client-side replacement.
 Other operators, upsert, and secondary-index maintenance remain
-unimplemented. Of 26,277 source-locked update oracle cases, the original 4,008
+unimplemented. Of 30,489 source-locked update oracle cases, the original 4,008
 set/unset cases intentionally cover non-ID object paths only: frozen TinyMongo's
 legacy scalar/array/ID behavior differs. The 4,719 min/max cases additionally
 cover whole-value ordering, numeric array paths, scalar/null path errors,
@@ -231,6 +250,13 @@ without ID writes because frozen push also silently restores IDs. Another 5,573
 pull cases cover non-ID object/array paths, literal and query conditions, embedded
 IDs, logical clauses, ranges, regex, and eager errors. Frozen pull also restores
 collection IDs; independent tests enforce their immutability.
+Another 4,212 increment cases compare the exact common semantics on non-ID object
+paths, including 2,000 random Double/Decimal promotion cases. Frozen Python shrinks
+small Int64 results, produces unencodable wide integers, adds zero to missing
+operands, rewrites signed-zero no-ops, and uses legacy path/ID behavior. Those
+differences, plus unspecified arithmetic Double NaN bits, are outside that exact
+matrix, not coerced or waived. Independent Rust/storage/driver tests enforce the
+documented Mongo numeric boundaries, NaN counts, strict paths and immutable IDs.
 Across these legacy differences, BriskDB rejects changed
 IDs and blocked parents; independent tests cover those stricter boundaries,
 without changing frozen corpus/allowances. Independent unit, transaction, and real-wire tests

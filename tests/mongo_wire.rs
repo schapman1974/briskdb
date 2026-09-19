@@ -564,7 +564,15 @@ async fn multi_update_errors_distinguish_confirmed_rollback_from_prior_commits()
             ("$db", BsonValue::from("wire")),
         ])
     }
-    for (bad_shard, earlier_noops) in [(0, false), (1, true), (1, false)] {
+    for (bad_shard, earlier_noops, increment) in [
+        (0, false, false),
+        (1, true, false),
+        (1, false, false),
+        (0, false, true),
+        (1, true, true),
+        (1, false, true),
+    ] {
+        let code = if increment { 14 } else { 2 };
         for ordered in [true, false] {
             let (root, database, mut server) = setup().await;
             let mut stream = TcpStream::connect(server.address()).await.unwrap();
@@ -572,7 +580,16 @@ async fn multi_update_errors_distinguish_confirmed_rollback_from_prior_commits()
                 .map(|id| {
                     doc([
                         ("_id", BsonValue::Int32(id)),
-                        ("items", BsonValue::Array(vec![])),
+                        (
+                            "items",
+                            if increment {
+                                BsonValue::Decimal128(
+                                    briskdb::document::BsonDecimal128::parse("NaN").unwrap(),
+                                )
+                            } else {
+                                BsonValue::Array(vec![])
+                            },
+                        ),
                     ])
                 })
                 .collect();
@@ -591,7 +608,11 @@ async fn multi_update_errors_distinguish_confirmed_rollback_from_prior_commits()
                         statement(
                             row.get_first("_id").cloned(),
                             "items",
-                            BsonValue::Array(vec![BsonValue::Int32(1)]),
+                            if increment {
+                                BsonValue::Int32(0)
+                            } else {
+                                BsonValue::Array(vec![BsonValue::Int32(1)])
+                            },
                         )
                     })
                     .collect();
@@ -622,8 +643,11 @@ async fn multi_update_errors_distinguish_confirmed_rollback_from_prior_commits()
                 (
                     "u",
                     BsonValue::Document(doc([(
-                        "$addToSet",
-                        BsonValue::Document(doc([("items", BsonValue::Int32(1))])),
+                        if increment { "$inc" } else { "$addToSet" },
+                        BsonValue::Document(doc([(
+                            "items",
+                            BsonValue::Int32(i32::from(!increment)),
+                        )])),
                     )])),
                 ),
                 ("multi", BsonValue::Boolean(true)),
@@ -646,7 +670,7 @@ async fn multi_update_errors_distinguish_confirmed_rollback_from_prior_commits()
             let partial = bad_shard == 1 && !earlier_noops;
             if partial {
                 assert_eq!(reply.get_first("ok"), Some(&BsonValue::Double(0.0)));
-                assert_eq!(reply.get_first("code"), Some(&BsonValue::Int32(2)));
+                assert_eq!(reply.get_first("code"), Some(&BsonValue::Int32(code)));
                 assert!(reply.get_first("writeErrors").is_none());
                 assert!(reply.get_first("n").is_none());
                 assert!(reply.get_first("nModified").is_none());
@@ -663,12 +687,12 @@ async fn multi_update_errors_distinguish_confirmed_rollback_from_prior_commits()
                     panic!("write error")
                 };
                 assert_eq!(error.get_first("index"), Some(&BsonValue::Int32(0)));
-                assert_eq!(error.get_first("code"), Some(&BsonValue::Int32(2)));
+                assert_eq!(error.get_first("code"), Some(&BsonValue::Int32(code)));
             }
             let mut expected = before;
             for (shard, rows) in expected.iter_mut().enumerate() {
                 for row in rows {
-                    if partial && shard == 0 {
+                    if partial && shard == 0 && !increment {
                         *row = BsonDocument::from_entries(row.iter().map(|(field, value)| {
                             (
                                 field,

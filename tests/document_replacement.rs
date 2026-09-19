@@ -40,6 +40,280 @@ fn set(fields: BsonDocument) -> BsonDocument {
     doc([("$set", BsonValue::Document(fields))])
 }
 
+fn inc(fields: BsonDocument) -> BsonDocument {
+    doc([("$inc", BsonValue::Document(fields))])
+}
+
+#[tokio::test]
+async fn increment_counts_decimal_noops_images_preflight_and_restart() {
+    use briskdb::document::BsonDecimal128;
+    let decimal = |text: &str| BsonValue::Decimal128(BsonDecimal128::parse(text).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            inc(doc([("counter", BsonValue::Int64(1))]))
+        )
+        .await,
+        (24, 24)
+    );
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            inc(doc([("counter", BsonValue::Int32(0))]))
+        )
+        .await,
+        (24, 0)
+    );
+    many_counts(
+        &engine,
+        &session,
+        BsonDocument::new(),
+        set(doc([("amount", decimal("1.00"))])),
+    )
+    .await;
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            inc(doc([("amount", decimal("0.000"))]))
+        )
+        .await,
+        (24, 0)
+    );
+    let options = DocumentReadOptions::new()
+        .with_sort(DocumentSort::new(doc([("_id", BsonValue::Int32(-1))])).unwrap())
+        .with_projection(
+            DocumentProjection::new(doc([
+                ("counter", BsonValue::Int32(1)),
+                ("_id", BsonValue::Int32(0)),
+            ]))
+            .unwrap(),
+        );
+    for (after, expected) in [(false, 1), (true, 3)] {
+        let result = engine
+            .execute_document(
+                &session,
+                request(
+                    find_update(
+                        BsonDocument::new(),
+                        inc(doc([("counter", BsonValue::Int32(1))])),
+                        options.clone(),
+                        after,
+                    ),
+                    RequestContext::new(),
+                ),
+            )
+            .await
+            .unwrap()
+            .into_parts()
+            .2;
+        let DocumentResult::Document(Some(image)) = result else {
+            panic!("image")
+        };
+        assert_eq!(
+            encode_document(&image).unwrap(),
+            encode_document(&doc([("counter", BsonValue::Int64(expected))])).unwrap()
+        );
+    }
+    for value in [decimal("sNaN"), decimal("NaN"), BsonValue::Double(f64::NAN)] {
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            set(doc([("amount", value)])),
+        )
+        .await;
+        for _ in 0..2 {
+            assert_eq!(
+                many_counts(
+                    &engine,
+                    &session,
+                    BsonDocument::new(),
+                    inc(doc([("amount", BsonValue::Int32(0))]))
+                )
+                .await,
+                (24, 24)
+            );
+        }
+    }
+    many_counts(
+        &engine,
+        &session,
+        BsonDocument::new(),
+        set(doc([
+            ("amount", decimal("2")),
+            ("overflow", BsonValue::Int64(i64::MAX)),
+        ])),
+    )
+    .await;
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            inc(doc([("amount", BsonValue::Double(0.1))]))
+        )
+        .await,
+        (24, 24)
+    );
+    for row in rows(&engine, &session).await {
+        assert_eq!(
+            encode_document(&doc([("v", row.get_first("amount").unwrap().clone())])).unwrap(),
+            encode_document(&doc([("v", decimal("2.100000000000000"))])).unwrap()
+        );
+    }
+    let before: Vec<_> = rows(&engine, &session)
+        .await
+        .iter()
+        .map(|row| encode_document(row).unwrap())
+        .collect();
+    for field in ["done", "overflow"] {
+        let invalid = doc([
+            (
+                "$set",
+                BsonValue::Document(doc([("atomic_marker", BsonValue::Boolean(true))])),
+            ),
+            (
+                "$inc",
+                BsonValue::Document(doc([(field, BsonValue::Int32(1))])),
+            ),
+        ]);
+        for command in [
+            DocumentCommand::Update(update(BsonDocument::new(), invalid.clone())),
+            update_many(BsonDocument::new(), invalid.clone()),
+            find_update(
+                BsonDocument::new(),
+                invalid,
+                DocumentReadOptions::new(),
+                true,
+            ),
+        ] {
+            assert!(
+                engine
+                    .execute_document(&session, request(command, RequestContext::new()))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    update_many(
+                        doc([("_id", BsonValue::Int32(99))]),
+                        inc(doc([("counter", BsonValue::Boolean(true))]))
+                    ),
+                    RequestContext::new()
+                )
+            )
+            .await
+            .is_err()
+    );
+    for after in [false, true] {
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    request(
+                        find_update(
+                            BsonDocument::new(),
+                            inc(doc([("counter", BsonValue::Int32(1))])),
+                            DocumentReadOptions::new(),
+                            after
+                        ),
+                        RequestContext::new().with_result_limits(ResultLimits::new(1, 1).unwrap())
+                    )
+                )
+                .await
+                .is_err()
+        );
+    }
+    let token = CancellationToken::new();
+    token.cancel();
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    update_many(
+                        BsonDocument::new(),
+                        inc(doc([("counter", BsonValue::Int32(1))]))
+                    ),
+                    RequestContext::new().with_cancellation_token(token)
+                )
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        rows(&engine, &session)
+            .await
+            .iter()
+            .map(|row| encode_document(row).unwrap())
+            .collect::<Vec<_>>(),
+        before
+    );
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(
+        rows(&engine, &engine.session())
+            .await
+            .iter()
+            .map(|row| encode_document(row).unwrap())
+            .collect::<Vec<_>>(),
+        before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_increment_reselects_under_lock_without_lost_counts() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(root.path(), 4).await.unwrap());
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let engine = Arc::clone(&engine);
+        workers.push(tokio::spawn(async move {
+            let session = engine.session();
+            for _ in 0..8 {
+                assert_eq!(
+                    many_counts(
+                        &engine,
+                        &session,
+                        BsonDocument::new(),
+                        inc(doc([("counter", BsonValue::Int64(1))]))
+                    )
+                    .await,
+                    (24, 24)
+                );
+            }
+        }));
+    }
+    for worker in workers {
+        worker.await.unwrap();
+    }
+    for row in rows(&engine, &session).await {
+        assert!(matches!(
+            row.get_first("counter"),
+            Some(BsonValue::Int64(32))
+        ));
+    }
+}
+
 fn extrema(low: i32, high: i32) -> BsonDocument {
     doc([
         (
