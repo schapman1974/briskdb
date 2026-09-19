@@ -443,7 +443,7 @@ class Session:
         collection: str,
         keys: BsonDocument,
         *,
-        name: str,
+        name: Optional[str] = None,
         unique: bool = False,
         request_id: Optional[UUID] = None,
         timeout_ms: Optional[int] = None,

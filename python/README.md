@@ -98,7 +98,14 @@ mutating stored documents. The projection persists across cursor batches.
 Pass `sort={"priority": -1, "_id": 1}` for global BSON sorting before skip/limit
 and projection; the sort persists across cursor batches. Stable ties use natural
 order. Sorted pages use bounded key windows and rescan until sorted indexes
-exist; large skips may need repeated scans. Secondary indexes remain `pending_build`;
+exist; large skips may need repeated scans. `create_index(database, collection,
+{"body": 1, "rank": -1})` now generates `body_1_rank_-1`; `name=` is optional in
+both synchronous and asyncio APIs. Numeric direction aliases normalize to Int32,
+while malformed/duplicate paths, invalid directions, reserved names and oversized
+definitions fail before catalog changes. Explicit names remain supported.
+Secondary indexes remain `pending_build`, including `unique=True`: declarations
+do not yet accelerate queries or enforce uniqueness. The built-in `_id_` remains
+ready and enforced, but its redeclaration is not part of this checkpoint;
 other update operators, additional aggregation expressions, and bulk-write
 Python helpers remain future work. Multi-delete/update commit one shard at a time;
 failure rolls back the current shard, not earlier commits. See the
