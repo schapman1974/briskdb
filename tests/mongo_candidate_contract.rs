@@ -68,6 +68,10 @@ fn run_contract(uri: &str, report: &std::path::Path) -> std::process::Output {
             "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_update_path_conflicts_report_code_40_before_writing",
             "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_preserve_immutable_id_semantics",
             "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_report_target_and_path_errors_atomically",
+            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_cover_upsert_update_many_and_find_and_modify",
+            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_apply_to_upsert_equality_fields",
+            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_and_delete_metadata",
+            "compat/mongo/v1/runner/contracts/test_bson_value_types_contract.py::test_tm037_zero_timestamp_write_boundaries_match_mongodb",
             "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_comment_remains_invalid_as_a_field_operator",
             "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_add_to_set_non_array_errors_report_code_2_and_leave_document_atomic",
             "compat/mongo/v1/runner/contracts/test_array_update_contract.py",
@@ -147,7 +151,11 @@ individual.update('tests.contracts.test_update_operator_contract::' + name for n
     'test_update_path_conflicts_report_code_40_before_writing',
     'test_new_update_operators_preserve_immutable_id_semantics',
     'test_new_update_operators_report_target_and_path_errors_atomically',
+    'test_new_update_operators_cover_upsert_update_many_and_find_and_modify',
+    'test_new_update_operators_apply_to_upsert_equality_fields',
 ])
+individual.add('tests.contracts.test_crud_contract::test_replace_upsert_and_delete_metadata')
+individual.add('tests.contracts.test_bson_value_types_contract::test_tm037_zero_timestamp_write_boundaries_match_mongodb')
 individual.update('tests.contracts.test_bson_comparison_contract::' + name for name in [
     'test_tm036_pull_reuses_unbounded_min_max_key_ranges',
     'test_pull_reuses_recursive_bson_range_comparison',
@@ -173,11 +181,11 @@ expected = {(case['id'], api) for case in corpus['cases']
             for api in case['apis']}
 executions = ingest_junit(Path(sys.argv[1]), 'briskdb', corpus)['executions']
 actual = {(item['case_id'], item['api']) for item in executions}
-assert len(expected) == len(executions) == 238, ('locked suite coverage changed', len(expected), len(executions))
+assert len(expected) == len(executions) == 246, ('locked suite coverage changed', len(expected), len(executions))
 assert actual == expected, 'candidate suite omitted or substituted locked cases'
 assert all(item['outcome'] == 'passed' and item['target'] == 'briskdb-briskdb'
            for item in executions), 'candidate suite skipped or failed a case'
-print('Verified all 238 exact frozen candidate executions, with no skips.')
+print('Verified all 246 exact frozen candidate executions, with no skips.')
 "#,
             ])
             .arg(report)

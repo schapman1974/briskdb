@@ -564,14 +564,18 @@ async fn multi_update_errors_distinguish_confirmed_rollback_from_prior_commits()
             ("$db", BsonValue::from("wire")),
         ])
     }
-    for (bad_shard, earlier_noops, increment) in [
+    for (bad_shard, earlier_noops, increment, upsert) in [
         (0, false, false),
         (1, true, false),
         (1, false, false),
         (0, false, true),
         (1, true, true),
         (1, false, true),
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|(shard, noops, increment)| {
+        [false, true].map(|upsert| (shard, noops, increment, upsert))
+    }) {
         let code = if increment { 14 } else { 2 };
         for ordered in [true, false] {
             let (root, database, mut server) = setup().await;
@@ -651,6 +655,7 @@ async fn multi_update_errors_distinguish_confirmed_rollback_from_prior_commits()
                     )])),
                 ),
                 ("multi", BsonValue::Boolean(true)),
+                ("upsert", BsonValue::Boolean(upsert)),
             ]));
             let reply = send_command(
                 &mut stream,

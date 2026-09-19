@@ -234,7 +234,7 @@ arithmetic as described above. No-op writes skip SQL.
 including retained fields. Result/plan/post-image checks precede SQL, so validation
 failures leave the record unchanged. Concurrent updates read the current document
 under the write lock rather than applying a stale client-side replacement.
-Other operators, operator upserts, and secondary-index maintenance remain
+Other operators and secondary-index maintenance remain
 unimplemented. Of 30,489 source-locked update oracle cases, the original 4,008
 set/unset cases intentionally cover non-ID object paths only: frozen TinyMongo's
 legacy scalar/array/ID behavior differs. The 4,719 min/max cases additionally
@@ -330,8 +330,8 @@ An inserted replacement returns `matched_count: 0`, `modified_count: 0`, and
 `upserted_id: Some(id)`. Rust and native Python expose `did_upsert`, so an inserted
 null ID is distinguishable from no upsert. Native commands require an existing
 collection; the wire adapter creates missing namespaces as for inserts. Failed
-wire upserts can therefore leave an empty collection, but validation/result
-failure never commits a document. Returned IDs reserve two reply-container levels,
+insert-on-miss attempts can therefore leave an empty collection, but insertion
+preparation/result failure never commits a document. Returned IDs reserve two reply-container levels,
 and post-image/result limits are checked before natural-order reservation or SQL.
 
 The insertion shard rechecks the original predicate under an immediate write
@@ -340,7 +340,37 @@ than the general predicate budget), and concurrent same-ID upserts
 update the winner instead of inserting twice. Natural order is reserved outside
 the shard lock to preserve manifest/shard lock ordering; losing races may leave
 unused order numbers. Non-ID filters do not gain a global snapshot or uniqueness
-across shards. Operator and find-and-modify upserts remain unsupported.
+across shards. Find-and-modify upserts remain unsupported.
+
+`Update` also accepts `with_upsert(true)` for both one/many scopes. A no-match
+search derives a seed from positive direct/`$eq` equality clauses, including
+literal embedded documents and nested `$and` clauses. Dotted object paths use
+the same bounded, strict path rules as updates. Duplicate/overlapping equality
+paths fail with code 54 (`NotSingleValueField`). Dotted `_id` equalities can seed
+an embedded identifier; non-equality ID predicates supply no seed values.
+Ranges, regex predicates, negations, and alternatives are not copied; advanced
+logical simplifications such as singleton `$in`/`$all` are not inferred.
+Inference only runs after no match; it does not reject an otherwise valid
+matched update. Existing matcher and updater work/retention/growth budgets apply.
+
+The operators run on that seed before missing-ID generation. A query-bound ID
+is immutable; `$set` can provide an unbound ID. All zero timestamps remain literal,
+including query-seeded values. The result is normalized ID-first and shares the
+replacement-upsert identity/result/depth/post-image preflight, natural-order
+reservation, target-shard recheck and metadata. Many-scope rechecks update every
+new match on the target shard; they do not acquire a cross-shard snapshot.
+No-write insertion preparation failures and explicitly rolled-back target-shard
+failures may be certified for safe unordered continuation; an initial many-update
+failure after earlier shard commits cannot receive that certificate.
+
+Required CI checks 1,772 source-locked upsert executions (886 cases in both scopes)
+against unchanged TinyMongo `_document_for_upsert`, including exact persisted BSON,
+metadata and atomic errors for all eleven operators. That matrix covers the common
+direct/sole-`$eq`, non-overlapping object-path behavior and small integer increments.
+Legacy literal-document/AND inference, scalar-parent overwrite, silent ID restoration,
+and numeric differences are outside the matrix, not rewritten or waived. Independent
+tests cover strict inference, supplied/generated/null/large IDs, concurrent counters,
+limits, native/wire clients and restart.
 
 `DocumentFindOneAndReplaceRequest` wraps a validated `DocumentReplaceRequest`
 plus projection/sort read options. It defaults to the before-image;
@@ -799,7 +829,7 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 
 ## Current boundary
 
-Other update operators, operator/find-and-modify upserts,
+Other update operators, find-and-modify upserts,
 additional aggregation expressions/group-key forms,
 database statistics, index metadata cursors, and physical secondary-index builds
 remain later roadmap work. Collection metadata cursors are implemented.
