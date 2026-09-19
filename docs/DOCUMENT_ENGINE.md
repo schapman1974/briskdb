@@ -74,6 +74,7 @@ The current engine executes:
 | `Distinct` | Uses the same filters and global encounter order, with shared BSON identity and bounded unique values |
 | `Delete` | Deletes one or many matches; exact `_id` routes to one shard, other filters use the shared matcher |
 | `FindOneAndDelete` | Atomically deletes one shard-local selection and returns its projected pre-delete document |
+| `FindOneAndReplace` | Atomically replaces one shard-local selection and returns its projected before/after document; no upsert yet |
 | `Replace` | Replaces one matching document, preserving `_id` and natural order; returns matched/modified counts, with no upsert yet |
 
 `CollectionExists` uses an admitted, controlled manifest lookup and scalar result
@@ -128,6 +129,25 @@ than the incoming replacement. Validation failure rolls back the local
 transaction. Successful commits are not reclassified by late cancellation.
 Declared secondary indexes are still pending; their physical uniqueness and
 post-image validation belong to the index milestone, not this checkpoint.
+
+`DocumentFindOneAndReplaceRequest` wraps a validated `DocumentReplaceRequest`
+plus projection/sort read options. It defaults to the before-image;
+`with_return_after(true)` selects the post-image. `FindOneAndReplace` returns
+`Document(Some(image))` or `Document(None)` without creating a missing document.
+Sorting always uses the original stored values; projection only changes the
+returned image, never the persisted replacement. No-ops still return the selected
+image. Both forms share the same local reselection, ID/natural-order preservation,
+and write-option boundaries as `Replace`.
+
+The normalized post-image and prepared write are validated before projection of
+the selected return image. Exact response size/plan budgets and a reserved
+return-envelope nesting level are checked before the SQL write. A response
+failure therefore leaves the old document intact, for both return modes. A
+projection may make a valid large/deep stored image returnable, but cannot bypass
+the normalized post-image cap. The successful commit is not reclassified by late
+cancellation. The shared tests cover before/after concurrency, original-field
+sorting, projection/storage separation, native depth-100 records, wire response
+headroom, no-match/no-op results, and restart.
 
 ### Filtered deletion and commit boundaries
 
@@ -557,7 +577,7 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 
 ## Current boundary
 
-Update expressions, replacement upsert, remaining findAndModify forms,
+Update expressions, replacement upsert, operator-update findAndModify,
 additional aggregation expressions/group-key forms,
 database statistics, index metadata cursors, and physical secondary-index builds
 remain later roadmap work. Collection metadata cursors are implemented.

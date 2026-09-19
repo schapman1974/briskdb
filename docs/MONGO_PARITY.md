@@ -269,9 +269,19 @@ Mongo `findAndModify` now supports `remove: true`: shared filter, sort, projecti
 Runtime sort checks apply even to exact-ID routes. Return-value budgets fail
 before deletion, including documents inserted through the larger native BSON
 interface. Missing collections return null without creation after eager semantic
-validation. Update/replacement forms, upsert, return-after, hint/collation/let,
+validation. Operator-update forms, upsert, hint/collation/let,
 and unacknowledged findAndModify remain unsupported. Native Python exposes
 `find_one_and_delete` with the same shared execution and request controls.
+
+Replacement `findAndModify` accepts a replacement document in `update`, optional
+`remove:false`, `query`, `fields`, `sort`, and boolean `new` (default false).
+The shared `FindOneAndReplace` command validates both the normalized stored
+post-image and the selected before/after reply before mutation. Replies include
+`value` (null on no match) and `lastErrorObject.n`/`updatedExisting`; a projected
+empty document still reports a match. Missing collections are not created, and
+validation remains eager. `remove:true` cannot be combined with `update` or
+`new:true`. Operator/pipeline updates and upsert remain unsupported. Native
+sync/async Python exposes `find_one_and_replace` with the same semantics.
 
 Wire `update` now supports replacement statements (`q` and a document `u`,
 `multi:false`, `upsert:false`) through shared `Replace`. Both body arrays and
@@ -282,10 +292,10 @@ post-images, including retained IDs, must fit the advertised 512 KiB BSON cap
 before mutation. Existing bounded write-concern and one-way write handling apply.
 Batch statements commit independently; operational failure may leave previous
 commits, so no all-or-nothing batch or retryable-write guarantee is implied.
-Operator/pipeline updates, upserts, multi updates, hint/sort/collation/arrayFilters,
-and replacement findAndModify remain explicit future work. Native sync/async
+Operator/pipeline updates, upserts, multi updates, and update-command
+hint/sort/collation/arrayFilters remain explicit future work. Native sync/async
 Python exposes `replace_one` with the same engine semantics and controls.
-Updates, the remaining findAndModify forms, and index metadata cursors remain unimplemented.
+Operator updates/findAndModify and index metadata cursors remain unimplemented.
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required
 real-driver CI also verifies BSON fidelity, ordered/unordered duplicate failures,

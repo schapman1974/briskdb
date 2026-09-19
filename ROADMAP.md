@@ -531,7 +531,10 @@ requires an earlier dependency:
       the selected shard reselects under its write lock. Exact output budgets
       (including wire BSON bounds) are validated before mutation. Concurrent
       consumers, runtime sort failures, deadline rollback, and restart are
-      covered. Update/replace findAndModify forms remain open.
+      covered. Find-one-and-replace now uses the same shared path with
+      projected before/after images, sort, immutable-ID validation, and exact
+      return/post-image preflight before commit. Operator-update forms and
+      upserts remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

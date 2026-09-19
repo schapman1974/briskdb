@@ -1034,7 +1034,7 @@ async fn unacknowledged_writes_execute_without_emitting_a_reply() {
 }
 
 #[tokio::test]
-async fn find_and_delete_rejects_wire_envelope_depth_before_mutation() {
+async fn find_and_modify_rejects_wire_envelope_depth_before_mutation() {
     use briskdb::document::{
         BSON_MAX_NESTING_DEPTH, DocumentCommand, DocumentInsertRequest, DocumentNamespace,
         DocumentWriteOptions,
@@ -1068,6 +1068,26 @@ async fn find_and_delete_rejects_wire_envelope_depth_before_mutation() {
         )
         .await
         .unwrap();
+    let replacement = BsonDocument::from_entries([
+        ("findAndModify", BsonValue::from("deep")),
+        ("$db", BsonValue::from("wire")),
+        (
+            "query",
+            BsonValue::Document(
+                BsonDocument::from_entries([("_id", BsonValue::from("deep"))]).unwrap(),
+            ),
+        ),
+        ("update", BsonValue::Document(BsonDocument::new())),
+    ])
+    .unwrap();
+    assert_eq!(
+        send_command(&mut stream, &replacement)
+            .await
+            .get_first("code"),
+        Some(&BsonValue::Int32(10334))
+    );
+    // The following delete still sees the deep original, proving replacement
+    // could not commit before discovering its return-envelope depth error.
     let mut removal = BsonDocument::from_entries([
         ("findAndModify", BsonValue::from("deep")),
         ("$db", BsonValue::from("wire")),
@@ -1155,6 +1175,24 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
     assert!(
         matches!(reply.get_first("code"), Some(BsonValue::Int32(10334))),
         "{reply:?}"
+    );
+    let replacement = BsonDocument::from_entries([
+        ("findAndModify", BsonValue::from("items")),
+        ("$db", BsonValue::from("wire")),
+        (
+            "query",
+            BsonValue::Document(
+                BsonDocument::from_entries([("_id", BsonValue::from("large"))]).unwrap(),
+            ),
+        ),
+        ("update", BsonValue::Document(BsonDocument::new())),
+    ])
+    .unwrap();
+    assert_eq!(
+        send_command(&mut stream, &replacement)
+            .await
+            .get_first("code"),
+        Some(&BsonValue::Int32(10334))
     );
     let removal = BsonDocument::from_entries([
         ("findAndModify", BsonValue::from("items")),

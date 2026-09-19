@@ -4,10 +4,11 @@ use briskdb::{
     core::{CancellationToken, Engine, EngineErrorKind, RequestContext, ResultLimits, Session},
     document::{
         BsonDocument, BsonTimestamp, BsonValue, DocumentCollectionOptions, DocumentCommand,
-        DocumentCreateCollectionRequest, DocumentFilter, DocumentFindRequest,
-        DocumentInsertRequest, DocumentMutationError, DocumentNamespace, DocumentPlan,
-        DocumentReadOptions, DocumentReplaceRequest, DocumentRequest, DocumentRequestId,
-        DocumentResult, DocumentWriteOptions, encode_document,
+        DocumentCreateCollectionRequest, DocumentFilter, DocumentFindOneAndReplaceRequest,
+        DocumentFindRequest, DocumentInsertRequest, DocumentMutationError, DocumentNamespace,
+        DocumentPlan, DocumentProjection, DocumentReadOptions, DocumentReplaceRequest,
+        DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort, DocumentWriteOptions,
+        encode_document,
     },
 };
 use rusqlite::{Connection, TransactionBehavior};
@@ -34,6 +35,379 @@ fn replace(filter: BsonDocument, replacement: BsonDocument) -> DocumentReplaceRe
         DocumentWriteOptions::new(),
     )
     .unwrap()
+}
+
+fn find_replace(
+    filter: BsonDocument,
+    replacement: BsonDocument,
+    options: DocumentReadOptions,
+    after: bool,
+) -> DocumentCommand {
+    DocumentCommand::FindOneAndReplace(
+        DocumentFindOneAndReplaceRequest::new(replace(filter, replacement), options)
+            .with_return_after(after),
+    )
+}
+
+async fn returned(
+    engine: &Engine,
+    session: &Session,
+    command: DocumentCommand,
+) -> Option<BsonDocument> {
+    let execution = engine
+        .execute_document(session, request(command, RequestContext::new()))
+        .await
+        .unwrap();
+    let DocumentResult::Document(document) = execution.into_parts().2 else {
+        panic!("document")
+    };
+    document
+}
+
+#[tokio::test]
+async fn find_replace_sorts_original_values_and_returns_projected_before_or_after() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let options = DocumentReadOptions::new()
+        .with_sort(DocumentSort::new(doc([("_id", BsonValue::Int32(-1))])).unwrap())
+        .with_projection(
+            DocumentProjection::new(doc([
+                ("group", BsonValue::Int32(1)),
+                ("_id", BsonValue::Int32(0)),
+            ]))
+            .unwrap(),
+        );
+    let before = returned(
+        &engine,
+        &session,
+        find_replace(
+            doc([("group", BsonValue::Int32(0))]),
+            doc([("value", BsonValue::Int64(9))]),
+            options,
+            false,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(before, doc([("group", BsonValue::Int32(0))]));
+    let current = rows(&engine, &session).await;
+    assert_eq!(
+        current[22],
+        doc([
+            ("_id", BsonValue::Int32(22)),
+            ("value", BsonValue::Int64(9))
+        ])
+    );
+    let replacement = doc([
+        ("_id", BsonValue::Double(22.0)),
+        ("value", BsonValue::Int64(9)),
+    ]);
+    for after in [false, true] {
+        let document = returned(
+            &engine,
+            &session,
+            find_replace(
+                doc([("_id", BsonValue::Double(22.0))]),
+                replacement.clone(),
+                DocumentReadOptions::new(),
+                after,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            encode_document(&document).unwrap(),
+            encode_document(&current[22]).unwrap()
+        );
+        assert!(
+            returned(
+                &engine,
+                &session,
+                find_replace(
+                    doc([("_id", BsonValue::Int32(-1))]),
+                    BsonDocument::new(),
+                    DocumentReadOptions::new(),
+                    after
+                )
+            )
+            .await
+            .is_none()
+        );
+    }
+    let projected = returned(
+        &engine,
+        &session,
+        find_replace(
+            doc([("_id", BsonValue::Int32(22))]),
+            doc([("value", BsonValue::from("new"))]),
+            DocumentReadOptions::new().with_projection(
+                DocumentProjection::new(doc([
+                    ("value", BsonValue::Int32(1)),
+                    ("_id", BsonValue::Int32(0)),
+                ]))
+                .unwrap(),
+            ),
+            true,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(projected, doc([("value", BsonValue::from("new"))]));
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(
+        rows(&engine, &engine.session()).await[22],
+        doc([
+            ("_id", BsonValue::Int32(22)),
+            ("value", BsonValue::from("new"))
+        ])
+    );
+}
+
+#[tokio::test]
+async fn find_replace_preflights_both_return_images_and_does_not_store_the_projection() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let filter = doc([("_id", BsonValue::Int32(0))]);
+    let large = doc([("payload", BsonValue::from("x".repeat(600000)))]);
+    changed(&engine, &session, filter.clone(), large.clone(), true).await;
+    let budget = RequestContext::new().with_result_limits(ResultLimits::new(1, 128).unwrap());
+    for (after, replacement) in [(false, BsonDocument::new()), (true, large.clone())] {
+        let error = engine
+            .execute_document(
+                &session,
+                request(
+                    find_replace(
+                        filter.clone(),
+                        replacement,
+                        DocumentReadOptions::new(),
+                        after,
+                    ),
+                    budget.clone(),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        assert_eq!(
+            rows(&engine, &session).await[0].get_first("payload"),
+            large.get_first("payload")
+        );
+    }
+    let only_id = DocumentReadOptions::new()
+        .with_projection(DocumentProjection::new(doc([("_id", BsonValue::Int32(1))])).unwrap());
+    let execution = engine
+        .execute_document(
+            &session,
+            request(
+                find_replace(filter.clone(), large.clone(), only_id.clone(), true),
+                budget,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        execution.result(),
+        &DocumentResult::Document(Some(doc([("_id", BsonValue::Int32(0))])))
+    );
+    assert_eq!(
+        rows(&engine, &session).await[0].get_first("payload"),
+        large.get_first("payload")
+    );
+    // Root-depth-100 data is valid to store, but not to nest in a reply.
+    let mut deep = BsonDocument::new();
+    for _ in 1..briskdb::document::BSON_MAX_NESTING_DEPTH {
+        deep = doc([("nested", BsonValue::Document(deep))]);
+    }
+    for after in [false, true] {
+        changed(
+            &engine,
+            &session,
+            filter.clone(),
+            if after {
+                BsonDocument::new()
+            } else {
+                deep.clone()
+            },
+            true,
+        )
+        .await;
+        let before = rows(&engine, &session).await;
+        let replacement = if after {
+            deep.clone()
+        } else {
+            BsonDocument::new()
+        };
+        let error = engine
+            .execute_document(
+                &session,
+                request(
+                    find_replace(
+                        filter.clone(),
+                        replacement.clone(),
+                        DocumentReadOptions::new(),
+                        after,
+                    ),
+                    RequestContext::new(),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        assert_eq!(before, rows(&engine, &session).await);
+        assert!(
+            returned(
+                &engine,
+                &session,
+                find_replace(filter.clone(), replacement, only_id.clone(), after)
+            )
+            .await
+            .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn find_replace_rejects_bad_runtime_sort_projection_identity_and_controls_before_writing() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    changed(
+        &engine,
+        &session,
+        doc([("_id", BsonValue::Int32(0))]),
+        doc([
+            ("a", BsonValue::Array(vec![])),
+            ("b", BsonValue::Array(vec![])),
+        ]),
+        true,
+    )
+    .await;
+    let before = rows(&engine, &session).await;
+    for after in [false, true] {
+        for filter in [BsonDocument::new(), doc([("_id", BsonValue::Int32(0))])] {
+            for options in [
+                DocumentReadOptions::new().with_skip(1),
+                DocumentReadOptions::new().with_sort(
+                    DocumentSort::new(doc([
+                        ("a", BsonValue::Int32(1)),
+                        ("b", BsonValue::Int32(1)),
+                    ]))
+                    .unwrap(),
+                ),
+                DocumentReadOptions::new().with_projection(
+                    DocumentProjection::new(doc([
+                        ("a", BsonValue::Int32(1)),
+                        ("b", BsonValue::Int32(0)),
+                    ]))
+                    .unwrap(),
+                ),
+            ] {
+                assert!(
+                    engine
+                        .execute_document(
+                            &session,
+                            request(
+                                find_replace(filter.clone(), BsonDocument::new(), options, after),
+                                RequestContext::new()
+                            )
+                        )
+                        .await
+                        .is_err()
+                );
+            }
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            assert_eq!(
+                engine
+                    .execute_document(
+                        &session,
+                        request(
+                            find_replace(
+                                filter.clone(),
+                                BsonDocument::new(),
+                                DocumentReadOptions::new(),
+                                after
+                            ),
+                            RequestContext::new().with_cancellation_token(cancel)
+                        )
+                    )
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::Cancelled
+            );
+            assert_eq!(
+                engine
+                    .execute_document(
+                        &session,
+                        request(
+                            find_replace(
+                                filter,
+                                doc([("_id", BsonValue::Int32(99))]),
+                                DocumentReadOptions::new(),
+                                after
+                            ),
+                            RequestContext::new()
+                        )
+                    )
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::InvalidArgument
+            );
+        }
+    }
+    assert_eq!(before, rows(&engine, &session).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_find_replacements_return_each_selected_id_once() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(root.path(), 4).await.unwrap());
+    seed(&engine, &engine.session()).await;
+    let mut tasks = Vec::new();
+    for after in [false, true, false, true] {
+        let engine = Arc::clone(&engine);
+        tasks.push(tokio::spawn(async move {
+            let session = engine.session();
+            let mut ids = Vec::new();
+            let options = DocumentReadOptions::new()
+                .with_sort(DocumentSort::new(doc([("_id", BsonValue::Int32(1))])).unwrap());
+            while let Some(document) = returned(
+                &engine,
+                &session,
+                find_replace(
+                    doc([("done", BsonValue::Boolean(false))]),
+                    doc([("done", BsonValue::Boolean(true))]),
+                    options.clone(),
+                    after,
+                ),
+            )
+            .await
+            {
+                assert_eq!(document.get_first("done"), Some(&BsonValue::Boolean(after)));
+                let Some(BsonValue::Int32(id)) = document.get_first("_id") else {
+                    panic!("id")
+                };
+                ids.push(*id);
+            }
+            ids
+        }));
+    }
+    let mut ids = Vec::new();
+    for task in tasks {
+        ids.extend(task.await.unwrap());
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, (0..24).collect::<Vec<_>>());
 }
 async fn seed(engine: &Engine, session: &Session) {
     engine
@@ -462,19 +836,35 @@ async fn replacement_write_lock_deadline_leaves_documents_and_session_usable() {
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    let error = engine
-        .execute_document(
-            &session,
-            request(
-                DocumentCommand::Replace(replace(BsonDocument::new(), BsonDocument::new())),
-                RequestContext::new()
-                    .with_timeout(Duration::from_millis(150))
-                    .unwrap(),
-            ),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+    for command in [
+        DocumentCommand::Replace(replace(BsonDocument::new(), BsonDocument::new())),
+        find_replace(
+            BsonDocument::new(),
+            BsonDocument::new(),
+            DocumentReadOptions::new(),
+            false,
+        ),
+        find_replace(
+            BsonDocument::new(),
+            BsonDocument::new(),
+            DocumentReadOptions::new(),
+            true,
+        ),
+    ] {
+        let error = engine
+            .execute_document(
+                &session,
+                request(
+                    command,
+                    RequestContext::new()
+                        .with_timeout(Duration::from_millis(150))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+    }
     drop(locks);
     assert_eq!(before, rows(&engine, &session).await);
     assert_eq!(

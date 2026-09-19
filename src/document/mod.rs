@@ -45,11 +45,11 @@ pub use command::{
     DocumentCreateCollectionRequest, DocumentCreateIndexRequest, DocumentCursorId,
     DocumentDeleteRequest, DocumentDistinctRequest, DocumentDropCollectionRequest,
     DocumentDropDatabaseRequest, DocumentDropIndexRequest, DocumentFindOneAndDeleteRequest,
-    DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
-    DocumentListCollectionMetadataRequest, DocumentListCollectionsRequest,
-    DocumentListDatabaseNamesRequest, DocumentListIndexesRequest, DocumentMutationScope,
-    DocumentNamespace, DocumentReplaceRequest, DocumentRequest, DocumentRequestId,
-    DocumentUpdateRequest, MAX_DOCUMENT_INDEX_NAME_BYTES,
+    DocumentFindOneAndReplaceRequest, DocumentFindRequest, DocumentIndexRequest,
+    DocumentInsertRequest, DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
+    DocumentListCollectionsRequest, DocumentListDatabaseNamesRequest, DocumentListIndexesRequest,
+    DocumentMutationScope, DocumentNamespace, DocumentReplaceRequest, DocumentRequest,
+    DocumentRequestId, DocumentUpdateRequest, MAX_DOCUMENT_INDEX_NAME_BYTES,
 };
 pub use distinct::DocumentDistinct;
 pub use error::{

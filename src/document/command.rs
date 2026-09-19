@@ -996,6 +996,53 @@ impl fmt::Debug for DocumentReplaceRequest {
     }
 }
 
+/// Replace one selected document and return its projected before/after image.
+/// Uses the same replacement validation, write options, and post-image byte cap
+/// as `DocumentReplaceRequest`. Only projection and sort read options apply.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentFindOneAndReplaceRequest {
+    replacement: DocumentReplaceRequest,
+    read_options: DocumentReadOptions,
+    return_after: bool,
+}
+
+impl DocumentFindOneAndReplaceRequest {
+    pub const fn new(
+        replacement: DocumentReplaceRequest,
+        read_options: DocumentReadOptions,
+    ) -> Self {
+        Self {
+            replacement,
+            read_options,
+            return_after: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_return_after(mut self, return_after: bool) -> Self {
+        self.return_after = return_after;
+        self
+    }
+
+    pub const fn namespace(&self) -> &DocumentNamespace {
+        self.replacement.namespace()
+    }
+    pub const fn replacement_request(&self) -> &DocumentReplaceRequest {
+        &self.replacement
+    }
+    pub const fn read_options(&self) -> &DocumentReadOptions {
+        &self.read_options
+    }
+    pub const fn return_after(&self) -> bool {
+        self.return_after
+    }
+
+    pub fn into_parts(self) -> (DocumentReplaceRequest, DocumentReadOptions, bool) {
+        (self.replacement, self.read_options, self.return_after)
+    }
+}
+
 /// Request to delete one or many matching documents.
 ///
 /// `One` selects the earliest match in durable natural order, then rechecks
@@ -1255,6 +1302,7 @@ pub enum DocumentCommandKind {
     DropDatabase,
     Find,
     FindOneAndDelete,
+    FindOneAndReplace,
     Aggregate,
     Count,
     Distinct,
@@ -1282,6 +1330,7 @@ pub enum DocumentCommand {
     DropDatabase(DocumentDropDatabaseRequest),
     Find(DocumentFindRequest),
     FindOneAndDelete(DocumentFindOneAndDeleteRequest),
+    FindOneAndReplace(DocumentFindOneAndReplaceRequest),
     Aggregate(DocumentAggregateRequest),
     Count(DocumentCountRequest),
     Distinct(DocumentDistinctRequest),
@@ -1308,6 +1357,7 @@ impl DocumentCommand {
             Self::DropDatabase(_) => DocumentCommandKind::DropDatabase,
             Self::Find(_) => DocumentCommandKind::Find,
             Self::FindOneAndDelete(_) => DocumentCommandKind::FindOneAndDelete,
+            Self::FindOneAndReplace(_) => DocumentCommandKind::FindOneAndReplace,
             Self::Aggregate(_) => DocumentCommandKind::Aggregate,
             Self::Count(_) => DocumentCommandKind::Count,
             Self::Distinct(_) => DocumentCommandKind::Distinct,
