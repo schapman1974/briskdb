@@ -117,6 +117,205 @@ async fn drain(
 }
 
 #[tokio::test]
+async fn groups_follow_global_sorted_input_and_page_exact_results_after_reopen() {
+    let documents = source_rows();
+    let before = encoded(&documents);
+    let accumulator = |name: &str, operand: BsonValue| BsonValue::Document(doc(&[(name, operand)]));
+    let stages = pipeline(&[
+        (
+            "$sort",
+            BsonValue::Document(doc(&[("_id", BsonValue::Int32(-1))])),
+        ),
+        (
+            "$project",
+            BsonValue::Document(doc(&[
+                ("_id", BsonValue::Int32(1)),
+                ("value", BsonValue::Int32(1)),
+                (
+                    "key",
+                    BsonValue::Document(doc(&[("team", BsonValue::from("$group"))])),
+                ),
+            ])),
+        ),
+        (
+            "$group",
+            BsonValue::Document(doc(&[
+                ("_id", BsonValue::from("$key")),
+                ("n", accumulator("$sum", BsonValue::Int32(1))),
+                ("sum", accumulator("$sum", BsonValue::from("$value"))),
+                ("avg", accumulator("$avg", BsonValue::from("$value"))),
+                ("first", accumulator("$first", BsonValue::from("$_id"))),
+                ("last", accumulator("$last", BsonValue::from("$_id"))),
+                ("ids", accumulator("$push", BsonValue::from("$_id"))),
+                (
+                    "unique",
+                    accumulator("$addToSet", BsonValue::from("$value")),
+                ),
+                ("min", accumulator("$min", BsonValue::from("$value"))),
+                ("max", accumulator("$max", BsonValue::from("$value"))),
+            ])),
+        ),
+    ]);
+    let expected: Vec<_> = (0..3)
+        .rev()
+        .map(|group| {
+            let ids: Vec<_> = (0_i64..180).rev().filter(|id| id % 3 == group).collect();
+            let values: Vec<_> = ids.iter().map(|id| (179 - id) % 7).collect();
+            let mut unique = Vec::new();
+            for value in &values {
+                if !unique.contains(value) {
+                    unique.push(*value);
+                }
+            }
+            let sum: i64 = values.iter().sum();
+            doc(&[
+                (
+                    "_id",
+                    BsonValue::Document(doc(&[("team", BsonValue::Int32(group as i32))])),
+                ),
+                ("n", BsonValue::Int32(60)),
+                ("sum", BsonValue::Int32(sum as i32)),
+                ("avg", BsonValue::Double(sum as f64 / 60.0)),
+                ("first", BsonValue::Int64(ids[0])),
+                ("last", BsonValue::Int64(*ids.last().unwrap())),
+                (
+                    "ids",
+                    BsonValue::Array(ids.into_iter().map(BsonValue::Int64).collect()),
+                ),
+                (
+                    "unique",
+                    BsonValue::Array(unique.into_iter().map(BsonValue::Int64).collect()),
+                ),
+                ("min", BsonValue::Int64(0)),
+                ("max", BsonValue::Int64(6)),
+            ])
+        })
+        .collect();
+    let (root, engine) = setup(documents).await;
+    let session = engine.session();
+    let first = call(
+        &engine,
+        &session,
+        aggregate(
+            stages.clone(),
+            DocumentReadOptions::new()
+                .with_batch_size(0)
+                .unwrap()
+                .with_batch_byte_limit(1500)
+                .unwrap(),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(first.plan(), Some(DocumentPlan::Scatter(plan)) if plan.shards() == [0, 1, 2, 3])
+    );
+    let (id, empty) = cursor(first);
+    assert!(empty.is_empty());
+    let first = call(&engine, &session, more(id.unwrap(), 3)).await;
+    let DocumentResult::Cursor(batch) = first.result() else {
+        panic!("cursor");
+    };
+    assert_eq!(
+        batch.documents().len(),
+        1,
+        "soft byte cap pages group results"
+    );
+    assert_eq!(
+        encoded(&drain(&engine, &session, first, 3).await),
+        encoded(&expected)
+    );
+    let original = call(
+        &engine,
+        &session,
+        aggregate(pipeline(&[]), DocumentReadOptions::new()),
+    )
+    .await;
+    assert_eq!(
+        encoded(&drain(&engine, &session, original, 100).await),
+        before
+    );
+    engine.shutdown().await.unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    let result = call(
+        &engine,
+        &session,
+        aggregate(stages, DocumentReadOptions::new()),
+    )
+    .await;
+    assert_eq!(encoded(&cursor(result).1), encoded(&expected));
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn group_expression_failure_discards_the_entire_result_and_cursor() {
+    let (_root, engine) = setup(vec![
+        doc(&[
+            ("_id", BsonValue::Int32(1)),
+            ("v", BsonValue::Array(vec![])),
+        ]),
+        doc(&[("_id", BsonValue::Int32(2)), ("v", BsonValue::Null)]),
+    ])
+    .await;
+    let session = engine.session();
+    let group = BsonValue::Document(doc(&[
+        ("_id", BsonValue::from("$_id")),
+        (
+            "n",
+            BsonValue::Document(doc(&[(
+                "$first",
+                BsonValue::Document(doc(&[("$size", BsonValue::from("$v"))])),
+            )])),
+        ),
+    ]));
+    let first = call(
+        &engine,
+        &session,
+        aggregate(
+            pipeline(&[("$group", group.clone())]),
+            DocumentReadOptions::new().with_batch_size(0).unwrap(),
+        ),
+    )
+    .await;
+    let (id, rows) = cursor(first);
+    assert!(rows.is_empty());
+    let id = id.unwrap();
+    assert_eq!(
+        engine
+            .execute_document(&session, request(more(id, 1), RequestContext::new()))
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::InvalidQuery
+    );
+    assert_eq!(
+        engine
+            .execute_document(&session, request(more(id, 1), RequestContext::new()))
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::FailedPrecondition
+    );
+    let limited = call(
+        &engine,
+        &session,
+        aggregate(
+            pipeline(&[("$limit", BsonValue::Int32(1)), ("$group", group)]),
+            DocumentReadOptions::new(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        cursor(limited).1,
+        vec![doc(&[
+            ("_id", BsonValue::Int32(1)),
+            ("n", BsonValue::Int32(0))
+        ])]
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn transforms_share_global_execution_byte_paging_and_immutable_storage() {
     let mut documents = source_rows();
     for row in &mut documents {

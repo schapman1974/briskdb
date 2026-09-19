@@ -23,6 +23,16 @@ fn aggregation_transforms_match_the_locked_tinymongo_oracle() {
     );
 }
 
+#[test]
+#[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
+fn aggregation_groups_match_the_locked_tinymongo_oracle() {
+    compare(
+        "document_aggregation_groups_oracle.py",
+        8000,
+        96 * 1024 * 1024,
+    );
+}
+
 fn compare(script: &str, minimum: usize, maximum_bytes: usize) {
     let python = std::env::var("BRISKDB_MONGO_ORACLE_PYTHON").unwrap_or_else(|_| "python3".into());
     let output = Command::new(python)
@@ -90,6 +100,8 @@ fn compare(script: &str, minimum: usize, maximum_bytes: usize) {
                 let actual =
                     actual.unwrap_or_else(|error| panic!("case {count}: {case:?}: {error:?}"));
                 let encode = |value| {
+                    let value =
+                        normalize_arithmetic_nans(value, case.get_first("numeric_nan_fields"));
                     encode_document(&BsonDocument::from_entries([("result", value)]).unwrap())
                         .unwrap()
                 };
@@ -112,4 +124,39 @@ fn compare(script: &str, minimum: usize, maximum_bytes: usize) {
         "expected the complete pipeline matrix, got {count}"
     );
     println!("{count} source-locked TinyMongo aggregation cases passed ({script})");
+}
+
+fn normalize_arithmetic_nans(value: BsonValue, fields: Option<&BsonValue>) -> BsonValue {
+    let Some(BsonValue::Array(fields)) = fields else {
+        return value;
+    };
+    let BsonValue::Array(rows) = value else {
+        panic!("result rows");
+    };
+    BsonValue::Array(
+        rows.into_iter()
+            .map(|row| {
+                let BsonValue::Document(row) = row else {
+                    panic!("result document");
+                };
+                BsonValue::Document(
+                    BsonDocument::from_entries(row.into_entries().into_iter().map(
+                        |(name, value)| {
+                            let numeric = fields.iter().any(
+                                |field| matches!(field, BsonValue::String(field) if field == &name),
+                            );
+                            let value = match value {
+                                BsonValue::Double(value) if numeric && value.is_nan() => {
+                                    BsonValue::Double(f64::NAN)
+                                }
+                                value => value,
+                            };
+                            (name, value)
+                        },
+                    ))
+                    .unwrap(),
+                )
+            })
+            .collect(),
+    )
 }

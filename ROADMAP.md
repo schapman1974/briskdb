@@ -565,7 +565,7 @@ requires an earlier dependency:
       stream; count retains a counter, and sort materializes bounded input.
       Resource/error/cancellation cleanup and cursor ownership are tested.
       Basic-suite projection consumers now use the shared transforms below.
-      Groups (#176), full candidate-corpus acceptance, and aggregation-based
+      Grouping is implemented below; full candidate-corpus acceptance and aggregation-based
       PyMongo `count_documents()` remain open.
     - [ ] [#177](https://github.com/schapman1974/briskdb/issues/177) — shared
       `$project`/`$set`/`$addFields`/`$unset` stages and `$ifNull`/`$literal`/`$size`
@@ -576,8 +576,19 @@ requires an earlier dependency:
       materialization boundaries so limits stop unused expression evaluation.
       Allocation amplification, depth/nodes/work, cancellation, cursor cleanup,
       sync/async clients, byte paging, and restart are covered. The frozen
-      projection-to-group identity case and full candidate-corpus acceptance
-      remain pending groups and collection lifecycle support.
+      projection-to-group identity case now uses the shared group stage below;
+      full candidate-corpus acceptance still needs collection lifecycle support.
+    - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared
+      `$group` supports null/field keys, recursive structured BSON identity, and
+      all eight planned accumulators across Rust, sync/async native Python, and
+      PyMongo. It retains bounded states in established global input order,
+      including first/last and ordered Decimal128/mixed-numeric arithmetic.
+      Another 9,509 locked-oracle pipelines pass in both execution modes;
+      arithmetic double NaN bits are unspecified and normalized only in tagged
+      numeric outputs. Separate tests cover unencodable-reference integer sums,
+      memory/BSON limits, cancellation, byte paging, cleanup, and restart.
+      Literal/computed group keys, partial-shard accumulator-state merging, and
+      full candidate-corpus acceptance remain open. No disk spill or snapshot.
     - [ ] [#166](https://github.com/schapman1974/briskdb/issues/166) — targeted
       collection existence checks now share the engine across Rust, embedded
       sync/async Python, and wire read/write namespace handling. Catalogs beyond

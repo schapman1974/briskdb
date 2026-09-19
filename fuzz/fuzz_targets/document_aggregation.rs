@@ -126,5 +126,32 @@ fuzz_target!(|data: &[u8]| {
                 exercise(std::slice::from_ref(&envelope), pipeline);
             }
         }
+        let mut group = BsonDocument::from_entries([("_id", BsonValue::from("$v"))]).unwrap();
+        for operator in [
+            "$addToSet",
+            "$avg",
+            "$first",
+            "$last",
+            "$max",
+            "$min",
+            "$push",
+            "$sum",
+        ] {
+            group
+                .push(
+                    &operator[1..],
+                    BsonValue::Document(
+                        BsonDocument::from_entries([(operator, BsonValue::from("$v"))]).unwrap(),
+                    ),
+                )
+                .unwrap();
+        }
+        exercise(
+            &[envelope.clone(), envelope],
+            DocumentPipeline::new(vec![
+                BsonDocument::from_entries([("$group", BsonValue::Document(group))]).unwrap(),
+            ])
+            .unwrap(),
+        );
     }
 });

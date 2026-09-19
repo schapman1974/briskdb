@@ -319,6 +319,7 @@ dependencies = [
  "bytes",
  "clap",
  "criterion",
+ "dec",
  "fancy-regex",
  "futures",
  "getrandom 0.4.3",
@@ -650,6 +651,28 @@ name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
+name = "dec"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ae126ef80702bd514a66279b6dac1e58ff1dbcb12024f7110de95608348fd7"
+dependencies = [
+ "decnumber-sys",
+ "libc",
+ "paste",
+ "static_assertions",
+]
+
+[[package]]
+name = "decnumber-sys"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b4bc33814bd5bcd46dd13f9471a29ab1a22c4701ae0c4a182e45e8336d1a5b"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "der"
@@ -2558,6 +2581,12 @@ dependencies = [
  "psm",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stringprep"

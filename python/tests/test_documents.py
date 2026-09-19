@@ -52,6 +52,35 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_group_structured_keys_numeric_precision_and_cursor_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            documents = [{"_id": 1, "k": {"x": Int64(1)}, "v": Decimal128("1.00")},
+                         {"_id": 2, "k": {"x": 1.0}, "v": 2.1}, {"_id": 3}, {"_id": 4, "k": None, "v": None}]
+            pipeline = [{"$group": {"_id": "$k", "avg": {"$avg": "$v"}, "sum": {"$sum": "$v"},
+                                    "first": {"$first": "$v"}, "last": {"$last": "$v"}, "push": {"$push": "$v"},
+                                    "set": {"$addToSet": "$k"}, "min": {"$min": "$v"}, "max": {"$max": "$v"}}}]
+            expected = [{"_id": {"x": Int64(1)}, "avg": Decimal128("1.550000000000000044408920985006262"),
+                         "sum": Decimal128("3.100000000000000088817841970012523"), "first": Decimal128("1.00"), "last": 2.1,
+                         "push": [Decimal128("1.00"), 2.1], "set": [{"x": Int64(1)}], "min": Decimal128("1.00"), "max": 2.1},
+                        {"_id": None, "avg": None, "sum": 0, "first": None, "last": None, "push": [None], "set": [None], "min": None, "max": None}]
+            before = bson_bytes({"documents": documents, "pipeline": pipeline})
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for document in documents:
+                        session.insert_one(DATABASE, COLLECTION, document)
+                    page = session.aggregate(DATABASE, COLLECTION, pipeline, batch_size=0)
+                    rows = []
+                    while page["cursor_id"] is not None:
+                        page = session.get_more(DATABASE, COLLECTION, page["cursor_id"], batch_size=1)
+                        rows.extend(page["documents"])
+                    self.assertEqual(bson_bytes({"rows": rows}), bson_bytes({"rows": expected}))
+                    self.assertEqual(session.find(DATABASE, COLLECTION)["documents"], documents)
+            self.assertEqual(bson_bytes({"documents": documents, "pipeline": pipeline}), before)
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(bson_bytes({"rows": session.aggregate(DATABASE, COLLECTION, pipeline)["documents"]}), bson_bytes({"rows": expected}))
+
     def test_aggregate_transforms_preserve_bson_and_original_documents(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             documents = [{"_id": Int64(index), "source": Decimal128("1.50"), "items": [{"x": index}, None], "secret": "private"} for index in range(3)]
@@ -1031,6 +1060,28 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_group_order_and_error_cursor_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=4, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for index in range(12):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": Int64(index), "bucket": index % 3, "v": [] if index == 0 else None})
+                    pipeline = [{"$sort": {"_id": -1}}, {"$group": {"_id": "$bucket", "n": {"$sum": 1}, "first": {"$first": "$_id"}, "last": {"$last": "$_id"}}}]
+                    page = await session.aggregate(DATABASE, COLLECTION, pipeline, batch_size=1)
+                    rows = page["documents"]
+                    while page["cursor_id"] is not None:
+                        page = await session.get_more(DATABASE, COLLECTION, page["cursor_id"], batch_size=1)
+                        rows.extend(page["documents"])
+                    self.assertEqual(bson_bytes({"rows": rows}), bson_bytes({"rows": [{"_id": key, "n": 4, "first": Int64(9 + key), "last": Int64(key)} for key in (2, 1, 0)]}))
+                    bad = [{"$group": {"_id": "$_id", "n": {"$first": {"$size": "$v"}}}}]
+                    page = await session.aggregate(DATABASE, COLLECTION, bad, batch_size=0)
+                    self.assertEqual(page["documents"], [])
+                    with self.assertRaises(briskdb.InvalidQueryError):
+                        await session.get_more(DATABASE, COLLECTION, page["cursor_id"], batch_size=1)
+                    with self.assertRaises(briskdb.FailedPreconditionError):
+                        await session.get_more(DATABASE, COLLECTION, page["cursor_id"], batch_size=1)
+
     async def test_async_aggregate_transform_paging_and_missing_values(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=3, documents=True) as database:
