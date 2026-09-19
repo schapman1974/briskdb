@@ -67,6 +67,226 @@ fn push(operand: BsonValue) -> BsonDocument {
     doc([("$push", BsonValue::Document(doc([("items", operand)])))])
 }
 
+fn pull(condition: BsonValue) -> BsonDocument {
+    doc([("$pull", BsonValue::Document(doc([("items", condition)])))])
+}
+
+#[tokio::test]
+async fn pull_predicates_counts_images_atomic_failures_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let values = vec![
+        BsonValue::Int64(1),
+        BsonValue::Int32(2),
+        BsonValue::Int32(3),
+    ];
+    many_counts(
+        &engine,
+        &session,
+        BsonDocument::new(),
+        set(doc([("items", BsonValue::Array(values.clone()))])),
+    )
+    .await;
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            pull(BsonValue::Double(2.0))
+        )
+        .await,
+        (24, 24)
+    );
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            pull(BsonValue::Int32(2))
+        )
+        .await,
+        (24, 0)
+    );
+    let options = DocumentReadOptions::new()
+        .with_sort(DocumentSort::new(doc([("_id", BsonValue::Int32(-1))])).unwrap())
+        .with_projection(
+            DocumentProjection::new(doc([
+                ("items", BsonValue::Int32(1)),
+                ("_id", BsonValue::Int32(0)),
+            ]))
+            .unwrap(),
+        );
+    for after in [false, true] {
+        let condition = if after {
+            BsonValue::Int32(1)
+        } else {
+            BsonValue::Document(doc([("$gte", BsonValue::Int32(3))]))
+        };
+        let result = engine
+            .execute_document(
+                &session,
+                request(
+                    find_update(BsonDocument::new(), pull(condition), options.clone(), after),
+                    RequestContext::new(),
+                ),
+            )
+            .await
+            .unwrap()
+            .into_parts()
+            .2;
+        let DocumentResult::Document(Some(image)) = result else {
+            panic!("image")
+        };
+        let expected = if after {
+            vec![]
+        } else {
+            vec![BsonValue::Int64(1), BsonValue::Int32(3)]
+        };
+        assert_eq!(
+            encode_document(&image).unwrap(),
+            encode_document(&doc([("items", BsonValue::Array(expected))])).unwrap()
+        );
+    }
+    let before = rows(&engine, &session).await;
+    let invalid = doc([
+        (
+            "$set",
+            BsonValue::Document(doc([("atomic_marker", BsonValue::Boolean(true))])),
+        ),
+        (
+            "$pull",
+            BsonValue::Document(doc([("done", BsonValue::Int32(1))])),
+        ),
+    ]);
+    for command in [
+        DocumentCommand::Update(update(BsonDocument::new(), invalid.clone())),
+        update_many(BsonDocument::new(), invalid.clone()),
+        find_update(
+            BsonDocument::new(),
+            invalid,
+            DocumentReadOptions::new(),
+            true,
+        ),
+    ] {
+        assert!(
+            engine
+                .execute_document(&session, request(command, RequestContext::new()))
+                .await
+                .is_err()
+        );
+    }
+    let malformed = pull(BsonValue::Document(doc([("$regex", BsonValue::from("["))])));
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    update_many(doc([("_id", BsonValue::Int32(99))]), malformed),
+                    RequestContext::new()
+                )
+            )
+            .await
+            .is_err()
+    );
+    for after in [false, true] {
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    request(
+                        find_update(
+                            BsonDocument::new(),
+                            pull(BsonValue::Int32(1)),
+                            DocumentReadOptions::new(),
+                            after
+                        ),
+                        RequestContext::new().with_result_limits(ResultLimits::new(1, 1).unwrap())
+                    )
+                )
+                .await
+                .is_err()
+        );
+    }
+    let token = CancellationToken::new();
+    token.cancel();
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    update_many(BsonDocument::new(), pull(BsonValue::Int32(1))),
+                    RequestContext::new().with_cancellation_token(token)
+                )
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(rows(&engine, &session).await, before);
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(rows(&engine, &engine.session()).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pull_predicates_do_not_lose_removals_or_reintroduce_values() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(root.path(), 4).await.unwrap());
+    let session = engine.session();
+    seed(&engine, &session).await;
+    many_counts(
+        &engine,
+        &session,
+        BsonDocument::new(),
+        set(doc([(
+            "items",
+            BsonValue::Array((0..32).map(BsonValue::Int64).collect()),
+        )])),
+    )
+    .await;
+    let mut workers = Vec::new();
+    for worker in 0..4 {
+        let engine = Arc::clone(&engine);
+        workers.push(tokio::spawn(async move {
+            let session = engine.session();
+            for step in 0..8 {
+                assert_eq!(
+                    many_counts(
+                        &engine,
+                        &session,
+                        BsonDocument::new(),
+                        pull(BsonValue::Document(doc([(
+                            "$eq",
+                            BsonValue::Int32(worker * 8 + step)
+                        )])))
+                    )
+                    .await,
+                    (24, 24)
+                );
+            }
+        }));
+    }
+    for worker in workers {
+        worker.await.unwrap();
+    }
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            pull(BsonValue::Document(doc([("$gte", BsonValue::Int32(0))])))
+        )
+        .await,
+        (24, 0)
+    );
+    for row in rows(&engine, &session).await {
+        assert_eq!(row.get_first("items"), Some(&BsonValue::Array(vec![])));
+    }
+}
+
 #[tokio::test]
 async fn push_modifiers_counts_images_preflight_and_restart() {
     let root = tempfile::tempdir().unwrap();

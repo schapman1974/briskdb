@@ -19,7 +19,7 @@ CI and byte-compares the normalized result with the checked-in reference. The
 full report remains `reference-only`; partial candidate coverage is not folded
 into that report or treated as full parity.
 
-Required CI separately runs 196 exact sync/async executions in the frozen
+Required CI separately runs 216 exact sync/async executions in the frozen
 `test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
 `test_aggregation_contract`, `test_group_accumulators_contract`, and
 `test_client_read_fidelity_contract` modules,
@@ -29,11 +29,9 @@ the CRUD top-level/nested `$unset` case, and three query-validation cases coveri
 invalid field `$comment`, invalid `$not`, and operator typos across CRUD methods,
 plus all nine non-upsert `test_update_operator_contract` cases (min/max, pop,
 rename, numeric paths, operand/target errors, conflicts, and immutable IDs),
-plus literal pull-all equality and pull-all non-array target errors
-(two additional cases in both API modes),
-and the add-to-set non-array atomicity case through both update-one/update-many,
-plus five push/array-modifier cases covering bounded arrays, modifier order,
-plain push/add-to-set regressions, invalid modifiers, and non-array push targets,
+plus the complete `test_array_update_contract` suite, the add-to-set non-array
+atomicity case through both update-one/update-many, and three BSON comparison
+cases covering pull ranges, missing/array paths, and embedded IDs,
 against a real four-shard BriskDB listener.
 It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
 cleanup. The JUnit result is checked against the exact locked case/API set;
@@ -294,7 +292,7 @@ validation remains eager. `remove:true` cannot be combined with `update` or
 `new:true`. Pipeline updates and upsert remain unsupported. Native
 sync/async Python exposes `find_one_and_replace` with the same semantics.
 
-Operator `findAndModify` accepts `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`
+Operator `findAndModify` accepts `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`
 documents in `update`, with the
 same query/sort/projection and boolean `new` options, through `FindOneAndUpdate`.
 It preserves untouched fields and shares operator validation, immutable-ID
@@ -303,7 +301,7 @@ return an image; projected `{}` still sets `n:1` and `updatedExisting:true`.
 Missing namespaces return null without creation after eager validation. Native
 sync/async Python exposes `find_one_and_update` with identical image semantics.
 
-Wire `update` supports replacement statements and `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push` operator
+Wire `update` supports replacement statements and `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull` operator
 statements (`q` and a document `u`,
 `upsert:false`) through shared `Replace`/`Update`. Only operator documents accept
 `multi:true`; replacement remains single-document. Both body arrays and
@@ -346,10 +344,16 @@ always inserting, stably sorting, then slicing. Scalar sort compares whole BSON
 values; compound sort follows the frozen document-only selectors, not query-sort
 array selection. Integral numeric positions/slices clamp at array boundaries.
 Scratch/comparison work and temporary growth remain bounded before final slicing.
-Its 20,704 source-locked update oracle cases include 4,008 object-only
-set/unset, 4,719 min/max, 3,078 pop/rename, 4,440 array-membership, and 4,459 push cases. The
+Pull reuses shared literal/field/document matching with ordinary embedded-ID
+semantics, strict update paths, missing-field no-ops, stable removal, and eager
+validation even without matches. Query comparison, regex work, path allocation,
+AST/program retention, and cancellation share update budgets. Context-specific
+expression and regex errors remain indexed driver write errors when safe.
+Its 26,277 source-locked update oracle cases include 4,008 object-only
+set/unset, 4,719 min/max, 3,078 pop/rename, 4,440 array-membership, 4,459 push,
+and 5,573 pull cases. The
 membership subset excludes ID writes and uses object-only add-to-set paths:
-push subset covers non-ID object/array paths. These
+push/pull subsets cover non-ID object/array paths and embedded-ID queries. These
 legacy reference helpers restore IDs (and add-to-set overwrites scalar parents) instead of
 enforcing BriskDB's stricter safety rules. These boundaries have independent
 tests, not frozen allowances or rewritten expected results. Independent

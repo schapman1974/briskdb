@@ -6,7 +6,9 @@ use std::{cmp::Ordering, error::Error, fmt};
 
 use super::{
     BsonCodecOptions, BsonDocument, BsonErrorContext, BsonValue, CanonicalBsonKey,
-    DocumentMutationError, encode_document, encode_document_with_options, memory,
+    DocumentMutationError, encode_document, encode_document_with_options,
+    matcher::{MatchControl, PullMatcher},
+    memory,
 };
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
@@ -85,6 +87,7 @@ enum OperationAction {
         remove: bool,
     },
     Push(push::Push),
+    Pull(PullMatcher),
 }
 
 enum Action {
@@ -164,7 +167,7 @@ impl DocumentUpdater {
             check()?;
             match operator {
                 "$set" | "$unset" | "$min" | "$max" | "$pop" | "$rename" | "$addToSet"
-                | "$pullAll" | "$push" => {}
+                | "$pullAll" | "$push" | "$pull" => {}
                 name if name.starts_with('$') => {
                     return Err(DocumentUpdateError::UnsupportedOperator.error());
                 }
@@ -218,6 +221,12 @@ impl DocumentUpdater {
                     "$push" => OperationAction::Push(push::Push::compile(
                         value,
                         &mut retained_bytes,
+                        check,
+                    )?),
+                    "$pull" => OperationAction::Pull(PullMatcher::compile(
+                        value,
+                        &mut retained_bytes,
+                        MAX_RETAINED_BYTES,
                         check,
                     )?),
                     _ => unreachable!("operator prevalidated"),
@@ -290,6 +299,24 @@ impl DocumentUpdater {
                 }
                 OperationAction::Push(push) => {
                     push.apply_document(&mut result, &operation.path, &mut budget)?
+                }
+                OperationAction::Pull(matcher) => {
+                    if let Some(value) =
+                        existing_document_value(&mut result, &operation.path, true, &mut budget)?
+                    {
+                        let BsonValue::Array(values) = value else {
+                            return Err(DocumentUpdateError::BadValue.error());
+                        };
+                        let mut kept = 0;
+                        for read in 0..values.len() {
+                            budget.step()?;
+                            if !matcher.matches(&values[read], &mut budget)? {
+                                values.swap(kept, read);
+                                kept += 1;
+                            }
+                        }
+                        values.truncate(kept);
+                    }
                 }
             }
         }
@@ -374,6 +401,26 @@ struct Budget<'a> {
     comparison_bytes: usize,
     steps: usize,
     check: &'a mut dyn FnMut() -> EngineResult<()>,
+}
+
+impl MatchControl for Budget<'_> {
+    fn step(&mut self) -> EngineResult<()> {
+        Budget::step(self)
+    }
+    fn value(&mut self, value: &BsonValue) -> EngineResult<()> {
+        self.comparison_value(value)
+    }
+    fn comparison_bytes(&mut self, bytes: usize) -> EngineResult<()> {
+        self.comparison_bytes = self
+            .comparison_bytes
+            .checked_add(bytes)
+            .filter(|bytes| *bytes <= MAX_COMPARISON_BYTES)
+            .ok_or_else(limit)?;
+        Ok(())
+    }
+    fn allocation(&mut self, bytes: usize) -> EngineResult<()> {
+        self.charge(bytes)
+    }
 }
 impl Budget<'_> {
     fn step(&mut self) -> EngineResult<()> {

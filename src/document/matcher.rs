@@ -12,7 +12,30 @@ use super::{
 };
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
+mod pull;
 mod regex_compat;
+pub(super) use pull::PullMatcher;
+
+/// Optional value/allocation accounting for an updater sharing this matcher.
+/// Ordinary reads retain their existing matcher bounds and request checks.
+pub(super) trait MatchControl {
+    fn step(&mut self) -> EngineResult<()>;
+    fn value(&mut self, _value: &BsonValue) -> EngineResult<()> {
+        Ok(())
+    }
+    fn comparison_bytes(&mut self, _bytes: usize) -> EngineResult<()> {
+        Ok(())
+    }
+    fn allocation(&mut self, _bytes: usize) -> EngineResult<()> {
+        Ok(())
+    }
+}
+
+impl<F: FnMut() -> EngineResult<()>> MatchControl for F {
+    fn step(&mut self) -> EngineResult<()> {
+        self()
+    }
+}
 
 const MAX_QUERY_BYTES: usize = 1024 * 1024;
 const MAX_QUERY_NODES: usize = 4096;
@@ -188,9 +211,12 @@ impl DocumentMatcher {
     pub(crate) fn matches_with_check(
         &self,
         document: &BsonDocument,
-        check: &mut dyn FnMut() -> EngineResult<()>,
+        mut check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<bool> {
-        let mut work = Work { steps: 0, check };
+        let mut work = Work {
+            steps: 0,
+            check: &mut check,
+        };
         self.evaluate(Root::Document(document), true, false, &mut work)
     }
 }
@@ -645,12 +671,12 @@ fn types(
 
 struct Work<'a> {
     steps: usize,
-    check: &'a mut dyn FnMut() -> EngineResult<()>,
+    check: &'a mut dyn MatchControl,
 }
 
 impl Work<'_> {
     fn step(&mut self) -> EngineResult<()> {
-        (self.check)()?;
+        self.check.step()?;
         self.steps += 1;
         if self.steps > MAX_MATCH_STEPS {
             return Err(limit());
@@ -689,10 +715,12 @@ fn candidate<'a>(
     output: &mut Vec<Candidate<'a>>,
     value: Option<&'a BsonValue>,
     indexed: bool,
+    work: &mut Work<'_>,
 ) -> EngineResult<()> {
     if output.len() == MAX_PATH_CANDIDATES {
         return Err(limit());
     }
+    work.check.allocation(128)?;
     output.push(Candidate { value, indexed });
     Ok(())
 }
@@ -708,7 +736,7 @@ fn resolve<'a>(
         let Root::Value(value) = root else {
             return Err(query_error(2));
         };
-        return candidate(output, Some(value), false);
+        return candidate(output, Some(value), false, work);
     };
     match root {
         Root::Value(BsonValue::Document(document)) | Root::Document(document) => {
@@ -723,14 +751,14 @@ fn resolve<'a>(
             }
             match found {
                 Some(value) => resolve(Root::Value(value), remaining, output, work),
-                None => candidate(output, None, false),
+                None => candidate(output, None, false, work),
             }
         }
         Root::Value(BsonValue::Array(values)) => {
             if let Some(index) = array_index(part) {
                 if let Some(value) = values.get(index) {
                     if remaining.is_empty() {
-                        candidate(output, Some(value), true)?;
+                        candidate(output, Some(value), true, work)?;
                     } else if matches!(value, BsonValue::Document(_) | BsonValue::Array(_)) {
                         resolve(Root::Value(value), remaining, output, work)?;
                     }
@@ -746,7 +774,7 @@ fn resolve<'a>(
             }
             Ok(())
         }
-        Root::Value(_) => candidate(output, None, false),
+        Root::Value(_) => candidate(output, None, false, work),
     }
 }
 
@@ -794,7 +822,7 @@ impl DocumentMatcher {
                         && matches!(root, Root::Value(BsonValue::Array(_)))
                         && array_index(&path[0]).is_none()
                     {
-                        candidate(&mut candidates, None, false)?;
+                        candidate(&mut candidates, None, false, work)?;
                     } else {
                         resolve(root, path, &mut candidates, work)?;
                     }
@@ -841,14 +869,22 @@ fn equal(
     let Some(actual) = actual else {
         return Ok(matches!(expected, BsonValue::Null));
     };
-    if actual == expected {
+    work.check.value(actual)?;
+    work.check.value(expected)?;
+    let matched = actual == expected;
+    work.check.step()?;
+    if matched {
         return Ok(true);
     }
     if !exact {
         if let BsonValue::Array(values) = actual {
             for value in values {
                 work.step()?;
-                if value == expected {
+                work.check.value(value)?;
+                work.check.value(expected)?;
+                let matched = value == expected;
+                work.check.step()?;
+                if matched {
                     return Ok(true);
                 }
             }
@@ -922,7 +958,10 @@ impl Predicate {
                         return Ok(false);
                     }
                 }
+                work.check.value(value)?;
+                work.check.value(operand)?;
                 let comparison = value.cmp(operand);
+                work.check.step()?;
                 Ok(if comparison.is_eq() {
                     *inclusive
                 } else if *greater {
@@ -1051,14 +1090,22 @@ impl CompiledRegex {
     ) -> EngineResult<bool> {
         scalar_or_members(actual, exact, false, work, |value, work| {
             work.step()?;
-            match value {
+            if let Some(value) = value {
+                work.check.value(value)?;
+            }
+            work.check.comparison_bytes(
+                128 + self.identity.pattern().len() + self.identity.options().len(),
+            )?;
+            let result = match value {
                 Some(BsonValue::RegularExpression(regex)) => Ok(regex == &self.identity),
                 Some(BsonValue::String(value)) => match &self.expression {
                     Some(expression) => expression.is_match(value).map_err(|_| limit()),
                     None => Ok(false),
                 },
                 _ => Ok(false),
-            }
+            };
+            work.check.step()?;
+            result
         })
     }
 }

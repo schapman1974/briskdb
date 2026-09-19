@@ -107,7 +107,7 @@ batch size and cannot change the original skip or limit.
 ### Field updates and single-record write boundaries
 
 `Update` executes scopes `One` and `Many` with `$set`, `$unset`, `$min`, `$max`,
-`$pop`, `$rename`, `$addToSet`, `$pullAll`, and `$push`, using the same
+`$pop`, `$rename`, `$addToSet`, `$pullAll`, `$push`, and `$pull`, using the same
 locked selection/reselection and preflighted write path as replacement. A shared
 `DocumentUpdater` validates every operator, operand, path, and prefix conflict
 before namespace lookup or matching. It bounds specifications to 1 MiB/4,096
@@ -180,6 +180,26 @@ the persisted document-size cap applies to the final post-image. See Mongo's
 [$push](https://www.mongodb.com/docs/manual/reference/operator/update/push/)
 definition; exact sorting and field-processing behavior follows the frozen input.
 
+`$pull` removes all matching members without creating missing fields. Non-document
+conditions use literal BSON equality (a scalar does not implicitly match an array
+containing it). Operator documents use the shared query field predicates, including
+equality/ranges, `$in`/`$nin`, regex, `$elemMatch`, `$all`, `$size`, `$type`, `$mod`,
+and `$exists`. Document conditions use shared dotted-path and logical matching;
+embedded `_id` fields are ordinary fields, not collection primary keys. An empty
+condition document matches document members only. Top-level `$not` is rejected,
+but `$not` in a document field is supported. `$expr` at the condition/logical-clause
+level fails with code 224; nested field/element uses fail with code 2. Malformed
+conditions are validated eagerly even when the collection/filter/array is empty;
+regex error codes 51075/51091/51108 are preserved as update errors.
+The matcher borrows members without wrapping or cloning them. Its path-candidate
+allocations, literal/range comparisons, regex input/pattern work, and traversal
+share the update's growth/comparison/step budgets. Conservative AST and potential
+regex-program retention is preflighted before compilation; existing query depth,
+node, regex-size/count/backtracking limits still apply. Stable in-place compaction
+affects only the private post-image, discarded on any error. See Mongo's
+[$pull](https://www.mongodb.com/docs/manual/reference/operator/update/pull/)
+definition; exact predicate validation follows the frozen input.
+
 Only changed paths are edited. Untouched fields retain order and exact BSON
 types; new fields follow specification order. Missing `$set` parents become
 objects. Numeric paths traverse existing arrays (zero-based canonical ASCII
@@ -196,7 +216,7 @@ including retained fields. Result/plan/post-image checks precede SQL, so validat
 failures leave the record unchanged. Concurrent updates read the current document
 under the write lock rather than applying a stale client-side replacement.
 Other operators, upsert, and secondary-index maintenance remain
-unimplemented. Of 20,704 source-locked update oracle cases, the original 4,008
+unimplemented. Of 26,277 source-locked update oracle cases, the original 4,008
 set/unset cases intentionally cover non-ID object paths only: frozen TinyMongo's
 legacy scalar/array/ID behavior differs. The 4,719 min/max cases additionally
 cover whole-value ordering, numeric array paths, scalar/null path errors,
@@ -207,7 +227,10 @@ membership helpers silently restore changed IDs, and add-to-set overwrites
 scalar parents/does not implement numeric array paths. Another 4,459 push cases
 cover object/array paths, blocked parents, values, fixed modifier
 order, numeric boundaries, stable compound sorting, slicing, and invalid operands
-without ID writes because frozen push also silently restores IDs.
+without ID writes because frozen push also silently restores IDs. Another 5,573
+pull cases cover non-ID object/array paths, literal and query conditions, embedded
+IDs, logical clauses, ranges, regex, and eager errors. Frozen pull also restores
+collection IDs; independent tests enforce their immutability.
 Across these legacy differences, BriskDB rejects changed
 IDs and blocked parents; independent tests cover those stricter boundaries,
 without changing frozen corpus/allowances. Independent unit, transaction, and real-wire tests

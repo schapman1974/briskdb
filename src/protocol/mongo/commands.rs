@@ -145,6 +145,7 @@ impl CommandError {
                     14 => "TypeMismatch",
                     9 => "FailedToParse",
                     115 => "CommandNotSupported",
+                    224 => "QueryFeatureNotAllowed",
                     _ => "BadValue",
                 };
                 return Self::new(code, name, "invalid or unsupported document query");
@@ -1420,7 +1421,20 @@ impl Executor {
                             if (safe_statement_error || error.rolled_back_update)
                                 && matches!(
                                     error.code,
-                                    2 | 9 | 14 | 28 | 40 | 52 | 56 | 66 | 72 | 10334 | 115
+                                    2 | 9
+                                        | 14
+                                        | 28
+                                        | 40
+                                        | 52
+                                        | 56
+                                        | 66
+                                        | 72
+                                        | 10334
+                                        | 115
+                                        | 224
+                                        | 51075
+                                        | 51091
+                                        | 51108
                                 ) =>
                         {
                             // Single mutations fail before commit. Multi updates

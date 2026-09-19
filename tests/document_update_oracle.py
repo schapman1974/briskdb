@@ -14,6 +14,8 @@ Push covers non-ID object/array paths and blocked parents; its helper silently
 restores changed IDs, so identity is tested independently. Push sorting uses
 whole values or frozen object-only field
 lookup, not ordinary query-sort array-element selection.
+Pull covers non-ID paths and shared query predicates; embedded member _id fields
+use ordinary field matching. Immutable collection IDs are tested independently.
 """
 import hashlib
 import random
@@ -275,6 +277,60 @@ def main():
         {"$push": {"missing": {"$each": []}}},
     ]:
         emit({"_id": 7, "v": [1, 2]}, update)
+
+    # 1,156 literal cases distinguish whole-array equality from field predicates.
+    for actual in comparison_values:
+        for condition in comparison_values:
+            emit({"_id": 7, "v": [actual, actual]}, {"$pull": {"v": condition}})
+    conditions = [
+        {"$eq": 1}, {"$ne": 1}, {"$gte": None}, {"$gt": [1]},
+        {"$lt": MaxKey()}, {"$gt": MinKey()}, {"$in": [1, True, Regex("a", "i")]},
+        {"$nin": [1, None]}, {"$all": [1, 2]}, {"$size": 2}, {"$type": "array"},
+        {"$type": "number"}, {"$mod": [2, 0]}, {"$exists": False},
+        {"$regex": "^a", "$options": "i"}, {"$elemMatch": {"$gt": 1}},
+        {"$elemMatch": {"x": {"$gte": 1}}}, {}, {"x": 1}, {"x": None},
+        {"x": {"$exists": False}}, {"x": {"$not": {"$gte": 1}}},
+        {"a.x": {"$gt": 1}}, {"a.0": {"$eq": 1}}, {"_id": 2},
+        {"_id": {"$gt": 1}}, {"$or": [{"x": 1}, {"_id": 2}]},
+        {"$and": [{"x": {"$ne": 1}}, {"a": {"$exists": True}}]},
+        {"$nor": [{"x": 1}, {"_id": 2}]},
+        {"a": {"$elemMatch": {"x": 1, "y": {"$gt": 2}}}},
+    ]
+    assert len(conditions) == 30
+    arrays = [comparison_values, comparison_values[::-1], [],
+              [{"x": 1}, {"x": [1, 2]}, {"_id": [1, 2]}, {"_id": 2}, {}, None],
+              [{"a": [{"x": 2}]}, {"a": [1, 2]}, {"a": {"0": 1}}, {"a": [{"x": 1, "y": 3}]}],
+              [[1, 2], [1, 3], [], [[1]], {"x": 2}, "Alpha", "beta", Regex("a", "i")]]
+    for condition in conditions:
+        for items in arrays:
+            emit({"_id": 7, "v": items}, {"$pull": {"v": condition}})
+    for _ in range(1000):
+        items = [randomizer.choice(comparison_values) for _ in range(randomizer.randrange(8))]
+        operand = randomizer.choice(comparison_values)
+        comparison = {randomizer.choice(["$gt", "$gte", "$lt", "$lte"]): operand}
+        emit({"_id": 7, "v": items}, {"$pull": {"v": operand}})
+        emit({"_id": 7, "v": items}, {"$pull": {"v": comparison}})
+        documents = [{"x": value, "_id": [1, 2]} for value in items] + [{}, None]
+        emit({"_id": 7, "v": documents}, {"$pull": {"v": {"x": comparison}}})
+        emit({"_id": 7, "v": documents}, {"$pull": {"v": {"$or": [{"x": comparison}, {"_id": 2}]}}})
+    for current in [[], [[], [1]], [None, []], 1, {"0": []}, {"x": {"y": [1]}}]:
+        for path in ["v", "v.0", "v.1", "v.3", "v.01", "v.x", "v.0.x", "v.0.0", "v.x.y"]:
+            for condition in [1, {}, {"$gte": 1}]:
+                emit({"_id": 7, "v": current}, {"$pull": {path: condition}})
+    invalid = [
+        {"$expr": {"$eq": [1, 1]}}, {"$or": [{"$expr": {"$eq": [1, 1]}}]},
+        {"x": {"$expr": {"$eq": [1, 1]}}}, {"$elemMatch": {"$expr": {"$eq": [1, 1]}}},
+        {"$not": {"$eq": 1}}, {"$unknown": 1}, {"$comment": "no"}, {"$where": "no"},
+        {"x": {"$not": {"$unknown": 1}}}, {"$and": []}, {"$or": [1]}, {"$nor": {}},
+        {"$in": None}, {"$nin": 1}, {"$all": "no"}, {"$size": -1}, {"$type": "no"},
+        {"$mod": [0, 1]}, {"$elemMatch": 1}, {"$regex": "["},
+        {"$regex": "a", "$options": "q"}, {"$regex": Regex("a", "i"), "$options": "m"},
+        {"$options": "i"}, {"$gt": Regex("a")}, {"x": 1, "$gt": 2},
+    ]
+    assert len(invalid) == 25
+    for condition in invalid:
+        for document in [{"_id": 7}, {"_id": 7, "v": []}, {"_id": 7, "v": [1, {"x": 2}]}]:
+            emit(document, {"$set": {"atomic_marker": True}, "$pull": {"v": condition}})
 
 
 if __name__ == "__main__":
