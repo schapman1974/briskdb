@@ -313,6 +313,18 @@ class AsyncSession:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> DeleteOneResult: ...
+    async def delete_many(
+        self,
+        database: str,
+        collection: str,
+        filter: BsonDocument,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> DeleteOneResult: ...
     async def status(self) -> Status: ...
     async def close(self) -> None: ...
     async def __aenter__(self) -> AsyncSession: ...

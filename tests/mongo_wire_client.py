@@ -10,6 +10,44 @@ from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timesta
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
 
 
+def delete_smoke(uri):
+    from pymongo import DeleteMany, DeleteOne
+    from pymongo.write_concern import WriteConcern
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_deletes.items
+        collection.insert_many([{"_id": i, "group": i % 2, "nested": {"label": "remove"}} for i in reversed(range(40))])
+        assert collection.delete_one({"group": 0}).deleted_count == 1
+        assert collection.find_one({"_id": 38}) is None
+        assert collection.delete_many({"group": 0, "nested.label": {"$regex": "^rem"}}).deleted_count == 19
+        assert collection.delete_many({"_id": 39.0}).deleted_count == 1
+        assert collection.delete_one({}).deleted_count == 1
+        assert collection.delete_many({"absent": {"$exists": True}}).deleted_count == 0
+        assert client.absent_delete.items.delete_many({}).deleted_count == 0
+        assert "absent_delete" not in client.list_database_names()
+        for ordered in (True, False):
+            batch = client.wire_deletes[f"ordered_{ordered}"]
+            batch.insert_many([{"_id": i} for i in range(4)])
+            try:
+                batch.bulk_write([DeleteOne({"_id": 0}), DeleteMany({"$where": "private"}), DeleteMany({"_id": {"$gt": 1}})], ordered=ordered)
+            except BulkWriteError as error:
+                assert error.details["nRemoved"] == (1 if ordered else 3)
+                assert [(item["index"], item["code"]) for item in error.details["writeErrors"]] == [(1, 115)]
+                assert "private" not in error.details["writeErrors"][0]["errmsg"]
+            else:
+                raise AssertionError("invalid selector must be an indexed write error")
+            assert batch.count_documents({}) == (3 if ordered else 1)
+        for selector, code in [({"q": {}, "limit": 2}, 2), ({"q": {}, "limit": 0, "hint": "_id_"}, 72), ({"q": {"$where": "private"}, "limit": 0}, 115)]:
+            reply = client.absent_delete.command("delete", "items", deletes=[selector])
+            assert reply["n"] == 0 and reply["writeErrors"][0]["code"] == code
+        assert collection.count_documents({}) == 18
+        # Exercise OP_MSG moreToCome on the same pooled connection; ping is a
+        # processing barrier, not a durability/replication claim.
+        unack = collection.with_options(write_concern=WriteConcern(w=0))
+        assert not unack.delete_many({"_id": {"$gt": 30}}).acknowledged
+        client.admin.command("ping")
+        assert collection.count_documents({}) == 15
+
+
 def check_hello(reply):
     assert reply["isWritablePrimary"] is True
     assert reply["maxWireVersion"] == 8
@@ -714,6 +752,8 @@ def lifecycle_smoke(uri):
 
 
 def persisted_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert [row["_id"] for row in client.wire_deletes.items.find({})] == list(reversed(range(1, 30, 2)))
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         assert client.wire_data.items.find_one({"_id": "typed"})["decimal"] == Decimal128("1.250")
         assert client.wire_data.items.find_one({"_id": None})["value"] == "typed id"
@@ -834,6 +874,14 @@ def metadata_smoke(uri):
 
 
 async def async_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_deletes.items
+        await collection.insert_many([{"_id": i, "v": [i % 2]} for i in range(12)])
+        assert (await collection.delete_one({"v": 0})).deleted_count == 1
+        assert await collection.find_one({"_id": 0}) is None
+        assert (await collection.delete_many({"v": 0})).deleted_count == 5
+        assert (await collection.delete_many({})).deleted_count == 6
+        assert (await collection.delete_many({})).deleted_count == 0
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000, maxPoolSize=3) as client:
         assert (await client.admin.command("ping"))["ok"] == 1
         check_hello(await client.admin.command("hello"))
@@ -949,5 +997,6 @@ if __name__ == "__main__":
         aggregation_smoke(sys.argv[1])
         lifecycle_smoke(sys.argv[1])
         metadata_smoke(sys.argv[1])
+        delete_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

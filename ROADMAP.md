@@ -499,7 +499,7 @@ requires an earlier dependency:
       engine-owned cursors. Tests cover BSON fidelity, numeric-equivalent IDs,
       cross-interface access, restart, host enablement, one-way writes, and
       response limits. Missing collections read empty without creating metadata.
-      Updates/deletes, index metadata cursors, and full database
+      Updates/findAndModify, index metadata cursors, and full database
       lifecycle remain open.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
@@ -509,8 +509,16 @@ requires an earlier dependency:
       writes, with no cross-shard atomicity promise. Tests cover BSON types,
       direct zero-timestamp normalization, raw server-generated IDs, restart,
       concurrent duplicates, driver batch splitting, and boundary rejection.
+    - [ ] [#175](https://github.com/schapman1974/briskdb/issues/175) — filtered
+      delete-one/many now use the shared matcher across Rust, native sync/async
+      Python, and Mongo wire. Exact IDs stay single-shard; delete-one rechecks
+      the earliest natural-order candidate under a write lock. Delete-many
+      streams one shard-local transaction at a time; later failure/cancellation
+      preserves earlier commits, with no global snapshot/atomicity claim.
+      Wire batches preserve ordered/unordered selector errors and counts;
+      missing collections return zero. FindAndModify remains open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
-      BSON matcher now powers embedded and wire find/count/distinct/aggregate. Includes dotted
+      BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
       bounded regex evaluation, eager validation, and cancellation. Filtering
       precedes global pagination; exact `$eq` IDs retain point routing (#180).
@@ -582,9 +590,9 @@ requires an earlier dependency:
       projection-to-group identity case now uses the shared group stage below.
       All frozen aggregation projection-stage and application aggregation cases
       now pass through the real four-shard endpoint in both API modes. Combined
-      with the basic suite, required CI checks exactly 112 frozen executions and
+      with the basic and group-accumulator suites, required CI checks exactly 142 frozen executions and
       rejects missing, duplicated, substituted, or skipped cases. The full
-      456-execution corpus and group-accumulator suite remain separate open work.
+      456-execution corpus remains separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared
       `$group` supports literal/field/computed keys, recursive structured BSON identity, and
       all eight planned accumulators across Rust, sync/async native Python, and
@@ -596,6 +604,8 @@ requires an earlier dependency:
       arithmetic double NaN bits are unspecified and normalized only in tagged
       numeric outputs. Separate tests cover unencodable-reference integer sums,
       memory/BSON limits, cancellation, byte paging, cleanup, and restart.
+      All 30 frozen group-accumulator sync/async executions now pass against
+      the real four-shard candidate, including empty-input setup via delete-many.
       Partial-shard accumulator-state merging and
       full candidate-corpus acceptance remain open. No disk spill or snapshot.
     - [ ] [#166](https://github.com/schapman1974/briskdb/issues/166) — targeted

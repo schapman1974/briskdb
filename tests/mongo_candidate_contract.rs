@@ -57,6 +57,7 @@ fn run_contract(uri: &str, report: &std::path::Path) -> std::process::Output {
             "compat/mongo/v1/runner/contracts/test_aggregation_basic_stages_contract.py",
             "compat/mongo/v1/runner/contracts/test_aggregation_projection_stages_contract.py",
             "compat/mongo/v1/runner/contracts/test_aggregation_contract.py",
+            "compat/mongo/v1/runner/contracts/test_group_accumulators_contract.py",
         ])
         .args([
             "--mongo-contract-target=briskdb",
@@ -88,16 +89,17 @@ modules = {
     'tests.contracts.test_aggregation_basic_stages_contract',
     'tests.contracts.test_aggregation_projection_stages_contract',
     'tests.contracts.test_aggregation_contract',
+    'tests.contracts.test_group_accumulators_contract',
 }
 expected = {(case['id'], api) for case in corpus['cases']
             if case['id'].split('::', 1)[0] in modules for api in case['apis']}
 executions = ingest_junit(Path(sys.argv[1]), 'briskdb', corpus)['executions']
 actual = {(item['case_id'], item['api']) for item in executions}
-assert len(expected) == len(executions) == 112, 'locked suite coverage changed'
+assert len(expected) == len(executions) == 142, 'locked suite coverage changed'
 assert actual == expected, 'candidate suite omitted or substituted locked cases'
 assert all(item['outcome'] == 'passed' and item['target'] == 'briskdb-briskdb'
            for item in executions), 'candidate suite skipped or failed a case'
-print('Verified all 112 exact frozen candidate executions, with no skips.')
+print('Verified all 142 exact frozen candidate executions, with no skips.')
 "#,
             ])
             .arg(report)

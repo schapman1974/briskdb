@@ -14,6 +14,7 @@ use std::{
 use tokio::task::JoinHandle;
 
 mod aggregation;
+mod deletion;
 mod distinct;
 mod metadata;
 mod sorting;
@@ -855,69 +856,15 @@ impl Engine {
                 ))
             }
             DocumentCommand::Delete(request) => {
-                let (namespace, filter, scope, options) = request.into_parts();
-                require_delete_options(options)?;
-                if scope != DocumentMutationScope::One {
-                    return Err(unsupported(
-                        "multi-document deletes require the matcher semantics milestone",
-                    ));
-                }
-                let catalog_storage = storage.clone();
-                let (collection_id, id_key, shard, plan) = self
-                    .run_document_storage_task(
-                        cancellation.clone(),
-                        deadline,
-                        move |cancellation, control| {
-                            let collection = catalog_storage.document_collection_controlled(
-                                namespace.database(),
-                                namespace.collection(),
-                                Arc::clone(&control),
-                            )?;
-                            let collection_id = require_collection(collection)?.id();
-                            let id = require_point_filter(filter, cancellation, &control)?;
-                            ensure_document_cpu_active(cancellation, &control)?;
-                            let (id_key, shard) = catalog_storage.prepare_document_id(&id)?;
-                            let plan = DocumentPlan::Point(DocumentPointPlan::new(
-                                collection_id,
-                                shard,
-                                id_key.clone(),
-                            )?);
-                            enforce_execution_result_limits(
-                                &DocumentExecution::new(
-                                    request_id,
-                                    Some(plan.clone()),
-                                    DocumentResult::Delete(DocumentDeleteResult::new(0)),
-                                ),
-                                result_limits,
-                            )?;
-                            ensure_document_cpu_active(cancellation, &control)?;
-                            Ok((collection_id, id_key, shard, plan))
-                        },
-                    )
-                    .await?;
-                let delete_key = id_key;
-                let deleted = self
-                    .run_document_shard(
-                        shard,
-                        owner,
-                        cancellation,
-                        deadline,
-                        move |storage, connection, cancellation| {
-                            storage.delete_document_on_connection(
-                                connection,
-                                collection_id,
-                                shard,
-                                &delete_key,
-                                cancellation,
-                            )
-                        },
-                    )
-                    .await?;
-                Ok(DocumentExecution::new(
+                self.run_document_delete(
+                    owner,
                     request_id,
-                    Some(plan),
-                    DocumentResult::Delete(DocumentDeleteResult::new(u64::from(deleted))),
-                ))
+                    request,
+                    cancellation,
+                    deadline,
+                    result_limits,
+                )
+                .await
             }
             DocumentCommand::Distinct(request) => {
                 self.run_document_distinct(
@@ -1179,6 +1126,37 @@ impl Engine {
             + Send
             + 'static,
     {
+        self.run_document_shard_controlled(
+            shard,
+            owner,
+            cancellation,
+            deadline,
+            move |storage, connection, cancellation, _control| {
+                work(storage, connection, cancellation)
+            },
+        )
+        .await
+    }
+
+    async fn run_document_shard_controlled<T, F>(
+        &self,
+        shard: u16,
+        owner: ConnectionOwner,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        work: F,
+    ) -> EngineResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(
+                &Storage,
+                &mut PooledConnection,
+                &CancellationToken,
+                &OperationControl,
+            ) -> EngineResult<T>
+            + Send
+            + 'static,
+    {
         let control = OperationControl::new(deadline);
         let mut cancel_on_drop = CancelOnDrop::new(Arc::clone(&control));
         let shutdown = self.inner.shutdown_cancel.clone();
@@ -1212,10 +1190,12 @@ impl Engine {
             let result = permit
                 .checkout_controlled(Arc::clone(&worker_control))
                 .and_then(|mut connection| {
-                    let result = connection
-                        .run_document_controlled(Arc::clone(&worker_control), |connection| {
-                            work(&storage, connection, &task_cancellation)
-                        });
+                    let result = connection.run_document_controlled(
+                        Arc::clone(&worker_control),
+                        |connection| {
+                            work(&storage, connection, &task_cancellation, &worker_control)
+                        },
+                    );
                     retire_if_broken(&mut connection, &result);
                     result
                 });
@@ -1832,19 +1812,6 @@ fn prepare_filter_route(
                 ensure_document_cpu_active(cancellation, control)
             })?;
             Ok(PreparedFilterRoute::Scatter(Some(Arc::new(matcher))))
-        }
-    }
-}
-
-fn require_point_filter(
-    filter: DocumentFilter,
-    cancellation: &CancellationToken,
-    control: &OperationControl,
-) -> EngineResult<BsonValue> {
-    match classify_filter(filter, cancellation, control)? {
-        FilterRoute::Point(id) => Ok(id),
-        FilterRoute::Scatter | FilterRoute::Filtered(_) => {
-            Err(unsupported("this mutation requires an exact _id filter"))
         }
     }
 }

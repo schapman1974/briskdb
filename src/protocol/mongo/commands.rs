@@ -18,13 +18,13 @@ use crate::{
         BsonCodecOptions, BsonDocument, BsonValue, DocumentAggregateRequest, DocumentAggregator,
         DocumentCollectionExistsRequest, DocumentCollectionOptions, DocumentCommand,
         DocumentContinueCursorRequest, DocumentCountRequest, DocumentCreateCollectionRequest,
-        DocumentCursorError, DocumentCursorId, DocumentDistinctRequest,
+        DocumentCursorError, DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
         DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
         DocumentFindRequest, DocumentInsertRequest, DocumentKillCursorRequest,
         DocumentListCollectionMetadataRequest, DocumentListDatabaseNamesRequest, DocumentMatcher,
-        DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentProjector,
-        DocumentQueryError, DocumentReadOptions, DocumentRequest, DocumentRequestId,
-        DocumentResult, DocumentSort, DocumentSorter, DocumentWriteOptions,
+        DocumentMutationScope, DocumentNamespace, DocumentPipeline, DocumentProjection,
+        DocumentProjector, DocumentQueryError, DocumentReadOptions, DocumentRequest,
+        DocumentRequestId, DocumentResult, DocumentSort, DocumentSorter, DocumentWriteOptions,
         decode_document_batch_with_options, encode_document_with_options,
     },
 };
@@ -158,6 +158,7 @@ pub(super) enum Command {
     DropCollection(DocumentDropCollectionRequest),
     DropDatabase(DocumentDropDatabaseRequest),
     Insert(DocumentInsertRequest),
+    Delete(Vec<Result<DocumentDeleteRequest>>, bool),
     Count(DocumentCountRequest),
     Distinct(DocumentDistinctRequest),
     Find(DocumentFindRequest, bool, Option<Duration>),
@@ -177,6 +178,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
     if !matches!(
         name,
         "insert"
+            | "delete"
             | "find"
             | "aggregate"
             | "count"
@@ -193,7 +195,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
     }
     Some((|| {
         let started = Instant::now();
-        if request.more_to_come && name != "insert" {
+        if request.more_to_come && !matches!(name, "insert" | "delete") {
             return Err(CommandError::options());
         }
         let namespace = if name == "listDatabases" {
@@ -254,11 +256,14 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     true
                 }
                 "documents" if name == "insert" => matches!(value, BsonValue::Array(_)),
-                "ordered" if name == "insert" => matches!(value, BsonValue::Boolean(_)),
+                "deletes" if name == "delete" => matches!(value, BsonValue::Array(_)),
+                "ordered" if matches!(name, "insert" | "delete") => {
+                    matches!(value, BsonValue::Boolean(_))
+                }
                 "bypassDocumentValidation" if name == "insert" => {
                     matches!(value, BsonValue::Boolean(false))
                 }
-                "writeConcern" if name == "insert" => valid_write_concern(value),
+                "writeConcern" if matches!(name, "insert" | "delete") => valid_write_concern(value),
                 "writeConcern" if matches!(name, "drop" | "dropDatabase" | "create") => {
                     valid_write_concern(value)
                         && matches!(value, BsonValue::Document(doc)
@@ -268,7 +273,12 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 "comment"
                     if matches!(
                         name,
-                        "drop" | "dropDatabase" | "create" | "listCollections" | "listDatabases"
+                        "drop"
+                            | "dropDatabase"
+                            | "create"
+                            | "listCollections"
+                            | "listDatabases"
+                            | "delete"
                     ) =>
                 {
                     matches!(value, BsonValue::Null)
@@ -437,6 +447,53 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     DocumentWriteOptions::new(),
                 )?)
             }
+        } else if name == "delete" {
+            let statements = write_documents(request, "deletes")?;
+            let deletes = statements
+                .into_iter()
+                .map(|statement| {
+                    if statement
+                        .iter()
+                        .any(|(name, _)| !matches!(name, "q" | "limit"))
+                    {
+                        return Err(CommandError::options());
+                    }
+                    let Some(BsonValue::Document(filter)) = statement.get_first("q") else {
+                        return Err(CommandError::invalid());
+                    };
+                    let scope = match statement.get_first("limit") {
+                        Some(BsonValue::Int32(0) | BsonValue::Int64(0)) => {
+                            DocumentMutationScope::Many
+                        }
+                        Some(BsonValue::Int32(1) | BsonValue::Int64(1)) => {
+                            DocumentMutationScope::One
+                        }
+                        _ => return Err(CommandError::invalid()),
+                    };
+                    DocumentMatcher::compile_with_check(filter, &mut || {
+                        if started.elapsed() >= timeout {
+                            Err(EngineError::deadline_exceeded(
+                                "Mongo command parsing deadline exceeded",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    })?;
+                    Ok(DocumentDeleteRequest::new(
+                        namespace.clone(),
+                        DocumentFilter::new(filter.clone())?,
+                        scope,
+                        DocumentWriteOptions::new(),
+                    ))
+                })
+                .collect();
+            Command::Delete(
+                deletes,
+                !matches!(
+                    request.body.get_first("ordered"),
+                    Some(BsonValue::Boolean(false))
+                ),
+            )
         } else if name == "insert" {
             let documents = insert_documents(request)?;
             let ordered = !matches!(
@@ -721,12 +778,15 @@ fn valid_write_concern(value: &BsonValue) -> bool {
     }))
 }
 
-fn insert_documents(request: &Request) -> Result<Vec<BsonDocument>> {
+fn write_documents(request: &Request, identifier: &str) -> Result<Vec<BsonDocument>> {
     let options = BsonCodecOptions::new()
         .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)
         .with_max_decoded_bytes(wire::MAX_DECODED_DOCUMENT_BYTES);
     let documents = if !request.sequences.is_empty() {
-        if request.sequences.len() != 1 || request.sequences[0].identifier != "documents" {
+        if request.sequences.len() != 1
+            || request.sequences[0].identifier != identifier
+            || request.body.get_first(identifier).is_some()
+        {
             return Err(CommandError::options());
         }
         let documents = &request.sequences[0].documents;
@@ -738,11 +798,11 @@ fn insert_documents(request: &Request) -> Result<Vec<BsonDocument>> {
             CommandError::new(
                 10334,
                 "BSONObjectTooLarge",
-                "insert batch exceeds decoded memory limit",
+                "write batch exceeds decoded memory limit",
             )
         })?
     } else {
-        let Some(BsonValue::Array(documents)) = request.body.get_first("documents") else {
+        let Some(BsonValue::Array(documents)) = request.body.get_first(identifier) else {
             return Err(CommandError::invalid());
         };
         if documents.is_empty() || documents.len() > 1000 {
@@ -756,6 +816,14 @@ fn insert_documents(request: &Request) -> Result<Vec<BsonDocument>> {
             })
             .collect::<Result<Vec<_>>>()?
     };
+    Ok(documents)
+}
+
+fn insert_documents(request: &Request) -> Result<Vec<BsonDocument>> {
+    let documents = write_documents(request, "documents")?;
+    let options = BsonCodecOptions::new()
+        .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)
+        .with_max_decoded_bytes(wire::MAX_DECODED_DOCUMENT_BYTES);
     // ID generation belongs to the engine. Reserve the exact BSON ObjectId
     // element size here so normalization cannot exceed the advertised limit.
     for document in &documents {
@@ -997,6 +1065,59 @@ impl Executor {
                     }
                     _ => Err(CommandError::unsupported()),
                 }
+            }
+            Command::Delete(deletes, ordered) => {
+                let mut count = 0i64;
+                let mut errors = Vec::new();
+                for (index, delete) in deletes.into_iter().enumerate() {
+                    let delete = match delete {
+                        Ok(delete) => delete,
+                        Err(error) => {
+                            errors.push(BsonValue::Document(error.write_document(index)));
+                            if ordered {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    if !self
+                        .exists(session, identity, &context, delete.namespace())
+                        .await?
+                    {
+                        continue;
+                    }
+                    // Operational failures can follow committed shard writes.
+                    // Abort instead of claiming an exact count or retrying them.
+                    match self
+                        .call(session, identity, &context, DocumentCommand::Delete(delete))
+                        .await?
+                    {
+                        DocumentResult::Delete(result) => {
+                            count = count
+                                .checked_add(
+                                    i64::try_from(result.deleted_count())
+                                        .map_err(|_| CommandError::invalid())?,
+                                )
+                                .ok_or_else(CommandError::invalid)?;
+                        }
+                        _ => {
+                            return Err(CommandError::new(
+                                1,
+                                "InternalError",
+                                "unexpected engine result",
+                            ));
+                        }
+                    }
+                }
+                let mut body = fields([
+                    ("ok", BsonValue::Double(1.0)),
+                    ("n", BsonValue::Int64(count)),
+                ]);
+                if !errors.is_empty() {
+                    body.push("writeErrors", BsonValue::Array(errors))
+                        .expect("static field name");
+                }
+                Ok(body)
             }
             Command::Insert(insert) => {
                 self.ensure_collection(session, identity, &context, insert.namespace())
