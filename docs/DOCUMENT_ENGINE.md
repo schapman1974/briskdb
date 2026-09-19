@@ -382,7 +382,7 @@ numeric sums return Int32 zero, empty numeric averages null. Newly computed
 double NaNs use a canonical quiet NaN; their arithmetic sign/payload is not
 specified. Pass-through values, keys, extrema, and sets preserve original bits.
 Noncanonical finite Decimal128 BID payloads are interpreted as zero, consistent
-with [shared BSON identity](BSON.md#comparison-and-identity) and MongoDB's BID
+with [shared BSON identity](BSON.md#equality-representation-equality-hashing-and-order) and MongoDB's BID
 arithmetic. Python's `to_decimal()` recovers some malformed payloads differently;
 this boundary is covered by explicit Rust vectors, not a claim of reference
 agreement on those malformed inputs. Pass-through results retain the raw BID.
