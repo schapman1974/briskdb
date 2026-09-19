@@ -266,6 +266,7 @@ cargo test --features documents --test bson_document
 cargo install cargo-fuzz
 cargo fuzz run --fuzz-dir fuzz bson_codec
 cargo fuzz run --fuzz-dir fuzz bson_comparison
+cargo fuzz run --fuzz-dir fuzz document_distinct
 ```
 
 The versioned collection catalog and shard persistence built on these types is

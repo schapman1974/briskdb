@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added synchronous/async `distinct` with shared BSON identity, first-encounter
+  representation retention, bounded output, and normal request controls.
 - Added synchronous/async `collection_exists` with targeted engine lookup,
   typed boolean results, and the usual request/cancellation/result controls.
 - Added the non-retryable `IdempotencyConflictError` integrity category for

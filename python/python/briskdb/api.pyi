@@ -16,6 +16,7 @@ from ._briskdb import (
     CreateIndexResult,
     Database,
     DeleteOneResult,
+    DistinctResult,
     FindResult,
     InsertOneResult,
     KillCursorResult,
@@ -236,6 +237,19 @@ class AsyncSession:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> KillCursorResult: ...
+    async def distinct(
+        self,
+        database: str,
+        collection: str,
+        field: str,
+        filter: Optional[BsonDocument] = None,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> DistinctResult: ...
     async def count_documents(
         self,
         database: str,

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pymongo
-from bson import Binary, Decimal128, Int64, ObjectId, Regex, Timestamp
+from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timestamp
 from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
 
 
@@ -337,6 +337,60 @@ def sorting_smoke(uri):
                     raise AssertionError("invalid sort must fail before missing-collection handling")
 
 
+def distinct_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_distinct.items
+        assert collection.distinct("v") == []
+        documents = [
+            {"_id": 0, "v": [Int64(1), True, None, [2, 3]], "nested": {"a": ["first", "second"]}},
+            {"_id": 1, "v": [1.0, False, [2.0, Int64(3)]], "nested": [{"a": "no-fanout"}]},
+            {"_id": 2, "v": Decimal128("1.00"), "": "empty-key", "payload": "x" * 100000},
+            {"_id": 3},
+        ]
+        collection.insert_many(documents)
+        expected = [Int64(1), True, None, [2, 3], False]
+        assert BSON.encode({"v": collection.distinct("v", maxTimeMS=10000)}) == BSON.encode({"v": expected})
+        assert collection.distinct("nested.a") == ["first", "second"]
+        assert collection.distinct("") == ["empty-key"]
+        assert collection.distinct("v.0") == []
+        assert collection.distinct("v\x00") == []
+        assert isinstance(collection.distinct("v", {"_id": 2})[0], Decimal128)
+        assert client.unwritten_distinct.items.distinct("v") == []
+        for arguments, code in [
+            ({"key": 7}, 14), ({"key": Code("v")}, 14), ({"key": "v", "query": []}, 14),
+            ({"key": "v", "query": {"$where": "private-data"}}, 115),
+            ({"key": "v", "hint": "_id_"}, 72), ({"key": "v", "collation": {"locale": "en"}}, 72),
+            ({"key": "v", "skip": 1}, 72), ({"key": "v", "comment": "private-data"}, 72),
+        ]:
+            for database in [client.wire_distinct, client.unwritten_distinct]:
+                try:
+                    database.command("distinct", "items", **arguments)
+                except OperationFailure as error:
+                    assert error.code == code, (arguments, error.code)
+                    assert "private-data" not in str(error)
+                else:
+                    raise AssertionError("distinct options must fail before missing-collection handling")
+        # Global encounter order and first representation must survive internal
+        # paging, not depend on the physical shard that happens to be read first.
+        client.wire_distinct.ordered.insert_many([
+            {"_id": index, "v": Int64(index) if index < 17 else float(index % 17)} for index in range(160)
+        ])
+        values = client.wire_distinct.ordered.distinct("v")
+        assert values == list(range(17)) and all(isinstance(value, Int64) for value in values)
+        # A result over the bootstrap byte budget fails wholly, then the socket
+        # and session remain usable. No partial values array is returned.
+        client.wire_distinct.too_large.insert_many([{"_id": i, "v": str(i) + "x" * 300000} for i in range(4)])
+        try:
+            client.wire_distinct.too_large.distinct("v")
+        except OperationFailure as error:
+            assert error.code == 10334
+            assert "values" not in error.details
+        else:
+            raise AssertionError("oversized distinct must fail wholly")
+        assert collection.distinct("nested.a") == ["first", "second"]
+        assert list(collection.find().sort("_id", 1)) == documents
+
+
 def count_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         collection = client.wire_count.items
@@ -397,6 +451,9 @@ def persisted_smoke(uri):
         assert [row["_id"] for row in client.wire_sorting.items.find({}, {"_id": 1}).sort("_id", -1).batch_size(4)] == list(reversed(range(36)))
         assert client.wire_count.items.estimated_document_count() == 37
         assert client.wire_count.command("count", "items", query={"group": 1}, skip=3)["n"] == 9
+        values = client.wire_distinct.ordered.distinct("v")
+        assert values == list(range(17)) and all(isinstance(value, Int64) for value in values)
+        assert client.wire_distinct.items.distinct("nested.a") == ["first", "second"]
 
 
 async def async_smoke(uri):
@@ -406,6 +463,10 @@ async def async_smoke(uri):
         assert await client.wire_count.items.estimated_document_count(maxTimeMS=10000) == 37
         assert (await client.wire_count.command("count", "items", query={"group": 1}, skip=3, limit=5))["n"] == 5
         assert await client.unwritten_count.items.estimated_document_count() == 0
+        values = await client.wire_distinct.items.distinct("v")
+        assert isinstance(values[0], Int64) and len(values) == 5
+        assert await client.wire_distinct.items.distinct("nested.a", maxTimeMS=10000) == ["first", "second"]
+        assert await client.unwritten_distinct.items.distinct("v") == []
         replies = await asyncio.gather(*(client.admin.command("ping") for _ in range(12)))
         assert all(reply["ok"] == 1 for reply in replies)
         try:
@@ -464,5 +525,6 @@ if __name__ == "__main__":
         projection_smoke(sys.argv[1])
         sorting_smoke(sys.argv[1])
         count_smoke(sys.argv[1])
+        distinct_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

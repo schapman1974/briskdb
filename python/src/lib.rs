@@ -13,11 +13,11 @@ use std::{
 use briskdb::document::{
     DocumentCollectionExistsRequest, DocumentCollectionOptions, DocumentCommand,
     DocumentContinueCursorRequest, DocumentCountRequest, DocumentCreateCollectionRequest,
-    DocumentCreateIndexRequest, DocumentCursorId, DocumentDeleteRequest, DocumentFilter,
-    DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
-    DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
-    DocumentNamespace, DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId,
-    DocumentSort, DocumentWriteOptions,
+    DocumentCreateIndexRequest, DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
+    DocumentFilter, DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest,
+    DocumentKillCursorRequest, DocumentListCollectionsRequest, DocumentListIndexesRequest,
+    DocumentMutationScope, DocumentNamespace, DocumentProjection, DocumentReadOptions,
+    DocumentRequest, DocumentRequestId, DocumentSort, DocumentWriteOptions,
 };
 use briskdb::{
     BriskCursor, BriskDb, BriskSession, BriskTransaction,
@@ -1703,6 +1703,54 @@ impl Session {
         self.execute_document_command(
             py,
             DocumentCommand::Count(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (database, collection, field, filter = None, *, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn distinct(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        field: Py<PyAny>,
+        filter: Option<Py<PyAny>>,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let representation = self.shared.uuid_representation;
+        // Use BSON conversion to distinguish strings from Code, which is a
+        // Python str subclass but is not a BSON string in this contract.
+        let wrapper = PyDict::new(py);
+        wrapper.set_item("field", field.bind(py))?;
+        let wrapper = extract_bson_document(py, wrapper.as_any(), representation)?;
+        let field = match wrapper.get_first("field") {
+            Some(briskdb::document::BsonValue::String(value)) => value.clone(),
+            _ => {
+                return Err(crate::error::type_mismatch(
+                    "distinct field must be a BSON string",
+                ));
+            }
+        };
+        let filter = document_filter(py, filter.as_ref(), representation)?;
+        let request = python_engine_result(DocumentDistinctRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            field,
+            filter,
+            DocumentReadOptions::new(),
+        ))?;
+        self.execute_document_command(
+            py,
+            DocumentCommand::Distinct(request),
             request_id,
             timeout_ms,
             cancellation.as_deref(),

@@ -18,11 +18,11 @@ use crate::{
         BsonCodecOptions, BsonDocument, BsonValue, DocumentCollectionExistsRequest,
         DocumentCollectionOptions, DocumentCommand, DocumentContinueCursorRequest,
         DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCursorError,
-        DocumentCursorId, DocumentFilter, DocumentFindRequest, DocumentInsertRequest,
-        DocumentKillCursorRequest, DocumentMatcher, DocumentNamespace, DocumentProjection,
-        DocumentProjector, DocumentQueryError, DocumentReadOptions, DocumentRequest,
-        DocumentRequestId, DocumentResult, DocumentSort, DocumentSorter, DocumentWriteOptions,
-        decode_document_batch_with_options, encode_document_with_options,
+        DocumentCursorId, DocumentDistinctRequest, DocumentFilter, DocumentFindRequest,
+        DocumentInsertRequest, DocumentKillCursorRequest, DocumentMatcher, DocumentNamespace,
+        DocumentProjection, DocumentProjector, DocumentQueryError, DocumentReadOptions,
+        DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort, DocumentSorter,
+        DocumentWriteOptions, decode_document_batch_with_options, encode_document_with_options,
     },
 };
 
@@ -151,6 +151,7 @@ fn fields<const N: usize>(entries: [(&str, BsonValue); N]) -> BsonDocument {
 pub(super) enum Command {
     Insert(DocumentInsertRequest),
     Count(DocumentCountRequest),
+    Distinct(DocumentDistinctRequest),
     Find(DocumentFindRequest, bool, Option<Duration>),
     GetMore(DocumentContinueCursorRequest),
     KillCursors(DocumentNamespace, Vec<DocumentCursorId>),
@@ -166,7 +167,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
     let (name, value) = request.body.iter().next()?;
     if !matches!(
         name,
-        "insert" | "find" | "count" | "getMore" | "killCursors"
+        "insert" | "find" | "count" | "distinct" | "getMore" | "killCursors"
     ) {
         return None;
     }
@@ -216,6 +217,26 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 "writeConcern" if name == "insert" => valid_write_concern(value),
                 "filter" if name == "find" => matches!(value, BsonValue::Document(_)),
                 "query" if name == "count" => matches!(value, BsonValue::Document(_)),
+                "key" if name == "distinct" => {
+                    if !matches!(value, BsonValue::String(_)) {
+                        return Err(CommandError::new(
+                            14,
+                            "TypeMismatch",
+                            "distinct key must be a string",
+                        ));
+                    }
+                    true
+                }
+                "query" if name == "distinct" => {
+                    if !matches!(value, BsonValue::Document(_)) {
+                        return Err(CommandError::new(
+                            14,
+                            "TypeMismatch",
+                            "distinct query must be a document",
+                        ));
+                    }
+                    true
+                }
                 "limit" | "skip" if name == "count" => {
                     unsigned(value)?;
                     true
@@ -331,6 +352,40 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 single_batch,
                 cursor_budget,
             )
+        } else if name == "distinct" {
+            if !request.sequences.is_empty() {
+                return Err(CommandError::options());
+            }
+            let field = match request.body.get_first("key") {
+                Some(BsonValue::String(field)) => field.clone(),
+                _ => {
+                    return Err(CommandError::new(
+                        14,
+                        "TypeMismatch",
+                        "distinct key must be a string",
+                    ));
+                }
+            };
+            let filter = match request.body.get_first("query") {
+                Some(BsonValue::Document(filter)) => filter.clone(),
+                None => BsonDocument::new(),
+                _ => return Err(CommandError::invalid()),
+            };
+            DocumentMatcher::compile_with_check(&filter, &mut || {
+                if started.elapsed() >= timeout {
+                    Err(EngineError::deadline_exceeded(
+                        "Mongo distinct parsing deadline exceeded",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })?;
+            Command::Distinct(DocumentDistinctRequest::new(
+                namespace,
+                field,
+                DocumentFilter::new(filter)?,
+                DocumentReadOptions::new(),
+            )?)
         } else if name == "count" {
             if !request.sequences.is_empty() {
                 return Err(CommandError::options());
@@ -673,6 +728,36 @@ impl Executor {
                         ),
                     ])),
                     Err(error) => Err(error),
+                    _ => Err(CommandError::new(
+                        1,
+                        "InternalError",
+                        "unexpected engine result",
+                    )),
+                }
+            }
+            Command::Distinct(distinct) => {
+                if !self
+                    .exists(session, identity, &context, distinct.namespace())
+                    .await?
+                {
+                    return Ok(fields([
+                        ("ok", BsonValue::Double(1.0)),
+                        ("values", BsonValue::Array(Vec::new())),
+                    ]));
+                }
+                match self
+                    .call(
+                        session,
+                        identity,
+                        &context,
+                        DocumentCommand::Distinct(distinct),
+                    )
+                    .await?
+                {
+                    DocumentResult::Distinct(values) => Ok(fields([
+                        ("ok", BsonValue::Double(1.0)),
+                        ("values", BsonValue::Array(values.into_vec())),
+                    ])),
                     _ => Err(CommandError::new(
                         1,
                         "InternalError",

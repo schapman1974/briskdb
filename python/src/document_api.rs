@@ -77,6 +77,19 @@ pub(crate) fn execution_to_python(
             output.set_item("kind", "count")?;
             output.set_item("count", count)?;
         }
+        DocumentResult::Distinct(values) => {
+            output.set_item("kind", "distinct")?;
+            let output_values = PyList::empty(py);
+            for value in &values {
+                output_values.append(bson_value_to_python(
+                    py,
+                    value,
+                    uuid_representation,
+                    bson_types,
+                )?)?;
+            }
+            output.set_item("values", output_values)?;
+        }
         DocumentResult::Insert(result) => {
             output.set_item("kind", "insert")?;
             output.set_item("acknowledged", result.acknowledged())?;
@@ -119,7 +132,6 @@ pub(crate) fn execution_to_python(
         // core change accidentally routes one through these methods.
         DocumentResult::Acknowledged(_)
         | DocumentResult::Document(_)
-        | DocumentResult::Distinct(_)
         | DocumentResult::Update(_) => {
             return Err(crate::error::unsupported(
                 "this document result is not exposed by the current Python API",

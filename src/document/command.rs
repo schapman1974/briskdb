@@ -37,12 +37,7 @@ fn validate_index_name(name: &str) -> EngineResult<()> {
 }
 
 fn validate_field_path(path: &str) -> EngineResult<()> {
-    if path.is_empty() || path.contains('\0') {
-        return Err(invalid_argument(
-            "document field path must be nonempty and contain no NUL",
-        ));
-    }
-    Ok(())
+    super::distinct::validate_field(path)
 }
 
 /// Exact, case-sensitive identity of one logical document collection.
