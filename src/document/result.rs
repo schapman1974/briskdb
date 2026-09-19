@@ -245,6 +245,11 @@ impl DocumentUpdateResult {
         self.upserted_id.as_ref()
     }
 
+    /// An inserted null `_id` is still an upsert, not an absent result.
+    pub const fn did_upsert(&self) -> bool {
+        self.upserted_id.is_some()
+    }
+
     pub const fn acknowledged(&self) -> bool {
         self.acknowledged
     }

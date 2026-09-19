@@ -31,6 +31,90 @@ def rolled_back_batch_smoke(database, collection, expression, code):
     assert [BSON.encode(row) for row in collection.find({})] == before
 
 
+def replacement_upsert_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_replace_upsert.items
+        for query, replacement, identifier in [
+            ({"_id": Int64(100)}, {"value": 7}, Int64(100)),
+            ({"_id": {"$eq": None}}, {"value": 7}, None),
+            ({"_id": 101, "missing": True}, {"value": 7, "_id": 101.0}, 101.0),
+        ]:
+            original = BSON.encode(replacement)
+            result = collection.replace_one(query, replacement, upsert=True)
+            assert result.did_upsert and result.modified_count == 0
+            assert result.matched_count == (1 if identifier is None else 0)
+            assert BSON.encode({"v": result.upserted_id}) == BSON.encode({"v": identifier})
+            assert BSON.encode(collection.find_one({"_id": identifier})) == BSON.encode({"_id": identifier, "value": 7})
+            assert BSON.encode(replacement) == original
+            result = collection.replace_one({"_id": identifier}, {"value": 7}, upsert=True)
+            assert (result.matched_count, result.modified_count, result.did_upsert) == (1, 0, False)
+        generated = collection.replace_one({"missing": True}, {"tag": "generated"}, upsert=True)
+        assert isinstance(generated.upserted_id, ObjectId)
+        for query, replacement, code in [({"_id": 999}, {"_id": 998}, 66), ({"missing": True}, {"_id": 100}, 11000)]:
+            try:
+                collection.replace_one(query, replacement, upsert=True)
+            except WriteError as error:
+                assert error.code == code
+            else:
+                raise AssertionError("upsert must preserve ID and duplicate errors")
+        assert collection.count_documents({}) == 4
+        concurrent = client.wire_replace_upsert.concurrent
+        def upsert(_):
+            return concurrent.replace_one({"_id": Int64(999)}, {"value": 1}, upsert=True)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(upsert, range(32)))
+        assert sum(result.did_upsert for result in results) == 1
+        assert sum(result.matched_count for result in results) == 31
+        assert sum(result.modified_count for result in results) == 0
+        assert concurrent.count_documents({}) == 1
+        # OP_MSG sequence exceeds one BSON body but not the message limit. Four
+        # large returned IDs fit; the fifth must fail before insertion, and an
+        # unordered small final upsert must still fit and execute.
+        bounded = client.wire_replace_upsert.bounded
+        writes = [pymongo.ReplaceOne({"slot": i}, {"_id": str(i) + "x" * 127000, "slot": i}, upsert=True) for i in range(5)]
+        writes.append(pymongo.ReplaceOne({"slot": 9}, {"_id": "small", "slot": 9}, upsert=True))
+        try:
+            bounded.bulk_write(writes, ordered=False)
+        except BulkWriteError as error:
+            assert [(item["index"], item["code"]) for item in error.details["writeErrors"]] == [(4, 10334)], error.details
+            assert error.details["nUpserted"] == 5
+            assert [item["index"] for item in error.details["upserted"]] == [0, 1, 2, 3, 5]
+        else:
+            raise AssertionError("aggregate upsert ID budget must be preflighted")
+        assert bounded.count_documents({}) == 5 and bounded.find_one({"slot": 4}) is None
+        for ordered in [True, False]:
+            batch = client.wire_replace_upsert["ordered" if ordered else "unordered"]
+            reply = batch.database.command("update", batch.name, ordered=ordered, updates=[
+                {"q": {"_id": None}, "u": {"value": 1}, "upsert": True},
+                {"q": {"_id": None}, "u": {"value": 2}, "upsert": True},
+                {"q": {"missing": True}, "u": {"_id": None}, "upsert": True},
+                {"q": {"_id": 4}, "u": {"value": 4}, "upsert": True},
+            ])
+            assert (reply["n"], reply["nModified"]) == ((2, 1) if ordered else (3, 1))
+            assert reply["upserted"] == ([{"index": 0, "_id": None}] if ordered else [{"index": 0, "_id": None}, {"index": 3, "_id": 4}])
+            assert [(error["index"], error["code"]) for error in reply["writeErrors"]] == [(2, 11000)]
+            assert batch.find_one({"_id": None}) == {"_id": None, "value": 2}
+            assert batch.count_documents({}) == (1 if ordered else 2)
+        deep = client.wire_replace_upsert.deep
+        identifier = 1
+        for _ in range(98):
+            identifier = {"nested": identifier}
+        # An OP_MSG statement can carry this ID, but its upserted reply needs
+        # one extra container. Reject before commit and leave the socket usable.
+        try:
+            deep.replace_one({"missing": True}, {"_id": identifier}, upsert=True)
+        except WriteError as error:
+            assert error.code == 10334
+        else:
+            raise AssertionError("upsert reply depth must be preflighted")
+        assert deep.count_documents({}) == 0
+        assert deep.replace_one({"_id": 1}, {}, upsert=True).did_upsert
+        one_way = client.wire_replace_upsert.one_way
+        result = one_way.with_options(write_concern=pymongo.write_concern.WriteConcern(w=0)).replace_one({"_id": "one-way"}, {"value": 7}, upsert=True)
+        assert not result.acknowledged
+        assert one_way.find_one({"_id": "one-way"}) == {"_id": "one-way", "value": 7}
+
+
 def increment_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_increment.items
@@ -588,7 +672,7 @@ def replacement_smoke(uri):
             ({"q": {}, "u": {"$mul": {"v": 1}}}, 115),
             ({"q": {}, "u": [{"$set": {"v": 1}}]}, 115),
             ({"q": {}, "u": {}, "multi": True}, 72),
-            ({"q": {}, "u": {}, "upsert": True}, 72),
+            ({"q": {}, "u": {}, "upsert": 1}, 72),
             ({"q": {}, "u": {}, "hint": "_id_"}, 72),
             ({"q": {}, "u": {}, "sort": {"_id": 1}}, 72),
             ({"q": {}, "u": {"value": 1, "$inc": {"n": 1}}}, 52),
@@ -1428,6 +1512,10 @@ def persisted_smoke(uri):
         assert client.wire_pull.concurrent.find_one()["values"] == []
         assert isinstance(client.wire_increment.concurrent.find_one()["counter"], Int64)
         assert client.wire_increment.concurrent.find_one()["counter"] == 32
+        assert client.wire_replace_upsert.items.count_documents({}) == 4
+        assert client.wire_replace_upsert.items.find_one({"_id": None}) == {"_id": None, "value": 7}
+        assert client.wire_replace_upsert.concurrent.count_documents({}) == 1
+        assert client.wire_replace_upsert.bounded.count_documents({}) == 5
         assert client.wire_increment.items.find_one({"_id": 7})["counter"] == 4
         assert client.wire_increment.items.find_one()["amount"].bid == Decimal128("2.100000000000000").bid
         assert client.wire_pull.items.find_one({"_id": 11})["values"] == [True, {"_id": 3, "x": 3}, "beta"]
@@ -1562,6 +1650,19 @@ def metadata_smoke(uri):
                 raise AssertionError(f"unsupported metadata command accepted: {command}")
         assert "rejected" not in database.list_collection_names()
         assert list(database.list_collections(nameOnly=True, authorizedCollections=True, filter={"info": {"$exists": True}})) == []
+
+
+async def async_replacement_upsert_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_replace_upsert.items
+        result = await collection.replace_one({"_id": {"$eq": None}}, {"value": Int64(1)}, upsert=True)
+        assert result.did_upsert and result.upserted_id is None
+        assert (result.matched_count, result.modified_count) == (1, 0)
+        result = await collection.replace_one({"_id": None}, {"value": Int64(2)}, upsert=True)
+        assert (result.matched_count, result.modified_count, result.did_upsert) == (1, 1, False)
+        assert BSON.encode(await collection.find_one()) == BSON.encode({"_id": None, "value": Int64(2)})
+        generated = await collection.replace_one({"missing": True}, {}, upsert=True)
+        assert isinstance(generated.upserted_id, ObjectId) and generated.did_upsert
 
 
 async def async_increment_smoke(uri):
@@ -1837,6 +1938,7 @@ if __name__ == "__main__":
         push_smoke(sys.argv[1])
         pull_smoke(sys.argv[1])
         increment_smoke(sys.argv[1])
+        replacement_upsert_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
         # Give the added operator cases their own bounded phase; retain the
         # existing discovery/CRUD phase's deadline as the suite grows.
@@ -1845,5 +1947,6 @@ if __name__ == "__main__":
         asyncio.run(asyncio.wait_for(async_push_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_pull_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_increment_smoke(sys.argv[1]), timeout=20))
+        asyncio.run(asyncio.wait_for(async_replacement_upsert_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

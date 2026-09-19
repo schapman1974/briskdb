@@ -2073,6 +2073,272 @@ fn replace(filter: BsonDocument, replacement: BsonDocument) -> DocumentReplaceRe
     .unwrap()
 }
 
+fn replace_upsert(filter: BsonDocument, replacement: BsonDocument) -> DocumentReplaceRequest {
+    DocumentReplaceRequest::new(
+        ns(),
+        DocumentFilter::new(filter).unwrap(),
+        replacement,
+        DocumentWriteOptions::new().with_upsert(true),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn replacement_upserts_preserve_identity_results_limits_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    for (filter, replacement, id) in [
+        (
+            doc([("_id", BsonValue::Int64(100))]),
+            doc([("v", BsonValue::Int32(7))]),
+            BsonValue::Int64(100),
+        ),
+        (
+            doc([("_id", BsonValue::Document(doc([("$eq", BsonValue::Null)])))]),
+            doc([("v", BsonValue::Int32(7))]),
+            BsonValue::Null,
+        ),
+        (
+            doc([
+                ("_id", BsonValue::Int64(101)),
+                ("other", BsonValue::Boolean(true)),
+            ]),
+            doc([
+                ("v", BsonValue::Int32(7)),
+                ("_id", BsonValue::Double(101.0)),
+            ]),
+            BsonValue::Double(101.0),
+        ),
+    ] {
+        let execution = engine
+            .execute_document(
+                &session,
+                request(
+                    DocumentCommand::Replace(replace_upsert(filter, replacement)),
+                    RequestContext::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        let DocumentResult::Update(result) = execution.result() else {
+            panic!("update")
+        };
+        assert_eq!(
+            (
+                result.matched_count(),
+                result.modified_count(),
+                result.did_upsert()
+            ),
+            (0, 0, true)
+        );
+        assert_eq!(
+            encode_document(&doc([("v", result.upserted_id().unwrap().clone())])).unwrap(),
+            encode_document(&doc([("v", id.clone())])).unwrap()
+        );
+        let current = rows(&engine, &session).await;
+        let row = current
+            .iter()
+            .find(|row| row.get_first("_id") == Some(&id))
+            .unwrap();
+        assert_eq!(
+            encode_document(row).unwrap(),
+            encode_document(&doc([("_id", id.clone()), ("v", BsonValue::Int32(7))])).unwrap()
+        );
+        let repeated = engine
+            .execute_document(
+                &session,
+                request(
+                    DocumentCommand::Replace(replace_upsert(
+                        doc([("_id", id)]),
+                        doc([("v", BsonValue::Int32(7))]),
+                    )),
+                    RequestContext::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        let DocumentResult::Update(result) = repeated.result() else {
+            panic!("update")
+        };
+        assert_eq!(
+            (
+                result.matched_count(),
+                result.modified_count(),
+                result.did_upsert()
+            ),
+            (1, 0, false)
+        );
+    }
+    let zero = BsonValue::Timestamp(BsonTimestamp::new(0, 0));
+    let result = engine
+        .execute_document(
+            &session,
+            request(
+                DocumentCommand::Replace(replace_upsert(
+                    doc([("missing", BsonValue::Boolean(true))]),
+                    doc([
+                        ("a", zero.clone()),
+                        ("b", zero.clone()),
+                        ("nested", BsonValue::Document(doc([("v", zero.clone())]))),
+                    ]),
+                )),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    let DocumentResult::Update(result) = result.result() else {
+        panic!("update")
+    };
+    assert!(matches!(result.upserted_id(), Some(BsonValue::ObjectId(_))));
+    let current = rows(&engine, &session).await;
+    let row = current
+        .iter()
+        .find(|row| row.get_first("_id") == result.upserted_id())
+        .unwrap();
+    assert_ne!(row.get_first("a"), Some(&zero));
+    assert_ne!(row.get_first("a"), row.get_first("b"));
+    assert_eq!(
+        row.get_first("nested"),
+        Some(&BsonValue::Document(doc([("v", zero)])))
+    );
+    let before: Vec<_> = current
+        .iter()
+        .map(|row| encode_document(row).unwrap())
+        .collect();
+    for command in [
+        replace_upsert(
+            doc([("_id", BsonValue::Int32(900))]),
+            doc([("_id", BsonValue::Int32(901))]),
+        ),
+        replace_upsert(
+            doc([("absent", BsonValue::Boolean(true))]),
+            doc([("_id", BsonValue::Int32(1))]),
+        ),
+        replace_upsert(
+            doc([("_id", BsonValue::Int32(900))]),
+            doc([("payload", BsonValue::from("x".repeat(100)))]),
+        )
+        .with_max_document_bytes(32)
+        .unwrap(),
+    ] {
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    request(DocumentCommand::Replace(command), RequestContext::new())
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    DocumentCommand::Replace(replace_upsert(
+                        doc([("_id", BsonValue::Int32(900))]),
+                        BsonDocument::new()
+                    )),
+                    RequestContext::new().with_result_limits(ResultLimits::new(1, 1).unwrap())
+                )
+            )
+            .await
+            .is_err()
+    );
+    let token = CancellationToken::new();
+    token.cancel();
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    DocumentCommand::Replace(replace_upsert(
+                        doc([("_id", BsonValue::Int32(900))]),
+                        BsonDocument::new()
+                    )),
+                    RequestContext::new().with_cancellation_token(token)
+                )
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        rows(&engine, &session)
+            .await
+            .iter()
+            .map(|row| encode_document(row).unwrap())
+            .collect::<Vec<_>>(),
+        before
+    );
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(
+        rows(&engine, &engine.session())
+            .await
+            .iter()
+            .map(|row| encode_document(row).unwrap())
+            .collect::<Vec<_>>(),
+        before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_exact_id_replacement_upserts_insert_once_and_recheck_winners() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(root.path(), 4).await.unwrap());
+    seed(&engine, &engine.session()).await;
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let engine = Arc::clone(&engine);
+        workers.push(tokio::spawn(async move {
+            let session = engine.session();
+            let mut inserted = 0;
+            let mut matched = 0;
+            for _ in 0..8 {
+                let execution = engine
+                    .execute_document(
+                        &session,
+                        request(
+                            DocumentCommand::Replace(replace_upsert(
+                                doc([("_id", BsonValue::Int64(999))]),
+                                doc([("v", BsonValue::Int32(1))]),
+                            )),
+                            RequestContext::new(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                let DocumentResult::Update(result) = execution.result() else {
+                    panic!("update")
+                };
+                inserted += u64::from(result.did_upsert());
+                matched += result.matched_count();
+                assert_eq!(result.modified_count(), 0);
+            }
+            (inserted, matched)
+        }));
+    }
+    let mut totals = (0, 0);
+    for worker in workers {
+        let (inserted, matched) = worker.await.unwrap();
+        totals.0 += inserted;
+        totals.1 += matched;
+    }
+    assert_eq!(totals, (1, 31));
+    let current = rows(&engine, &engine.session()).await;
+    assert_eq!(current.len(), 25);
+    assert_eq!(
+        current.last().unwrap(),
+        &doc([("_id", BsonValue::Int64(999)), ("v", BsonValue::Int32(1))])
+    );
+}
+
 fn find_update(
     filter: BsonDocument,
     expression: BsonDocument,
@@ -3012,7 +3278,6 @@ async fn replace_rejects_invalid_options_identity_and_budgets_before_mutation() 
         );
     }
     for options in [
-        DocumentWriteOptions::new().with_upsert(true),
         DocumentWriteOptions::new().with_ordered(false),
         DocumentWriteOptions::new().with_bypass_document_validation(true),
     ] {

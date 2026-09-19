@@ -85,6 +85,10 @@ fn run_contract(uri: &str, report: &std::path::Path) -> std::process::Output {
             "compat/mongo/v1/runner/contracts/test_talkpython_contract.py::test_inc_creates_a_missing_counter",
             "compat/mongo/v1/runner/contracts/test_decimal128_contract.py::test_decimal128_inc_promotes_the_result",
             "compat/mongo/v1/runner/contracts/test_decimal128_contract.py::test_decimal128_representation_changes_are_persisted",
+            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_preserves_equality_bound_id",
+            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_stores_id_first",
+            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_accepts_bson_equal_filter_and_replacement_ids",
+            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_replace_upsert_rejects_conflicting_filter_and_replacement_ids",
         ])
         .args([
             "--mongo-contract-target=briskdb",
@@ -154,17 +158,26 @@ individual.update('tests.contracts.test_decimal128_contract::' + name for name i
     'test_decimal128_representation_changes_are_persisted',
 ])
 individual.add('tests.contracts.test_crud_contract::test_update_and_result_metadata')
+individual.update('tests.contracts.test_crud_contract::' + name for name in [
+    'test_replace_upsert_preserves_equality_bound_id[query0-77]',
+    'test_replace_upsert_preserves_equality_bound_id[query1-pinned-key]',
+    'test_replace_upsert_preserves_equality_bound_id[query2-88]',
+    'test_replace_upsert_preserves_equality_bound_id[query3-None]',
+    'test_replace_upsert_stores_id_first',
+    'test_replace_upsert_accepts_bson_equal_filter_and_replacement_ids',
+    'test_replace_upsert_rejects_conflicting_filter_and_replacement_ids',
+])
 expected = {(case['id'], api) for case in corpus['cases']
             if (case['id'].split('::', 1)[0] in modules or case['id'] in individual or
                 case['id'] == 'tests.contracts.test_crud_contract::test_unset_removes_top_level_and_nested_fields')
             for api in case['apis']}
 executions = ingest_junit(Path(sys.argv[1]), 'briskdb', corpus)['executions']
 actual = {(item['case_id'], item['api']) for item in executions}
-assert len(expected) == len(executions) == 224, 'locked suite coverage changed'
+assert len(expected) == len(executions) == 238, ('locked suite coverage changed', len(expected), len(executions))
 assert actual == expected, 'candidate suite omitted or substituted locked cases'
 assert all(item['outcome'] == 'passed' and item['target'] == 'briskdb-briskdb'
            for item in executions), 'candidate suite skipped or failed a case'
-print('Verified all 224 exact frozen candidate executions, with no skips.')
+print('Verified all 238 exact frozen candidate executions, with no skips.')
 "#,
             ])
             .arg(report)

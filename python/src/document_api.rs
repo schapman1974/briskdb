@@ -128,6 +128,7 @@ pub(crate) fn execution_to_python(
             output.set_item("acknowledged", result.acknowledged())?;
             output.set_item("matched_count", result.matched_count())?;
             output.set_item("modified_count", result.modified_count())?;
+            output.set_item("did_upsert", result.did_upsert())?;
             match result.upserted_id() {
                 Some(id) => output.set_item(
                     "upserted_id",

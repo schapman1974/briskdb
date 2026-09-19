@@ -62,8 +62,9 @@ def sync_contract(path: str) -> None:
     updated_many: int = document_session.update_many("app", "notes", {}, {"$unset": {"body": 1}})["matched_count"]
     updated_image: Optional[dict[str, object]] = document_session.find_one_and_update("app", "notes", {}, {"$set": {"body": "new"}}, return_document=True)["document"]
     modified: int = document_session.replace_one("app", "notes", {}, {"body": "replacement"}, upsert=False)["modified_count"]
+    did_upsert: bool = document_session.replace_one("app", "notes", {"_id": None}, {}, upsert=True)["did_upsert"]
     replaced: Optional[dict[str, object]] = document_session.find_one_and_replace("app", "notes", {}, {"body": "replacement"}, projection=["_id"], return_document=True)["document"]
-    print(removed, modified, replaced)
+    print(removed, modified, replaced, did_upsert)
     print(deleted_many)
     print(
         address,
