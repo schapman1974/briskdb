@@ -998,6 +998,87 @@ async fn unacknowledged_writes_execute_without_emitting_a_reply() {
 }
 
 #[tokio::test]
+async fn find_and_delete_rejects_wire_envelope_depth_before_mutation() {
+    use briskdb::document::{
+        BSON_MAX_NESTING_DEPTH, DocumentCommand, DocumentInsertRequest, DocumentNamespace,
+        DocumentWriteOptions,
+    };
+    let (_root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    send_command(
+        &mut stream,
+        &insert_command(
+            "deep",
+            BsonDocument::from_entries([("_id", BsonValue::from("seed"))]).unwrap(),
+        ),
+    )
+    .await;
+    let mut deep = BsonDocument::new();
+    for _ in 1..BSON_MAX_NESTING_DEPTH {
+        deep = BsonDocument::from_entries([("nested", BsonValue::Document(deep))]).unwrap();
+    }
+    deep.push("_id", BsonValue::from("deep")).unwrap();
+    database
+        .execute_document(
+            &database.session(),
+            engine_request(DocumentCommand::Insert(
+                DocumentInsertRequest::new(
+                    DocumentNamespace::new("wire", "deep").unwrap(),
+                    vec![deep],
+                    DocumentWriteOptions::new(),
+                )
+                .unwrap(),
+            )),
+        )
+        .await
+        .unwrap();
+    let mut removal = BsonDocument::from_entries([
+        ("findAndModify", BsonValue::from("deep")),
+        ("$db", BsonValue::from("wire")),
+        ("remove", BsonValue::Boolean(true)),
+        (
+            "query",
+            BsonValue::Document(
+                BsonDocument::from_entries([("_id", BsonValue::from("deep"))]).unwrap(),
+            ),
+        ),
+    ])
+    .unwrap();
+    assert_eq!(
+        send_command(&mut stream, &removal).await.get_first("code"),
+        Some(&BsonValue::Int32(10334))
+    );
+    removal
+        .push(
+            "fields",
+            BsonValue::Document(
+                BsonDocument::from_entries([("_id", BsonValue::Int32(1))]).unwrap(),
+            ),
+        )
+        .unwrap();
+    let reply = send_command(&mut stream, &removal).await;
+    assert_eq!(
+        reply.get_first("value"),
+        Some(&BsonValue::Document(
+            BsonDocument::from_entries([("_id", BsonValue::from("deep"))]).unwrap()
+        ))
+    );
+    assert_eq!(
+        send_command(&mut stream, &removal).await.get_first("value"),
+        Some(&BsonValue::Null)
+    );
+    assert_eq!(
+        first_batch(
+            &send_command(&mut stream, &find_command("deep", BsonValue::from("seed"))).await
+        )
+        .len(),
+        1
+    );
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_usable() {
     use briskdb::document::{
         DocumentCommand, DocumentInsertRequest, DocumentNamespace, DocumentWriteOptions,
@@ -1039,6 +1120,24 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
         matches!(reply.get_first("code"), Some(BsonValue::Int32(10334))),
         "{reply:?}"
     );
+    let removal = BsonDocument::from_entries([
+        ("findAndModify", BsonValue::from("items")),
+        ("$db", BsonValue::from("wire")),
+        ("remove", BsonValue::Boolean(true)),
+        (
+            "query",
+            BsonValue::Document(
+                BsonDocument::from_entries([("_id", BsonValue::from("large"))]).unwrap(),
+            ),
+        ),
+    ])
+    .unwrap();
+    assert_eq!(
+        send_command(&mut stream, &removal).await.get_first("code"),
+        Some(&BsonValue::Int32(10334))
+    );
+    // The projected read below must still find the large document: a response
+    // BSON limit is rejected inside the write transaction, before deletion.
     let mut projected = find_command("items", BsonValue::from("large"));
     projected
         .push(

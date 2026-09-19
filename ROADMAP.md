@@ -516,7 +516,13 @@ requires an earlier dependency:
       streams one shard-local transaction at a time; later failure/cancellation
       preserves earlier commits, with no global snapshot/atomicity claim.
       Wire batches preserve ordered/unordered selector errors and counts;
-      missing collections return zero. FindAndModify remains open.
+      missing collections return zero. Find-one-and-delete now returns a
+      projected pre-image through native sync/async Python and wire
+      findAndModify remove. Sort uses original fields and natural-order ties;
+      the selected shard reselects under its write lock. Exact output budgets
+      (including wire BSON bounds) are validated before mutation. Concurrent
+      consumers, runtime sort failures, deadline rollback, and restart are
+      covered. Update/replace findAndModify forms remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
