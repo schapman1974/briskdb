@@ -20,8 +20,9 @@ use crate::{
         DocumentCursorId, DocumentFilter, DocumentFindRequest, DocumentInsertRequest,
         DocumentKillCursorRequest, DocumentListCollectionsRequest, DocumentMatcher,
         DocumentNamespace, DocumentProjection, DocumentProjector, DocumentQueryError,
-        DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentResult,
-        DocumentWriteOptions, decode_document_batch_with_options, encode_document_with_options,
+        DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort,
+        DocumentSorter, DocumentWriteOptions, decode_document_batch_with_options,
+        encode_document_with_options,
     },
 };
 
@@ -210,7 +211,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 }
                 "writeConcern" if name == "insert" => valid_write_concern(value),
                 "filter" if name == "find" => matches!(value, BsonValue::Document(_)),
-                "projection" if name == "find" => matches!(value, BsonValue::Document(_)),
+                "projection" | "sort" if name == "find" => matches!(value, BsonValue::Document(_)),
                 "limit" | "skip" | "batchSize" if name == "find" => {
                     unsigned(value)?;
                     true
@@ -271,6 +272,20 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     }
                 })?;
                 options = options.with_projection(DocumentProjection::new(projection.clone())?);
+            }
+            if let Some(BsonValue::Document(sort)) = request.body.get_first("sort") {
+                if !sort.is_empty() {
+                    DocumentSorter::compile_with_check(sort, &mut || {
+                        if started.elapsed() >= timeout {
+                            Err(EngineError::deadline_exceeded(
+                                "Mongo sorting parsing deadline exceeded",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    })?;
+                    options = options.with_sort(DocumentSort::new(sort.clone())?);
+                }
             }
             if let Some(value) = request.body.get_first("skip") {
                 options = options.with_skip(unsigned(value)?);

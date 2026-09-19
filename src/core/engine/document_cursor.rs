@@ -11,7 +11,7 @@ use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
     document::{
         CanonicalBsonKey, DocumentCollectionId, DocumentCursorError, DocumentCursorId,
-        DocumentMatcher, DocumentNamespace, DocumentProjector,
+        DocumentMatcher, DocumentNamespace, DocumentProjector, DocumentSortKey, DocumentSorter,
     },
     storage::ConnectionOwner,
 };
@@ -35,15 +35,33 @@ pub(super) struct CursorState {
     pub collection_id: DocumentCollectionId,
     pub source: CursorSource,
     pub projection: Option<Arc<DocumentProjector>>,
+    pub sorter: Option<Arc<DocumentSorter>>,
+    pub sort_after: Option<Arc<SortPosition>>,
     pub after: Option<u64>,
     pub skip: u64,
     pub remaining: Option<u64>,
     pub batch_byte_limit: Option<u64>,
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct SortPosition {
+    pub key: DocumentSortKey,
+    pub natural_order: u64,
+}
+
 impl CursorState {
     fn retained_bytes(&self) -> usize {
         4096usize
+            .saturating_add(
+                self.sorter
+                    .as_ref()
+                    .map_or(0, |sorter| sorter.retained_bytes()),
+            )
+            .saturating_add(
+                self.sort_after
+                    .as_ref()
+                    .map_or(0, |position| position.key.retained_bytes()),
+            )
             .saturating_add(
                 self.projection
                     .as_ref()
@@ -235,12 +253,28 @@ impl CursorLease {
         if inner.closed {
             return Err(closed());
         }
+        if let Some(state) = &state {
+            let retained_bytes = state.retained_bytes();
+            let others: usize = inner
+                .entries
+                .iter()
+                .filter(|(id, _)| **id != self.id)
+                .map(|(_, entry)| entry.retained_bytes)
+                .sum();
+            if others.saturating_add(retained_bytes) > MAX_RETAINED_BYTES {
+                return Err(EngineError::new(
+                    EngineErrorKind::LimitExceeded,
+                    "open document cursor limit exceeded",
+                ));
+            }
+        }
         let entry = inner
             .entries
             .get_mut(&self.id)
             .ok_or_else(|| DocumentCursorError::NotFound.into_engine_error())?;
         let retained = state.is_some();
         if retained {
+            entry.retained_bytes = state.as_ref().expect("retained state").retained_bytes();
             entry.state = state;
             entry.touched = Instant::now();
         } else {
@@ -295,6 +329,8 @@ mod tests {
             collection_id: DocumentCollectionId::from_validated(1),
             source: CursorSource::Scatter(None),
             projection: None,
+            sorter: None,
+            sort_after: None,
             after: None,
             skip: 0,
             remaining: None,
@@ -384,5 +420,56 @@ mod tests {
                 .kind(),
             EngineErrorKind::LimitExceeded
         );
+    }
+
+    #[test]
+    fn sort_key_growth_is_reaccounted_and_quota_failure_discards_the_cursor() {
+        let registry = Arc::new(CursorRegistry::default());
+        let sorter = Arc::new(
+            DocumentSorter::compile(
+                &BsonDocument::from_entries([("v", BsonValue::Int32(1))]).unwrap(),
+            )
+            .unwrap(),
+        );
+        let position = |size| {
+            Arc::new(SortPosition {
+                key: sorter
+                    .key(
+                        &BsonDocument::from_entries([("v", BsonValue::String("x".repeat(size)))])
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                natural_order: 1,
+            })
+        };
+        let small = position(7 * 1024 * 1024);
+        let mut ids = Vec::new();
+        for owner in 1..=9 {
+            let mut retained = state();
+            retained.sorter = Some(sorter.clone());
+            retained.sort_after = Some(small.clone());
+            ids.push(
+                registry
+                    .insert(ConnectionOwner::new(owner), retained)
+                    .unwrap(),
+            );
+        }
+        let mut lease = registry
+            .checkout(ConnectionOwner::new(1), &state().namespace, ids[0])
+            .unwrap();
+        let mut retained = lease.state.take().unwrap();
+        retained.sort_after = Some(position(8 * 1024 * 1024 - 256));
+        assert_eq!(
+            lease.complete(Some(retained)).unwrap_err().kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        assert!(!registry.0.lock().unwrap().entries.contains_key(&ids[0]));
+        let mut lease = registry
+            .checkout(ConnectionOwner::new(2), &state().namespace, ids[1])
+            .unwrap();
+        let mut retained = lease.state.take().unwrap();
+        retained.sort_after = Some(position(1));
+        lease.complete(Some(retained)).unwrap();
+        assert!(registry.0.lock().unwrap().entries[&ids[1]].retained_bytes < 10_000);
     }
 }

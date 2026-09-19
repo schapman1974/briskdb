@@ -13,6 +13,8 @@ use std::{
 
 use tokio::task::JoinHandle;
 
+mod sorting;
+
 use super::document_cursor::{CursorSource as PreparedFilterRoute, CursorState};
 use super::{Engine, Operation, flatten_join, pending_cancellation_reason, retire_if_broken};
 use crate::{
@@ -28,8 +30,8 @@ use crate::{
         DocumentFilter, DocumentIndexMetadata, DocumentInsertResult, DocumentMatcher,
         DocumentMutationScope, DocumentNamespace, DocumentPlan, DocumentPointPlan,
         DocumentProjector, DocumentReadOptions, DocumentRequest, DocumentResult,
-        DocumentScatterPlan, DocumentWriteError, DocumentWriteOptions, MAX_DOCUMENT_REQUEST_BYTES,
-        encode_document,
+        DocumentScatterPlan, DocumentSorter, DocumentWriteError, DocumentWriteOptions,
+        MAX_DOCUMENT_REQUEST_BYTES, encode_document,
     },
     storage::{
         ConnectionOwner, DocumentStorageRecord, MAX_DOCUMENT_SHARD_SCAN_RECORDS, PooledConnection,
@@ -453,11 +455,11 @@ impl Engine {
             }
             DocumentCommand::Find(request) => {
                 let (namespace, filter, options) = request.into_parts();
-                require_find_options(&options)?;
                 let catalog_storage = storage.clone();
                 let catalog_namespace = namespace.clone();
                 let projection = options.projection().cloned();
-                let (collection_id, route, projection) = self
+                let sort = options.sort().cloned();
+                let (collection_id, route, projection, sorter) = self
                     .run_document_storage_task(
                         cancellation.clone(),
                         deadline,
@@ -469,6 +471,16 @@ impl Engine {
                                         spec.document(),
                                         &mut || ensure_document_cpu_active(cancellation, &control),
                                     )
+                                    .map(Arc::new)
+                                })
+                                .transpose()?;
+                            let sorter = sort
+                                .as_ref()
+                                .filter(|spec| !spec.document().is_empty())
+                                .map(|spec| {
+                                    DocumentSorter::compile_with_check(spec.document(), &mut || {
+                                        ensure_document_cpu_active(cancellation, &control)
+                                    })
                                     .map(Arc::new)
                                 })
                                 .transpose()?;
@@ -485,7 +497,7 @@ impl Engine {
                                 &control,
                             )?;
                             ensure_document_cpu_active(cancellation, &control)?;
-                            Ok((collection_id, route, projection))
+                            Ok((collection_id, route, projection, sorter))
                         },
                     )
                     .await?;
@@ -494,6 +506,8 @@ impl Engine {
                     collection_id,
                     source: route,
                     projection,
+                    sorter,
+                    sort_after: None,
                     after: None,
                     skip: options.skip(),
                     remaining: options.limit(),
@@ -529,15 +543,15 @@ impl Engine {
             }
             DocumentCommand::ContinueCursor(request) => {
                 let (namespace, id, options) = request.into_parts();
-                require_find_options(&options)?;
                 if options.batch_size() == 0
                     || options.skip() != 0
                     || options.limit().is_some()
                     || options.projection().is_some()
+                    || options.sort().is_some()
                 {
                     return Err(EngineError::new(
                         EngineErrorKind::InvalidArgument,
-                        "cursor continuation requires a positive batch size and cannot change skip/limit/projection",
+                        "cursor continuation requires a positive batch size and cannot change skip/limit/projection/sort",
                     ));
                 }
                 let mut lease = self
@@ -1088,9 +1102,29 @@ impl Engine {
                 if let Some(record) = &record {
                     validate_point_record(record, collection_id, shard, &id_key)?;
                 }
-                let Some(record) = record.filter(|_| state.skip == 0) else {
+                let Some(record) = record else {
                     return Ok((Vec::new(), false));
                 };
+                // Sorting validates the original value even when skip removes
+                // this point result; array-key errors must not be hidden.
+                let record = if let Some(sorter) = state.sorter.clone() {
+                    self.run_document_storage_task(
+                        cancellation.clone(),
+                        deadline,
+                        move |cancellation, control| {
+                            sorter.key_validated_with_check(record.document(), &mut || {
+                                ensure_document_cpu_active(cancellation, &control)
+                            })?;
+                            Ok(record)
+                        },
+                    )
+                    .await?
+                } else {
+                    record
+                };
+                if state.skip != 0 {
+                    return Ok((Vec::new(), false));
+                }
                 let (document, encoded_len) = self
                     .cursor_output_document(
                         record,
@@ -1116,6 +1150,19 @@ impl Engine {
             }
             PreparedFilterRoute::Scatter(matcher) => {
                 let matcher = matcher.clone();
+                if state.sorter.is_some() {
+                    return self
+                        .scan_sorted_document_page(
+                            owner,
+                            state,
+                            cancellation,
+                            deadline,
+                            matcher,
+                            options,
+                            limits,
+                        )
+                        .await;
+                }
                 self.scan_document_page(
                     owner,
                     state,
@@ -1468,15 +1515,6 @@ fn require_delete_options(options: DocumentWriteOptions) -> EngineResult<()> {
     Ok(())
 }
 
-fn require_find_options(options: &DocumentReadOptions) -> EngineResult<()> {
-    if options.sort().is_some() {
-        return Err(unsupported(
-            "document sort expressions require the query semantics milestone",
-        ));
-    }
-    Ok(())
-}
-
 fn require_count_options(options: &DocumentReadOptions) -> EngineResult<()> {
     require_catalog_read_options(options)
 }
@@ -1487,7 +1525,10 @@ fn require_catalog_read_options(options: &DocumentReadOptions) -> EngineResult<(
             "projection is only supported for document find",
         ));
     }
-    require_find_options(options)
+    if options.sort().is_some() {
+        return Err(unsupported("sorting is only supported for document find"));
+    }
+    Ok(())
 }
 
 fn require_collection(
@@ -2215,7 +2256,16 @@ mod tests {
             .await
             .unwrap();
 
-        for mode in 0..3 {
+        for mode in 0..6 {
+            let mut options = DocumentReadOptions::new().with_batch_size(0).unwrap();
+            if mode >= 3 {
+                options = options.with_sort(
+                    crate::document::DocumentSort::new(
+                        BsonDocument::from_entries([("v", BsonValue::Int32(1))]).unwrap(),
+                    )
+                    .unwrap(),
+                );
+            }
             let opened = engine
                 .execute_document(
                     &session,
@@ -2225,7 +2275,7 @@ mod tests {
                         DocumentCommand::Find(DocumentFindRequest::new(
                             namespace.clone(),
                             DocumentFilter::empty(),
-                            DocumentReadOptions::new().with_batch_size(0).unwrap(),
+                            options,
                         )),
                     ),
                 )
@@ -2243,7 +2293,7 @@ mod tests {
                 .unwrap();
             let token = CancellationToken::new();
             let mut context = RequestContext::new().with_cancellation_token(token.clone());
-            if mode == 1 {
+            if mode % 3 == 1 {
                 context = context.with_timeout(Duration::from_secs(2)).unwrap();
             }
             let request = DocumentRequest::new(
@@ -2268,7 +2318,7 @@ mod tests {
             })
             .await
             .expect("continuation must reach pool admission");
-            match mode {
+            match mode % 3 {
                 0 => {
                     token.cancel();
                 }
@@ -2276,12 +2326,12 @@ mod tests {
                 _ => (),
             }
             let result = timeout(Duration::from_secs(3), task).await.unwrap();
-            if mode == 2 {
+            if mode % 3 == 2 {
                 assert!(result.unwrap_err().is_cancelled());
             } else {
                 assert_eq!(
                     result.unwrap().unwrap_err().kind(),
-                    if mode == 0 {
+                    if mode % 3 == 0 {
                         EngineErrorKind::Cancelled
                     } else {
                         EngineErrorKind::DeadlineExceeded

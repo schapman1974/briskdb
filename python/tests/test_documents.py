@@ -52,6 +52,28 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_sorted_cursors_use_original_fields_and_keep_stable_ties(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            database, session = self.open_session(root)
+            for index in range(30):
+                session.insert_one(DATABASE, COLLECTION, {"_id": index, "rank": Int64(index % 5), "hidden": True})
+            expected = sorted(range(30), key=lambda index: -(index % 5))[3:22]
+            batch = session.find(DATABASE, COLLECTION, {"hidden": True}, sort={"rank": -1},
+                                 projection={"_id": 1}, skip=3, limit=19, batch_size=0)
+            rows = []
+            while not batch["exhausted"]:
+                batch = session.get_more(DATABASE, COLLECTION, batch["cursor_id"], batch_size=4)
+                rows.extend(batch["documents"])
+            self.assertEqual(rows, [{"_id": index} for index in expected])
+            self.assertEqual(session.find(DATABASE, COLLECTION, {"_id": 4}, sort={"rank": -1})["plan"]["kind"], "point")
+            self.assertEqual(len(session.find(DATABASE, COLLECTION, sort={})["documents"]), 30)
+            with self.assertRaises(briskdb.InvalidQueryError):
+                session.find(DATABASE, COLLECTION, sort={"rank": 0})
+            with self.assertRaises(briskdb.TypeMismatchError):
+                session.find(DATABASE, COLLECTION, sort=[("rank", 1)])
+            session.close()
+            database.close()
+
     def test_projections_preserve_bson_arrays_order_and_cursor_state(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             database, session = self.open_session(root)
@@ -865,6 +887,20 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_sorting_precedes_projection_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=4, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for index in range(9):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": index, "rank": index})
+                    batch = await session.find(DATABASE, COLLECTION, sort={"rank": -1}, projection={"_id": 1}, batch_size=2)
+                    rows = batch["documents"]
+                    while not batch["exhausted"]:
+                        batch = await session.get_more(DATABASE, COLLECTION, batch["cursor_id"], batch_size=3)
+                        rows.extend(batch["documents"])
+                    self.assertEqual(rows, [{"_id": index} for index in reversed(range(9))])
+
     async def test_async_projection_is_retained_across_pages(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=4, documents=True) as database:

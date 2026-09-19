@@ -10,7 +10,7 @@ use briskdb::{
         DocumentCursorId, DocumentExecution, DocumentFilter, DocumentFindRequest,
         DocumentInsertRequest, DocumentKillCursorRequest, DocumentNamespace, DocumentPlan,
         DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId,
-        DocumentResult, DocumentWriteOptions, encode_document,
+        DocumentResult, DocumentSort, DocumentWriteOptions, encode_document,
     },
 };
 
@@ -71,6 +71,9 @@ async fn seed(engine: &Engine, session: &Session, count: i32) {
         )),
     )
     .await;
+    if count == 0 {
+        return;
+    }
     call(
         engine,
         session,
@@ -213,6 +216,222 @@ async fn projected_cursors_filter_original_values_and_budget_only_returned_field
         full[0].get_first("payload"),
         Some(&BsonValue::String("x".repeat(300)))
     );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sorted_cursors_apply_global_skip_limit_before_projection_across_windows() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session, 1100).await;
+    let sort =
+        DocumentSort::new(BsonDocument::from_entries([("rank", BsonValue::Int32(-1))]).unwrap())
+            .unwrap();
+    let options = DocumentReadOptions::new()
+        .with_sort(sort.clone())
+        .with_projection(
+            DocumentProjection::new(
+                BsonDocument::from_entries([("_id", BsonValue::Int32(1))]).unwrap(),
+            )
+            .unwrap(),
+        )
+        .with_skip(1030)
+        .with_limit(17)
+        .unwrap()
+        .with_batch_size(0)
+        .unwrap()
+        .with_batch_byte_limit(400)
+        .unwrap();
+    let filter = DocumentFilter::new(
+        BsonDocument::from_entries([(
+            "rank",
+            BsonValue::Document(
+                BsonDocument::from_entries([("$gte", BsonValue::Int32(20))]).unwrap(),
+            ),
+        )])
+        .unwrap(),
+    )
+    .unwrap();
+    let opened = call(
+        &engine,
+        &session,
+        DocumentCommand::Find(DocumentFindRequest::new(namespace(), filter, options)),
+    )
+    .await;
+    assert!(matches!(opened.plan(), Some(DocumentPlan::Scatter(_))));
+    let (mut id, mut rows) = cursor(opened);
+    let error = engine
+        .execute_document(
+            &session,
+            request(DocumentCommand::ContinueCursor(
+                DocumentContinueCursorRequest::new(
+                    namespace(),
+                    id.unwrap(),
+                    DocumentReadOptions::new().with_sort(sort),
+                ),
+            )),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+    let mut page = 0;
+    while let Some(current) = id {
+        let batch_size = [2, 7, 1, 11][page % 4];
+        let (next, documents) = cursor(call(&engine, &session, more(current, batch_size)).await);
+        assert!(documents.len() as u64 <= batch_size);
+        rows.extend(documents);
+        id = next;
+        page += 1;
+    }
+    assert_eq!(ids(&rows), (53..=69).rev().collect::<Vec<_>>());
+    assert!(rows.iter().all(|row| row.len() == 1));
+    assert!(page > 2);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sorted_cursors_keep_bson_ties_and_validate_point_array_keys_before_skip() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session, 0).await;
+    let values = [
+        BsonValue::Int32(1),
+        BsonValue::Null,
+        BsonValue::Int64(1),
+        BsonValue::Array(vec![]),
+        BsonValue::Double(1.0),
+        BsonValue::MinKey,
+        BsonValue::Null,
+    ];
+    call(
+        &engine,
+        &session,
+        DocumentCommand::Insert(
+            DocumentInsertRequest::new(
+                namespace(),
+                values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(id, value)| {
+                        BsonDocument::from_entries([
+                            ("_id", BsonValue::Int32(id as i32)),
+                            ("v", value),
+                        ])
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+                DocumentWriteOptions::new(),
+            )
+            .unwrap(),
+        ),
+    )
+    .await;
+    let options = DocumentReadOptions::new()
+        .with_sort(
+            DocumentSort::new(BsonDocument::from_entries([("v", BsonValue::Int32(1))]).unwrap())
+                .unwrap(),
+        )
+        .with_batch_size(1)
+        .unwrap();
+    let (mut id, mut rows) = cursor(call(&engine, &session, find(options)).await);
+    while let Some(current) = id {
+        let (next, batch) = cursor(call(&engine, &session, more(current, 2)).await);
+        rows.extend(batch);
+        id = next;
+    }
+    assert_eq!(ids(&rows), [5, 3, 1, 6, 0, 2, 4]);
+    let document = BsonDocument::from_entries([
+        ("_id", BsonValue::Int32(99)),
+        ("a", BsonValue::Array(vec![])),
+        ("b", BsonValue::Array(vec![])),
+    ])
+    .unwrap();
+    call(
+        &engine,
+        &session,
+        DocumentCommand::Insert(
+            DocumentInsertRequest::new(namespace(), vec![document], DocumentWriteOptions::new())
+                .unwrap(),
+        ),
+    )
+    .await;
+    let error = engine
+        .execute_document(
+            &session,
+            request(DocumentCommand::Find(DocumentFindRequest::new(
+                namespace(),
+                DocumentFilter::new(
+                    BsonDocument::from_entries([("_id", BsonValue::Int32(99))]).unwrap(),
+                )
+                .unwrap(),
+                DocumentReadOptions::new().with_skip(1).with_sort(
+                    DocumentSort::new(
+                        BsonDocument::from_entries([
+                            ("a", BsonValue::Int32(1)),
+                            ("b", BsonValue::Int32(1)),
+                        ])
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            ))),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+    assert_eq!(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<briskdb::document::DocumentQueryError>()
+            .unwrap()
+            .mongo_code(),
+        2
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sorted_continuations_fail_whole_and_release_state_at_hard_result_limits() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session, 12).await;
+    for limits in [
+        ResultLimits::new(1, 4096).unwrap(),
+        ResultLimits::new(10, 400).unwrap(),
+    ] {
+        let options = DocumentReadOptions::new()
+            .with_sort(
+                DocumentSort::new(
+                    BsonDocument::from_entries([("rank", BsonValue::Int32(-1))]).unwrap(),
+                )
+                .unwrap(),
+            )
+            .with_batch_size(0)
+            .unwrap();
+        let (id, _) = cursor(call(&engine, &session, find(options)).await);
+        let error = engine
+            .execute_document(
+                &session,
+                DocumentRequest::new(
+                    DocumentRequestId::new([8; 16]).unwrap(),
+                    RequestContext::new().with_result_limits(limits),
+                    more(id.unwrap(), 3),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        assert_missing(
+            engine
+                .execute_document(&session, request(more(id.unwrap(), 3)))
+                .await
+                .unwrap_err(),
+        );
+    }
     engine.shutdown().await.unwrap();
 }
 

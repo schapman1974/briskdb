@@ -17,7 +17,7 @@ use briskdb::document::{
     DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
     DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
     DocumentNamespace, DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId,
-    DocumentWriteOptions,
+    DocumentSort, DocumentWriteOptions,
 };
 use briskdb::{
     BriskCursor, BriskDb, BriskSession, BriskTransaction,
@@ -1569,6 +1569,7 @@ impl Session {
         filter = None,
         *,
         projection = None,
+        sort = None,
         skip = 0,
         limit = None,
         batch_size = 101,
@@ -1586,6 +1587,7 @@ impl Session {
         collection: String,
         filter: Option<Py<PyAny>>,
         projection: Option<Py<PyAny>>,
+        sort: Option<Py<PyAny>>,
         skip: u64,
         limit: Option<u64>,
         batch_size: u64,
@@ -1604,6 +1606,11 @@ impl Session {
                 projection.bind(py),
                 self.shared.uuid_representation,
             )?);
+        }
+        if let Some(sort) = sort {
+            options = options.with_sort(python_engine_result(DocumentSort::new(
+                extract_bson_document(py, sort.bind(py), self.shared.uuid_representation)?,
+            ))?);
         }
         let request = DocumentFindRequest::new(
             python_engine_result(DocumentNamespace::new(database, collection))?,

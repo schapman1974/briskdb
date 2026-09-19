@@ -293,6 +293,50 @@ def projection_smoke(uri):
                     raise AssertionError("invalid projection must fail before storage admission")
 
 
+def sorting_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=10000, maxPoolSize=3) as client:
+        collection = client.wire_sorting.items
+        documents = [{"_id": index, "rank": Int64(index % 5), "group": index % 2, "payload": "x" * 1000}
+                     for index in range(36)]
+        collection.insert_many(documents)
+        expected = sorted((row for row in documents if row["group"] == 0), key=lambda row: -row["rank"])[2:15]
+        rows = list(collection.find({"group": 0}, {"_id": 1}).sort("rank", -1).skip(2).limit(13).batch_size(3))
+        assert rows == [{"_id": row["_id"]} for row in expected]
+        assert collection.find_one({}, {"_id": 1}, sort=[("rank", -1), ("_id", -1)]) == {"_id": 34}
+        assert collection.find_one({"_id": 7}, sort=[("rank", 1)]) == documents[7]
+        assert [row["_id"] for row in collection.find().sort("_id", -1).limit(-4)] == [35, 34, 33, 32]
+        initial = client.wire_sorting.command("find", "items", sort={"_id": -1}, batchSize=0)
+        identifier = initial["cursor"]["id"]
+        assert identifier and not initial["cursor"]["firstBatch"]
+        reply = client.wire_sorting.command("getMore", identifier, collection="items", batchSize=2)
+        assert [row["_id"] for row in reply["cursor"]["nextBatch"]] == [35, 34]
+        client.wire_sorting.command("killCursors", "items", cursors=[identifier])
+        assert [row["_id"] for row in client.wire_cursors.large.find().sort("_id", -1).batch_size(1000)] == list(reversed(range(30)))
+        compound = client.wire_sorting.compound
+        compound.insert_many([
+            {"_id": 1, "items": [{"x": 1, "y": 9}, {"x": 2, "y": 8}]},
+            {"_id": 2, "items": [{"x": 1, "y": 5}]},
+        ])
+        assert [row["_id"] for row in compound.find().sort([("items.x", 1), ("items.y", 1)]).batch_size(1)] == [2, 1]
+        parallel = client.wire_sorting.parallel
+        parallel.insert_one({"_id": 1, "a": [], "b": []})
+        try:
+            list(parallel.find({"_id": 1}).sort([("a", 1), ("b", 1)]).skip(1))
+        except OperationFailure as error:
+            assert error.code == 2
+        else:
+            raise AssertionError("point sort must validate parallel array keys before skip")
+        for spec, code in [({"rank": 0}, 15975), ({"rank": True}, 15974), ({"": 1}, 40352),
+                           ({"rank": {"$meta": "textScore"}}, 115)]:
+            for database in [client.wire_sorting, client.unwritten_sorting]:
+                try:
+                    database.command("find", "items", sort=spec)
+                except OperationFailure as error:
+                    assert error.code == code, (spec, error.code)
+                else:
+                    raise AssertionError("invalid sort must fail before missing-collection handling")
+
+
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         assert client.wire_data.items.find_one({"_id": "typed"})["decimal"] == Decimal128("1.250")
@@ -308,6 +352,7 @@ def persisted_smoke(uri):
         row = client.wire_projection.items.find_one({"_id": 7}, {"profile.name": 1})
         assert row == {"_id": 7, "profile": {"name": "name-7"}}
         assert len(client.wire_projection.items.find_one({"_id": 7})["payload"]) == 5000
+        assert [row["_id"] for row in client.wire_sorting.items.find({}, {"_id": 1}).sort("_id", -1).batch_size(4)] == list(reversed(range(36)))
 
 
 async def async_smoke(uri):
@@ -345,6 +390,8 @@ async def async_smoke(uri):
         assert [row["_id"] for row in rows] == list(range(8, 129))
         rows = await client.wire_projection.items.find({"secret": "filter-me"}, {"before": 1, "_id": 0}, batch_size=3).to_list()
         assert rows == [{"before": Int64(index)} for index in range(24)]
+        rows = await client.wire_sorting.items.find({}, {"_id": 1}).sort("_id", -1).skip(3).limit(11).batch_size(2).to_list()
+        assert rows == [{"_id": index} for index in range(32, 21, -1)]
         cursor = client.wire_batches.split.find(batch_size=2)
         assert (await cursor.__anext__())["_id"] == 0
         identifier = cursor.cursor_id
@@ -368,5 +415,6 @@ if __name__ == "__main__":
         query_smoke(sys.argv[1])
         cursor_smoke(sys.argv[1])
         projection_smoke(sys.argv[1])
+        sorting_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

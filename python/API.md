@@ -53,7 +53,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `create_index(database, collection, keys, *, name, unique=False, ...)`
 - `list_indexes(database, collection, *, skip=0, limit=None, batch_size=101, ...)`
 - `insert_one(database, collection, document, ...)`
-- `find(database, collection, filter=None, *, projection=None, skip=0, limit=None, batch_size=101, ...)`
+- `find(database, collection, filter=None, *, projection=None, sort=None, skip=0, limit=None, batch_size=101, ...)`
 - `get_more(database, collection, cursor_id, *, batch_size=101, ...)`
 - `kill_cursor(database, collection, cursor_id, ...)`
 - `count_documents(database, collection, filter=None, *, skip=0, limit=None, ...)`
@@ -113,8 +113,18 @@ Stored documents and exact BSON representations remain unchanged. Filters use
 original values; result byte limits apply to projected output. A cursor retains
 its initial projection. Invalid mixed modes and conflicting paths fail eagerly;
 expression, positional, and numeric-array-index projections are unsupported.
+
+`sort` accepts an ordered mapping such as `{"priority": -1, "_id": 1}` with up
+to 32 numeric `1`/`-1` directions. An empty mapping preserves natural order.
+Sorting uses original values before skip/limit and projection; equal BSON keys
+retain durable natural order. It persists across cursor batches. Bounded sorting
+windows currently rescan matching documents; large skips may require several
+scans and an internal window/memory boundary may return a short batch. Metadata
+and expression sorts are unsupported. Python pair-list sort shorthand is not
+part of the embedded API; ordinary PyMongo chaining works through the wire API.
+
 Delete still requires an exact `_id`. Updates, replacements,
-sorting, aggregation, and bulk-write helpers remain unsupported. There is no Python collection
+aggregation and bulk-write helpers remain unsupported. There is no Python collection
 object or Python-hosted MongoDB network listener in this slice. The separate
 opt-in Rust Mongo listener also exposes batch inserts and retained finds through PyMongo.
 

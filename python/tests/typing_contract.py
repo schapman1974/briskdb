@@ -37,7 +37,7 @@ def sync_contract(path: str) -> None:
         "app", "notes", {"_id": 1, "body": "typed"}
     )["inserted_count"]
     documents: List[dict[str, object]] = document_session.find(
-        "app", "notes", {"_id": 1}, projection=["body"]
+        "app", "notes", {"_id": 1}, projection=["body"], sort={"body": 1}
     )["documents"]
     count: int = document_session.count_documents("app", "notes")["count"]
     continued: List[dict[str, object]] = document_session.get_more("app", "notes", 1)["documents"]
@@ -83,7 +83,7 @@ async def async_contract(path: str) -> None:
     namespace: str = created["collection"]["namespace"]
     await session.insert_one("app", "typed", {"_id": 1})
     document_count: int = (await session.count_documents("app", "typed"))["count"]
-    projected: List[dict[str, object]] = (await session.find("app", "typed", projection={"_id": 1}))["documents"]
+    projected: List[dict[str, object]] = (await session.find("app", "typed", projection={"_id": 1}, sort={"_id": -1}))["documents"]
     continued: List[dict[str, object]] = (await session.get_more("app", "typed", 1))["documents"]
     killed: bool = (await session.kill_cursor("app", "typed", 1))["killed"]
     print(continued, killed, projected)

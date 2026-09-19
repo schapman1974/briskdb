@@ -421,6 +421,7 @@ class Session:
         filter: Optional[BsonDocument] = None,
         *,
         projection: Optional[BsonProjection] = None,
+        sort: Optional[BsonDocument] = None,
         skip: int = 0,
         limit: Optional[int] = None,
         batch_size: int = 101,

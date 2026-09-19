@@ -537,9 +537,12 @@ requires an earlier dependency:
       real sync/async drivers and Python APIs cover paging and unchanged storage.
       Shared BSON sort keys now cover stable semantic ties, dotted/numeric
       paths, correlated compound arrays, and parallel-array errors, with 4,654
-      additional locked-oracle cases and bounded/cancellable work. Connecting
-      sorting to global paged reads, distinct, broader wire count helpers, and
-      remaining options still keep this issue open.
+      additional locked-oracle cases and bounded/cancellable work. Global sorted
+      find now preserves natural-order ties, skip/limit, and projection across
+      native/Python/wire batches using bounded top-key windows and retained
+      last-key positions. Windows rescan until sorted indexes exist; key growth
+      is reaccounted against cursor quotas. Distinct, broader wire count helpers,
+      and remaining options still keep this issue open.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.
