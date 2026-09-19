@@ -1,4 +1,4 @@
-//! Bounded expressions shared by aggregation transforms and future accumulators.
+//! Bounded expressions shared by aggregation transforms and accumulators.
 
 use super::{BsonDocument, BsonJavaScript, BsonValue, matcher::query_error, memory};
 use crate::core::{EngineError, EngineErrorKind, EngineResult};

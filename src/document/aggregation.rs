@@ -1,10 +1,14 @@
-//! Shared, bounded basic aggregation. Adapters must not reinterpret stages.
+//! Shared, bounded aggregation. Adapters must not reinterpret stages.
 
 use std::{cmp::Reverse, collections::BinaryHeap, fmt};
 
 use super::{
     BsonDocument, BsonErrorContext, BsonValue, DocumentMatcher, DocumentPipeline, DocumentSorter,
-    aggregation_transform::Transform, encode_document, matcher::integer, matcher::query_error,
+    aggregation_group::{Group, Groups},
+    aggregation_transform::Transform,
+    encode_document,
+    matcher::integer,
+    matcher::query_error,
     memory,
 };
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
@@ -21,9 +25,10 @@ enum Stage {
     Limit(u64),
     Count(String),
     Transform(Transform),
+    Group(Group),
 }
 
-/// An eagerly compiled basic and projection-stage aggregation pipeline.
+/// An eagerly compiled aggregation pipeline with transforms and grouping.
 /// Inputs are immutable and retained BSON representations survive unchanged.
 /// Sorts are stable relative to the preceding stage, not the original input.
 ///
@@ -123,6 +128,11 @@ impl DocumentAggregator {
                     let bytes = transform.retained_bytes();
                     (Stage::Transform(transform), bytes)
                 }
+                "$group" => {
+                    let group = Group::compile(stage, argument, &mut || budget.step())?;
+                    let bytes = group.retained_bytes();
+                    (Stage::Group(group), bytes)
+                }
                 _ => return Err(query_error(115)),
             };
             add_bytes(&mut retained_bytes, bytes)?;
@@ -145,16 +155,20 @@ impl DocumentAggregator {
         let boundary = self
             .stages
             .iter()
-            .position(|stage| matches!(stage, Stage::Sort(_) | Stage::Count(_)))
+            .position(blocking)
             .unwrap_or(self.stages.len());
         let remaining = prefix_counters(&self.stages[..boundary]);
+        let groups =
+            matches!(self.stages.get(boundary), Some(Stage::Group(_))).then(Groups::default);
+        let bytes = groups.as_ref().map_or(0, Groups::retained_bytes);
         DocumentAggregationStream {
             plan: self,
             boundary,
             remaining,
             rows: Vec::new(),
             count: 0,
-            bytes: 0,
+            bytes,
+            groups,
             steps: 0,
             consumed: 0,
             exhausted: false,
@@ -206,7 +220,8 @@ impl DocumentAggregator {
 
 /// Incremental execution of a compiled pipeline. Match/skip/limit/transform stages
 /// emit at most one owned row per input; the first count retains only a counter,
-/// and the first sort buffers bounded rows. `finish` flushes any blocking stage
+/// the first sort buffers bounded rows, and the first group retains bounded
+/// accumulator states rather than source rows. `finish` flushes any blocking stage
 /// through the remaining shared stage executor. Engine-validated source rows
 /// are moved without cloning. Public pushes copy only rows retained by a sort,
 /// so caller-reserved spare BSON capacity cannot escape retention accounting.
@@ -223,6 +238,7 @@ pub struct DocumentAggregationStream {
     rows: Vec<Row>,
     count: usize,
     bytes: usize,
+    groups: Option<Groups>,
     steps: usize,
     consumed: usize,
     exhausted: bool,
@@ -336,6 +352,12 @@ impl DocumentAggregationStream {
                     self.count += 1;
                     Ok(None)
                 }
+                Some(Stage::Group(plan)) => {
+                    let groups = self.groups.as_mut().expect("group boundary");
+                    groups.push(plan, &document, 0, &mut || budget.step())?;
+                    self.bytes = groups.retained_bytes();
+                    Ok(None)
+                }
                 None => Ok(Some(document)),
                 _ => unreachable!("boundary is the first blocking stage"),
             }
@@ -366,6 +388,9 @@ impl DocumentAggregationStream {
         let rows = match self.plan.stages.get(self.boundary) {
             Some(Stage::Sort(sorter)) => sort(self.rows, sorter, &mut budget)?,
             Some(Stage::Count(field)) => count_row(field, self.count, &mut budget)?,
+            Some(Stage::Group(plan)) => {
+                group_rows(self.groups.expect("group boundary"), plan, &mut budget)?
+            }
             None => return Ok(Vec::new()),
             _ => unreachable!("boundary is the first blocking stage"),
         };
@@ -381,6 +406,10 @@ fn failed_stream() -> EngineError {
     )
 }
 
+fn blocking(stage: &Stage) -> bool {
+    matches!(stage, Stage::Sort(_) | Stage::Count(_) | Stage::Group(_))
+}
+
 fn execute_stages(
     mut stages: &[Stage],
     mut rows: Vec<Row>,
@@ -388,10 +417,7 @@ fn execute_stages(
 ) -> EngineResult<Vec<Row>> {
     while !stages.is_empty() {
         budget.step()?;
-        let boundary = stages
-            .iter()
-            .position(|stage| matches!(stage, Stage::Sort(_) | Stage::Count(_)))
-            .unwrap_or(stages.len());
+        let boundary = stages.iter().position(blocking).unwrap_or(stages.len());
         let mut remaining = prefix_counters(&stages[..boundary]);
         let mut exhausted = false;
         let mut next = Vec::new();
@@ -399,6 +425,7 @@ fn execute_stages(
         let mut bytes = 0;
         let mut unconsumed: usize = rows.iter().map(|row| row.retained_bytes).sum();
         let counting = matches!(stages.get(boundary), Some(Stage::Count(_)));
+        let mut groups = Groups::default();
         // Fuse nonblocking stages. In particular, a later limit must stop
         // evaluating earlier expressions on rows that will never be consumed.
         for row in rows {
@@ -416,7 +443,10 @@ fn execute_stages(
                 budget,
             )? {
                 count += 1;
-                if !counting {
+                if let Some(Stage::Group(plan)) = stages.get(boundary) {
+                    groups.push(plan, &row.document, unconsumed, &mut || budget.step())?;
+                    bytes = groups.retained_bytes();
+                } else if !counting {
                     add_bytes(&mut bytes, row.retained_bytes)?;
                     next.push(row);
                 }
@@ -425,6 +455,7 @@ fn execute_stages(
         rows = match stages.get(boundary) {
             Some(Stage::Sort(sorter)) => sort(next, sorter, budget)?,
             Some(Stage::Count(field)) => count_row(field, count, budget)?,
+            Some(Stage::Group(plan)) => group_rows(groups, plan, budget)?,
             None => return Ok(next),
             _ => unreachable!("blocking boundary"),
         };
@@ -439,6 +470,21 @@ fn prefix_counters(stages: &[Stage]) -> Vec<u64> {
         .map(|stage| match stage {
             Stage::Skip(amount) | Stage::Limit(amount) => *amount,
             _ => 0,
+        })
+        .collect()
+}
+
+fn group_rows(groups: Groups, plan: &Group, budget: &mut Budget<'_>) -> EngineResult<Vec<Row>> {
+    groups
+        .finish(plan, &mut || budget.step())?
+        .into_iter()
+        .map(|document| {
+            let retained_bytes =
+                DocumentAggregator::document_retained_bytes(&document, &mut || budget.step())?;
+            Ok(Row {
+                document,
+                retained_bytes,
+            })
         })
         .collect()
 }
@@ -708,7 +754,7 @@ mod tests {
             ("$count", BsonValue::String("secret.\0".into()), 40159),
             ("$count", BsonValue::String("secret.field".into()), 40160),
             ("$count", BsonValue::String("_id".into()), 15948),
-            ("$group", BsonValue::Document(doc(&[])), 115),
+            ("$group", BsonValue::Document(doc(&[])), 2),
             ("$project", BsonValue::Document(doc(&[])), 51272),
             ("$unknown-secret", BsonValue::Null, 115),
         ] {

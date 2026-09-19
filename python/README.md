@@ -74,15 +74,15 @@ Pass `sort={"priority": -1, "_id": 1}` for global BSON sorting before skip/limit
 and projection; the sort persists across cursor batches. Stable ties use natural
 order. Sorted pages use bounded key windows and rescan until sorted indexes
 exist; large skips may need repeated scans. Secondary indexes remain `pending_build`; updates,
-aggregation groups/additional expressions, and bulk-write Python helpers remain future work.
+additional aggregation expressions/group-key forms, and bulk-write Python helpers remain future work.
 
 `session.aggregate(database, collection, pipeline, batch_size=101)` accepts a list
 of `$match`, `$sort`, `$skip`, `$limit`, `$count`, `$project`, `$set`, `$addFields`,
-and `$unset` stages and returns the same
+`$unset`, and `$group` stages and returns the same
 cursor shape as find, with `get_more`/`kill_cursor` continuation and cleanup.
 The async session has the same method and request controls. Simple pipelines
 stream across batches; count retains a counter and sort uses bounded working
-memory. There is no disk spill or snapshot guarantee. A zero batch size defers
+memory; group retains bounded accumulator states. There is no disk spill or snapshot guarantee. A zero batch size defers
 input reads. Pipeline conversion uses one 16-MiB BSON/64-MiB heap budget; execution
 has 65,536 consumed-input and four-million-step bounds over the whole cursor.
 Projection stages support field references, arrays, `$literal`, `$ifNull`, `$size`,
@@ -90,8 +90,14 @@ and `$$REMOVE`. Assignments read the original input; no pipeline stage changes
 stored documents. A later limit stops unused expression evaluation, including
 after a sort. Each transform specification has a 1-MiB/4,096-node/depth-100 bound;
 per-row allocation-work and step limits reject computed-output amplification.
+Group keys may be null or a field reference, including fields containing arrays
+or compound documents. Supported accumulators are `$addToSet`, `$avg`, `$first`,
+`$last`, `$max`, `$min`, `$push`, and `$sum`. They share global input order, BSON
+identity, Decimal128 arithmetic, memory limits and cursor cleanup with Rust and
+PyMongo; see the [numeric and grouping contract](../docs/DOCUMENT_ENGINE.md#aggregation-groups-and-numeric-accumulators)
+for result-type boundaries. Group results must each fit BSON before delivery.
 Native `count_documents()` remains the separate direct engine count helper;
-PyMongo's version still needs the future `$group` stage.
+PyMongo's version still needs its literal `_id: 1` group-key form.
 
 Pass `shards` when creating a data directory. Later calls may omit it and use
 the count stored in the manifest. Passing the wrong count raises

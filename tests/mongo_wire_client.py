@@ -449,6 +449,27 @@ def aggregation_smoke(uri):
         assert list(collection.aggregate([{"$skip": 7}, {"$limit": 30}, {"$match": {"group": 1}}, {"$skip": 1}, {"$limit": 6}], batchSize=1)) == [row for row in documents[7:37] if row["group"] == 1][1:7]
         assert list(collection.aggregate([{"$match": {"group": 1}}, {"$skip": Decimal128("3.0")}, {"$limit": 7.0}, {"$count": "n"}])) == [{"n": 7}]
         assert list(collection.aggregate([{"$count": "n"}, {"$count": "again"}])) == [{"again": 1}]
+        grouped = [{"$sort": {"_id": -1}}, {"$group": {
+            "_id": "$group", "n": {"$sum": 1}, "sum": {"$sum": "$value"}, "avg": {"$avg": "$value"},
+            "first": {"$first": "$_id"}, "last": {"$last": "$_id"}, "ids": {"$push": "$_id"},
+            "values": {"$addToSet": "$value"}, "min": {"$min": "$value"}, "max": {"$max": "$value"},
+        }}]
+        grouped_expected = []
+        for key in (2, 1, 0):
+            source = [row for row in reversed(documents) if row["group"] == key]
+            total = sum(row["value"] for row in source)
+            grouped_expected.append({"_id": key, "n": 60, "sum": total, "avg": total / 60,
+                                     "first": source[0]["_id"], "last": source[-1]["_id"],
+                                     "ids": [row["_id"] for row in source], "values": list(dict.fromkeys(row["value"] for row in source)),
+                                     "min": Int64(0), "max": Int64(6)})
+        assert BSON.encode({"rows": list(collection.aggregate(grouped, batchSize=1))}) == BSON.encode({"rows": grouped_expected})
+        assert list(client.unwritten_aggregate.items.aggregate([{"$group": {"_id": None, "n": {"$sum": 1}}}])) == []
+        precision = client.wire_aggregate.precision
+        precision.insert_many([{"_id": 1, "v": Decimal128("1.00")}, {"_id": 2, "v": 2.1}])
+        numeric = [{"$group": {"_id": None, "sum": {"$sum": "$v"}, "avg": {"$avg": "$v"}}}]
+        expected_numeric = [{"_id": None, "sum": Decimal128("3.100000000000000088817841970012523"),
+                             "avg": Decimal128("1.550000000000000044408920985006262")}]
+        assert BSON.encode({"rows": list(precision.aggregate(numeric))}) == BSON.encode({"rows": expected_numeric})
         first = client.wire_aggregate.command("aggregate", "items", pipeline=stages, cursor={"batchSize": 0})["cursor"]
         assert first["firstBatch"] == [] and first["id"] != 0
         identifier = first["id"]
@@ -468,6 +489,9 @@ def aggregation_smoke(uri):
             ([{"$count": "private.field"}], {}, 40160), ([{"$sort": {}}], {}, 15976),
             ([{"$match": {"$where": "private"}}], {}, 115),
             ([{"$group": {"_id": 1, "n": {"$sum": 1}}}], {}, 115),
+            ([{"$group": {"_id": None, "private.path": {"$sum": 1}}}], {}, 40235),
+            ([{"$group": {"_id": None, "private": {"$first": "$$REMOVE"}}}], {}, 115),
+            ([{"$group": {"_id": None, "private": {"$avg": []}}}], {}, 40237),
             ([], {"allowDiskUse": True}, 72), ([], {"hint": "_id_"}, 72),
             ([], {"comment": "private"}, 72), ([], {"readConcern": {"level": "local"}}, 72),
             ([], {"cursor": []}, 14), ([], {"cursor": {"unknown": 1}}, 72),
@@ -496,6 +520,28 @@ def aggregation_smoke(uri):
             rows.extend(page["nextBatch"])
             identifier = page["id"]
         assert [row["_id"] for row in rows] == [4, 3, 2, 1, 0]
+        first = client.wire_aggregate.command("aggregate", "large", pipeline=[{"$group": {"_id": "$_id", "payload": {"$first": "$payload"}}}], cursor={"batchSize": 1000})["cursor"]
+        assert len(first["firstBatch"]) == 2 and first["id"]
+        grouped_rows = first["firstBatch"]
+        identifier = first["id"]
+        while identifier:
+            page = client.wire_aggregate.command("getMore", identifier, collection="large", batchSize=1000)["cursor"]
+            grouped_rows.extend(page["nextBatch"])
+            identifier = page["id"]
+        assert [row["_id"] for row in grouped_rows] == list(range(5))
+        # A whole group must fit BSON, and total retained group state must fit
+        # its working quota even when a later limit asks for only one result.
+        for copies in (10, 40):
+            too_large = [{"$group": {"_id": None, "values": {"$push": {f"copy{i}": "$payload" for i in range(copies)}}}}, {"$limit": 1}]
+            first = client.wire_aggregate.command("aggregate", "large", pipeline=too_large, cursor={"batchSize": 0})["cursor"]
+            assert first["firstBatch"] == [] and first["id"]
+            for code in (10334, 43):
+                try:
+                    client.wire_aggregate.command("getMore", first["id"], collection="large", batchSize=1)
+                except OperationFailure as error:
+                    assert error.code == code
+                else:
+                    raise AssertionError("oversized grouping must fail without partial replies and release the cursor")
         assert list(collection.find({})) == documents
 
         transformed = client.wire_aggregate.transforms
@@ -533,6 +579,17 @@ def aggregation_smoke(uri):
                     raise AssertionError("transform validation must be eager")
         errors = client.wire_aggregate.transform_errors
         errors.insert_many([{"_id": 1, "v": []}, {"_id": 2, "v": None}])
+        group_error = {"$group": {"_id": "$_id", "n": {"$first": {"$size": "$v"}}}}
+        first = client.wire_aggregate.command("aggregate", "transform_errors", pipeline=[group_error], cursor={"batchSize": 0})["cursor"]
+        assert first["firstBatch"] == [] and first["id"]
+        for code in (17124, 43):
+            try:
+                client.wire_aggregate.command("getMore", first["id"], collection="transform_errors", batchSize=1)
+            except OperationFailure as error:
+                assert error.code == code
+            else:
+                raise AssertionError("group failure must return no partial rows and release its cursor")
+        assert list(errors.aggregate([{"$limit": 1}, group_error])) == [{"_id": 1, "n": 0}]
         size = {"$set": {"n": {"$size": "$v"}}}
         first = client.wire_aggregate.command("aggregate", "transform_errors", pipeline=[size], cursor={"batchSize": 1})["cursor"]
         assert first["firstBatch"][0]["n"] == 0 and first["id"]
@@ -591,6 +648,7 @@ def persisted_smoke(uri):
         assert list(client.wire_aggregate.items.aggregate([{"$count": "n"}])) == [{"n": 180}]
         assert [row["_id"] for row in client.wire_aggregate.items.aggregate([{"$sort": {"_id": -1}}, {"$limit": 7}], batchSize=2)] == list(reversed(range(173, 180)))
         assert list(client.wire_aggregate.transforms.aggregate([{"$project": {"_id": 0, "n": {"$size": "$items"}, "source": 1}}])) == [{"source": Int64(9), "n": 3}]
+        assert list(client.wire_aggregate.items.aggregate([{"$group": {"_id": "$group", "n": {"$sum": 1}}}])) == [{"_id": key, "n": 60} for key in range(3)]
 
 
 async def async_smoke(uri):
@@ -608,6 +666,8 @@ async def async_smoke(uri):
         assert [row["_id"] for row in await aggregate.to_list()] == [172, 169, 166, 163, 160, 157, 154]
         aggregate = await client.wire_aggregate.items.aggregate([{"$count": "n"}])
         assert await aggregate.to_list() == [{"n": 180}]
+        aggregate = await client.wire_aggregate.items.aggregate([{"$sort": {"_id": -1}}, {"$group": {"_id": "$group", "n": {"$sum": 1}, "first": {"$first": "$_id"}, "last": {"$last": "$_id"}}}], batchSize=1)
+        assert await aggregate.to_list() == [{"_id": key, "n": 60, "first": Int64(177 + key), "last": Int64(key)} for key in (2, 1, 0)]
         aggregate = await client.wire_aggregate.transforms.aggregate([
             {"$addFields": {"items.tag": "$source", "secret": "$$REMOVE"}},
             {"$project": {"_id": 0, "n": {"$size": "$items"}, "copy": {"$ifNull": ["$absent", "$source"]}}},

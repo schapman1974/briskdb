@@ -126,8 +126,8 @@ Concurrent writes do not have a cross-shard snapshot guarantee. Count does not
 open a cursor. Invalid queries/options fail before absent-collection handling.
 Negative legacy count limits, hints, collation, comments, and read concern are
 explicitly rejected. PyMongo `count_documents()` sends an aggregation pipeline
-ending in `$group`; that stage remains unsupported (code 115), even though basic
-`aggregate()` now works. The native
+ending in `$group` with a literal `_id: 1`; that key form remains unsupported
+(code 115), although grouping by null or a field now works. The native
 embedded `Session.count_documents()` already uses the engine count command.
 
 Distinct uses the [shared extractor and resource bounds](DOCUMENT_ENGINE.md#distinct-values).
@@ -158,7 +158,18 @@ original-input assignment semantics, nested arrays/missing values, eager errors,
 and lazy limit consumption are preserved. Transform allocation/work/depth limits
 bound computed-output amplification before delivery. Real sync/async driver tests
 cover paging, expanded result byte caps, runtime-error cleanup, and restart.
-Groups, additional expressions, and full candidate-corpus acceptance remain open.
+Shared `$group` now supports null/field keys (including structured field values)
+and all eight planned accumulators: addToSet, avg, first, last, max, min, push,
+and sum. Required CI adds 9,509 pipelines in both execution modes. Grouping follows
+the global input order and retains bounded accumulator state, with exact BSON
+identity and Decimal128/mixed-numeric semantics. Arithmetic Double NaN payloads
+are deliberately canonicalized; other representations remain exact. See the
+[group contract](DOCUMENT_ENGINE.md#aggregation-groups-and-numeric-accumulators)
+for integer result-type/overflow boundaries versus the frozen reference and
+MongoDB. Real-driver tests cover structured/numeric results, byte paging,
+whole-group size/memory rejection, no partial group replies, cleanup and restart.
+Literal/computed group keys, partial-shard accumulator merging, additional
+expressions, and full candidate-corpus acceptance remain open.
 
 Updates, deletes, and metadata cursors
 are not implemented by this checkpoint.

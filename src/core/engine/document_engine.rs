@@ -2446,7 +2446,7 @@ mod tests {
             .await
             .unwrap();
 
-        for mode in 0..12 {
+        for mode in 0..15 {
             let mut options = DocumentReadOptions::new().with_batch_size(0).unwrap();
             if (3..6).contains(&mode) {
                 options = options.with_sort(
@@ -2457,7 +2457,30 @@ mod tests {
                 );
             }
             let command = if mode >= 6 {
-                let stages = if mode >= 9 {
+                let stages = if mode >= 12 {
+                    vec![
+                        BsonDocument::from_entries([(
+                            "$group",
+                            BsonValue::Document(
+                                BsonDocument::from_entries([
+                                    ("_id", BsonValue::Null),
+                                    (
+                                        "n",
+                                        BsonValue::Document(
+                                            BsonDocument::from_entries([(
+                                                "$sum",
+                                                BsonValue::Int32(1),
+                                            )])
+                                            .unwrap(),
+                                        ),
+                                    ),
+                                ])
+                                .unwrap(),
+                            ),
+                        )])
+                        .unwrap(),
+                    ]
+                } else if mode >= 9 {
                     vec![
                         BsonDocument::from_entries([(
                             "$sort",

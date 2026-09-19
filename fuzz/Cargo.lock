@@ -127,6 +127,7 @@ version = "0.1.0-alpha.6"
 dependencies = [
  "blake3",
  "bson",
+ "dec",
  "fancy-regex",
  "getrandom 0.4.3",
  "libc",
@@ -224,6 +225,28 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "dec"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ae126ef80702bd514a66279b6dac1e58ff1dbcb12024f7110de95608348fd7"
+dependencies = [
+ "decnumber-sys",
+ "libc",
+ "paste",
+ "static_assertions",
+]
+
+[[package]]
+name = "decnumber-sys"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b4bc33814bd5bcd46dd13f9471a29ab1a22c4701ae0c4a182e45e8336d1a5b"
+dependencies = [
+ "cc",
  "libc",
 ]
 
@@ -534,6 +557,12 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pin-project-lite"
@@ -847,6 +876,12 @@ dependencies = [
  "psm",
  "windows-sys",
 ]
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "syn"

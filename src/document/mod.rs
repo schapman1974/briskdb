@@ -6,6 +6,8 @@
 
 mod aggregation;
 mod aggregation_expression;
+mod aggregation_group;
+mod aggregation_numeric;
 mod aggregation_transform;
 mod catalog;
 mod codec;

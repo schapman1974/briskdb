@@ -270,7 +270,7 @@ wire hints, collation, read concern, and comments are not implemented yet.
 ### Basic aggregation core
 
 `DocumentAggregator` compiles a `DocumentPipeline` into shared `$match`, `$sort`,
-`$skip`, `$limit`, `$count`, and the projection stages described below. Every stage is validated before execution,
+`$skip`, `$limit`, `$count`, `$group`, and the projection stages described below. Every stage is validated before execution,
 even behind an empty-producing stage. Empty pipelines preserve inputs; stages
 execute in declaration order without mutating their source documents. Matching
 uses `DocumentMatcher`; sorting uses `DocumentSorter` with stable ties relative
@@ -284,7 +284,7 @@ input, otherwise one document with the validated field name and an Int32 count
 under the current row bound. Empty, dollar-prefixed, NUL/dotted and `_id` count
 fields retain their distinct frozen validation errors. Generic stage-shape and
 non-document match errors have no numeric code in the reference; the typed core
-represents those as BadValue (2). Groups and unimplemented stages remain explicitly unsupported.
+represents those as BadValue (2). Unimplemented stages remain explicitly unsupported.
 
 The borrowed `DocumentAggregator::execute` API materializes input. It admits at most
 65,536 input rows and 64 MiB of conservative working-data retention, including
@@ -343,8 +343,67 @@ checking exact BSON/order, missing/null/array behavior, lazy consumption, and
 validation. Unit tests cover amplification, depth/nodes/bytes, every cancellation
 and deadline checkpoint, input immutability, and failed-stream poisoning. Native
 and real-driver tests cover paged transforms, runtime-error cursor cleanup,
-output expansion/byte caps, sync/async calls, and restart. Groups and full candidate
-corpus acceptance, including the projection-to-group identity case, remain open.
+output expansion/byte caps, sync/async calls, and restart. Projection-to-group
+identity now uses the shared group stage below. Full candidate-corpus acceptance
+still requires collection lifecycle support for the frozen harness.
+
+### Aggregation groups and numeric accumulators
+
+`$group` supports `_id: null` or a field reference, including fields containing
+compound documents or arrays. Missing keys become null. Groups retain first
+encounter order and the first exact key representation using shared recursive
+BSON identity; numeric aliases compare equal while document field order matters.
+Computed/constant keys other than null remain unsupported under the frozen
+reference grammar. Accumulator expressions reuse the transformation evaluator
+without `$$REMOVE`. All shapes, output names, expressions, and error precedence
+are validated even for absent collections and empty inputs.
+
+Supported accumulators are `$addToSet`, `$avg`, `$first`, `$last`, `$max`, `$min`,
+`$push`, and `$sum`. First/last include missing as null; first still evaluates
+later operands and can therefore fail on a later invalid expression. Push and
+addToSet omit missing, retain explicit null and whole arrays, and preserve input
+order; addToSet retains the first representation of each BSON identity. Min/max
+ignore missing/null, return null if there are no comparable values, and retain
+the last representation on equal extrema. Results put `_id` first, followed by
+accumulator fields in specification order. Source documents remain unchanged.
+
+Sum/average ignore nonnumeric values (including booleans and arrays). Integer
+totals remain exact within the 65,536-input bound. As in frozen Python, an
+integer-only result uses Int32 if representable, otherwise Int64; this is not
+a claim of MongoDB's original-Int64 type retention. Frozen Python cannot BSON
+encode totals outside Int64; BriskDB returns Double for that explicit boundary,
+consistent with the [documented overflow result type](https://www.mongodb.com/docs/manual/reference/operator/aggregation/sum/#result-data-type).
+This does not promise identical intermediate-overflow behavior for every MongoDB
+version. Decimal128 arithmetic uses a 34-digit, half-even, clamped IEEE context
+with exact binary64 operands before addition, retaining decimal scale. Average
+uses separate decimal and compensated two-double totals with split Int64 input;
+it follows the frozen cancellation, mixed-number, and nonfinite rules. Empty
+numeric sums return Int32 zero, empty numeric averages null. Newly computed
+double NaNs use a canonical quiet NaN; their arithmetic sign/payload is not
+specified. Pass-through values, keys, extrema, and sets preserve original bits.
+
+Grouping is blocking but retains states, not source documents. The global
+natural or preceding sort order feeds the states, so first/last and ordered
+numeric addition do not depend on physical shard boundaries or cursor batches.
+Rounded shard-local totals are **not** merged: partial aggregation pushdown is
+still open because rounding is not associative. Group keys/states/output and
+per-row expression allocation share conservative 64 MiB working bounds,
+reduced by unconsumed rows already retained upstream. Specifications are capped
+at 1 MiB/4,096 charged syntax/path nodes. Pipeline row/work/cancellation limits
+remain cumulative. Every completed group document is BSON-size/depth validated
+before any result is delivered, even if a later limit/project would shrink it.
+Failures poison the execution and release its cursor without partial group
+results. No disk spill, indexed grouping, or snapshot is promised.
+
+Required CI adds 9,509 source-locked grouping pipelines, each tested in both
+execution modes. Comparisons retain exact BSON except arithmetic Double NaN
+bits in explicitly tagged numeric output fields; input/pass-through NaNs remain
+byte-for-byte comparisons. The unchanged reference produces all expectations;
+unencodable integer totals are separate Rust edge tests, not coerced oracle
+outputs. Tests also cover structured identity, stage ordering, numeric quantum,
+resource limits, every cancellation/deadline checkpoint, cursor cleanup,
+cross-shard byte paging, sync/async native and wire clients, and restart. Full
+frozen command-corpus acceptance and partial-shard state merging remain open.
 
 ### Aggregate commands and cursors
 
@@ -352,7 +411,8 @@ corpus acceptance, including the projection-to-group identity case, remain open.
 and sync/async PyMongo `aggregate()` now share that compiled core. The engine's
 `DocumentAggregationStream` moves owned source documents through a streaming
 match/skip/limit/transform prefix. The first count retains only a counter; the first sort
-retains bounded input. Finalization feeds blocking-stage output through the
+retains bounded input; the first group retains bounded accumulator state.
+Finalization feeds blocking-stage output through the
 remaining shared executor. A prefix limit stops further source consumption.
 Streams admit at most 65,536 consumed inputs and four million checked steps
 over their entire lifetime, including finalization; bounds do not reset per
@@ -372,7 +432,7 @@ blocking stage has produced retained results, that buffered remainder is fixed.
 Aggregate cursors use the same 8-per-session/32-global registry, 64 MiB aggregate
 retention quota, namespace ownership, 600-second idle expiry, and error/close/
 kill/shutdown cleanup as find. Retention includes the compiled pipeline, sort
-input and buffered results, including queue allocation left after popping rows.
+input, group state and buffered results, including queue allocation left after popping rows.
 Empty initial batches defer source reads. Continuations enforce unchanged query
 semantics, positive batch sizes, and retained soft byte caps. Hard result limits
 fail the current request and discard its cursor; previous delivered batches
@@ -390,7 +450,7 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 ## Current boundary
 
 Update expressions, replacements,
-multi-document deletion, upsert, aggregation groups and additional expressions,
+multi-document deletion, upsert, additional aggregation expressions/group-key forms,
 metadata cursors, and physical secondary-index builds remain later roadmap work.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
 category.
