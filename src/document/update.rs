@@ -72,8 +72,16 @@ struct Operation {
 
 enum OperationAction {
     Field(Action),
-    Pop { front: bool },
-    Rename { target: Vec<String> },
+    Pop {
+        front: bool,
+    },
+    Rename {
+        target: Vec<String>,
+    },
+    ArrayMembership {
+        values: Vec<BsonValue>,
+        remove: bool,
+    },
 }
 
 enum Action {
@@ -114,7 +122,7 @@ impl Action {
     }
 }
 
-/// `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename` transformations preserving untouched BSON
+/// Field and array transformations preserving untouched BSON
 /// representations and field order. Paths are non-positional; missing write
 /// parents become documents. Equal min/max values preserve their stored type.
 /// Operations follow specification order, as in the frozen TinyMongo contract.
@@ -152,7 +160,8 @@ impl DocumentUpdater {
         for (operator, operand) in spec.iter() {
             check()?;
             match operator {
-                "$set" | "$unset" | "$min" | "$max" | "$pop" | "$rename" => {}
+                "$set" | "$unset" | "$min" | "$max" | "$pop" | "$rename" | "$addToSet"
+                | "$pullAll" => {}
                 name if name.starts_with('$') => {
                     return Err(DocumentUpdateError::UnsupportedOperator.error());
                 }
@@ -189,6 +198,19 @@ impl DocumentUpdater {
                             return Err(DocumentUpdateError::BadValue.error());
                         }
                         OperationAction::Rename { target }
+                    }
+                    "$addToSet" => OperationAction::ArrayMembership {
+                        values: add_to_set_values(value)?,
+                        remove: false,
+                    },
+                    "$pullAll" => {
+                        let BsonValue::Array(values) = value else {
+                            return Err(DocumentUpdateError::BadValue.error());
+                        };
+                        OperationAction::ArrayMembership {
+                            values: values.clone(),
+                            remove: true,
+                        }
                     }
                     _ => unreachable!("operator prevalidated"),
                 };
@@ -249,6 +271,15 @@ impl DocumentUpdater {
                 OperationAction::Rename { target } => {
                     rename_document(&mut result, &operation.path, target, &mut budget)?;
                 }
+                OperationAction::ArrayMembership { values, remove } => {
+                    array_membership_document(
+                        &mut result,
+                        &operation.path,
+                        values,
+                        *remove,
+                        &mut budget,
+                    )?;
+                }
             }
         }
         if let Some(original_id) = document.get_first("_id") {
@@ -275,6 +306,22 @@ impl DocumentUpdater {
         encode_document(&result).map_err(|e| e.into_engine_error(BsonErrorContext::ClientInput))?;
         Ok(result)
     }
+}
+
+fn add_to_set_values(value: &BsonValue) -> EngineResult<Vec<BsonValue>> {
+    if let BsonValue::Document(modifiers) = value {
+        if modifiers.iter().any(|(name, _)| name.starts_with('$')) {
+            if modifiers.len() != 1 {
+                return Err(DocumentUpdateError::BadValue.error());
+            }
+            let Some(BsonValue::Array(values)) = modifiers.get_first("$each") else {
+                return Err(DocumentUpdateError::BadValue.error());
+            };
+            return Ok(values.clone());
+        }
+    }
+    // A plain array/document is one literal element, not an implicit $each.
+    Ok(vec![value.clone()])
 }
 
 fn compile_path(path: &str, rename: bool, retained_bytes: &mut usize) -> EngineResult<Vec<String>> {
@@ -566,6 +613,90 @@ fn rename_document(
     write_document(document, target, &Action::Set(value), false, budget)
 }
 
+fn contains_value(
+    values: &[BsonValue],
+    candidate: &BsonValue,
+    budget: &mut Budget<'_>,
+) -> EngineResult<bool> {
+    for existing in values {
+        // Bound equality work even for duplicate/no-op updates, and preserve
+        // stored representations: BSON equality is not byte equality.
+        budget.comparison_value(existing)?;
+        budget.comparison_value(candidate)?;
+        let equal = existing == candidate;
+        budget.step()?;
+        if equal {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn add_unique(
+    values: &mut Vec<BsonValue>,
+    candidates: &[BsonValue],
+    budget: &mut Budget<'_>,
+) -> EngineResult<()> {
+    for candidate in candidates {
+        budget.step()?;
+        if !contains_value(values, candidate, budget)? {
+            budget.charge(128)?;
+            let value = budget.clone_value(candidate)?;
+            values.try_reserve_exact(1).map_err(|_| limit())?;
+            values.push(value);
+        }
+    }
+    Ok(())
+}
+
+fn array_membership_document(
+    document: &mut BsonDocument,
+    path: &[String],
+    candidates: &[BsonValue],
+    remove: bool,
+    budget: &mut Budget<'_>,
+) -> EngineResult<()> {
+    let Some(value) = existing_document_value(document, path, true, budget)? else {
+        if !remove {
+            let mut values = Vec::new();
+            add_unique(&mut values, candidates, budget)?;
+            // $each: [] still creates a missing array. Use the same bounded,
+            // strict numeric-path writer as field updates, never overwrite a
+            // scalar parent or allocate an unchecked array gap.
+            write_document(
+                document,
+                path,
+                &Action::Set(BsonValue::Array(values)),
+                true,
+                budget,
+            )?;
+        }
+        return Ok(());
+    };
+    let BsonValue::Array(values) = value else {
+        return Err(DocumentUpdateError::BadValue.error());
+    };
+    if remove {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        // Fallible, order-preserving compaction of the private post-image. No
+        // extra array copy, and no storage mutation before every check passes.
+        let mut kept = 0;
+        for read in 0..values.len() {
+            budget.step()?;
+            if !contains_value(candidates, &values[read], budget)? {
+                values.swap(kept, read);
+                kept += 1;
+            }
+        }
+        values.truncate(kept);
+        Ok(())
+    } else {
+        add_unique(values, candidates, budget)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +719,219 @@ mod tests {
             source = cause.source();
         }
         panic!("missing typed error: {error}")
+    }
+
+    #[test]
+    fn array_membership_uses_literal_bson_equality_and_preserves_order() {
+        let ordered = BsonValue::Document(doc([
+            ("a", BsonValue::Int32(1)),
+            ("b", BsonValue::Int32(2)),
+        ]));
+        let reversed = BsonValue::Document(doc([
+            ("b", BsonValue::Int32(2)),
+            ("a", BsonValue::Int32(1)),
+        ]));
+        let original = doc([
+            ("_id", BsonValue::Int64(7)),
+            (
+                "values",
+                BsonValue::Array(vec![
+                    BsonValue::Int64(1),
+                    BsonValue::Double(1.0),
+                    BsonValue::Boolean(true),
+                    ordered.clone(),
+                ]),
+            ),
+            ("grid", BsonValue::Array(vec![BsonValue::Array(vec![])])),
+        ]);
+        let each = BsonValue::Document(doc([(
+            "$each",
+            BsonValue::Array(vec![
+                BsonValue::Int32(1),
+                reversed.clone(),
+                reversed.clone(),
+                BsonValue::Null,
+            ]),
+        )]));
+        let added = DocumentUpdater::compile(&spec(
+            "$addToSet",
+            doc([
+                ("values", each),
+                ("grid.0", BsonValue::Array(vec![BsonValue::Int64(2)])),
+                (
+                    "grid.3",
+                    BsonValue::Document(doc([("$each", BsonValue::Array(vec![]))])),
+                ),
+            ]),
+        ))
+        .unwrap()
+        .apply(&original)
+        .unwrap();
+        let expected = BsonValue::Array(vec![
+            BsonValue::Int64(1),
+            BsonValue::Double(1.0),
+            BsonValue::Boolean(true),
+            ordered.clone(),
+            reversed.clone(),
+            BsonValue::Null,
+        ]);
+        assert_eq!(
+            encode_document(&doc([(
+                "values",
+                added.get_first("values").unwrap().clone()
+            )]))
+            .unwrap(),
+            encode_document(&doc([("values", expected)])).unwrap()
+        );
+        assert_eq!(
+            added.get_first("grid"),
+            Some(&BsonValue::Array(vec![
+                BsonValue::Array(vec![BsonValue::Array(vec![BsonValue::Int64(2)])]),
+                BsonValue::Null,
+                BsonValue::Null,
+                BsonValue::Array(vec![])
+            ]))
+        );
+        let pulled = DocumentUpdater::compile(&spec(
+            "$pullAll",
+            doc([
+                (
+                    "values",
+                    BsonValue::Array(vec![BsonValue::Double(1.0), ordered]),
+                ),
+                ("missing.x", BsonValue::Array(vec![BsonValue::Null])),
+                (
+                    "grid.0",
+                    BsonValue::Array(vec![BsonValue::Array(vec![BsonValue::Int32(2)])]),
+                ),
+            ]),
+        ))
+        .unwrap()
+        .apply(&added)
+        .unwrap();
+        assert_eq!(
+            pulled.get_first("values"),
+            Some(&BsonValue::Array(vec![
+                BsonValue::Boolean(true),
+                reversed,
+                BsonValue::Null
+            ]))
+        );
+        assert!(pulled.get_first("missing").is_none());
+        assert_eq!(
+            original.get_first("grid"),
+            Some(&BsonValue::Array(vec![BsonValue::Array(vec![])]))
+        );
+    }
+
+    #[test]
+    fn array_membership_validates_operands_paths_ids_and_work_budgets() {
+        for value in [
+            BsonValue::Document(doc([("$each", BsonValue::Int32(1))])),
+            BsonValue::Document(doc([("$sort", BsonValue::Int32(1))])),
+            BsonValue::Document(doc([
+                ("$each", BsonValue::Array(vec![])),
+                ("extra", BsonValue::Null),
+            ])),
+        ] {
+            assert_eq!(
+                code(
+                    DocumentUpdater::compile(&spec("$addToSet", doc([("v", value)]))).unwrap_err()
+                ),
+                2
+            );
+        }
+        assert_eq!(
+            code(
+                DocumentUpdater::compile(&spec("$pullAll", doc([("v", BsonValue::Null)])))
+                    .unwrap_err()
+            ),
+            2
+        );
+        let original = doc([
+            (
+                "_id",
+                BsonValue::Document(doc([("v", BsonValue::Array(vec![BsonValue::Int32(1)]))])),
+            ),
+            ("scalar", BsonValue::Null),
+            ("a", BsonValue::Array(vec![BsonValue::Null])),
+        ]);
+        for (operator, path, value, expected) in [
+            ("$addToSet", "scalar.x", BsonValue::Null, 28),
+            ("$addToSet", "a.0.x", BsonValue::Null, 28),
+            ("$addToSet", "a.01", BsonValue::Null, 28),
+            ("$addToSet", "scalar", BsonValue::Null, 2),
+            ("$addToSet", "_id.v", BsonValue::Int32(2), 66),
+            ("$pullAll", "scalar", BsonValue::Array(vec![]), 2),
+            ("$pullAll", "scalar.x", BsonValue::Array(vec![]), 28),
+            (
+                "$pullAll",
+                "_id.v",
+                BsonValue::Array(vec![BsonValue::Int32(1)]),
+                66,
+            ),
+        ] {
+            let before = encode_document(&original).unwrap();
+            assert_eq!(
+                code(
+                    DocumentUpdater::compile(&spec(operator, doc([(path, value)])))
+                        .unwrap()
+                        .apply(&original)
+                        .unwrap_err()
+                ),
+                expected
+            );
+            assert_eq!(encode_document(&original).unwrap(), before);
+        }
+        let no_id_change =
+            DocumentUpdater::compile(&spec("$addToSet", doc([("_id.v", BsonValue::Double(1.0))])))
+                .unwrap()
+                .apply(&original)
+                .unwrap();
+        assert_eq!(
+            encode_document(&no_id_change).unwrap(),
+            encode_document(&original).unwrap()
+        );
+        let mut check = || Ok(());
+        let mut budget = Budget {
+            bytes: 0,
+            comparison_bytes: MAX_COMPARISON_BYTES - 1,
+            steps: 0,
+            check: &mut check,
+        };
+        assert_eq!(
+            contains_value(&[BsonValue::Int32(1)], &BsonValue::Int64(1), &mut budget)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        let mut budget = Budget {
+            bytes: MAX_RETAINED_BYTES - 1,
+            comparison_bytes: 0,
+            steps: 0,
+            check: &mut check,
+        };
+        let mut values = vec![];
+        assert_eq!(
+            add_unique(&mut values, &[BsonValue::Null], &mut budget)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        assert!(values.is_empty());
+        let mut cancelled = || Err(EngineError::new(EngineErrorKind::Cancelled, "test"));
+        let mut budget = Budget {
+            bytes: 0,
+            comparison_bytes: 0,
+            steps: 0,
+            check: &mut cancelled,
+        };
+        assert_eq!(
+            contains_value(&[BsonValue::Int32(1)], &BsonValue::Int64(1), &mut budget)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Cancelled
+        );
     }
 
     #[test]

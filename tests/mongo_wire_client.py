@@ -10,6 +10,68 @@ from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timesta
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
 
 
+def array_membership_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_membership.items
+        ordered, reversed_doc = {"a": 1, "b": 2}, {"b": 2, "a": 1}
+        original = [Int64(1), 1.0, True, ordered, reversed_doc]
+        collection.insert_many([{"_id": Int64(i), "values": original, "keep": True} for i in range(12)])
+        assert collection.update_one({"_id": 0}, {"$addToSet": {"values": 1.0}}).modified_count == 0
+        extra = [Timestamp(0, 0), Binary(b"value", 128), [1, 2]]
+        expression = {"$addToSet": {"values": {"$each": extra + extra}}}
+        result = collection.update_many({}, expression)
+        assert (result.matched_count, result.modified_count) == (12, 12)
+        assert collection.update_many({}, expression).modified_count == 0
+        assert BSON.encode({"v": collection.find_one({"_id": 0})["values"]}) == BSON.encode({"v": original + extra})
+        result = collection.update_many({}, {"$pullAll": {"values": [1, ordered]}})
+        assert (result.matched_count, result.modified_count) == (12, 12)
+        remaining = [True, reversed_doc] + extra
+        assert collection.find_one_and_update({}, {"$pullAll": {"values": [Binary(b"value", 128)]}}, sort=[("_id", -1)], projection={"values": 1, "_id": 0}) == {"values": remaining}
+        assert collection.find_one_and_update({"_id": 11}, {"$addToSet": {"nested.0.values": {"$each": []}}}, return_document=True, projection={"nested": 1, "_id": 0}) == {"nested": {"0": {"values": []}}}
+        before = BSON.encode(collection.find_one({"_id": 0}))
+        for expression, code in [
+            ({"$addToSet": {"keep": 1}}, 2), ({"$pullAll": {"keep": []}}, 2),
+            ({"$addToSet": {"values": {"$each": 1}}}, 2),
+            ({"$addToSet": {"values": {"$each": [], "$slice": 1}}}, 2),
+            ({"$pullAll": {"values": None}}, 2),
+            ({"$addToSet": {"values.0.x": 1}}, 28),
+            ({"$pullAll": {"values.01": []}}, 28),
+        ]:
+            try:
+                collection.update_one({"_id": 0}, {"$set": {"atomic_marker": True}, **expression})
+            except OperationFailure as error:
+                assert error.code == code
+            else:
+                raise AssertionError("expected array membership rejection")
+            assert BSON.encode(collection.find_one({"_id": 0})) == before
+        try:
+            client.wire_membership.command("update", "items", ordered=False, updates=[
+                {"q": {}, "u": {"$addToSet": {"keep": 1}}, "multi": True},
+                {"q": {}, "u": {"$set": {"should_not_run": True}}},
+            ])
+        except OperationFailure as error:
+            assert error.code == 2 and "writeErrors" not in error.details
+        else:
+            raise AssertionError("runtime multi-update failure must abort")
+        assert collection.count_documents({"should_not_run": {"$exists": True}}) == 0
+        queue = client.wire_membership.concurrent
+        queue.insert_one({"_id": 1, "values": []})
+        def add(worker):
+            return sum(queue.update_one({}, {"$addToSet": {"values": {"$each": [Int64(worker), float(worker)]}}}).modified_count for _ in range(4))
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            assert sum(pool.map(add, range(4))) == 4
+        assert sorted(queue.find_one()["values"]) == list(range(4))
+        capped = client.wire_membership.capped
+        capped.insert_one({"_id": 1, "values": ["x" * 280000]})
+        try:
+            capped.update_one({}, {"$addToSet": {"values": "y" * 280000}})
+        except OperationFailure:
+            pass
+        else:
+            raise AssertionError("oversized post-image must fail before commit")
+        assert capped.find_one()["values"] == ["x" * 280000]
+
+
 def pop_rename_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_pop_rename.items
@@ -1216,6 +1278,9 @@ def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         assert client.wire_pop_rename.queue.count_documents({"items": [], "keep": True}) == 12
         assert client.wire_pop_rename.items.find_one({"_id": 23})["nested"] == {"value": Binary(b"value", 128)}
+        assert sorted(client.wire_membership.concurrent.find_one()["values"]) == list(range(4))
+        assert client.wire_membership.items.find_one({"_id": 11})["nested"] == {"0": {"values": []}}
+        assert client.wire_membership.capped.find_one()["values"] == ["x" * 280000]
         assert client.wire_min_max.items.count_documents({"low": -32, "high": 32, "keep": True}) == 24
         row = client.wire_find_update.items.find_one({"_id": 10})
         assert row["rank"] == -1 and row["done"] is True and "group" not in row and row["stamp"] == Timestamp(0, 0)
@@ -1347,6 +1412,22 @@ def metadata_smoke(uri):
                 raise AssertionError(f"unsupported metadata command accepted: {command}")
         assert "rejected" not in database.list_collection_names()
         assert list(database.list_collections(nameOnly=True, authorizedCollections=True, filter={"info": {"$exists": True}})) == []
+
+
+async def async_array_membership_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_membership.items
+        await collection.insert_many([{"_id": i, "values": [Int64(1), True]} for i in range(4)])
+        assert (await collection.update_one({"_id": 0}, {"$addToSet": {"values": 1.0}})).modified_count == 0
+        result = await collection.update_many({}, {"$addToSet": {"values": {"$each": [2, 2.0, [1, 2]]}}})
+        assert (result.matched_count, result.modified_count) == (4, 4)
+        assert await collection.find_one_and_update({}, {"$pullAll": {"values": [1, [1, 2]]}}, sort=[("_id", -1)], projection={"values": 1, "_id": 0}, return_document=True) == {"values": [True, 2]}
+        try:
+            await collection.update_one({}, {"$addToSet": {"values": {"$each": None}}})
+        except OperationFailure as error:
+            assert error.code == 2
+        else:
+            raise AssertionError("malformed each must be rejected")
 
 
 async def async_pop_rename_smoke(uri):
@@ -1544,9 +1625,11 @@ if __name__ == "__main__":
         find_update_smoke(sys.argv[1])
         min_max_smoke(sys.argv[1])
         pop_rename_smoke(sys.argv[1])
+        array_membership_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
         # Give the added operator cases their own bounded phase; retain the
         # existing discovery/CRUD phase's deadline as the suite grows.
         asyncio.run(asyncio.wait_for(async_pop_rename_smoke(sys.argv[1]), timeout=20))
+        asyncio.run(asyncio.wait_for(async_array_membership_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

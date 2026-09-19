@@ -6,7 +6,10 @@ different cases are deliberately outside this matrix, not rewritten or waived.
 Rust unit, transaction, and wire tests check those set/unset boundaries
 independently. Min/max, pop, and rename additionally cover whole BSON ordering,
 numeric array paths, blocked parents, and immutable IDs using the unchanged
-reference helpers.
+reference helpers. Add-to-set uses non-ID object paths only because its legacy
+reference helper shares the old set-path behavior. Pull-all covers non-ID numeric
+paths; both legacy membership helpers restore changed IDs silently. Strict
+add-to-set paths and immutable IDs are tested independently, not waived.
 """
 import hashlib
 import random
@@ -168,6 +171,53 @@ def main():
         {"$pop": {"a": 1}, "$unset": {"a.0": 1}},
     ]:
         emit({"_id": 7}, update)
+
+    for current in comparison_values:
+        for candidate in comparison_values:
+            document = {"_id": Int64(7), "v": [current, current],
+                        "nested": {"v": [current]}, "keep": current}
+            emit(document, {"$addToSet": {"v": candidate, "nested.v": candidate}})
+            emit(document, {"$pullAll": {"v": [candidate], "nested.v": [candidate]}})
+        emit({"_id": 7}, {"$addToSet": {"missing.0.v": current}})
+        for operator, operand in [("$addToSet", 1), ("$pullAll", [1])]:
+            emit({"_id": 7, "v": current}, {operator: {"v": operand}})
+    for _ in range(1000):
+        items = [randomizer.choice(comparison_values) for _ in range(randomizer.randrange(7))]
+        candidates = [randomizer.choice(comparison_values) for _ in range(randomizer.randrange(7))]
+        emit({"_id": 7, "v": items, "nested": {"v": items}},
+             {"$addToSet": {"v": {"$each": candidates}, "nested.v": {"$each": candidates},
+                            "new.v": {"$each": candidates}}})
+        emit({"_id": 7, "v": items, "grid": [items]},
+             {"$pullAll": {"v": candidates, "grid.0": candidates,
+                           "grid.3": candidates, "absent.v": candidates}})
+    for update in [
+        {"$addToSet": {}}, {"$pullAll": {}},
+        {"$addToSet": {"new": {"$each": []}}},
+        {"$addToSet": {"v": {"$each": 1}}},
+        {"$addToSet": {"v": {"$each": [], "$sort": 1}}},
+        {"$addToSet": {"v": {"$each": [], "extra": 1}}},
+        {"$addToSet": {"v": {"$unknown": 1}}},
+        {"$pullAll": {"v": 1}}, {"$pullAll": {"v": None}},
+        {"$pullAll": {"v": {"$each": []}}},
+        {"$addToSet": {"v": 1}, "$pullAll": {"v": []}},
+        {"$pullAll": {"v": []}, "$set": {"v.x": 1}},
+        {"$addToSet": {"v..x": 1}}, {"$pullAll": {"v..x": []}},
+        {"$addToSet": []}, {"$pullAll": []},
+    ]:
+        emit({"_id": 7, "v": [True, 1, 1.0]}, update)
+    for document, path, candidates in [
+        ({"_id": 7}, "missing.x", [None]),
+        ({"_id": 7, "v": 1}, "v.x", []),
+        ({"_id": 7, "v": None}, "v.x", []),
+        ({"_id": 7, "v": [None]}, "v.0.x", []),
+        ({"_id": 7, "v": [[1, 2]]}, "v.0", [1.0]),
+        ({"_id": 7, "v": [[1, 2]]}, "v.3", [1]),
+        ({"_id": 7, "v": [[1, 2]]}, "v.99999999999999999999999", [1]),
+        ({"_id": 7, "v": [1]}, "v.01", []),
+        ({"_id": 7, "v": [1]}, "v.x", []),
+        ({"_id": 7, "v": [1]}, "v.-1", []),
+    ]:
+        emit(document, {"$pullAll": {path: candidates}})
 
 
 if __name__ == "__main__":

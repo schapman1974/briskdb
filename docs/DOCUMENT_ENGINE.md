@@ -107,7 +107,7 @@ batch size and cannot change the original skip or limit.
 ### Field updates and single-record write boundaries
 
 `Update` executes scopes `One` and `Many` with `$set`, `$unset`, `$min`, `$max`,
-`$pop`, and `$rename`, using the same
+`$pop`, `$rename`, `$addToSet`, and `$pullAll`, using the same
 locked selection/reselection and preflighted write path as replacement. A shared
 `DocumentUpdater` validates every operator, operand, path, and prefix conflict
 before namespace lookup or matching. It bounds specifications to 1 MiB/4,096
@@ -148,6 +148,20 @@ write. See Mongo's [$pop](https://www.mongodb.com/docs/manual/reference/operator
 and [$rename](https://www.mongodb.com/docs/manual/reference/operator/update/rename/)
 definitions; exact field ordering follows the frozen reference.
 
+`$addToSet` adds absent literal values or the individual candidates in `$each`.
+It retains existing duplicates, element order, and stored BSON representations;
+a plain array is one element. Missing fields become arrays, including an empty
+`$each`. `$pullAll` removes every literal match without treating documents as
+query expressions; missing targets are no-ops. Both use BSON equality (numeric
+aliases equal, booleans distinct, document field order significant) and strict
+numeric array paths. Non-array targets and malformed operands/modifiers use code
+2. Unsupported modifiers are rejected eagerly even with no matches. Equality
+shares the 64-MiB comparison-work and million-step cancellation limits, including
+no-ops. Growth is charged before allocation; removal compacts the private array
+in order. See Mongo's [$addToSet](https://www.mongodb.com/docs/manual/reference/operator/update/addtoset/)
+and [$pullAll](https://www.mongodb.com/docs/manual/reference/operator/update/pullall/)
+definitions. Specification/element encounter order follows the frozen contract.
+
 Only changed paths are edited. Untouched fields retain order and exact BSON
 types; new fields follow specification order. Missing `$set` parents become
 objects. Numeric paths traverse existing arrays (zero-based canonical ASCII
@@ -164,12 +178,17 @@ including retained fields. Result/plan/post-image checks precede SQL, so validat
 failures leave the record unchanged. Concurrent updates read the current document
 under the write lock rather than applying a stale client-side replacement.
 Other operators, upsert, and secondary-index maintenance remain
-unimplemented. Of 11,805 source-locked update oracle cases, the original 4,008
+unimplemented. Of 16,245 source-locked update oracle cases, the original 4,008
 set/unset cases intentionally cover non-ID object paths only: frozen TinyMongo's
 legacy scalar/array/ID behavior differs. The 4,719 min/max cases additionally
 cover whole-value ordering, numeric array paths, scalar/null path errors,
 immutable IDs, and conflicts. Another 3,078 cases cover pop/rename values, paths,
-operand errors, missing fields, and identity. Independent unit, transaction, and real-wire tests
+operand errors, missing fields, and identity. The additional 4,440 array-membership
+cases exclude ID writes; add-to-set cases use object paths only. Frozen legacy
+membership helpers silently restore changed IDs, and add-to-set overwrites
+scalar parents/does not implement numeric array paths. BriskDB rejects changed
+IDs and blocked parents; independent tests cover those stricter boundaries,
+without changing frozen corpus/allowances. Independent unit, transaction, and real-wire tests
 check resource and commit boundaries. Frozen source, corpus, and intentional-
 difference allowances have not been changed.
 
