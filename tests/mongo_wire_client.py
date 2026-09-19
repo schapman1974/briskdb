@@ -31,6 +31,57 @@ def rolled_back_batch_smoke(database, collection, expression, code):
     assert [BSON.encode(row) for row in collection.find({})] == before
 
 
+def increment_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_increment.items
+        collection.insert_many([{"_id": Int64(i), "counter": Int64(1), "amount": Decimal128("2"), "overflow": Int64(2**63 - 1), "invalid": True} for i in range(8)])
+        result = collection.update_many({}, {"$inc": {"counter": 1, "amount": 0.1}})
+        assert (result.matched_count, result.modified_count) == (8, 8)
+        assert collection.update_many({}, {"$inc": {"counter": 0, "amount": Decimal128("0E-100")}}).modified_count == 0
+        assert BSON.encode(collection.find_one_and_update({}, {"$inc": {"counter": 1}}, sort=[("_id", -1)], projection={"counter": 1, "_id": 0})) == BSON.encode({"counter": Int64(2)})
+        assert BSON.encode(collection.find_one_and_update({"_id": 7}, {"$inc": {"counter": 1}}, return_document=True, projection={"counter": 1, "_id": 0})) == BSON.encode({"counter": Int64(4)})
+        assert collection.find_one()["amount"].bid == Decimal128("2.100000000000000").bid
+        for expression, code in [
+            ({"$set": {"marker": True}, "$inc": {"invalid": 1}}, 14),
+            ({"$set": {"marker": True}, "$inc": {"overflow": 1}}, 2),
+            ({"$inc": {"counter": True}}, 14),
+            ({"$inc": {"_id": 1}}, 66),
+        ]:
+            rolled_back_batch_smoke(client.wire_increment, collection, expression, code)
+        for expression, code in [({"$inc": {"counter": True}}, 14), ({"$inc": {"counter.x": 1}, "$set": {"counter": 2}}, 40)]:
+            try:
+                collection.update_one({"_id": 99}, expression)
+            except WriteError as error:
+                assert error.code == code
+            else:
+                raise AssertionError("increment validation must precede matching")
+        fidelity = client.wire_increment.fidelity
+        fidelity.insert_one({"_id": 0, "value": Decimal128("sNaN")})
+        for _ in range(2):
+            assert fidelity.update_one({}, {"$inc": {"value": 0}}).modified_count == 1
+            assert fidelity.find_one()["value"].bid == Decimal128("NaN").bid
+        for value in [Int64(1), -0.0, Decimal128("sNaN")]:
+            fidelity.update_one({}, {"$unset": {"missing": 1}})
+            fidelity.update_one({}, {"$inc": {"missing": value}})
+            assert BSON.encode({"v": fidelity.find_one()["missing"]}) == BSON.encode({"v": value})
+        fidelity.update_one({}, {"$set": {"value": -0.0}})
+        assert fidelity.update_one({}, {"$inc": {"value": 0}}).modified_count == 0
+        assert BSON.encode({"v": fidelity.find_one()["value"]}) == BSON.encode({"v": -0.0})
+        fidelity.update_one({}, {"$set": {"value": 2**31 - 1}})
+        fidelity.update_one({}, {"$inc": {"value": 1}})
+        assert BSON.encode({"v": fidelity.find_one()["value"]}) == BSON.encode({"v": Int64(2**31)})
+        fidelity.update_one({}, {"$inc": {"value": -1}})
+        assert BSON.encode({"v": fidelity.find_one()["value"]}) == BSON.encode({"v": Int64(2**31 - 1)})
+        queue = client.wire_increment.concurrent
+        queue.insert_one({"_id": 0, "counter": Int64(0)})
+        def increment(_):
+            return queue.find_one_and_update({}, {"$inc": {"counter": 1}})["counter"]
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            observed = list(workers.map(increment, range(32)))
+        assert sorted(observed) == list(range(32))
+        assert BSON.encode({"v": queue.find_one()["counter"]}) == BSON.encode({"v": Int64(32)})
+
+
 def pull_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_pull.items
@@ -374,7 +425,7 @@ def field_update_smoke(uri):
             ({"$set": {"_id": 2}}, 66), ({"$unset": {"_id": 1}}, 66),
             ({"$set": {"a": 1}, "$unset": {"a.x": 1}}, 40),
             ({"$set": {"a..b": 1}}, 56), ({"$set": {"array.$.x": 1}}, 115),
-            ({"$inc": {"v": 1}}, 115), ({"$set": 1}, 9),
+            ({"$mul": {"v": 1}}, 115), ({"$set": 1}, 9),
             ({"$set": {"array.9999999999999999999999999": 1}}, 10334),
         ]:
             try:
@@ -445,7 +496,7 @@ def find_replace_smoke(uri):
             new=True, fields={"_id": 0})
         assert reply == {"ok": 1, "lastErrorObject": {"n": 1, "updatedExisting": True}, "value": {}}
         for options, code in [
-            ({"update": {"$inc": {"value": 2}}}, 115), ({"update": [{"$set": {"value": 2}}]}, 115),
+            ({"update": {"$mul": {"value": 2}}}, 115), ({"update": [{"$set": {"value": 2}}]}, 115),
             ({"update": {}, "remove": True}, 72), ({"remove": True, "new": True}, 72),
             ({"remove": False}, 72), ({"update": {}, "upsert": True}, 72),
             ({"update": {}, "hint": "_id_"}, 72), ({"update": {}, "let": {}}, 72),
@@ -534,7 +585,7 @@ def replacement_smoke(uri):
             assert batch.find_one({"_id": 1}) == {"_id": 1, "v": 0}
             assert batch.find_one({"_id": 2})["v"] == (0 if ordered else 1)
         for statement, code in [
-            ({"q": {}, "u": {"$inc": {"v": 1}}}, 115),
+            ({"q": {}, "u": {"$mul": {"v": 1}}}, 115),
             ({"q": {}, "u": [{"$set": {"v": 1}}]}, 115),
             ({"q": {}, "u": {}, "multi": True}, 72),
             ({"q": {}, "u": {}, "upsert": True}, 72),
@@ -1375,6 +1426,10 @@ def persisted_smoke(uri):
         assert client.wire_push.items.find_one({"_id": 11})["values"] == [[4, 5], Timestamp(0, 0), Binary(b"value", 128)]
         assert client.wire_push.capped.find_one()["values"] == ["y" * 280000]
         assert client.wire_pull.concurrent.find_one()["values"] == []
+        assert isinstance(client.wire_increment.concurrent.find_one()["counter"], Int64)
+        assert client.wire_increment.concurrent.find_one()["counter"] == 32
+        assert client.wire_increment.items.find_one({"_id": 7})["counter"] == 4
+        assert client.wire_increment.items.find_one()["amount"].bid == Decimal128("2.100000000000000").bid
         assert client.wire_pull.items.find_one({"_id": 11})["values"] == [True, {"_id": 3, "x": 3}, "beta"]
         assert client.wire_min_max.items.count_documents({"low": -32, "high": 32, "keep": True}) == 24
         row = client.wire_find_update.items.find_one({"_id": 10})
@@ -1507,6 +1562,25 @@ def metadata_smoke(uri):
                 raise AssertionError(f"unsupported metadata command accepted: {command}")
         assert "rejected" not in database.list_collection_names()
         assert list(database.list_collections(nameOnly=True, authorizedCollections=True, filter={"info": {"$exists": True}})) == []
+
+
+async def async_increment_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_increment.items
+        await collection.insert_many([{"_id": i, "amount": Decimal128("1.00")} for i in range(4)])
+        result = await collection.update_many({}, {"$inc": {"counter": Int64(1), "amount": Decimal128("2.5")}})
+        assert (result.matched_count, result.modified_count) == (4, 4)
+        assert (await collection.update_many({}, {"$inc": {"counter": 0, "amount": Decimal128("0E-100")}})).modified_count == 0
+        image = await collection.find_one_and_update({}, {"$inc": {"counter": 1}}, sort=[("_id", -1)], projection={"counter": 1, "_id": 0}, return_document=True)
+        assert BSON.encode(image) == BSON.encode({"counter": Int64(2)})
+        assert (await collection.find_one())["amount"].bid == Decimal128("3.50").bid
+        for expression, code in [({"$inc": {"counter": True}}, 14), ({"$inc": {"_id": 1}}, 66)]:
+            try:
+                await collection.update_many({}, expression)
+            except WriteError as error:
+                assert error.code == code
+            else:
+                raise AssertionError("async increment errors must be driver WriteErrors")
 
 
 async def async_pull_smoke(uri):
@@ -1762,6 +1836,7 @@ if __name__ == "__main__":
         array_membership_smoke(sys.argv[1])
         push_smoke(sys.argv[1])
         pull_smoke(sys.argv[1])
+        increment_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
         # Give the added operator cases their own bounded phase; retain the
         # existing discovery/CRUD phase's deadline as the suite grows.
@@ -1769,5 +1844,6 @@ if __name__ == "__main__":
         asyncio.run(asyncio.wait_for(async_array_membership_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_push_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_pull_smoke(sys.argv[1]), timeout=20))
+        asyncio.run(asyncio.wait_for(async_increment_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

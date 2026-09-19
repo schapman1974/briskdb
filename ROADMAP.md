@@ -517,10 +517,10 @@ requires an earlier dependency:
       Python, and ordered/unordered wire replacement batches share this path.
       Result/post-image limits and immutable-ID checks precede commit. No global
       snapshot is claimed. Shared `update_one`/`update_many` support
-      `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`
+      `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`/`$inc`
       across all three adapters, with object/array paths, eager conflict checks,
       immutable IDs, exact modified counts, bounded growth, and literal timestamps.
-      26,277 source-locked update cases supplement transaction/wire tests: 4,008
+      30,489 source-locked update cases supplement transaction/wire tests: 4,008
       object-only set/unset, 4,719 min/max, 3,078 pop/rename, and 4,440 non-ID
       membership cases (object-only add-to-set paths), 4,459 push cases, and 5,573
       pull cases on non-ID object/array paths. Legacy push/pull/membership helpers
@@ -539,6 +539,13 @@ requires an earlier dependency:
       conditions, with ordinary embedded-ID semantics and eager update-specific
       errors. Missing paths are no-ops; stable removal, comparison/regex work,
       path allocations, AST/program retention, and cancellation remain bounded.
+      Increment completes the eleven planned operators: Int32 promotion, retained
+      Int64 width, atomic overflow rejection, Double/Decimal promotion, exact
+      missing operands, rounded no-ops, and executed NaN modification counts.
+      Another 4,212 oracle cases cover common frozen numeric/object-path behavior;
+      legacy Int64 shrinking, unencodable overflow, missing/signed-zero differences,
+      and stricter paths/IDs have independent tests. No frozen allowances change.
+      Concurrent counters, images, rollback, request controls and restart are tested.
       Min/max use whole BSON order, preserve equal stored types, distinguish
       missing array slots from null, and bound comparison work even on no-ops.
       Pop supports front/back removal and numeric paths; rename moves fields
@@ -552,7 +559,7 @@ requires an earlier dependency:
       abort without fabricated counts. First-shard provisional writes, earlier
       no-op shards, partial commits, ordered/unordered behavior, restart,
       cancellation/task-abort, and continued-session tests cover
-      this boundary. Other operators, upsert, and secondary-index post-image
+      this boundary. Upsert and secondary-index post-image
       validation remain open.
     - [ ] [#175](https://github.com/schapman1974/briskdb/issues/175) — filtered
       delete-one/many now use the shared matcher across Rust, native sync/async
@@ -570,7 +577,7 @@ requires an earlier dependency:
       covered. Find-one-and-replace now uses the same shared path with
       projected before/after images, sort, immutable-ID validation, and exact
       return/post-image preflight before commit. Find-one-and-update now shares
-      this path for all ten supported field/array operators, preserving untouched fields and supporting
+      this path for all eleven supported field/array operators, preserving untouched fields and supporting
       sorted before/after images across Rust, native Python, and wire clients.
       Concurrent consumers, no-op/no-match/projected-empty replies, depth/size
       rejection before writes, cancellation, and restart are tested. Other
@@ -653,7 +660,9 @@ requires an earlier dependency:
       read fidelity, three cross-CRUD query-validation cases, and all nine
       non-upsert update-operator contracts, the add-to-set non-array atomicity case,
       the complete array-update suite, and three pull/BSON-comparison cases,
-      required CI checks exactly 216 frozen executions and
+      plus missing-counter, CRUD increment metadata, Decimal promotion, and
+      Decimal representation/no-op contracts,
+      required CI checks exactly 224 frozen executions and
       rejects missing, duplicated, substituted, or skipped cases. The full
       456-execution corpus remains separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared

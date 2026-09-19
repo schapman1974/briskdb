@@ -52,6 +52,44 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_increment_numeric_fidelity_counts_images_controls_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for i in range(4):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": Int64(i), "amount": Decimal128("2"), "overflow": Int64(2**63 - 1), "invalid": True})
+                    identifier = uuid.uuid4()
+                    result = session.update_many(DATABASE, COLLECTION, {}, {"$inc": {"counter": Int64(1), "amount": 0.1}}, request_id=identifier)
+                    self.assertEqual((result["matched_count"], result["modified_count"], result["request_id"]), (4, 4, identifier))
+                    self.assertEqual(session.update_many(DATABASE, COLLECTION, {}, {"$inc": {"counter": 0, "amount": Decimal128("0E-100")}})["modified_count"], 0)
+                    image = session.find_one_and_update(DATABASE, COLLECTION, {}, {"$inc": {"counter": 1}}, sort={"_id": -1}, projection={"counter": 1, "_id": 0})["document"]
+                    self.assertEqual(bson_bytes(image), bson_bytes({"counter": Int64(1)}))
+                    image = session.find_one_and_update(DATABASE, COLLECTION, {"_id": 3}, {"$inc": {"counter": 1}}, return_document=True, projection={"counter": 1, "_id": 0})["document"]
+                    self.assertEqual(bson_bytes(image), bson_bytes({"counter": Int64(3)}))
+                    for row in session.find(DATABASE, COLLECTION)["documents"]:
+                        self.assertEqual(row["amount"].bid, Decimal128("2.100000000000000").bid)
+                    session.update_many(DATABASE, COLLECTION, {}, {"$set": {"nan": Decimal128("sNaN")}})
+                    for _ in range(2):
+                        self.assertEqual(session.update_many(DATABASE, COLLECTION, {}, {"$inc": {"nan": 0}})["modified_count"], 4)
+                    before = [bson_bytes(row) for row in session.find(DATABASE, COLLECTION)["documents"]]
+                    for method in (session.update_one, session.update_many):
+                        for field in ("invalid", "overflow", "_id"):
+                            with self.assertRaises(briskdb.InvalidArgumentError):
+                                method(DATABASE, COLLECTION, {}, {"$set": {"marker": True}, "$inc": {field: 1}})
+                        with self.assertRaises(briskdb.InvalidArgumentError):
+                            method(DATABASE, COLLECTION, {"_id": 99}, {"$inc": {"counter": True}})
+                    for after in (False, True):
+                        with self.assertRaises(briskdb.LimitExceededError):
+                            session.find_one_and_update(DATABASE, COLLECTION, {}, {"$inc": {"counter": 1}}, return_document=after, max_result_bytes=1)
+                    token = briskdb.CancellationToken(); token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.update_many(DATABASE, COLLECTION, {}, {"$inc": {"counter": 1}}, cancellation=token)
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION)["documents"]], before)
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION)["documents"]], before)
+
     def test_pull_predicates_counts_images_errors_controls_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -304,7 +342,7 @@ class PythonDocumentApiTests(unittest.TestCase):
                         session.update_one(DATABASE, COLLECTION, {}, {"$set": {"a.9999999999999999999999999": 1}})
                     with self.assertRaises(briskdb.LimitExceededError):
                         session.update_one(DATABASE, COLLECTION, {}, {"$set": {"changed": 1}}, max_result_bytes=1)
-                    for update, options in [({"$inc": {"v": 1}}, {}), ({"$set": {"v": 2}}, {"upsert": True})]:
+                    for update, options in [({"$mul": {"v": 1}}, {}), ({"$set": {"v": 2}}, {"upsert": True})]:
                         with self.assertRaises(briskdb.UnsupportedError):
                             session.update_one(DATABASE, COLLECTION, {}, update, **options)
                     token = briskdb.CancellationToken(); token.cancel()
@@ -1587,6 +1625,27 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_increment_counts_numeric_fidelity_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for i in range(4):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": i, "amount": Decimal128("1.00")})
+                    result = await session.update_many(DATABASE, COLLECTION, {}, {"$inc": {"counter": Int64(1), "amount": Decimal128("2.5")}})
+                    self.assertEqual((result["matched_count"], result["modified_count"]), (4, 4))
+                    self.assertEqual((await session.update_many(DATABASE, COLLECTION, {}, {"$inc": {"counter": 0, "amount": Decimal128("0E-100")}}))["modified_count"], 0)
+                    image = (await session.find_one_and_update(DATABASE, COLLECTION, {}, {"$inc": {"counter": 1}}, sort={"_id": -1}, projection={"counter": 1, "_id": 0}, return_document=True))["document"]
+                    self.assertEqual(bson_bytes(image), bson_bytes({"counter": Int64(2)}))
+                    before = [bson_bytes(row) for row in (await session.find(DATABASE, COLLECTION))["documents"]]
+                    for expression in ({"$inc": {"counter": True}}, {"$inc": {"_id": 1}}):
+                        with self.assertRaises(briskdb.InvalidArgumentError):
+                            await session.update_many(DATABASE, COLLECTION, {}, expression)
+                    token = briskdb.CancellationToken(); token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        await session.update_many(DATABASE, COLLECTION, {}, {"$inc": {"counter": 1}}, cancellation=token)
+                    self.assertEqual([bson_bytes(row) for row in (await session.find(DATABASE, COLLECTION))["documents"]], before)
+
     async def test_async_find_one_and_replace_forwards_images_sort_projection_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

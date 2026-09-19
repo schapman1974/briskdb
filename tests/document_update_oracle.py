@@ -16,9 +16,14 @@ whole values or frozen object-only field
 lookup, not ordinary query-sort array-element selection.
 Pull covers non-ID paths and shared query predicates; embedded member _id fields
 use ordinary field matching. Immutable collection IDs are tested independently.
+Increment compares exact common numeric behavior on non-ID object paths; legacy
+width, overflow, missing/signed-zero, path/ID and arithmetic-NaN differences are
+explicitly bounded below and independently tested, never rewritten or waived.
 """
 import hashlib
+import math
 import random
+import struct
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -331,6 +336,64 @@ def main():
     for condition in invalid:
         for document in [{"_id": 7}, {"_id": 7, "v": []}, {"_id": 7, "v": [1, {"x": 2}]}]:
             emit(document, {"$set": {"atomic_marker": True}, "$pull": {"v": condition}})
+
+    # Increment's legacy Python helper shrinks Int64, permits unencodable integer
+    # overflow, adds zero to missing operands, and rewrites signed-zero no-ops.
+    # Compare only the exact intersection, without coercing reference results.
+    # Rust/storage/wire tests independently enforce Mongo width, overflow, missing
+    # operand fidelity, signed-zero no-ops, strict paths and immutable IDs.
+    numbers = [
+        -10, 0, 1, Int64(1), 2**31 - 1, -(2**31), 2**31, -(2**31)-1,
+        Int64(2**63 - 1), Int64(-(2**63)), 2**60,
+        0.0, -0.0, 0.1, 1.5, 1e16, -1e16, 5e-324, -5e-324,
+        1.7976931348623157e308, float("inf"), float("-inf"),
+        float("nan"), -float("nan"),
+        *[Decimal128(value) for value in [
+            "0", "-0", "0.00", "-0.00", "1.00", "2.1", "-2.1",
+            "1E34", "-1E34", "1E-6176", "-1E-6176", "0E-6176", "0E+6111",
+            "1.000000000000000000000000000000001",
+            "9.999999999999999999999999999999999E+6144",
+            "-9.999999999999999999999999999999999E+6144", "1E-6143", "1E+6144",
+            "NaN", "-NaN", "sNaN", "-sNaN", "Infinity", "-Infinity",
+        ]],
+    ]
+
+    def compatible(left, right):
+        result = bson_types.add_bson_numbers(left, right)
+        if isinstance(result, int):
+            if not -(2**63) <= result < 2**63:
+                return False
+            if any(isinstance(value, Int64) or (isinstance(value, int) and not -(2**31) <= value < 2**31)
+                   for value in (left, right)) and -(2**31) <= result < 2**31:
+                return False
+        if isinstance(result, float):
+            if math.isnan(result):  # Newly computed NaN bits are not portable.
+                return False
+            if isinstance(left, float) and result == left and BSON.encode({"v": result}) != BSON.encode({"v": left}):
+                return False
+        return True
+
+    for left in numbers:
+        for right in numbers:
+            if compatible(left, right):
+                emit({"_id": Int64(7), "v": left, "nested": {"v": left}},
+                     {"$inc": {"v": right, "nested.v": right}})
+    for _ in range(1000):
+        # Diverse Double bit patterns exercise the 15-significant-digit update
+        # promotion independently of aggregation's exact binary conversion.
+        value = struct.unpack("<d", randomizer.getrandbits(64).to_bytes(8, "little"))[0]
+        decimal = randomizer.choice([value for value in numbers if isinstance(value, Decimal128)])
+        emit({"_id": 7, "v": decimal}, {"$inc": {"v": value}})
+        emit({"_id": 7, "v": value}, {"$inc": {"v": decimal}})
+    for value in [0, 1, -1, 2**31, 0.5, Decimal128("1.00"), Decimal128("1E-6176")]:
+        emit({"_id": 7}, {"$inc": {"v": value, "missing.0.value": value}})
+    for value in [None, True, False, "1", [], {}, Binary(b"x"), Timestamp(0, 0), Regex("x"), MinKey(), MaxKey()]:
+        for document in [{"_id": 7}, {"_id": 7, "v": 1}]:
+            emit(document, {"$inc": {"v": value}})
+        emit({"_id": 7, "v": value}, {"$set": {"marker": True}, "$inc": {"v": 1}})
+    for update in [{"$inc": {}}, {"$inc": []}, {"$inc": {"a..b": 1}},
+                   {"$inc": {"a": 1, "a.b": 2}}, {"$set": {"a": 1}, "$inc": {"a.b": 2}}]:
+        emit({"_id": 7}, update)
 
 
 if __name__ == "__main__":

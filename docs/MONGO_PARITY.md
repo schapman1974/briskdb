@@ -19,7 +19,7 @@ CI and byte-compares the normalized result with the checked-in reference. The
 full report remains `reference-only`; partial candidate coverage is not folded
 into that report or treated as full parity.
 
-Required CI separately runs 216 exact sync/async executions in the frozen
+Required CI separately runs 224 exact sync/async executions in the frozen
 `test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
 `test_aggregation_contract`, `test_group_accumulators_contract`, and
 `test_client_read_fidelity_contract` modules,
@@ -32,6 +32,8 @@ rename, numeric paths, operand/target errors, conflicts, and immutable IDs),
 plus the complete `test_array_update_contract` suite, the add-to-set non-array
 atomicity case through both update-one/update-many, and three BSON comparison
 cases covering pull ranges, missing/array paths, and embedded IDs,
+plus missing-counter and CRUD increment metadata cases and two Decimal128
+increment promotion/representation contracts,
 against a real four-shard BriskDB listener.
 It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
 cleanup. The JUnit result is checked against the exact locked case/API set;
@@ -292,7 +294,7 @@ validation remains eager. `remove:true` cannot be combined with `update` or
 `new:true`. Pipeline updates and upsert remain unsupported. Native
 sync/async Python exposes `find_one_and_replace` with the same semantics.
 
-Operator `findAndModify` accepts `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`
+Operator `findAndModify` accepts `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`/`$inc`
 documents in `update`, with the
 same query/sort/projection and boolean `new` options, through `FindOneAndUpdate`.
 It preserves untouched fields and shares operator validation, immutable-ID
@@ -301,7 +303,7 @@ return an image; projected `{}` still sets `n:1` and `updatedExisting:true`.
 Missing namespaces return null without creation after eager validation. Native
 sync/async Python exposes `find_one_and_update` with identical image semantics.
 
-Wire `update` supports replacement statements and `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull` operator
+Wire `update` supports replacement statements and `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`/`$inc` operator
 statements (`q` and a document `u`,
 `upsert:false`) through shared `Replace`/`Update`. Only operator documents accept
 `multi:true`; replacement remains single-document. Both body arrays and
@@ -349,9 +351,18 @@ semantics, strict update paths, missing-field no-ops, stable removal, and eager
 validation even without matches. Query comparison, regex work, path allocation,
 AST/program retention, and cancellation share update budgets. Context-specific
 expression and regex errors remain indexed driver write errors when safe.
-Its 26,277 source-locked update oracle cases include 4,008 object-only
+Increment implements numeric promotion, retained Int64 width, code-2 integer
+overflow rejection, exact missing operands, and 15-digit Double-to-Decimal
+promotion. Rounded Decimal and equal Double no-ops retain stored bits; executed
+NaN arithmetic counts as modified even with identical output bytes. Its fixed
+workspace, path growth and cancellation are bounded. See the shared
+[numeric boundaries](DOCUMENT_ENGINE.md#field-updates-and-single-record-write-boundaries).
+Its 30,489 source-locked update oracle cases include 4,008 object-only
 set/unset, 4,719 min/max, 3,078 pop/rename, 4,440 array-membership, 4,459 push,
-and 5,573 pull cases. The
+5,573 pull cases, and 4,212 increment cases. Increment compares the exact shared
+non-ID object-path subset: frozen Python's Int64 shrinking, unencodable overflow,
+missing/signed-zero behavior, strict path/ID differences, and unspecified newly
+computed Double NaN bits are independently tested, never coerced in the oracle. The
 membership subset excludes ID writes and uses object-only add-to-set paths:
 push/pull subsets cover non-ID object/array paths and embedded-ID queries. These
 legacy reference helpers restore IDs (and add-to-set overwrites scalar parents) instead of

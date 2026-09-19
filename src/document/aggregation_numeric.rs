@@ -93,6 +93,36 @@ fn double_output(value: f64) -> BsonValue {
     BsonValue::Double(if value.is_nan() { f64::NAN } else { value })
 }
 
+/// Update arithmetic deliberately differs from aggregation: a Double promotes
+/// with 15 significant digits, not its exact binary expansion. Both operands
+/// already fit Decimal128 precision, so parsing cannot introduce double rounding.
+pub(super) fn increment_decimal(left: &BsonValue, right: &BsonValue) -> BsonValue {
+    let parse = |value: &BsonValue| {
+        let text = match value {
+            BsonValue::Int32(value) => value.to_string(),
+            BsonValue::Int64(value) => value.to_string(),
+            BsonValue::Double(value) if value.is_finite() => format!("{value:.14e}"),
+            BsonValue::Double(value) => exact_double(*value),
+            BsonValue::Decimal128(value) => decimal_text(*value),
+            _ => unreachable!("validated numeric update"),
+        };
+        context().parse(text).expect("bounded Decimal128 operand")
+    };
+    let mut result = parse(left);
+    context().add(&mut result, &parse(right));
+    let result = output(result);
+    if matches!(left, BsonValue::Decimal128(_))
+        && result.canonical_number() != Some(CanonicalNumber::NaN)
+        && result == *left
+    {
+        // Retain quantum, signed zero and noncanonical zero BID on a rounded
+        // no-op. NaNs are executed arithmetic, never this equality shortcut.
+        left.clone()
+    } else {
+        result
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Sum {
     integer: i128,

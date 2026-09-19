@@ -593,7 +593,7 @@ pub(super) fn update_record(
     cancellation: &CancellationToken,
     control: &OperationControl,
 ) -> EngineResult<DocumentExecution> {
-    let post_image = updater.apply_with_check(record.document(), &mut || {
+    let (post_image, force_modified) = updater.apply_for_write(record.document(), &mut || {
         ensure_document_cpu_active(cancellation, control)
     })?;
     write_post_image(
@@ -601,6 +601,7 @@ pub(super) fn update_record(
         transaction,
         record,
         post_image,
+        force_modified,
         max_document_bytes,
         returns,
         projection,
@@ -683,6 +684,7 @@ fn replace_record(
         transaction,
         record,
         post_image,
+        false,
         max_document_bytes,
         returns,
         projection,
@@ -700,6 +702,7 @@ fn write_post_image(
     transaction: &Transaction<'_>,
     record: DocumentStorageRecord,
     post_image: BsonDocument,
+    force_modified: bool,
     max_document_bytes: usize,
     returns: MutationReturn,
     projection: Option<&DocumentProjector>,
@@ -721,7 +724,8 @@ fn write_post_image(
     // instead compare the bytes that storage persists, including field order.
     let before = encode_document(record.document())
         .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?;
-    let modified = bytes != before;
+    // NaN arithmetic is executed even when its resulting encoding is identical.
+    let modified = force_modified || bytes != before;
     drop(bytes);
     drop(before);
     // Prepare the write before consuming either image for projection. Retain

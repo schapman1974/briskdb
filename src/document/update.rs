@@ -1,5 +1,6 @@
 //! Bounded, eagerly validated field updates. No storage or protocol policy.
 
+mod increment;
 mod push;
 
 use std::{cmp::Ordering, error::Error, fmt};
@@ -88,6 +89,7 @@ enum OperationAction {
     },
     Push(push::Push),
     Pull(PullMatcher),
+    Increment(BsonValue),
 }
 
 enum Action {
@@ -167,7 +169,7 @@ impl DocumentUpdater {
             check()?;
             match operator {
                 "$set" | "$unset" | "$min" | "$max" | "$pop" | "$rename" | "$addToSet"
-                | "$pullAll" | "$push" | "$pull" => {}
+                | "$pullAll" | "$push" | "$pull" | "$inc" => {}
                 name if name.starts_with('$') => {
                     return Err(DocumentUpdateError::UnsupportedOperator.error());
                 }
@@ -187,6 +189,12 @@ impl DocumentUpdater {
                     "$unset" => OperationAction::Field(Action::Unset),
                     "$min" => OperationAction::Field(Action::Min(value.clone())),
                     "$max" => OperationAction::Field(Action::Max(value.clone())),
+                    "$inc" => {
+                        if value.canonical_number().is_none() {
+                            return Err(DocumentUpdateError::TypeMismatch.error());
+                        }
+                        OperationAction::Increment(value.clone())
+                    }
                     "$pop" => {
                         let front = match value {
                             value if *value == BsonValue::Int32(-1) => true,
@@ -263,6 +271,17 @@ impl DocumentUpdater {
         document: &BsonDocument,
         check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<BsonDocument> {
+        self.apply_for_write(document, check)
+            .map(|(document, _)| document)
+    }
+
+    // Arithmetic on an existing NaN counts as executed even if its BSON is
+    // identical. Keep this write-result policy out of public pure transforms.
+    pub(crate) fn apply_for_write(
+        &self,
+        document: &BsonDocument,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<(BsonDocument, bool)> {
         check()?;
         encode_document(document)
             .map_err(|e| e.into_engine_error(BsonErrorContext::ClientInput))?;
@@ -277,8 +296,13 @@ impl DocumentUpdater {
         // preflighted both its write and its exact result. Charge before cloning.
         budget.charge(input_bytes.checked_mul(2).ok_or_else(limit)?)?;
         let mut result = document.clone();
+        let mut force_modified = false;
         for operation in &self.operations {
             match &operation.action {
+                OperationAction::Increment(value) => {
+                    force_modified |=
+                        increment::apply(&mut result, &operation.path, value, &mut budget)?;
+                }
                 OperationAction::Field(action) => {
                     write_document(&mut result, &operation.path, action, true, &mut budget)?;
                 }
@@ -342,7 +366,7 @@ impl DocumentUpdater {
         }
         (budget.check)()?;
         encode_document(&result).map_err(|e| e.into_engine_error(BsonErrorContext::ClientInput))?;
-        Ok(result)
+        Ok((result, force_modified))
     }
 }
 
@@ -1414,7 +1438,7 @@ mod tests {
             (BsonDocument::new(), 9),
             (doc([("plain", BsonValue::Int32(1))]), 9),
             (doc([("$set", BsonValue::Int32(1))]), 9),
-            (spec("$inc", BsonDocument::new()), 115),
+            (spec("$mul", BsonDocument::new()), 115),
             (spec("$set", doc([("a..b", BsonValue::Null)])), 56),
             (spec("$set", doc([("a.$[].b", BsonValue::Null)])), 115),
             (

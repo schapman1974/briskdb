@@ -99,17 +99,21 @@ async with await briskdb.open_async("./data", shards=4, documents=True) as db:
 `update_one`, and `update_many` (without upsert).
 `find_one_and_replace` and `find_one_and_update` forward projection, sort, and
 `return_document` before/after selection. `update_one` supports
-`$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`
+`$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`/`$inc`
 and forwards the same identity, deadline, cancellation, and result controls.
 `update_many` uses those same operators/controls, committing one shard at a time;
 failure or cancellation rolls back the current shard but preserves earlier
 commits. It returns aggregate counts only on success, with no global atomicity
 or snapshot guarantee.
-`find_one_and_update` supports the same ten operators (including add-to-set
+`find_one_and_update` supports the same eleven operators (including add-to-set
 `$each`, literal BSON-equality pull-all, and push's fixed insertion/sort/slice
 modifier order, and pull's literal/field/document predicates) and preflights the returned
 image before mutation, including BSON size/depth limits. Projection affects only
 the reply; untouched stored fields are retained.
+Increment shares sync numeric promotion, Int64 width/overflow checks, exact missing
+operands, Decimal rounding, signed-zero no-ops and executed NaN modification counts.
+Concurrent increments re-read under the write lock; result/work limits and
+cancellation apply before committing.
 They use the same
 request IDs, deadlines, cancellation tokens, result limits, BSON conversion,
 and point/scatter plans as their synchronous `Session` methods.
