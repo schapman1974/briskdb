@@ -96,6 +96,7 @@ jobs:
           --test document_sorting_oracle --test document_distinct_oracle
           --test document_aggregation_oracle --test document_update_oracle
           --test document_upsert_oracle --test document_index_definition_oracle
+          --test document_index_keys_oracle
           -- --ignored --nocapture
 
       - name: Run frozen supported contracts against BriskDB

@@ -15,6 +15,7 @@ mod command;
 mod distinct;
 mod error;
 mod index_definition;
+mod index_keys;
 mod key;
 mod matcher;
 mod memory;
@@ -61,6 +62,7 @@ pub use error::{
     DocumentMutationError,
 };
 pub(crate) use index_definition::normalize_index_definition;
+pub use index_keys::{DocumentIndexKey, DocumentIndexKeyGenerator};
 pub use key::{BSON_KEY_ENCODING_VERSION, BSON_MAX_CANONICAL_KEY_BYTES, CanonicalBsonKey};
 pub use matcher::{DocumentMatcher, DocumentQueryError};
 pub use options::{
