@@ -137,6 +137,15 @@ order, async calls, restart, unchanged storage, and whole-result byte rejection.
 Required CI adds 4,888 frozen-oracle extraction/identity cases without modifying
 the full candidate command corpus or its allowlists.
 
+The shared [basic aggregation core](DOCUMENT_ENGINE.md#basic-aggregation-core)
+now validates and executes bounded materialized `$match`/`$sort`/`$skip`/`$limit`/
+`$count` pipelines over caller-provided BSON. Required CI compares 5,134 complete
+pipelines against the frozen implementation, separately from the full candidate
+command corpus. Aggregate command dispatch and retained result cursors are not
+connected yet; neither PyMongo `aggregate()` nor `count_documents()` is enabled
+by this core-only checkpoint. Expressions/projections and group accumulators
+remain separate roadmap work.
+
 Updates, deletes, and metadata/aggregation cursors
 are not implemented by this checkpoint.
 Sessions, retryable writes, replication, change streams, and compression are

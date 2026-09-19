@@ -551,6 +551,15 @@ requires an earlier dependency:
       outputs; missing/null/array/path semantics follow 4,888 additional locked
       oracle cases. It uses no retained cursor slot, rejects whole over-budget
       results, and remains a scan implementation without snapshot semantics.
+    - [ ] [#179](https://github.com/schapman1974/briskdb/issues/179) — shared basic
+      aggregation core compiles `$match`, `$sort`, `$skip`, `$limit`, and `$count`
+      eagerly and executes immutable BSON through bounded materialized stages.
+      Matching and stable sorting reuse the authoritative implementations;
+      exact numeric stage arguments, empty counts, stage ordering, cancellation,
+      and resource limits are tested. Required CI compares 5,134 whole pipelines
+      with the locked TinyMongo source. Engine/wire aggregate dispatch and
+      retained aggregate cursors remain open; this core alone does not enable
+      PyMongo `aggregate()` or aggregation-based `count_documents()`.
     - [ ] [#166](https://github.com/schapman1974/briskdb/issues/166) — targeted
       collection existence checks now share the engine across Rust, embedded
       sync/async Python, and wire read/write namespace handling. Catalogs beyond

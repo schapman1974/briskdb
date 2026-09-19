@@ -267,6 +267,7 @@ cargo install cargo-fuzz
 cargo fuzz run --fuzz-dir fuzz bson_codec
 cargo fuzz run --fuzz-dir fuzz bson_comparison
 cargo fuzz run --fuzz-dir fuzz document_distinct
+cargo fuzz run --fuzz-dir fuzz document_aggregation
 ```
 
 The versioned collection catalog and shard persistence built on these types is

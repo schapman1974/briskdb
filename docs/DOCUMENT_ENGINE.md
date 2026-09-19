@@ -266,10 +266,48 @@ success, and leave the session reusable. The public collector is unusable after
 any failed push. Native distinct rejects projection/sort/pagination options;
 wire hints, collation, read concern, and comments are not implemented yet.
 
+### Basic aggregation core
+
+`DocumentAggregator` compiles a `DocumentPipeline` into shared `$match`, `$sort`,
+`$skip`, `$limit`, and `$count` stages. Every stage is validated before execution,
+even behind an empty-producing stage. Empty pipelines preserve inputs; stages
+execute in declaration order without mutating their source documents. Matching
+uses `DocumentMatcher`; sorting uses `DocumentSorter` with stable ties relative
+to the preceding stage. Repeated sorts therefore preserve the earlier stage's
+ordering where the later keys tie. Exact BSON types and field order survive.
+
+Skip/limit accept finite, exactly integral BSON numbers through signed 64-bit
+maximum, including Double/Decimal128; booleans and fractions are invalid. Skip
+allows zero; limit requires a positive value. Count emits no document for empty
+input, otherwise one document with the validated field name and an Int32 count
+under the current row bound. Empty, dollar-prefixed, NUL/dotted and `_id` count
+fields retain their distinct frozen validation errors. Generic stage-shape and
+non-document match errors have no numeric code in the reference; the typed core
+represents those as BadValue (2). Other stages are explicitly unsupported here.
+
+The initial executor materializes input and stage output. It admits at most
+65,536 input rows and 64 MiB of conservative working-data retention, including
+sort keys, plus a separate 64 MiB compiled-plan quota. BSON is structurally
+validated and its retained size checked before cloning. All stages share a
+four-million-step execution budget and cancellation callback, including key
+extraction, selection, count and result collection; compilation has its own
+four-million-step bound. Existing matcher/sorter per-document limits also apply.
+The shared BSON heap estimator is reused by sorting, distinct and aggregation.
+Sorts use a bounded key heap with input-position ties; no disk spill or index
+optimization is implied. A later limit cannot bypass initial materialization
+limits. Errors return no partial success and leave the compiled plan reusable.
+
+Required CI compares 5,134 whole-pipeline cases with the source-locked TinyMongo
+runner, including stage permutations, BSON families, repeated sorts, numeric
+boundaries, and eager errors. Unit tests cover each cancellation/deadline
+checkpoint, memory/row/work limits, immutable inputs and redacted diagnostics.
+This is currently a protocol-neutral core only: native/wire aggregate commands,
+storage reads and retained aggregate cursors are the next integration slice.
+
 ## Current boundary
 
 Update expressions, replacements,
-multi-document deletion, upsert, aggregation, metadata/aggregation
+multi-document deletion, upsert, aggregate command dispatch, metadata/aggregation
 cursors, and physical secondary-index builds remain later roadmap work.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
 category.

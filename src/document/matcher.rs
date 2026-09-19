@@ -535,7 +535,7 @@ fn truthy(value: &BsonValue) -> bool {
     }
 }
 
-fn integer(value: &BsonValue, truncate: bool) -> Option<i64> {
+pub(super) fn integer(value: &BsonValue, truncate: bool) -> Option<i64> {
     match value {
         BsonValue::Int32(value) => return Some(i64::from(*value)),
         BsonValue::Int64(value) => return Some(*value),
