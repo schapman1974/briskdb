@@ -11,6 +11,7 @@ from bson import BSON, Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId
 import tinymongo.aggregation as aggregation
 import tinymongo.bson_types as bson_types
 import tinymongo.sorting as sorting
+import tinymongo.projection as projection
 import tinymongo.table_backends as backend
 from tinymongo.errors import OperationFailure, TinyMongoNotSupportedError
 
@@ -31,14 +32,19 @@ def emit(documents, pipeline):
     sys.stdout.buffer.write(BSON.encode(case))
 
 
-def main():
+def locked_sources():
     for module, digest in [
         (aggregation, "3ad7c2bc6af69083559f163b0cc037977c7bd8aa64523b2c63c982cb58532cad"),
         (sorting, "76d7d9174d598c7319bcf001fcee0717544b26b132f1636a18dc1f06c8b4b9a6"),
         (bson_types, "a4b070ef1937b82f740ddb0c07279f4128d95ae3e75ba63ebec9e2068cdc9973"),
         (backend, "b16dbc8c435a639d85c29d857f8487b2c88d2eef10969a9e412d8afce02898a1"),
+        (projection, "2027ad33c0df266d968cbad07b96c84f3e873560e241c1253ed69e87156e6035"),
     ]:
         assert hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest() == digest
+
+
+def main():
+    locked_sources()
     values = [
         None, False, True, -10, 0, 1, Int64(1), Int64(2**63 - 1),
         1.0, 1.25, float("nan"), float("inf"), float("-inf"), -0.0,

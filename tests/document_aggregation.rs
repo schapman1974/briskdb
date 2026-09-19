@@ -117,6 +117,175 @@ async fn drain(
 }
 
 #[tokio::test]
+async fn transforms_share_global_execution_byte_paging_and_immutable_storage() {
+    let mut documents = source_rows();
+    for row in &mut documents {
+        row.push(
+            "items",
+            BsonValue::Array(vec![
+                BsonValue::Document(doc(&[("x", BsonValue::Int32(1))])),
+                BsonValue::Null,
+                BsonValue::Document(doc(&[])),
+            ]),
+        )
+        .unwrap();
+    }
+    let before = encoded(&documents);
+    let stages = pipeline(&[
+        (
+            "$set",
+            BsonValue::Document(doc(&[
+                ("items.tag", BsonValue::from("$payload")),
+                ("copied", BsonValue::from("$value")),
+                ("value", BsonValue::Int32(99)),
+                ("gone.deep", BsonValue::from("$$REMOVE")),
+            ])),
+        ),
+        (
+            "$project",
+            BsonValue::Document(doc(&[
+                ("_id", BsonValue::Int32(1)),
+                ("items", BsonValue::Int32(1)),
+                ("prior", BsonValue::from("$copied")),
+                (
+                    "n",
+                    BsonValue::Document(doc(&[("$size", BsonValue::from("$items"))])),
+                ),
+                (
+                    "literal",
+                    BsonValue::Document(doc(&[("$literal", BsonValue::from("$$REMOVE"))])),
+                ),
+            ])),
+        ),
+        (
+            "$match",
+            BsonValue::Document(doc(&[("n", BsonValue::Int32(3))])),
+        ),
+        (
+            "$sort",
+            BsonValue::Document(doc(&[
+                ("prior", BsonValue::Int32(1)),
+                ("_id", BsonValue::Int32(-1)),
+            ])),
+        ),
+        ("$unset", BsonValue::from("literal")),
+        ("$skip", BsonValue::Int32(2)),
+        ("$limit", BsonValue::Int32(17)),
+    ]);
+    let expected = DocumentAggregator::compile(&stages)
+        .unwrap()
+        .execute(&documents)
+        .unwrap();
+    assert_eq!(expected.len(), 17);
+    assert!(expected.iter().all(
+        |row| matches!(row.get_first("prior"), Some(BsonValue::Int64(_)))
+            && row.get_first("literal").is_none()
+    ));
+    let (root, engine) = setup(documents).await;
+    let session = engine.session();
+    let first = call(
+        &engine,
+        &session,
+        aggregate(
+            stages.clone(),
+            DocumentReadOptions::new()
+                .with_batch_size(0)
+                .unwrap()
+                .with_batch_byte_limit(700)
+                .unwrap(),
+        ),
+    )
+    .await;
+    let actual = drain(&engine, &session, first, 5).await;
+    assert_eq!(encoded(&actual), encoded(&expected));
+    let original = call(
+        &engine,
+        &session,
+        aggregate(pipeline(&[]), DocumentReadOptions::new()),
+    )
+    .await;
+    assert_eq!(
+        encoded(&drain(&engine, &session, original, 30).await),
+        before
+    );
+    engine.shutdown().await.unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let first = call(
+        &engine,
+        &engine.session(),
+        aggregate(stages, DocumentReadOptions::new()),
+    )
+    .await;
+    assert_eq!(encoded(&cursor(first).1), encoded(&expected));
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn computed_errors_release_retained_cursors_and_limits_stop_evaluation() {
+    let (root, engine) = setup(vec![
+        doc(&[
+            ("_id", BsonValue::Int32(1)),
+            ("v", BsonValue::Array(vec![])),
+        ]),
+        doc(&[("_id", BsonValue::Int32(2)), ("v", BsonValue::Null)]),
+    ])
+    .await;
+    let session = engine.session();
+    let transform = BsonValue::Document(doc(&[(
+        "n",
+        BsonValue::Document(doc(&[("$size", BsonValue::from("$v"))])),
+    )]));
+    let first = call(
+        &engine,
+        &session,
+        aggregate(
+            pipeline(&[("$set", transform.clone())]),
+            DocumentReadOptions::new().with_batch_size(1).unwrap(),
+        ),
+    )
+    .await;
+    let (id, rows) = cursor(first);
+    assert_eq!(rows[0].get_first("n"), Some(&BsonValue::Int32(0)));
+    let id = id.unwrap();
+    let error = engine
+        .execute_document(&session, request(more(id, 1), RequestContext::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::InvalidQuery);
+    assert_eq!(
+        engine
+            .execute_document(&session, request(more(id, 1), RequestContext::new()))
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::FailedPrecondition
+    );
+    for sorted in [false, true] {
+        let mut entries = vec![];
+        if sorted {
+            entries.push((
+                "$sort",
+                BsonValue::Document(doc(&[("_id", BsonValue::Int32(1))])),
+            ));
+        }
+        entries.extend([("$set", transform.clone()), ("$limit", BsonValue::Int32(1))]);
+        let rows = cursor(
+            call(
+                &engine,
+                &session,
+                aggregate(pipeline(&entries), DocumentReadOptions::new()),
+            )
+            .await,
+        )
+        .1;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_first("n"), Some(&BsonValue::Int32(0)));
+    }
+    engine.shutdown().await.unwrap();
+    drop(root);
+}
+
+#[tokio::test]
 async fn global_pipeline_order_exact_bson_and_byte_bounded_cursors_survive_reopen() {
     let documents = source_rows();
     let before = encoded(&documents);

@@ -99,8 +99,32 @@ fuzz_target!(|data: &[u8]| {
         .map(|(name, value)| BsonDocument::from_entries([(name, value)]).unwrap())
         .collect::<Vec<_>>();
         exercise(
-            &[envelope.clone(), envelope],
+            &[envelope.clone(), envelope.clone()],
             DocumentPipeline::new(stages).unwrap(),
         );
+        for name in ["$project", "$set", "$addFields"] {
+            let spec = BsonDocument::from_entries([
+                ("copy", BsonValue::from("$v")),
+                ("array.copy", BsonValue::from("$payload")),
+                ("shell.gone", BsonValue::from("$$REMOVE")),
+                (
+                    "literal",
+                    BsonValue::Document(
+                        BsonDocument::from_entries([(
+                            "$literal",
+                            BsonValue::Document(envelope.clone()),
+                        )])
+                        .unwrap(),
+                    ),
+                ),
+            ])
+            .unwrap();
+            if let Ok(pipeline) = DocumentPipeline::new(vec![
+                BsonDocument::from_entries([(name, BsonValue::Document(spec))]).unwrap(),
+                BsonDocument::from_entries([("$limit", BsonValue::Int32(1))]).unwrap(),
+            ]) {
+                exercise(std::slice::from_ref(&envelope), pipeline);
+            }
+        }
     }
 });

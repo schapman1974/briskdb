@@ -564,8 +564,20 @@ requires an earlier dependency:
       global source reads and retained, byte-bounded cursors. Simple prefixes
       stream; count retains a counter, and sort materializes bounded input.
       Resource/error/cancellation cleanup and cursor ownership are tested.
-      Projection/expression stages (#177), groups (#176), related full-contract
-      cases, and aggregation-based PyMongo `count_documents()` remain open.
+      Basic-suite projection consumers now use the shared transforms below.
+      Groups (#176), full candidate-corpus acceptance, and aggregation-based
+      PyMongo `count_documents()` remain open.
+    - [ ] [#177](https://github.com/schapman1974/briskdb/issues/177) — shared
+      `$project`/`$set`/`$addFields`/`$unset` stages and `$ifNull`/`$literal`/`$size`
+      expressions now run across Rust, native Python, and wire aggregation.
+      Field references, missing/null, arrays, `$$REMOVE`, collision/error order,
+      original-input assignments, and exact output field order follow 7,037
+      additional locked-oracle pipelines. Nonblocking stages fuse around
+      materialization boundaries so limits stop unused expression evaluation.
+      Allocation amplification, depth/nodes/work, cancellation, cursor cleanup,
+      sync/async clients, byte paging, and restart are covered. The frozen
+      projection-to-group identity case and full candidate-corpus acceptance
+      remain pending groups and collection lifecycle support.
     - [ ] [#166](https://github.com/schapman1974/briskdb/issues/166) — targeted
       collection existence checks now share the engine across Rust, embedded
       sync/async Python, and wire read/write namespace handling. Catalogs beyond

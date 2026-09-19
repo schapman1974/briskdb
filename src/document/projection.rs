@@ -183,7 +183,7 @@ fn limit() -> EngineError {
     )
 }
 
-fn numeric_component(part: &str) -> bool {
+pub(super) fn numeric_component(part: &str) -> bool {
     // Python str.isdigit includes Unicode decimal digits plus these digit
     // characters (superscripts, circled digits, and historic digit forms).
     // Numeric-but-not-digit characters such as fractions remain valid names.

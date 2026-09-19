@@ -5,6 +5,8 @@
 //! layer all consume the same value and codec rules.
 
 mod aggregation;
+mod aggregation_expression;
+mod aggregation_transform;
 mod catalog;
 mod codec;
 mod command;

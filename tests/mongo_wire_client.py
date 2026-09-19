@@ -498,6 +498,74 @@ def aggregation_smoke(uri):
         assert [row["_id"] for row in rows] == [4, 3, 2, 1, 0]
         assert list(collection.find({})) == documents
 
+        transformed = client.wire_aggregate.transforms
+        original = {"_id": Int64(1), "source": Int64(9), "a": {"y": 2, "x": Int64(1), "old": 0},
+                    "items": [{"name": "one", "secret": 1}, {}, 3], "secret": "private"}
+        transformed.insert_one(original)
+        pipeline = [
+            {"$set": {"source": "new", "old": "$source", "items.label": "$source", "secret": "$$REMOVE"}},
+            {"$project": {"_id": 0, "items.name": 1, "items.label": 1, "n": {"$size": "$items"},
+                          "copied": "$old", "fallback": {"$ifNull": ["$absent", "$$REMOVE", None]},
+                          "literal": {"$literal": "$source"}, "missing.shell": "$$REMOVE"}},
+            {"$unset": "literal"},
+        ]
+        expected = [{"items": [{"name": "one", "label": Int64(9)}, {"label": Int64(9)}, {"label": Int64(9)}],
+                     "n": 3, "copied": Int64(9), "fallback": None, "missing": {}}]
+        assert BSON.encode({"rows": list(transformed.aggregate(pipeline, batchSize=1))}) == BSON.encode({"rows": expected})
+        assert transformed.find_one({}) == original
+        for stage in ("$set", "$addFields"):
+            assert list(transformed.aggregate([{stage: {"source": 2, "old": "$source"}}]))[0]["old"] == Int64(9)
+        for pipeline, code in [
+            ([{"$project": {}}], 51272), ([{"$project": {"a": 0, "b": "$source"}}], 31310),
+            ([{"$project": {"a": 0, "b": {"$literal": 1}}}], 31252),
+            ([{"$set": {"a": 1, "a.b": 2}}], 40176), ([{"$unset": ["a", "a"]}], 31250),
+            ([{"$set": {"private": {"$ifNull": []}}}], 1257300),
+            ([{"$set": {"private": {"$size": []}}}], 16020),
+            ([{"$project": {"private": "$$REMOVE.$bad"}}], 16410),
+        ]:
+            for target in (transformed, client.unwritten_aggregate.transforms):
+                try:
+                    list(target.aggregate(pipeline))
+                except OperationFailure as error:
+                    assert error.code == code, (pipeline, error.code)
+                    assert "private" not in str(error)
+                else:
+                    raise AssertionError("transform validation must be eager")
+        errors = client.wire_aggregate.transform_errors
+        errors.insert_many([{"_id": 1, "v": []}, {"_id": 2, "v": None}])
+        size = {"$set": {"n": {"$size": "$v"}}}
+        first = client.wire_aggregate.command("aggregate", "transform_errors", pipeline=[size], cursor={"batchSize": 1})["cursor"]
+        assert first["firstBatch"][0]["n"] == 0 and first["id"]
+        for code in (17124, 43):
+            try:
+                client.wire_aggregate.command("getMore", first["id"], collection="transform_errors")
+            except OperationFailure as error:
+                assert error.code == code
+            else:
+                raise AssertionError("expression failure must release its cursor")
+        for prefix in ([], [{"$sort": {"_id": 1}}]):
+            assert list(errors.aggregate(prefix + [size, {"$limit": 1}])) == [{"_id": 1, "v": [], "n": 0}]
+        # Projection grows each row, but successful output still pages at the
+        # same byte cap. A much larger broadcast fails before allocating it.
+        expanded = client.wire_aggregate.expanded
+        expanded.insert_many([{"_id": index, "payload": "x" * 200000, "items": [None] * 400} for index in range(5)])
+        pipeline = [{"$project": {"_id": 1, "first": "$payload", "second": "$payload"}}, {"$sort": {"_id": -1}}]
+        first = client.wire_aggregate.command("aggregate", "expanded", pipeline=pipeline, cursor={"batchSize": 1000})["cursor"]
+        assert len(first["firstBatch"]) == 2
+        rows = first["firstBatch"]
+        identifier = first["id"]
+        while identifier:
+            page = client.wire_aggregate.command("getMore", identifier, collection="expanded", batchSize=1000)["cursor"]
+            rows.extend(page["nextBatch"])
+            identifier = page["id"]
+        assert [row["_id"] for row in rows] == [4, 3, 2, 1, 0]
+        try:
+            list(expanded.aggregate([{"$set": {"items.copy": "$payload"}}]))
+        except OperationFailure as error:
+            assert error.code == 10334
+        else:
+            raise AssertionError("broadcast amplification must be bounded")
+
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
@@ -522,6 +590,7 @@ def persisted_smoke(uri):
         assert client.wire_distinct.items.distinct("nested.a") == ["first", "second"]
         assert list(client.wire_aggregate.items.aggregate([{"$count": "n"}])) == [{"n": 180}]
         assert [row["_id"] for row in client.wire_aggregate.items.aggregate([{"$sort": {"_id": -1}}, {"$limit": 7}], batchSize=2)] == list(reversed(range(173, 180)))
+        assert list(client.wire_aggregate.transforms.aggregate([{"$project": {"_id": 0, "n": {"$size": "$items"}, "source": 1}}])) == [{"source": Int64(9), "n": 3}]
 
 
 async def async_smoke(uri):
@@ -539,6 +608,11 @@ async def async_smoke(uri):
         assert [row["_id"] for row in await aggregate.to_list()] == [172, 169, 166, 163, 160, 157, 154]
         aggregate = await client.wire_aggregate.items.aggregate([{"$count": "n"}])
         assert await aggregate.to_list() == [{"n": 180}]
+        aggregate = await client.wire_aggregate.transforms.aggregate([
+            {"$addFields": {"items.tag": "$source", "secret": "$$REMOVE"}},
+            {"$project": {"_id": 0, "n": {"$size": "$items"}, "copy": {"$ifNull": ["$absent", "$source"]}}},
+        ], batchSize=1)
+        assert await aggregate.to_list() == [{"n": 3, "copy": Int64(9)}]
         aggregate = await client.wire_aggregate.items.aggregate([], batchSize=1)
         assert (await aggregate.__anext__())["_id"] == 0
         identifier = aggregate.cursor_id

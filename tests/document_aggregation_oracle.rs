@@ -10,12 +10,27 @@ use briskdb::document::{
 #[test]
 #[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
 fn aggregation_matches_the_locked_tinymongo_oracle() {
+    compare("document_aggregation_oracle.py", 5000, 32 * 1024 * 1024);
+}
+
+#[test]
+#[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
+fn aggregation_transforms_match_the_locked_tinymongo_oracle() {
+    compare(
+        "document_aggregation_transforms_oracle.py",
+        5000,
+        64 * 1024 * 1024,
+    );
+}
+
+fn compare(script: &str, minimum: usize, maximum_bytes: usize) {
     let python = std::env::var("BRISKDB_MONGO_ORACLE_PYTHON").unwrap_or_else(|_| "python3".into());
     let output = Command::new(python)
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/document_aggregation_oracle.py"
-        ))
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join(script),
+        )
         .output()
         .unwrap();
     assert!(
@@ -23,7 +38,7 @@ fn aggregation_matches_the_locked_tinymongo_oracle() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.len() < 32 * 1024 * 1024);
+    assert!(output.stdout.len() < maximum_bytes);
     let mut bytes = output.stdout.as_slice();
     let mut count = 0;
     while !bytes.is_empty() {
@@ -93,8 +108,8 @@ fn aggregation_matches_the_locked_tinymongo_oracle() {
         count += 1;
     }
     assert!(
-        count > 5000,
+        count > minimum,
         "expected the complete pipeline matrix, got {count}"
     );
-    println!("{count} source-locked TinyMongo aggregation cases passed");
+    println!("{count} source-locked TinyMongo aggregation cases passed ({script})");
 }

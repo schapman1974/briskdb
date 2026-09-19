@@ -64,7 +64,7 @@ The current engine executes:
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
 | `Find` | Evaluates BSON match expressions and returns a bounded batch with a continuation ID when needed |
-| `Aggregate` | Executes the shared five-stage pipeline over global natural-order input and returns a retained cursor |
+| `Aggregate` | Executes shared basic/projection stages over global natural-order input and returns a retained cursor |
 | `ContinueCursor` | Resumes a session-owned find or aggregate cursor |
 | `KillCursor` | Releases a session-owned cursor; reports whether it existed |
 | `Count` | Evaluates the same match expressions, then applies global skip/limit |
@@ -270,7 +270,7 @@ wire hints, collation, read concern, and comments are not implemented yet.
 ### Basic aggregation core
 
 `DocumentAggregator` compiles a `DocumentPipeline` into shared `$match`, `$sort`,
-`$skip`, `$limit`, and `$count` stages. Every stage is validated before execution,
+`$skip`, `$limit`, `$count`, and the projection stages described below. Every stage is validated before execution,
 even behind an empty-producing stage. Empty pipelines preserve inputs; stages
 execute in declaration order without mutating their source documents. Matching
 uses `DocumentMatcher`; sorting uses `DocumentSorter` with stable ties relative
@@ -284,9 +284,9 @@ input, otherwise one document with the validated field name and an Int32 count
 under the current row bound. Empty, dollar-prefixed, NUL/dotted and `_id` count
 fields retain their distinct frozen validation errors. Generic stage-shape and
 non-document match errors have no numeric code in the reference; the typed core
-represents those as BadValue (2). Other stages are explicitly unsupported here.
+represents those as BadValue (2). Groups and unimplemented stages remain explicitly unsupported.
 
-The borrowed `DocumentAggregator::execute` API materializes input and stage output. It admits at most
+The borrowed `DocumentAggregator::execute` API materializes input. It admits at most
 65,536 input rows and 64 MiB of conservative working-data retention, including
 sort keys, plus a separate 64 MiB compiled-plan quota. BSON is structurally
 validated and its retained size checked before cloning. All stages share a
@@ -304,12 +304,54 @@ boundaries, and eager errors. Unit tests cover each cancellation/deadline
 checkpoint, memory/row/work limits, immutable inputs and redacted diagnostics.
 Both materialized and incremental modes run against every oracle case.
 
+### Aggregation projection and expression stages
+
+`$project`, `$set`, `$addFields`, and `$unset` share one Rust transformation layer
+across native and wire APIs. Basic include/exclude and unset operations reuse
+`DocumentProjector`. Computed projections retain traversed source fields in source
+order, then append direct computed fields in specification order. Nested output
+paths preserve array shape; computed descendants create object shells for missing
+or scalar parents. Set/addFields evaluate every assignment against the original
+document before applying any changes, preserve replaced field positions, and
+broadcast dotted assignments through arrays. No stage mutates stored input.
+
+Supported expressions are field references, literal values/arrays/documents,
+`$literal`, `$ifNull`, `$size`, and `$$REMOVE` (including validated suffixes).
+Missing values remain distinct from null: object fields omit missing results,
+expression arrays replace them with null, and ifNull skips both missing and null.
+Field references traverse arrays of documents but do not descend through raw
+nested arrays at the same path component. Output numeric/positional paths and
+other variables/operators remain unsupported. Path collisions, mixed projection
+modes, eager expression validation, and error-code precedence follow the frozen
+implementation; code-less expression-shape failures map to BadValue (2).
+
+Nonblocking stages are fused in both execution modes, including after sort/count.
+A later limit stops evaluating preceding expressions on unconsumed rows; skip
+still consumes/evaluates skipped rows. Each transform specification is bounded to
+1 MiB encoded BSON, 4,096 charged syntax/path nodes, and depth 100. Each row's
+transform has a one-million-step budget, nested within the pipeline's persistent
+four-million-step budget. A 64 MiB cumulative allocation-work cap includes the
+source and all copied/generated values, even discarded fallbacks, so broadcast
+amplification is rejected before allocating the full result. Available allocation
+headroom is reduced by buffered and unconsumed rows already in the pipeline.
+Generated rows are
+codec-validated before later stages; normal BSON depth/size and retained-output
+limits still apply. These are conservative quotas, not RSS measurements.
+
+Required CI adds 7,037 source-locked whole-pipeline transform cases in both modes,
+checking exact BSON/order, missing/null/array behavior, lazy consumption, and
+validation. Unit tests cover amplification, depth/nodes/bytes, every cancellation
+and deadline checkpoint, input immutability, and failed-stream poisoning. Native
+and real-driver tests cover paged transforms, runtime-error cursor cleanup,
+output expansion/byte caps, sync/async calls, and restart. Groups and full candidate
+corpus acceptance, including the projection-to-group identity case, remain open.
+
 ### Aggregate commands and cursors
 
 `DocumentCommand::Aggregate`, native Python `Session.aggregate`/`AsyncSession.aggregate`,
 and sync/async PyMongo `aggregate()` now share that compiled core. The engine's
 `DocumentAggregationStream` moves owned source documents through a streaming
-match/skip/limit prefix. The first count retains only a counter; the first sort
+match/skip/limit/transform prefix. The first count retains only a counter; the first sort
 retains bounded input. Finalization feeds blocking-stage output through the
 remaining shared executor. A prefix limit stops further source consumption.
 Streams admit at most 65,536 consumed inputs and four million checked steps
@@ -348,7 +390,7 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 ## Current boundary
 
 Update expressions, replacements,
-multi-document deletion, upsert, aggregation expressions/projections/groups,
+multi-document deletion, upsert, aggregation groups and additional expressions,
 metadata cursors, and physical secondary-index builds remain later roadmap work.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
 category.
