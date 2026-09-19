@@ -585,6 +585,14 @@ class Session:
         timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
         max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
     ) -> UpdateResult: ...
+    def find_one_and_update(
+        self, database: str, collection: str, filter: BsonDocument, update: BsonDocument, *,
+        projection: Optional[BsonProjection] = None, sort: Optional[BsonDocument] = None,
+        return_document: bool = False, upsert: bool = False,
+        request_id: Optional[UUID] = None, timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None, max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> OneDocumentResult: ...
     def replace_one(
         self,
         database: str,

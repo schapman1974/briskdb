@@ -60,6 +60,7 @@ def sync_contract(path: str) -> None:
     removed: Optional[dict[str, object]] = document_session.find_one_and_delete("app", "notes", {}, projection=["body"], sort={"body": 1})["document"]
     updated: int = document_session.update_one("app", "notes", {}, {"$set": {"body": "updated"}})["modified_count"]
     updated_many: int = document_session.update_many("app", "notes", {}, {"$unset": {"body": 1}})["matched_count"]
+    updated_image: Optional[dict[str, object]] = document_session.find_one_and_update("app", "notes", {}, {"$set": {"body": "new"}}, return_document=True)["document"]
     modified: int = document_session.replace_one("app", "notes", {}, {"body": "replacement"}, upsert=False)["modified_count"]
     replaced: Optional[dict[str, object]] = document_session.find_one_and_replace("app", "notes", {}, {"body": "replacement"}, projection=["_id"], return_document=True)["document"]
     print(removed, modified, replaced)
@@ -122,6 +123,7 @@ async def async_contract(path: str) -> None:
     removed: Optional[dict[str, object]] = (await session.find_one_and_delete("app", "typed", {}, projection={"_id": 1}, sort={"_id": -1}))["document"]
     updated: int = (await session.update_one("app", "typed", {}, {"$unset": {"body": 1}}))["modified_count"]
     updated_many: int = (await session.update_many("app", "typed", {}, {"$set": {"body": "updated"}}))["matched_count"]
+    updated_image: Optional[dict[str, object]] = (await session.find_one_and_update("app", "typed", {}, {"$unset": {"body": 1}}, projection=["_id"]))["document"]
     modified: int = (await session.replace_one("app", "typed", {}, {"body": "replacement"}))["modified_count"]
     replaced: Optional[dict[str, object]] = (await session.find_one_and_replace("app", "typed", {}, {"body": "replacement"}, sort={"_id": 1}, return_document=True))["document"]
     print(removed, modified, replaced)

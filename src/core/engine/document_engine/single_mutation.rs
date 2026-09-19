@@ -4,9 +4,10 @@ use super::*;
 use crate::{
     document::{
         BSON_MAX_NESTING_DEPTH, BsonCodecOptions, CanonicalBsonKey, DEFAULT_DOCUMENT_BATCH_SIZE,
-        DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest, DocumentMutationError,
-        DocumentReplaceRequest, DocumentRequestId, DocumentSortKey, DocumentUpdateRequest,
-        DocumentUpdateResult, DocumentUpdater, encode_document_with_options,
+        DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
+        DocumentFindOneAndUpdateRequest, DocumentMutationError, DocumentReplaceRequest,
+        DocumentRequestId, DocumentSortKey, DocumentUpdateRequest, DocumentUpdateResult,
+        DocumentUpdater, encode_document_with_options,
     },
     sqlite_error,
 };
@@ -26,22 +27,23 @@ enum Mutation {
     Update {
         updater: Arc<DocumentUpdater>,
         max_document_bytes: usize,
+        returns: MutationReturn,
     },
     Replace {
         document: Arc<BsonDocument>,
         max_document_bytes: usize,
-        returns: ReplacementReturn,
+        returns: MutationReturn,
     },
 }
 
 #[derive(Clone, Copy)]
-enum ReplacementReturn {
+pub(super) enum MutationReturn {
     Counts,
     Before,
     After,
 }
 
-impl ReplacementReturn {
+impl MutationReturn {
     fn no_match(self) -> DocumentResult {
         match self {
             Self::Counts => DocumentResult::Update(
@@ -56,13 +58,65 @@ impl Mutation {
     fn no_match(&self) -> DocumentResult {
         match self {
             Self::Delete => DocumentResult::Document(None),
-            Self::Update { .. } => ReplacementReturn::Counts.no_match(),
-            Self::Replace { returns, .. } => returns.no_match(),
+            Self::Update { returns, .. } | Self::Replace { returns, .. } => returns.no_match(),
         }
     }
 }
 
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_document_find_update(
+        &self,
+        owner: ConnectionOwner,
+        request_id: DocumentRequestId,
+        request: DocumentFindOneAndUpdateRequest,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        limits: ResultLimits,
+    ) -> EngineResult<DocumentExecution> {
+        let (update, read_options, return_after) = request.into_parts();
+        require_single_mutation_read_options(&read_options)?;
+        let max_document_bytes = update.max_document_bytes();
+        let (namespace, filter, update, scope, write_options) = update.into_parts();
+        if scope != DocumentMutationScope::One {
+            return Err(unsupported(
+                "find-one-and-update requires single-document scope",
+            ));
+        }
+        require_replacement_options(write_options)?;
+        let updater = self
+            .run_document_storage_task(
+                cancellation.clone(),
+                deadline,
+                move |cancellation, control| {
+                    DocumentUpdater::compile_with_check(update.document(), &mut || {
+                        ensure_document_cpu_active(cancellation, &control)
+                    })
+                },
+            )
+            .await?;
+        self.run_document_single_mutation(
+            owner,
+            request_id,
+            namespace,
+            filter,
+            read_options,
+            Mutation::Update {
+                updater: Arc::new(updater),
+                max_document_bytes,
+                returns: if return_after {
+                    MutationReturn::After
+                } else {
+                    MutationReturn::Before
+                },
+            },
+            cancellation,
+            deadline,
+            limits,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_document_update(
         &self,
@@ -112,6 +166,7 @@ impl Engine {
             Mutation::Update {
                 updater,
                 max_document_bytes,
+                returns: MutationReturn::Counts,
             },
             cancellation,
             deadline,
@@ -168,7 +223,7 @@ impl Engine {
             Mutation::Replace {
                 document: Arc::new(replacement),
                 max_document_bytes,
-                returns: ReplacementReturn::Counts,
+                returns: MutationReturn::Counts,
             },
             cancellation,
             deadline,
@@ -202,9 +257,9 @@ impl Engine {
                 document: Arc::new(document),
                 max_document_bytes,
                 returns: if return_after {
-                    ReplacementReturn::After
+                    MutationReturn::After
                 } else {
-                    ReplacementReturn::Before
+                    MutationReturn::Before
                 },
             },
             cancellation,
@@ -467,6 +522,7 @@ fn mutate_record(
         Mutation::Update {
             updater,
             max_document_bytes,
+            returns,
         } => {
             let Some(record) = record else {
                 return Ok(DocumentExecution::new(
@@ -481,6 +537,8 @@ fn mutate_record(
                 record,
                 updater,
                 *max_document_bytes,
+                *returns,
+                projection,
                 request_id,
                 plan,
                 limits,
@@ -527,6 +585,8 @@ pub(super) fn update_record(
     record: DocumentStorageRecord,
     updater: &DocumentUpdater,
     max_document_bytes: usize,
+    returns: MutationReturn,
+    projection: Option<&DocumentProjector>,
     request_id: DocumentRequestId,
     plan: DocumentPlan,
     limits: ResultLimits,
@@ -542,8 +602,8 @@ pub(super) fn update_record(
         record,
         post_image,
         max_document_bytes,
-        ReplacementReturn::Counts,
-        None,
+        returns,
+        projection,
         request_id,
         plan,
         limits,
@@ -559,7 +619,7 @@ fn replace_record(
     record: Option<DocumentStorageRecord>,
     replacement: &BsonDocument,
     max_document_bytes: usize,
-    returns: ReplacementReturn,
+    returns: MutationReturn,
     projection: Option<&DocumentProjector>,
     request_id: DocumentRequestId,
     plan: DocumentPlan,
@@ -641,7 +701,7 @@ fn write_post_image(
     record: DocumentStorageRecord,
     post_image: BsonDocument,
     max_document_bytes: usize,
-    returns: ReplacementReturn,
+    returns: MutationReturn,
     projection: Option<&DocumentProjector>,
     request_id: DocumentRequestId,
     plan: DocumentPlan,
@@ -678,15 +738,15 @@ fn write_post_image(
         record.natural_order(),
     );
     let result = match returns {
-        ReplacementReturn::Counts => {
+        MutationReturn::Counts => {
             DocumentResult::Update(DocumentUpdateResult::new(1, u64::from(modified), None)?)
         }
-        ReplacementReturn::Before => DocumentResult::Document(Some(project_return_document(
+        MutationReturn::Before => DocumentResult::Document(Some(project_return_document(
             record.into_document(),
             projection,
             &mut check,
         )?)),
-        ReplacementReturn::After => DocumentResult::Document(Some(project_return_document(
+        MutationReturn::After => DocumentResult::Document(Some(project_return_document(
             post_image, projection, &mut check,
         )?)),
     };

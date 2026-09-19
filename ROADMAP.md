@@ -499,7 +499,7 @@ requires an earlier dependency:
       engine-owned cursors. Tests cover BSON fidelity, numeric-equivalent IDs,
       cross-interface access, restart, host enablement, one-way writes, and
       response limits. Missing collections read empty without creating metadata.
-      Operator updates, remaining findAndModify forms, index metadata cursors,
+      Additional update operators, upserts, index metadata cursors,
       and broader database options remain open.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
@@ -540,8 +540,12 @@ requires an earlier dependency:
       consumers, runtime sort failures, deadline rollback, and restart are
       covered. Find-one-and-replace now uses the same shared path with
       projected before/after images, sort, immutable-ID validation, and exact
-      return/post-image preflight before commit. Operator-update forms and
-      upserts remain open.
+      return/post-image preflight before commit. Find-one-and-update now shares
+      this path for `$set`/`$unset`, preserving untouched fields and supporting
+      sorted before/after images across Rust, native Python, and wire clients.
+      Concurrent consumers, no-op/no-match/projected-empty replies, depth/size
+      rejection before writes, cancellation, and restart are tested. Other
+      operators, upserts, and secondary-index validation remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
@@ -616,7 +620,9 @@ requires an earlier dependency:
       All frozen aggregation projection-stage and application aggregation cases
       now pass through the real four-shard endpoint in both API modes. Combined
       with the basic/group-accumulator suites, replacement, and three additional
-      application write/identity contracts plus nested unsetting, required CI checks exactly 152 frozen executions and
+      application write/identity contracts, nested unsetting, configured-client
+      read fidelity, and three cross-CRUD query-validation cases, required CI
+      checks exactly 162 frozen executions and
       rejects missing, duplicated, substituted, or skipped cases. The full
       456-execution corpus remains separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared

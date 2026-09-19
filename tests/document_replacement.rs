@@ -5,10 +5,11 @@ use briskdb::{
     document::{
         BsonDocument, BsonTimestamp, BsonValue, DocumentCollectionOptions, DocumentCommand,
         DocumentCreateCollectionRequest, DocumentFilter, DocumentFindOneAndReplaceRequest,
-        DocumentFindRequest, DocumentInsertRequest, DocumentMutationError, DocumentMutationScope,
-        DocumentNamespace, DocumentPlan, DocumentProjection, DocumentReadOptions,
-        DocumentReplaceRequest, DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort,
-        DocumentUpdate, DocumentUpdateRequest, DocumentWriteOptions, encode_document,
+        DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentInsertRequest,
+        DocumentMutationError, DocumentMutationScope, DocumentNamespace, DocumentPlan,
+        DocumentProjection, DocumentReadOptions, DocumentReplaceRequest, DocumentRequest,
+        DocumentRequestId, DocumentResult, DocumentSort, DocumentUpdate, DocumentUpdateRequest,
+        DocumentWriteOptions, encode_document,
     },
 };
 use rusqlite::{Connection, TransactionBehavior};
@@ -569,6 +570,299 @@ fn replace(filter: BsonDocument, replacement: BsonDocument) -> DocumentReplaceRe
         DocumentWriteOptions::new(),
     )
     .unwrap()
+}
+
+fn find_update(
+    filter: BsonDocument,
+    expression: BsonDocument,
+    options: DocumentReadOptions,
+    after: bool,
+) -> DocumentCommand {
+    DocumentCommand::FindOneAndUpdate(
+        DocumentFindOneAndUpdateRequest::new(update(filter, expression), options)
+            .with_return_after(after),
+    )
+}
+
+#[tokio::test]
+async fn find_update_returns_original_or_updated_projection_without_replacing_other_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let options = DocumentReadOptions::new()
+        .with_sort(DocumentSort::new(doc([("_id", BsonValue::Int32(-1))])).unwrap())
+        .with_projection(
+            DocumentProjection::new(doc([
+                ("done", BsonValue::Int32(1)),
+                ("_id", BsonValue::Int32(0)),
+            ]))
+            .unwrap(),
+        );
+    let before = returned(
+        &engine,
+        &session,
+        find_update(
+            doc([("group", BsonValue::Int32(0))]),
+            set(doc([
+                ("done", BsonValue::Boolean(true)),
+                ("stamp", BsonValue::Timestamp(BsonTimestamp::new(0, 0))),
+            ])),
+            options,
+            false,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(before, doc([("done", BsonValue::Boolean(false))]));
+    let current = rows(&engine, &session).await;
+    assert_eq!(current[22].get_first("group"), Some(&BsonValue::Int32(0)));
+    assert_eq!(
+        current[22].get_first("done"),
+        Some(&BsonValue::Boolean(true))
+    );
+    assert_eq!(
+        current[22].get_first("stamp"),
+        Some(&BsonValue::Timestamp(BsonTimestamp::new(0, 0)))
+    );
+    for after in [false, true] {
+        let image = returned(
+            &engine,
+            &session,
+            find_update(
+                doc([("_id", BsonValue::Double(22.0))]),
+                set(doc([("done", BsonValue::Boolean(true))])),
+                DocumentReadOptions::new(),
+                after,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            encode_document(&image).unwrap(),
+            encode_document(&current[22]).unwrap()
+        );
+        assert!(
+            returned(
+                &engine,
+                &session,
+                find_update(
+                    doc([("_id", BsonValue::Int32(-1))]),
+                    set(BsonDocument::new()),
+                    DocumentReadOptions::new(),
+                    after
+                )
+            )
+            .await
+            .is_none()
+        );
+    }
+    let after = returned(
+        &engine,
+        &session,
+        find_update(
+            doc([("_id", BsonValue::Int32(22))]),
+            doc([(
+                "$unset",
+                BsonValue::Document(doc([("group", BsonValue::Null)])),
+            )]),
+            DocumentReadOptions::new().with_projection(
+                DocumentProjection::new(doc([
+                    ("group", BsonValue::Int32(1)),
+                    ("_id", BsonValue::Int32(0)),
+                ]))
+                .unwrap(),
+            ),
+            true,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(after.is_empty());
+    let expected = rows(&engine, &session).await;
+    assert!(expected[22].get_first("group").is_none());
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(rows(&engine, &engine.session()).await, expected);
+}
+
+#[tokio::test]
+async fn find_update_preflights_images_and_rejects_invalid_scopes_paths_and_runtime_sort() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let filter = doc([("_id", BsonValue::Int32(0))]);
+    let large = BsonValue::from("x".repeat(600_000));
+    for after in [false, true] {
+        if !after {
+            update_counts(
+                &engine,
+                &session,
+                filter.clone(),
+                set(doc([("large", large.clone())])),
+            )
+            .await;
+        }
+        let before = rows(&engine, &session).await;
+        let expression = if after {
+            set(doc([("large", large.clone())]))
+        } else {
+            doc([(
+                "$unset",
+                BsonValue::Document(doc([("large", BsonValue::Null)])),
+            )])
+        };
+        let error = engine
+            .execute_document(
+                &session,
+                request(
+                    find_update(
+                        filter.clone(),
+                        expression.clone(),
+                        DocumentReadOptions::new(),
+                        after,
+                    ),
+                    RequestContext::new().with_result_limits(ResultLimits::new(1, 128).unwrap()),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+        assert_eq!(rows(&engine, &session).await, before);
+        let image = returned(
+            &engine,
+            &session,
+            find_update(
+                filter.clone(),
+                expression,
+                DocumentReadOptions::new().with_projection(
+                    DocumentProjection::new(doc([("_id", BsonValue::Int32(1))])).unwrap(),
+                ),
+                after,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(image, doc([("_id", BsonValue::Int32(0))]));
+    }
+    update_counts(
+        &engine,
+        &session,
+        filter.clone(),
+        set(doc([
+            ("a", BsonValue::Array(vec![BsonValue::Int32(1)])),
+            ("b", BsonValue::Array(vec![BsonValue::Int32(1)])),
+        ])),
+    )
+    .await;
+    let before = rows(&engine, &session).await;
+    let many = DocumentUpdateRequest::new(
+        ns(),
+        DocumentFilter::empty(),
+        DocumentUpdate::new(set(BsonDocument::new())).unwrap(),
+        DocumentMutationScope::Many,
+        DocumentWriteOptions::new(),
+    );
+    let commands = [
+        DocumentCommand::FindOneAndUpdate(DocumentFindOneAndUpdateRequest::new(
+            many,
+            DocumentReadOptions::new(),
+        )),
+        find_update(
+            filter.clone(),
+            set(doc([("group.x", BsonValue::Null)])),
+            DocumentReadOptions::new(),
+            true,
+        ),
+        find_update(
+            filter.clone(),
+            set(doc([("_id", BsonValue::Int32(-1))])),
+            DocumentReadOptions::new(),
+            false,
+        ),
+        find_update(
+            filter.clone(),
+            set(BsonDocument::new()),
+            DocumentReadOptions::new().with_skip(1),
+            false,
+        ),
+        find_update(
+            filter.clone(),
+            set(doc([("done", BsonValue::Boolean(true))])),
+            DocumentReadOptions::new().with_sort(
+                DocumentSort::new(doc([
+                    ("a", BsonValue::Int32(1)),
+                    ("b", BsonValue::Int32(1)),
+                ]))
+                .unwrap(),
+            ),
+            false,
+        ),
+        find_update(
+            BsonDocument::new(),
+            set(doc([("done", BsonValue::Boolean(true))])),
+            DocumentReadOptions::new().with_sort(
+                DocumentSort::new(doc([
+                    ("a", BsonValue::Int32(1)),
+                    ("b", BsonValue::Int32(1)),
+                ]))
+                .unwrap(),
+            ),
+            true,
+        ),
+    ];
+    for command in commands {
+        assert!(
+            engine
+                .execute_document(&session, request(command, RequestContext::new()))
+                .await
+                .is_err()
+        );
+        assert_eq!(rows(&engine, &session).await, before);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_find_updates_return_each_selected_record_once() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(root.path(), 4).await.unwrap());
+    seed(&engine, &engine.session()).await;
+    let mut tasks = Vec::new();
+    for after in [false, true, false, true] {
+        let engine = Arc::clone(&engine);
+        tasks.push(tokio::spawn(async move {
+            let session = engine.session();
+            let mut ids = Vec::new();
+            while let Some(image) = returned(
+                &engine,
+                &session,
+                find_update(
+                    doc([("done", BsonValue::Boolean(false))]),
+                    set(doc([("done", BsonValue::Boolean(true))])),
+                    DocumentReadOptions::new(),
+                    after,
+                ),
+            )
+            .await
+            {
+                assert_eq!(image.get_first("done"), Some(&BsonValue::Boolean(after)));
+                let Some(BsonValue::Int32(id)) = image.get_first("_id") else {
+                    panic!("id")
+                };
+                ids.push(*id);
+            }
+            ids
+        }));
+    }
+    let mut ids = Vec::new();
+    for task in tasks {
+        ids.extend(task.await.unwrap());
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, (0..24).collect::<Vec<_>>());
 }
 
 fn find_replace(
@@ -1371,6 +1665,18 @@ async fn replacement_write_lock_deadline_leaves_documents_and_session_usable() {
         })
         .collect::<Vec<_>>();
     for command in [
+        find_update(
+            BsonDocument::new(),
+            set(doc([("done", BsonValue::Boolean(true))])),
+            DocumentReadOptions::new(),
+            false,
+        ),
+        find_update(
+            BsonDocument::new(),
+            set(doc([("done", BsonValue::Boolean(true))])),
+            DocumentReadOptions::new(),
+            true,
+        ),
         DocumentCommand::Update(update(
             BsonDocument::new(),
             set(doc([("done", BsonValue::Boolean(true))])),

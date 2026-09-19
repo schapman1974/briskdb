@@ -95,14 +95,18 @@ async with await briskdb.open_async("./data", shards=4, documents=True) as db:
 
 `AsyncSession` includes create/list collection and index calls plus
 `insert_one`, `find`, `count_documents`, `delete_one`, `delete_many`, and
-`find_one_and_delete`, `replace_one`, `find_one_and_replace`, `update_one`, and `update_many`
-(without upsert). `find_one_and_replace` forwards projection, sort, and
+`find_one_and_delete`, `replace_one`, `find_one_and_replace`, `find_one_and_update`,
+`update_one`, and `update_many` (without upsert).
+`find_one_and_replace` and `find_one_and_update` forward projection, sort, and
 `return_document` before/after selection. `update_one` supports `$set`/`$unset`
 and forwards the same identity, deadline, cancellation, and result controls.
 `update_many` uses those same operators/controls, committing one shard at a time;
 failure or cancellation rolls back the current shard but preserves earlier
 commits. It returns aggregate counts only on success, with no global atomicity
 or snapshot guarantee.
+`find_one_and_update` supports the same two operators and preflights the returned
+image before mutation, including BSON size/depth limits. Projection affects only
+the reply; untouched stored fields are retained.
 They use the same
 request IDs, deadlines, cancellation tokens, result limits, BSON conversion,
 and point/scatter plans as their synchronous `Session` methods.
