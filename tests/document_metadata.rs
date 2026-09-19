@@ -224,6 +224,241 @@ async fn collection_metadata_streams_filters_and_preserves_uuid_across_reopen() 
     engine.shutdown().await.unwrap();
 }
 
+fn database_names(filter: BsonDocument) -> DocumentCommand {
+    DocumentCommand::ListDatabaseNames(briskdb::document::DocumentListDatabaseNamesRequest::new(
+        DocumentFilter::new(filter).unwrap(),
+    ))
+}
+
+async fn names(engine: &Engine, session: &Session, filter: BsonDocument) -> Vec<String> {
+    let DocumentResult::DatabaseNames(names) =
+        execute(engine, session, database_names(filter)).await
+    else {
+        panic!("database names")
+    };
+    names.into_vec()
+}
+
+#[tokio::test]
+async fn database_names_are_filtered_exact_persistent_and_follow_collection_lifecycle() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    assert!(
+        names(&engine, &session, BsonDocument::new())
+            .await
+            .is_empty()
+    );
+    for filter in [
+        doc([("sizeOnDisk", BsonValue::Int32(0))]),
+        doc([("empty", BsonValue::Boolean(false))]),
+        doc([("$unsupported", BsonValue::Int32(1))]),
+    ] {
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    request(database_names(filter), RequestContext::new())
+                )
+                .await
+                .is_err()
+        );
+    }
+    create(&engine, &session, "App", "one", BsonDocument::new()).await;
+    create(&engine, &session, "App", "two", BsonDocument::new()).await;
+    create(&engine, &session, "app", "one", BsonDocument::new()).await;
+    create(&engine, &session, "日本語", "one", BsonDocument::new()).await;
+    assert_eq!(
+        names(&engine, &session, BsonDocument::new()).await,
+        ["App", "app", "日本語"]
+    );
+    assert_eq!(
+        names(&engine, &session, doc([("name", BsonValue::from("App"))])).await,
+        ["App"]
+    );
+    let filter = doc([(
+        "$or",
+        BsonValue::Array(vec![
+            BsonValue::Document(doc([(
+                "name",
+                BsonValue::Document(doc([("$regex", BsonValue::from("^a"))])),
+            )])),
+            BsonValue::Document(doc([("name", BsonValue::from("日本語"))])),
+        ]),
+    )]);
+    assert_eq!(names(&engine, &session, filter).await, ["app", "日本語"]);
+    execute(
+        &engine,
+        &session,
+        DocumentCommand::DropCollection(DocumentDropCollectionRequest::new(
+            DocumentNamespace::new("App", "one").unwrap(),
+            DocumentWriteOptions::new(),
+        )),
+    )
+    .await;
+    assert_eq!(names(&engine, &session, BsonDocument::new()).await.len(), 3);
+    execute(
+        &engine,
+        &session,
+        DocumentCommand::DropCollection(DocumentDropCollectionRequest::new(
+            DocumentNamespace::new("App", "two").unwrap(),
+            DocumentWriteOptions::new(),
+        )),
+    )
+    .await;
+    execute(
+        &engine,
+        &session,
+        DocumentCommand::DropDatabase(
+            DocumentDropDatabaseRequest::new("app", DocumentWriteOptions::new()).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        names(&engine, &session, BsonDocument::new()).await,
+        ["日本語"]
+    );
+    engine.shutdown().await.unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    assert_eq!(
+        names(&engine, &session, BsonDocument::new()).await,
+        ["日本語"]
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn database_name_catalog_ceiling_and_request_limits_are_enforced() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    for index in 0..64 {
+        create(
+            &engine,
+            &session,
+            &format!("db{index:02}"),
+            "items",
+            if index == 0 {
+                doc([("opaque", BsonValue::from("x".repeat(64 * 1024)))])
+            } else {
+                BsonDocument::new()
+            },
+        )
+        .await;
+    }
+    let all = database_names(BsonDocument::new());
+    assert_eq!(
+        names(&engine, &session, BsonDocument::new()).await.len(),
+        64
+    );
+    let overflow = DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+        DocumentNamespace::new("overflow", "items").unwrap(),
+        DocumentCollectionOptions::empty(),
+        DocumentWriteOptions::new(),
+    ));
+    let identities = || {
+        rusqlite::Connection::open_with_flags(root.path().join("manifest.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+            .query_row("SELECT database_high_water, collection_high_water FROM briskdb_document_identities WHERE singleton = 1", [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).unwrap()
+    };
+    let before = identities();
+    assert_eq!(
+        engine
+            .execute_document(&session, request(overflow, RequestContext::new()))
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::LimitExceeded
+    );
+    assert_eq!(identities(), before);
+    for limits in [
+        ResultLimits::new(63, 4096).unwrap(),
+        ResultLimits::new(64, 20).unwrap(),
+    ] {
+        assert_eq!(
+            engine
+                .execute_document(
+                    &session,
+                    request(
+                        all.clone(),
+                        RequestContext::new().with_result_limits(limits)
+                    )
+                )
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::LimitExceeded
+        );
+    }
+    let filtered = database_names(doc([("name", BsonValue::from("db00"))]));
+    let execution = engine
+        .execute_document(
+            &session,
+            request(
+                filtered,
+                RequestContext::new().with_result_limits(ResultLimits::new(1, 64).unwrap()),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(execution.plan().is_none());
+    let result = execution.into_parts().2;
+    assert!(!format!("{result:?}").contains("db00"));
+    let token = CancellationToken::new();
+    token.cancel();
+    assert_eq!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    all.clone(),
+                    RequestContext::new().with_cancellation_token(token)
+                )
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::Cancelled
+    );
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    all,
+                    RequestContext::new().with_deadline(Instant::now() - Duration::from_secs(1))
+                )
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        names(&engine, &session, BsonDocument::new()).await.len(),
+        64
+    );
+    execute(
+        &engine,
+        &session,
+        DocumentCommand::DropDatabase(
+            DocumentDropDatabaseRequest::new("db63", DocumentWriteOptions::new()).unwrap(),
+        ),
+    )
+    .await;
+    create(
+        &engine,
+        &session,
+        "replacement",
+        "items",
+        BsonDocument::new(),
+    )
+    .await;
+    assert_eq!(
+        names(&engine, &session, BsonDocument::new()).await.len(),
+        64
+    );
+    engine.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn metadata_cursor_ceiling_drop_recreate_ownership_and_cleanup() {
     let root = tempfile::tempdir().unwrap();

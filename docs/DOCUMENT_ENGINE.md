@@ -62,6 +62,7 @@ The current engine executes:
 | `CollectionExists` | Checks one exact namespace without enumerating unrelated collections; returns a boolean without creating metadata |
 | `ListCollections` | Returns collection metadata for one exact database name |
 | `ListCollectionMetadata` | Filters and pages BSON collection metadata through the shared cursor registry; `name_only` restricts both output and filtering to name/type |
+| `ListDatabaseNames` | Returns `DatabaseNames(Box<[String]>)` from a validated document catalog snapshot; shared filters on `name` and logical combinations, normal request controls, no disk statistics |
 | `CreateIndex` | Declares index metadata and returns its name; non-built-in indexes remain pending until physical index work lands |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
@@ -485,7 +486,7 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 
 Update expressions, replacements,
 multi-document deletion, upsert, additional aggregation expressions/group-key forms,
-database discovery, index metadata cursors, and physical secondary-index builds
+database statistics, index metadata cursors, and physical secondary-index builds
 remain later roadmap work. Collection metadata cursors are implemented.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
 category.

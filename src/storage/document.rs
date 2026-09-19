@@ -385,6 +385,41 @@ mod enabled {
             self.fail_closed_on_corruption(result)
         }
 
+        /// Only document database names; no SQL namespaces, internal tables,
+        /// collection metadata, or physical-size estimates. The catalog caps
+        /// this result at 64 names of at most 63 UTF-8 bytes each.
+        pub(crate) fn document_database_names_controlled(
+            &self,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<Vec<String>> {
+            let result = (|| {
+                let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+                let read_control = Arc::clone(&control);
+                run_manifest_controlled(&mut connection, control, |connection| {
+                    read_ready_manifest_snapshot(connection, self.shard_count(), |connection| {
+                        let mut statement = connection.prepare(
+                            "SELECT database_name FROM briskdb_document_databases ORDER BY database_id",
+                        ).map_err(sqlite_error::storage)?;
+                        let mut rows = statement.query([]).map_err(sqlite_error::storage)?;
+                        let mut names = Vec::new();
+                        while let Some(row) = rows.next().map_err(sqlite_error::storage)? {
+                            ensure_control_active(
+                                &read_control,
+                                "while reading document database names",
+                            )?;
+                            names.push(row.get(0).map_err(sqlite_error::storage)?);
+                        }
+                        ensure_control_active(
+                            &read_control,
+                            "after reading document database names",
+                        )?;
+                        Ok(names)
+                    })
+                })
+            })();
+            self.fail_closed_on_corruption(result)
+        }
+
         /// Capture a database identity and collection allocation ceiling in one
         /// validated snapshot. An absent database is never created by discovery.
         pub(crate) fn document_metadata_identity_controlled(
@@ -2639,6 +2674,22 @@ mod enabled {
             .map_err(sqlite_error::storage)?
         {
             return Ok(id);
+        }
+        // Reject caller-induced capacity exhaustion before inserting a row.
+        // The later manifest validator must reserve DataCorruption for invalid
+        // stored state, not a rolled-back attempt to exceed a supported limit.
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM briskdb_document_databases",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error::storage)?;
+        if count >= manifest::MAX_DOCUMENT_DATABASES as i64 {
+            return Err(EngineError::new(
+                EngineErrorKind::LimitExceeded,
+                "document database catalog is full",
+            ));
         }
         let id = next_positive_id(connection, "database_high_water", "document database")?;
         connection

@@ -43,6 +43,8 @@ def sync_contract(path: str) -> None:
     exists: bool = document_session.collection_exists("app", "notes")["exists"]
     metadata: List[dict[str, object]] = document_session.list_collection_metadata("app", {"name": "notes"}, name_only=True, batch_size=1, batch_byte_limit=1024)["documents"]
     print(metadata)
+    database_names: List[str] = document_session.list_database_names({"name": "app"})["names"]
+    print(database_names)
     dropped_collection: bool = document_session.drop_collection("app", "missing")["existed"]
     dropped_database: bool = document_session.drop_database("missing")["existed"]
     print(dropped_collection, dropped_database)
@@ -97,6 +99,8 @@ async def async_contract(path: str) -> None:
     exists: bool = (await session.collection_exists("app", "typed"))["exists"]
     metadata: List[dict[str, object]] = (await session.list_collection_metadata("app", name_only=True, batch_size=1))["documents"]
     print(metadata)
+    database_names: List[str] = (await session.list_database_names({"name": "app"}))["names"]
+    print(database_names)
     dropped_collection: bool = (await session.drop_collection("app", "missing"))["existed"]
     dropped_database: bool = (await session.drop_database("missing"))["existed"]
     print(dropped_collection, dropped_database)

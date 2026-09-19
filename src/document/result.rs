@@ -302,6 +302,7 @@ pub enum DocumentResultKind {
     NamespaceDropped,
     Collection,
     Collections,
+    DatabaseNames,
     Document,
     Cursor,
     Count,
@@ -324,6 +325,7 @@ pub enum DocumentResult {
     NamespaceDropped(bool),
     Collection(DocumentCollectionMetadata),
     Collections(Box<[DocumentCollectionMetadata]>),
+    DatabaseNames(Box<[String]>),
     Document(Option<BsonDocument>),
     Cursor(DocumentCursorBatch),
     Count(u64),
@@ -344,6 +346,7 @@ impl DocumentResult {
             Self::NamespaceDropped(_) => DocumentResultKind::NamespaceDropped,
             Self::Collection(_) => DocumentResultKind::Collection,
             Self::Collections(_) => DocumentResultKind::Collections,
+            Self::DatabaseNames(_) => DocumentResultKind::DatabaseNames,
             Self::Document(_) => DocumentResultKind::Document,
             Self::Cursor(_) => DocumentResultKind::Cursor,
             Self::Count(_) => DocumentResultKind::Count,
@@ -371,6 +374,9 @@ impl fmt::Debug for DocumentResult {
             }
             Self::Collections(values) => {
                 debug.field("collection_count", &values.len());
+            }
+            Self::DatabaseNames(values) => {
+                debug.field("database_count", &values.len());
             }
             Self::Document(value) => {
                 debug.field("present", &value.is_some());

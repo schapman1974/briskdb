@@ -752,10 +752,36 @@ def persisted_smoke(uri):
 def metadata_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         database = client.wire_metadata
+        before = set(client.list_database_names())
+        assert "wire_metadata" not in before
         assert client.absent_metadata.list_collection_names() == []
         assert list(client.absent_metadata.list_collections()) == []
         for name in ["alpha", "beta", "gamma"]:
             assert database.create_collection(name).name == name
+        assert set(client.list_database_names()) == before | {"wire_metadata"}
+        reply = client.admin.command("listDatabases", 1, nameOnly=True, filter={"name": "wire_metadata"}, authorizedDatabases=True)
+        assert reply == {"databases": [{"name": "wire_metadata"}], "ok": 1.0}
+        assert list(client.list_databases(nameOnly=True, filter={"$or": [{"name": "wire_metadata"}, {"name": "absent_metadata"}]})) == [{"name": "wire_metadata"}]
+        for command in [
+            {"listDatabases": 1}, {"listDatabases": 1, "nameOnly": False},
+            {"listDatabases": 1, "nameOnly": True, "filter": {"sizeOnDisk": 0}},
+            {"listDatabases": 1, "nameOnly": True, "filter": {"$or": [{"empty": False}]}},
+            {"listDatabases": 1, "nameOnly": True, "filter": {"name": {"$unsupported": 1}}},
+            {"listDatabases": 1, "nameOnly": 1},
+            {"listDatabases": 1, "nameOnly": True, "cursor": {}},
+        ]:
+            try:
+                client.admin.command(command)
+            except OperationFailure:
+                pass
+            else:
+                raise AssertionError(f"unsupported database listing accepted: {command}")
+        try:
+            database.command("listDatabases", 1, nameOnly=True)
+        except OperationFailure as error:
+            assert error.code == 13
+        else:
+            raise AssertionError("listDatabases must be an admin command")
         try:
             database.create_collection("alpha")
         except CollectionInvalid:
@@ -814,11 +840,13 @@ async def async_smoke(uri):
         metadata = client.async_metadata
         await metadata.create_collection("one")
         await metadata.create_collection("two")
+        assert "async_metadata" in await client.list_database_names()
         assert sorted(await metadata.list_collection_names()) == ["one", "two"]
         cursor = await metadata.list_collections(cursor={"batchSize": 1})
         assert [row["name"] async for row in cursor] == ["one", "two"]
         assert await metadata.list_collection_names(filter={"name": "two"}) == ["two"]
         await client.drop_database("async_metadata")
+        assert "async_metadata" not in await client.list_database_names()
         assert await metadata.list_collection_names() == []
         await client.async_lifecycle.items.insert_one({"_id": 1})
         await client.async_lifecycle.items.drop()

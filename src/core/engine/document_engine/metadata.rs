@@ -4,6 +4,42 @@ use super::*;
 use crate::document::{BsonBinary, DocumentCursorBatch, DocumentListCollectionMetadataRequest};
 
 impl Engine {
+    pub(super) async fn list_document_database_names(
+        &self,
+        filter: DocumentFilter,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        limits: ResultLimits,
+    ) -> EngineResult<Vec<String>> {
+        let storage = self.inner.database.storage.clone();
+        self.run_document_storage_task(cancellation, deadline, move |cancellation, control| {
+            let mut check = || ensure_document_cpu_active(cancellation, &control);
+            let matcher = DocumentMatcher::compile_with_check(filter.document(), &mut check)?;
+            // Full Mongo listDatabases may filter by disk statistics even when
+            // nameOnly is true. Never evaluate unavailable statistics as missing.
+            require_database_name_filter(filter.document(), &mut check)?;
+            let names = storage.document_database_names_controlled(Arc::clone(&control))?;
+            let mut filtered = Vec::new();
+            let mut budget = DocumentResultBudget::new(limits);
+            for name in names {
+                check()?;
+                let row = BsonDocument::from_entries([("name", BsonValue::String(name.clone()))])
+                    .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?;
+                if matcher.matches_with_check(&row, &mut check)? {
+                    budget.add_rows(1)?;
+                    budget.add_bytes(
+                        DOCUMENT_RESULT_ROW_BYTES + DOCUMENT_RESULT_VALUE_BYTES + name.len() as u64,
+                    )?;
+                    filtered.push(name);
+                }
+            }
+            budget.finish()?;
+            check()?;
+            Ok(filtered)
+        })
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn start_collection_metadata_cursor(
         &self,
@@ -164,6 +200,34 @@ impl Engine {
         state.after_id = after;
         Ok((documents, has_more))
     }
+}
+
+fn require_database_name_filter(
+    filter: &BsonDocument,
+    check: &mut dyn FnMut() -> EngineResult<()>,
+) -> EngineResult<()> {
+    let mut pending = vec![filter];
+    while let Some(document) = pending.pop() {
+        for (field, value) in document.iter() {
+            check()?;
+            match (field, value) {
+                ("name", _) => {}
+                ("$and" | "$or" | "$nor", BsonValue::Array(clauses)) => {
+                    for clause in clauses {
+                        if let BsonValue::Document(clause) = clause {
+                            pending.push(clause);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(unsupported(
+                        "database name discovery supports filters on name only; database statistics are not implemented",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn collection_metadata_document(

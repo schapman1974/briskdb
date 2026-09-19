@@ -1,5 +1,18 @@
 # Unreleased
 
+Logical document database-name discovery now uses the shared engine through
+Rust, native sync/async Python `list_database_names`, and Mongo
+`listDatabases` with `nameOnly: true`. PyMongo's sync/async name helpers work
+without synthetic admin/local databases or leaking SQL/internal catalog objects.
+Shared name filters and request controls apply even on an empty catalog; results
+are bounded by the existing 64-database/63-byte-name catalog limits. Creation,
+last-collection removal, drop, and reopen are reflected in a validated snapshot.
+Attempting a 65th database now fails with a capacity error before allocation,
+without degrading otherwise-valid storage; dropping a database frees a slot.
+Full size/statistics replies and statistics-dependent filters remain explicitly
+unsupported: logical databases share physical files, and this change does not
+invent an allocation policy. No storage format or frozen-contract change.
+
 Plain Mongo `create` and paged `listCollections` now use the shared Rust engine.
 Real sync/async PyMongo can explicitly create collections, list names, and filter
 full collection metadata with retained getMore/killCursors support. Native
@@ -11,7 +24,7 @@ disappear between pages, and drop/recreate cannot revive an old database cursor.
 Full metadata includes persisted options, an opaque stable UUIDv8, and the real
 built-in unique `_id_` definition. No Mongo index format version is invented.
 UUIDs derive from existing durable identities; this adds no storage migration.
-Advanced collection options, database listings/statistics, and index metadata
+Advanced collection options, full database statistics, and index metadata
 cursors remain unsupported; this does not close the full lifecycle milestone.
 
 The required Mongo compatibility job now executes all 112 frozen sync/async

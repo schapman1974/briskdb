@@ -608,8 +608,11 @@ requires an earlier dependency:
       Format 16 upgrades preserve existing data; interrupted accepted drops roll
       forward on reopen. Explicit plain wire creation and retained collection
       metadata cursors now share the engine. Names/full metadata, filters, stable
-      UUIDs, and pooled getMore work with real sync/async PyMongo. Database
-      listings and advanced creation options remain open.
+      UUIDs, and pooled getMore work with real sync/async PyMongo. Names-only
+      database discovery now shares exact-name filtering and request controls
+      across Rust, native Python, and PyMongo. Full database statistics and
+      advanced creation options remain open; shared physical files are not
+      misreported as independent per-database disk usage.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.
