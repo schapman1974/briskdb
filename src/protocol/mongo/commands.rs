@@ -13,7 +13,7 @@ use crate::{
         DocumentCreateCollectionRequest, DocumentFilter, DocumentFindRequest,
         DocumentInsertRequest, DocumentListCollectionsRequest, DocumentNamespace,
         DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentResult,
-        DocumentWriteOptions, encode_document_with_options,
+        DocumentWriteOptions, decode_document_batch_with_options, encode_document_with_options,
     },
 };
 
@@ -63,9 +63,9 @@ impl CommandError {
         ])
     }
 
-    fn write_document(&self) -> BsonDocument {
+    fn write_document(&self, index: usize) -> BsonDocument {
         fields([
-            ("index", BsonValue::Int32(0)),
+            ("index", BsonValue::Int32(index as i32)),
             ("code", BsonValue::Int32(self.code)),
             ("codeName", BsonValue::from(self.name)),
             ("errmsg", BsonValue::from(self.message)),
@@ -150,7 +150,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     true
                 }
                 "documents" if name == "insert" => matches!(value, BsonValue::Array(_)),
-                "ordered" if name == "insert" => matches!(value, BsonValue::Boolean(true)),
+                "ordered" if name == "insert" => matches!(value, BsonValue::Boolean(_)),
                 "bypassDocumentValidation" if name == "insert" => {
                     matches!(value, BsonValue::Boolean(false))
                 }
@@ -168,16 +168,15 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             }
         }
         let command = if name == "insert" {
-            let document = single_insert(request)?;
-            // PyMongo generates missing IDs before sending insert_one. Server
-            // ID generation and bulk-write outcomes remain the insert milestone.
-            if document.get_first("_id").is_none() {
-                return Err(CommandError::invalid());
-            }
+            let documents = insert_documents(request)?;
+            let ordered = !matches!(
+                request.body.get_first("ordered"),
+                Some(BsonValue::Boolean(false))
+            );
             Command::Insert(DocumentInsertRequest::new(
                 namespace,
-                vec![document],
-                DocumentWriteOptions::new(),
+                documents,
+                DocumentWriteOptions::new().with_ordered(ordered),
             )?)
         } else {
             if !request.sequences.is_empty() {
@@ -241,27 +240,62 @@ fn valid_write_concern(value: &BsonValue) -> bool {
     }))
 }
 
-fn single_insert(request: &Request) -> Result<BsonDocument> {
-    if !request.sequences.is_empty() {
+fn insert_documents(request: &Request) -> Result<Vec<BsonDocument>> {
+    let options = BsonCodecOptions::new()
+        .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)
+        .with_max_decoded_bytes(wire::MAX_DECODED_DOCUMENT_BYTES);
+    let documents = if !request.sequences.is_empty() {
         if request.sequences.len() != 1 || request.sequences[0].identifier != "documents" {
             return Err(CommandError::options());
         }
         let documents = &request.sequences[0].documents;
-        if documents.len() != 1 {
-            return Err(CommandError::unsupported());
+        if documents.is_empty() || documents.len() > 1000 {
+            return Err(CommandError::invalid());
         }
-        return wire::document(&documents[0]).map_err(|_| CommandError::invalid());
-    }
-    let Some(BsonValue::Array(documents)) = request.body.get_first("documents") else {
-        return Err(CommandError::invalid());
+        let raw: Vec<&[u8]> = documents.iter().map(|bytes| bytes.as_ref()).collect();
+        decode_document_batch_with_options(&raw, &options).map_err(|_| {
+            CommandError::new(
+                10334,
+                "BSONObjectTooLarge",
+                "insert batch exceeds decoded memory limit",
+            )
+        })?
+    } else {
+        let Some(BsonValue::Array(documents)) = request.body.get_first("documents") else {
+            return Err(CommandError::invalid());
+        };
+        if documents.is_empty() || documents.len() > 1000 {
+            return Err(CommandError::invalid());
+        }
+        documents
+            .iter()
+            .map(|value| match value {
+                BsonValue::Document(document) => Ok(document.clone()),
+                _ => Err(CommandError::invalid()),
+            })
+            .collect::<Result<Vec<_>>>()?
     };
-    if documents.len() != 1 {
-        return Err(CommandError::unsupported());
+    // ID generation belongs to the engine. Reserve the exact BSON ObjectId
+    // element size here so normalization cannot exceed the advertised limit.
+    for document in &documents {
+        let encoded = encode_document_with_options(document, &options)
+            .map_err(|_| CommandError::invalid())?;
+        if encoded.len()
+            + if document.get_first("_id").is_none() {
+                17
+            } else {
+                0
+            }
+            > wire::MAX_BOOTSTRAP_BSON_BYTES
+        {
+            return Err(CommandError::new(
+                10334,
+                "BSONObjectTooLarge",
+                "generated ID would exceed document limit",
+            ));
+        }
     }
-    let BsonValue::Document(document) = &documents[0] else {
-        return Err(CommandError::invalid());
-    };
-    Ok(document.clone())
+    Ok(documents)
 }
 
 /// Shared by connections of this listener. Catalog creation still goes through
@@ -397,16 +431,34 @@ impl Executor {
                     .call(session, identity, &context, DocumentCommand::Insert(insert))
                     .await
                 {
-                    Ok(DocumentResult::Insert(result)) => Ok(fields([
-                        ("ok", BsonValue::Double(1.0)),
-                        ("n", BsonValue::Int32(result.inserted_ids().len() as i32)),
-                    ])),
+                    Ok(DocumentResult::Insert(result)) => {
+                        let mut body = fields([
+                            ("ok", BsonValue::Double(1.0)),
+                            ("n", BsonValue::Int32(result.inserted_ids().len() as i32)),
+                        ]);
+                        if !result.write_errors().is_empty() {
+                            let errors = result
+                                .write_errors()
+                                .iter()
+                                .map(|error| {
+                                    let mapped = CommandError::from(EngineError::new(
+                                        error.kind(),
+                                        "batch write failed",
+                                    ));
+                                    BsonValue::Document(mapped.write_document(error.index()))
+                                })
+                                .collect();
+                            body.push("writeErrors", BsonValue::Array(errors))
+                                .expect("static field name");
+                        }
+                        Ok(body)
+                    }
                     Err(error) if error.code == 11000 => Ok(fields([
                         ("ok", BsonValue::Double(1.0)),
                         ("n", BsonValue::Int32(0)),
                         (
                             "writeErrors",
-                            BsonValue::Array(vec![BsonValue::Document(error.write_document())]),
+                            BsonValue::Array(vec![BsonValue::Document(error.write_document(0))]),
                         ),
                     ])),
                     Err(error) => Err(error),

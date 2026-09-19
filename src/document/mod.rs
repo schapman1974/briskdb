@@ -25,8 +25,8 @@ pub use catalog::{
 };
 pub use codec::{
     BSON_MAX_DECODED_BYTES, BSON_MAX_DOCUMENT_BYTES, BSON_MAX_NESTING_DEPTH, BsonCodecOptions,
-    DuplicateFieldPolicy, decode_document, decode_document_with_options, encode_document,
-    encode_document_with_options,
+    DuplicateFieldPolicy, decode_document, decode_document_batch_with_options,
+    decode_document_with_options, encode_document, encode_document_with_options,
 };
 pub use command::{
     DocumentAggregateRequest, DocumentCommand, DocumentCommandKind, DocumentContinueCursorRequest,
@@ -48,7 +48,7 @@ pub use options::{
 pub use plan::{DocumentPlan, DocumentPointPlan, DocumentScatterPlan};
 pub use result::{
     DocumentCursorBatch, DocumentDeleteResult, DocumentExecution, DocumentInsertResult,
-    DocumentResult, DocumentResultKind, DocumentUpdateResult,
+    DocumentResult, DocumentResultKind, DocumentUpdateResult, DocumentWriteError,
 };
 pub use value::{
     BsonBinary, BsonDateTime, BsonDecimal128, BsonDocument, BsonJavaScript, BsonObjectId,

@@ -12,7 +12,7 @@ use crate::document::{
 /// Conservative initial listener budget, also advertised during discovery.
 pub const MAX_BOOTSTRAP_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_BOOTSTRAP_BSON_BYTES: usize = 512 * 1024;
-const MAX_DECODED_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_DECODED_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SEQUENCE_DOCUMENTS: usize = 1000;
 const MAX_SEQUENCES: usize = 16;
 
@@ -45,7 +45,7 @@ pub fn decode_request(frame: Frame) -> io::Result<Request> {
     }
 }
 
-pub(super) fn document(bytes: &[u8]) -> io::Result<BsonDocument> {
+fn document(bytes: &[u8]) -> io::Result<BsonDocument> {
     decode_document_with_options(
         bytes,
         &BsonCodecOptions::new()

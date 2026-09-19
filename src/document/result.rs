@@ -102,10 +102,31 @@ impl fmt::Debug for DocumentCursorBatch {
     }
 }
 
-/// Result of inserting one or more documents in input order.
+/// A classified, payload-free failure of one input in a document write batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentWriteError {
+    index: usize,
+    kind: EngineErrorKind,
+}
+
+impl DocumentWriteError {
+    pub(crate) const fn new(index: usize, kind: EngineErrorKind) -> Self {
+        Self { index, kind }
+    }
+
+    pub const fn index(self) -> usize {
+        self.index
+    }
+    pub const fn kind(self) -> EngineErrorKind {
+        self.kind
+    }
+}
+
+/// Successful IDs and per-input failures, each in input order.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DocumentInsertResult {
     inserted_ids: Box<[BsonValue]>,
+    write_errors: Box<[DocumentWriteError]>,
     acknowledged: bool,
 }
 
@@ -130,15 +151,20 @@ impl DocumentInsertResult {
         }
         Ok(Self {
             inserted_ids: inserted_ids.into_boxed_slice(),
+            write_errors: Box::new([]),
             acknowledged: true,
         })
     }
 
-    pub(crate) fn from_validated(inserted_ids: Vec<BsonValue>) -> Self {
-        debug_assert!(!inserted_ids.is_empty());
-        debug_assert!(inserted_ids.len() as u64 <= MAX_DOCUMENT_BATCH_SIZE);
+    pub(crate) fn from_batch(
+        inserted_ids: Vec<BsonValue>,
+        write_errors: Vec<DocumentWriteError>,
+    ) -> Self {
+        debug_assert!(!inserted_ids.is_empty() || !write_errors.is_empty());
+        debug_assert!((inserted_ids.len() + write_errors.len()) as u64 <= MAX_DOCUMENT_BATCH_SIZE);
         Self {
             inserted_ids: inserted_ids.into_boxed_slice(),
+            write_errors: write_errors.into_boxed_slice(),
             acknowledged: true,
         }
     }
@@ -147,10 +173,16 @@ impl DocumentInsertResult {
         &self.inserted_ids
     }
 
+    pub fn write_errors(&self) -> &[DocumentWriteError] {
+        &self.write_errors
+    }
+
     pub const fn acknowledged(&self) -> bool {
         self.acknowledged
     }
 
+    /// Consume the successful IDs, discarding any per-input errors.
+    /// Inspect `write_errors()` first when the request contains multiple inputs.
     pub fn into_inserted_ids(self) -> Vec<BsonValue> {
         self.inserted_ids.into_vec()
     }
@@ -162,6 +194,7 @@ impl fmt::Debug for DocumentInsertResult {
             .debug_struct("DocumentInsertResult")
             .field("inserted_count", &self.inserted_ids.len())
             .field("inserted_ids", &"<redacted>")
+            .field("write_errors", &self.write_errors)
             .field("acknowledged", &self.acknowledged)
             .finish()
     }

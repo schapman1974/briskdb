@@ -268,7 +268,7 @@ with briskdb.open("./data", shards=4, documents=True) as db:
 
 PyMongo remains optional and is loaded only when a document method runs, so a
 SQL-only installation has no BSON dependency. The current slice supports
-collection/index metadata, one explicit-ID insert, empty or exact-`_id`
+collection/index metadata, single-document inserts with optional `_id`, empty or exact-`_id`
 find/count, and exact-`_id` deletion. Secondary index declarations remain
 `pending_build`.
 
@@ -348,8 +348,8 @@ more valuable than a star. Start with the
 - Multi-process access is same-host/local-filesystem only. Schema, catalog,
   upgrade, and recovery work requires sole-process ownership.
 - Pre-1.0 storage and public-library compatibility can change between releases.
-- Python document commands currently require explicit `_id` values and only
-  implement empty or exact-`_id` filters. Updates, aggregation, bulk writes,
+- Python document commands generate missing ObjectIds and currently only
+  implement empty or exact-`_id` filters. Updates, aggregation, embedded bulk writes,
   retained document cursors, and built secondary indexes are still planned.
 - Ubuntu 24.04 x86-64 receives the full required Rust CI suite. Python wheels
   receive native build, audit, install, restart, corruption, and concurrency
