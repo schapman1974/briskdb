@@ -3,7 +3,7 @@
 use std::{io, process::Command, time::Duration};
 
 use briskdb::{
-    BriskDb, EngineState,
+    BriskDb, DocumentSupport, EngineState,
     document::{BsonDocument, BsonValue, decode_document, encode_document},
     protocol::mongo::{Frame, FrameCodec, MAX_BOOTSTRAP_MESSAGE_BYTES, MongoServer, Opcode},
 };
@@ -19,6 +19,7 @@ async fn setup() -> (tempfile::TempDir, BriskDb, MongoServer) {
     let root = tempfile::tempdir().unwrap();
     let database = BriskDb::builder(root.path())
         .with_shard_count(2)
+        .with_document_support(DocumentSupport::Enabled)
         .open()
         .await
         .unwrap();
@@ -122,7 +123,7 @@ async fn modern_discovery_ping_and_unsupported_commands() {
         matches!(body.get_first("compression"), Some(BsonValue::Array(items)) if items.is_empty())
     );
     let mut coalesced = packet(&command("ping"), 43, 0);
-    coalesced.extend_from_slice(&packet(&command("find"), 44, 0));
+    coalesced.extend_from_slice(&packet(&command("aggregate"), 44, 0));
     stream.write_all(&coalesced).await.unwrap();
     assert_eq!(response(&mut stream).await.0.response_to, 43);
     let (frame, body) = response(&mut stream).await;
@@ -271,27 +272,311 @@ async fn finite_connection_cap_rejects_overflow() {
 #[tokio::test]
 #[ignore = "requires pinned PyMongo; CI runs this explicitly with BRISKDB_MONGO_WIRE_PYTHON"]
 async fn real_pymongo_sync_async_discovery() {
-    let (_root, database, mut server) = setup().await;
+    let (root, database, mut server) = setup().await;
+    let output = run_driver(server.address(), "initial").await;
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+    assert_driver(output);
+    let database = BriskDb::builder(root.path())
+        .with_shard_count(2)
+        .with_document_support(DocumentSupport::Enabled)
+        .open()
+        .await
+        .unwrap();
+    let mut server = MongoServer::start(&database, "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let output = run_driver(server.address(), "reopened").await;
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+    assert_driver(output);
+}
+
+async fn run_driver(address: std::net::SocketAddr, phase: &'static str) -> std::process::Output {
     let python = std::env::var("BRISKDB_MONGO_WIRE_PYTHON").unwrap_or_else(|_| "python3".into());
-    let uri = format!("mongodb://{}/", server.address());
-    let output = tokio::task::spawn_blocking(move || {
+    let uri = format!("mongodb://{address}/");
+    tokio::task::spawn_blocking(move || {
         Command::new(python)
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/mongo_wire_client.py"
             ))
             .arg(uri)
+            .arg(phase)
             .output()
             .unwrap()
     })
     .await
-    .unwrap();
-    server.close().await.unwrap();
-    database.close().await.unwrap();
+    .unwrap()
+}
+
+fn assert_driver(output: std::process::Output) {
     assert!(
         output.status.success(),
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn insert_command(collection: &str, document: BsonDocument) -> BsonDocument {
+    BsonDocument::from_entries([
+        ("insert", BsonValue::from(collection)),
+        (
+            "documents",
+            BsonValue::Array(vec![BsonValue::Document(document)]),
+        ),
+        ("$db", BsonValue::from("wire")),
+    ])
+    .unwrap()
+}
+
+fn find_command(collection: &str, id: BsonValue) -> BsonDocument {
+    BsonDocument::from_entries([
+        ("find", BsonValue::from(collection)),
+        (
+            "filter",
+            BsonValue::Document(BsonDocument::from_entries([("_id", id)]).unwrap()),
+        ),
+        ("$db", BsonValue::from("wire")),
+    ])
+    .unwrap()
+}
+
+async fn send_command(stream: &mut TcpStream, body: &BsonDocument) -> BsonDocument {
+    stream.write_all(&packet(body, 77, 0)).await.unwrap();
+    let (frame, response) = response(stream).await;
+    assert_eq!(frame.response_to, 77);
+    response
+}
+
+fn first_batch(body: &BsonDocument) -> &[BsonValue] {
+    let Some(BsonValue::Document(cursor)) = body.get_first("cursor") else {
+        panic!("expected cursor: {body:?}");
+    };
+    assert!(matches!(cursor.get_first("id"), Some(BsonValue::Int64(0))));
+    let Some(BsonValue::Array(documents)) = cursor.get_first("firstBatch") else {
+        panic!("expected firstBatch");
+    };
+    documents
+}
+
+fn engine_request(
+    command: briskdb::document::DocumentCommand,
+) -> briskdb::document::DocumentRequest {
+    briskdb::document::DocumentRequest::new(
+        briskdb::document::DocumentRequestId::new([1; 16]).unwrap(),
+        briskdb::RequestContext::new(),
+        command,
+    )
+}
+
+#[tokio::test]
+async fn wire_and_embedded_documents_share_the_engine_and_survive_reopen() {
+    use briskdb::document::{
+        DocumentCommand, DocumentFilter, DocumentFindRequest, DocumentNamespace, DocumentPlan,
+        DocumentReadOptions, DocumentResult,
+    };
+    let (root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let document = BsonDocument::from_entries([
+        ("_id", BsonValue::Int64(42)),
+        ("value", BsonValue::from("shared")),
+    ])
+    .unwrap();
+    let inserted = send_command(&mut stream, &insert_command("items", document.clone())).await;
+    assert!(matches!(inserted.get_first("n"), Some(BsonValue::Int32(1))));
+    let execution = database
+        .execute_document(
+            &database.session(),
+            engine_request(DocumentCommand::Find(DocumentFindRequest::new(
+                DocumentNamespace::new("wire", "items").unwrap(),
+                DocumentFilter::new(
+                    BsonDocument::from_entries([("_id", BsonValue::Double(42.0))]).unwrap(),
+                )
+                .unwrap(),
+                DocumentReadOptions::new(),
+            ))),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(execution.plan(), Some(DocumentPlan::Point(_))));
+    let DocumentResult::Cursor(batch) = execution.result() else {
+        panic!("expected engine cursor");
+    };
+    assert!(batch.documents()[0].representation_eq(&document));
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+    let database = BriskDb::builder(root.path())
+        .with_shard_count(2)
+        .with_document_support(DocumentSupport::Enabled)
+        .open()
+        .await
+        .unwrap();
+    let mut server = MongoServer::start(&database, "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let found = send_command(&mut stream, &find_command("items", BsonValue::Int32(42))).await;
+    assert!(
+        matches!(first_batch(&found), [BsonValue::Document(actual)] if actual.representation_eq(&document))
+    );
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_data_commands_and_missing_reads_do_not_create_collections() {
+    use briskdb::document::{
+        DocumentCommand, DocumentListCollectionsRequest, DocumentReadOptions, DocumentResult,
+    };
+    let (_root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let document = BsonDocument::from_entries([("_id", BsonValue::Int32(1))]).unwrap();
+    for (field, value) in [
+        ("ordered", BsonValue::Boolean(false)),
+        ("bypassDocumentValidation", BsonValue::Boolean(true)),
+        ("txnNumber", BsonValue::Int64(1)),
+        (
+            "writeConcern",
+            BsonValue::Document(
+                BsonDocument::from_entries([("w", BsonValue::from("majority"))]).unwrap(),
+            ),
+        ),
+    ] {
+        let mut command = insert_command("rejected", document.clone());
+        command.push(field, value).unwrap();
+        let reply = send_command(&mut stream, &command).await;
+        assert!(
+            matches!(reply.get_first("code"), Some(BsonValue::Int32(72))),
+            "{reply:?}"
+        );
+    }
+    let missing = send_command(&mut stream, &find_command("missing", BsonValue::Int32(1))).await;
+    assert!(first_batch(&missing).is_empty());
+    let metadata = database
+        .execute_document(
+            &database.session(),
+            engine_request(DocumentCommand::ListCollections(
+                DocumentListCollectionsRequest::new("wire", DocumentReadOptions::new()).unwrap(),
+            )),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(metadata.result(), DocumentResult::Collections(items) if items.is_empty()));
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn document_commands_respect_disabled_host_support() {
+    let root = tempfile::tempdir().unwrap();
+    let database = BriskDb::builder(root.path())
+        .with_shard_count(2)
+        .open()
+        .await
+        .unwrap();
+    let mut server = MongoServer::start(&database, "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let reply = send_command(
+        &mut stream,
+        &insert_command(
+            "disabled",
+            BsonDocument::from_entries([("_id", BsonValue::Int32(1))]).unwrap(),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        reply.get_first("code"),
+        Some(BsonValue::Int32(20))
+    ));
+    let reply = send_command(&mut stream, &command("ping")).await;
+    assert!(matches!(
+        reply.get_first("ok"),
+        Some(BsonValue::Double(1.0))
+    ));
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn unacknowledged_insert_executes_without_emitting_a_reply() {
+    let (_root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let document = BsonDocument::from_entries([("_id", BsonValue::from("one-way"))]).unwrap();
+    let mut insert = insert_command("items", document.clone());
+    insert
+        .push(
+            "writeConcern",
+            BsonValue::Document(BsonDocument::from_entries([("w", BsonValue::Int32(0))]).unwrap()),
+        )
+        .unwrap();
+    let mut bytes = packet(&insert, 1, 2);
+    bytes.extend_from_slice(&packet(
+        &find_command("items", BsonValue::from("one-way")),
+        2,
+        0,
+    ));
+    stream.write_all(&bytes).await.unwrap();
+    let (frame, body) = response(&mut stream).await;
+    assert_eq!(frame.response_to, 2);
+    assert!(
+        matches!(first_batch(&body), [BsonValue::Document(actual)] if actual.representation_eq(&document))
+    );
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_usable() {
+    use briskdb::document::{
+        DocumentCommand, DocumentInsertRequest, DocumentNamespace, DocumentWriteOptions,
+    };
+    let (_root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let seed = BsonDocument::from_entries([("_id", BsonValue::from("seed"))]).unwrap();
+    assert!(matches!(
+        send_command(&mut stream, &insert_command("items", seed))
+            .await
+            .get_first("n"),
+        Some(BsonValue::Int32(1))
+    ));
+    let large = BsonDocument::from_entries([
+        ("_id", BsonValue::from("large")),
+        ("value", BsonValue::String("x".repeat(600 * 1024))),
+    ])
+    .unwrap();
+    database
+        .execute_document(
+            &database.session(),
+            engine_request(DocumentCommand::Insert(
+                DocumentInsertRequest::new(
+                    DocumentNamespace::new("wire", "items").unwrap(),
+                    vec![large],
+                    DocumentWriteOptions::new(),
+                )
+                .unwrap(),
+            )),
+        )
+        .await
+        .unwrap();
+    let reply = send_command(
+        &mut stream,
+        &find_command("items", BsonValue::from("large")),
+    )
+    .await;
+    assert!(
+        matches!(reply.get_first("code"), Some(BsonValue::Int32(10334))),
+        "{reply:?}"
+    );
+    assert!(matches!(
+        send_command(&mut stream, &command("ping"))
+            .await
+            .get_first("ok"),
+        Some(BsonValue::Double(1.0))
+    ));
+    server.close().await.unwrap();
+    database.close().await.unwrap();
 }

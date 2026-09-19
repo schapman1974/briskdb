@@ -45,7 +45,7 @@ pub fn decode_request(frame: Frame) -> io::Result<Request> {
     }
 }
 
-fn document(bytes: &[u8]) -> io::Result<BsonDocument> {
+pub(super) fn document(bytes: &[u8]) -> io::Result<BsonDocument> {
     decode_document_with_options(
         bytes,
         &BsonCodecOptions::new()

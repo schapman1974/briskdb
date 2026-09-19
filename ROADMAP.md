@@ -481,17 +481,26 @@ requires an earlier dependency:
       heap per document, eight connections, bounded sequences/batches, and an
       absolute 15-second frame-read deadline. Shutdown joins connection/parser
       work without closing the borrowed engine. CLI/common listener assembly,
-      negotiated compression, expanded resource/fuzz gates, and data dispatch
+      negotiated compression and expanded resource/fuzz gates
       remain; this is not a completed Mongo compatibility milestone.
     - [ ] [#170](https://github.com/schapman1974/briskdb/issues/170) and
       [#169](https://github.com/schapman1974/briskdb/issues/169) — standalone
       hello/isMaster, ping, buildInfo, correlated replies, and initial strict
       option validation implemented. No sessions, retryable writes, replication,
-      change streams, or compression are advertised. Data commands fail
-      explicitly. Required CI smoke exercises real PyMongo 4.17.0 sync/async
-      discovery, pooling, reconnect, and unsupported-command errors (#184).
-      Next: connect supported exact-ID document commands and extend command/error
-      contracts; cursor and broad semantic compatibility remain later work.
+      change streams, or compression are advertised. Required CI smoke exercises
+      real PyMongo 4.17.0 sync/async discovery, pooling, reconnect, and explicit
+      unsupported-command errors (#184).
+    - [ ] Initial wire data slice for [#173](https://github.com/schapman1974/briskdb/issues/173),
+      [#172](https://github.com/schapman1974/briskdb/issues/172), and
+      [#180](https://github.com/schapman1974/briskdb/issues/180): single-document
+      insert and literal exact-ID find now use the same enabled document engine
+      as embedded Rust/Python. First writes provision collections through the
+      engine, duplicate IDs map to `DuplicateKeyError`, and read replies exhaust
+      a zero-ID cursor. Tests cover BSON fidelity, numeric-equivalent IDs,
+      cross-interface access, restart, host enablement, one-way writes, and
+      response limits. Missing collections read empty without creating metadata.
+      Insert batches, server-generated IDs, updates/deletes, retained cursors,
+      general queries, and full collection lifecycle remain open.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.
