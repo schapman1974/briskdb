@@ -74,7 +74,7 @@ before storage admission. The current option contract is:
 | Find `projection` | Basic inclusion/exclusion document, dotted/nested paths, arrays, and `_id` rules; validated before missing-collection handling |
 | Find `sort` | Up to 32 ordinary fields with numeric `1`/`-1` directions; global BSON order with stable natural-order ties. Empty document preserves natural order. Metadata/expression sorts are unsupported. |
 | Find `batchSize` | Integer from 0 through 1000; zero opens an empty initial batch. Default 101. |
-| Aggregate `pipeline` / `cursor` | Required stage array and cursor document; cursor accepts only `batchSize` from 0 through 1000 (default 101). Basic match/sort/skip/limit/count stages; absent collection returns empty after validation. |
+| Aggregate `pipeline` / `cursor` | Required stage array and cursor document; cursor accepts only `batchSize` from 0 through 1000 (default 101). Basic stages plus project/set/addFields/unset; absent collection returns empty after validation. |
 | Aggregate `allowDiskUse` | Only `false`; there is no disk spill |
 | `getMore` `batchSize` | Integer from 1 through 1000; default 101. Pages also end at the wire byte budget. |
 | Find `singleBatch` | Boolean; `true` intentionally returns only the first batch, with cursor ID zero |
@@ -151,7 +151,14 @@ modes against the frozen implementation, separately from the full candidate
 command corpus. Real-driver tests cover sync/async paging, empty initial batches,
 pooled-socket handoff, byte caps, cleanup, validation and restart. Hints, comments,
 collation, read concern, sessions and other unimplemented options fail explicitly.
-Expressions/projections and group accumulators remain separate roadmap work.
+Projection stages now share `$project`, `$set`, `$addFields`, and `$unset`, with
+`$literal`/`$ifNull`/`$size`, field references, and `$$REMOVE`. Required CI compares
+another 7,037 source-locked whole pipelines in both modes. Exact field order,
+original-input assignment semantics, nested arrays/missing values, eager errors,
+and lazy limit consumption are preserved. Transform allocation/work/depth limits
+bound computed-output amplification before delivery. Real sync/async driver tests
+cover paging, expanded result byte caps, runtime-error cleanup, and restart.
+Groups, additional expressions, and full candidate-corpus acceptance remain open.
 
 Updates, deletes, and metadata cursors
 are not implemented by this checkpoint.

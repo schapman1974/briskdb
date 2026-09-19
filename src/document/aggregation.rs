@@ -4,7 +4,8 @@ use std::{cmp::Reverse, collections::BinaryHeap, fmt};
 
 use super::{
     BsonDocument, BsonErrorContext, BsonValue, DocumentMatcher, DocumentPipeline, DocumentSorter,
-    encode_document, matcher::integer, matcher::query_error, memory,
+    aggregation_transform::Transform, encode_document, matcher::integer, matcher::query_error,
+    memory,
 };
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
@@ -19,17 +20,20 @@ enum Stage {
     Skip(u64),
     Limit(u64),
     Count(String),
+    Transform(Transform),
 }
 
-/// An eagerly compiled `$match`/`$sort`/`$skip`/`$limit`/`$count` pipeline.
-/// Inputs are immutable and exact BSON representations survive unchanged.
+/// An eagerly compiled basic and projection-stage aggregation pipeline.
+/// Inputs are immutable and retained BSON representations survive unchanged.
 /// Sorts are stable relative to the preceding stage, not the original input.
 ///
-/// This first runner materializes its input and each stage. It rejects more
+/// The borrowed `execute` API materializes its input. It rejects more
 /// than 65,536 input rows, 64 MiB of conservatively charged working data (sort
 /// keys included), or four million checked work steps per execution. Compiled
 /// stages have a separate 64 MiB retention bound. A late limit does not bypass
-/// these quotas. No spilling, storage access or cursor ownership is provided.
+/// these quotas. `into_stream` instead accepts incremental owned inputs.
+/// Nonblocking stages are fused so limits stop upstream expression evaluation,
+/// including after blocking stages. No spilling or storage access is provided.
 pub struct DocumentAggregator {
     stages: Vec<Stage>,
     retained_bytes: usize,
@@ -113,6 +117,12 @@ impl DocumentAggregator {
                     }
                     (Stage::Count(field.clone()), field.len())
                 }
+                "$project" | "$set" | "$addFields" | "$unset" => {
+                    let transform =
+                        Transform::compile(name, stage, argument, &mut || budget.step())?;
+                    let bytes = transform.retained_bytes();
+                    (Stage::Transform(transform), bytes)
+                }
                 _ => return Err(query_error(115)),
             };
             add_bytes(&mut retained_bytes, bytes)?;
@@ -137,9 +147,11 @@ impl DocumentAggregator {
             .iter()
             .position(|stage| matches!(stage, Stage::Sort(_) | Stage::Count(_)))
             .unwrap_or(self.stages.len());
+        let remaining = prefix_counters(&self.stages[..boundary]);
         DocumentAggregationStream {
             plan: self,
             boundary,
+            remaining,
             rows: Vec::new(),
             count: 0,
             bytes: 0,
@@ -192,7 +204,7 @@ impl DocumentAggregator {
     }
 }
 
-/// Incremental execution of a compiled basic pipeline. Match/skip/limit stages
+/// Incremental execution of a compiled pipeline. Match/skip/limit/transform stages
 /// emit at most one owned row per input; the first count retains only a counter,
 /// and the first sort buffers bounded rows. `finish` flushes any blocking stage
 /// through the remaining shared stage executor. Engine-validated source rows
@@ -207,6 +219,7 @@ impl DocumentAggregator {
 pub struct DocumentAggregationStream {
     plan: DocumentAggregator,
     boundary: usize,
+    remaining: Vec<u64>,
     rows: Vec<Row>,
     count: usize,
     bytes: usize,
@@ -230,6 +243,11 @@ impl DocumentAggregationStream {
         self.plan
             .retained_bytes
             .saturating_add(self.bytes)
+            .saturating_add(
+                self.remaining
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
             .saturating_add(512)
     }
 
@@ -286,31 +304,24 @@ impl DocumentAggregationStream {
             self.consumed += 1;
             let retained_bytes =
                 DocumentAggregator::document_retained_bytes(&document, &mut || budget.step())?;
-            for stage in &mut self.plan.stages[..self.boundary] {
-                budget.step()?;
-                match stage {
-                    Stage::Match(matcher) => {
-                        if !matcher.matches_with_check(&document, &mut || budget.step())? {
-                            return Ok(None);
-                        }
-                    }
-                    Stage::Skip(remaining) => {
-                        if *remaining != 0 {
-                            *remaining -= 1;
-                            return Ok(None);
-                        }
-                    }
-                    Stage::Limit(remaining) => {
-                        if *remaining == 0 {
-                            self.exhausted = true;
-                            return Ok(None);
-                        }
-                        *remaining -= 1;
-                        self.exhausted |= *remaining == 0;
-                    }
-                    _ => unreachable!("prefix has no blocking stage"),
-                }
-            }
+            let Some(row) = execute_prefix(
+                &self.plan.stages[..self.boundary],
+                &mut self.remaining,
+                Row {
+                    document,
+                    retained_bytes,
+                },
+                &mut self.exhausted,
+                self.bytes,
+                &mut budget,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Row {
+                document,
+                retained_bytes,
+            } = row;
             budget.step()?;
             match self.plan.stages.get(self.boundary) {
                 Some(Stage::Sort(_)) => {
@@ -371,32 +382,114 @@ fn failed_stream() -> EngineError {
 }
 
 fn execute_stages(
-    stages: &[Stage],
+    mut stages: &[Stage],
     mut rows: Vec<Row>,
     budget: &mut Budget<'_>,
 ) -> EngineResult<Vec<Row>> {
-    for stage in stages {
+    while !stages.is_empty() {
         budget.step()?;
-        rows = match stage {
-            Stage::Match(matcher) => select(rows, budget, |_, row, budget| {
-                matcher.matches_with_check(&row.document, &mut || budget.step())
-            })?,
-            Stage::Sort(sorter) => sort(rows, sorter, budget)?,
-            Stage::Skip(amount) => select(rows, budget, |index, _, _| Ok(index as u64 >= *amount))?,
-            Stage::Limit(amount) => {
-                select(rows, budget, |index, _, _| Ok((index as u64) < *amount))?
+        let boundary = stages
+            .iter()
+            .position(|stage| matches!(stage, Stage::Sort(_) | Stage::Count(_)))
+            .unwrap_or(stages.len());
+        let mut remaining = prefix_counters(&stages[..boundary]);
+        let mut exhausted = false;
+        let mut next = Vec::new();
+        let mut count = 0;
+        let mut bytes = 0;
+        let mut unconsumed: usize = rows.iter().map(|row| row.retained_bytes).sum();
+        let counting = matches!(stages.get(boundary), Some(Stage::Count(_)));
+        // Fuse nonblocking stages. In particular, a later limit must stop
+        // evaluating earlier expressions on rows that will never be consumed.
+        for row in rows {
+            budget.step()?;
+            if exhausted {
+                break;
             }
-            Stage::Count(field) => {
-                let amount = rows.len();
-                // Drop input before allocating a new result document.
-                for _row in rows {
-                    budget.step()?;
+            unconsumed -= row.retained_bytes;
+            if let Some(row) = execute_prefix(
+                &stages[..boundary],
+                &mut remaining,
+                row,
+                &mut exhausted,
+                unconsumed + bytes,
+                budget,
+            )? {
+                count += 1;
+                if !counting {
+                    add_bytes(&mut bytes, row.retained_bytes)?;
+                    next.push(row);
                 }
-                count_row(field, amount, budget)?
             }
+        }
+        rows = match stages.get(boundary) {
+            Some(Stage::Sort(sorter)) => sort(next, sorter, budget)?,
+            Some(Stage::Count(field)) => count_row(field, count, budget)?,
+            None => return Ok(next),
+            _ => unreachable!("blocking boundary"),
         };
+        stages = &stages[boundary + 1..];
     }
     Ok(rows)
+}
+
+fn prefix_counters(stages: &[Stage]) -> Vec<u64> {
+    stages
+        .iter()
+        .map(|stage| match stage {
+            Stage::Skip(amount) | Stage::Limit(amount) => *amount,
+            _ => 0,
+        })
+        .collect()
+}
+
+fn execute_prefix(
+    stages: &[Stage],
+    remaining: &mut [u64],
+    mut row: Row,
+    exhausted: &mut bool,
+    retained_elsewhere: usize,
+    budget: &mut Budget<'_>,
+) -> EngineResult<Option<Row>> {
+    for (stage, remaining) in stages.iter().zip(remaining) {
+        budget.step()?;
+        match stage {
+            Stage::Match(matcher) => {
+                if !matcher.matches_with_check(&row.document, &mut || budget.step())? {
+                    return Ok(None);
+                }
+            }
+            Stage::Skip(_) => {
+                if *remaining != 0 {
+                    *remaining -= 1;
+                    return Ok(None);
+                }
+            }
+            Stage::Limit(_) => {
+                if *remaining == 0 {
+                    *exhausted = true;
+                    return Ok(None);
+                }
+                *remaining -= 1;
+                *exhausted |= *remaining == 0;
+            }
+            Stage::Transform(transform) => {
+                row.document = transform.apply(
+                    row.document,
+                    MAX_BYTES
+                        .checked_sub(retained_elsewhere)
+                        .ok_or_else(limit)?,
+                    &mut || budget.step(),
+                )?;
+                row.retained_bytes =
+                    DocumentAggregator::document_retained_bytes(&row.document, &mut || {
+                        budget.step()
+                    })?;
+            }
+            _ => unreachable!("nonblocking prefix"),
+        }
+    }
+    Ok(Some(row))
 }
 
 fn count_row(field: &str, amount: usize, budget: &mut Budget<'_>) -> EngineResult<Vec<Row>> {
@@ -443,21 +536,6 @@ impl Budget<'_> {
         }
         Ok(())
     }
-}
-
-fn select(
-    rows: Vec<Row>,
-    budget: &mut Budget<'_>,
-    mut keep: impl FnMut(usize, &Row, &mut Budget<'_>) -> EngineResult<bool>,
-) -> EngineResult<Vec<Row>> {
-    let mut selected = Vec::new();
-    for (index, row) in rows.into_iter().enumerate() {
-        budget.step()?;
-        if keep(index, &row, budget)? {
-            selected.push(row);
-        }
-    }
-    Ok(selected)
 }
 
 fn sort(
@@ -631,7 +709,7 @@ mod tests {
             ("$count", BsonValue::String("secret.field".into()), 40160),
             ("$count", BsonValue::String("_id".into()), 15948),
             ("$group", BsonValue::Document(doc(&[])), 115),
-            ("$project", BsonValue::Document(doc(&[])), 115),
+            ("$project", BsonValue::Document(doc(&[])), 51272),
             ("$unknown-secret", BsonValue::Null, 115),
         ] {
             let error = DocumentAggregator::compile(&pipeline(&[
@@ -996,5 +1074,42 @@ mod tests {
             stream.finish().unwrap(),
             [doc(&[("v", BsonValue::String("x".into()))])]
         );
+    }
+
+    #[test]
+    fn transforms_respect_memory_already_retained_by_other_rows() {
+        let plan = DocumentAggregator::compile(&pipeline(&[(
+            "$set",
+            BsonValue::Document(doc(&[("copy", BsonValue::from("$payload"))])),
+        )]))
+        .unwrap();
+        let document = doc(&[("payload", BsonValue::from("x".repeat(1024 * 1024)))]);
+        for retained in [0, MAX_BYTES - 2 * 1024 * 1024] {
+            let mut check = || Ok(());
+            let mut budget = Budget {
+                check: &mut check,
+                steps: 0,
+            };
+            let row = Row {
+                document: document.clone(),
+                retained_bytes: DocumentAggregator::document_retained_bytes(&document, &mut || {
+                    Ok(())
+                })
+                .unwrap(),
+            };
+            let result = execute_prefix(
+                &plan.stages,
+                &mut prefix_counters(&plan.stages),
+                row,
+                &mut false,
+                retained,
+                &mut budget,
+            );
+            if retained == 0 {
+                assert!(result.unwrap().is_some());
+            } else {
+                assert_eq!(result.err().unwrap().kind(), EngineErrorKind::LimitExceeded);
+            }
+        }
     }
 }
