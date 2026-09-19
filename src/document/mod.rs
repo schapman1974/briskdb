@@ -54,6 +54,7 @@ pub use command::{
     DocumentUpdateRequest, MAX_DOCUMENT_INDEX_NAME_BYTES,
 };
 pub use distinct::DocumentDistinct;
+pub(crate) use error::DocumentWriteRollback;
 pub use error::{
     BsonError, BsonErrorContext, BsonErrorKind, BsonResult, DocumentCursorError,
     DocumentMutationError,

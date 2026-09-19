@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::{
-    document::{DocumentRequestId, DocumentUpdateResult, DocumentUpdater},
+    document::{DocumentRequestId, DocumentUpdateResult, DocumentUpdater, DocumentWriteRollback},
     sqlite_error,
 };
 use rusqlite::{Transaction, TransactionBehavior};
@@ -76,66 +76,86 @@ impl Engine {
                         let transaction =
                             Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
                                 .map_err(sqlite_error::statement)?;
-                        let point = key.is_some();
-                        let mut after = None;
-                        let (mut matched, mut modified) = totals;
-                        loop {
-                            ensure_document_cpu_active(cancellation, control)?;
-                            let record = if point {
-                                match key.take() {
-                                    Some(key) => storage.get_document_on_connection(
+                        let outcome = (|| {
+                            let point = key.is_some();
+                            let mut after = None;
+                            let (mut matched, mut modified) = totals;
+                            loop {
+                                ensure_document_cpu_active(cancellation, control)?;
+                                let record = if point {
+                                    match key.take() {
+                                        Some(key) => storage.get_document_on_connection(
+                                            &transaction,
+                                            collection_id,
+                                            shard,
+                                            &key,
+                                            cancellation,
+                                        )?,
+                                        None => None,
+                                    }
+                                } else {
+                                    deletion::next_match(
+                                        storage,
                                         &transaction,
                                         collection_id,
                                         shard,
-                                        &key,
+                                        &mut after,
+                                        matcher.as_deref(),
                                         cancellation,
-                                    )?,
-                                    None => None,
-                                }
-                            } else {
-                                deletion::next_match(
+                                        control,
+                                    )?
+                                };
+                                let Some(record) = record else { break };
+                                let execution = single_mutation::update_record(
                                     storage,
                                     &transaction,
-                                    collection_id,
-                                    shard,
-                                    &mut after,
-                                    matcher.as_deref(),
+                                    record,
+                                    &updater,
+                                    max_document_bytes,
+                                    single_mutation::MutationReturn::Counts,
+                                    None,
+                                    request_id,
+                                    plan.clone(),
+                                    limits,
                                     cancellation,
                                     control,
-                                )?
-                            };
-                            let Some(record) = record else { break };
-                            let execution = single_mutation::update_record(
-                                storage,
-                                &transaction,
-                                record,
-                                &updater,
-                                max_document_bytes,
-                                single_mutation::MutationReturn::Counts,
-                                None,
-                                request_id,
-                                plan.clone(),
-                                limits,
-                                cancellation,
-                                control,
-                            )?;
-                            let DocumentResult::Update(result) = execution.into_parts().2 else {
-                                return Err(EngineError::new(
-                                    EngineErrorKind::Internal,
-                                    "unexpected field-update result",
-                                ));
-                            };
-                            matched = matched
-                                .checked_add(result.matched_count())
-                                .ok_or_else(result_size_overflow)?;
-                            modified = modified
-                                .checked_add(result.modified_count())
-                                .ok_or_else(result_size_overflow)?;
+                                )?;
+                                let DocumentResult::Update(result) = execution.into_parts().2
+                                else {
+                                    return Err(EngineError::new(
+                                        EngineErrorKind::Internal,
+                                        "unexpected field-update result",
+                                    ));
+                                };
+                                matched = matched
+                                    .checked_add(result.matched_count())
+                                    .ok_or_else(result_size_overflow)?;
+                                modified = modified
+                                    .checked_add(result.modified_count())
+                                    .ok_or_else(result_size_overflow)?;
+                            }
+                            ensure_document_cpu_active(cancellation, control)?;
+                            Ok((matched, modified))
+                        })();
+                        match outcome {
+                            Ok(counts) => {
+                                // A commit/cleanup failure is never certified as a
+                                // rolled-back statement. Known successful commits
+                                // are not reclassified by late cancellation.
+                                transaction.commit().map_err(sqlite_error::statement)?;
+                                Ok(counts)
+                            }
+                            Err(error) => {
+                                // Do not rely on Drop's best-effort rollback when
+                                // certifying an error as safe for batch continuation.
+                                transaction.rollback().map_err(sqlite_error::statement)?;
+                                Err(if totals.1 == 0 {
+                                    DocumentWriteRollback::wrap(error)
+                                } else {
+                                    error
+                                })
+                            }
                         }
-                        ensure_document_cpu_active(cancellation, control)?;
-                        transaction.commit().map_err(sqlite_error::statement)?;
-                        // Known commits are not reclassified by late cancellation.
-                        Ok((matched, modified))
                     },
                 )
                 .await?;

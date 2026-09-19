@@ -204,12 +204,19 @@ On validation, cancellation, or storage failure, the current shard rolls back;
 earlier committed shards remain changed. There is no cross-shard snapshot or
 all-or-nothing transaction, nor a claim of MongoDB's individual-document failure
 boundary or frozen TinyMongo's collection-wide validation boundary. Successful
-final commits are not reclassified by late cancellation. Wire parsing errors
-remain indexed statement errors, but a runtime multi-update failure aborts the
-whole command (including unordered batches) without fabricated partial counts.
+final commits are not reclassified by late cancellation. A runtime failure is
+certified as having no committed document changes only after an explicit
+rollback succeeds and earlier shards reported zero modifications (earlier
+no-op matches are allowed). This internal evidence preserves the original error
+kind/cause chain. The wire adapter reports certified validation/resource errors
+as indexed write errors, stopping ordered batches but allowing unordered ones
+to continue. Parsing errors remain indexed as before. Earlier changed shards,
+commit/rollback failures, cancellation, and other operational or uncertified
+failures still abort the whole command without fabricated partial counts.
 Native callers receive an error, not a successful result with guessed counts.
-Tests deterministically cover later-shard validation failure, cancellation/task
-abort after an earlier commit, restart, and continued session/lock usability.
+Tests deterministically cover first-shard rollback after provisional writes,
+earlier no-op shards, later-shard failure after committed changes, ordered and
+unordered continuation, cancellation/task abort, restart, and session/lock reuse.
 
 ### Replacement and returned-image boundaries
 
