@@ -63,7 +63,7 @@ The current engine executes:
 | `ListCollections` | Returns collection metadata for one exact database name |
 | `ListCollectionMetadata` | Filters and pages BSON collection metadata through the shared cursor registry; `name_only` restricts both output and filtering to name/type |
 | `ListDatabaseNames` | Returns `DatabaseNames(Box<[String]>)` from a validated document catalog snapshot; shared filters on `name` and logical combinations, normal request controls, no disk statistics |
-| `CreateIndex` | Declares index metadata and returns its name; non-built-in indexes remain pending until physical index work lands |
+| `CreateIndex` | Validates and normalizes ordered keys, resolves a bounded default/explicit name, and declares pending index metadata; it does not build or enforce a secondary index |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
 | `Find` | Evaluates BSON match expressions and returns a bounded batch with a continuation ID when needed |
@@ -84,6 +84,33 @@ accounting. Its result is independent of catalog page size and unrelated metadat
 size. Missing databases/collections return false; names are exact and case-sensitive.
 The wire adapter uses this same command for absent-collection handling instead of
 listing the catalog. Existence and a later read/write are not one atomic operation.
+
+Index declarations validate ordered, distinct dotted field paths before namespace
+lookup or catalog mutation. Empty path components and `$`-prefixed components are
+rejected. Ordinary numeric directions exactly equal to `1` or `-1` normalize to
+Int32; booleans, other numbers, and special index types are rejected. Key order
+remains significant. Bounds are 32 fields, 100 path components, 1 MiB encoded
+specification, and 255 UTF-8 bytes for an explicit or generated name. Validation
+runs on a controlled worker and observes cancellation/deadlines.
+
+Omitting the name produces ordered `field_direction` pairs joined by underscores,
+following the ordinary [MongoDB naming convention](https://www.mongodb.com/docs/manual/indexes/).
+An explicit short name can accommodate a long valid field path. `_id`/`_id_`
+remain reserved; this checkpoint does not add built-in-index redeclaration.
+Same-name declarations with identical ordered keys and uniqueness are idempotent;
+conflicts fail without catalog changes. Legacy numeric direction aliases compare
+semantically without rewriting their original stored BSON. Opaque legacy
+specification envelopes retain byte-exact conflict checks. Existing metadata is
+still readable; new validation does not migrate or activate older declarations.
+
+All declared secondary indexes remain `PendingBuild`, including `unique` ones:
+they are not query authorities or uniqueness constraints. Sparse/partial options,
+physical builds, write-time maintenance, wire index commands, and index cursors
+remain future work. Required CI compares 64 valid ascending integer-key definitions
+against unchanged TinyMongo index source, including names, key order, flags and
+restart metadata. Descending/numeric-alias normalization, invalid inputs,
+resource limits and legacy metadata preservation are independently tested; no
+frozen expectations or compatibility allowances are changed.
 
 Namespace drops share the schema-migration gate and require sole-process
 ownership. Preflight errors leave data unchanged; interruption after the durable

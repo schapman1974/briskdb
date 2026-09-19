@@ -84,6 +84,129 @@ async fn insert(
 }
 
 #[tokio::test]
+async fn index_definitions_normalize_names_before_catalog_changes_and_survive_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    let keys = BsonDocument::from_entries([
+        ("profile.name", BsonValue::Int64(1)),
+        ("rank", BsonValue::Double(-1.0)),
+    ])
+    .unwrap();
+    for supplied_name in [None, Some("profile.name_1_rank_-1")] {
+        let mut index = DocumentIndexRequest::new(keys.clone())
+            .unwrap()
+            .with_unique(true);
+        if let Some(name) = supplied_name {
+            index = index.with_name(name).unwrap();
+        }
+        let execution = engine
+            .execute_document(
+                &session,
+                request(
+                    2,
+                    RequestContext::new(),
+                    DocumentCommand::CreateIndex(DocumentCreateIndexRequest::new(
+                        namespace(),
+                        index,
+                        DocumentWriteOptions::new(),
+                    )),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(execution.result(), DocumentResult::IndexName(name) if name == "profile.name_1_rank_-1")
+        );
+    }
+    for (key, direction) in [
+        ("bad..path", BsonValue::Int32(1)),
+        ("valid", BsonValue::Boolean(true)),
+        ("valid", BsonValue::from("hashed")),
+    ] {
+        let index =
+            DocumentIndexRequest::new(BsonDocument::from_entries([(key, direction)]).unwrap())
+                .unwrap()
+                .with_name("must_not_exist")
+                .unwrap();
+        let error = engine
+            .execute_document(
+                &session,
+                request(
+                    3,
+                    RequestContext::new(),
+                    DocumentCommand::CreateIndex(DocumentCreateIndexRequest::new(
+                        namespace(),
+                        index,
+                        DocumentWriteOptions::new(),
+                    )),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+    }
+    let conflict = DocumentIndexRequest::new(keys)
+        .unwrap()
+        .with_name("profile.name_1_rank_-1")
+        .unwrap();
+    assert_eq!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    4,
+                    RequestContext::new(),
+                    DocumentCommand::CreateIndex(DocumentCreateIndexRequest::new(
+                        namespace(),
+                        conflict,
+                        DocumentWriteOptions::new()
+                    ))
+                )
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::FailedPrecondition
+    );
+    drop(session);
+    drop(engine);
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let execution = engine
+        .execute_document(
+            &engine.session(),
+            request(
+                5,
+                RequestContext::new(),
+                DocumentCommand::ListIndexes(DocumentListIndexesRequest::new(
+                    namespace(),
+                    DocumentReadOptions::new(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    let DocumentResult::Indexes(indexes) = execution.result() else {
+        panic!("indexes")
+    };
+    assert_eq!(indexes.len(), 2);
+    let index = indexes.iter().find(|index| !index.is_built_in()).unwrap();
+    assert_eq!(index.name(), "profile.name_1_rank_-1");
+    assert!(index.is_unique());
+    assert_eq!(index.lifecycle(), DocumentIndexLifecycle::PendingBuild);
+    assert!(
+        index.specification().representation_eq(
+            &BsonDocument::from_entries([
+                ("profile.name", BsonValue::Int32(1)),
+                ("rank", BsonValue::Int32(-1))
+            ])
+            .unwrap()
+        )
+    );
+}
+
+#[tokio::test]
 async fn collection_existence_is_targeted_bounded_read_only_and_persistent() {
     let temp = tempfile::tempdir().unwrap();
     let engine = Engine::open(temp.path(), 2).await.unwrap();

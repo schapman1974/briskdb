@@ -416,6 +416,16 @@ enforcing BriskDB's stricter safety rules. These boundaries have independent
 tests, not frozen allowances or rewritten expected results. Independent
 tests check resource and commit limits. Additional update operators and index metadata cursors remain
 unimplemented.
+
+The native index-definition foundation now validates ordered keys, normalizes
+numeric directions and generates bounded default names before catalog mutation.
+Required CI compares 64 valid ascending integer-key definitions with the unchanged
+frozen index model, including pending metadata after restart. Descending/numeric
+aliases and invalid/resource-limited definitions have independent tests. This is
+not physical index support: secondary declarations still enforce no uniqueness,
+and wire index commands and metadata cursors remain unimplemented. The full frozen
+index suites remain open; no frozen expected result or allowance is changed.
+
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required
 real-driver CI also verifies BSON fidelity, ordered/unordered duplicate failures,

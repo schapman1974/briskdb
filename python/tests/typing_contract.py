@@ -31,7 +31,7 @@ def sync_contract(path: str) -> None:
         "app", "notes", request_id=request_id
     )["collection"]["id"]
     index_lifecycle: Literal["pending_build"] = document_session.create_index(
-        "app", "notes", {"body": 1}, name="body_1"
+        "app", "notes", {"body": 1}
     )["lifecycle"]
     inserted: int = document_session.insert_one(
         "app", "notes", {"_id": 1, "body": "typed"}

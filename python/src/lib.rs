@@ -1591,7 +1591,7 @@ impl Session {
         collection,
         keys,
         *,
-        name,
+        name = None,
         unique = false,
         request_id = None,
         timeout_ms = None,
@@ -1606,7 +1606,7 @@ impl Session {
         database: String,
         collection: String,
         keys: Py<PyAny>,
-        name: String,
+        name: Option<String>,
         unique: bool,
         request_id: Option<Py<PyAny>>,
         timeout_ms: Option<u64>,
@@ -1617,8 +1617,10 @@ impl Session {
         self.require_document_support()?;
         let namespace = python_engine_result(DocumentNamespace::new(database, collection))?;
         let keys = extract_bson_document(py, keys.bind(py), self.shared.uuid_representation)?;
-        let index = python_engine_result(DocumentIndexRequest::new(keys))?;
-        let index = python_engine_result(index.with_name(name))?.with_unique(unique);
+        let mut index = python_engine_result(DocumentIndexRequest::new(keys))?.with_unique(unique);
+        if let Some(name) = name {
+            index = python_engine_result(index.with_name(name))?;
+        }
         let command = DocumentCommand::CreateIndex(DocumentCreateIndexRequest::new(
             namespace,
             index,

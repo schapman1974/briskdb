@@ -949,63 +949,84 @@ mod enabled {
             debug_assert!(spec_bson.len() <= manifest::MAX_DOCUMENT_METADATA_BSON_BYTES);
             let manifest_path = self.root.join("manifest.sqlite");
             let mut connection = open_existing_manifest(&manifest_path)?;
-            run_manifest_controlled(&mut connection, control.clone(), |connection| {
-                configure_journal_mode(connection)?;
-                let transaction = connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .map_err(sqlite_error::storage)?;
-                require_ready_manifest(&transaction, self.shard_count())?;
-                require_active_collection(&transaction, collection_id)?;
-                let existing = transaction
-                    .query_row(
-                        "SELECT spec_bson, is_unique, lifecycle_state
+            let stored_spec =
+                run_manifest_controlled(&mut connection, control.clone(), |connection| {
+                    configure_journal_mode(connection)?;
+                    let transaction = connection
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .map_err(sqlite_error::storage)?;
+                    require_ready_manifest(&transaction, self.shard_count())?;
+                    require_active_collection(&transaction, collection_id)?;
+                    let existing = transaction
+                        .query_row(
+                            "SELECT spec_bson, is_unique, lifecycle_state
                          FROM briskdb_document_indexes
                          WHERE collection_id = ?1 AND index_name = ?2",
-                        params![to_sqlite_id(collection_id)?, name],
-                        |row| {
-                            Ok((
-                                row.get::<_, Vec<u8>>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, i64>(2)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                    .map_err(sqlite_error::storage)?;
-                if let Some((existing_spec, existing_unique, lifecycle)) = existing {
-                    if existing_spec != spec_bson
-                        || existing_unique != i64::from(unique)
-                        || lifecycle != INDEX_PENDING_BUILD
-                    {
-                        return Err(EngineError::new(
-                            EngineErrorKind::FailedPrecondition,
-                            "document index name already has a different declaration",
-                        ));
-                    }
-                } else {
-                    transaction
-                        .execute(
-                            "INSERT INTO briskdb_document_indexes (
+                            params![to_sqlite_id(collection_id)?, name],
+                            |row| {
+                                Ok((
+                                    row.get::<_, Vec<u8>>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, i64>(2)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .map_err(sqlite_error::storage)?;
+                    let stored_spec =
+                        if let Some((existing_spec, existing_unique, lifecycle)) = existing {
+                            // Legacy pending declarations can retain numeric direction
+                            // aliases. Normalizing a new request must not rewrite or
+                            // conflict with a semantically identical existing key list.
+                            let canonical_keys = !specification.is_empty()
+                                && specification
+                                    .iter()
+                                    .all(|(_, value)| matches!(value, BsonValue::Int32(1 | -1)));
+                            let same_spec = existing_spec == spec_bson
+                                || (canonical_keys
+                                    && decode_metadata_document(
+                                        &existing_spec,
+                                        "document index specification",
+                                    )? == *specification);
+                            if !same_spec
+                                || existing_unique != i64::from(unique)
+                                || lifecycle != INDEX_PENDING_BUILD
+                            {
+                                return Err(EngineError::new(
+                                    EngineErrorKind::FailedPrecondition,
+                                    "document index name already has a different declaration",
+                                ));
+                            }
+                            existing_spec
+                        } else {
+                            transaction
+                                .execute(
+                                    "INSERT INTO briskdb_document_indexes (
                                 collection_id, index_name, spec_bson, is_unique, is_builtin,
                                 index_format_version, lifecycle_state
                              ) VALUES (?1, ?2, ?3, ?4, 0, 1, ?5)",
-                            params![
-                                to_sqlite_id(collection_id)?,
-                                name,
-                                spec_bson,
-                                i64::from(unique),
-                                INDEX_PENDING_BUILD
-                            ],
-                        )
-                        .map_err(sqlite_error::storage)?;
-                    manifest::validate_document_catalog(&transaction, self.shard_count())?;
-                    manifest::refresh_manifest_digest(&transaction)?;
-                    require_ready_manifest(&transaction, self.shard_count())?;
-                }
-                ensure_control_active(&control, "before committing document index declaration")?;
-                transaction.commit().map_err(sqlite_error::storage)
-            })?;
-            let decoded = decode_metadata_document(&spec_bson, "document index specification")?;
+                                    params![
+                                        to_sqlite_id(collection_id)?,
+                                        name,
+                                        spec_bson,
+                                        i64::from(unique),
+                                        INDEX_PENDING_BUILD
+                                    ],
+                                )
+                                .map_err(sqlite_error::storage)?;
+                            manifest::validate_document_catalog(&transaction, self.shard_count())?;
+                            manifest::refresh_manifest_digest(&transaction)?;
+                            require_ready_manifest(&transaction, self.shard_count())?;
+                            spec_bson.clone()
+                        };
+                    ensure_control_active(
+                        &control,
+                        "before committing document index declaration",
+                    )?;
+                    transaction.commit().map_err(sqlite_error::storage)?;
+                    Ok(stored_spec)
+                })?;
+            let decoded = decode_metadata_document(&stored_spec, "document index specification")?;
             Ok(DocumentIndexMetadata::from_validated_parts(
                 name.to_owned(),
                 decoded,
@@ -3644,6 +3665,57 @@ mod enabled {
                 EngineErrorKind::Cancelled
             );
             transaction.commit().unwrap();
+        }
+
+        #[test]
+        fn idempotent_index_declaration_preserves_legacy_numeric_direction_bytes() {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let collection = storage
+                .create_document_collection("app", "items", &DocumentCollectionOptions::empty())
+                .unwrap();
+            let legacy = document([("a", BsonValue::Int64(1)), ("b", BsonValue::Double(-1.0))]);
+            storage
+                .declare_document_index(collection.id(), "legacy", &legacy, false)
+                .unwrap();
+            let canonical = document([("a", BsonValue::Int32(1)), ("b", BsonValue::Int32(-1))]);
+            let result = storage
+                .declare_document_index(collection.id(), "legacy", &canonical, false)
+                .unwrap();
+            assert!(result.specification().representation_eq(&legacy));
+            // Storage also retains older opaque specification envelopes. Do
+            // not broaden their existing byte-exact conflict behavior while
+            // recognizing normalized ordinary key directions.
+            let opaque = document([(
+                "key",
+                BsonValue::Document(document([("a", BsonValue::Int64(1))])),
+            )]);
+            storage
+                .declare_document_index(collection.id(), "opaque", &opaque, false)
+                .unwrap();
+            let different = document([(
+                "key",
+                BsonValue::Document(document([("a", BsonValue::Int32(1))])),
+            )]);
+            assert_eq!(
+                storage
+                    .declare_document_index(collection.id(), "opaque", &different, false)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition
+            );
+            drop(storage);
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let collection = storage
+                .document_collection_controlled("app", "items", OperationControl::new(None))
+                .unwrap()
+                .unwrap();
+            let index = collection
+                .indexes()
+                .iter()
+                .find(|index| index.name() == "legacy")
+                .unwrap();
+            assert!(index.specification().representation_eq(&legacy));
         }
 
         #[test]

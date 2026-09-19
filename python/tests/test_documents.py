@@ -52,6 +52,35 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_index_definitions_default_names_validation_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    keys = OrderedDict([("profile.name", Int64(1)), ("rank", -1.0)])
+                    result = session.create_index(DATABASE, COLLECTION, keys, unique=True)
+                    self.assertEqual((result["index_name"], result["lifecycle"]), ("profile.name_1_rank_-1", "pending_build"))
+                    result = session.create_index(DATABASE, COLLECTION, {"profile.name": Decimal128("1.00"), "rank": -1}, name="profile.name_1_rank_-1", unique=True)
+                    self.assertEqual(result["index_name"], "profile.name_1_rank_-1")
+                    for invalid in [{}, {"bad..path": 1}, {"$private": 1}, {"valid": True}, {"valid": "hashed"}, {"valid": 0}, {"valid": float("nan")}]:
+                        with self.assertRaises(briskdb.InvalidArgumentError):
+                            session.create_index(DATABASE, COLLECTION, invalid, name="must_not_exist")
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.create_index(DATABASE, COLLECTION, {"x" * 254: 1})
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.create_index(DATABASE, COLLECTION, {"bounded": 1}, max_result_bytes=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.create_index(DATABASE, COLLECTION, {"cancelled": 1}, cancellation=token)
+                    indexes = session.list_indexes(DATABASE, COLLECTION)["indexes"]
+                    self.assertEqual(len(indexes), 2)
+                    self.assertEqual(bson_bytes(indexes[1]["keys"]), bson_bytes({"profile.name": 1, "rank": -1}))
+                    self.assertEqual(indexes[1]["lifecycle"], "pending_build")
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(session.list_indexes(DATABASE, COLLECTION)["indexes"], indexes)
+
     def test_find_upserts_images_metadata_controls_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -1757,6 +1786,19 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_index_definitions_generate_names_and_remain_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    result = await session.create_index(DATABASE, COLLECTION, {"label": 1, "rank": -1})
+                    self.assertEqual((result["index_name"], result["lifecycle"]), ("label_1_rank_-1", "pending_build"))
+                    result = await session.create_index(DATABASE, COLLECTION, {"label": Int64(1), "rank": -1.0}, name=None)
+                    self.assertEqual(result["index_name"], "label_1_rank_-1")
+                    with self.assertRaises(briskdb.InvalidArgumentError):
+                        await session.create_index(DATABASE, COLLECTION, {"bad.$private": 1})
+                    self.assertEqual(len((await session.list_indexes(DATABASE, COLLECTION))["indexes"]), 2)
+
     async def test_async_find_upserts_images_and_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

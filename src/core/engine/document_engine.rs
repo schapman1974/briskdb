@@ -309,10 +309,20 @@ impl Engine {
                         "sparse and partial document indexes require the document-index execution milestone",
                     ));
                 }
-                let name = index.name().ok_or_else(|| {
-                    unsupported("unnamed document indexes require deterministic name generation")
-                })?;
-                let name = name.to_owned();
+                let (keys, name, unique, _, _) = index.into_parts();
+                let (keys, name) = self
+                    .run_document_storage_task(
+                        cancellation.clone(),
+                        deadline,
+                        move |cancellation, control| {
+                            crate::document::normalize_index_definition(
+                                &keys,
+                                name.as_deref(),
+                                &mut || ensure_document_cpu_active(cancellation, &control),
+                            )
+                        },
+                    )
+                    .await?;
                 enforce_execution_result_limits(
                     &DocumentExecution::new(
                         request_id,
@@ -321,7 +331,6 @@ impl Engine {
                     ),
                     result_limits,
                 )?;
-                let (keys, _, unique, _, _) = index.into_parts();
                 let catalog_storage = storage.clone();
                 let collection_id = self
                     .run_document_storage_task(

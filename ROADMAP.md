@@ -604,6 +604,18 @@ requires an earlier dependency:
       Concurrent same-ID insertion/update images are atomic; native sync/async
       Python and wire replies preserve inserted-versus-matched distinctions.
       Other operators and secondary-index validation remain open.
+    - [ ] [#174](https://github.com/schapman1974/briskdb/issues/174) — shared
+      index-definition validation now checks ordered distinct paths and numeric
+      ascending/descending directions on controlled workers before catalog writes.
+      Missing names are generated deterministically; names/specifications/fields
+      and path depth are bounded. Native sync/async Python accepts optional names.
+      Equivalent declarations are idempotent without rewriting legacy numeric
+      direction bytes. 64 source-locked valid ascending definitions verify exact
+      names, key order, flags and pending metadata after restart. Independent tests
+      cover descending/numeric aliases, controls and rejection atomicity. All
+      secondary declarations remain pending and enforce no uniqueness yet;
+      sparse/partial definitions, key tokens, physical build/recovery, write-time
+      maintenance, wire index commands and metadata cursors remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
