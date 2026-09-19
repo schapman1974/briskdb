@@ -103,8 +103,16 @@ A retained cursor forces sole-process startup ownership. Restart resumes the
 exact remaining shard prefix idempotently. An active collection with a missing
 or incompatible table is corruption. An exact document table without catalog
 authority is also rejected. Builds without the `documents` feature still
-understand current manifest format 16 and validate its physical schema, but
+understand current manifest format 17 and validate its physical schema, but
 refuse to open a root containing collections or a pending deletion.
+
+Every built-in and declared index also has a durable root-wide `DocumentIndexId`.
+The manifest-only version-17 migration assigns IDs without changing existing
+specification bytes or lifecycles. New IDs and declarations commit together;
+idempotent declarations retain their IDs. Namespace deletion cascades the mapping
+but never reduces the allocation high-water mark, including when the catalog
+becomes empty. Restart validates mapping coverage and checksums. These identities
+do not activate secondary indexes or change native Python/wire metadata shapes.
 
 ## Namespace deletion and restart
 

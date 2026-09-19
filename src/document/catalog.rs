@@ -49,6 +49,25 @@ impl DocumentCollectionId {
     }
 }
 
+/// Stable, database-root-wide identity of one document index.
+///
+/// Identities survive reopening and are never reused after committed drops.
+/// They occupy a separate identity space from SQL indexes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DocumentIndexId(u64);
+
+impl DocumentIndexId {
+    pub(crate) fn from_validated(value: u64) -> Self {
+        debug_assert!(value > 0);
+        Self(value)
+    }
+
+    /// Return the durable positive integer identity.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Immutable placement rule for documents in one collection.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -133,6 +152,7 @@ impl Default for DocumentCollectionOptions {
 /// Durable metadata for one document index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentIndexMetadata {
+    id: DocumentIndexId,
     name: String,
     specification: BsonDocument,
     unique: bool,
@@ -142,6 +162,7 @@ pub struct DocumentIndexMetadata {
 
 impl DocumentIndexMetadata {
     pub(crate) fn from_validated_parts(
+        id: DocumentIndexId,
         name: String,
         specification: BsonDocument,
         unique: bool,
@@ -149,12 +170,18 @@ impl DocumentIndexMetadata {
         lifecycle: DocumentIndexLifecycle,
     ) -> Self {
         Self {
+            id,
             name,
             specification,
             unique,
             built_in,
             lifecycle,
         }
+    }
+
+    /// Return the durable identity, independent of the index name.
+    pub const fn id(&self) -> DocumentIndexId {
+        self.id
     }
 
     /// Return the exact index name.

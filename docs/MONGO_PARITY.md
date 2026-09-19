@@ -128,6 +128,12 @@ cursor. There is no cross-batch snapshot promise. Collection UUIDv8 identity
 survives reopen and backup, changes on drop/recreate, and differs for independent
 roots. Index metadata cursors remain open.
 
+The shared Rust index catalog now assigns stable, root-wide IDs to built-in and
+pending secondary indexes. The version-17 manifest upgrade preserves existing
+specification bytes; declarations and allocation commit together, and committed
+namespace drops never recycle IDs. These IDs are not new wire/Python fields and
+do not activate physical indexes, uniqueness enforcement, or index cursors.
+
 `listDatabases` on `admin` supports `nameOnly: true`, including ordinary
 sync/async PyMongo `list_database_names()` and
 `list_databases(nameOnly=True, filter={"name": ...})`. It returns only

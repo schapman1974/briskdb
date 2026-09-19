@@ -2169,7 +2169,9 @@ impl DocumentResultBudget {
         let specification = encode_document(index.specification())
             .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?;
         check()?;
-        self.add_bytes(DOCUMENT_RESULT_VALUE_BYTES + 3)?;
+        // Include the durable u64 identity retained by Rust metadata even
+        // though native Python/wire metadata shapes do not expose it yet.
+        self.add_bytes(DOCUMENT_RESULT_VALUE_BYTES + 3 + 8)?;
         self.add_bytes(u64::try_from(index.name().len()).unwrap_or(u64::MAX))?;
         self.add_bytes(u64::try_from(specification.len()).unwrap_or(u64::MAX))
     }

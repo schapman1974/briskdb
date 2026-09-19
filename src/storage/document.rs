@@ -153,8 +153,8 @@ mod enabled {
         document::{
             BsonDocument, BsonErrorContext, BsonValue, CanonicalBsonKey, DocumentCatalog,
             DocumentCollectionId, DocumentCollectionMetadata, DocumentCollectionOptions,
-            DocumentDatabaseId, DocumentIndexLifecycle, DocumentIndexMetadata, DocumentPlacement,
-            encode_document,
+            DocumentDatabaseId, DocumentIndexId, DocumentIndexLifecycle, DocumentIndexMetadata,
+            DocumentPlacement, encode_document,
         },
         sqlite_error,
     };
@@ -712,6 +712,7 @@ mod enabled {
                                 params![collection_id, id_specification_bson, INDEX_PENDING_BUILD],
                             )
                             .map_err(sqlite_error::storage)?;
+                        allocate_index_identity(&transaction, collection_id, "_id_")?;
                         transaction
                             .execute(
                                 "INSERT INTO briskdb_document_provisioning (
@@ -949,7 +950,7 @@ mod enabled {
             debug_assert!(spec_bson.len() <= manifest::MAX_DOCUMENT_METADATA_BSON_BYTES);
             let manifest_path = self.root.join("manifest.sqlite");
             let mut connection = open_existing_manifest(&manifest_path)?;
-            let stored_spec =
+            let (stored_spec, index_id) =
                 run_manifest_controlled(&mut connection, control.clone(), |connection| {
                     configure_journal_mode(connection)?;
                     let transaction = connection
@@ -973,61 +974,76 @@ mod enabled {
                         )
                         .optional()
                         .map_err(sqlite_error::storage)?;
-                    let stored_spec =
-                        if let Some((existing_spec, existing_unique, lifecycle)) = existing {
-                            // Legacy pending declarations can retain numeric direction
-                            // aliases. Normalizing a new request must not rewrite or
-                            // conflict with a semantically identical existing key list.
-                            let canonical_keys = !specification.is_empty()
-                                && specification
-                                    .iter()
-                                    .all(|(_, value)| matches!(value, BsonValue::Int32(1 | -1)));
-                            let same_spec = existing_spec == spec_bson
-                                || (canonical_keys
-                                    && decode_metadata_document(
-                                        &existing_spec,
-                                        "document index specification",
-                                    )? == *specification);
-                            if !same_spec
-                                || existing_unique != i64::from(unique)
-                                || lifecycle != INDEX_PENDING_BUILD
-                            {
-                                return Err(EngineError::new(
-                                    EngineErrorKind::FailedPrecondition,
-                                    "document index name already has a different declaration",
-                                ));
-                            }
-                            existing_spec
-                        } else {
-                            transaction
-                                .execute(
-                                    "INSERT INTO briskdb_document_indexes (
+                    let stored_spec = if let Some((existing_spec, existing_unique, lifecycle)) =
+                        existing
+                    {
+                        // Legacy pending declarations can retain numeric direction
+                        // aliases. Normalizing a new request must not rewrite or
+                        // conflict with a semantically identical existing key list.
+                        let canonical_keys = !specification.is_empty()
+                            && specification
+                                .iter()
+                                .all(|(_, value)| matches!(value, BsonValue::Int32(1 | -1)));
+                        let same_spec = existing_spec == spec_bson
+                            || (canonical_keys
+                                && decode_metadata_document(
+                                    &existing_spec,
+                                    "document index specification",
+                                )? == *specification);
+                        if !same_spec
+                            || existing_unique != i64::from(unique)
+                            || lifecycle != INDEX_PENDING_BUILD
+                        {
+                            return Err(EngineError::new(
+                                EngineErrorKind::FailedPrecondition,
+                                "document index name already has a different declaration",
+                            ));
+                        }
+                        existing_spec
+                    } else {
+                        transaction
+                            .execute(
+                                "INSERT INTO briskdb_document_indexes (
                                 collection_id, index_name, spec_bson, is_unique, is_builtin,
                                 index_format_version, lifecycle_state
                              ) VALUES (?1, ?2, ?3, ?4, 0, 1, ?5)",
-                                    params![
-                                        to_sqlite_id(collection_id)?,
-                                        name,
-                                        spec_bson,
-                                        i64::from(unique),
-                                        INDEX_PENDING_BUILD
-                                    ],
-                                )
-                                .map_err(sqlite_error::storage)?;
-                            manifest::validate_document_catalog(&transaction, self.shard_count())?;
-                            manifest::refresh_manifest_digest(&transaction)?;
-                            require_ready_manifest(&transaction, self.shard_count())?;
-                            spec_bson.clone()
-                        };
+                                params![
+                                    to_sqlite_id(collection_id)?,
+                                    name,
+                                    spec_bson,
+                                    i64::from(unique),
+                                    INDEX_PENDING_BUILD
+                                ],
+                            )
+                            .map_err(sqlite_error::storage)?;
+                        allocate_index_identity(&transaction, to_sqlite_id(collection_id)?, name)?;
+                        manifest::validate_document_catalog(&transaction, self.shard_count())?;
+                        manifest::refresh_manifest_digest(&transaction)?;
+                        require_ready_manifest(&transaction, self.shard_count())?;
+                        spec_bson.clone()
+                    };
+                    let index_id = transaction
+                        .query_row(
+                            "SELECT index_id FROM briskdb_document_index_identities
+                         WHERE collection_id = ?1 AND index_name = ?2",
+                            params![to_sqlite_id(collection_id)?, name],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(sqlite_error::storage)?;
+                    let index_id = DocumentIndexId::from_validated(positive_u64(
+                        index_id,
+                        "document index identity",
+                    )?);
                     ensure_control_active(
                         &control,
                         "before committing document index declaration",
                     )?;
                     transaction.commit().map_err(sqlite_error::storage)?;
-                    Ok(stored_spec)
+                    Ok((stored_spec, index_id))
                 })?;
             let decoded = decode_metadata_document(&stored_spec, "document index specification")?;
             Ok(DocumentIndexMetadata::from_validated_parts(
+                index_id,
                 name.to_owned(),
                 decoded,
                 unique,
@@ -2600,9 +2616,12 @@ mod enabled {
         }
         let mut statement = connection
             .prepare(
-                "SELECT index_name, spec_bson, is_unique, is_builtin, lifecycle_state
-                 FROM briskdb_document_indexes WHERE collection_id = ?1
-                 ORDER BY index_name COLLATE BINARY",
+                "SELECT i.index_name, i.spec_bson, i.is_unique, i.is_builtin, i.lifecycle_state, d.index_id
+                 FROM briskdb_document_indexes AS i
+                 LEFT JOIN briskdb_document_index_identities AS d
+                   ON d.collection_id = i.collection_id AND d.index_name = i.index_name
+                 WHERE i.collection_id = ?1
+                 ORDER BY i.index_name COLLATE BINARY",
             )
             .map_err(sqlite_error::storage)?;
         let rows = statement
@@ -2613,6 +2632,7 @@ mod enabled {
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })
             .map_err(sqlite_error::storage)?
@@ -2620,7 +2640,7 @@ mod enabled {
             .map_err(sqlite_error::storage)?;
         let expected_id = builtin_id_specification()?;
         let mut indexes = Vec::with_capacity(rows.len());
-        for (name, spec_bson, unique, built_in, lifecycle) in rows {
+        for (name, spec_bson, unique, built_in, lifecycle, index_id) in rows {
             if let Some(control) = control {
                 ensure_control_active(control, "while decoding document index metadata")?;
             }
@@ -2646,6 +2666,10 @@ mod enabled {
                 ));
             }
             indexes.push(DocumentIndexMetadata::from_validated_parts(
+                DocumentIndexId::from_validated(positive_u64(
+                    index_id.ok_or_else(|| corrupt("document index identity is missing"))?,
+                    "document index identity",
+                )?),
                 name,
                 specification,
                 unique,
@@ -2719,6 +2743,52 @@ mod enabled {
             )
             .map_err(sqlite_error::storage)?;
         Ok(id)
+    }
+
+    fn allocate_index_identity(
+        transaction: &rusqlite::Transaction<'_>,
+        collection_id: i64,
+        name: &str,
+    ) -> EngineResult<()> {
+        // Called only after insertion of a new declaration, in the same
+        // IMMEDIATE transaction. Rollback discards both the ID and declaration;
+        // committed drops remove mappings but never lower this high-water mark.
+        let current = transaction
+            .query_row(
+                "SELECT index_high_water FROM briskdb_document_index_allocator WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sqlite_error::storage)?;
+        if current < 0 {
+            return Err(corrupt(
+                "document index identity high-water mark is negative",
+            ));
+        }
+        let next = current.checked_add(1).ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::LimitExceeded,
+                "document index identity space is exhausted",
+            )
+        })?;
+        let changed = transaction
+            .execute(
+                "UPDATE briskdb_document_index_allocator SET index_high_water = ?1
+             WHERE singleton = 1 AND index_high_water = ?2",
+                params![next, current],
+            )
+            .map_err(sqlite_error::storage)?;
+        if changed != 1 {
+            return Err(corrupt(
+                "document index identity allocation did not advance exactly once",
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO briskdb_document_index_identities (index_id, collection_id, index_name)
+             VALUES (?1, ?2, ?3)",
+            params![next, collection_id, name],
+        ).map_err(sqlite_error::storage)?;
+        Ok(())
     }
 
     fn next_positive_id(connection: &Connection, column: &str, kind: &str) -> EngineResult<i64> {
@@ -3099,9 +3169,15 @@ mod enabled {
                             .insert_document(other.id(), &document([("_id", BsonValue::Int32(1))]))
                             .unwrap();
                     }
-                    let highest = storage
-                        .document_catalog()
-                        .unwrap()
+                    let before_catalog = storage.document_catalog().unwrap();
+                    let highest_index = before_catalog
+                        .collections()
+                        .iter()
+                        .flat_map(|collection| collection.indexes())
+                        .map(|index| index.id())
+                        .max()
+                        .unwrap();
+                    let highest = before_catalog
                         .collections()
                         .iter()
                         .map(|c| c.id().get())
@@ -3142,6 +3218,10 @@ mod enabled {
                     assert_eq!(catalog.collection("other", "keep").is_some(), keep_other);
                     if let Some(other) = &other {
                         assert_eq!(recovered.document_count(other.id()).unwrap(), 1);
+                        assert_eq!(
+                            catalog.collection("other", "keep").unwrap().indexes(),
+                            other.indexes()
+                        );
                     }
                     if before_intent {
                         assert_eq!(recovered.document_count(one.id()).unwrap(), 8);
@@ -3154,6 +3234,7 @@ mod enabled {
                             )
                             .unwrap();
                         assert!(fresh.id().get() > highest);
+                        assert!(fresh.indexes()[0].id() > highest_index);
                         assert_eq!(recovered.document_count(fresh.id()).unwrap(), 0);
                     }
                     drop(recovered);
@@ -3665,6 +3746,286 @@ mod enabled {
                 EngineErrorKind::Cancelled
             );
             transaction.commit().unwrap();
+        }
+
+        #[test]
+        fn index_identities_survive_reopen_and_are_never_reused_after_namespace_drops() {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let one = storage
+                .create_document_collection("app", "one", &DocumentCollectionOptions::empty())
+                .unwrap();
+            let two = storage
+                .create_document_collection("app", "two", &DocumentCollectionOptions::empty())
+                .unwrap();
+            let spec = document([("value", BsonValue::Int32(1))]);
+            let first = storage
+                .declare_document_index(one.id(), "same_name", &spec, false)
+                .unwrap();
+            let second = storage
+                .declare_document_index(two.id(), "same_name", &spec, false)
+                .unwrap();
+            let ids = [
+                one.indexes()[0].id(),
+                two.indexes()[0].id(),
+                first.id(),
+                second.id(),
+            ];
+            assert_eq!(ids.into_iter().collect::<HashSet<_>>().len(), 4);
+            assert!(ids.into_iter().all(|id| id.get() > 0));
+            assert_eq!(
+                storage
+                    .declare_document_index(one.id(), "same_name", &spec, false)
+                    .unwrap(),
+                first
+            );
+            drop(storage);
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let catalog = storage.document_catalog().unwrap();
+            assert_eq!(
+                catalog.collection("app", "one").unwrap().indexes()[1],
+                first
+            );
+            assert_eq!(
+                catalog.collection("app", "two").unwrap().indexes()[1],
+                second
+            );
+            let migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            storage
+                .drop_document_namespace_controlled(
+                    "app",
+                    Some("one"),
+                    migration,
+                    OperationControl::new(None),
+                )
+                .unwrap();
+            let fresh = storage
+                .create_document_collection("app", "one", &DocumentCollectionOptions::empty())
+                .unwrap();
+            assert!(fresh.indexes()[0].id() > second.id());
+            let fresh_index = storage
+                .declare_document_index(fresh.id(), "same_name", &spec, false)
+                .unwrap();
+            assert!(fresh_index.id() > fresh.indexes()[0].id());
+            assert_eq!(
+                storage
+                    .document_catalog()
+                    .unwrap()
+                    .collection("app", "two")
+                    .unwrap()
+                    .indexes()[1],
+                second
+            );
+            let migration = storage.begin_schema_migration().unwrap();
+            migration.wait_for_quiescence_blocking();
+            storage
+                .drop_document_namespace_controlled(
+                    "app",
+                    None,
+                    migration,
+                    OperationControl::new(None),
+                )
+                .unwrap();
+            assert!(storage.document_catalog().unwrap().collections().is_empty());
+            drop(storage);
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let recreated = storage
+                .create_document_collection("app", "one", &DocumentCollectionOptions::empty())
+                .unwrap();
+            assert!(recreated.indexes()[0].id() > fresh_index.id());
+        }
+
+        #[test]
+        fn concurrent_index_declarations_share_one_durable_allocator() {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let collection = storage
+                .create_document_collection("app", "one", &DocumentCollectionOptions::empty())
+                .unwrap();
+            let id = collection.id();
+            let returned = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..4)
+                    .map(|worker| {
+                        let storage = &storage;
+                        scope.spawn(move || {
+                            (0..4)
+                                .map(|ordinal| {
+                                    storage
+                                        .declare_document_index(
+                                            id,
+                                            &format!("w{worker}_{ordinal}"),
+                                            &document([("a", BsonValue::Int32(1))]),
+                                            false,
+                                        )
+                                        .unwrap()
+                                        .id()
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .flat_map(|worker| worker.join().unwrap())
+                    .collect::<HashSet<_>>()
+            });
+            assert_eq!(returned.len(), 16);
+            assert!(!returned.contains(&collection.indexes()[0].id()));
+            drop(storage);
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let catalog = storage.document_catalog().unwrap();
+            let indexes = catalog.collection("app", "one").unwrap().indexes();
+            assert_eq!(indexes.len(), 17);
+            assert_eq!(
+                indexes
+                    .iter()
+                    .filter(|index| !index.is_built_in())
+                    .map(|index| index.id())
+                    .collect::<HashSet<_>>(),
+                returned
+            );
+        }
+
+        #[test]
+        fn index_identity_exhaustion_rolls_back_declarations_and_new_namespaces() {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let collection = storage
+                .create_document_collection("app", "one", &DocumentCollectionOptions::empty())
+                .unwrap();
+            let connection = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+            connection
+                .execute(
+                    "UPDATE briskdb_document_index_allocator SET index_high_water = ?1",
+                    [i64::MAX - 1],
+                )
+                .unwrap();
+            manifest::refresh_manifest_digest(&connection).unwrap();
+            let spec = document([("value", BsonValue::Int32(1))]);
+            let last = storage
+                .declare_document_index(collection.id(), "last", &spec, false)
+                .unwrap();
+            assert_eq!(last.id().get(), i64::MAX as u64);
+            let before = storage.document_catalog().unwrap();
+            let root: Vec<u8> = connection
+                .query_row("SELECT manifest_digest FROM briskdb_integrity", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                storage
+                    .declare_document_index(collection.id(), "last", &spec, false)
+                    .unwrap(),
+                last
+            );
+            for result in [
+                storage
+                    .declare_document_index(collection.id(), "too_late", &spec, false)
+                    .map(|_| ()),
+                storage
+                    .create_document_collection(
+                        "new_database",
+                        "new_collection",
+                        &DocumentCollectionOptions::empty(),
+                    )
+                    .map(|_| ()),
+            ] {
+                assert_eq!(result.unwrap_err().kind(), EngineErrorKind::LimitExceeded);
+            }
+            assert_eq!(storage.document_catalog().unwrap(), before);
+            assert_eq!(
+                connection
+                    .query_row("SELECT manifest_digest FROM briskdb_integrity", [], |r| r
+                        .get::<_, Vec<
+                        u8,
+                    >>(
+                        0
+                    ))
+                    .unwrap(),
+                root
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT index_high_water FROM briskdb_document_index_allocator",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                i64::MAX
+            );
+            drop(storage);
+            assert_eq!(
+                Storage::open(temp.path(), 2)
+                    .unwrap()
+                    .document_catalog()
+                    .unwrap(),
+                before
+            );
+        }
+
+        #[test]
+        fn index_identity_allocation_and_mapping_roll_back_together() {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Storage::open(temp.path(), 2).unwrap();
+            let collection = storage
+                .create_document_collection("app", "one", &DocumentCollectionOptions::empty())
+                .unwrap();
+            let mut connection =
+                open_existing_manifest(&temp.path().join("manifest.sqlite")).unwrap();
+            let original: i64 = connection
+                .query_row(
+                    "SELECT index_high_water FROM briskdb_document_index_allocator",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            {
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                transaction.execute("INSERT INTO briskdb_document_indexes VALUES (?1, 'rolled_back', x'0500000000', 0, 0, 1, 2)", [to_sqlite_id(collection.id()).unwrap()]).unwrap();
+                allocate_index_identity(
+                    &transaction,
+                    to_sqlite_id(collection.id()).unwrap(),
+                    "rolled_back",
+                )
+                .unwrap();
+                manifest::validate_document_catalog(&transaction, 2).unwrap();
+                manifest::refresh_manifest_digest(&transaction).unwrap();
+                // Simulate cancellation/failure after allocation but before commit.
+                transaction.rollback().unwrap();
+            }
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT index_high_water FROM briskdb_document_index_allocator",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                original
+            );
+            assert_eq!(
+                storage
+                    .document_catalog()
+                    .unwrap()
+                    .collection("app", "one")
+                    .unwrap()
+                    .indexes()
+                    .len(),
+                1
+            );
+            let next = storage
+                .declare_document_index(
+                    collection.id(),
+                    "committed",
+                    &document([("a", BsonValue::Int32(1))]),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(next.id().get(), (original + 1) as u64);
         }
 
         #[test]
@@ -4624,6 +4985,7 @@ mod enabled {
                     rusqlite::params![id_specification_bson, INDEX_PENDING_BUILD],
                 )
                 .unwrap();
+            allocate_index_identity(&transaction, 1, "_id_").unwrap();
             transaction
                 .execute(
                     "INSERT INTO briskdb_document_provisioning (

@@ -621,6 +621,10 @@ requires an earlier dependency:
       Generated keys now round-trip through the versioned, bounded `BDIK` tuple
       codec before oracle comparisons. Fixed bytes, corrupt/future frames,
       arbitrary inputs, cancellation and resource limits have independent tests.
+      Durable root-wide index IDs now survive reopening and committed namespace
+      drops without reuse. The version-17 manifest migration preserves exact
+      legacy/import metadata; checksummed coverage, allocator exhaustion and
+      rollback are tested. IDs do not change Python/wire metadata shapes.
       This helper does
       not enable sparse/partial catalog options or activate indexes; physical build/recovery, write-time
       maintenance, wire index commands and metadata cursors remain open.
