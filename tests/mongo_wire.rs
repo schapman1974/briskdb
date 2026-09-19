@@ -372,6 +372,168 @@ async fn send_command(stream: &mut TcpStream, body: &BsonDocument) -> BsonDocume
     response
 }
 
+fn live_cursor_id(body: &BsonDocument) -> i64 {
+    let Some(BsonValue::Document(cursor)) = body.get_first("cursor") else {
+        panic!("cursor: {body:?}");
+    };
+    let Some(BsonValue::Int64(id)) = cursor.get_first("id") else {
+        panic!("cursor ID");
+    };
+    *id
+}
+
+fn cursor_find(collection: &str, batch: i32) -> BsonDocument {
+    BsonDocument::from_entries([
+        ("find", BsonValue::from(collection)),
+        ("batchSize", BsonValue::Int32(batch)),
+        ("$db", BsonValue::from("wire")),
+    ])
+    .unwrap()
+}
+
+fn cursor_more(collection: &str, id: i64, batch: i32) -> BsonDocument {
+    BsonDocument::from_entries([
+        ("getMore", BsonValue::Int64(id)),
+        ("collection", BsonValue::from(collection)),
+        ("batchSize", BsonValue::Int32(batch)),
+        ("$db", BsonValue::from("wire")),
+    ])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cursor_handoff_disconnect_cleanup_and_restart_are_explicit() {
+    let (root, database, mut server) = setup().await;
+    let mut first = TcpStream::connect(server.address()).await.unwrap();
+    let documents: Vec<_> = (0..12)
+        .map(|id| BsonDocument::from_entries([("_id", BsonValue::Int32(id))]).unwrap())
+        .collect();
+    first
+        .write_all(&insert_sequence("cursor_items", &documents))
+        .await
+        .unwrap();
+    assert_eq!(
+        response(&mut first).await.1.get_first("n"),
+        Some(&BsonValue::Int32(12))
+    );
+    let opened = send_command(&mut first, &cursor_find("cursor_items", 2)).await;
+    let id = live_cursor_id(&opened);
+    assert!(id > 0);
+    let mut second = TcpStream::connect(server.address()).await.unwrap();
+    let rejected = send_command(&mut second, &cursor_more("wrong", id, 2)).await;
+    assert_eq!(rejected.get_first("code"), Some(&BsonValue::Int32(43)));
+    let page = send_command(&mut second, &cursor_more("cursor_items", id, 2)).await;
+    assert_eq!(live_cursor_id(&page), id);
+    // Ownership follows getMore to the second socket; closing the first must
+    // not invalidate a cursor already transferred by the driver's pool.
+    drop(first);
+    let page = send_command(&mut second, &cursor_more("cursor_items", id, 2)).await;
+    assert_eq!(live_cursor_id(&page), id);
+    // Half-close and observe the server's EOF so cleanup has completed before
+    // checking it. Polling killCursors would itself remove the cursor and could
+    // conceal a disconnect-cleanup bug.
+    second.shutdown().await.unwrap();
+    disconnected(&mut second).await;
+    let mut probe = TcpStream::connect(server.address()).await.unwrap();
+    let kill = BsonDocument::from_entries([
+        ("killCursors", BsonValue::from("cursor_items")),
+        ("cursors", BsonValue::Array(vec![BsonValue::Int64(id)])),
+        ("$db", BsonValue::from("wire")),
+    ])
+    .unwrap();
+    assert_eq!(
+        send_command(&mut probe, &kill)
+            .await
+            .get_first("cursorsNotFound"),
+        Some(&BsonValue::Array(vec![BsonValue::Int64(id)]))
+    );
+    assert_eq!(
+        send_command(&mut probe, &cursor_more("cursor_items", id, 2))
+            .await
+            .get_first("code"),
+        Some(&BsonValue::Int32(43))
+    );
+    let stale = live_cursor_id(&send_command(&mut probe, &cursor_find("cursor_items", 0)).await);
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+    let database = BriskDb::builder(root.path())
+        .with_shard_count(2)
+        .with_document_support(DocumentSupport::Enabled)
+        .open()
+        .await
+        .unwrap();
+    let mut server = MongoServer::start(&database, "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    assert_eq!(
+        send_command(&mut stream, &cursor_more("cursor_items", stale, 2))
+            .await
+            .get_first("code"),
+        Some(&BsonValue::Int32(43))
+    );
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cursor_limits_malformed_commands_and_unacknowledged_reads_do_not_leak() {
+    let (_root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let seed = BsonDocument::from_entries([("_id", BsonValue::Int32(1))]).unwrap();
+    send_command(&mut stream, &insert_command("cursor_limits", seed)).await;
+    for _ in 0..12 {
+        stream
+            .write_all(&packet(&cursor_find("cursor_limits", 0), 4, 2))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        send_command(&mut stream, &command("ping"))
+            .await
+            .get_first("ok"),
+        Some(&BsonValue::Double(1.0))
+    );
+    let mut ids = Vec::new();
+    for _ in 0..8 {
+        ids.push(BsonValue::Int64(live_cursor_id(
+            &send_command(&mut stream, &cursor_find("cursor_limits", 0)).await,
+        )));
+    }
+    assert_eq!(
+        send_command(&mut stream, &cursor_find("cursor_limits", 0))
+            .await
+            .get_first("code"),
+        Some(&BsonValue::Int32(10334))
+    );
+    let BsonValue::Int64(id) = ids[0] else {
+        unreachable!()
+    };
+    for batch in [0, -1, 1001] {
+        assert_eq!(
+            send_command(&mut stream, &cursor_more("cursor_limits", id, batch))
+                .await
+                .get_first("code"),
+            Some(&BsonValue::Int32(2))
+        );
+    }
+    let kill = BsonDocument::from_entries([
+        ("killCursors", BsonValue::from("cursor_limits")),
+        ("cursors", BsonValue::Array(ids.clone())),
+        ("$db", BsonValue::from("wire")),
+    ])
+    .unwrap();
+    assert_eq!(
+        send_command(&mut stream, &kill)
+            .await
+            .get_first("cursorsKilled"),
+        Some(&BsonValue::Array(ids))
+    );
+    assert!(live_cursor_id(&send_command(&mut stream, &cursor_find("cursor_limits", 0)).await) > 0);
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
 fn first_batch(body: &BsonDocument) -> &[BsonValue] {
     let Some(BsonValue::Document(cursor)) = body.get_first("cursor") else {
         panic!("expected cursor: {body:?}");
@@ -593,6 +755,28 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
         matches!(reply.get_first("code"), Some(BsonValue::Int32(10334))),
         "{reply:?}"
     );
+    let tail = BsonDocument::from_entries([("_id", BsonValue::from("tail"))]).unwrap();
+    send_command(&mut stream, &insert_command("items", tail)).await;
+    let id = live_cursor_id(&send_command(&mut stream, &cursor_find("items", 1)).await);
+    assert!(id > 0);
+    // The oversized document is followed by another row, so the engine retains
+    // a continuation before the wire encoder rejects the batch. That error
+    // must discard the cursor instead of leaking an inaccessible slot.
+    assert_eq!(
+        send_command(&mut stream, &cursor_more("items", id, 1))
+            .await
+            .get_first("code"),
+        Some(&BsonValue::Int32(10334))
+    );
+    assert_eq!(
+        send_command(&mut stream, &cursor_more("items", id, 1))
+            .await
+            .get_first("code"),
+        Some(&BsonValue::Int32(43))
+    );
+    for _ in 0..8 {
+        assert!(live_cursor_id(&send_command(&mut stream, &cursor_find("items", 0)).await) > 0);
+    }
     assert!(matches!(
         send_command(&mut stream, &command("ping"))
             .await

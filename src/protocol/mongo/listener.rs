@@ -21,6 +21,7 @@ use crate::{
 
 const MAX_CONNECTIONS: usize = 8;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A caller-owned Mongo listener. Does not close the borrowed engine,
 /// install signal handlers, or enable any listener through default features.
@@ -92,6 +93,7 @@ async fn run(
             biased;
             _ = shutdown.cancelled() => break,
             _ = lifecycle.tick() => {
+                executor.prune_cursors();
                 if database.engine().state() != EngineState::Running { break; }
             }
             _ = connections.join_next(), if !connections.is_empty() => {},
@@ -124,6 +126,7 @@ async fn connection(
     executor: Arc<commands::Executor>,
 ) -> io::Result<()> {
     let session = executor.session();
+    let _cursors = executor.connection_cursors(session.id().get());
     let mut codec = FrameCodec::with_max_message_bytes(MAX_BOOTSTRAP_MESSAGE_BYTES)?;
     let mut source = BytesMut::with_capacity(8192);
     let mut response_id = 0i32;
@@ -131,7 +134,12 @@ async fn connection(
         if shutdown.is_cancelled() {
             return Ok(());
         }
-        let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+        let mut deadline = tokio::time::Instant::now()
+            + if source.is_empty() {
+                IDLE_TIMEOUT
+            } else {
+                IO_TIMEOUT
+            };
         let frame = loop {
             if let Some(frame) = codec.decode(&mut source)? {
                 break frame;
@@ -147,6 +155,9 @@ async fn connection(
             if read == 0 {
                 codec.decode_eof(&mut source)?;
                 return Ok(());
+            }
+            if source.is_empty() {
+                deadline = tokio::time::Instant::now() + IO_TIMEOUT;
             }
             source.extend_from_slice(&chunk[..read]);
         };
@@ -167,18 +178,24 @@ async fn connection(
             Some(Err(error)) => error.document(),
             None => dispatch(&request),
         };
-        let result = tokio::task::spawn_blocking(move || {
+        let cursor_id = commands::reply_cursor_id(&body);
+        let (result, rejected) = tokio::task::spawn_blocking(move || {
             if request.more_to_come {
-                return Ok(None);
+                return Ok((None, true));
             }
-            let body = match commands::validate_response(&body) {
-                Ok(()) => body,
-                Err(error) => error.document(),
+            let (body, rejected) = match commands::validate_response(&body) {
+                Ok(()) => (body, false),
+                Err(error) => (error.document(), true),
             };
-            wire::reply(&request, &body, response_id).map(Some)
+            wire::reply(&request, &body, response_id).map(|reply| (Some(reply), rejected))
         })
         .await
         .map_err(|_| io::Error::other("Mongo parser task failed"))??;
+        if rejected {
+            if let Some(id) = cursor_id {
+                executor.discard_cursor(id);
+            }
+        }
         if shutdown.is_cancelled() {
             return Ok(());
         }

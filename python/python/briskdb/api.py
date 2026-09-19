@@ -400,6 +400,44 @@ class AsyncSession:
             cancellation=cancellation,
         )
 
+    async def get_more(
+        self,
+        database: str,
+        collection: str,
+        cursor_id: int,
+        *,
+        batch_size: int = 101,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.get_more, database, collection, cursor_id,
+            batch_size=batch_size, request_id=request_id, timeout_ms=timeout_ms,
+            cancellation=cancellation, max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+        )
+
+    async def kill_cursor(
+        self,
+        database: str,
+        collection: str,
+        cursor_id: int,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.kill_cursor, database, collection, cursor_id,
+            request_id=request_id, timeout_ms=timeout_ms, cancellation=cancellation,
+            max_result_rows=max_result_rows, max_result_bytes=max_result_bytes,
+        )
+
     async def count_documents(
         self,
         database: str,

@@ -2,8 +2,11 @@
 
 use std::{
     error::Error,
+    sync::Arc,
     time::{Duration, Instant},
 };
+
+mod cursors;
 
 use tokio::sync::Mutex;
 
@@ -13,16 +16,18 @@ use crate::{
     core::{EngineError, EngineErrorKind, RequestContext, ResultLimits, Session},
     document::{
         BsonCodecOptions, BsonDocument, BsonValue, DocumentCollectionOptions, DocumentCommand,
-        DocumentCreateCollectionRequest, DocumentFilter, DocumentFindRequest,
-        DocumentInsertRequest, DocumentListCollectionsRequest, DocumentMatcher, DocumentNamespace,
-        DocumentQueryError, DocumentReadOptions, DocumentRequest, DocumentRequestId,
-        DocumentResult, DocumentWriteOptions, decode_document_batch_with_options,
-        encode_document_with_options,
+        DocumentContinueCursorRequest, DocumentCreateCollectionRequest, DocumentCursorError,
+        DocumentCursorId, DocumentFilter, DocumentFindRequest, DocumentInsertRequest,
+        DocumentKillCursorRequest, DocumentListCollectionsRequest, DocumentMatcher,
+        DocumentNamespace, DocumentQueryError, DocumentReadOptions, DocumentRequest,
+        DocumentRequestId, DocumentResult, DocumentWriteOptions,
+        decode_document_batch_with_options, encode_document_with_options,
     },
 };
 
 type Result<T> = std::result::Result<T, CommandError>;
 
+#[derive(Debug)]
 pub(super) struct CommandError {
     code: i32,
     name: &'static str,
@@ -81,6 +86,16 @@ impl From<EngineError> for CommandError {
     fn from(error: EngineError) -> Self {
         let mut source = error.source();
         while let Some(cause) = source {
+            if let Some(cursor) = cause.downcast_ref::<DocumentCursorError>() {
+                return Self::new(
+                    cursor.mongo_code(),
+                    match cursor {
+                        DocumentCursorError::NotFound => "CursorNotFound",
+                        DocumentCursorError::InUse => "CursorInUse",
+                    },
+                    "cursor is unavailable",
+                );
+            }
             if let Some(query) = cause.downcast_ref::<DocumentQueryError>() {
                 let code = query.mongo_code();
                 let name = match code {
@@ -134,7 +149,9 @@ fn fields<const N: usize>(entries: [(&str, BsonValue); N]) -> BsonDocument {
 
 pub(super) enum Command {
     Insert(DocumentInsertRequest),
-    Find(DocumentFindRequest),
+    Find(DocumentFindRequest, bool, Option<Duration>),
+    GetMore(DocumentContinueCursorRequest),
+    KillCursors(DocumentNamespace, Vec<DocumentCursorId>),
 }
 
 pub(super) struct Prepared {
@@ -145,15 +162,28 @@ pub(super) struct Prepared {
 /// Called on the bounded blocking parser, before any engine work is admitted.
 pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
     let (name, value) = request.body.iter().next()?;
-    if !matches!(name, "insert" | "find") {
+    if !matches!(name, "insert" | "find" | "getMore" | "killCursors") {
         return None;
     }
     Some((|| {
-        let BsonValue::String(collection) = value else {
+        let started = Instant::now();
+        if request.more_to_come && name != "insert" {
+            return Err(CommandError::options());
+        }
+        let collection = if name == "getMore" {
+            request
+                .body
+                .get_first("collection")
+                .ok_or_else(CommandError::invalid)?
+        } else {
+            value
+        };
+        let BsonValue::String(collection) = collection else {
             return Err(CommandError::invalid());
         };
         let namespace = DocumentNamespace::new(&request.database, collection)?;
         let mut timeout = Duration::from_secs(15);
+        let mut cursor_budget = None;
         for (field, value) in request.body.iter().skip(1) {
             let valid = match field {
                 "$db" => matches!(value, BsonValue::String(_)),
@@ -163,7 +193,13 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 "maxTimeMS" => {
                     let millis = unsigned(value)?;
                     if millis > 0 {
+                        if name == "getMore" {
+                            return Err(CommandError::options());
+                        }
                         timeout = timeout.min(Duration::from_millis(millis));
+                        if name == "find" {
+                            cursor_budget = Some(Duration::from_millis(millis));
+                        }
                     }
                     true
                 }
@@ -179,13 +215,19 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     true
                 }
                 "singleBatch" if name == "find" => matches!(value, BsonValue::Boolean(_)),
+                "collection" if name == "getMore" => matches!(value, BsonValue::String(_)),
+                "batchSize" if name == "getMore" => {
+                    unsigned(value)?;
+                    true
+                }
+                "cursors" if name == "killCursors" => matches!(value, BsonValue::Array(_)),
                 _ => false,
             };
             if !valid {
                 return Err(CommandError::options());
             }
         }
-        let command = if name == "insert" {
+        let mut command = if name == "insert" {
             let documents = insert_documents(request)?;
             let ordered = !matches!(
                 request.body.get_first("ordered"),
@@ -196,7 +238,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 documents,
                 DocumentWriteOptions::new().with_ordered(ordered),
             )?)
-        } else {
+        } else if name == "find" {
             if !request.sequences.is_empty() {
                 return Err(CommandError::options());
             }
@@ -207,7 +249,15 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             };
             // Validate before missing-collection handling or storage admission.
             // The shared engine compiles the same authoritative matcher.
-            DocumentMatcher::compile(&filter)?;
+            DocumentMatcher::compile_with_check(&filter, &mut || {
+                if started.elapsed() >= timeout {
+                    Err(EngineError::deadline_exceeded(
+                        "Mongo command parsing deadline exceeded",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })?;
             let mut options = DocumentReadOptions::new();
             if let Some(value) = request.body.get_first("skip") {
                 options = options.with_skip(unsigned(value)?);
@@ -220,15 +270,16 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             }
             if let Some(value) = request.body.get_first("batchSize") {
                 let size = unsigned(value)?;
-                if size == 0 || size > 1000 {
+                if size > 1000 {
                     return Err(CommandError::unsupported());
                 }
                 options = options.with_batch_size(size)?;
             }
-            if matches!(
+            let single_batch = matches!(
                 request.body.get_first("singleBatch"),
                 Some(BsonValue::Boolean(true))
-            ) {
+            );
+            if single_batch && options.batch_size() > 0 {
                 options = options.clone().with_limit(
                     options
                         .limit()
@@ -236,14 +287,70 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                         .min(options.batch_size()),
                 )?;
             }
-            Command::Find(DocumentFindRequest::new(
+            options =
+                options.with_batch_byte_limit((wire::MAX_BOOTSTRAP_MESSAGE_BYTES - 8192) as u64)?;
+            Command::Find(
+                DocumentFindRequest::new(namespace, DocumentFilter::new(filter)?, options),
+                single_batch,
+                cursor_budget,
+            )
+        } else if name == "getMore" {
+            if !request.sequences.is_empty() {
+                return Err(CommandError::options());
+            }
+            let id = cursor_id(value)?;
+            let batch = request
+                .body
+                .get_first("batchSize")
+                .map(unsigned)
+                .transpose()?
+                .unwrap_or(101);
+            if batch == 0 || batch > 1000 {
+                return Err(CommandError::invalid());
+            }
+            let options = DocumentReadOptions::new()
+                .with_batch_size(batch)?
+                .with_batch_byte_limit((wire::MAX_BOOTSTRAP_MESSAGE_BYTES - 8192) as u64)?;
+            Command::GetMore(DocumentContinueCursorRequest::new(namespace, id, options))
+        } else {
+            if !request.sequences.is_empty() {
+                return Err(CommandError::options());
+            }
+            let Some(BsonValue::Array(ids)) = request.body.get_first("cursors") else {
+                return Err(CommandError::invalid());
+            };
+            if ids.len() > 1000 {
+                return Err(CommandError::invalid());
+            }
+            Command::KillCursors(
                 namespace,
-                DocumentFilter::new(filter)?,
-                options,
-            ))
+                ids.iter().map(cursor_id).collect::<Result<Vec<_>>>()?,
+            )
         };
-        Ok(Prepared { command, timeout })
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Err(CommandError::new(
+                50,
+                "MaxTimeMSExpired",
+                "command deadline exceeded",
+            ));
+        }
+        if let Command::Find(_, _, budget) = &mut command {
+            *budget = budget.map(|budget| budget.saturating_sub(elapsed));
+        }
+        Ok(Prepared {
+            command,
+            timeout: timeout - elapsed,
+        })
     })())
+}
+
+fn cursor_id(value: &BsonValue) -> Result<DocumentCursorId> {
+    let id = unsigned(value)?;
+    if id == 0 || id > i64::MAX as u64 {
+        return Err(CommandError::invalid());
+    }
+    DocumentCursorId::new(id).map_err(Into::into)
 }
 
 fn unsigned(value: &BsonValue) -> Result<u64> {
@@ -326,6 +433,7 @@ fn insert_documents(request: &Request) -> Result<Vec<BsonDocument>> {
 pub(super) struct Executor {
     database: BriskDb,
     creation: Mutex<()>,
+    cursors: Arc<cursors::WireCursors>,
 }
 
 impl Executor {
@@ -333,11 +441,24 @@ impl Executor {
         Self {
             database,
             creation: Mutex::new(()),
+            cursors: Arc::new(cursors::WireCursors::default()),
         }
     }
 
     pub(super) fn session(&self) -> Session {
         self.database.session()
+    }
+
+    pub(super) fn connection_cursors(&self, owner: u64) -> cursors::ConnectionCursors {
+        self.cursors.connection(owner)
+    }
+
+    pub(super) fn prune_cursors(&self) {
+        self.cursors.prune();
+    }
+
+    pub(super) fn discard_cursor(&self, id: DocumentCursorId) {
+        self.cursors.discard(id);
     }
 
     pub(super) async fn execute(
@@ -492,20 +613,43 @@ impl Executor {
                     )),
                 }
             }
-            Command::Find(find) => {
-                let namespace = find.namespace().to_string();
+            Command::Find(find, single_batch, budget) => {
+                let started = Instant::now();
+                let namespace = find.namespace().clone();
                 if !self
                     .exists(session, identity, &context, find.namespace())
                     .await?
                 {
-                    return Ok(cursor_reply(namespace, Vec::new()));
+                    return Ok(cursor_reply(namespace.to_string(), None, Vec::new(), false));
                 }
+                if single_batch && find.read_options().batch_size() == 0 {
+                    return Ok(cursor_reply(namespace.to_string(), None, Vec::new(), false));
+                }
+                // Mongo drivers may use a different pooled socket for getMore.
+                // Retain this cursor's engine ownership separately from TCP.
+                let cursor_session = Arc::new(self.session());
                 match self
-                    .call(session, identity, &context, DocumentCommand::Find(find))
+                    .call(
+                        &cursor_session,
+                        identity,
+                        &context,
+                        DocumentCommand::Find(find),
+                    )
                     .await?
                 {
-                    DocumentResult::Cursor(batch) if batch.is_exhausted() => {
-                        Ok(cursor_reply(namespace, batch.into_parts().2))
+                    DocumentResult::Cursor(batch) => {
+                        let (_, id, documents) = batch.into_parts();
+                        let id = if single_batch { None } else { id };
+                        if let Some(id) = id {
+                            self.cursors.register(
+                                id,
+                                namespace.clone(),
+                                cursor_session,
+                                session.id().get(),
+                                budget.map(|budget| budget.saturating_sub(started.elapsed())),
+                            )?;
+                        }
+                        Ok(cursor_reply(namespace.to_string(), id, documents, false))
                     }
                     _ => Err(CommandError::new(
                         1,
@@ -514,20 +658,110 @@ impl Executor {
                     )),
                 }
             }
+            Command::GetMore(next) => {
+                let namespace = next.namespace().clone();
+                let id = next.cursor_id();
+                let lease = self.cursors.lookup(id, &namespace, session.id().get())?;
+                let started = Instant::now();
+                let context = if let Some(remaining) = lease.remaining {
+                    let deadline = context
+                        .deadline()
+                        .expect("Mongo command deadline")
+                        .min(Instant::now() + remaining.min(Duration::from_secs(15)));
+                    context.with_deadline(deadline)
+                } else {
+                    context
+                };
+                let result = self
+                    .call(
+                        &lease.session,
+                        identity,
+                        &context,
+                        DocumentCommand::ContinueCursor(next),
+                    )
+                    .await;
+                match result {
+                    Ok(DocumentResult::Cursor(batch)) => {
+                        let (_, next_id, documents) = batch.into_parts();
+                        lease.complete(started.elapsed(), next_id.is_some())?;
+                        Ok(cursor_reply(
+                            namespace.to_string(),
+                            next_id,
+                            documents,
+                            true,
+                        ))
+                    }
+                    Err(error) => Err(error),
+                    _ => Err(CommandError::new(
+                        1,
+                        "InternalError",
+                        "unexpected engine result",
+                    )),
+                }
+            }
+            Command::KillCursors(namespace, ids) => {
+                let mut killed = Vec::new();
+                let mut missing = Vec::new();
+                for id in ids {
+                    let Some(cursor_session) = self.cursors.take(id, &namespace) else {
+                        missing.push(BsonValue::Int64(id.get() as i64));
+                        continue;
+                    };
+                    let command = DocumentCommand::KillCursor(DocumentKillCursorRequest::new(
+                        namespace.clone(),
+                        id,
+                        DocumentWriteOptions::new(),
+                    ));
+                    match self
+                        .call(&cursor_session, identity, &context, command)
+                        .await?
+                    {
+                        DocumentResult::CursorKilled(true) => {
+                            killed.push(BsonValue::Int64(id.get() as i64))
+                        }
+                        DocumentResult::CursorKilled(false) => {
+                            missing.push(BsonValue::Int64(id.get() as i64))
+                        }
+                        _ => {
+                            return Err(CommandError::new(
+                                1,
+                                "InternalError",
+                                "unexpected engine result",
+                            ));
+                        }
+                    }
+                }
+                Ok(fields([
+                    ("ok", BsonValue::Double(1.0)),
+                    ("cursorsKilled", BsonValue::Array(killed)),
+                    ("cursorsNotFound", BsonValue::Array(missing)),
+                    ("cursorsAlive", BsonValue::Array(Vec::new())),
+                    ("cursorsUnknown", BsonValue::Array(Vec::new())),
+                ]))
+            }
         }
     }
 }
 
-fn cursor_reply(namespace: String, documents: Vec<BsonDocument>) -> BsonDocument {
+fn cursor_reply(
+    namespace: String,
+    id: Option<DocumentCursorId>,
+    documents: Vec<BsonDocument>,
+    continuation: bool,
+) -> BsonDocument {
     fields([
         ("ok", BsonValue::Double(1.0)),
         (
             "cursor",
             BsonValue::Document(fields([
-                ("id", BsonValue::Int64(0)),
+                ("id", BsonValue::Int64(id.map_or(0, |id| id.get() as i64))),
                 ("ns", BsonValue::String(namespace)),
                 (
-                    "firstBatch",
+                    if continuation {
+                        "nextBatch"
+                    } else {
+                        "firstBatch"
+                    },
                     BsonValue::Array(documents.into_iter().map(BsonValue::Document).collect()),
                 ),
             ])),
@@ -535,23 +769,32 @@ fn cursor_reply(namespace: String, documents: Vec<BsonDocument>) -> BsonDocument
     ])
 }
 
+pub(super) fn reply_cursor_id(body: &BsonDocument) -> Option<DocumentCursorId> {
+    let BsonValue::Document(cursor) = body.get_first("cursor")? else {
+        return None;
+    };
+    cursor_id(cursor.get_first("id")?).ok()
+}
+
 /// Called on the blocking encoder. Embedded callers may have stored a BSON
 /// document larger than this listener advertises; reject it with a command
 /// error while keeping the connection usable.
 pub(super) fn validate_response(body: &BsonDocument) -> Result<()> {
     if let Some(BsonValue::Document(cursor)) = body.get_first("cursor") {
-        if let Some(BsonValue::Array(documents)) = cursor.get_first("firstBatch") {
-            let options =
-                BsonCodecOptions::new().with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES);
-            for document in documents {
-                if let BsonValue::Document(document) = document {
-                    encode_document_with_options(document, &options).map_err(|_| {
-                        CommandError::new(
-                            10334,
-                            "BSONObjectTooLarge",
-                            "document exceeds Mongo listener limit",
-                        )
-                    })?;
+        for name in ["firstBatch", "nextBatch"] {
+            if let Some(BsonValue::Array(documents)) = cursor.get_first(name) {
+                let options =
+                    BsonCodecOptions::new().with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES);
+                for document in documents {
+                    if let BsonValue::Document(document) = document {
+                        encode_document_with_options(document, &options).map_err(|_| {
+                            CommandError::new(
+                                10334,
+                                "BSONObjectTooLarge",
+                                "document exceeds Mongo listener limit",
+                            )
+                        })?;
+                    }
                 }
             }
         }

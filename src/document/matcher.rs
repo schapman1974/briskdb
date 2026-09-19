@@ -67,6 +67,7 @@ fn limit() -> EngineError {
 /// bounds; all branches are validated even when a logical clause short-circuits.
 pub struct DocumentMatcher {
     clauses: Vec<Clause>,
+    retained_bytes: usize,
 }
 
 impl fmt::Debug for DocumentMatcher {
@@ -151,17 +152,29 @@ impl DocumentMatcher {
         check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<Self> {
         check()?;
-        encode_document_with_options(
+        let encoded = encode_document_with_options(
             filter,
             &BsonCodecOptions::new().with_max_document_bytes(MAX_QUERY_BYTES),
         )
         .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
-        Compiler {
+        let mut compiler = Compiler {
             nodes: 0,
             regexes: 0,
             check,
-        }
-        .document(filter, 0, false)
+        };
+        let mut matcher = compiler.document(filter, 0, false)?;
+        // Conservative accounting for owned AST/value allocations and bounded
+        // regex programs/caches. This is a retention quota, not an RSS metric.
+        matcher.retained_bytes = encoded
+            .len()
+            .saturating_mul(16)
+            .saturating_add(compiler.nodes.saturating_mul(128))
+            .saturating_add(compiler.regexes.saturating_mul(1024 * 1024));
+        Ok(matcher)
+    }
+
+    pub(crate) const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 
     /// Match caller-supplied BSON after structural size/depth validation.
@@ -256,7 +269,10 @@ impl Compiler<'_> {
                 }
             }
         }
-        Ok(DocumentMatcher { clauses })
+        Ok(DocumentMatcher {
+            clauses,
+            retained_bytes: 0,
+        })
     }
 
     fn predicates(

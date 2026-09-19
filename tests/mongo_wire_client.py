@@ -207,6 +207,52 @@ def query_smoke(uri):
         assert client.admin.command("ping")["ok"] == 1
 
 
+def cursor_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=5000, maxPoolSize=3) as client:
+        collection = client.wire_batches.split
+        assert [row["_id"] for row in collection.find().batch_size(37)] == list(range(1001))
+        assert [row["_id"] for row in collection.find({"_id": {"$gte": 17}}).skip(5).limit(123).batch_size(7)] == list(range(22, 145))
+        first = client.wire_batches.command("find", "split", filter={}, batchSize=0)
+        identifier = first["cursor"]["id"]
+        assert identifier > 0 and first["cursor"]["firstBatch"] == []
+        try:
+            client.wire_batches.command("getMore", identifier, collection="wrong", batchSize=2)
+        except OperationFailure as error:
+            assert error.code == 43
+        else:
+            raise AssertionError("foreign namespaces must not access a cursor")
+        next_batch = client.wire_batches.command("getMore", identifier, collection="split", batchSize=3)
+        assert next_batch["cursor"]["id"] == identifier
+        assert [row["_id"] for row in next_batch["cursor"]["nextBatch"]] == [0, 1, 2]
+        killed = client.wire_batches.command("killCursors", "split", cursors=[identifier])
+        assert killed["cursorsKilled"] == [identifier]
+        assert killed["cursorsAlive"] == killed["cursorsUnknown"] == []
+        missing = client.wire_batches.command("killCursors", "split", cursors=[identifier])
+        assert missing["cursorsNotFound"] == [identifier]
+        cursor = collection.find(batch_size=2)
+        assert next(cursor)["_id"] == 0
+        identifier = cursor.cursor_id
+        cursor.close()
+        try:
+            client.wire_batches.command("getMore", identifier, collection="split")
+        except OperationFailure as error:
+            assert error.code == 43
+        else:
+            raise AssertionError("closing a PyMongo cursor must release its server cursor")
+        def consume(start):
+            return [row["_id"] for row in collection.find({"_id": {"$gte": start}}).limit(30).batch_size(3)]
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            assert list(pool.map(consume, [0, 100, 200])) == [list(range(start, start + 30)) for start in [0, 100, 200]]
+        large = client.wire_cursors.large
+        large.insert_many([{"_id": index, "payload": "x" * 60_000} for index in range(30)])
+        assert [row["_id"] for row in large.find(batch_size=1000)] == list(range(30))
+        single = client.wire_cursors.command("find", "large", filter={}, batchSize=1000, singleBatch=True)
+        assert single["cursor"]["id"] == 0
+        assert 0 < len(single["cursor"]["firstBatch"]) < 30
+        empty = client.wire_cursors.command("find", "large", batchSize=0, singleBatch=True)
+        assert empty["cursor"]["id"] == 0 and empty["cursor"]["firstBatch"] == []
+
+
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         assert client.wire_data.items.find_one({"_id": "typed"})["decimal"] == Decimal128("1.250")
@@ -218,6 +264,7 @@ def persisted_smoke(uri):
         assert client.wire_batches.timestamps.find_one({"_id": "first"})["stamp"].time > 0
         assert client.async_data.batches.find_one({"_id": 2}) == {"_id": 2}
         assert sorted(item["_id"] for item in client.wire_queries.items.find({"v": {"$in": [7]}})) == ["array", "number"]
+        assert [row["_id"] for row in client.wire_batches.split.find(batch_size=31).limit(150)] == list(range(150))
 
 
 async def async_smoke(uri):
@@ -251,6 +298,18 @@ async def async_smoke(uri):
         assert await client.async_data.batches.find_one({"_id": 2}) == {"_id": 2}
         rows = await client.wire_queries.items.find({"items.score": {"$gt": 1}}).to_list()
         assert sorted(item["_id"] for item in rows) == ["array", "number"]
+        rows = await client.wire_batches.split.find(batch_size=17).skip(8).limit(121).to_list()
+        assert [row["_id"] for row in rows] == list(range(8, 129))
+        cursor = client.wire_batches.split.find(batch_size=2)
+        assert (await cursor.__anext__())["_id"] == 0
+        identifier = cursor.cursor_id
+        await cursor.close()
+        try:
+            await client.wire_batches.command("getMore", identifier, collection="split")
+        except OperationFailure as error:
+            assert error.code == 43
+        else:
+            raise AssertionError("async close must kill the cursor")
 
 
 if __name__ == "__main__":
@@ -262,5 +321,6 @@ if __name__ == "__main__":
         document_smoke(sys.argv[1])
         batch_smoke(sys.argv[1])
         query_smoke(sys.argv[1])
+        cursor_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
-    print("PyMongo 4.17.0 discovery, insert batches, exact-ID find, BSON, and rejection passed")
+    print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

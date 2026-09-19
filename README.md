@@ -132,7 +132,7 @@ experimental and opt-in; the exact contract lives in
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working; the opt-in `documents` feature adds a thin native document-command facade |
 | Same-host service and embedded processes sharing one ready root | Working on local filesystems |
-| Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, batch inserts, and bounded find queries now share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), write/index semantics, and retained cursors remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
+| Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, batch inserts, and retained find cursors now share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), write/index semantics, and aggregation remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
 | Native Python extension | Typed sync/async SQL and opt-in BSON document commands; tagged releases build audited macOS/Linux ARM/x86 wheels |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
@@ -269,7 +269,7 @@ with briskdb.open("./data", shards=4, documents=True) as db:
 PyMongo remains optional and is loaded only when a document method runs, so a
 SQL-only installation has no BSON dependency. The current slice supports
 collection/index metadata, single-document inserts with optional `_id`, BSON
-match-expression find/count, and exact-`_id` deletion. Finds must fit one batch.
+match-expression find/count, retained find cursors, and exact-`_id` deletion.
 Secondary index declarations remain
 `pending_build`.
 
@@ -351,7 +351,7 @@ more valuable than a star. Start with the
 - Pre-1.0 storage and public-library compatibility can change between releases.
 - Python document commands generate missing ObjectIds and support bounded BSON
   find/count filters. Updates, aggregation, embedded bulk writes,
-  retained document cursors, and built secondary indexes are still planned.
+  metadata/aggregation document cursors, and built secondary indexes are still planned.
 - Ubuntu 24.04 x86-64 receives the full required Rust CI suite. Python wheels
   receive native build, audit, install, restart, corruption, and concurrency
   checks on Linux/macOS x86-64 and ARM64.

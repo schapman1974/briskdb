@@ -168,7 +168,8 @@ pub struct DocumentReadOptions {
     sort: Option<DocumentSort>,
     skip: u64,
     limit: Option<NonZeroU64>,
-    batch_size: NonZeroU64,
+    batch_size: u64,
+    batch_byte_limit: Option<NonZeroU64>,
 }
 
 impl DocumentReadOptions {
@@ -179,8 +180,8 @@ impl DocumentReadOptions {
             sort: None,
             skip: 0,
             limit: None,
-            batch_size: NonZeroU64::new(DEFAULT_DOCUMENT_BATCH_SIZE)
-                .expect("the default document batch size is nonzero"),
+            batch_size: DEFAULT_DOCUMENT_BATCH_SIZE,
+            batch_byte_limit: None,
         }
     }
 
@@ -213,7 +214,8 @@ impl DocumentReadOptions {
         Ok(self)
     }
 
-    /// Request a positive, bounded cursor batch size.
+    /// Request a bounded cursor batch size. Zero creates an empty initial find
+    /// batch with a retained cursor; continuation requests require a positive size.
     pub fn with_batch_size(mut self, batch_size: u64) -> EngineResult<Self> {
         if batch_size > MAX_DOCUMENT_BATCH_SIZE {
             return Err(EngineError::new(
@@ -221,13 +223,27 @@ impl DocumentReadOptions {
                 format!("document batch size must not exceed {MAX_DOCUMENT_BATCH_SIZE}"),
             ));
         }
-        self.batch_size = NonZeroU64::new(batch_size).ok_or_else(|| {
+        self.batch_size = batch_size;
+        Ok(self)
+    }
+
+    /// Cap encoded bytes per cursor page without weakening the request's hard
+    /// result limits. A single document that cannot fit still fails explicitly.
+    pub fn with_batch_byte_limit(mut self, bytes: u64) -> EngineResult<Self> {
+        self.batch_byte_limit = Some(NonZeroU64::new(bytes).ok_or_else(|| {
             EngineError::new(
                 EngineErrorKind::InvalidArgument,
-                "document batch size must be greater than zero",
+                "document batch byte limit must be greater than zero",
             )
-        })?;
+        })?);
         Ok(self)
+    }
+
+    pub const fn batch_byte_limit(&self) -> Option<u64> {
+        match self.batch_byte_limit {
+            Some(limit) => Some(limit.get()),
+            None => None,
+        }
     }
 
     pub const fn projection(&self) -> Option<&DocumentProjection> {
@@ -250,7 +266,7 @@ impl DocumentReadOptions {
     }
 
     pub const fn batch_size(&self) -> u64 {
-        self.batch_size.get()
+        self.batch_size
     }
 
     pub fn into_parts(
@@ -261,13 +277,15 @@ impl DocumentReadOptions {
         u64,
         Option<u64>,
         u64,
+        Option<u64>,
     ) {
         (
             self.projection,
             self.sort,
             self.skip,
             self.limit.map(NonZeroU64::get),
-            self.batch_size.get(),
+            self.batch_size,
+            self.batch_byte_limit.map(NonZeroU64::get),
         )
     }
 }
@@ -290,6 +308,7 @@ impl fmt::Debug for DocumentReadOptions {
             .field("skip", &self.skip)
             .field("limit", &self.limit())
             .field("batch_size", &self.batch_size())
+            .field("batch_byte_limit", &self.batch_byte_limit())
             .finish()
     }
 }
@@ -384,7 +403,14 @@ mod tests {
         assert_eq!(options.skip(), 3);
         assert_eq!(options.limit(), Some(7));
         assert_eq!(options.batch_size(), 11);
-        assert!(DocumentReadOptions::new().with_batch_size(0).is_err());
+        assert_eq!(
+            DocumentReadOptions::new()
+                .with_batch_size(0)
+                .unwrap()
+                .batch_size(),
+            0
+        );
+        assert!(DocumentReadOptions::new().with_batch_byte_limit(0).is_err());
         assert!(
             DocumentReadOptions::new()
                 .with_batch_size(MAX_DOCUMENT_BATCH_SIZE + 1)

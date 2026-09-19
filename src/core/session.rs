@@ -58,6 +58,8 @@ pub(crate) struct SessionInner {
     routing_key: Option<String>,
     prepared: PreparedState,
     transaction: Option<TransactionState>,
+    #[cfg(feature = "documents")]
+    pub(crate) document_cursor_owner: Option<super::engine::DocumentCursorOwner>,
 }
 
 #[derive(Debug)]
@@ -224,6 +226,8 @@ impl Session {
                 routing_key: None,
                 prepared: PreparedState::new(id, prepared_limits),
                 transaction: None,
+                #[cfg(feature = "documents")]
+                document_cursor_owner: None,
             })),
         }
     }
@@ -270,6 +274,10 @@ impl Session {
             inner.state = SessionState::Closed;
             inner.routing_key = None;
             inner.prepared.clear();
+            #[cfg(feature = "documents")]
+            {
+                inner.document_cursor_owner = None;
+            }
             inner.take_transaction()
         };
         if let Some(transaction) = transaction {
