@@ -63,6 +63,249 @@ fn membership(operator: &str, values: Vec<BsonValue>) -> BsonDocument {
     doc([(operator, BsonValue::Document(doc([("items", operand)])))])
 }
 
+fn push(operand: BsonValue) -> BsonDocument {
+    doc([("$push", BsonValue::Document(doc([("items", operand)])))])
+}
+
+#[tokio::test]
+async fn push_modifiers_counts_images_preflight_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            push(BsonValue::Int64(3))
+        )
+        .await,
+        (24, 24)
+    );
+    let expression = push(BsonValue::Document(doc([
+        ("$slice", BsonValue::Int32(2)),
+        ("$sort", BsonValue::Int32(1)),
+        ("$position", BsonValue::Int32(-1)),
+        (
+            "$each",
+            BsonValue::Array(vec![BsonValue::Int32(2), BsonValue::Int32(1)]),
+        ),
+    ])));
+    assert_eq!(
+        many_counts(&engine, &session, BsonDocument::new(), expression).await,
+        (24, 24)
+    );
+    let empty = push(BsonValue::Document(doc([(
+        "$each",
+        BsonValue::Array(vec![]),
+    )])));
+    assert_eq!(
+        many_counts(&engine, &session, BsonDocument::new(), empty).await,
+        (24, 0)
+    );
+    let options = DocumentReadOptions::new()
+        .with_sort(DocumentSort::new(doc([("_id", BsonValue::Int32(-1))])).unwrap())
+        .with_projection(
+            DocumentProjection::new(doc([
+                ("items", BsonValue::Int32(1)),
+                ("_id", BsonValue::Int32(0)),
+            ]))
+            .unwrap(),
+        );
+    for after in [false, true] {
+        let image = engine
+            .execute_document(
+                &session,
+                request(
+                    find_update(
+                        BsonDocument::new(),
+                        push(BsonValue::Int64(4)),
+                        options.clone(),
+                        after,
+                    ),
+                    RequestContext::new(),
+                ),
+            )
+            .await
+            .unwrap()
+            .into_parts()
+            .2;
+        let expected = if after {
+            vec![
+                BsonValue::Int32(1),
+                BsonValue::Int32(2),
+                BsonValue::Int64(4),
+                BsonValue::Int64(4),
+            ]
+        } else {
+            vec![BsonValue::Int32(1), BsonValue::Int32(2)]
+        };
+        let DocumentResult::Document(Some(image)) = image else {
+            panic!("image")
+        };
+        assert_eq!(
+            encode_document(&image).unwrap(),
+            encode_document(&doc([("items", BsonValue::Array(expected))])).unwrap()
+        );
+    }
+    let before = rows(&engine, &session).await;
+    let invalid = doc([
+        (
+            "$set",
+            BsonValue::Document(doc([("atomic_marker", BsonValue::Boolean(true))])),
+        ),
+        (
+            "$push",
+            BsonValue::Document(doc([("done", BsonValue::Null)])),
+        ),
+    ]);
+    for command in [
+        DocumentCommand::Update(update(BsonDocument::new(), invalid.clone())),
+        update_many(BsonDocument::new(), invalid.clone()),
+        find_update(
+            BsonDocument::new(),
+            invalid,
+            DocumentReadOptions::new(),
+            true,
+        ),
+    ] {
+        assert!(
+            engine
+                .execute_document(&session, request(command, RequestContext::new()))
+                .await
+                .is_err()
+        );
+    }
+    let capped = update(BsonDocument::new(), push(BsonValue::from("x".repeat(512))))
+        .with_max_document_bytes(128)
+        .unwrap();
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(DocumentCommand::Update(capped), RequestContext::new())
+            )
+            .await
+            .is_err()
+    );
+    for after in [false, true] {
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    request(
+                        find_update(
+                            BsonDocument::new(),
+                            push(BsonValue::Null),
+                            DocumentReadOptions::new(),
+                            after
+                        ),
+                        RequestContext::new().with_result_limits(ResultLimits::new(1, 1).unwrap())
+                    )
+                )
+                .await
+                .is_err()
+        );
+    }
+    let token = CancellationToken::new();
+    token.cancel();
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    update_many(BsonDocument::new(), push(BsonValue::Null)),
+                    RequestContext::new().with_cancellation_token(token)
+                )
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(rows(&engine, &session).await, before);
+    // The persisted document cap applies after slicing, not to the temporary array.
+    let trimmed = push(BsonValue::Document(doc([
+        (
+            "$each",
+            BsonValue::Array(vec![BsonValue::from("x".repeat(512))]),
+        ),
+        ("$slice", BsonValue::Int32(0)),
+    ])));
+    let capped = update(BsonDocument::new(), trimmed)
+        .with_max_document_bytes(128)
+        .unwrap();
+    engine
+        .execute_document(
+            &session,
+            request(DocumentCommand::Update(capped), RequestContext::new()),
+        )
+        .await
+        .unwrap();
+    let persisted = rows(&engine, &session).await;
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(rows(&engine, &engine.session()).await, persisted);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pushes_preserve_every_value_and_sort_slice_all_matches() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(root.path(), 4).await.unwrap());
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let mut workers = Vec::new();
+    for worker in 0..4 {
+        let engine = Arc::clone(&engine);
+        workers.push(tokio::spawn(async move {
+            let session = engine.session();
+            for step in 0..8 {
+                assert_eq!(
+                    many_counts(
+                        &engine,
+                        &session,
+                        BsonDocument::new(),
+                        push(BsonValue::Int32(worker * 8 + step))
+                    )
+                    .await,
+                    (24, 24)
+                );
+            }
+        }));
+    }
+    for worker in workers {
+        worker.await.unwrap();
+    }
+    for row in rows(&engine, &session).await {
+        let Some(BsonValue::Array(values)) = row.get_first("items") else {
+            panic!("array")
+        };
+        let mut values = values.clone();
+        values.sort();
+        assert_eq!(values, (0..32).map(BsonValue::Int32).collect::<Vec<_>>());
+    }
+    let expression = push(BsonValue::Document(doc([
+        ("$each", BsonValue::Array(vec![])),
+        ("$sort", BsonValue::Int32(1)),
+        ("$slice", BsonValue::Int32(-8)),
+    ])));
+    assert_eq!(
+        many_counts(&engine, &session, BsonDocument::new(), expression.clone()).await,
+        (24, 24)
+    );
+    assert_eq!(
+        many_counts(&engine, &session, BsonDocument::new(), expression).await,
+        (24, 0)
+    );
+    for row in rows(&engine, &session).await {
+        assert_eq!(
+            row.get_first("items"),
+            Some(&BsonValue::Array((24..32).map(BsonValue::Int32).collect()))
+        );
+    }
+}
+
 #[tokio::test]
 async fn array_membership_counts_images_atomic_errors_limits_and_restart() {
     let root = tempfile::tempdir().unwrap();

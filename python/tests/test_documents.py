@@ -52,6 +52,40 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_push_modifiers_counts_images_fidelity_controls_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for i in range(4):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": Int64(i), "values": [Int64(3)], "keep": True})
+                    identifier = uuid.uuid4()
+                    expression = {"$push": {"values": {"$slice": 3, "$sort": 1, "$position": -1, "$each": [2, 1]}}}
+                    result = session.update_many(DATABASE, COLLECTION, {}, expression, request_id=identifier)
+                    self.assertEqual((result["matched_count"], result["modified_count"], result["request_id"]), (4, 4, identifier))
+                    self.assertEqual(session.update_one(DATABASE, COLLECTION, {}, {"$push": {"values": {"$each": []}}})["modified_count"], 0)
+                    image = session.find_one_and_update(DATABASE, COLLECTION, {}, {"$push": {"values": [4, 5]}}, sort={"_id": -1}, projection={"values": 1, "_id": 0})["document"]
+                    self.assertEqual(bson_bytes(image), bson_bytes({"values": [1, 2, Int64(3)]}))
+                    expression = {"$push": {"values": {"$each": [Timestamp(0, 0), Binary(b"value", 128)], "$slice": -3}}}
+                    image = session.find_one_and_update(DATABASE, COLLECTION, {"_id": 3}, expression, return_document=True, projection={"values": 1, "_id": 0})["document"]
+                    self.assertEqual(bson_bytes(image), bson_bytes({"values": [[4, 5], Timestamp(0, 0), Binary(b"value", 128)]}))
+                    before = [bson_bytes(row) for row in session.find(DATABASE, COLLECTION)["documents"]]
+                    for method in (session.update_one, session.update_many):
+                        with self.assertRaises(briskdb.InvalidArgumentError):
+                            method(DATABASE, COLLECTION, {}, {"$set": {"atomic_marker": True}, "$push": {"keep": 1}})
+                    with self.assertRaises(briskdb.InvalidArgumentError):
+                        session.update_many(DATABASE, COLLECTION, {"_id": 99}, {"$push": {"values": {"$each": [], "$sort": {}}}})
+                    for after in (False, True):
+                        with self.assertRaises(briskdb.LimitExceededError):
+                            session.find_one_and_update(DATABASE, COLLECTION, {}, {"$push": {"values": None}}, return_document=after, max_result_bytes=1)
+                    token = briskdb.CancellationToken(); token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.update_many(DATABASE, COLLECTION, {}, {"$push": {"values": None}}, cancellation=token)
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION)["documents"]], before)
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION)["documents"]], before)
+
     def test_array_membership_counts_fidelity_images_errors_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -1539,6 +1573,25 @@ class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(briskdb.CancelledError):
                         await session.find_one_and_replace(DATABASE, COLLECTION, {}, {}, cancellation=token)
                     self.assertIsNone((await session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 99}, {}))["document"])
+
+    async def test_async_push_counts_images_and_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for i in range(4):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": i, "values": [Int64(3)]})
+                    result = await session.update_many(DATABASE, COLLECTION, {}, {"$push": {"values": {"$each": [2, 1], "$sort": 1}}})
+                    self.assertEqual((result["matched_count"], result["modified_count"]), (4, 4))
+                    self.assertEqual((await session.update_one(DATABASE, COLLECTION, {}, {"$push": {"values": {"$each": []}}}))["modified_count"], 0)
+                    image = (await session.find_one_and_update(DATABASE, COLLECTION, {}, {"$push": {"values": {"$each": [4], "$slice": -2}}}, sort={"_id": -1}, projection={"values": 1, "_id": 0}, return_document=True))["document"]
+                    self.assertEqual(bson_bytes(image), bson_bytes({"values": [Int64(3), 4]}))
+                    with self.assertRaises(briskdb.InvalidArgumentError):
+                        await session.update_many(DATABASE, COLLECTION, {}, {"$push": {"_id": 1}})
+                    token = briskdb.CancellationToken(); token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        await session.update_many(DATABASE, COLLECTION, {}, {"$push": {"values": None}}, cancellation=token)
+                    self.assertEqual([row["values"] for row in (await session.find(DATABASE, COLLECTION))["documents"]], [[1, 2, Int64(3)]] * 3 + [[Int64(3), 4]])
 
     async def test_async_array_membership_counts_images_and_cancellation(self) -> None:
         with tempfile.TemporaryDirectory() as root:

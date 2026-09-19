@@ -1,5 +1,7 @@
 //! Bounded, eagerly validated field updates. No storage or protocol policy.
 
+mod push;
+
 use std::{cmp::Ordering, error::Error, fmt};
 
 use super::{
@@ -82,6 +84,7 @@ enum OperationAction {
         values: Vec<BsonValue>,
         remove: bool,
     },
+    Push(push::Push),
 }
 
 enum Action {
@@ -161,7 +164,7 @@ impl DocumentUpdater {
             check()?;
             match operator {
                 "$set" | "$unset" | "$min" | "$max" | "$pop" | "$rename" | "$addToSet"
-                | "$pullAll" => {}
+                | "$pullAll" | "$push" => {}
                 name if name.starts_with('$') => {
                     return Err(DocumentUpdateError::UnsupportedOperator.error());
                 }
@@ -212,6 +215,11 @@ impl DocumentUpdater {
                             remove: true,
                         }
                     }
+                    "$push" => OperationAction::Push(push::Push::compile(
+                        value,
+                        &mut retained_bytes,
+                        check,
+                    )?),
                     _ => unreachable!("operator prevalidated"),
                 };
                 operations.push(Operation { path, action });
@@ -279,6 +287,9 @@ impl DocumentUpdater {
                         *remove,
                         &mut budget,
                     )?;
+                }
+                OperationAction::Push(push) => {
+                    push.apply_document(&mut result, &operation.path, &mut budget)?
                 }
             }
         }

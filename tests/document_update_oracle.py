@@ -10,6 +10,10 @@ reference helpers. Add-to-set uses non-ID object paths only because its legacy
 reference helper shares the old set-path behavior. Pull-all covers non-ID numeric
 paths; both legacy membership helpers restore changed IDs silently. Strict
 add-to-set paths and immutable IDs are tested independently, not waived.
+Push covers non-ID object/array paths and blocked parents; its helper silently
+restores changed IDs, so identity is tested independently. Push sorting uses
+whole values or frozen object-only field
+lookup, not ordinary query-sort array-element selection.
 """
 import hashlib
 import random
@@ -218,6 +222,59 @@ def main():
         ({"_id": 7, "v": [1]}, "v.-1", []),
     ]:
         emit(document, {"$pullAll": {path: candidates}})
+
+    for current in comparison_values:
+        for candidate in comparison_values:
+            emit({"_id": 7, "v": [current], "nested": {"v": [current]}},
+                 {"$push": {"v": candidate, "nested.v": candidate}})
+        emit({"_id": 7}, {"$push": {"missing.0.v": current}})
+        emit({"_id": 7, "v": current}, {"$push": {"v": "added"}})
+    for _ in range(1000):
+        items = [randomizer.choice(comparison_values) for _ in range(randomizer.randrange(7))]
+        additions = [randomizer.choice(comparison_values) for _ in range(randomizer.randrange(5))]
+        position = randomizer.choice([-99, -3, -1, 0, 1, 3, 99])
+        slice_count = randomizer.choice([-99, -2, -1, 0, 1, 2, 99])
+        direction = randomizer.choice([-1, 1])
+        emit({"_id": 7, "v": items}, {"$push": {"v": {
+            "$slice": slice_count, "$sort": direction, "$each": additions, "$position": position}}})
+        documents = [{"group": randomizer.randrange(3), "score": value, "serial": index}
+                     for index, value in enumerate(items)]
+        added_documents = [{"group": randomizer.randrange(3), "score": value, "serial": index + 100}
+                           for index, value in enumerate(additions)]
+        emit({"_id": 7, "v": documents + [None, {}]}, {"$push": {"v": {
+            "$each": added_documents, "$position": position,
+            "$sort": {"group": 1, "score": -1}, "$slice": slice_count}}})
+        emit({"_id": 7, "v": items}, {"$push": {"v": {"$each": [], "$sort": direction}}})
+    for current in [[], [[], [1]], [None, []], 1, {"0": []}, {"x": {"y": []}}]:
+        for path in ["v", "v.0", "v.1", "v.3", "v.01", "v.x", "v.0.x", "v.0.0", "v.x.y"]:
+            for operand in [1, {"$each": []}, {"$each": [2, 1], "$sort": 1, "$slice": 1}]:
+                emit({"_id": 7, "v": current}, {"$push": {path: operand}})
+    modifier_values = [0, 1, -1, 99, -99, Int64(-(2**63)), Int64(2**63 - 1),
+                       1.0, -1.0, 0.5, True, False, None, "1", float("nan"),
+                       float("inf"), float("-inf"), Decimal128("NaN"), Decimal128("sNaN"),
+                       Decimal128("0.5"), Decimal128("-0"), Decimal128("1E6144"),
+                       Decimal128("-1E6144"), Decimal128("1E-6176")]
+    assert len(modifier_values) == 24
+    for value in modifier_values:
+        for modifier in ["$position", "$slice"]:
+            emit({"_id": 7, "v": [1, 2, 3]}, {"$push": {"v": {"$each": [9], modifier: value}}})
+    sort_specs = [None, True, 0, 2, 1.5, [], {}, {"a": 0}, {"a": True},
+                  {"a": 1, "b": -1}, {"": 1}, {"$x": -1}, {"a.0": 1}]
+    assert len(sort_specs) == 13
+    for sort_spec in sort_specs:
+        emit({"_id": 7, "v": [{"a": [2], "": 2, "$x": 1}, {"a": [1], "": 1, "$x": 2}, None]},
+             {"$push": {"v": {"$each": [], "$sort": sort_spec}}})
+    for update in [
+        {"$push": {}}, {"$push": []}, {"$push": {"v": {"$each": "bad"}}},
+        {"$push": {"v": {"$slice": 1}}}, {"$push": {"v": {"$sort": 1}}},
+        {"$push": {"v": {"$position": 1}}},
+        {"$push": {"v": {"$each": [], "extra": 1}}},
+        {"$push": {"v": {"$each": [], "$unknown": 1}}},
+        {"$push": {"v..x": 1}}, {"$push": {"v": 1}, "$set": {"v.0": 1}},
+        {"$push": {"v": {"$each": [], "$slice": 0}}},
+        {"$push": {"missing": {"$each": []}}},
+    ]:
+        emit({"_id": 7, "v": [1, 2]}, update)
 
 
 if __name__ == "__main__":
