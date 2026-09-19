@@ -19,6 +19,8 @@ const MAX_COMPARISON_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentUpdateError {
     InvalidExpression,
+    BadValue,
+    TypeMismatch,
     UnsupportedOperator,
     InvalidPath,
     ConflictingPaths,
@@ -29,6 +31,8 @@ impl DocumentUpdateError {
     pub const fn mongo_code(self) -> i32 {
         match self {
             Self::InvalidExpression => 9,
+            Self::BadValue => 2,
+            Self::TypeMismatch => 14,
             Self::UnsupportedOperator => 115,
             Self::InvalidPath => 56,
             Self::ConflictingPaths => 40,
@@ -50,6 +54,8 @@ impl fmt::Display for DocumentUpdateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidExpression => "update requires operator documents",
+            Self::BadValue => "update operand or rename path is invalid",
+            Self::TypeMismatch => "update target has an invalid BSON type",
             Self::UnsupportedOperator => "update operator or positional path is not supported",
             Self::InvalidPath => "update path contains an empty component",
             Self::ConflictingPaths => "update paths overlap",
@@ -61,7 +67,13 @@ impl Error for DocumentUpdateError {}
 
 struct Operation {
     path: Vec<String>,
-    action: Action,
+    action: OperationAction,
+}
+
+enum OperationAction {
+    Field(Action),
+    Pop { front: bool },
+    Rename { target: Vec<String> },
 }
 
 enum Action {
@@ -102,7 +114,7 @@ impl Action {
     }
 }
 
-/// `$set`/`$unset`/`$min`/`$max` transformations preserving untouched BSON
+/// `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename` transformations preserving untouched BSON
 /// representations and field order. Paths are non-positional; missing write
 /// parents become documents. Equal min/max values preserve their stored type.
 /// Operations follow specification order, as in the frozen TinyMongo contract.
@@ -139,16 +151,13 @@ impl DocumentUpdater {
         let mut operations = Vec::new();
         for (operator, operand) in spec.iter() {
             check()?;
-            let action: fn(&BsonValue) -> Action = match operator {
-                "$set" => |value| Action::Set(value.clone()),
-                "$unset" => |_| Action::Unset,
-                "$min" => |value| Action::Min(value.clone()),
-                "$max" => |value| Action::Max(value.clone()),
+            match operator {
+                "$set" | "$unset" | "$min" | "$max" | "$pop" | "$rename" => {}
                 name if name.starts_with('$') => {
                     return Err(DocumentUpdateError::UnsupportedOperator.error());
                 }
                 _ => return Err(DocumentUpdateError::InvalidExpression.error()),
-            };
+            }
             let BsonValue::Document(fields) = operand else {
                 return Err(DocumentUpdateError::InvalidExpression.error());
             };
@@ -157,28 +166,42 @@ impl DocumentUpdater {
                 if operations.len() == MAX_OPERATIONS {
                     return Err(limit());
                 }
-                let components = path.split('.').count();
-                if components > 100 {
-                    return Err(limit());
-                }
-                retained_bytes = retained_bytes
-                    .checked_add(components * 128 + 128)
-                    .filter(|bytes| *bytes <= MAX_RETAINED_BYTES)
-                    .ok_or_else(limit)?;
-                let path: Vec<String> = path.split('.').map(str::to_owned).collect();
-                if path.iter().any(String::is_empty) {
-                    return Err(DocumentUpdateError::InvalidPath.error());
-                }
-                if path.iter().any(|part| part.starts_with('$')) {
-                    return Err(DocumentUpdateError::UnsupportedOperator.error());
-                }
-                operations.push(Operation {
-                    path,
-                    action: action(value),
-                });
+                let path = compile_path(path, operator == "$rename", &mut retained_bytes)?;
+                let action = match operator {
+                    "$set" => OperationAction::Field(Action::Set(value.clone())),
+                    "$unset" => OperationAction::Field(Action::Unset),
+                    "$min" => OperationAction::Field(Action::Min(value.clone())),
+                    "$max" => OperationAction::Field(Action::Max(value.clone())),
+                    "$pop" => {
+                        let front = match value {
+                            value if *value == BsonValue::Int32(-1) => true,
+                            value if *value == BsonValue::Int32(1) => false,
+                            _ => return Err(DocumentUpdateError::InvalidExpression.error()),
+                        };
+                        OperationAction::Pop { front }
+                    }
+                    "$rename" => {
+                        let BsonValue::String(target) = value else {
+                            return Err(DocumentUpdateError::BadValue.error());
+                        };
+                        let target = compile_path(target, true, &mut retained_bytes)?;
+                        if path.starts_with(&target) || target.starts_with(&path) {
+                            return Err(DocumentUpdateError::BadValue.error());
+                        }
+                        OperationAction::Rename { target }
+                    }
+                    _ => unreachable!("operator prevalidated"),
+                };
+                operations.push(Operation { path, action });
             }
         }
-        let mut paths: Vec<_> = operations.iter().map(|op| &op.path).collect();
+        let mut paths = Vec::with_capacity(operations.len() * 2);
+        for operation in &operations {
+            paths.push(&operation.path);
+            if let OperationAction::Rename { target } = &operation.action {
+                paths.push(target);
+            }
+        }
         paths.sort_unstable();
         for pair in paths.windows(2) {
             check()?;
@@ -216,7 +239,17 @@ impl DocumentUpdater {
         budget.charge(input_bytes.checked_mul(2).ok_or_else(limit)?)?;
         let mut result = document.clone();
         for operation in &self.operations {
-            write_document(&mut result, &operation.path, &operation.action, &mut budget)?;
+            match &operation.action {
+                OperationAction::Field(action) => {
+                    write_document(&mut result, &operation.path, action, true, &mut budget)?;
+                }
+                OperationAction::Pop { front } => {
+                    pop_document(&mut result, &operation.path, *front, &mut budget)?;
+                }
+                OperationAction::Rename { target } => {
+                    rename_document(&mut result, &operation.path, target, &mut budget)?;
+                }
+            }
         }
         if let Some(original_id) = document.get_first("_id") {
             let id = result
@@ -242,6 +275,33 @@ impl DocumentUpdater {
         encode_document(&result).map_err(|e| e.into_engine_error(BsonErrorContext::ClientInput))?;
         Ok(result)
     }
+}
+
+fn compile_path(path: &str, rename: bool, retained_bytes: &mut usize) -> EngineResult<Vec<String>> {
+    let components = path.split('.').count();
+    if components > 100 {
+        return Err(limit());
+    }
+    *retained_bytes = retained_bytes
+        .checked_add(components * 128 + path.len() + 128)
+        .filter(|bytes| *bytes <= MAX_RETAINED_BYTES)
+        .ok_or_else(limit)?;
+    if path.contains('\0') {
+        return Err(DocumentUpdateError::BadValue.error());
+    }
+    let parts: Vec<String> = path.split('.').map(str::to_owned).collect();
+    if parts.iter().any(String::is_empty) {
+        return Err(DocumentUpdateError::InvalidPath.error());
+    }
+    if parts.iter().any(|part| part.starts_with('$')) {
+        return Err(if rename {
+            DocumentUpdateError::BadValue
+        } else {
+            DocumentUpdateError::UnsupportedOperator
+        }
+        .error());
+    }
+    Ok(parts)
 }
 
 fn limit() -> EngineError {
@@ -292,6 +352,7 @@ fn write_document(
     document: &mut BsonDocument,
     path: &[String],
     action: &Action,
+    array_paths: bool,
     budget: &mut Budget<'_>,
 ) -> EngineResult<()> {
     budget.step()?;
@@ -339,6 +400,7 @@ fn write_document(
         &mut document.entries_mut()[position].1,
         &path[1..],
         action,
+        array_paths,
         budget,
     )
 }
@@ -347,11 +409,14 @@ fn write_value(
     target: &mut BsonValue,
     path: &[String],
     action: &Action,
+    array_paths: bool,
     budget: &mut Budget<'_>,
 ) -> EngineResult<()> {
     budget.step()?;
     match target {
-        BsonValue::Document(document) => write_document(document, path, action, budget),
+        BsonValue::Document(document) => {
+            write_document(document, path, action, array_paths, budget)
+        }
         BsonValue::Array(array) => {
             let component = &path[0];
             if component != "0"
@@ -362,6 +427,9 @@ fn write_value(
                 } else {
                     Err(DocumentUpdateError::PathNotViable.error())
                 };
+            }
+            if !array_paths {
+                return Err(DocumentUpdateError::BadValue.error());
             }
             let index = match component.parse::<usize>() {
                 Ok(index) => index,
@@ -394,12 +462,108 @@ fn write_value(
                 }
                 Ok(())
             } else {
-                write_value(&mut array[index], &path[1..], action, budget)
+                write_value(&mut array[index], &path[1..], action, array_paths, budget)
             }
         }
         _ if action.value().is_none() => Ok(()),
         _ => Err(DocumentUpdateError::PathNotViable.error()),
     }
+}
+
+// Existing-only traversal: pop/rename never create paths while looking up a
+// source. Canonical indices beyond usize are simply absent, without allocation.
+fn existing_document_value<'a>(
+    document: &'a mut BsonDocument,
+    path: &[String],
+    array_paths: bool,
+    budget: &mut Budget<'_>,
+) -> EngineResult<Option<&'a mut BsonValue>> {
+    budget.step()?;
+    for (name, value) in document.entries_mut() {
+        budget.step()?;
+        if name == &path[0] {
+            return existing_value(value, &path[1..], array_paths, budget);
+        }
+    }
+    Ok(None)
+}
+
+fn existing_value<'a>(
+    value: &'a mut BsonValue,
+    path: &[String],
+    array_paths: bool,
+    budget: &mut Budget<'_>,
+) -> EngineResult<Option<&'a mut BsonValue>> {
+    budget.step()?;
+    if path.is_empty() {
+        return Ok(Some(value));
+    }
+    match value {
+        BsonValue::Document(document) => {
+            existing_document_value(document, path, array_paths, budget)
+        }
+        BsonValue::Array(values) => {
+            let part = &path[0];
+            if part != "0" && (part.starts_with('0') || !part.bytes().all(|b| b.is_ascii_digit())) {
+                return Err(DocumentUpdateError::PathNotViable.error());
+            }
+            if !array_paths {
+                return Err(DocumentUpdateError::BadValue.error());
+            }
+            let Some(value) = part
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| values.get_mut(index))
+            else {
+                return Ok(None);
+            };
+            existing_value(value, &path[1..], array_paths, budget)
+        }
+        _ => Err(DocumentUpdateError::PathNotViable.error()),
+    }
+}
+
+fn pop_document(
+    document: &mut BsonDocument,
+    path: &[String],
+    front: bool,
+    budget: &mut Budget<'_>,
+) -> EngineResult<()> {
+    let Some(value) = existing_document_value(document, path, true, budget)? else {
+        return Ok(());
+    };
+    let BsonValue::Array(values) = value else {
+        return Err(DocumentUpdateError::TypeMismatch.error());
+    };
+    if !values.is_empty() {
+        // Charge possible element movement before mutating the private image.
+        for _ in values.iter() {
+            budget.step()?;
+        }
+        if front {
+            values.remove(0);
+        } else {
+            values.pop();
+        }
+    }
+    Ok(())
+}
+
+fn rename_document(
+    document: &mut BsonDocument,
+    source: &[String],
+    target: &[String],
+    budget: &mut Budget<'_>,
+) -> EngineResult<()> {
+    let Some(value) = existing_document_value(document, source, false, budget)? else {
+        return Ok(());
+    };
+    if source[0] == "_id" || target[0] == "_id" {
+        return Err(DocumentMutationError::ImmutableId.into_engine_error());
+    }
+    let value = budget.clone_value(value)?;
+    write_document(document, source, &Action::Unset, false, budget)?;
+    write_document(document, target, &Action::Set(value), false, budget)
 }
 
 #[cfg(test)]
@@ -424,6 +588,173 @@ mod tests {
             source = cause.source();
         }
         panic!("missing typed error: {error}")
+    }
+
+    #[test]
+    fn pop_and_rename_preserve_order_missing_paths_and_error_atomicity() {
+        let original = doc([
+            ("_id", BsonValue::Int32(7)),
+            (
+                "from",
+                BsonValue::Array(vec![BsonValue::Int64(1), BsonValue::Int64(2)]),
+            ),
+            ("to", BsonValue::Null),
+            (
+                "nested",
+                BsonValue::Document(doc([("old", BsonValue::from("value"))])),
+            ),
+        ]);
+        let update = doc([
+            (
+                "$pop",
+                BsonValue::Document(doc([("from", BsonValue::Double(-1.0))])),
+            ),
+            (
+                "$rename",
+                BsonValue::Document(doc([("nested.old", BsonValue::from("to"))])),
+            ),
+        ]);
+        let result = DocumentUpdater::compile(&update)
+            .unwrap()
+            .apply(&original)
+            .unwrap();
+        assert_eq!(
+            encode_document(&result).unwrap(),
+            encode_document(&doc([
+                ("_id", BsonValue::Int32(7)),
+                ("from", BsonValue::Array(vec![BsonValue::Int64(2)])),
+                ("to", BsonValue::from("value")),
+                ("nested", BsonValue::Document(BsonDocument::new())),
+            ]))
+            .unwrap()
+        );
+        for (operator, fields, expected) in [
+            ("$pop", doc([("to", BsonValue::Int32(1))]), 14),
+            (
+                "$rename",
+                doc([("nested.old", BsonValue::from("from.0"))]),
+                2,
+            ),
+            (
+                "$rename",
+                doc([("nested.old", BsonValue::from("to.x"))]),
+                28,
+            ),
+            ("$rename", doc([("_id", BsonValue::from("changed"))]), 66),
+            ("$rename", doc([("to", BsonValue::from("_id"))]), 66),
+        ] {
+            let expression = doc([
+                (
+                    "$set",
+                    BsonValue::Document(doc([("atomic_marker", BsonValue::Boolean(true))])),
+                ),
+                (operator, BsonValue::Document(fields)),
+            ]);
+            let before = encode_document(&original).unwrap();
+            assert_eq!(
+                code(
+                    DocumentUpdater::compile(&expression)
+                        .unwrap()
+                        .apply(&original)
+                        .unwrap_err()
+                ),
+                expected
+            );
+            assert_eq!(encode_document(&original).unwrap(), before);
+        }
+        let no_rename = DocumentUpdater::compile(&spec(
+            "$rename",
+            doc([("missing", BsonValue::from("from.0"))]),
+        ))
+        .unwrap()
+        .apply(&original)
+        .unwrap();
+        assert_eq!(
+            encode_document(&no_rename).unwrap(),
+            encode_document(&original).unwrap()
+        );
+        let missing = DocumentUpdater::compile(&spec(
+            "$pop",
+            doc([("from.999999999999999999999999", BsonValue::Int32(1))]),
+        ))
+        .unwrap()
+        .apply(&original)
+        .unwrap();
+        assert_eq!(
+            encode_document(&missing).unwrap(),
+            encode_document(&original).unwrap()
+        );
+    }
+
+    #[test]
+    fn pop_rename_validate_all_paths_and_budget_before_mutating() {
+        for (expression, expected) in [
+            (spec("$rename", doc([("a", BsonValue::from("b\0c"))])), 2),
+            (spec("$rename", doc([("a", BsonValue::from("a.b"))])), 2),
+            (spec("$rename", doc([("a", BsonValue::from("a"))])), 2),
+            (spec("$rename", doc([("a", BsonValue::from("$x"))])), 2),
+            (spec("$rename", doc([("a", BsonValue::from(""))])), 56),
+            (
+                spec(
+                    "$rename",
+                    doc([("a", BsonValue::from("b")), ("c", BsonValue::from("b"))]),
+                ),
+                40,
+            ),
+            (spec("$pop", doc([("a", BsonValue::Boolean(true))])), 9),
+        ] {
+            assert_eq!(
+                code(DocumentUpdater::compile(&expression).unwrap_err()),
+                expected
+            );
+        }
+        assert_eq!(
+            DocumentUpdater::compile(&spec(
+                "$rename",
+                doc([("a", BsonValue::from(vec!["b"; 101].join(".")))])
+            ))
+            .unwrap_err()
+            .kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        let mut original = doc([("a", BsonValue::Array(vec![BsonValue::Int32(1); 1024]))]);
+        let before = encode_document(&original).unwrap();
+        let mut check = || Ok(());
+        let mut budget = Budget {
+            bytes: 0,
+            comparison_bytes: 0,
+            steps: MAX_STEPS - 20,
+            check: &mut check,
+        };
+        assert_eq!(
+            pop_document(&mut original, &["a".into()], true, &mut budget)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        assert_eq!(encode_document(&original).unwrap(), before);
+        let mut visited = 0;
+        let mut cancelled = || {
+            visited += 1;
+            if visited == 50 {
+                Err(EngineError::new(EngineErrorKind::Cancelled, "test"))
+            } else {
+                Ok(())
+            }
+        };
+        let mut budget = Budget {
+            bytes: 0,
+            comparison_bytes: 0,
+            steps: 0,
+            check: &mut cancelled,
+        };
+        assert_eq!(
+            pop_document(&mut original, &["a".into()], false, &mut budget)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Cancelled
+        );
+        assert_eq!(encode_document(&original).unwrap(), before);
     }
 
     #[test]

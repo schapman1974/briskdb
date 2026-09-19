@@ -10,6 +10,52 @@ from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timesta
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
 
 
+def pop_rename_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_pop_rename.items
+        collection.insert_many([{"_id": Int64(i), "old": Binary(b"value", 128), "target": None, "items": [Int64(1), Int64(2), Int64(3)], "keep": True} for i in range(24)])
+        expression = {"$pop": {"items": -1}, "$rename": {"old": "target"}}
+        result = collection.update_one({"_id": 0}, expression)
+        assert (result.matched_count, result.modified_count) == (1, 1)
+        result = collection.update_many({"old": {"$exists": True}}, expression)
+        assert (result.matched_count, result.modified_count) == (23, 23)
+        assert collection.update_many({}, {"$rename": {"absent": "target"}, "$pop": {"missing.x": 1}}).modified_count == 0
+        assert collection.find_one_and_update({}, {"$pop": {"items": 1}}, sort=[("_id", -1)], projection={"items": 1, "_id": 0}) == {"items": [Int64(2), Int64(3)]}
+        assert collection.find_one_and_update({"_id": 23}, {"$rename": {"target": "nested.value"}}, return_document=True, projection={"nested": 1, "_id": 0}) == {"nested": {"value": Binary(b"value", 128)}}
+        before = BSON.encode(collection.find_one({"_id": 0}))
+        for operator, changes, code in [("$pop", {"keep": 1}, 14), ("$pop", {"items": 0}, 9), ("$rename", {"target": "items.0"}, 2), ("$rename", {"target": "keep.x"}, 28), ("$rename", {"target": "_id"}, 66), ("$rename", {"target": "target"}, 2), ("$rename", {"target": "bad\x00name"}, 2)]:
+            try:
+                collection.update_one({"_id": 0}, {"$set": {"atomic_marker": True}, operator: changes})
+            except OperationFailure as error:
+                assert error.code == code
+            else:
+                raise AssertionError("expected atomic pop/rename rejection")
+            assert BSON.encode(collection.find_one({"_id": 0})) == before
+        try:
+            client.wire_pop_rename.command("update", "items", ordered=False, updates=[
+                {"q": {}, "u": {"$pop": {"keep": 1}}, "multi": True},
+                {"q": {}, "u": {"$set": {"should_not_run": True}}},
+            ])
+        except OperationFailure as error:
+            assert error.code == 14 and "writeErrors" not in error.details
+        else:
+            raise AssertionError("runtime multi-update failures must abort the batch")
+        assert collection.count_documents({"should_not_run": {"$exists": True}}) == 0
+        queue = client.wire_pop_rename.queue
+        queue.insert_many([{"_id": i, "items": list(range(4)), "keep": True} for i in range(12)])
+        def consume(_):
+            seen = []
+            while True:
+                image = queue.find_one_and_update({"items.0": {"$exists": True}}, {"$pop": {"items": -1}})
+                if image is None:
+                    return seen
+                seen.append((image["_id"], image["items"][0]))
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            seen = list(pool.map(consume, range(4)))
+        assert sorted(pair for group in seen for pair in group) == [(i, item) for i in range(12) for item in range(4)]
+        assert queue.count_documents({"items": [], "keep": True}) == 12
+
+
 def min_max_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_min_max.items
@@ -1168,6 +1214,8 @@ def lifecycle_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert client.wire_pop_rename.queue.count_documents({"items": [], "keep": True}) == 12
+        assert client.wire_pop_rename.items.find_one({"_id": 23})["nested"] == {"value": Binary(b"value", 128)}
         assert client.wire_min_max.items.count_documents({"low": -32, "high": 32, "keep": True}) == 24
         row = client.wire_find_update.items.find_one({"_id": 10})
         assert row["rank"] == -1 and row["done"] is True and "group" not in row and row["stamp"] == Timestamp(0, 0)
@@ -1299,6 +1347,16 @@ def metadata_smoke(uri):
                 raise AssertionError(f"unsupported metadata command accepted: {command}")
         assert "rejected" not in database.list_collection_names()
         assert list(database.list_collections(nameOnly=True, authorizedCollections=True, filter={"info": {"$exists": True}})) == []
+
+
+async def async_pop_rename_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_pop_rename.items
+        await collection.insert_many([{"_id": i, "old": Int64(9), "items": [1, 2, 3]} for i in range(4)])
+        assert (await collection.update_one({"_id": 0}, {"$pop": {"items": 1}})).modified_count == 1
+        result = await collection.update_many({}, {"$rename": {"old": "nested.value"}})
+        assert (result.matched_count, result.modified_count) == (4, 4)
+        assert await collection.find_one_and_update({}, {"$pop": {"items": -1}}, sort=[("_id", -1)], projection={"items": 1, "_id": 0}, return_document=True) == {"items": [2, 3]}
 
 
 async def async_smoke(uri):
@@ -1485,6 +1543,10 @@ if __name__ == "__main__":
         update_many_smoke(sys.argv[1])
         find_update_smoke(sys.argv[1])
         min_max_smoke(sys.argv[1])
+        pop_rename_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
+        # Give the added operator cases their own bounded phase; retain the
+        # existing discovery/CRUD phase's deadline as the suite grows.
+        asyncio.run(asyncio.wait_for(async_pop_rename_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

@@ -19,7 +19,7 @@ CI and byte-compares the normalized result with the checked-in reference. The
 full report remains `reference-only`; partial candidate coverage is not folded
 into that report or treated as full parity.
 
-Required CI separately runs 166 exact sync/async executions in the frozen
+Required CI separately runs 180 exact sync/async executions in the frozen
 `test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
 `test_aggregation_contract`, `test_group_accumulators_contract`, and
 `test_client_read_fidelity_contract` modules,
@@ -27,7 +27,8 @@ plus four `test_talkpython_contract` cases: full-document replacement, applicati
 write-result metadata, binary ID/subtype equality, and distinct boolean/numeric IDs,
 the CRUD top-level/nested `$unset` case, and three query-validation cases covering
 invalid field `$comment`, invalid `$not`, and operator typos across CRUD methods,
-plus the two min/max BSON-order/no-op/null contract cases,
+plus all nine non-upsert `test_update_operator_contract` cases (min/max, pop,
+rename, numeric paths, operand/target errors, conflicts, and immutable IDs),
 against a real four-shard BriskDB listener.
 It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
 cleanup. The JUnit result is checked against the exact locked case/API set;
@@ -288,7 +289,8 @@ validation remains eager. `remove:true` cannot be combined with `update` or
 `new:true`. Pipeline updates and upsert remain unsupported. Native
 sync/async Python exposes `find_one_and_replace` with the same semantics.
 
-Operator `findAndModify` accepts `$set`/`$unset`/`$min`/`$max` documents in `update`, with the
+Operator `findAndModify` accepts `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`
+documents in `update`, with the
 same query/sort/projection and boolean `new` options, through `FindOneAndUpdate`.
 It preserves untouched fields and shares operator validation, immutable-ID
 checks, post-image limits, and pre-commit return size/depth checks. No-ops still
@@ -296,7 +298,7 @@ return an image; projected `{}` still sets `n:1` and `updatedExisting:true`.
 Missing namespaces return null without creation after eager validation. Native
 sync/async Python exposes `find_one_and_update` with identical image semantics.
 
-Wire `update` supports replacement statements and `$set`/`$unset`/`$min`/`$max` operator
+Wire `update` supports replacement statements and `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename` operator
 statements (`q` and a document `u`,
 `upsert:false`) through shared `Replace`/`Update`. Only operator documents accept
 `multi:true`; replacement remains single-document. Both body arrays and
@@ -320,8 +322,10 @@ Python exposes `replace_one`, `update_one`, and `update_many` with the same engi
 controls. The field-update subset includes bounded object/array paths, immutable
 IDs, and exact modified counts. Min/max compare whole BSON values and preserve
 equal-value representations; missing array slots differ from existing nulls.
-Its 8,727 source-locked update oracle cases include 4,008 object-only set/unset
-cases and 4,719 min/max cases with array paths and ID/error boundaries. Independent
+Pop removes front/back array elements; rename moves fields but does not traverse
+arrays. Missing pop targets or rename sources are no-ops; typed operand/path/ID errors precede
+commit. Its 11,805 source-locked update oracle cases include 4,008 object-only
+set/unset, 4,719 min/max, and 3,078 pop/rename cases. Independent
 tests check resource and commit limits. Additional update operators and index metadata cursors remain
 unimplemented.
 Sessions, retryable writes, replication, change streams, and compression are

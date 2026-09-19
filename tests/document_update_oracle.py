@@ -4,8 +4,9 @@ TinyMongo's legacy set/unset helpers do not implement Mongo numeric array paths
 and silently overwrite scalar set parents/restore changed IDs. Those unsafe or
 different cases are deliberately outside this matrix, not rewritten or waived.
 Rust unit, transaction, and wire tests check those set/unset boundaries
-independently. Min/max additionally cover whole BSON ordering, numeric array
-paths, blocked parents, and immutable IDs using the unchanged reference helpers.
+independently. Min/max, pop, and rename additionally cover whole BSON ordering,
+numeric array paths, blocked parents, and immutable IDs using the unchanged
+reference helpers.
 """
 import hashlib
 import random
@@ -99,6 +100,72 @@ def main():
         {"$min": {"a": 1}, "$max": {"a": 3}},
         {"$min": {"a": 1}, "$set": {"a.b": 3}},
         {"$max": {"a.b": 1}, "$unset": {"a": 1}},
+    ]:
+        emit({"_id": 7}, update)
+
+
+    for _ in range(1000):
+        items = [randomizer.choice(values) for _ in range(randomizer.randrange(6))]
+        document = {"_id": 7, "front": items, "grid": [items], "keep": True}
+        for direction in [-1, 1]:
+            emit(document, {"$pop": {"front": direction, "grid.0": direction,
+                                     "missing.child": direction, "grid.3": direction}})
+        value, other = randomizer.choice(values), randomizer.choice(values)
+        emit({"_id": 7, "source": value, "dest": other,
+              "nested": {"old": other, "keep": value}, "tail": True},
+             {"$rename": {"source": "dest", "nested.old": "new.value", "absent": "tail"}})
+    for operand in [1, -1, Int64(1), -1.0, Decimal128("1.00"), Decimal128("-1"),
+                    0, 2, 1.5, True, "1", None, [], {}, float("nan"), Decimal128("Infinity")]:
+        emit({"_id": 7, "v": [1, 2, 3]}, {"$pop": {"v": operand}})
+    for value in values:
+        emit({"_id": 7, "v": value}, {"$pop": {"v": 1}})
+    for document, path in [
+        ({"_id": 7, "v": 1}, "v.x"),
+        ({"_id": 7, "v": None}, "v.x"),
+        ({"_id": 7, "v": [None]}, "v.0.x"),
+        ({"_id": 7, "v": [[1, 2]]}, "v.0"),
+        ({"_id": 7, "v": [[1, 2]]}, "v.3"),
+        ({"_id": 7, "v": [[1, 2]]}, "v.99999999999999999999999"),
+        ({"_id": 7, "v": [1]}, "v.01"),
+        ({"_id": 7, "v": [1]}, "v.x"),
+        ({"_id": 7, "v": [1]}, "v.-1"),
+        ({"_id": 7}, "absent.x"),
+        ({"_id": 7, "v": {}}, "v.missing"),
+        ({"_id": {"list": [1, 2]}}, "_id.list"),
+    ]:
+        emit(document, {"$pop": {path: 1}})
+    for document, source, target in [
+        ({"_id": 7, "a": []}, "absent", "a.0"),
+        ({"_id": 7, "a": 1}, "a.x", "new"),
+        ({"_id": 7, "a": []}, "a.0", "new"),
+        ({"_id": 7, "a": []}, "a.x", "new"),
+        ({"_id": 7, "a": [], "v": 1}, "v", "a.0"),
+        ({"_id": 7, "a": [], "v": 1}, "v", "a.x"),
+        ({"_id": 7, "a": None, "v": 1}, "v", "a.x"),
+        ({"_id": 7}, "absent", "_id"),
+        ({"_id": 7, "v": 7}, "v", "_id"),
+        ({"_id": 7}, "_id", "new"),
+        ({"_id": {}}, "_id.missing", "new"),
+        ({"_id": {"x": 1}}, "_id.x", "new"),
+        ({"_id": 7}, "a", "a"),
+        ({"_id": 7}, "a", "a.b"),
+        ({"_id": 7}, "a.b", "a"),
+        ({"_id": 7}, "a", 1),
+        ({"_id": 7}, "a", ""),
+        ({"_id": 7}, "a", "b..c"),
+        ({"_id": 7}, "a", "b.$[].c"),
+        ({"_id": 7}, "a.$[].b", "new"),
+        ({"_id": 7}, "a..b", "new"),
+        ({"_id": 7, "a": [1, 2]}, "a", "new"),
+        ({"_id": 7, "a": None}, "a", "new.value"),
+        ({"_id": 7, "a": {"x": 1}}, "a.x", "a.y"),
+    ]:
+        emit(document, {"$rename": {source: target}})
+    for update in [
+        {"$pop": {}, "$rename": {}},
+        {"$rename": {"a": "b", "b": "a"}},
+        {"$rename": {"a": "b"}, "$set": {"b": 1}},
+        {"$pop": {"a": 1}, "$unset": {"a.0": 1}},
     ]:
         emit({"_id": 7}, update)
 

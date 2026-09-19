@@ -61,6 +61,13 @@ fn run_contract(uri: &str, report: &std::path::Path) -> std::process::Output {
             "compat/mongo/v1/runner/contracts/test_client_read_fidelity_contract.py",
             "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_min_and_max_follow_bson_order_and_report_noops",
             "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_min_and_max_include_null_in_whole_bson_value_order",
+            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_rename_moves_nested_values_overwrites_and_ignores_missing_source",
+            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_pop_handles_front_back_nested_empty_and_missing_arrays",
+            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_follow_numeric_array_paths",
+            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_malformed_new_update_operands_report_mongodb_codes",
+            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_update_path_conflicts_report_code_40_before_writing",
+            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_preserve_immutable_id_semantics",
+            "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_report_target_and_path_errors_atomically",
             "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_comment_remains_invalid_as_a_field_operator",
             "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_every_filtering_crud_entrypoint_rejects_invalid_not_operands",
             "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_every_filtering_crud_entrypoint_rejects_operator_typos",
@@ -117,6 +124,13 @@ individual.update('tests.contracts.test_query_operator_contract::' + name for na
 individual.update('tests.contracts.test_update_operator_contract::' + name for name in [
     'test_min_and_max_follow_bson_order_and_report_noops',
     'test_min_and_max_include_null_in_whole_bson_value_order',
+    'test_rename_moves_nested_values_overwrites_and_ignores_missing_source',
+    'test_pop_handles_front_back_nested_empty_and_missing_arrays',
+    'test_new_update_operators_follow_numeric_array_paths',
+    'test_malformed_new_update_operands_report_mongodb_codes',
+    'test_update_path_conflicts_report_code_40_before_writing',
+    'test_new_update_operators_preserve_immutable_id_semantics',
+    'test_new_update_operators_report_target_and_path_errors_atomically',
 ])
 expected = {(case['id'], api) for case in corpus['cases']
             if (case['id'].split('::', 1)[0] in modules or case['id'] in individual or
@@ -124,11 +138,11 @@ expected = {(case['id'], api) for case in corpus['cases']
             for api in case['apis']}
 executions = ingest_junit(Path(sys.argv[1]), 'briskdb', corpus)['executions']
 actual = {(item['case_id'], item['api']) for item in executions}
-assert len(expected) == len(executions) == 166, 'locked suite coverage changed'
+assert len(expected) == len(executions) == 180, 'locked suite coverage changed'
 assert actual == expected, 'candidate suite omitted or substituted locked cases'
 assert all(item['outcome'] == 'passed' and item['target'] == 'briskdb-briskdb'
            for item in executions), 'candidate suite skipped or failed a case'
-print('Verified all 166 exact frozen candidate executions, with no skips.')
+print('Verified all 180 exact frozen candidate executions, with no skips.')
 "#,
             ])
             .arg(report)

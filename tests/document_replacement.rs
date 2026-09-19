@@ -53,6 +53,285 @@ fn extrema(low: i32, high: i32) -> BsonDocument {
     ])
 }
 
+fn pop_rename() -> BsonDocument {
+    doc([
+        (
+            "$pop",
+            BsonValue::Document(doc([("items", BsonValue::Int32(-1))])),
+        ),
+        (
+            "$rename",
+            BsonValue::Document(doc([("old", BsonValue::from("new.value"))])),
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn pop_rename_share_counts_images_preflight_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let array = BsonValue::Array(vec![
+        BsonValue::Int64(1),
+        BsonValue::Int64(2),
+        BsonValue::Int64(3),
+    ]);
+    many_counts(
+        &engine,
+        &session,
+        BsonDocument::new(),
+        set(doc([
+            ("old", BsonValue::Int64(9)),
+            ("items", array.clone()),
+        ])),
+    )
+    .await;
+    assert_eq!(
+        update_counts(
+            &engine,
+            &session,
+            doc([("_id", BsonValue::Int32(0))]),
+            pop_rename()
+        )
+        .await,
+        (1, 1)
+    );
+    let options = DocumentReadOptions::new()
+        .with_sort(DocumentSort::new(doc([("_id", BsonValue::Int32(-1))])).unwrap())
+        .with_projection(
+            DocumentProjection::new(doc([
+                ("items", BsonValue::Int32(1)),
+                ("old", BsonValue::Int32(1)),
+                ("_id", BsonValue::Int32(0)),
+            ]))
+            .unwrap(),
+        );
+    let before = engine
+        .execute_document(
+            &session,
+            request(
+                find_update(BsonDocument::new(), pop_rename(), options, false),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .2;
+    assert_eq!(
+        before,
+        DocumentResult::Document(Some(doc([("old", BsonValue::Int64(9)), ("items", array)])))
+    );
+    let projection = DocumentReadOptions::new().with_projection(
+        DocumentProjection::new(doc([
+            ("new", BsonValue::Int32(1)),
+            ("_id", BsonValue::Int32(0)),
+        ]))
+        .unwrap(),
+    );
+    let after = engine
+        .execute_document(
+            &session,
+            request(
+                find_update(
+                    doc([("_id", BsonValue::Int32(1))]),
+                    pop_rename(),
+                    projection,
+                    true,
+                ),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .2;
+    assert_eq!(
+        after,
+        DocumentResult::Document(Some(doc([(
+            "new",
+            BsonValue::Document(doc([("value", BsonValue::Int64(9))]))
+        )])))
+    );
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            doc([("old", BsonValue::Int64(9))]),
+            pop_rename()
+        )
+        .await,
+        (21, 21)
+    );
+    let noop = doc([
+        (
+            "$pop",
+            BsonValue::Document(doc([("absent", BsonValue::Int32(1))])),
+        ),
+        (
+            "$rename",
+            BsonValue::Document(doc([("old", BsonValue::from("_id"))])),
+        ),
+    ]);
+    assert_eq!(
+        many_counts(&engine, &session, BsonDocument::new(), noop).await,
+        (24, 0)
+    );
+    let before = rows(&engine, &session).await;
+    for row in &before {
+        assert!(row.get_first("old").is_none());
+        assert_eq!(
+            row.get_first("items"),
+            Some(&BsonValue::Array(vec![
+                BsonValue::Int64(2),
+                BsonValue::Int64(3)
+            ]))
+        );
+    }
+    let id = doc([("_id", BsonValue::Int32(0))]);
+    for (operator, fields) in [
+        ("$pop", doc([("new", BsonValue::Int32(1))])),
+        ("$rename", doc([("new.value", BsonValue::from("items.0"))])),
+        ("$rename", doc([("new", BsonValue::from("_id"))])),
+    ] {
+        let expression = doc([
+            (
+                "$set",
+                BsonValue::Document(doc([("changed", BsonValue::Boolean(true))])),
+            ),
+            (operator, BsonValue::Document(fields)),
+        ]);
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    request(
+                        DocumentCommand::Update(update(id.clone(), expression)),
+                        RequestContext::new()
+                    )
+                )
+                .await
+                .is_err()
+        );
+    }
+    let rename = doc([(
+        "$rename",
+        BsonValue::Document(doc([("new", BsonValue::from("x".repeat(512)))])),
+    )]);
+    let capped = update(id.clone(), rename)
+        .with_max_document_bytes(128)
+        .unwrap();
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(DocumentCommand::Update(capped), RequestContext::new())
+            )
+            .await
+            .is_err()
+    );
+    for after in [false, true] {
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    request(
+                        find_update(id.clone(), pop_rename(), DocumentReadOptions::new(), after),
+                        RequestContext::new().with_result_limits(ResultLimits::new(1, 1).unwrap())
+                    )
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(rows(&engine, &session).await, before);
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(rows(&engine, &engine.session()).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pop_consumers_return_each_element_exactly_once() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(root.path(), 4).await.unwrap());
+    let session = engine.session();
+    seed(&engine, &session).await;
+    many_counts(
+        &engine,
+        &session,
+        BsonDocument::new(),
+        set(doc([(
+            "items",
+            BsonValue::Array((0..8).map(BsonValue::Int32).collect()),
+        )])),
+    )
+    .await;
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let engine = Arc::clone(&engine);
+        tasks.push(tokio::spawn(async move {
+            let session = engine.session();
+            let mut seen = Vec::new();
+            loop {
+                let filter = doc([(
+                    "items.0",
+                    BsonValue::Document(doc([("$exists", BsonValue::Boolean(true))])),
+                )]);
+                let expression = doc([(
+                    "$pop",
+                    BsonValue::Document(doc([("items", BsonValue::Int32(-1))])),
+                )]);
+                let result = engine
+                    .execute_document(
+                        &session,
+                        request(
+                            find_update(filter, expression, DocumentReadOptions::new(), false),
+                            RequestContext::new(),
+                        ),
+                    )
+                    .await
+                    .unwrap()
+                    .into_parts()
+                    .2;
+                match result {
+                    DocumentResult::Document(None) => return seen,
+                    DocumentResult::Document(Some(row)) => {
+                        let Some(BsonValue::Int32(id)) = row.get_first("_id") else {
+                            panic!("ID")
+                        };
+                        let Some(BsonValue::Array(items)) = row.get_first("items") else {
+                            panic!("items")
+                        };
+                        let BsonValue::Int32(item) = items[0] else {
+                            panic!("item")
+                        };
+                        seen.push((*id, item));
+                    }
+                    _ => panic!("returned image"),
+                }
+            }
+        }));
+    }
+    let mut seen = Vec::new();
+    for task in tasks {
+        seen.extend(task.await.unwrap());
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        (0..24)
+            .flat_map(|id| (0..8).map(move |item| (id, item)))
+            .collect::<Vec<_>>()
+    );
+    for row in rows(&engine, &session).await {
+        assert_eq!(row.get_first("items"), Some(&BsonValue::Array(vec![])));
+        assert_eq!(row.get_first("done"), Some(&BsonValue::Boolean(false)));
+    }
+}
+
 #[tokio::test]
 async fn min_max_share_counts_images_preflight_and_restart() {
     let root = tempfile::tempdir().unwrap();
