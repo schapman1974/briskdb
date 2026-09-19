@@ -35,6 +35,38 @@ impl fmt::Display for DocumentCursorError {
 
 impl Error for DocumentCursorError {}
 
+/// Payload-free validation failures for document mutations.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentMutationError {
+    ImmutableId,
+    InvalidReplacement,
+}
+
+impl DocumentMutationError {
+    pub const fn mongo_code(self) -> i32 {
+        match self {
+            Self::ImmutableId => 66,
+            Self::InvalidReplacement => 52,
+        }
+    }
+
+    pub(crate) fn into_engine_error(self) -> EngineError {
+        EngineError::from_source(EngineErrorKind::InvalidArgument, self.to_string(), self)
+    }
+}
+
+impl fmt::Display for DocumentMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ImmutableId => "document replacement cannot change the semantic _id",
+            Self::InvalidReplacement => "replacement must not contain top-level update operators",
+        })
+    }
+}
+
+impl Error for DocumentMutationError {}
+
 /// Stable category for failures produced by the BSON value and codec layer.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

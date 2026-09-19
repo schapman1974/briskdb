@@ -964,6 +964,42 @@ async fn unacknowledged_writes_execute_without_emitting_a_reply() {
     assert!(
         matches!(first_batch(&body), [BsonValue::Document(actual)] if actual.representation_eq(&document))
     );
+    let replacement = BsonDocument::from_entries([
+        ("_id", BsonValue::from("one-way")),
+        ("value", BsonValue::Int64(7)),
+    ])
+    .unwrap();
+    let update = BsonDocument::from_entries([
+        ("update", BsonValue::from("items")),
+        ("$db", BsonValue::from("wire")),
+        (
+            "updates",
+            BsonValue::Array(vec![BsonValue::Document(
+                BsonDocument::from_entries([
+                    ("q", BsonValue::Document(BsonDocument::new())),
+                    ("u", BsonValue::Document(replacement.clone())),
+                ])
+                .unwrap(),
+            )]),
+        ),
+        (
+            "writeConcern",
+            BsonValue::Document(BsonDocument::from_entries([("w", BsonValue::Int32(0))]).unwrap()),
+        ),
+    ])
+    .unwrap();
+    let mut bytes = packet(&update, 5, 2);
+    bytes.extend_from_slice(&packet(
+        &find_command("items", BsonValue::from("one-way")),
+        6,
+        0,
+    ));
+    stream.write_all(&bytes).await.unwrap();
+    let (frame, body) = response(&mut stream).await;
+    assert_eq!(frame.response_to, 6);
+    assert!(
+        matches!(first_batch(&body), [BsonValue::Document(actual)] if actual.representation_eq(&replacement))
+    );
     let delete = BsonDocument::from_entries([
         ("delete", BsonValue::from("items")),
         ("$db", BsonValue::from("wire")),

@@ -74,6 +74,7 @@ The current engine executes:
 | `Distinct` | Uses the same filters and global encounter order, with shared BSON identity and bounded unique values |
 | `Delete` | Deletes one or many matches; exact `_id` routes to one shard, other filters use the shared matcher |
 | `FindOneAndDelete` | Atomically deletes one shard-local selection and returns its projected pre-delete document |
+| `Replace` | Replaces one matching document, preserving `_id` and natural order; returns matched/modified counts, with no upsert yet |
 
 `CollectionExists` uses an admitted, controlled manifest lookup and scalar result
 accounting. Its result is independent of catalog page size and unrelated metadata
@@ -99,6 +100,34 @@ restarts. `skip` and `limit` apply once across the whole cursor, after the
 merge; `batch_size` bounds each returned page. An initial batch size of zero
 opens a cursor without reading documents. Continuations require a positive
 batch size and cannot change the original skip or limit.
+
+### Replacement and single-record write boundaries
+
+`Replace` shares the controlled single-record selection/reselection path with
+`FindOneAndDelete`. Exact-ID routes use one immediate write transaction. Other
+filters scan bounded records in global natural order and reselect the winning
+shard under its write lock, retrying if the local winner changed. This is atomic
+shard-local selection and replacement, not a cross-shard snapshot. A no-match
+returns zero matched/modified counts without creating a document. The original
+natural-order identity and stored `_id` representation survive replacement.
+An omitted ID is retained; a semantically equal numeric alias is accepted; a
+conflicting ID fails with payload-free `DocumentMutationError::ImmutableId`.
+
+The normalized post-image places `_id` first and replaces all other fields.
+Only direct non-ID `Timestamp(0, 0)` fields receive server timestamps, matching
+insert normalization; nested timestamps and explicit nulls remain unchanged.
+Modification counts compare encoded BSON bytes, including type and field order,
+not query equality. An identical post-image skips the SQL write. Replacement
+documents reject top-level update operators before execution. Upsert and
+non-default write options remain unsupported.
+
+Request/plan/result budgets and normalized post-image size are checked before
+commit. `DocumentReplaceRequest::with_max_document_bytes` lets wire adapters
+enforce their smaller advertised BSON limit, including a retained ID larger
+than the incoming replacement. Validation failure rolls back the local
+transaction. Successful commits are not reclassified by late cancellation.
+Declared secondary indexes are still pending; their physical uniqueness and
+post-image validation belong to the index milestone, not this checkpoint.
 
 ### Filtered deletion and commit boundaries
 
@@ -528,8 +557,8 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 
 ## Current boundary
 
-Update expressions, replacements,
-multi-document deletion, upsert, additional aggregation expressions/group-key forms,
+Update expressions, replacement upsert, remaining findAndModify forms,
+additional aggregation expressions/group-key forms,
 database statistics, index metadata cursors, and physical secondary-index builds
 remain later roadmap work. Collection metadata cursors are implemented.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`

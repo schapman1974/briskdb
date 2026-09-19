@@ -20,7 +20,8 @@ use briskdb::document::{
     DocumentInsertRequest, DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
     DocumentListCollectionsRequest, DocumentListDatabaseNamesRequest, DocumentListIndexesRequest,
     DocumentMutationScope, DocumentNamespace, DocumentPipeline, DocumentProjection,
-    DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentSort, DocumentWriteOptions,
+    DocumentReadOptions, DocumentReplaceRequest, DocumentRequest, DocumentRequestId, DocumentSort,
+    DocumentWriteOptions,
 };
 use briskdb::{
     BriskCursor, BriskDb, BriskSession, BriskTransaction,
@@ -1828,6 +1829,47 @@ impl Session {
         self.execute_document_command(
             py,
             DocumentCommand::FindOneAndDelete(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (database, collection, filter, replacement, *, upsert = false, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn replace_one(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        filter: Py<PyAny>,
+        replacement: Py<PyAny>,
+        upsert: bool,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let filter = python_engine_result(DocumentFilter::new(extract_bson_document(
+            py,
+            filter.bind(py),
+            self.shared.uuid_representation,
+        )?))?;
+        let replacement =
+            extract_bson_document(py, replacement.bind(py), self.shared.uuid_representation)?;
+        let request = python_engine_result(DocumentReplaceRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            filter,
+            replacement,
+            DocumentWriteOptions::new().with_upsert(upsert),
+        ))?;
+        self.execute_document_command(
+            py,
+            DocumentCommand::Replace(request),
             request_id,
             timeout_ms,
             cancellation.as_deref(),

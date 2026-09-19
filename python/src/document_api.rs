@@ -123,6 +123,19 @@ pub(crate) fn execution_to_python(
             }
             output.set_item("inserted_ids", ids)?;
         }
+        DocumentResult::Update(result) => {
+            output.set_item("kind", "update")?;
+            output.set_item("acknowledged", result.acknowledged())?;
+            output.set_item("matched_count", result.matched_count())?;
+            output.set_item("modified_count", result.modified_count())?;
+            match result.upserted_id() {
+                Some(id) => output.set_item(
+                    "upserted_id",
+                    bson_value_to_python(py, id, uuid_representation, bson_types)?,
+                )?,
+                None => output.set_item("upserted_id", py.None())?,
+            }
+        }
         DocumentResult::Delete(result) => {
             output.set_item("kind", "delete")?;
             output.set_item("acknowledged", result.acknowledged())?;
@@ -148,7 +161,7 @@ pub(crate) fn execution_to_python(
         // The Python surface only constructs commands from the currently
         // executable engine slice. Keep future result variants explicit if a
         // core change accidentally routes one through these methods.
-        DocumentResult::Acknowledged(_) | DocumentResult::Update(_) => {
+        DocumentResult::Acknowledged(_) => {
             return Err(crate::error::unsupported(
                 "this document result is not exposed by the current Python API",
             ));

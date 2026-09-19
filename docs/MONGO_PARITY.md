@@ -19,9 +19,10 @@ CI and byte-compares the normalized result with the checked-in reference. The
 full report remains `reference-only`; partial candidate coverage is not folded
 into that report or treated as full parity.
 
-Required CI separately runs all 142 sync/async executions in the frozen
+Required CI separately runs 144 exact sync/async executions in the frozen
 `test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
-`test_aggregation_contract`, and `test_group_accumulators_contract` modules
+`test_aggregation_contract`, and `test_group_accumulators_contract` modules,
+plus `test_talkpython_contract::test_replace_one_preserves_id_and_replaces_the_full_document`,
 against a real four-shard BriskDB listener.
 It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
 cleanup. The JUnit result is checked against the exact locked case/API set;
@@ -271,6 +272,19 @@ interface. Missing collections return null without creation after eager semantic
 validation. Update/replacement forms, upsert, return-after, hint/collation/let,
 and unacknowledged findAndModify remain unsupported. Native Python exposes
 `find_one_and_delete` with the same shared execution and request controls.
+
+Wire `update` now supports replacement statements (`q` and a document `u`,
+`multi:false`, `upsert:false`) through shared `Replace`. Both body arrays and
+OP_MSG `updates` sequences preserve ordered/unordered per-statement errors and
+`n`/`nModified`; an immutable-ID violation is code 66. Missing collections return
+zero only after eager validation, without creating metadata. Normalized
+post-images, including retained IDs, must fit the advertised 512 KiB BSON cap
+before mutation. Existing bounded write-concern and one-way write handling apply.
+Batch statements commit independently; operational failure may leave previous
+commits, so no all-or-nothing batch or retryable-write guarantee is implied.
+Operator/pipeline updates, upserts, multi updates, hint/sort/collation/arrayFilters,
+and replacement findAndModify remain explicit future work. Native sync/async
+Python exposes `replace_one` with the same engine semantics and controls.
 Updates, the remaining findAndModify forms, and index metadata cursors remain unimplemented.
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required

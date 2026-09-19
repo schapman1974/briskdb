@@ -499,8 +499,8 @@ requires an earlier dependency:
       engine-owned cursors. Tests cover BSON fidelity, numeric-equivalent IDs,
       cross-interface access, restart, host enablement, one-way writes, and
       response limits. Missing collections read empty without creating metadata.
-      Updates/findAndModify, index metadata cursors, and full database
-      lifecycle remain open.
+      Operator updates, remaining findAndModify forms, index metadata cursors,
+      and broader database options remain open.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
       single-shard worker grouping. Missing IDs receive ObjectIds; explicit
@@ -509,6 +509,15 @@ requires an earlier dependency:
       writes, with no cross-shard atomicity promise. Tests cover BSON types,
       direct zero-timestamp normalization, raw server-generated IDs, restart,
       concurrent duplicates, driver batch splitting, and boundary rejection.
+    - [ ] [#171](https://github.com/schapman1974/briskdb/issues/171) — shared
+      `replace_one` now selects one match and atomically replaces its shard-local
+      record while preserving natural order and the original `_id` representation.
+      Exact stored BSON bytes determine matched/modified counts; top-level zero
+      timestamps are stamped, nested values are preserved. Rust, native sync/async
+      Python, and ordered/unordered wire replacement batches share this path.
+      Result/post-image limits and immutable-ID checks precede commit. No global
+      snapshot is claimed. Upsert, operator/array updates, and secondary-index
+      post-image validation remain open.
     - [ ] [#175](https://github.com/schapman1974/briskdb/issues/175) — filtered
       delete-one/many now use the shared matcher across Rust, native sync/async
       Python, and Mongo wire. Exact IDs stay single-shard; delete-one rechecks
@@ -596,7 +605,8 @@ requires an earlier dependency:
       projection-to-group identity case now uses the shared group stage below.
       All frozen aggregation projection-stage and application aggregation cases
       now pass through the real four-shard endpoint in both API modes. Combined
-      with the basic and group-accumulator suites, required CI checks exactly 142 frozen executions and
+      with the basic/group-accumulator suites and the full-document replacement
+      contract, required CI checks exactly 144 frozen executions and
       rejects missing, duplicated, substituted, or skipped cases. The full
       456-execution corpus remains separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared

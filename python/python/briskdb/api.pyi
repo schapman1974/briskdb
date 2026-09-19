@@ -19,6 +19,7 @@ from ._briskdb import (
     Database,
     DatabaseNamesResult,
     DeleteOneResult,
+    UpdateResult,
     DistinctResult,
     FindResult,
     InsertOneResult,
@@ -302,6 +303,20 @@ class AsyncSession:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> CountDocumentsResult: ...
+    async def replace_one(
+        self,
+        database: str,
+        collection: str,
+        filter: BsonDocument,
+        replacement: BsonDocument,
+        *,
+        upsert: bool = False,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> UpdateResult: ...
     async def find_one_and_delete(
         self,
         database: str,

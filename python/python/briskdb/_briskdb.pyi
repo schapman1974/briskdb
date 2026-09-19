@@ -129,6 +129,13 @@ class OneDocumentResult(DocumentExecution):
     kind: Literal["document"]
     document: Optional[BsonResultDocument]
 
+class UpdateResult(DocumentExecution):
+    kind: Literal["update"]
+    acknowledged: bool
+    matched_count: int
+    modified_count: int
+    upserted_id: Any
+
 class CloseReport(TypedDict):
     already_closed: bool
     forced: bool
@@ -549,6 +556,20 @@ class Session:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> CountDocumentsResult: ...
+    def replace_one(
+        self,
+        database: str,
+        collection: str,
+        filter: BsonDocument,
+        replacement: BsonDocument,
+        *,
+        upsert: bool = False,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> UpdateResult: ...
     def find_one_and_delete(
         self,
         database: str,

@@ -1,11 +1,11 @@
-//! Atomic shard-local selection and deletion with a preflighted pre-image.
+//! Atomic shard-local single-record mutations with preflighted results.
 
 use super::*;
 use crate::{
     document::{
         BSON_MAX_NESTING_DEPTH, BsonCodecOptions, CanonicalBsonKey, DEFAULT_DOCUMENT_BATCH_SIZE,
-        DocumentFindOneAndDeleteRequest, DocumentRequestId, DocumentSortKey,
-        encode_document_with_options,
+        DocumentFindOneAndDeleteRequest, DocumentMutationError, DocumentReplaceRequest,
+        DocumentRequestId, DocumentSortKey, DocumentUpdateResult, encode_document_with_options,
     },
     sqlite_error,
 };
@@ -17,6 +17,26 @@ struct Candidate {
     natural_order: u64,
     key: CanonicalBsonKey,
     sort: Option<DocumentSortKey>,
+}
+
+#[derive(Clone)]
+enum Mutation {
+    Delete,
+    Replace {
+        document: Arc<BsonDocument>,
+        max_document_bytes: usize,
+    },
+}
+
+impl Mutation {
+    fn no_match(&self) -> DocumentResult {
+        match self {
+            Self::Delete => DocumentResult::Document(None),
+            Self::Replace { .. } => DocumentResult::Update(
+                DocumentUpdateResult::new(0, 0, None).expect("zero update counts"),
+            ),
+        }
+    }
 }
 
 impl Engine {
@@ -40,8 +60,70 @@ impl Engine {
                 "find-one-and-delete accepts only projection and sort read options",
             ));
         }
+        self.run_document_single_mutation(
+            owner,
+            request_id,
+            namespace,
+            filter,
+            options,
+            Mutation::Delete,
+            cancellation,
+            deadline,
+            limits,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_document_replace(
+        &self,
+        owner: ConnectionOwner,
+        request_id: DocumentRequestId,
+        request: DocumentReplaceRequest,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        limits: ResultLimits,
+    ) -> EngineResult<DocumentExecution> {
+        let max_document_bytes = request.max_document_bytes();
+        let (namespace, filter, replacement, options) = request.into_parts();
+        if !options.ordered() || options.upsert() || options.bypass_document_validation() {
+            return Err(unsupported(
+                "replacement upsert and non-default write options are not implemented",
+            ));
+        }
+        self.run_document_single_mutation(
+            owner,
+            request_id,
+            namespace,
+            filter,
+            DocumentReadOptions::new(),
+            Mutation::Replace {
+                document: Arc::new(replacement),
+                max_document_bytes,
+            },
+            cancellation,
+            deadline,
+            limits,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_document_single_mutation(
+        &self,
+        owner: ConnectionOwner,
+        request_id: DocumentRequestId,
+        namespace: DocumentNamespace,
+        filter: DocumentFilter,
+        options: DocumentReadOptions,
+        mutation: Mutation,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        limits: ResultLimits,
+    ) -> EngineResult<DocumentExecution> {
         let storage = self.inner.database.storage.clone();
         let shard_count = self.shard_count();
+        let no_match = mutation.no_match();
         let (collection_id, route, projection, sorter, plan) = self
             .run_document_storage_task(
                 cancellation.clone(),
@@ -80,11 +162,7 @@ impl Engine {
                         }
                     };
                     enforce_execution_result_limits_with_check(
-                        &DocumentExecution::new(
-                            request_id,
-                            Some(plan.clone()),
-                            DocumentResult::Document(None),
-                        ),
+                        &DocumentExecution::new(request_id, Some(plan.clone()), no_match),
                         limits,
                         &mut check,
                     )?;
@@ -119,7 +197,8 @@ impl Engine {
                                 ensure_document_cpu_active(cancellation, control)
                             })?;
                         }
-                        let execution = return_and_delete(
+                        let execution = mutate_record(
+                            &mutation,
                             storage,
                             &transaction,
                             record,
@@ -171,7 +250,7 @@ impl Engine {
                         return Ok(DocumentExecution::new(
                             request_id,
                             Some(plan),
-                            DocumentResult::Document(None),
+                            mutation.no_match(),
                         ));
                     };
                     let shard = candidate.shard;
@@ -179,6 +258,7 @@ impl Engine {
                     let sorter = sorter.clone();
                     let projection = projection.clone();
                     let plan = plan.clone();
+                    let mutation = mutation.clone();
                     let execution = self
                         .run_document_shard_controlled(
                             shard,
@@ -215,7 +295,8 @@ impl Engine {
                                     &candidate.key,
                                     cancellation,
                                 )?;
-                                let execution = return_and_delete(
+                                let execution = mutate_record(
+                                    &mutation,
                                     storage,
                                     &transaction,
                                     record,
@@ -239,6 +320,154 @@ impl Engine {
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mutate_record(
+    mutation: &Mutation,
+    storage: &Storage,
+    transaction: &Transaction<'_>,
+    record: Option<DocumentStorageRecord>,
+    request_id: DocumentRequestId,
+    plan: DocumentPlan,
+    projection: Option<&DocumentProjector>,
+    limits: ResultLimits,
+    cancellation: &CancellationToken,
+    control: &OperationControl,
+) -> EngineResult<DocumentExecution> {
+    match mutation {
+        Mutation::Delete => return_and_delete(
+            storage,
+            transaction,
+            record,
+            request_id,
+            plan,
+            projection,
+            limits,
+            cancellation,
+            control,
+        ),
+        Mutation::Replace {
+            document,
+            max_document_bytes,
+        } => replace_record(
+            storage,
+            transaction,
+            record,
+            document,
+            *max_document_bytes,
+            request_id,
+            plan,
+            limits,
+            cancellation,
+            control,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_record(
+    storage: &Storage,
+    transaction: &Transaction<'_>,
+    record: Option<DocumentStorageRecord>,
+    replacement: &BsonDocument,
+    max_document_bytes: usize,
+    request_id: DocumentRequestId,
+    plan: DocumentPlan,
+    limits: ResultLimits,
+    cancellation: &CancellationToken,
+    control: &OperationControl,
+) -> EngineResult<DocumentExecution> {
+    let mut check = || ensure_document_cpu_active(cancellation, control);
+    check()?;
+    let Some(record) = record else {
+        return Ok(DocumentExecution::new(
+            request_id,
+            Some(plan),
+            DocumentResult::Update(DocumentUpdateResult::new(0, 0, None)?),
+        ));
+    };
+    if let Some(id) = replacement.get_first("_id") {
+        let key = CanonicalBsonKey::encode(id)
+            .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+        if &key != record.id_key() {
+            return Err(DocumentMutationError::ImmutableId.into_engine_error());
+        }
+    }
+    check()?;
+    // Canonical field order and the original ID representation survive even
+    // when the caller supplied a numerically equal ID of another BSON type.
+    let mut post_image = BsonDocument::new();
+    post_image
+        .try_reserve(replacement.len() + 1)
+        .map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::OutOfMemory,
+                "unable to prepare replacement",
+                error,
+            )
+        })?;
+    post_image
+        .push(
+            "_id",
+            record
+                .document()
+                .get_first("_id")
+                .expect("validated stored ID")
+                .clone(),
+        )
+        .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+    for (name, value) in replacement.iter().filter(|(name, _)| *name != "_id") {
+        check()?;
+        let value = match value {
+            BsonValue::Timestamp(value) if value.time() == 0 && value.increment() == 0 => {
+                BsonValue::Timestamp(next_server_timestamp()?)
+            }
+            value => value.clone(),
+        };
+        post_image
+            .push(name, value)
+            .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+    }
+    let bytes = encode_document_with_options(
+        &post_image,
+        &BsonCodecOptions::new().with_max_document_bytes(max_document_bytes),
+    )
+    .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+    check()?;
+    // Query equality intentionally merges numeric types. Modification counts
+    // instead compare the bytes that storage persists, including field order.
+    let before = encode_document(record.document())
+        .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?;
+    let modified = bytes != before;
+    drop(bytes);
+    drop(before);
+    let execution = DocumentExecution::new(
+        request_id,
+        Some(plan),
+        DocumentResult::Update(DocumentUpdateResult::new(1, u64::from(modified), None)?),
+    );
+    enforce_execution_result_limits_with_check(&execution, limits, &mut check)?;
+    check()?;
+    if modified {
+        let prepared = storage.prepare_document_write(&post_image)?;
+        check()?;
+        if !storage.replace_document_on_connection(
+            transaction,
+            record.collection_id(),
+            record.shard(),
+            record.id_key(),
+            record.natural_order(),
+            &prepared,
+            cancellation,
+        )? {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "selected document vanished inside its write transaction",
+            ));
+        }
+    }
+    Ok(execution)
 }
 
 #[allow(clippy::too_many_arguments)]

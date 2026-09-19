@@ -58,7 +58,8 @@ def sync_contract(path: str) -> None:
     ]
     deleted_many: int = document_session.delete_many("app", "notes", {"body": "typed"})["deleted_count"]
     removed: Optional[dict[str, object]] = document_session.find_one_and_delete("app", "notes", {}, projection=["body"], sort={"body": 1})["document"]
-    print(removed)
+    modified: int = document_session.replace_one("app", "notes", {}, {"body": "replacement"}, upsert=False)["modified_count"]
+    print(removed, modified)
     print(deleted_many)
     print(
         address,
@@ -116,7 +117,8 @@ async def async_contract(path: str) -> None:
     killed: bool = (await session.kill_cursor("app", "typed", 1))["killed"]
     deleted_many: int = (await session.delete_many("app", "typed", {}))["deleted_count"]
     removed: Optional[dict[str, object]] = (await session.find_one_and_delete("app", "typed", {}, projection={"_id": 1}, sort={"_id": -1}))["document"]
-    print(removed)
+    modified: int = (await session.replace_one("app", "typed", {}, {"body": "replacement"}))["modified_count"]
+    print(removed, modified)
     print(deleted_many)
     print(continued, killed, projected, exists, distinct)
     print(address, data_address, admin_address, rows, outcome, namespace, document_count)
