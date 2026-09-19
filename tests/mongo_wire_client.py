@@ -10,6 +10,45 @@ from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timesta
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
 
 
+def min_max_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_min_max.items
+        collection.insert_many([{"_id": Int64(i), "low": 5.0, "high": 5.0, "keep": True, "a": [None]} for i in range(24)])
+        equal = collection.update_one({"_id": 0}, {"$min": {"low": Int64(5)}, "$max": {"high": Decimal128("5")}})
+        assert (equal.matched_count, equal.modified_count) == (1, 0)
+        assert type(collection.find_one({"_id": 0})["low"]) is float
+        result = collection.update_many({}, {"$min": {"low": 4, "a.3": 2}, "$max": {"high": 6}})
+        assert (result.matched_count, result.modified_count) == (24, 24)
+        assert collection.find_one_and_update({}, {"$min": {"low": 3}}, sort=[("_id", -1)], projection={"low": 1, "_id": 0}) == {"low": 4}
+        assert collection.find_one_and_update({"_id": 23}, {"$max": {"high": 7}}, return_document=True, projection={"high": 1, "_id": 0}) == {"high": 7}
+        before = BSON.encode(collection.find_one({"_id": 0}))
+        for expression, code in [({"$min": {"keep.x": 1}}, 28), ({"$max": {"_id": 99}}, 66), ({"$min": {"low": 1}, "$max": {"low": 2}}, 40), ({"$min": []}, 9)]:
+            try:
+                collection.update_one({"_id": 0}, expression)
+            except OperationFailure as error:
+                assert error.code == code
+            else:
+                raise AssertionError("expected min/max validation error")
+            assert BSON.encode(collection.find_one({"_id": 0})) == before
+        reply = client.wire_min_max.command("update", "items", ordered=False, updates=[
+            {"q": {"_id": 0}, "u": {"$min": {"keep.x": 1}}},
+            {"q": {"_id": 0}, "u": {"$max": {"high": 8}}},
+        ])
+        assert (reply["n"], reply["nModified"]) == (1, 1)
+        assert [(error["index"], error["code"]) for error in reply["writeErrors"]] == [(0, 28)]
+        # Concurrent extrema combine current stored values, never stale client copies.
+        def write(worker):
+            for step in range(1, 9):
+                value = worker * 8 + step
+                result = collection.update_many({}, {"$min": {"low": -value}, "$max": {"high": value}})
+                assert result.matched_count == 24
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(write, range(4)))
+        rows = list(collection.find({}))
+        assert [row["_id"] for row in rows] == list(range(24))
+        assert all(type(row["_id"]) is Int64 and row["low"] == -32 and row["high"] == 32 and row["keep"] and row["a"] == [None, None, None, 2] for row in rows)
+
+
 def find_update_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_find_update.items
@@ -1129,6 +1168,7 @@ def lifecycle_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert client.wire_min_max.items.count_documents({"low": -32, "high": 32, "keep": True}) == 24
         row = client.wire_find_update.items.find_one({"_id": 10})
         assert row["rank"] == -1 and row["done"] is True and "group" not in row and row["stamp"] == Timestamp(0, 0)
         assert client.wire_update_many.items.count_documents({"validated": True}) == 24
@@ -1262,6 +1302,13 @@ def metadata_smoke(uri):
 
 
 async def async_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_min_max.items
+        await collection.insert_many([{"_id": i, "v": 5.0} for i in range(4)])
+        assert (await collection.update_one({"_id": 0}, {"$max": {"v": Int64(5)}})).modified_count == 0
+        result = await collection.update_many({}, {"$min": {"v": 4}})
+        assert (result.matched_count, result.modified_count) == (4, 4)
+        assert await collection.find_one_and_update({}, {"$max": {"v": 6}}, sort=[("_id", -1)], return_document=True, projection={"v": 1, "_id": 0}) == {"v": 6}
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         collection = client.async_find_update.items
         await collection.insert_many([{"_id": Int64(i), "rank": i, "keep": True} for i in range(6)])
@@ -1437,6 +1484,7 @@ if __name__ == "__main__":
         field_update_smoke(sys.argv[1])
         update_many_smoke(sys.argv[1])
         find_update_smoke(sys.argv[1])
+        min_max_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

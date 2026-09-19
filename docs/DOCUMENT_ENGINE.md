@@ -75,9 +75,9 @@ The current engine executes:
 | `Delete` | Deletes one or many matches; exact `_id` routes to one shard, other filters use the shared matcher |
 | `FindOneAndDelete` | Atomically deletes one shard-local selection and returns its projected pre-delete document |
 | `FindOneAndReplace` | Atomically replaces one shard-local selection and returns its projected before/after document; no upsert yet |
-| `FindOneAndUpdate` | Applies `$set`/`$unset` to one shard-local selection and returns its projected before/after document; no upsert yet |
+| `FindOneAndUpdate` | Applies `$set`/`$unset`/`$min`/`$max` to one shard-local selection and returns its projected before/after document; no upsert yet |
 | `Replace` | Replaces one matching document, preserving `_id` and natural order; returns matched/modified counts, with no upsert yet |
-| `Update` | Applies `$set`/`$unset` to one or many matches; returns matched/modified counts, with one transaction per shard for many |
+| `Update` | Applies `$set`/`$unset`/`$min`/`$max` to one or many matches; returns matched/modified counts, with one transaction per shard for many |
 
 `CollectionExists` uses an admitted, controlled manifest lookup and scalar result
 accounting. Its result is independent of catalog page size and unrelated metadata
@@ -106,13 +106,26 @@ batch size and cannot change the original skip or limit.
 
 ### Field updates and single-record write boundaries
 
-`Update` executes scopes `One` and `Many` with `$set` and `$unset`, using the same
+`Update` executes scopes `One` and `Many` with `$set`, `$unset`, `$min`, and `$max`, using the same
 locked selection/reselection and preflighted write path as replacement. A shared
 `DocumentUpdater` validates every operator, operand, path, and prefix conflict
 before namespace lookup or matching. It bounds specifications to 1 MiB/4,096
 operations, paths to 100 components, conservative retained values to 64 MiB,
 and traversal to one million steps. Cancellation/deadline checks run during
 compilation and application; array extension is charged before allocation.
+
+`$min`/`$max` compare complete BSON values, including null, arrays, nested
+documents, and mixed numeric types. They reuse the shared BSON total order, not
+query-sort array-element selection. Equal values preserve the stored type and
+bytes. Missing fields (including new array slots) receive the candidate even
+when it compares above/below null; existing nulls participate in comparison.
+Blocked paths fail with code 28 and changed IDs with code 66. Comparison work
+has a separate 64-MiB conservative value-traversal budget and shares the million
+step/cancellation budget, including no-ops. See Mongo's
+[$min](https://www.mongodb.com/docs/manual/reference/operator/update/min/) and
+[$max](https://www.mongodb.com/docs/manual/reference/operator/update/max/)
+definitions; specification-order field processing still follows the frozen
+TinyMongo input rather than claiming MongoDB 5+ lexicographic processing.
 
 Only changed paths are edited. Untouched fields retain order and exact BSON
 types; new fields follow specification order. Missing `$set` parents become
@@ -130,10 +143,13 @@ including retained fields. Result/plan/post-image checks precede SQL, so validat
 failures leave the record unchanged. Concurrent updates read the current document
 under the write lock rather than applying a stale client-side replacement.
 Other operators, upsert, and secondary-index maintenance remain
-unimplemented. The 4,008 source-locked oracle cases intentionally cover non-ID
-object paths only: frozen TinyMongo's legacy scalar/array/ID behavior differs.
-Those boundaries have independent unit, transaction, and real-wire tests; the
-frozen corpus and intentional-difference allowances have not been changed.
+unimplemented. Of 8,727 source-locked update oracle cases, the original 4,008
+set/unset cases intentionally cover non-ID object paths only: frozen TinyMongo's
+legacy scalar/array/ID behavior differs. The 4,719 min/max cases additionally
+cover whole-value ordering, numeric array paths, scalar/null path errors,
+immutable IDs, and conflicts. Independent unit, transaction, and real-wire tests
+check resource and commit boundaries. Frozen source, corpus, and intentional-
+difference allowances have not been changed.
 
 Scope `Many` streams matching records in natural order within ascending shard
 IDs, holding one immediate write transaction per shard. Exact-ID predicates

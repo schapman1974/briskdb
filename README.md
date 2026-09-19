@@ -132,7 +132,7 @@ experimental and opt-in; the exact contract lives in
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working; the opt-in `documents` feature adds a thin native document-command facade |
 | Same-host service and embedded processes sharing one ready root | Working on local filesystems |
-| Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, queries/cursors, basic aggregation, metadata, deletes, replacements, and `$set`/`$unset` updates share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), other operators, upserts, and secondary indexes remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
+| Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, queries/cursors, basic aggregation, metadata, deletes, replacements, and `$set`/`$unset`/`$min`/`$max` updates share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), other operators, upserts, and secondary indexes remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
 | Native Python extension | Typed sync/async SQL and opt-in BSON document commands; tagged releases build audited macOS/Linux ARM/x86 wheels |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
@@ -270,7 +270,7 @@ PyMongo remains optional and is loaded only when a document method runs, so a
 SQL-only installation has no BSON dependency. The current slice supports
 collection/index metadata, single-document inserts with optional `_id`, BSON
 find/count/distinct, basic aggregation and retained cursors, filtered deletes,
-replacements, `$set`/`$unset` updates, and projected before/after mutation images.
+replacements, `$set`/`$unset`/`$min`/`$max` updates, and projected before/after mutation images.
 Secondary index declarations remain
 `pending_build`.
 
@@ -351,7 +351,7 @@ more valuable than a star. Start with the
   upgrade, and recovery work requires sole-process ownership.
 - Pre-1.0 storage and public-library compatibility can change between releases.
 - Python document commands support bounded BSON queries, basic aggregation,
-  metadata/cursors, filtered deletes, replacements, and `$set`/`$unset` updates.
+  metadata/cursors, filtered deletes, replacements, and `$set`/`$unset`/`$min`/`$max` updates.
   Other update operators, upserts, native Python bulk-write helpers, and built
   secondary indexes remain planned. Multi-document writes commit per shard,
   without global atomicity or MongoDB per-document failure-boundary guarantees.
