@@ -495,11 +495,11 @@ requires an earlier dependency:
       [#180](https://github.com/schapman1974/briskdb/issues/180): single-document
       insert and literal exact-ID find now use the same enabled document engine
       as embedded Rust/Python. First writes provision collections through the
-      engine, duplicate IDs map to `DuplicateKeyError`, and read replies exhaust
-      a zero-ID cursor. Tests cover BSON fidelity, numeric-equivalent IDs,
+      engine, duplicate IDs map to `DuplicateKeyError`, and read replies use
+      engine-owned cursors. Tests cover BSON fidelity, numeric-equivalent IDs,
       cross-interface access, restart, host enablement, one-way writes, and
       response limits. Missing collections read empty without creating metadata.
-      Updates/deletes, retained cursors, and full collection
+      Updates/deletes, metadata/aggregation cursors, and full collection
       lifecycle remain open.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
@@ -516,8 +516,17 @@ requires an earlier dependency:
       precedes global pagination; exact `$eq` IDs retain point routing (#180).
       Required CI compares a generated BSON matrix with the locked oracle;
       real sync/async PyMongo and embedded Python tests cover queries/restart.
-      Remaining work includes broader dialect/consumer conformance, retained
-      cursors (#168), projection/sort (#172), and write/index/pipeline reuse.
+      Remaining work includes broader dialect/consumer conformance,
+      projection/sort (#172), and write/index/pipeline reuse.
+    - [ ] [#168](https://github.com/schapman1974/briskdb/issues/168) — retained find
+      cursors now support global filter/skip/limit paging, empty initial batches,
+      byte-bounded pages, getMore, and killCursors. Native Rust/Python cursors are
+      session-owned; wire cursors follow pooled sockets with disconnect cleanup.
+      Count/retention quotas, idle expiry, cumulative wire time budgets,
+      cancellation/error cleanup, and engine shutdown bound resources without
+      retaining SQLite leases. Required tests exercise real sync/async drivers,
+      restart, ownership, byte limits, and exhaustion. Metadata and aggregation
+      cursor consumers remain open; no cross-batch snapshot is promised.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.

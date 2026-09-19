@@ -39,7 +39,7 @@ pub use command::{
     DocumentNamespace, DocumentReplaceRequest, DocumentRequest, DocumentRequestId,
     DocumentUpdateRequest, MAX_DOCUMENT_INDEX_NAME_BYTES,
 };
-pub use error::{BsonError, BsonErrorContext, BsonErrorKind, BsonResult};
+pub use error::{BsonError, BsonErrorContext, BsonErrorKind, BsonResult, DocumentCursorError};
 pub use key::{BSON_KEY_ENCODING_VERSION, BSON_MAX_CANONICAL_KEY_BYTES, CanonicalBsonKey};
 pub use matcher::{DocumentMatcher, DocumentQueryError};
 pub use options::{

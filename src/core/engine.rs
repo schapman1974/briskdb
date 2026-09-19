@@ -1,7 +1,11 @@
 //! Asynchronous protocol-neutral engine boundary.
 
 #[cfg(feature = "documents")]
+mod document_cursor;
+#[cfg(feature = "documents")]
 mod document_engine;
+#[cfg(feature = "documents")]
+pub(crate) use document_cursor::DocumentCursorOwner;
 
 use std::{
     path::{Path, PathBuf},
@@ -385,6 +389,8 @@ struct EngineInner {
     active_idempotency_keys: Arc<ActiveIdempotencyKeys>,
     shutdown_cancel: CancellationToken,
     shutdown_gate: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(feature = "documents")]
+    document_cursors: Arc<document_cursor::CursorRegistry>,
     #[cfg(feature = "experimental-vtab")]
     registry_schema_cache: Arc<RegistrySchemaCache>,
     #[cfg(feature = "experimental-vtab")]
@@ -612,6 +618,8 @@ impl Engine {
                 active_idempotency_keys: Arc::new(ActiveIdempotencyKeys::default()),
                 shutdown_cancel: CancellationToken::new(),
                 shutdown_gate: Arc::new(tokio::sync::Mutex::new(())),
+                #[cfg(feature = "documents")]
+                document_cursors: Arc::new(document_cursor::CursorRegistry::default()),
                 #[cfg(feature = "experimental-vtab")]
                 registry_schema_cache: Arc::new(RegistrySchemaCache::new()),
                 #[cfg(feature = "experimental-vtab")]
@@ -924,6 +932,8 @@ impl Engine {
     /// This transition is synchronous, monotonic, and idempotent. Call
     /// [`Engine::shutdown`] to await cleanup of SQLite handles.
     pub fn begin_shutdown(&self) -> EngineState {
+        #[cfg(feature = "documents")]
+        self.inner.document_cursors.close();
         self.inner.lifecycle.begin_shutdown()
     }
 

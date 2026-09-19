@@ -4,6 +4,37 @@ use std::{error::Error, fmt};
 
 use crate::core::{EngineError, EngineErrorKind};
 
+/// Stable, payload-free failures for retained document cursor operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentCursorError {
+    NotFound,
+    InUse,
+}
+
+impl DocumentCursorError {
+    pub const fn mongo_code(self) -> i32 {
+        match self {
+            Self::NotFound => 43,
+            Self::InUse => 237,
+        }
+    }
+
+    pub(crate) fn into_engine_error(self) -> EngineError {
+        EngineError::from_source(EngineErrorKind::FailedPrecondition, self.to_string(), self)
+    }
+}
+
+impl fmt::Display for DocumentCursorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotFound => "document cursor not found",
+            Self::InUse => "document cursor is already in use",
+        })
+    }
+}
+
+impl Error for DocumentCursorError {}
+
 /// Stable category for failures produced by the BSON value and codec layer.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -13,6 +13,7 @@ use std::{
 
 use tokio::task::JoinHandle;
 
+use super::document_cursor::{CursorSource as PreparedFilterRoute, CursorState};
 use super::{Engine, Operation, flatten_join, pending_cancellation_reason, retire_if_broken};
 use crate::{
     core::{
@@ -23,11 +24,11 @@ use crate::{
     document::{
         BSON_MAX_DECODED_BYTES, BsonDocument, BsonErrorContext, BsonObjectId, BsonTimestamp,
         BsonValue, DocumentCollectionId, DocumentCollectionMetadata, DocumentCollectionOptions,
-        DocumentCommand, DocumentDeleteResult, DocumentExecution, DocumentFilter,
-        DocumentIndexMetadata, DocumentInsertResult, DocumentMatcher, DocumentMutationScope,
-        DocumentNamespace, DocumentPlan, DocumentPointPlan, DocumentReadOptions, DocumentRequest,
-        DocumentResult, DocumentScatterPlan, DocumentWriteError, DocumentWriteOptions,
-        MAX_DOCUMENT_REQUEST_BYTES, encode_document,
+        DocumentCommand, DocumentCursorError, DocumentDeleteResult, DocumentExecution,
+        DocumentFilter, DocumentIndexMetadata, DocumentInsertResult, DocumentMatcher,
+        DocumentMutationScope, DocumentNamespace, DocumentPlan, DocumentPointPlan,
+        DocumentReadOptions, DocumentRequest, DocumentResult, DocumentScatterPlan,
+        DocumentWriteError, DocumentWriteOptions, MAX_DOCUMENT_REQUEST_BYTES, encode_document,
     },
     storage::{
         ConnectionOwner, DocumentStorageRecord, MAX_DOCUMENT_SHARD_SCAN_RECORDS, PooledConnection,
@@ -136,10 +137,11 @@ impl Engine {
         let join = tokio::spawn(async move {
             let _lease = lease;
             let _schema_operation = schema_operation;
-            let _session = session;
+            let mut session = session;
             let result = engine
                 .coordinate_document_command(
                     owner,
+                    &mut session,
                     request_id,
                     command,
                     cancellation,
@@ -147,7 +149,14 @@ impl Engine {
                     result_limits,
                 )
                 .await;
-            worker_control.complete(result)
+            let cursor = result.as_ref().ok().and_then(execution_cursor);
+            let result = worker_control.complete(result);
+            if result.is_err() {
+                if let Some((namespace, id)) = cursor {
+                    engine.inner.document_cursors.kill(owner, &namespace, id);
+                }
+            }
+            result
         });
         operation.wait_started(join).await
     }
@@ -156,6 +165,7 @@ impl Engine {
     async fn coordinate_document_command(
         &self,
         owner: ConnectionOwner,
+        session: &mut SessionInner,
         request_id: crate::document::DocumentRequestId,
         command: DocumentCommand,
         cancellation: CancellationToken,
@@ -467,61 +477,111 @@ impl Engine {
                         },
                     )
                     .await?;
-                let (plan, documents) = match route {
-                    PreparedFilterRoute::Point { id_key, shard } => {
-                        let (id_key, record) = self
-                            .run_document_shard(
-                                shard,
-                                owner,
-                                cancellation,
-                                deadline,
-                                move |storage, connection, cancellation| {
-                                    let record = storage.get_document_on_connection(
-                                        connection,
-                                        collection_id,
-                                        shard,
-                                        &id_key,
-                                        cancellation,
-                                    )?;
-                                    Ok((id_key, record))
-                                },
-                            )
-                            .await?;
-                        if let Some(record) = &record {
-                            validate_point_record(record, collection_id, shard, &id_key)?;
-                        }
-                        let documents = apply_point_read(record, &options, result_limits)?;
-                        (
-                            DocumentPlan::Point(DocumentPointPlan::new(
-                                collection_id,
-                                shard,
-                                id_key,
-                            )?),
-                            documents,
-                        )
-                    }
-                    PreparedFilterRoute::Scatter(matcher) => {
-                        let documents = self
-                            .scan_document_collection(
-                                owner,
-                                collection_id,
-                                cancellation,
-                                deadline,
-                                matcher,
-                                &options,
-                                result_limits,
-                            )
-                            .await?;
-                        (scatter_plan(collection_id, self.shard_count())?, documents)
-                    }
+                let mut state = CursorState {
+                    namespace: namespace.clone(),
+                    collection_id,
+                    source: route,
+                    after: None,
+                    skip: options.skip(),
+                    remaining: options.limit(),
+                    batch_byte_limit: options.batch_byte_limit(),
+                };
+                let plan = self.document_cursor_plan(&state)?;
+                let (documents, has_more) = self
+                    .read_document_page(
+                        owner,
+                        &mut state,
+                        cancellation,
+                        deadline,
+                        &options,
+                        result_limits,
+                    )
+                    .await?;
+                let cursor_id = if has_more {
+                    session
+                        .document_cursor_owner
+                        .get_or_insert_with(|| self.inner.document_cursors.owner(owner));
+                    Some(self.inner.document_cursors.insert(owner, state)?)
+                } else {
+                    None
                 };
                 let batch = crate::document::DocumentCursorBatch::from_validated(
-                    namespace, None, documents,
+                    namespace, cursor_id, documents,
                 );
                 Ok(DocumentExecution::new(
                     request_id,
                     Some(plan),
                     DocumentResult::Cursor(batch),
+                ))
+            }
+            DocumentCommand::ContinueCursor(request) => {
+                let (namespace, id, options) = request.into_parts();
+                require_find_options(&options)?;
+                if options.batch_size() == 0 || options.skip() != 0 || options.limit().is_some() {
+                    return Err(EngineError::new(
+                        EngineErrorKind::InvalidArgument,
+                        "cursor continuation requires a positive batch size and cannot change skip/limit",
+                    ));
+                }
+                let mut lease = self
+                    .inner
+                    .document_cursors
+                    .checkout(owner, &namespace, id)?;
+                let mut state = lease.state.take().expect("checked-out cursor owns state");
+                let catalog_namespace = namespace.clone();
+                let collection_id = state.collection_id;
+                self.run_document_storage_task(
+                    cancellation.clone(),
+                    deadline,
+                    move |cancellation, control| {
+                        let current = storage.document_collection_controlled(
+                            catalog_namespace.database(),
+                            catalog_namespace.collection(),
+                            Arc::clone(&control),
+                        )?;
+                        if current.is_none_or(|collection| collection.id() != collection_id) {
+                            return Err(DocumentCursorError::NotFound.into_engine_error());
+                        }
+                        ensure_document_cpu_active(cancellation, &control)
+                    },
+                )
+                .await?;
+                if let Some(bytes) = options.batch_byte_limit() {
+                    state.batch_byte_limit =
+                        Some(state.batch_byte_limit.unwrap_or(u64::MAX).min(bytes));
+                }
+                let plan = self.document_cursor_plan(&state)?;
+                let (documents, has_more) = self
+                    .read_document_page(
+                        owner,
+                        &mut state,
+                        cancellation,
+                        deadline,
+                        &options,
+                        result_limits,
+                    )
+                    .await?;
+                let cursor_id = lease.complete(has_more.then_some(state))?;
+                Ok(DocumentExecution::new(
+                    request_id,
+                    Some(plan),
+                    DocumentResult::Cursor(crate::document::DocumentCursorBatch::from_validated(
+                        namespace, cursor_id, documents,
+                    )),
+                ))
+            }
+            DocumentCommand::KillCursor(request) => {
+                let (namespace, id, options) = request.into_parts();
+                require_catalog_write_options(options)?;
+                enforce_execution_result_limits(
+                    &DocumentExecution::new(request_id, None, DocumentResult::CursorKilled(true)),
+                    result_limits,
+                )?;
+                let killed = self.inner.document_cursors.kill(owner, &namespace, id);
+                Ok(DocumentExecution::new(
+                    request_id,
+                    None,
+                    DocumentResult::CursorKilled(killed),
                 ))
             }
             DocumentCommand::Count(request) => {
@@ -711,9 +771,7 @@ impl Engine {
             | DocumentCommand::Distinct(_)
             | DocumentCommand::Update(_)
             | DocumentCommand::Replace(_)
-            | DocumentCommand::DropIndex(_)
-            | DocumentCommand::ContinueCursor(_)
-            | DocumentCommand::KillCursor(_) => Err(unsupported(
+            | DocumentCommand::DropIndex(_) => Err(unsupported(
                 "this document command is modeled but requires a later document-semantics milestone",
             )),
             DocumentCommand::CreateCollection(_) => Err(EngineError::new(
@@ -727,21 +785,29 @@ impl Engine {
             // success even if cancellation wins the race to result delivery.
             Ok(execution)
         } else {
-            self.run_document_storage_task(
-                result_cancellation,
-                deadline,
-                move |cancellation, control| {
-                    enforce_execution_result_limits_controlled(
-                        &execution,
-                        result_limits,
-                        cancellation,
-                        &control,
-                    )?;
-                    ensure_document_cpu_active(cancellation, &control)?;
-                    Ok(execution)
-                },
-            )
-            .await
+            let cursor = execution_cursor(&execution);
+            let result = self
+                .run_document_storage_task(
+                    result_cancellation,
+                    deadline,
+                    move |cancellation, control| {
+                        enforce_execution_result_limits_controlled(
+                            &execution,
+                            result_limits,
+                            cancellation,
+                            &control,
+                        )?;
+                        ensure_document_cpu_active(cancellation, &control)?;
+                        Ok(execution)
+                    },
+                )
+                .await;
+            if result.is_err() {
+                if let Some((namespace, id)) = cursor {
+                    self.inner.document_cursors.kill(owner, &namespace, id);
+                }
+            }
+            result
         }
     }
 
@@ -942,18 +1008,115 @@ impl Engine {
         result
     }
 
+    fn document_cursor_plan(&self, state: &CursorState) -> EngineResult<DocumentPlan> {
+        match &state.source {
+            PreparedFilterRoute::Point { id_key, shard } => {
+                DocumentPointPlan::new(state.collection_id, *shard, id_key.clone())
+                    .map(DocumentPlan::Point)
+            }
+            PreparedFilterRoute::Scatter(_) => {
+                scatter_plan(state.collection_id, self.shard_count())
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
-    async fn scan_document_collection(
+    async fn read_document_page(
         &self,
         owner: ConnectionOwner,
-        collection_id: DocumentCollectionId,
+        state: &mut CursorState,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        options: &DocumentReadOptions,
+        limits: ResultLimits,
+    ) -> EngineResult<(Vec<BsonDocument>, bool)> {
+        enforce_empty_result_limit(limits)?;
+        if state
+            .batch_byte_limit
+            .is_some_and(|limit| cursor_page_base_bytes(state, self.shard_count()) > limit)
+        {
+            return Err(limit_exceeded(
+                "cursor envelope cannot fit the batch byte limit",
+            ));
+        }
+        if state.remaining == Some(0) {
+            return Ok((Vec::new(), false));
+        }
+        if options.batch_size() == 0 {
+            return Ok((Vec::new(), true));
+        }
+        match &state.source {
+            PreparedFilterRoute::Point { id_key, shard } => {
+                let id_key = id_key.clone();
+                let shard = *shard;
+                let collection_id = state.collection_id;
+                let (id_key, record) = self
+                    .run_document_shard(
+                        shard,
+                        owner,
+                        cancellation,
+                        deadline,
+                        move |storage, connection, cancellation| {
+                            let record = storage.get_document_on_connection(
+                                connection,
+                                collection_id,
+                                shard,
+                                &id_key,
+                                cancellation,
+                            )?;
+                            Ok((id_key, record))
+                        },
+                    )
+                    .await?;
+                if let Some(record) = &record {
+                    validate_point_record(record, collection_id, shard, &id_key)?;
+                    if state.skip == 0
+                        && state.batch_byte_limit.is_some_and(|limit| {
+                            cursor_page_base_bytes(state, self.shard_count())
+                                + DOCUMENT_RESULT_ROW_BYTES
+                                + DOCUMENT_RESULT_VALUE_BYTES
+                                + record.encoded_len() as u64
+                                > limit
+                        })
+                    {
+                        return Err(limit_exceeded(
+                            "document cannot fit the cursor batch byte limit",
+                        ));
+                    }
+                }
+                let point_options = options.clone().with_skip(state.skip);
+                Ok((apply_point_read(record, &point_options, limits)?, false))
+            }
+            PreparedFilterRoute::Scatter(matcher) => {
+                let matcher = matcher.clone();
+                self.scan_document_page(
+                    owner,
+                    state,
+                    cancellation,
+                    deadline,
+                    matcher,
+                    options,
+                    limits,
+                )
+                .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_document_page(
+        &self,
+        owner: ConnectionOwner,
+        state: &mut CursorState,
         cancellation: CancellationToken,
         deadline: Option<Instant>,
         matcher: Option<Arc<DocumentMatcher>>,
         options: &DocumentReadOptions,
         limits: ResultLimits,
-    ) -> EngineResult<Vec<BsonDocument>> {
+    ) -> EngineResult<(Vec<BsonDocument>, bool)> {
         enforce_empty_result_limit(limits)?;
+        let collection_id = state.collection_id;
+        let start_after = state.after;
         let frontier_limit = limits
             .max_bytes()
             .max(u64::try_from(BSON_MAX_DECODED_BYTES).unwrap_or(u64::MAX));
@@ -974,7 +1137,7 @@ impl Engine {
                             connection,
                             collection_id,
                             shard,
-                            None,
+                            start_after,
                             matcher.as_deref(),
                             cancellation,
                             deadline,
@@ -1003,11 +1166,10 @@ impl Engine {
             }
         }
 
-        let mut skipped = 0_u64;
         let mut documents = Vec::new();
-        let mut result_bytes = DOCUMENT_RESULT_ENVELOPE_BYTES;
-        let requested = options
-            .limit()
+        let mut result_bytes = cursor_page_base_bytes(state, self.shard_count());
+        let requested = state
+            .remaining
             .unwrap_or(u64::MAX)
             .min(options.batch_size());
         let retained_documents = requested.min(limits.max_rows());
@@ -1030,9 +1192,26 @@ impl Engine {
             retained_bytes = retained_bytes
                 .saturating_sub(u64::try_from(record.encoded_len()).unwrap_or(u64::MAX));
 
-            if skipped < options.skip() {
-                skipped += 1;
+            if state.skip > 0 {
+                state.skip -= 1;
             } else if u64::try_from(documents.len()).unwrap_or(u64::MAX) < requested {
+                let next_bytes = result_bytes
+                    .checked_add(DOCUMENT_RESULT_ROW_BYTES)
+                    .and_then(|bytes| bytes.checked_add(DOCUMENT_RESULT_VALUE_BYTES))
+                    .and_then(|bytes| bytes.checked_add(record.encoded_len() as u64))
+                    .ok_or_else(result_size_overflow)?;
+                if state
+                    .batch_byte_limit
+                    .is_some_and(|limit| next_bytes > limit)
+                {
+                    if documents.is_empty() {
+                        return Err(limit_exceeded(
+                            "document cannot fit the cursor batch byte limit",
+                        ));
+                    }
+                    has_more = true;
+                    break;
+                }
                 add_document_result_budget(&mut result_bytes, record.encoded_len(), limits)?;
                 if u64::try_from(documents.len()).unwrap_or(u64::MAX) >= limits.max_rows() {
                     return Err(limit_exceeded(
@@ -1040,8 +1219,16 @@ impl Engine {
                     ));
                 }
                 documents.push(record.into_document());
+                if let Some(remaining) = &mut state.remaining {
+                    *remaining = remaining.saturating_sub(1);
+                }
             } else {
                 has_more = true;
+                break;
+            }
+
+            state.after = Some(natural_order);
+            if state.remaining == Some(0) {
                 break;
             }
 
@@ -1083,17 +1270,39 @@ impl Engine {
             frontiers[shard_index] = next;
         }
 
-        if has_more
-            && options
-                .limit()
-                .is_none_or(|limit| limit > options.batch_size())
-        {
-            return Err(unsupported(
-                "document cursor continuation is not available yet; use a limit within one batch",
-            ));
-        }
-        Ok(documents)
+        Ok((documents, has_more))
     }
+}
+
+fn execution_cursor(
+    execution: &DocumentExecution,
+) -> Option<(DocumentNamespace, crate::document::DocumentCursorId)> {
+    match execution.result() {
+        DocumentResult::Cursor(batch) => {
+            batch.cursor_id().map(|id| (batch.namespace().clone(), id))
+        }
+        _ => None,
+    }
+}
+
+fn cursor_envelope_bytes(namespace: &DocumentNamespace) -> u64 {
+    DOCUMENT_RESULT_ENVELOPE_BYTES
+        + 8
+        + namespace.database().len() as u64
+        + 1
+        + namespace.collection().len() as u64
+}
+
+fn cursor_page_base_bytes(state: &CursorState, shards: u16) -> u64 {
+    cursor_envelope_bytes(&state.namespace)
+        + match &state.source {
+            PreparedFilterRoute::Point { id_key, .. } => {
+                DOCUMENT_RESULT_VALUE_BYTES + 10 + id_key.as_bytes().len() as u64
+            }
+            PreparedFilterRoute::Scatter(_) => {
+                DOCUMENT_RESULT_VALUE_BYTES + 8 + u64::from(shards) * 2
+            }
+        }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1236,14 +1445,6 @@ enum FilterRoute {
     Point(BsonValue),
     Scatter,
     Filtered(DocumentFilter),
-}
-
-enum PreparedFilterRoute {
-    Point {
-        id_key: crate::document::CanonicalBsonKey,
-        shard: u16,
-    },
-    Scatter(Option<Arc<DocumentMatcher>>),
 }
 
 fn classify_filter(
@@ -1949,6 +2150,125 @@ mod tests {
         document::{DocumentCollectionOptions, DocumentCreateCollectionRequest, DocumentRequestId},
         storage::SchemaGateState,
     };
+
+    #[tokio::test]
+    async fn cursor_continuations_release_state_on_cancel_deadline_and_task_abort() {
+        use crate::document::{DocumentContinueCursorRequest, DocumentFindRequest};
+
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::open_with_options(root.path(), 2, EngineOptions::new(1, 1).unwrap())
+            .await
+            .unwrap();
+        let session = Arc::new(engine.session());
+        let namespace = DocumentNamespace::new("app", "cursor_cancel").unwrap();
+        let identity = DocumentRequestId::new([9; 16]).unwrap();
+        engine
+            .execute_document(
+                &session,
+                DocumentRequest::new(
+                    identity,
+                    RequestContext::new(),
+                    DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                        namespace.clone(),
+                        DocumentCollectionOptions::empty(),
+                        DocumentWriteOptions::new(),
+                    )),
+                ),
+            )
+            .await
+            .unwrap();
+
+        for mode in 0..3 {
+            let opened = engine
+                .execute_document(
+                    &session,
+                    DocumentRequest::new(
+                        identity,
+                        RequestContext::new(),
+                        DocumentCommand::Find(DocumentFindRequest::new(
+                            namespace.clone(),
+                            DocumentFilter::empty(),
+                            DocumentReadOptions::new().with_batch_size(0).unwrap(),
+                        )),
+                    ),
+                )
+                .await
+                .unwrap();
+            let (_, id) = execution_cursor(&opened).unwrap();
+            // Reserve the only shard-0 permit without occupying a worker. The
+            // continuation can check out its cursor and read catalog metadata,
+            // then blocks at an observable, deterministic admission boundary.
+            let permit = engine
+                .inner
+                .connections
+                .acquire_for_owner(0, ConnectionOwner::new(engine.session().id().get()))
+                .await
+                .unwrap();
+            let token = CancellationToken::new();
+            let mut context = RequestContext::new().with_cancellation_token(token.clone());
+            if mode == 1 {
+                context = context.with_timeout(Duration::from_secs(2)).unwrap();
+            }
+            let request = DocumentRequest::new(
+                identity,
+                context,
+                DocumentCommand::ContinueCursor(DocumentContinueCursorRequest::new(
+                    namespace.clone(),
+                    id,
+                    DocumentReadOptions::new(),
+                )),
+            );
+            let task_engine = engine.clone();
+            let task_session = Arc::clone(&session);
+            let task =
+                tokio::spawn(
+                    async move { task_engine.execute_document(&task_session, request).await },
+                );
+            timeout(Duration::from_secs(1), async {
+                while engine.inner.connections.snapshot().unwrap().shards[0].queued != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("continuation must reach pool admission");
+            match mode {
+                0 => {
+                    token.cancel();
+                }
+                2 => task.abort(),
+                _ => (),
+            }
+            let result = timeout(Duration::from_secs(3), task).await.unwrap();
+            if mode == 2 {
+                assert!(result.unwrap_err().is_cancelled());
+            } else {
+                assert_eq!(
+                    result.unwrap().unwrap_err().kind(),
+                    if mode == 0 {
+                        EngineErrorKind::Cancelled
+                    } else {
+                        EngineErrorKind::DeadlineExceeded
+                    }
+                );
+            }
+            // Acquiring session state waits for any detached cancellation
+            // cleanup to finish before observing the registry.
+            let _session = timeout(Duration::from_secs(2), session.inner.lock())
+                .await
+                .unwrap();
+            assert!(!engine.inner.document_cursors.kill(
+                ConnectionOwner::new(session.id().get()),
+                &namespace,
+                id
+            ));
+            assert_eq!(
+                engine.inner.connections.snapshot().unwrap().shards[0].queued,
+                0
+            );
+            drop(permit);
+        }
+        engine.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn collection_creation_excludes_schema_operations_before_waiting_for_its_session() {

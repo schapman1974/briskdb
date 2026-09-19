@@ -11,9 +11,10 @@ use std::{
 };
 
 use briskdb::document::{
-    DocumentCollectionOptions, DocumentCommand, DocumentCountRequest,
-    DocumentCreateCollectionRequest, DocumentCreateIndexRequest, DocumentDeleteRequest,
-    DocumentFilter, DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest,
+    DocumentCollectionOptions, DocumentCommand, DocumentContinueCursorRequest,
+    DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
+    DocumentCursorId, DocumentDeleteRequest, DocumentFilter, DocumentFindRequest,
+    DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
     DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
     DocumentNamespace, DocumentReadOptions, DocumentRequest, DocumentRequestId,
     DocumentWriteOptions,
@@ -1648,6 +1649,69 @@ impl Session {
         self.execute_document_command(
             py,
             DocumentCommand::Count(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (database, collection, cursor_id, *, batch_size = 101, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn get_more(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        cursor_id: u64,
+        batch_size: u64,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let command = DocumentCommand::ContinueCursor(DocumentContinueCursorRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            python_engine_result(DocumentCursorId::new(cursor_id))?,
+            document_read_options(0, None, batch_size)?,
+        ));
+        self.execute_document_command(
+            py,
+            command,
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (database, collection, cursor_id, *, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn kill_cursor(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        cursor_id: u64,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let command = DocumentCommand::KillCursor(DocumentKillCursorRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            python_engine_result(DocumentCursorId::new(cursor_id))?,
+            DocumentWriteOptions::new(),
+        ));
+        self.execute_document_command(
+            py,
+            command,
             request_id,
             timeout_ms,
             cancellation.as_deref(),

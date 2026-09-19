@@ -62,7 +62,9 @@ The current engine executes:
 | `CreateIndex` | Declares index metadata and returns its name; non-built-in indexes remain pending until physical index work lands |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
-| `Find` | Evaluates BSON match expressions and returns one exhausted cursor batch |
+| `Find` | Evaluates BSON match expressions and returns a bounded batch with a continuation ID when needed |
+| `ContinueCursor` | Resumes a session-owned find in global natural order |
+| `KillCursor` | Releases a session-owned cursor; reports whether it existed |
 | `Count` | Evaluates the same match expressions, then applies global skip/limit |
 | `Delete` | Deletes one document selected by exact `_id` |
 
@@ -71,9 +73,26 @@ An exact `_id` filter, including `{_id: {$eq: value}}`, produces a
 produce a deterministic `DocumentPlan::Scatter` over every shard. The shared
 Rust matcher runs before scatter reads merge by the durable
 cross-shard natural-order value, so insertion order remains stable across
-restarts. `skip`, `limit`, and `batch_size` are applied after that merge. A
-result that would require cursor continuation currently fails unless the caller
-uses a limit that fits in one batch.
+restarts. `skip` and `limit` apply once across the whole cursor, after the
+merge; `batch_size` bounds each returned page. An initial batch size of zero
+opens a cursor without reading documents. Continuations require a positive
+batch size and cannot change the original skip or limit.
+
+Find cursors retain the compiled query, collection identity, and last consumed
+natural-order position—not SQLite connections, transactions, schema guards, or
+result documents. Pages are not a snapshot across concurrent writes. The engine
+allows at most 32 cursors total and 8 per session, with a conservative 64-MiB
+query-retention accounting quota. Idle cursors expire after 10 minutes, checked
+on registry access. Session close/drop and engine shutdown release their cursors;
+failed admitted continuations release theirs too. Foreign sessions/namespaces
+cannot read or kill another cursor. Invalid/stale IDs report `DocumentCursorError`.
+
+`DocumentReadOptions::with_batch_byte_limit` supplies an optional soft page
+boundary including engine result overhead: a page ends before the next document
+would exceed it. A single document that cannot fit fails. This does not weaken
+the request's hard `ResultLimits`. A continuation may narrow this byte ceiling,
+but cannot widen it. The alpha API's `DocumentReadOptions::into_parts` now returns
+this sixth component, and `with_batch_size(0)` is valid for initial find.
 
 The matcher supports dotted paths, missing/null distinctions, numeric BSON
 equivalence, type-bracketed comparisons, array membership, `$eq`, `$ne`, `$gt`,
@@ -132,7 +151,7 @@ authorizer before that connection can be reused.
 ## Current boundary
 
 Projection, sort, update expressions, replacements,
-multi-document deletion, upsert, distinct, aggregation, retained
+multi-document deletion, upsert, distinct, aggregation, metadata/aggregation
 cursors, and physical secondary-index builds remain later roadmap work.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
 category.

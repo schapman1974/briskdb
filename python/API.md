@@ -76,6 +76,7 @@ plan. Payload keys are:
 | `indexes` | ordered `indexes` list |
 | `insert` | `acknowledged`, `inserted_count`, `inserted_ids` |
 | `cursor` | `namespace`, `cursor_id`, `exhausted`, `documents` |
+| `cursor_killed` | `killed` boolean |
 | `count` | `count` |
 | `delete` | `acknowledged`, `deleted_count` |
 
@@ -92,12 +93,20 @@ are server-stamped; nested timestamps and timestamp IDs are preserved.
 Find/count use the [shared BSON matcher](../docs/DOCUMENT_ENGINE.md), including
 dotted paths, arrays, comparisons, logical operators, and bounded regexes.
 Filtering precedes global skip/limit; exact `_id`/`$eq` routes to one shard.
-Delete still requires an exact `_id`; a find must fit in one batch because
-cursor continuation has not landed. Updates, replacements, projection,
-sorting, aggregation, bulk writes, and
-retained cursor operations remain unsupported. There is no Python collection
+Find returns a bounded page. When `cursor_id` is not `None`, use
+`get_more(database, collection, cursor_id, *, batch_size=101, ...)` on the same
+session; it returns the same `cursor` result shape. `batch_size=0` is accepted
+only on initial find. Stop early with
+`kill_cursor(database, collection, cursor_id, ...)`, which returns
+`kind="cursor_killed"` and a `killed` boolean. Both methods accept the same request
+identity, timeout, cancellation, and result-limit controls, including asyncio
+wrappers. Session close also releases retained cursors. Failed executing
+continuations discard the cursor; pre-admission argument errors do not advance it.
+Cross-batch reads are not a snapshot under concurrent writes.
+Delete still requires an exact `_id`. Updates, replacements, projection,
+sorting, aggregation, and bulk-write helpers remain unsupported. There is no Python collection
 object or Python-hosted MongoDB network listener in this slice. The separate
-opt-in Rust Mongo listener also exposes batch inserts through PyMongo.
+opt-in Rust Mongo listener also exposes batch inserts and retained finds through PyMongo.
 
 ## Attached listeners
 

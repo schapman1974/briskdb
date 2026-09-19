@@ -52,6 +52,35 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_retained_cursor_batches_ownership_close_and_kill(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            database, session = self.open_session(root)
+            for index in range(24):
+                session.insert_one(DATABASE, COLLECTION, {"_id": index, "rank": index})
+            batch = session.find(DATABASE, COLLECTION, {"rank": {"$gte": 5}}, skip=2, limit=13, batch_size=3)
+            self.assertFalse(batch["exhausted"])
+            identifier = batch["cursor_id"]
+            foreign = database.session()
+            with self.assertRaises(briskdb.FailedPreconditionError):
+                foreign.get_more(DATABASE, COLLECTION, identifier)
+            self.assertFalse(foreign.kill_cursor(DATABASE, COLLECTION, identifier)["killed"])
+            found = batch["documents"]
+            while not batch["exhausted"]:
+                batch = session.get_more(DATABASE, COLLECTION, batch["cursor_id"], batch_size=2)
+                found.extend(batch["documents"])
+            self.assertEqual([doc["_id"] for doc in found], list(range(7, 20)))
+            with self.assertRaises(briskdb.FailedPreconditionError):
+                session.get_more(DATABASE, COLLECTION, identifier)
+            empty = session.find(DATABASE, COLLECTION, batch_size=0)
+            self.assertEqual(empty["documents"], [])
+            killed = session.kill_cursor(DATABASE, COLLECTION, empty["cursor_id"])
+            self.assertEqual(killed["kind"], "cursor_killed")
+            self.assertTrue(killed["killed"])
+            self.assertFalse(session.kill_cursor(DATABASE, COLLECTION, empty["cursor_id"])["killed"])
+            foreign.close()
+            session.close()
+            database.close()
+
     def test_general_matcher_filters_before_global_skip_limit_and_count(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             database, session = self.open_session(root)
@@ -79,7 +108,7 @@ class PythonDocumentApiTests(unittest.TestCase):
             database.close()
 
     def test_native_document_signatures_match_the_typed_api(self) -> None:
-        for method_name in ("find", "list_collections", "list_indexes"):
+        for method_name in ("find", "get_more", "list_collections", "list_indexes"):
             with self.subTest(method=method_name):
                 signature = inspect.signature(getattr(briskdb.Session, method_name))
                 self.assertEqual(signature.parameters["batch_size"].default, 101)
@@ -697,8 +726,9 @@ class PythonDocumentApiTests(unittest.TestCase):
                 session.count_documents(DATABASE, COLLECTION, max_result_bytes=1)
             with self.assertRaises(briskdb.InvalidArgumentError):
                 session.find(DATABASE, COLLECTION, limit=0)
-            with self.assertRaises(briskdb.InvalidArgumentError):
-                session.find(DATABASE, COLLECTION, batch_size=0)
+            first = session.find(DATABASE, COLLECTION, batch_size=0)
+            self.assertEqual(first["documents"], [])
+            self.assertTrue(session.kill_cursor(DATABASE, COLLECTION, first["cursor_id"])["killed"])
             with self.assertRaises(briskdb.InvalidArgumentError):
                 session.list_collections(DATABASE, timeout_ms=0)
             with self.assertRaises(briskdb.InvalidArgumentError):
@@ -800,6 +830,22 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_retained_cursors_forward_batches_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=4, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for index in range(12):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": index})
+                    batch = await session.find(DATABASE, COLLECTION, batch_size=0)
+                    found = []
+                    while not batch["exhausted"]:
+                        batch = await session.get_more(DATABASE, COLLECTION, batch["cursor_id"], batch_size=3)
+                        found.extend(batch["documents"])
+                    self.assertEqual([doc["_id"] for doc in found], list(range(12)))
+                    batch = await session.find(DATABASE, COLLECTION, batch_size=1)
+                    self.assertTrue((await session.kill_cursor(DATABASE, COLLECTION, batch["cursor_id"]))["killed"])
+
     async def test_async_document_methods_forward_values_and_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(
