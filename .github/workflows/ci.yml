@@ -105,7 +105,7 @@ jobs:
           retention-days: 14
 
   mongo-wire:
-    name: Mongo real-wire discovery (PyMongo 4.17.0)
+    name: Mongo real-wire discovery and documents (PyMongo 4.17.0)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -138,7 +138,7 @@ jobs:
           cargo test --locked --no-default-features --features mongo,tokio/rt-multi-thread --lib protocol::mongo
           cargo test --locked --no-default-features --features mongo --test mongo_wire
 
-      - name: Require real PyMongo sync and async discovery
+      - name: Require real PyMongo discovery, documents, and restart
         env:
           BRISKDB_MONGO_WIRE_PYTHON: python
         run: >-

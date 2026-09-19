@@ -1,4 +1,4 @@
-//! Host-owned, loopback-only discovery listener. No database mutations yet.
+//! Host-owned, loopback-only Mongo listener over the shared document engine.
 
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -11,19 +11,21 @@ use tokio::{
 };
 use tokio_util::codec::{Decoder, Encoder};
 
-use super::{FrameCodec, MAX_BOOTSTRAP_MESSAGE_BYTES, Request, decode_request, invalid, wire};
+use super::{
+    FrameCodec, MAX_BOOTSTRAP_MESSAGE_BYTES, Request, commands, decode_request, invalid, wire,
+};
 use crate::{
     BriskDb, CancellationToken, EngineState,
-    core::Engine,
     document::{BsonDocument, BsonValue},
 };
 
 const MAX_CONNECTIONS: usize = 8;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// A caller-owned Mongo discovery spike. Does not close the borrowed engine,
+/// A caller-owned Mongo listener. Does not close the borrowed engine,
 /// install signal handlers, or enable any listener through default features.
-/// Only hello/isMaster, ping, and buildInfo are implemented; data commands fail.
+/// Supports discovery and an initial single-insert/exact-ID-find slice. Data
+/// commands require the host's `DocumentSupport::Enabled` setting.
 pub struct MongoServer {
     address: SocketAddr,
     shutdown: CancellationToken,
@@ -33,7 +35,7 @@ pub struct MongoServer {
 impl MongoServer {
     pub async fn start(database: &BriskDb, address: SocketAddr) -> io::Result<Self> {
         if !address.ip().is_loopback() {
-            return Err(invalid("Mongo discovery listener requires loopback"));
+            return Err(invalid("Mongo listener requires loopback"));
         }
         if database.engine().state() != EngineState::Running {
             return Err(invalid("Mongo listener requires a running engine"));
@@ -42,8 +44,7 @@ impl MongoServer {
         let address = listener.local_addr()?;
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
-        let engine = database.engine().clone();
-        let task = tokio::spawn(run(listener, engine, token));
+        let task = tokio::spawn(run(listener, database.clone(), token));
         Ok(Self {
             address,
             shutdown,
@@ -76,7 +77,12 @@ impl Drop for MongoServer {
     }
 }
 
-async fn run(listener: TcpListener, engine: Engine, shutdown: CancellationToken) -> io::Result<()> {
+async fn run(
+    listener: TcpListener,
+    database: BriskDb,
+    shutdown: CancellationToken,
+) -> io::Result<()> {
+    let executor = Arc::new(commands::Executor::new(database.clone()));
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connections = JoinSet::new();
     let mut lifecycle = tokio::time::interval(Duration::from_millis(100));
@@ -86,7 +92,7 @@ async fn run(listener: TcpListener, engine: Engine, shutdown: CancellationToken)
             biased;
             _ = shutdown.cancelled() => break,
             _ = lifecycle.tick() => {
-                if engine.state() != EngineState::Running { break; }
+                if database.engine().state() != EngineState::Running { break; }
             }
             _ = connections.join_next(), if !connections.is_empty() => {},
             accepted = listener.accept() => {
@@ -96,11 +102,12 @@ async fn run(listener: TcpListener, engine: Engine, shutdown: CancellationToken)
                 };
                 let Ok(permit) = slots.clone().try_acquire_owned() else { drop(stream); continue; };
                 let token = shutdown.clone();
+                let executor = Arc::clone(&executor);
                 connections.spawn(async move {
                     // This slot remains held while the blocking parser is awaited,
                     // including during shutdown; malformed clients cannot grow the queue.
                     let _permit = permit;
-                    let _ = connection(stream, token).await;
+                    let _ = connection(stream, token, executor).await;
                 });
             }
         }
@@ -111,7 +118,12 @@ async fn run(listener: TcpListener, engine: Engine, shutdown: CancellationToken)
     outcome
 }
 
-async fn connection(mut stream: TcpStream, shutdown: CancellationToken) -> io::Result<()> {
+async fn connection(
+    mut stream: TcpStream,
+    shutdown: CancellationToken,
+    executor: Arc<commands::Executor>,
+) -> io::Result<()> {
+    let session = executor.session();
     let mut codec = FrameCodec::with_max_message_bytes(MAX_BOOTSTRAP_MESSAGE_BYTES)?;
     let mut source = BytesMut::with_capacity(8192);
     let mut response_id = 0i32;
@@ -139,12 +151,30 @@ async fn connection(mut stream: TcpStream, shutdown: CancellationToken) -> io::R
             source.extend_from_slice(&chunk[..read]);
         };
         response_id = response_id.wrapping_add(1);
-        let result = tokio::task::spawn_blocking(move || {
+        let (request, prepared) = tokio::task::spawn_blocking(move || {
             let request = decode_request(frame)?;
-            let body = dispatch(&request);
+            let prepared = commands::prepare(&request);
+            Ok::<_, io::Error>((request, prepared))
+        })
+        .await
+        .map_err(|_| io::Error::other("Mongo parser task failed"))??;
+        let body = match prepared {
+            Some(Ok(prepared)) => {
+                executor
+                    .execute(&session, request.request_id, prepared, shutdown.clone())
+                    .await
+            }
+            Some(Err(error)) => error.document(),
+            None => dispatch(&request),
+        };
+        let result = tokio::task::spawn_blocking(move || {
             if request.more_to_come {
                 return Ok(None);
             }
+            let body = match commands::validate_response(&body) {
+                Ok(()) => body,
+                Err(error) => error.document(),
+            };
             wire::reply(&request, &body, response_id).map(Some)
         })
         .await
@@ -189,7 +219,7 @@ fn dispatch(request: &Request) -> BsonDocument {
         return error(
             59,
             "CommandNotFound",
-            "command not implemented by BriskDB Mongo discovery spike",
+            "command not implemented by BriskDB Mongo listener",
         );
     }
     if !matches!(

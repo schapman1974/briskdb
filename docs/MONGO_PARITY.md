@@ -2,7 +2,7 @@
 
 Status: TinyMongo v1 contract frozen for issue
 [#161](https://github.com/schapman1974/briskdb/issues/161); BriskDB candidate
-endpoint not yet implemented
+endpoint has an initial opt-in discovery and point-operation slice
 
 BriskDB uses a versioned differential contract to define the document behavior
 that its Rust and Python APIs, and later its MongoDB listener, must preserve.
@@ -18,6 +18,54 @@ the `tinymongo-memory` reference. BriskDB's owned runner reproduces all 456 in
 CI and byte-compares the normalized result with the checked-in reference. The
 report remains `reference-only` until a BriskDB endpoint supplies candidate
 results through the checked-in adapter.
+
+## Current wire checkpoint
+
+The non-default `mongo` Cargo feature exposes `protocol::mongo::MongoServer`.
+The host explicitly starts it on a loopback address and closes it before
+closing the borrowed database. Data commands require opening `BriskDb` with
+`DocumentSupport::Enabled`; discovery still works with document support disabled.
+
+```rust,ignore
+let database = briskdb::BriskDb::builder("./data")
+    .with_document_support(briskdb::DocumentSupport::Enabled)
+    .open().await?;
+let mut mongo = briskdb::protocol::mongo::MongoServer::start(
+    &database, "127.0.0.1:27017".parse()?,
+).await?;
+// Keep the host runtime alive while clients use mongo.address().
+mongo.close().await?;
+database.close().await?;
+```
+
+Ordinary PyMongo 4.17.0 synchronous and asynchronous clients can discover,
+ping, inspect build information, insert one document, and find a literal exact
+`_id`. PyMongo generates omitted IDs client-side; raw inserts must supply `_id`
+at this checkpoint. Explicit null and other supported BSON IDs are preserved.
+Duplicate IDs produce a write error with code 11000. First writes create the
+collection through the shared engine's durable catalog; reads of absent
+collections return an exhausted empty cursor without creating anything.
+
+For these data commands, unknown fields and unsupported option values fail
+before storage admission. The current option contract is:
+
+| Option | Accepted behavior |
+| --- | --- |
+| `maxTimeMS` | Nonnegative integer; a positive value narrows the 15-second command deadline |
+| `$readPreference` | A document containing only a recognized `mode`; the standalone engine serves the request |
+| `ordered` | Only `true` for the current single-document insert slice |
+| `writeConcern` | Omitted/empty, or `w` equal to 0 or 1, `j: false`, and `wtimeout: 0`; no replication or stronger durability is promised |
+| `bypassDocumentValidation` | Only `false` |
+| Find `skip` / `limit` | Nonnegative integers; zero limit means no additional limit |
+| Find `batchSize` | Integer from 1 through 1000; the exact-ID cursor always exhausts |
+| Find `singleBatch` | Boolean; either value yields the same exhausted point-result cursor |
+
+General filters, projection, sorting, batches, server-side ID generation,
+updates, deletes, and retained cursors are not implemented by this checkpoint.
+Sessions, retryable writes, replication, change streams, and compression are
+not advertised. This is not full TinyMongo or MongoDB compatibility. Required
+real-driver CI also verifies BSON fidelity, reconnection, duplicate-key errors,
+resource limits, and persistence after closing and reopening BriskDB.
 
 ## Versioned files
 
