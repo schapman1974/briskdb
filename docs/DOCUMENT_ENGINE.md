@@ -143,8 +143,11 @@ then fetches only selected documents. Large skips can span several windows;
 memory-bound or window-bound pages may be shorter than the requested batch.
 Result byte limits apply after projection. Cancellation/deadlines cover scans,
 key derivation, heap extraction, and fetches in admitted workers. No result
-documents or SQLite leases are retained between requests, and concurrent writes
-do not have cross-batch snapshot semantics. This is bounded in-memory sorting,
+documents or SQLite leases are retained between requests. Selected rows are
+rechecked after fetch, so deletion, a changed filter match, or a changed sort
+key cannot return an unrelated/nonmatching row at the old position. Concurrent
+writes do not have cross-batch snapshot semantics; moved sort keys can be missed
+or encountered again at a later position. This is bounded in-memory sorting,
 not indexed sorting or external spill-to-disk execution.
 
 The shared implementation handles missing/null ties, the empty-array position

@@ -12,7 +12,9 @@ use super::{
 use crate::{
     core::engine::document_cursor::{CursorState, SortPosition},
     core::{CancellationToken, EngineError, EngineErrorKind, EngineResult, ResultLimits},
-    document::{BsonDocument, DocumentMatcher, DocumentReadOptions},
+    document::{
+        BsonDocument, DocumentMatcher, DocumentReadOptions, DocumentSortKey, DocumentSorter,
+    },
     storage::ConnectionOwner,
 };
 
@@ -216,6 +218,10 @@ impl Engine {
                 }
                 let natural_order = entry.position.natural_order;
                 let shard = entry.shard;
+                let position = Arc::new(entry.position);
+                let expected = position.clone();
+                let fetch_sorter = sorter.clone();
+                let fetch_matcher = matcher.clone();
                 let record = self
                     .run_document_shard(
                         shard,
@@ -242,14 +248,30 @@ impl Engine {
                                     record.id_key(),
                                 )?;
                             }
-                            // A deletion between scan and fetch must never return
-                            // an unrelated successor. No read snapshot is promised.
-                            Ok(record.filter(|record| record.natural_order() == natural_order))
+                            // Never return an unrelated successor after deletion,
+                            // or a newly nonmatching / moved row after replacement.
+                            // This is not a snapshot: moved keys may be omitted or
+                            // encountered again in a later window.
+                            let Some(record) =
+                                record.filter(|record| record.natural_order() == natural_order)
+                            else {
+                                return Ok(None);
+                            };
+                            if !still_selected(
+                                record.document(),
+                                fetch_matcher.as_deref(),
+                                &fetch_sorter,
+                                &expected.key,
+                                &mut || check(cancellation, deadline),
+                            )? {
+                                return Ok(None);
+                            }
+                            Ok(Some(record))
                         },
                     )
                     .await?;
                 let Some(record) = record else {
-                    state.sort_after = Some(Arc::new(entry.position));
+                    state.sort_after = Some(position);
                     continue;
                 };
                 let (document, encoded_len) = self
@@ -283,7 +305,7 @@ impl Engine {
                     ));
                 }
                 documents.push(document);
-                state.sort_after = Some(Arc::new(entry.position));
+                state.sort_after = Some(position);
                 if let Some(remaining) = &mut state.remaining {
                     *remaining -= 1;
                 }
@@ -303,10 +325,108 @@ impl Engine {
     }
 }
 
+fn still_selected(
+    document: &BsonDocument,
+    matcher: Option<&DocumentMatcher>,
+    sorter: &DocumentSorter,
+    expected: &DocumentSortKey,
+    check: &mut dyn FnMut() -> EngineResult<()>,
+) -> EngineResult<bool> {
+    check()?;
+    if let Some(matcher) = matcher {
+        if !matcher.matches_with_check(document, check)? {
+            return Ok(false);
+        }
+    }
+    let current = sorter.key_validated_with_check(document, check)?;
+    check()?;
+    Ok(&current == expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::document::{BsonValue, DocumentSorter};
+
+    #[test]
+    fn selected_rows_are_rechecked_after_filter_or_sort_key_changes() {
+        let document = |rank, visible, payload: &str| {
+            BsonDocument::from_entries([
+                ("rank", BsonValue::Int32(rank)),
+                ("visible", BsonValue::Boolean(visible)),
+                ("payload", BsonValue::from(payload)),
+            ])
+            .unwrap()
+        };
+        let original = document(1, true, "before");
+        let sorter = DocumentSorter::compile(
+            &BsonDocument::from_entries([("rank", BsonValue::Int32(1))]).unwrap(),
+        )
+        .unwrap();
+        let matcher = DocumentMatcher::compile(
+            &BsonDocument::from_entries([("visible", BsonValue::Boolean(true))]).unwrap(),
+        )
+        .unwrap();
+        let expected = sorter.key(&original).unwrap();
+        assert!(
+            still_selected(
+                &original,
+                Some(&matcher),
+                &sorter,
+                &expected,
+                &mut || Ok(())
+            )
+            .unwrap()
+        );
+        assert!(
+            !still_selected(
+                &document(1, false, "after"),
+                Some(&matcher),
+                &sorter,
+                &expected,
+                &mut || Ok(())
+            )
+            .unwrap()
+        );
+        assert!(
+            !still_selected(
+                &document(2, true, "after"),
+                Some(&matcher),
+                &sorter,
+                &expected,
+                &mut || Ok(())
+            )
+            .unwrap()
+        );
+        assert!(
+            still_selected(
+                &document(1, true, "after"),
+                Some(&matcher),
+                &sorter,
+                &expected,
+                &mut || Ok(())
+            )
+            .unwrap()
+        );
+        assert!(
+            !still_selected(
+                &document(2, true, "after"),
+                None,
+                &sorter,
+                &expected,
+                &mut || Ok(())
+            )
+            .unwrap()
+        );
+        let error = still_selected(&original, None, &sorter, &expected, &mut || {
+            Err(EngineError::new(
+                EngineErrorKind::Cancelled,
+                "test cancellation",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+    }
 
     #[test]
     fn top_key_windows_keep_a_sorted_prefix_after_memory_trimming() {
