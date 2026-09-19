@@ -96,7 +96,17 @@ jobs:
           --test document_sorting_oracle --test document_distinct_oracle
           --test document_aggregation_oracle -- --ignored --nocapture
 
-      - name: Generate Mongo parity report
+      - name: Run frozen aggregation suites against BriskDB
+        # The candidate checkpoint is deliberately separate from the full
+        # reference-only report: unimplemented suites are not allowlisted.
+        env:
+          BRISKDB_MONGO_CONTRACT_PYTHON: python
+          BRISKDB_MONGO_CONTRACT_REPORT: target/mongo-parity/candidate-aggregation.xml
+        run: >-
+          cargo +1.85.0 test --locked --no-default-features --features mongo
+          --test mongo_candidate_contract -- --ignored --nocapture
+
+      - name: Generate full reference-only Mongo parity report
         run: |
           mkdir -p target/mongo-parity
           python scripts/mongo_parity.py report \

@@ -1,5 +1,13 @@
 # Unreleased
 
+The required Mongo compatibility job now executes all 112 frozen sync/async
+basic-aggregation, projection-stage, and application-aggregation cases through
+a real four-shard BriskDB endpoint. Exact case/API coverage and zero skips are
+checked from JUnit. This completes roadmap issues #179 and #177; it does not
+claim the full Mongo corpus passes. Frozen inputs and reference allowances are
+unchanged, and the separate candidate artifact does not replace the full
+reference-only report. This test-gate change has no on-disk format change.
+
 BriskDB now ships a deterministic, code-first OpenAPI 3.1 artifact at
 `docs/openapi-v1.json`. It describes exactly the 17 versioned `/v1` paths and
 28 GET, HEAD, and POST operations, including each operation's data- or

@@ -354,8 +354,11 @@ validation. Unit tests cover amplification, depth/nodes/bytes, every cancellatio
 and deadline checkpoint, input immutability, and failed-stream poisoning. Native
 and real-driver tests cover paged transforms, runtime-error cursor cleanup,
 output expansion/byte caps, sync/async calls, and restart. Projection-to-group
-identity now uses the shared group stage below. Full candidate-corpus acceptance
-still requires collection lifecycle support for the frozen harness.
+identity now uses the shared group stage below. All frozen basic, projection-stage,
+and application aggregation cases pass through the real four-shard endpoint in
+both API modes. Required CI verifies exactly 112 executions, with no skipped or
+missing cases, using unchanged fixtures and their ordinary drop cleanup. This
+does not mark the full Mongo command corpus or group-accumulator suite complete.
 
 ### Aggregation groups and numeric accumulators
 

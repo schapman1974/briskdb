@@ -2,7 +2,7 @@
 
 Status: TinyMongo v1 contract frozen for issue
 [#161](https://github.com/schapman1974/briskdb/issues/161); BriskDB candidate
-endpoint has an initial opt-in discovery and point-operation slice
+endpoint has an opt-in shared document command slice and aggregation candidate gate
 
 BriskDB uses a versioned differential contract to define the document behavior
 that its Rust and Python APIs, and later its MongoDB listener, must preserve.
@@ -16,8 +16,28 @@ This is a frozen behavioral input, not a claim that BriskDB already has MongoDB
 parity. The checked-in report contains only the 456 sync/async executions from
 the `tinymongo-memory` reference. BriskDB's owned runner reproduces all 456 in
 CI and byte-compares the normalized result with the checked-in reference. The
-report remains `reference-only` until a BriskDB endpoint supplies candidate
-results through the checked-in adapter.
+full report remains `reference-only`; partial candidate coverage is not folded
+into that report or treated as full parity.
+
+Required CI separately runs all 112 sync/async executions in the frozen
+`test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
+and `test_aggregation_contract` modules against a real four-shard BriskDB listener.
+It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
+cleanup. The JUnit result is checked against the exact locked case/API set;
+missing, substituted, duplicate, skipped, or failed cases reject the gate.
+`target/mongo-parity/candidate-aggregation.xml` is uploaded alongside (not merged
+into) the full reference-only report. Frozen sources, corpus, adapters, reference
+results, and intentional-difference allowances are unchanged. This completes the
+basic and projection-stage suites (#179/#177), not the full 456-execution corpus
+or the separate group-accumulator suite (#176).
+
+To reproduce with the frozen runner's test dependencies installed:
+
+```sh
+BRISKDB_MONGO_CONTRACT_PYTHON=python3 cargo test --locked \
+  --no-default-features --features mongo --test mongo_candidate_contract \
+  -- --ignored --nocapture
+```
 
 ## Current wire checkpoint
 
