@@ -53,7 +53,9 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `create_index(database, collection, keys, *, name, unique=False, ...)`
 - `list_indexes(database, collection, *, skip=0, limit=None, batch_size=101, ...)`
 - `insert_one(database, collection, document, ...)`
-- `find(database, collection, filter=None, *, skip=0, limit=None, batch_size=101, ...)`
+- `find(database, collection, filter=None, *, projection=None, skip=0, limit=None, batch_size=101, ...)`
+- `get_more(database, collection, cursor_id, *, batch_size=101, ...)`
+- `kill_cursor(database, collection, cursor_id, ...)`
 - `count_documents(database, collection, filter=None, *, skip=0, limit=None, ...)`
 - `delete_one(database, collection, filter, ...)`
 
@@ -103,7 +105,15 @@ identity, timeout, cancellation, and result-limit controls, including asyncio
 wrappers. Session close also releases retained cursors. Failed executing
 continuations discard the cursor; pre-admission argument errors do not advance it.
 Cross-batch reads are not a snapshot under concurrent writes.
-Delete still requires an exact `_id`. Updates, replacements, projection,
+`projection` accepts a mapping or a sequence/set of field names. Repeated names
+in the field-name shorthand are deduplicated; an empty mapping/list leaves the
+document unchanged. Basic numeric/boolean inclusion and exclusion, nested
+mappings, dotted paths, arrays, and `_id` rules use the shared Rust projector.
+Stored documents and exact BSON representations remain unchanged. Filters use
+original values; result byte limits apply to projected output. A cursor retains
+its initial projection. Invalid mixed modes and conflicting paths fail eagerly;
+expression, positional, and numeric-array-index projections are unsupported.
+Delete still requires an exact `_id`. Updates, replacements,
 sorting, aggregation, and bulk-write helpers remain unsupported. There is no Python collection
 object or Python-hosted MongoDB network listener in this slice. The separate
 opt-in Rust Mongo listener also exposes batch inserts and retained finds through PyMongo.

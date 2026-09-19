@@ -80,7 +80,7 @@ def document_smoke(uri):
         assert client.other_database.items.find_one({"_id": "typed"}) is None
         for arguments, code in [
             ({"filter": {"$where": "unsupported"}}, 115),
-            ({"filter": {"_id": "typed"}, "projection": {"integer": 1}}, 72),
+            ({"filter": {"_id": "typed"}, "projection": {"integer": {"$slice": 1}}}, 115),
             ({"filter": {"_id": "typed"}, "lsid": {"id": Binary(b"0" * 16, 4)}}, 72),
         ]:
             try:
@@ -253,6 +253,46 @@ def cursor_smoke(uri):
         assert empty["cursor"]["id"] == 0 and empty["cursor"]["firstBatch"] == []
 
 
+def projection_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000, maxPoolSize=3) as client:
+        collection = client.wire_projection.items
+        documents = [
+            {"before": Int64(index), "_id": index, "secret": "filter-me", "profile": {"name": f"name-{index}", "age": 30},
+             "items": [{"sku": "a", "qty": 1}, {"qty": 2}, {}, [None, {"sku": "b"}]], "payload": "x" * 5000}
+            for index in range(24)
+        ]
+        collection.insert_many(documents)
+        spec = {"profile.name": 1, "items.sku": 1, "before": 1, "_id": 0}
+        rows = list(collection.find({"secret": "filter-me"}, spec).skip(2).limit(13).batch_size(3))
+        assert rows == [
+            {"before": Int64(index), "profile": {"name": f"name-{index}"}, "items": [{"sku": "a"}, {}, {}, [{"sku": "b"}]]}
+            for index in range(2, 15)
+        ]
+        assert all(list(row) == ["before", "profile", "items"] and isinstance(row["before"], Int64) for row in rows)
+        point = collection.find_one({"_id": 7}, {"items.qty": 0, "payload": 0, "secret": 0})
+        assert point["items"] == [{"sku": "a"}, {}, {}, [None, {"sku": "b"}]]
+        assert "payload" not in point and "secret" not in point
+        assert collection.find_one({"_id": 7}) == documents[7]
+        assert collection.find_one({"_id": 7}, ["before"]) == {"before": Int64(7), "_id": 7}
+        assert collection.find_one({"_id": 7}, {}) == documents[7]
+        assert collection.find_one({"_id": 7}, {"_id.missing": 1}) == {}
+        for spec, code in [
+            ({"before": 1, "secret": 0}, 31254),
+            ({"secret": 0, "before": 1}, 31253),
+            ({"profile": 1, "profile.name": 1}, 31249),
+            ({"profile.name": 1, "profile": 1}, 31250),
+            ({"items.0": 1}, 115),
+            ({"items": {"$slice": 1}}, 115),
+        ]:
+            for target in [collection, client.unwritten_projection.items]:
+                try:
+                    list(target.find({}, spec))
+                except OperationFailure as error:
+                    assert error.code == code, (spec, error.code)
+                else:
+                    raise AssertionError("invalid projection must fail before storage admission")
+
+
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         assert client.wire_data.items.find_one({"_id": "typed"})["decimal"] == Decimal128("1.250")
@@ -265,6 +305,9 @@ def persisted_smoke(uri):
         assert client.async_data.batches.find_one({"_id": 2}) == {"_id": 2}
         assert sorted(item["_id"] for item in client.wire_queries.items.find({"v": {"$in": [7]}})) == ["array", "number"]
         assert [row["_id"] for row in client.wire_batches.split.find(batch_size=31).limit(150)] == list(range(150))
+        row = client.wire_projection.items.find_one({"_id": 7}, {"profile.name": 1})
+        assert row == {"_id": 7, "profile": {"name": "name-7"}}
+        assert len(client.wire_projection.items.find_one({"_id": 7})["payload"]) == 5000
 
 
 async def async_smoke(uri):
@@ -300,6 +343,8 @@ async def async_smoke(uri):
         assert sorted(item["_id"] for item in rows) == ["array", "number"]
         rows = await client.wire_batches.split.find(batch_size=17).skip(8).limit(121).to_list()
         assert [row["_id"] for row in rows] == list(range(8, 129))
+        rows = await client.wire_projection.items.find({"secret": "filter-me"}, {"before": 1, "_id": 0}, batch_size=3).to_list()
+        assert rows == [{"before": Int64(index)} for index in range(24)]
         cursor = client.wire_batches.split.find(batch_size=2)
         assert (await cursor.__anext__())["_id"] == 0
         identifier = cursor.cursor_id
@@ -322,5 +367,6 @@ if __name__ == "__main__":
         batch_smoke(sys.argv[1])
         query_smoke(sys.argv[1])
         cursor_smoke(sys.argv[1])
+        projection_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

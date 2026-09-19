@@ -1,11 +1,12 @@
 from decimal import Decimal
 from os import PathLike
-from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional, Sequence, Tuple, TypedDict, Union
+from typing import AbstractSet, Any, Dict, Iterator, List, Literal, Mapping, Optional, Sequence, Tuple, TypedDict, Union
 from uuid import UUID
 
 SqlParameter = Union[None, bool, int, float, Decimal, str, bytes, bytearray, memoryview]
 SqlRow = Tuple[object, ...]
 BsonDocument = Mapping[str, Any]
+BsonProjection = Union[BsonDocument, Sequence[str], AbstractSet[str]]
 BsonResultDocument = Dict[str, Any]
 UuidRepresentation = Literal[
     "unspecified", "standard", "python_legacy", "java_legacy", "csharp_legacy"
@@ -419,6 +420,7 @@ class Session:
         collection: str,
         filter: Optional[BsonDocument] = None,
         *,
+        projection: Optional[BsonProjection] = None,
         skip: int = 0,
         limit: Optional[int] = None,
         batch_size: int = 101,

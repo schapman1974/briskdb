@@ -4,6 +4,7 @@ from uuid import UUID
 
 from ._briskdb import (
     BsonDocument,
+    BsonProjection,
     CancellationToken,
     CloseReport,
     CheckpointReport,
@@ -187,6 +188,7 @@ class AsyncSession:
         collection: str,
         filter: Optional[BsonDocument] = None,
         *,
+        projection: Optional[BsonProjection] = None,
         skip: int = 0,
         limit: Optional[int] = None,
         batch_size: int = 101,

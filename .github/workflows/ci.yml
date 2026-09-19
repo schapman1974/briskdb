@@ -87,12 +87,12 @@ jobs:
         with:
           shared-key: mongo-matcher-1.85
 
-      - name: Compare Rust matcher with source-locked TinyMongo
+      - name: Compare Rust matcher and projection with source-locked TinyMongo
         env:
           BRISKDB_MONGO_ORACLE_PYTHON: python
         run: >-
           cargo +1.85.0 test --locked --no-default-features --features documents
-          --test document_matcher_oracle -- --ignored --nocapture
+          --test document_matcher_oracle --test document_projection_oracle -- --ignored --nocapture
 
       - name: Generate Mongo parity report
         run: |

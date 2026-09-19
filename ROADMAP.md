@@ -517,7 +517,7 @@ requires an earlier dependency:
       Required CI compares a generated BSON matrix with the locked oracle;
       real sync/async PyMongo and embedded Python tests cover queries/restart.
       Remaining work includes broader dialect/consumer conformance,
-      projection/sort (#172), and write/index/pipeline reuse.
+      sorting/read helpers (#172), and write/index/pipeline reuse.
     - [ ] [#168](https://github.com/schapman1974/briskdb/issues/168) — retained find
       cursors now support global filter/skip/limit paging, empty initial batches,
       byte-bounded pages, getMore, and killCursors. Native Rust/Python cursors are
@@ -527,6 +527,16 @@ requires an earlier dependency:
       retaining SQLite leases. Required tests exercise real sync/async drivers,
       restart, ownership, byte limits, and exhaustion. Metadata and aggregation
       cursor consumers remain open; no cross-batch snapshot is promised.
+    - [ ] [#172](https://github.com/schapman1974/briskdb/issues/172) — basic find
+      projection now shares one Rust transform across embedded and wire APIs.
+      Inclusion/exclusion, nested/dotted paths, array traversal, `_id` rules,
+      field order, and BSON fidelity are retained across cursor batches. Filters
+      use original values and byte budgets use projected output. Eager errors,
+      cancellation, resource bounds, and cursor retention accounting are tested.
+      Required CI compares 4,865 cases against the locked projection oracle;
+      real sync/async drivers and Python APIs cover paging and unchanged storage.
+      Global sorting, distinct, broader wire count helpers, and remaining options
+      still keep this issue open.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.

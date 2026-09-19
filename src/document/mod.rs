@@ -13,6 +13,7 @@ mod matcher;
 mod number;
 mod options;
 mod plan;
+mod projection;
 mod result;
 mod value;
 
@@ -48,6 +49,7 @@ pub use options::{
     MAX_DOCUMENT_BATCH_SIZE, MAX_DOCUMENT_REQUEST_BYTES,
 };
 pub use plan::{DocumentPlan, DocumentPointPlan, DocumentScatterPlan};
+pub use projection::DocumentProjector;
 pub use result::{
     DocumentCursorBatch, DocumentDeleteResult, DocumentExecution, DocumentInsertResult,
     DocumentResult, DocumentResultKind, DocumentUpdateResult, DocumentWriteError,

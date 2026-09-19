@@ -19,9 +19,9 @@ use crate::{
         DocumentContinueCursorRequest, DocumentCreateCollectionRequest, DocumentCursorError,
         DocumentCursorId, DocumentFilter, DocumentFindRequest, DocumentInsertRequest,
         DocumentKillCursorRequest, DocumentListCollectionsRequest, DocumentMatcher,
-        DocumentNamespace, DocumentQueryError, DocumentReadOptions, DocumentRequest,
-        DocumentRequestId, DocumentResult, DocumentWriteOptions,
-        decode_document_batch_with_options, encode_document_with_options,
+        DocumentNamespace, DocumentProjection, DocumentProjector, DocumentQueryError,
+        DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentResult,
+        DocumentWriteOptions, decode_document_batch_with_options, encode_document_with_options,
     },
 };
 
@@ -210,6 +210,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 }
                 "writeConcern" if name == "insert" => valid_write_concern(value),
                 "filter" if name == "find" => matches!(value, BsonValue::Document(_)),
+                "projection" if name == "find" => matches!(value, BsonValue::Document(_)),
                 "limit" | "skip" | "batchSize" if name == "find" => {
                     unsigned(value)?;
                     true
@@ -259,6 +260,18 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 }
             })?;
             let mut options = DocumentReadOptions::new();
+            if let Some(BsonValue::Document(projection)) = request.body.get_first("projection") {
+                DocumentProjector::compile_with_check(projection, &mut || {
+                    if started.elapsed() >= timeout {
+                        Err(EngineError::deadline_exceeded(
+                            "Mongo projection parsing deadline exceeded",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })?;
+                options = options.with_projection(DocumentProjection::new(projection.clone())?);
+            }
             if let Some(value) = request.body.get_first("skip") {
                 options = options.with_skip(unsigned(value)?);
             }

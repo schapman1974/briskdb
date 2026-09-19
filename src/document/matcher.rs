@@ -43,7 +43,7 @@ impl fmt::Display for DocumentQueryError {
 
 impl Error for DocumentQueryError {}
 
-fn query_error(code: i32) -> EngineError {
+pub(super) fn query_error(code: i32) -> EngineError {
     let kind = match code {
         115 => EngineErrorKind::Unsupported,
         14 => EngineErrorKind::TypeMismatch,

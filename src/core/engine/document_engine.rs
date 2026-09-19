@@ -27,8 +27,9 @@ use crate::{
         DocumentCommand, DocumentCursorError, DocumentDeleteResult, DocumentExecution,
         DocumentFilter, DocumentIndexMetadata, DocumentInsertResult, DocumentMatcher,
         DocumentMutationScope, DocumentNamespace, DocumentPlan, DocumentPointPlan,
-        DocumentReadOptions, DocumentRequest, DocumentResult, DocumentScatterPlan,
-        DocumentWriteError, DocumentWriteOptions, MAX_DOCUMENT_REQUEST_BYTES, encode_document,
+        DocumentProjector, DocumentReadOptions, DocumentRequest, DocumentResult,
+        DocumentScatterPlan, DocumentWriteError, DocumentWriteOptions, MAX_DOCUMENT_REQUEST_BYTES,
+        encode_document,
     },
     storage::{
         ConnectionOwner, DocumentStorageRecord, MAX_DOCUMENT_SHARD_SCAN_RECORDS, PooledConnection,
@@ -455,11 +456,22 @@ impl Engine {
                 require_find_options(&options)?;
                 let catalog_storage = storage.clone();
                 let catalog_namespace = namespace.clone();
-                let (collection_id, route) = self
+                let projection = options.projection().cloned();
+                let (collection_id, route, projection) = self
                     .run_document_storage_task(
                         cancellation.clone(),
                         deadline,
                         move |cancellation, control| {
+                            let projection = projection
+                                .as_ref()
+                                .map(|spec| {
+                                    DocumentProjector::compile_with_check(
+                                        spec.document(),
+                                        &mut || ensure_document_cpu_active(cancellation, &control),
+                                    )
+                                    .map(Arc::new)
+                                })
+                                .transpose()?;
                             let collection = catalog_storage.document_collection_controlled(
                                 catalog_namespace.database(),
                                 catalog_namespace.collection(),
@@ -473,7 +485,7 @@ impl Engine {
                                 &control,
                             )?;
                             ensure_document_cpu_active(cancellation, &control)?;
-                            Ok((collection_id, route))
+                            Ok((collection_id, route, projection))
                         },
                     )
                     .await?;
@@ -481,6 +493,7 @@ impl Engine {
                     namespace: namespace.clone(),
                     collection_id,
                     source: route,
+                    projection,
                     after: None,
                     skip: options.skip(),
                     remaining: options.limit(),
@@ -517,10 +530,14 @@ impl Engine {
             DocumentCommand::ContinueCursor(request) => {
                 let (namespace, id, options) = request.into_parts();
                 require_find_options(&options)?;
-                if options.batch_size() == 0 || options.skip() != 0 || options.limit().is_some() {
+                if options.batch_size() == 0
+                    || options.skip() != 0
+                    || options.limit().is_some()
+                    || options.projection().is_some()
+                {
                     return Err(EngineError::new(
                         EngineErrorKind::InvalidArgument,
-                        "cursor continuation requires a positive batch size and cannot change skip/limit",
+                        "cursor continuation requires a positive batch size and cannot change skip/limit/projection",
                     ));
                 }
                 let mut lease = self
@@ -1054,7 +1071,7 @@ impl Engine {
                     .run_document_shard(
                         shard,
                         owner,
-                        cancellation,
+                        cancellation.clone(),
                         deadline,
                         move |storage, connection, cancellation| {
                             let record = storage.get_document_on_connection(
@@ -1070,22 +1087,32 @@ impl Engine {
                     .await?;
                 if let Some(record) = &record {
                     validate_point_record(record, collection_id, shard, &id_key)?;
-                    if state.skip == 0
-                        && state.batch_byte_limit.is_some_and(|limit| {
-                            cursor_page_base_bytes(state, self.shard_count())
-                                + DOCUMENT_RESULT_ROW_BYTES
-                                + DOCUMENT_RESULT_VALUE_BYTES
-                                + record.encoded_len() as u64
-                                > limit
-                        })
-                    {
-                        return Err(limit_exceeded(
-                            "document cannot fit the cursor batch byte limit",
-                        ));
-                    }
                 }
-                let point_options = options.clone().with_skip(state.skip);
-                Ok((apply_point_read(record, &point_options, limits)?, false))
+                let Some(record) = record.filter(|_| state.skip == 0) else {
+                    return Ok((Vec::new(), false));
+                };
+                let (document, encoded_len) = self
+                    .cursor_output_document(
+                        record,
+                        state.projection.clone(),
+                        cancellation,
+                        deadline,
+                    )
+                    .await?;
+                let mut bytes = cursor_page_base_bytes(state, self.shard_count());
+                if state.batch_byte_limit.is_some_and(|limit| {
+                    bytes
+                        + DOCUMENT_RESULT_ROW_BYTES
+                        + DOCUMENT_RESULT_VALUE_BYTES
+                        + encoded_len as u64
+                        > limit
+                }) {
+                    return Err(limit_exceeded(
+                        "document cannot fit the cursor batch byte limit",
+                    ));
+                }
+                add_document_result_budget(&mut bytes, encoded_len, limits)?;
+                Ok((vec![document], false))
             }
             PreparedFilterRoute::Scatter(matcher) => {
                 let matcher = matcher.clone();
@@ -1101,6 +1128,31 @@ impl Engine {
                 .await
             }
         }
+    }
+
+    async fn cursor_output_document(
+        &self,
+        record: DocumentStorageRecord,
+        projection: Option<Arc<DocumentProjector>>,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+    ) -> EngineResult<(BsonDocument, usize)> {
+        let Some(projection) = projection else {
+            let bytes = record.encoded_len();
+            return Ok((record.into_document(), bytes));
+        };
+        self.run_document_storage_task(cancellation, deadline, move |cancellation, control| {
+            let document = projection
+                .project_owned_validated_with_check(record.into_document(), &mut || {
+                    ensure_document_cpu_active(cancellation, &control)
+                })?;
+            let bytes = encode_document(&document)
+                .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?
+                .len();
+            ensure_document_cpu_active(cancellation, &control)?;
+            Ok((document, bytes))
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1195,10 +1247,18 @@ impl Engine {
             if state.skip > 0 {
                 state.skip -= 1;
             } else if u64::try_from(documents.len()).unwrap_or(u64::MAX) < requested {
+                let (document, encoded_len) = self
+                    .cursor_output_document(
+                        record,
+                        state.projection.clone(),
+                        cancellation.clone(),
+                        deadline,
+                    )
+                    .await?;
                 let next_bytes = result_bytes
                     .checked_add(DOCUMENT_RESULT_ROW_BYTES)
                     .and_then(|bytes| bytes.checked_add(DOCUMENT_RESULT_VALUE_BYTES))
-                    .and_then(|bytes| bytes.checked_add(record.encoded_len() as u64))
+                    .and_then(|bytes| bytes.checked_add(encoded_len as u64))
                     .ok_or_else(result_size_overflow)?;
                 if state
                     .batch_byte_limit
@@ -1212,13 +1272,13 @@ impl Engine {
                     has_more = true;
                     break;
                 }
-                add_document_result_budget(&mut result_bytes, record.encoded_len(), limits)?;
+                add_document_result_budget(&mut result_bytes, encoded_len, limits)?;
                 if u64::try_from(documents.len()).unwrap_or(u64::MAX) >= limits.max_rows() {
                     return Err(limit_exceeded(
                         "document result exceeds the request row limit",
                     ));
                 }
-                documents.push(record.into_document());
+                documents.push(document);
                 if let Some(remaining) = &mut state.remaining {
                     *remaining = remaining.saturating_sub(1);
                 }
@@ -1409,11 +1469,6 @@ fn require_delete_options(options: DocumentWriteOptions) -> EngineResult<()> {
 }
 
 fn require_find_options(options: &DocumentReadOptions) -> EngineResult<()> {
-    if options.projection().is_some() {
-        return Err(unsupported(
-            "document projections require the projection semantics milestone",
-        ));
-    }
     if options.sort().is_some() {
         return Err(unsupported(
             "document sort expressions require the query semantics milestone",
@@ -1423,10 +1478,15 @@ fn require_find_options(options: &DocumentReadOptions) -> EngineResult<()> {
 }
 
 fn require_count_options(options: &DocumentReadOptions) -> EngineResult<()> {
-    require_find_options(options)
+    require_catalog_read_options(options)
 }
 
 fn require_catalog_read_options(options: &DocumentReadOptions) -> EngineResult<()> {
+    if options.projection().is_some() {
+        return Err(unsupported(
+            "projection is only supported for document find",
+        ));
+    }
     require_find_options(options)
 }
 
@@ -1708,29 +1768,6 @@ fn next_server_timestamp() -> EngineResult<BsonTimestamp> {
             )
         })?;
     Ok(BsonTimestamp::new((next >> 32) as u32, next as u32))
-}
-
-fn apply_point_read(
-    record: Option<DocumentStorageRecord>,
-    options: &DocumentReadOptions,
-    limits: ResultLimits,
-) -> EngineResult<Vec<BsonDocument>> {
-    let Some(record) = record else {
-        enforce_empty_result_limit(limits)?;
-        return Ok(Vec::new());
-    };
-    if options.skip() > 0 {
-        enforce_empty_result_limit(limits)?;
-        return Ok(Vec::new());
-    }
-    let mut bytes = DOCUMENT_RESULT_ENVELOPE_BYTES;
-    add_document_result_budget(&mut bytes, record.encoded_len(), limits)?;
-    if limits.max_rows() < 1 {
-        return Err(limit_exceeded(
-            "document result exceeds the request row limit",
-        ));
-    }
-    Ok(vec![record.into_document()])
 }
 
 fn apply_count_options(count: u64, options: &DocumentReadOptions) -> u64 {

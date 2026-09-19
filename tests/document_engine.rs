@@ -806,7 +806,13 @@ async fn unsupported_document_semantics_fail_at_the_engine_boundary() {
     assert_eq!(error.kind(), EngineErrorKind::Unsupported);
 
     let projection = DocumentProjection::new(
-        BsonDocument::from_entries([("label", BsonValue::Int32(1))]).unwrap(),
+        BsonDocument::from_entries([(
+            "label",
+            BsonValue::Document(
+                BsonDocument::from_entries([("$slice", BsonValue::Int32(1))]).unwrap(),
+            ),
+        )])
+        .unwrap(),
     )
     .unwrap();
     let error = engine

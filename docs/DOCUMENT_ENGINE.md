@@ -94,6 +94,30 @@ the request's hard `ResultLimits`. A continuation may narrow this byte ceiling,
 but cannot widen it. The alpha API's `DocumentReadOptions::into_parts` now returns
 this sixth component, and `with_batch_size(0)` is valid for initial find.
 
+### Projection
+
+`DocumentReadOptions::with_projection` uses the shared Rust `DocumentProjector`.
+Basic inclusion/exclusion, dotted paths, nested-mapping shorthand, array
+traversal, and explicit `_id` rules follow the source-locked TinyMongo contract.
+Boolean and BSON numeric flags are accepted: zero excludes, nonzero includes.
+An empty document is an identity projection. Conflicting paths and mixed modes
+(except the separate `_id` flag) fail eagerly with payload-free query errors.
+Numeric array-index output paths, positional operators, `$slice`, `$elemMatch`,
+and expression projections are explicitly unsupported.
+
+Filtering uses original values. Projection preserves the surviving fields'
+original order and exact BSON representations without changing stored BSON.
+Returned-byte limits apply after projection, while the original read still obeys
+storage/merge memory bounds. A cursor retains its initial projection and rejects
+attempts to change it on continuation. Compilation is limited to 1 MiB, 4096
+path components, and depth 100; evaluation is bounded to one million traversal
+steps with cancellation/deadline checks in admitted blocking workers. Compiled
+projection state counts against the existing cursor retention quota.
+Required CI compares 4,865 generated BSON projection cases with the locked
+oracle, separately from the full frozen command corpus.
+
+### Matching and writes
+
 The matcher supports dotted paths, missing/null distinctions, numeric BSON
 equivalence, type-bracketed comparisons, array membership, `$eq`, `$ne`, `$gt`,
 `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$nor`, `$not`,
@@ -150,7 +174,7 @@ authorizer before that connection can be reused.
 
 ## Current boundary
 
-Projection, sort, update expressions, replacements,
+Sort, update expressions, replacements,
 multi-document deletion, upsert, distinct, aggregation, metadata/aggregation
 cursors, and physical secondary-index builds remain later roadmap work.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`

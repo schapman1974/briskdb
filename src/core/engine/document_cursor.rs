@@ -11,7 +11,7 @@ use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
     document::{
         CanonicalBsonKey, DocumentCollectionId, DocumentCursorError, DocumentCursorId,
-        DocumentMatcher, DocumentNamespace,
+        DocumentMatcher, DocumentNamespace, DocumentProjector,
     },
     storage::ConnectionOwner,
 };
@@ -34,6 +34,7 @@ pub(super) struct CursorState {
     pub namespace: DocumentNamespace,
     pub collection_id: DocumentCollectionId,
     pub source: CursorSource,
+    pub projection: Option<Arc<DocumentProjector>>,
     pub after: Option<u64>,
     pub skip: u64,
     pub remaining: Option<u64>,
@@ -42,11 +43,17 @@ pub(super) struct CursorState {
 
 impl CursorState {
     fn retained_bytes(&self) -> usize {
-        4096usize.saturating_add(match &self.source {
-            CursorSource::Point { id_key, .. } => id_key.as_bytes().len(),
-            CursorSource::Scatter(Some(matcher)) => matcher.retained_bytes(),
-            CursorSource::Scatter(None) => 0,
-        })
+        4096usize
+            .saturating_add(
+                self.projection
+                    .as_ref()
+                    .map_or(0, |projection| projection.retained_bytes()),
+            )
+            .saturating_add(match &self.source {
+                CursorSource::Point { id_key, .. } => id_key.as_bytes().len(),
+                CursorSource::Scatter(Some(matcher)) => matcher.retained_bytes(),
+                CursorSource::Scatter(None) => 0,
+            })
     }
 }
 
@@ -287,6 +294,7 @@ mod tests {
             namespace: DocumentNamespace::new("app", "items").unwrap(),
             collection_id: DocumentCollectionId::from_validated(1),
             source: CursorSource::Scatter(None),
+            projection: None,
             after: None,
             skip: 0,
             remaining: None,
@@ -348,5 +356,33 @@ mod tests {
         assert_eq!(registry.0.lock().unwrap().entries.len(), 6);
         registry.close();
         assert!(registry.0.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn projection_retention_shares_the_global_cursor_quota() {
+        let registry = Arc::new(CursorRegistry::default());
+        let spec = crate::document::BsonDocument::from_entries([(
+            "x".repeat(512 * 1024),
+            crate::document::BsonValue::Int32(1),
+        )])
+        .unwrap();
+        let projection = Arc::new(DocumentProjector::compile(&spec).unwrap());
+        let mut retained = state();
+        retained.projection = Some(projection.clone());
+        assert!(retained.retained_bytes() > 8 * 1024 * 1024);
+        for owner in 1..=7 {
+            let mut retained = state();
+            retained.projection = Some(projection.clone());
+            registry
+                .insert(ConnectionOwner::new(owner), retained)
+                .unwrap();
+        }
+        assert_eq!(
+            registry
+                .insert(ConnectionOwner::new(8), retained)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::LimitExceeded
+        );
     }
 }

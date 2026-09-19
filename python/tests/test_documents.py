@@ -52,6 +52,41 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_projections_preserve_bson_arrays_order_and_cursor_state(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            database, session = self.open_session(root)
+            documents = [SON([
+                ("before", Int64(index)), ("_id", index),
+                ("items", [{"name": "a", "value": 1}, {"value": 2}, None, [{"name": "b"}]]),
+                ("secret", "filter-me"), ("large", "x" * 5000),
+            ]) for index in range(12)]
+            for document in documents:
+                session.insert_one(DATABASE, COLLECTION, document)
+            batch = session.find(DATABASE, COLLECTION, {"secret": "filter-me"},
+                                 projection={"before": 1, "items.name": 1, "_id": 0},
+                                 batch_size=3, max_result_bytes=600)
+            found = batch["documents"]
+            while not batch["exhausted"]:
+                batch = session.get_more(DATABASE, COLLECTION, batch["cursor_id"], batch_size=3, max_result_bytes=600)
+                found.extend(batch["documents"])
+            expected = [SON([("before", Int64(index)), ("items", [{"name": "a"}, {}, [{"name": "b"}]])]) for index in range(12)]
+            self.assertEqual([bson_bytes(row) for row in found], [bson_bytes(row) for row in expected])
+            for fields in [["before", "before"], ("before",), {"before"}, frozenset({"before"})]:
+                self.assertEqual(session.find(DATABASE, COLLECTION, {"_id": 7}, projection=fields)["documents"], [{"before": Int64(7), "_id": 7}])
+            for fields in [None, {}, []]:
+                actual = session.find(DATABASE, COLLECTION, {"_id": 7}, projection=fields)["documents"][0]
+                self.assertEqual(bson_bytes(actual), bson_bytes(documents[7]))
+            with self.assertRaises(briskdb.InvalidQueryError):
+                session.find(DATABASE, COLLECTION, projection={"before": 1, "secret": 0})
+            with self.assertRaises(briskdb.UnsupportedError):
+                session.find(DATABASE, COLLECTION, projection={"items.0": 1})
+            with self.assertRaises(briskdb.TypeMismatchError):
+                session.find(DATABASE, COLLECTION, projection=[1])
+            with self.assertRaises(briskdb.LimitExceededError):
+                session.find(DATABASE, COLLECTION, projection=["before"] * 4097)
+            session.close()
+            database.close()
+
     def test_retained_cursor_batches_ownership_close_and_kill(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             database, session = self.open_session(root)
@@ -830,6 +865,20 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_projection_is_retained_across_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=4, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for index in range(8):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": index, "value": Int64(index), "hidden": True})
+                    batch = await session.find(DATABASE, COLLECTION, {"hidden": True}, projection={"value": 1, "_id": 0}, batch_size=0)
+                    found = []
+                    while not batch["exhausted"]:
+                        batch = await session.get_more(DATABASE, COLLECTION, batch["cursor_id"], batch_size=2)
+                        found.extend(batch["documents"])
+                    self.assertEqual(found, [{"value": Int64(index)} for index in range(8)])
+
     async def test_async_retained_cursors_forward_batches_and_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=4, documents=True) as database:

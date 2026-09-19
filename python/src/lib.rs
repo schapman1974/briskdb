@@ -16,7 +16,7 @@ use briskdb::document::{
     DocumentCursorId, DocumentDeleteRequest, DocumentFilter, DocumentFindRequest,
     DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
     DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
-    DocumentNamespace, DocumentReadOptions, DocumentRequest, DocumentRequestId,
+    DocumentNamespace, DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId,
     DocumentWriteOptions,
 };
 use briskdb::{
@@ -1568,6 +1568,7 @@ impl Session {
         collection,
         filter = None,
         *,
+        projection = None,
         skip = 0,
         limit = None,
         batch_size = 101,
@@ -1584,6 +1585,7 @@ impl Session {
         database: String,
         collection: String,
         filter: Option<Py<PyAny>>,
+        projection: Option<Py<PyAny>>,
         skip: u64,
         limit: Option<u64>,
         batch_size: u64,
@@ -1595,10 +1597,18 @@ impl Session {
     ) -> PyResult<Py<PyAny>> {
         self.require_document_support()?;
         let filter = document_filter(py, filter.as_ref(), self.shared.uuid_representation)?;
+        let mut options = document_read_options(skip, limit, batch_size)?;
+        if let Some(projection) = projection {
+            options = options.with_projection(document_projection(
+                py,
+                projection.bind(py),
+                self.shared.uuid_representation,
+            )?);
+        }
         let request = DocumentFindRequest::new(
             python_engine_result(DocumentNamespace::new(database, collection))?,
             filter,
-            document_read_options(skip, limit, batch_size)?,
+            options,
         );
         self.execute_document_command(
             py,
@@ -1931,6 +1941,60 @@ fn document_filter(
         )?)),
         None => Ok(DocumentFilter::empty()),
     }
+}
+
+fn document_projection(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    representation: PythonUuidRepresentation,
+) -> PyResult<DocumentProjection> {
+    use briskdb::document::{BsonDocument, BsonValue};
+    use pyo3::types::{PyByteArray, PyBytes, PyString};
+    use std::collections::HashSet;
+
+    let abc = py.import("collections.abc")?;
+    let field_sequence = (value.is_instance(&abc.getattr("Sequence")?)?
+        || value.is_instance(&abc.getattr("Set")?)?)
+        && !value.is_instance_of::<PyString>()
+        && !value.is_instance_of::<PyBytes>()
+        && !value.is_instance_of::<PyByteArray>();
+    let document = if field_sequence {
+        let mut document = BsonDocument::new();
+        let mut names = HashSet::new();
+        let mut bytes = 5usize;
+        for (offset, field) in value.try_iter()?.enumerate() {
+            if offset >= 4096 {
+                return Err(crate::error::limit_exceeded(
+                    "projection field limit exceeded",
+                ));
+            }
+            let field = field?;
+            let field = field
+                .cast::<PyString>()
+                .map_err(|_| crate::error::type_mismatch("projection fields must be strings"))?;
+            if field.len()? > 1024 * 1024 {
+                return Err(crate::error::limit_exceeded(
+                    "projection size limit exceeded",
+                ));
+            }
+            let name = field.to_cow()?;
+            bytes = bytes.saturating_add(name.len()).saturating_add(6);
+            if bytes > 1024 * 1024 {
+                return Err(crate::error::limit_exceeded(
+                    "projection size limit exceeded",
+                ));
+            }
+            if names.insert(name.to_string()) {
+                document
+                    .push(name.as_ref(), BsonValue::Int32(1))
+                    .map_err(|_| crate::error::invalid_value("invalid projection field name"))?;
+            }
+        }
+        document
+    } else {
+        extract_bson_document(py, value, representation)?
+    };
+    python_engine_result(DocumentProjection::new(document))
 }
 
 fn document_read_options(

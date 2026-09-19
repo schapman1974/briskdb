@@ -67,7 +67,10 @@ with `session.kill_cursor(database, collection, cursor_id)`. Cursors belong to
 the creating session and are released on session close. `find(..., batch_size=0)`
 opens an empty initial batch. Pages preserve global natural order, not a snapshot
 under concurrent writes. Request result limits still fail the whole command if
-exceeded. Secondary indexes remain `pending_build`; projection/sort, updates,
+exceeded. Pass `projection={"body": 1, "_id": 0}` or `projection=["body"]` to
+select returned fields; nested/array paths and exclusion are supported without
+mutating stored documents. The projection persists across cursor batches.
+Secondary indexes remain `pending_build`; sort, updates,
 aggregation, and bulk-write Python helpers remain future work.
 
 Pass `shards` when creating a data directory. Later calls may omit it and use

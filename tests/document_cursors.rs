@@ -9,8 +9,8 @@ use briskdb::{
         DocumentContinueCursorRequest, DocumentCreateCollectionRequest, DocumentCursorError,
         DocumentCursorId, DocumentExecution, DocumentFilter, DocumentFindRequest,
         DocumentInsertRequest, DocumentKillCursorRequest, DocumentNamespace, DocumentPlan,
-        DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentResult,
-        DocumentWriteOptions, encode_document,
+        DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId,
+        DocumentResult, DocumentWriteOptions, encode_document,
     },
 };
 
@@ -93,6 +93,127 @@ async fn seed(engine: &Engine, session: &Session, count: i32) {
         ),
     )
     .await;
+}
+
+#[tokio::test]
+async fn projected_cursors_filter_original_values_and_budget_only_returned_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session, 24).await;
+    let projection = DocumentProjection::new(
+        BsonDocument::from_entries([("rank", BsonValue::Int32(1)), ("_id", BsonValue::Int32(0))])
+            .unwrap(),
+    )
+    .unwrap();
+    let filter = DocumentFilter::new(
+        BsonDocument::from_entries([
+            (
+                "rank",
+                BsonValue::Document(
+                    BsonDocument::from_entries([("$gte", BsonValue::Int32(5))]).unwrap(),
+                ),
+            ),
+            ("payload", BsonValue::String("x".repeat(300))),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let first = engine
+        .execute_document(
+            &session,
+            DocumentRequest::new(
+                DocumentRequestId::new([3; 16]).unwrap(),
+                RequestContext::new().with_result_limits(ResultLimits::new(4, 400).unwrap()),
+                DocumentCommand::Find(DocumentFindRequest::new(
+                    namespace(),
+                    filter,
+                    DocumentReadOptions::new()
+                        .with_projection(projection.clone())
+                        .with_skip(2)
+                        .with_limit(13)
+                        .unwrap()
+                        .with_batch_size(4)
+                        .unwrap()
+                        .with_batch_byte_limit(400)
+                        .unwrap(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    let (mut id, mut documents) = cursor(first);
+    let rejected = engine
+        .execute_document(
+            &session,
+            request(DocumentCommand::ContinueCursor(
+                DocumentContinueCursorRequest::new(
+                    namespace(),
+                    id.unwrap(),
+                    DocumentReadOptions::new().with_projection(projection.clone()),
+                ),
+            )),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.kind(), EngineErrorKind::InvalidArgument);
+    while let Some(current) = id {
+        let (next, page) = cursor(call(&engine, &session, more(current, 4)).await);
+        documents.extend(page);
+        id = next;
+    }
+    assert_eq!(documents.len(), 13);
+    for (index, document) in documents.iter().enumerate() {
+        assert_eq!(document.len(), 1);
+        assert_eq!(
+            document.get_first("rank"),
+            Some(&BsonValue::Int32(7 + index as i32))
+        );
+    }
+    let point =
+        DocumentFilter::new(BsonDocument::from_entries([("_id", BsonValue::Int32(7))]).unwrap())
+            .unwrap();
+    let empty = call(
+        &engine,
+        &session,
+        DocumentCommand::Find(DocumentFindRequest::new(
+            namespace(),
+            point.clone(),
+            DocumentReadOptions::new()
+                .with_projection(projection)
+                .with_batch_size(0)
+                .unwrap(),
+        )),
+    )
+    .await;
+    assert!(matches!(empty.plan(), Some(DocumentPlan::Point(_))));
+    let (id, _) = cursor(empty);
+    let projected = call(&engine, &session, more(id.unwrap(), 1)).await;
+    assert!(matches!(projected.plan(), Some(DocumentPlan::Point(_))));
+    assert!(
+        cursor(projected).1[0].representation_eq(
+            &BsonDocument::from_entries([("rank", BsonValue::Int32(7))]).unwrap()
+        )
+    );
+    let full = cursor(
+        call(
+            &engine,
+            &session,
+            DocumentCommand::Find(DocumentFindRequest::new(
+                namespace(),
+                point,
+                DocumentReadOptions::new(),
+            )),
+        )
+        .await,
+    )
+    .1;
+    assert_eq!(full[0].len(), 3);
+    assert_eq!(
+        full[0].get_first("payload"),
+        Some(&BsonValue::String("x".repeat(300)))
+    );
+    engine.shutdown().await.unwrap();
 }
 
 fn assert_missing(error: briskdb::core::EngineError) {
