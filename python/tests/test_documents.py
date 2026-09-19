@@ -68,6 +68,11 @@ class PythonDocumentApiTests(unittest.TestCase):
                     self.assertEqual(session.update_one(DATABASE, COLLECTION, {"tag": "chosen"}, {"$set": {"_id": "chosen"}}, upsert=True)["upserted_id"], "chosen")
                     generated = session.update_many(DATABASE, COLLECTION, {"tag": "generated"}, {"$inc": {"counter": 1}}, upsert=True)
                     self.assertIsInstance(generated["upserted_id"], ObjectId)
+                    for method, identifier in [(session.update_one, Int64(1)), (session.update_many, Int64(2))]:
+                        result = method(DATABASE, COLLECTION, {"_id.a": identifier, "_id.b": {"$eq": None}}, {"$inc": {"counter": 1}}, upsert=True)
+                        self.assertEqual(bson_bytes({"v": result["upserted_id"]}), bson_bytes({"v": {"a": identifier, "b": None}}))
+                        result = method(DATABASE, COLLECTION, {"_id.ignored": {"$gt": 1}, "tag": identifier}, {"$set": {}}, upsert=True)
+                        self.assertIsInstance(result["upserted_id"], ObjectId)
                     large_id = "x" * 1_100_000
                     self.assertEqual(session.update_one(DATABASE, COLLECTION, {"_id": large_id}, {"$inc": {"counter": 1}}, upsert=True, max_result_bytes=16 * 1024 * 1024)["upserted_id"], large_id)
                     before = [bson_bytes(row) for row in session.find(DATABASE, COLLECTION, max_result_bytes=16 * 1024 * 1024)["documents"]]

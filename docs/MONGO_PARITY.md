@@ -336,7 +336,8 @@ Operator upserts for both one/many statements derive a seed from positive direct
 and `$eq` equalities, including `$and`, literal embedded documents and dotted
 object paths, then run the operators before generating any missing ID. Query-bound
 IDs remain immutable; the update can supply an unbound ID. Duplicate/overlapping
-equalities and positive dotted IDs fail with indexed code 54 before insertion.
+equalities fail with indexed code 54 before insertion. Dotted `_id` equalities
+can seed an embedded ID; non-equality ID predicates do not supply values.
 Range/regex/negation/alternative predicates do not supply values; singleton
 `$in`/`$all` and other logical simplifications are not inferred. Query-seeded and
 operator-assigned zero timestamps remain literal. Metadata, aggregate reply limits,

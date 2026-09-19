@@ -44,6 +44,13 @@ def operator_upsert_smoke(uri):
             assert (result.matched_count, result.modified_count, result.did_upsert) == (1, 1, False)
         assert collection.update_one({"tag": "chosen"}, {"$set": {"_id": "chosen"}}, upsert=True).upserted_id == "chosen"
         assert isinstance(collection.update_many({"tag": "generated"}, {"$inc": {"counter": 1}}, upsert=True).upserted_id, ObjectId)
+        dotted = client.wire_operator_upsert.dotted
+        for method, identifier in [(dotted.update_one, Int64(1)), (dotted.update_many, Int64(2))]:
+            result = method({"_id.a": identifier, "_id.b": {"$eq": None}}, {"$inc": {"counter": 1}}, upsert=True)
+            assert BSON.encode({"v": result.upserted_id}) == BSON.encode({"v": {"a": identifier, "b": None}})
+            assert dotted.find_one({"_id": result.upserted_id}) == {"_id": result.upserted_id, "counter": 1}
+            result = method({"_id.ignored": {"$gt": 1}, "tag": identifier}, {"$set": {}}, upsert=True)
+            assert isinstance(result.upserted_id, ObjectId)
         for multi in [False, True]:
             for ordered in [True, False]:
                 batch = client.wire_operator_upsert[f"batch_{multi}_{ordered}"]

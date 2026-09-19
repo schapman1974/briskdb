@@ -55,9 +55,6 @@ fn collect_equalities<'a>(
             Clause::Field {
                 path, predicates, ..
             } => {
-                if path.first().is_some_and(|part| part == "_id") && path.len() > 1 {
-                    return Err(query_error(54));
-                }
                 for predicate in predicates {
                     check()?;
                     if let Predicate::Equal(value) = predicate {
@@ -135,10 +132,29 @@ mod tests {
             ("literal", BsonValue::Document(literal)),
             ("equal", BsonValue::Int32(4)),
         ])));
+        let query = doc([
+            ("_id.a", BsonValue::Int64(7)),
+            (
+                "_id.b",
+                BsonValue::Document(doc([("$eq", BsonValue::Null)])),
+            ),
+            (
+                "_id.ignored",
+                BsonValue::Document(doc([("$gt", BsonValue::Int32(1))])),
+            ),
+        ]);
+        let seed = DocumentMatcher::compile(&query)
+            .unwrap()
+            .upsert_seed_with_check(&mut || Ok(()))
+            .unwrap();
+        assert!(seed.representation_eq(&doc([(
+            "_id",
+            BsonValue::Document(doc([("a", BsonValue::Int64(7)), ("b", BsonValue::Null),]))
+        )])));
     }
 
     #[test]
-    fn upsert_seed_rejects_conflicting_equalities_dotted_ids_and_cancellation() {
+    fn upsert_seed_rejects_conflicting_equalities_and_cancellation() {
         for query in [
             doc([("a", BsonValue::Int32(1)), ("a.b", BsonValue::Int32(2))]),
             doc([(
@@ -148,7 +164,10 @@ mod tests {
                     BsonValue::Document(doc([("a", BsonValue::Int32(1))])),
                 ]),
             )]),
-            doc([("_id.part", BsonValue::Int32(1))]),
+            doc([
+                ("_id", BsonValue::Int32(1)),
+                ("_id.part", BsonValue::Int32(1)),
+            ]),
         ] {
             let error = DocumentMatcher::compile(&query)
                 .unwrap()

@@ -346,7 +346,8 @@ across shards. Find-and-modify upserts remain unsupported.
 search derives a seed from positive direct/`$eq` equality clauses, including
 literal embedded documents and nested `$and` clauses. Dotted object paths use
 the same bounded, strict path rules as updates. Duplicate/overlapping equality
-paths or positive dotted `_id` paths fail with code 54 (`NotSingleValueField`).
+paths fail with code 54 (`NotSingleValueField`). Dotted `_id` equalities can seed
+an embedded identifier; non-equality ID predicates supply no seed values.
 Ranges, regex predicates, negations, and alternatives are not copied; advanced
 logical simplifications such as singleton `$in`/`$all` are not inferred.
 Inference only runs after no match; it does not reject an otherwise valid
