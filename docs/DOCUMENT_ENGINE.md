@@ -53,7 +53,7 @@ example.
 
 ## Implemented commands
 
-This first engine slice executes:
+The current engine executes:
 
 | Command | Current behavior |
 | --- | --- |
@@ -62,17 +62,38 @@ This first engine slice executes:
 | `CreateIndex` | Declares index metadata and returns its name; non-built-in indexes remain pending until physical index work lands |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
-| `Find` | Supports an empty filter or an exact top-level `{_id: value}` filter and returns one exhausted cursor batch |
-| `Count` | Supports an empty filter or an exact top-level `{_id: value}` filter |
+| `Find` | Evaluates BSON match expressions and returns one exhausted cursor batch |
+| `Count` | Evaluates the same match expressions, then applies global skip/limit |
 | `Delete` | Deletes one document selected by exact `_id` |
 
-An exact `_id` filter produces a `DocumentPlan::Point` with one collection and
-one physical shard. An empty filter produces a deterministic
-`DocumentPlan::Scatter` over every shard. Scatter reads merge by the durable
+An exact `_id` filter, including `{_id: {$eq: value}}`, produces a
+`DocumentPlan::Point` with one collection and one physical shard. Other filters
+produce a deterministic `DocumentPlan::Scatter` over every shard. The shared
+Rust matcher runs before scatter reads merge by the durable
 cross-shard natural-order value, so insertion order remains stable across
 restarts. `skip`, `limit`, and `batch_size` are applied after that merge. A
 result that would require cursor continuation currently fails unless the caller
 uses a limit that fits in one batch.
+
+The matcher supports dotted paths, missing/null distinctions, numeric BSON
+equivalence, type-bracketed comparisons, array membership, `$eq`, `$ne`, `$gt`,
+`$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$nor`, `$not`,
+`$all`, `$elemMatch`, `$size`, `$type`, `$mod`, and bounded regex predicates with
+`i/m/s/x/u` options. Logical branches are validated eagerly. Regex predicates
+are distinct from literal regex equality; ordinary backreferences and lookarounds
+are supported, with a backtracking budget. Python-style final-newline anchors,
+Unicode word/space classes, and dotted/dotless-I case folding are normalized.
+Engine-specific regex recursion/control verbs are rejected. Broader regex
+dialect conformance remains part of #167, not a claim of complete PCRE support.
+Following the frozen TinyMongo contract, `$type: "int"` includes Int64 values
+within the Int32 range; stored/returned BSON still preserves the Int64 tag.
+
+Compilation limits queries to 1 MiB, 4096 nodes, 100 levels, and 32 regexes of
+at most 4096 bytes each. Per-document execution limits path candidates and
+evaluation steps, checks cancellation/deadlines, and executes only inside
+admitted blocking workers. The matcher is authoritative; no SQL prefilter is
+used in this slice. Required CI compares a generated BSON matrix against the
+source-locked TinyMongo oracle without adding a production Python dependency.
 
 The engine preserves BSON field order and exact BSON representations in stored
 and returned documents. It accounts returned rows and encoded BSON bytes
@@ -110,7 +131,7 @@ authorizer before that connection can be reused.
 
 ## Current boundary
 
-General match expressions, projection, sort, update expressions, replacements,
+Projection, sort, update expressions, replacements,
 multi-document deletion, upsert, distinct, aggregation, retained
 cursors, and physical secondary-index builds remain later roadmap work.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`

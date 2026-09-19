@@ -742,9 +742,10 @@ async fn unsupported_document_semantics_fail_at_the_engine_boundary() {
     let session = engine.session();
     create_collection(&engine, &session, 40).await;
 
-    let general_filter =
-        DocumentFilter::new(BsonDocument::from_entries([("label", BsonValue::from("a"))]).unwrap())
-            .unwrap();
+    let general_filter = DocumentFilter::new(
+        BsonDocument::from_entries([("$where", BsonValue::from("a"))]).unwrap(),
+    )
+    .unwrap();
     let error = engine
         .execute_document(
             &session,
@@ -766,7 +767,7 @@ async fn unsupported_document_semantics_fail_at_the_engine_boundary() {
         BsonDocument::from_entries([(
             "_id",
             BsonValue::Document(
-                BsonDocument::from_entries([("$eq", BsonValue::Int32(1))]).unwrap(),
+                BsonDocument::from_entries([("$bitsAllSet", BsonValue::Int32(1))]).unwrap(),
             ),
         )])
         .unwrap(),
@@ -1052,6 +1053,141 @@ async fn insert_normalizes_missing_ids_and_only_direct_zero_timestamps() {
     assert_eq!(first.get_first("nested"), source.get_first("nested"));
     assert_eq!(first.get_first("array"), source.get_first("array"));
     assert_ne!(rows.documents()[2].get_first("stamp"), Some(&zero));
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn matcher_filters_before_global_pagination_and_count_and_reopens() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 4).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    insert(
+        &engine,
+        &session,
+        2,
+        (0..24)
+            .map(|number| {
+                BsonDocument::from_entries([
+                    ("_id", BsonValue::Int32(number)),
+                    ("rank", BsonValue::Int32(number)),
+                ])
+                .unwrap()
+            })
+            .collect(),
+    )
+    .await;
+    let filter = DocumentFilter::new(
+        BsonDocument::from_entries([(
+            "rank",
+            BsonValue::Document(
+                BsonDocument::from_entries([("$gte", BsonValue::Int32(12))]).unwrap(),
+            ),
+        )])
+        .unwrap(),
+    )
+    .unwrap();
+    let options = DocumentReadOptions::new()
+        .with_skip(3)
+        .with_limit(4)
+        .unwrap()
+        .with_batch_size(4)
+        .unwrap();
+    let found = engine
+        .execute_document(
+            &session,
+            request(
+                3,
+                RequestContext::new(),
+                DocumentCommand::Find(DocumentFindRequest::new(
+                    namespace(),
+                    filter.clone(),
+                    options.clone(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    let Some(DocumentPlan::Scatter(plan)) = found.plan() else {
+        panic!("expected scatter");
+    };
+    assert_eq!(plan.shards(), &[0, 1, 2, 3]);
+    let DocumentResult::Cursor(batch) = found.result() else {
+        panic!("expected cursor");
+    };
+    let ids: Vec<_> = batch
+        .documents()
+        .iter()
+        .map(|doc| doc.get_first("_id").unwrap().clone())
+        .collect();
+    assert_eq!(ids, (15..19).map(BsonValue::Int32).collect::<Vec<_>>());
+    let count = engine
+        .execute_document(
+            &session,
+            request(
+                4,
+                RequestContext::new(),
+                DocumentCommand::Count(DocumentCountRequest::new(
+                    namespace(),
+                    filter.clone(),
+                    options,
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(count.result(), DocumentResult::Count(4)));
+    let point_filter = DocumentFilter::new(
+        BsonDocument::from_entries([(
+            "_id",
+            BsonValue::Document(
+                BsonDocument::from_entries([("$eq", BsonValue::Double(7.0))]).unwrap(),
+            ),
+        )])
+        .unwrap(),
+    )
+    .unwrap();
+    let point = engine
+        .execute_document(
+            &session,
+            request(
+                5,
+                RequestContext::new(),
+                DocumentCommand::Find(DocumentFindRequest::new(
+                    namespace(),
+                    point_filter,
+                    DocumentReadOptions::new(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(point.plan(), Some(DocumentPlan::Point(_))));
+    let DocumentResult::Cursor(batch) = point.result() else {
+        panic!("expected cursor");
+    };
+    assert_eq!(
+        batch.documents()[0].get_first("_id"),
+        Some(&BsonValue::Int32(7))
+    );
+    engine.shutdown().await.unwrap();
+    let engine = Engine::open(temp.path(), 4).await.unwrap();
+    let count = engine
+        .execute_document(
+            &engine.session(),
+            request(
+                6,
+                RequestContext::new(),
+                DocumentCommand::Count(DocumentCountRequest::new(
+                    namespace(),
+                    filter,
+                    DocumentReadOptions::new(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(count.result(), DocumentResult::Count(12)));
     engine.shutdown().await.unwrap();
 }
 

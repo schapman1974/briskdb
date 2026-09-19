@@ -1,6 +1,9 @@
 //! Mongo command translation over the shared, host-enabled document engine.
 
-use std::time::{Duration, Instant};
+use std::{
+    error::Error,
+    time::{Duration, Instant},
+};
 
 use tokio::sync::Mutex;
 
@@ -11,9 +14,10 @@ use crate::{
     document::{
         BsonCodecOptions, BsonDocument, BsonValue, DocumentCollectionOptions, DocumentCommand,
         DocumentCreateCollectionRequest, DocumentFilter, DocumentFindRequest,
-        DocumentInsertRequest, DocumentListCollectionsRequest, DocumentNamespace,
-        DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentResult,
-        DocumentWriteOptions, decode_document_batch_with_options, encode_document_with_options,
+        DocumentInsertRequest, DocumentListCollectionsRequest, DocumentMatcher, DocumentNamespace,
+        DocumentQueryError, DocumentReadOptions, DocumentRequest, DocumentRequestId,
+        DocumentResult, DocumentWriteOptions, decode_document_batch_with_options,
+        encode_document_with_options,
     },
 };
 
@@ -75,6 +79,20 @@ impl CommandError {
 
 impl From<EngineError> for CommandError {
     fn from(error: EngineError) -> Self {
+        let mut source = error.source();
+        while let Some(cause) = source {
+            if let Some(query) = cause.downcast_ref::<DocumentQueryError>() {
+                let code = query.mongo_code();
+                let name = match code {
+                    14 => "TypeMismatch",
+                    9 => "FailedToParse",
+                    115 => "CommandNotSupported",
+                    _ => "BadValue",
+                };
+                return Self::new(code, name, "invalid or unsupported document query");
+            }
+            source = cause.source();
+        }
         // Diagnostics can contain SQL, paths, and BSON. Only fixed mappings
         // cross the protocol boundary.
         let (code, name, message) = match error.kind() {
@@ -182,20 +200,14 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             if !request.sequences.is_empty() {
                 return Err(CommandError::options());
             }
-            let Some(BsonValue::Document(filter)) = request.body.get_first("filter") else {
-                return Err(CommandError::unsupported());
+            let filter = match request.body.get_first("filter") {
+                Some(BsonValue::Document(filter)) => filter.clone(),
+                None => BsonDocument::new(),
+                _ => return Err(CommandError::invalid()),
             };
-            // Restrict this checkpoint to point reads, including on a missing
-            // collection. Never quietly treat an unsupported filter as empty.
-            let Some(id) = filter.get_first("_id") else {
-                return Err(CommandError::unsupported());
-            };
-            if filter.len() != 1
-                || matches!(id, BsonValue::RegularExpression(_))
-                || matches!(id, BsonValue::Document(doc) if doc.iter().any(|(key, _)| key.starts_with('$')))
-            {
-                return Err(CommandError::unsupported());
-            }
+            // Validate before missing-collection handling or storage admission.
+            // The shared engine compiles the same authoritative matcher.
+            DocumentMatcher::compile(&filter)?;
             let mut options = DocumentReadOptions::new();
             if let Some(value) = request.body.get_first("skip") {
                 options = options.with_skip(unsigned(value)?);
@@ -213,9 +225,20 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 }
                 options = options.with_batch_size(size)?;
             }
+            if matches!(
+                request.body.get_first("singleBatch"),
+                Some(BsonValue::Boolean(true))
+            ) {
+                options = options.clone().with_limit(
+                    options
+                        .limit()
+                        .unwrap_or(u64::MAX)
+                        .min(options.batch_size()),
+                )?;
+            }
             Command::Find(DocumentFindRequest::new(
                 namespace,
-                DocumentFilter::new(filter.clone())?,
+                DocumentFilter::new(filter)?,
                 options,
             ))
         };

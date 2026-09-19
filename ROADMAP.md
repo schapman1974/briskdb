@@ -499,7 +499,7 @@ requires an earlier dependency:
       a zero-ID cursor. Tests cover BSON fidelity, numeric-equivalent IDs,
       cross-interface access, restart, host enablement, one-way writes, and
       response limits. Missing collections read empty without creating metadata.
-      Updates/deletes, retained cursors, general queries, and full collection
+      Updates/deletes, retained cursors, and full collection
       lifecycle remain open.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
@@ -509,6 +509,15 @@ requires an earlier dependency:
       writes, with no cross-shard atomicity promise. Tests cover BSON types,
       direct zero-timestamp normalization, raw server-generated IDs, restart,
       concurrent duplicates, driver batch splitting, and boundary rejection.
+    - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
+      BSON matcher now powers embedded find/count and wire find. Includes dotted
+      paths, missing/null behavior, array/logical/comparison operators, type/mod,
+      bounded regex evaluation, eager validation, and cancellation. Filtering
+      precedes global pagination; exact `$eq` IDs retain point routing (#180).
+      Required CI compares a generated BSON matrix with the locked oracle;
+      real sync/async PyMongo and embedded Python tests cover queries/restart.
+      Remaining work includes broader dialect/consumer conformance, retained
+      cursors (#168), projection/sort (#172), and write/index/pipeline reuse.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.
