@@ -755,6 +755,21 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
         matches!(reply.get_first("code"), Some(BsonValue::Int32(10334))),
         "{reply:?}"
     );
+    let mut projected = find_command("items", BsonValue::from("large"));
+    projected
+        .push(
+            "projection",
+            BsonValue::Document(
+                BsonDocument::from_entries([("_id", BsonValue::Int32(1))]).unwrap(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        first_batch(&send_command(&mut stream, &projected).await),
+        &[BsonValue::Document(
+            BsonDocument::from_entries([("_id", BsonValue::from("large"))]).unwrap()
+        ),]
+    );
     let tail = BsonDocument::from_entries([("_id", BsonValue::from("tail"))]).unwrap();
     send_command(&mut stream, &insert_command("items", tail)).await;
     let id = live_cursor_id(&send_command(&mut stream, &cursor_find("items", 1)).await);

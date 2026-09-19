@@ -155,8 +155,8 @@ The two enablement checks fail closed:
   `FailedPrecondition` before submitting the request to the engine.
 
 Enabling the facade does not expand the engine's supported Mongo semantics.
-Shared BSON matching and retained find cursors use this same boundary. Updates,
-replacements, aggregation, distinct, and projection/sort remain `Unsupported`
+Shared BSON matching, basic projection, and retained find cursors use this same boundary. Updates,
+replacements, aggregation, distinct, and sorting remain `Unsupported`
 as described by the [engine contract](DOCUMENT_ENGINE.md). A separate opt-in
 loopback MongoDB listener is available through the `mongo` feature; embedded
 commands do not start it.

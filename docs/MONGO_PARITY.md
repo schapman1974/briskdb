@@ -63,6 +63,7 @@ before storage admission. The current option contract is:
 | `writeConcern` | Omitted/empty, or `w` equal to 0 or 1, `j: false`, and `wtimeout: 0`; no replication or stronger durability is promised |
 | `bypassDocumentValidation` | Only `false` |
 | Find `skip` / `limit` | Nonnegative integers; zero limit means no additional limit |
+| Find `projection` | Basic inclusion/exclusion document, dotted/nested paths, arrays, and `_id` rules; validated before missing-collection handling |
 | Find `batchSize` | Integer from 0 through 1000; zero opens an empty initial batch. Default 101. |
 | `getMore` `batchSize` | Integer from 1 through 1000; default 101. Pages also end at the wire byte budget. |
 | Find `singleBatch` | Boolean; `true` intentionally returns only the first batch, with cursor ID zero |
@@ -87,7 +88,15 @@ bounded to 15 seconds. Exhaustion returns ID zero; stale or wrong-namespace IDs
 return code 43. Simultaneous use returns code 237. No SQLite lease is held between
 batches, and no cross-batch snapshot is promised under concurrent writes.
 
-Projection, sorting, updates, deletes, and metadata/aggregation cursors
+Projection uses the shared engine transform after filtering; projected fields
+retain BSON types and stored field order. The same projection persists across
+getMore batches. Path collisions, mixed modes, and unsupported operators fail
+explicitly; numeric array-index and positional output paths are not supported.
+Wire byte limits apply to returned documents after projection. Required CI adds
+4,865 projection comparisons against the source-locked oracle and real-driver
+checks for nested arrays, continuation, unchanged storage, and restart.
+
+Sorting, updates, deletes, and metadata/aggregation cursors
 are not implemented by this checkpoint.
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required
