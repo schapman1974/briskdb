@@ -5,10 +5,10 @@ use briskdb::{
     document::{
         BsonDocument, BsonTimestamp, BsonValue, DocumentCollectionOptions, DocumentCommand,
         DocumentCreateCollectionRequest, DocumentFilter, DocumentFindOneAndReplaceRequest,
-        DocumentFindRequest, DocumentInsertRequest, DocumentMutationError, DocumentNamespace,
-        DocumentPlan, DocumentProjection, DocumentReadOptions, DocumentReplaceRequest,
-        DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort, DocumentWriteOptions,
-        encode_document,
+        DocumentFindRequest, DocumentInsertRequest, DocumentMutationError, DocumentMutationScope,
+        DocumentNamespace, DocumentPlan, DocumentProjection, DocumentReadOptions,
+        DocumentReplaceRequest, DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort,
+        DocumentUpdate, DocumentUpdateRequest, DocumentWriteOptions, encode_document,
     },
 };
 use rusqlite::{Connection, TransactionBehavior};
@@ -23,6 +23,260 @@ fn doc<const N: usize>(fields: [(&str, BsonValue); N]) -> BsonDocument {
 }
 fn ns() -> DocumentNamespace {
     DocumentNamespace::new("app", "items").unwrap()
+}
+
+fn update(filter: BsonDocument, expression: BsonDocument) -> DocumentUpdateRequest {
+    DocumentUpdateRequest::new(
+        ns(),
+        DocumentFilter::new(filter).unwrap(),
+        DocumentUpdate::new(expression).unwrap(),
+        DocumentMutationScope::One,
+        DocumentWriteOptions::new(),
+    )
+}
+
+fn set(fields: BsonDocument) -> BsonDocument {
+    doc([("$set", BsonValue::Document(fields))])
+}
+
+async fn update_counts(
+    engine: &Engine,
+    session: &Session,
+    filter: BsonDocument,
+    expression: BsonDocument,
+) -> (u64, u64) {
+    let result = engine
+        .execute_document(
+            session,
+            request(
+                DocumentCommand::Update(update(filter, expression)),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    let DocumentResult::Update(result) = result.into_parts().2 else {
+        panic!("update result")
+    };
+    assert!(result.upserted_id().is_none());
+    (result.matched_count(), result.modified_count())
+}
+
+#[tokio::test]
+async fn operator_updates_keep_fields_order_identity_and_literal_timestamps_across_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let expression = set(doc([
+        ("group", BsonValue::Int64(0)),
+        ("nested.0.value", BsonValue::from("$literal")),
+        ("stamp", BsonValue::Timestamp(BsonTimestamp::new(0, 0))),
+    ]));
+    assert_eq!(
+        update_counts(
+            &engine,
+            &session,
+            doc([("done", BsonValue::Boolean(false))]),
+            expression.clone()
+        )
+        .await,
+        (1, 1)
+    );
+    assert_eq!(
+        update_counts(
+            &engine,
+            &session,
+            doc([("_id", BsonValue::Double(0.0))]),
+            expression
+        )
+        .await,
+        (1, 0)
+    );
+    assert_eq!(
+        update_counts(
+            &engine,
+            &session,
+            doc([("_id", BsonValue::Int32(-1))]),
+            set(BsonDocument::new())
+        )
+        .await,
+        (0, 0)
+    );
+    let current = rows(&engine, &session).await;
+    assert_eq!(
+        current[0].iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        ["_id", "group", "done", "nested", "stamp"]
+    );
+    assert!(matches!(
+        current[0].get_first("group"),
+        Some(BsonValue::Int64(0))
+    ));
+    assert_eq!(
+        current[0].get_first("stamp"),
+        Some(&BsonValue::Timestamp(BsonTimestamp::new(0, 0)))
+    );
+    assert_eq!(
+        update_counts(
+            &engine,
+            &session,
+            doc([("_id", BsonValue::Int32(0))]),
+            doc([(
+                "$unset",
+                BsonValue::Document(doc([("nested.0.value", BsonValue::Null)]))
+            )])
+        )
+        .await,
+        (1, 1)
+    );
+    let expected = rows(&engine, &session).await;
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(rows(&engine, &engine.session()).await, expected);
+}
+
+#[tokio::test]
+async fn operator_failures_and_result_limits_precede_all_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let before = rows(&engine, &session).await;
+    let expressions = [
+        set(doc([
+            ("new", BsonValue::Int32(1)),
+            ("group.x", BsonValue::Null),
+        ])),
+        set(doc([
+            ("new", BsonValue::Int32(1)),
+            ("_id", BsonValue::Int32(-1)),
+        ])),
+        set(doc([("a", BsonValue::Null), ("a.b", BsonValue::Null)])),
+        doc([(
+            "$unset",
+            BsonValue::Document(doc([("_id", BsonValue::Null)])),
+        )]),
+    ];
+    for expression in expressions {
+        for filter in [BsonDocument::new(), doc([("_id", BsonValue::Int32(0))])] {
+            assert!(
+                engine
+                    .execute_document(
+                        &session,
+                        request(
+                            DocumentCommand::Update(update(filter, expression.clone())),
+                            RequestContext::new()
+                        )
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(rows(&engine, &session).await, before);
+        }
+    }
+    let expression = set(doc([("x", BsonValue::from("x".repeat(256)))]));
+    let capped = update(BsonDocument::new(), expression.clone())
+        .with_max_document_bytes(128)
+        .unwrap();
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(DocumentCommand::Update(capped), RequestContext::new())
+            )
+            .await
+            .is_err()
+    );
+    let context = RequestContext::new().with_result_limits(ResultLimits::new(1, 1).unwrap());
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    DocumentCommand::Update(update(BsonDocument::new(), expression)),
+                    context
+                )
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(rows(&engine, &session).await, before);
+    // Invalid syntax is checked even when the filter matches no documents.
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    DocumentCommand::Update(update(
+                        doc([("_id", BsonValue::Int32(-1))]),
+                        set(doc([("a", BsonValue::Null), ("a.b", BsonValue::Null)]))
+                    )),
+                    RequestContext::new()
+                )
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_operator_updates_reselect_and_do_not_lose_unrelated_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(root.path(), 4).await.unwrap());
+    seed(&engine, &engine.session()).await;
+    let mut tasks = Vec::new();
+    for index in 0..24 {
+        let engine = Arc::clone(&engine);
+        tasks.push(tokio::spawn(async move {
+            let field = format!("field{index}");
+            update_counts(
+                &engine,
+                &engine.session(),
+                doc([("_id", BsonValue::Int32(0))]),
+                set(doc([(&field, BsonValue::Int32(index))])),
+            )
+            .await
+        }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.unwrap(), (1, 1));
+    }
+    let current = rows(&engine, &engine.session()).await;
+    for index in 0..24 {
+        assert_eq!(
+            current[0].get_first(&format!("field{index}")),
+            Some(&BsonValue::Int32(index))
+        );
+    }
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let engine = Arc::clone(&engine);
+        tasks.push(tokio::spawn(async move {
+            let session = engine.session();
+            let mut total = 0;
+            loop {
+                let (matched, modified) = update_counts(
+                    &engine,
+                    &session,
+                    doc([("done", BsonValue::Boolean(false))]),
+                    set(doc([("done", BsonValue::Boolean(true))])),
+                )
+                .await;
+                assert_eq!(matched, modified);
+                if matched == 0 {
+                    return total;
+                }
+                total += modified;
+            }
+        }));
+    }
+    let mut total = 0;
+    for task in tasks {
+        total += task.await.unwrap();
+    }
+    assert_eq!(total, 24);
 }
 fn request(command: DocumentCommand, context: RequestContext) -> DocumentRequest {
     DocumentRequest::new(DocumentRequestId::new([1; 16]).unwrap(), context, command)
@@ -837,6 +1091,10 @@ async fn replacement_write_lock_deadline_leaves_documents_and_session_usable() {
         })
         .collect::<Vec<_>>();
     for command in [
+        DocumentCommand::Update(update(
+            BsonDocument::new(),
+            set(doc([("done", BsonValue::Boolean(true))])),
+        )),
         DocumentCommand::Replace(replace(BsonDocument::new(), BsonDocument::new())),
         find_replace(
             BsonDocument::new(),

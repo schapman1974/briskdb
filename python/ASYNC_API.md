@@ -95,8 +95,10 @@ async with await briskdb.open_async("./data", shards=4, documents=True) as db:
 
 `AsyncSession` includes create/list collection and index calls plus
 `insert_one`, `find`, `count_documents`, `delete_one`, `delete_many`, and
-`find_one_and_delete`, `replace_one`, and `find_one_and_replace` (without upsert).
-The latter forwards projection, sort, and `return_document` before/after selection.
+`find_one_and_delete`, `replace_one`, `find_one_and_replace`, and `update_one`
+(without upsert). `find_one_and_replace` forwards projection, sort, and
+`return_document` before/after selection. `update_one` supports `$set`/`$unset`
+and forwards the same identity, deadline, cancellation, and result controls.
 They use the same
 request IDs, deadlines, cancellation tokens, result limits, BSON conversion,
 and point/scatter plans as their synchronous `Session` methods.

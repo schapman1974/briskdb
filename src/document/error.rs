@@ -59,7 +59,7 @@ impl DocumentMutationError {
 impl fmt::Display for DocumentMutationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::ImmutableId => "document replacement cannot change the semantic _id",
+            Self::ImmutableId => "document mutation cannot change the semantic _id",
             Self::InvalidReplacement => "replacement must not contain top-level update operators",
         })
     }

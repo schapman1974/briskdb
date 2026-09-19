@@ -927,7 +927,18 @@ impl Engine {
                 )
                 .await
             }
-            DocumentCommand::Update(_) | DocumentCommand::DropIndex(_) => Err(unsupported(
+            DocumentCommand::Update(request) => {
+                self.run_document_update(
+                    owner,
+                    request_id,
+                    request,
+                    cancellation,
+                    deadline,
+                    result_limits,
+                )
+                .await
+            }
+            DocumentCommand::DropIndex(_) => Err(unsupported(
                 "this document command is modeled but requires a later document-semantics milestone",
             )),
             DocumentCommand::CreateCollection(_)
