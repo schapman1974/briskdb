@@ -139,6 +139,8 @@ Generation validates input BSON and has independent per-call limits: 16,384 keys
 8 MiB conservative charge per scalar/scope, 64 MiB cumulative work/retention charge,
 and one million traversal/work steps. Duplicate values still consume work. Shared
 scalar allocations avoid copying a large compound component into every tuple.
+Expanded tuple bytes are still charged, so sharing cannot hide excessive future
+hashing or persistence work for a large scalar paired with an array.
 Partial definitions are bounded to 1 MiB and 4,096 validation nodes, in addition
 to the matcher's own limits. Controlled entry points honor interruption during
 compilation, membership, traversal, deduplication and tuple assembly. Errors return

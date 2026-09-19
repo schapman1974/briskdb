@@ -176,6 +176,24 @@ impl DocumentIndexKeyGenerator {
             components.push(values);
         }
         let mut output = Vec::new();
+        // Arc sharing bounds allocations, but consumers must eventually hash or
+        // persist every full tuple. Charge expanded key bytes as well: a large
+        // scalar paired with a multikey array must not amplify into gigabytes.
+        for values in &components {
+            let mut bytes = 0_usize;
+            for value in values {
+                budget.step()?;
+                let size = match value.as_ref() {
+                    Component::EmptyArray => 1,
+                    Component::Value(key) => key.as_bytes().len() + 8,
+                };
+                bytes = bytes.checked_add(size).ok_or_else(limit)?;
+            }
+            if values.len() == 1 {
+                bytes = bytes.checked_mul(key_count).ok_or_else(limit)?;
+            }
+            budget.charge(bytes)?;
+        }
         // Charge tuple vectors and Arc cells before allocating. Scalar key
         // bytes are shared across tuples and already charged by component_keys.
         budget.charge(key_count * (128 + self.paths.len() * 32))?;
@@ -748,5 +766,28 @@ mod tests {
         )])));
         let error = DocumentIndexKeyGenerator::compile(&keys, false, Some(&invalid)).unwrap_err();
         assert!(!format!("{error:?}").contains("private-invalid-type"));
+    }
+
+    #[test]
+    fn compound_fanout_is_bounded_even_when_scalar_allocations_are_shared() {
+        let keys = doc([("v", BsonValue::Int32(1)), ("w", BsonValue::Int32(1))]);
+        let compiled = DocumentIndexKeyGenerator::compile(&keys, false, None).unwrap();
+        let make_input = |count| {
+            doc([
+                ("v", BsonValue::String("private".repeat(10_000))),
+                (
+                    "w",
+                    BsonValue::Array((0..count).map(BsonValue::Int32).collect()),
+                ),
+            ])
+        };
+        assert_eq!(compiled.keys(&make_input(4)).unwrap().len(), 4);
+        let input = make_input(1024);
+        assert!(encode_document(&input).unwrap().len() < 100_000);
+        assert_eq!(
+            compiled.keys(&input).unwrap_err().kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        assert_eq!(compiled.keys(&make_input(4)).unwrap().len(), 4);
     }
 }
