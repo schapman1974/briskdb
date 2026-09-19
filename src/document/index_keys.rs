@@ -1,6 +1,6 @@
 //! Bounded equality entries for the frozen ordinary secondary-index subset.
-//! No catalog activation, storage format, planner authority or uniqueness is
-//! implied by generating a key.
+//! Generating/encoding a key does not activate catalog or physical indexes,
+//! establish planner authority, or enforce uniqueness.
 
 use std::{collections::HashSet, fmt, sync::Arc};
 
@@ -10,6 +10,9 @@ use super::{
     number::CanonicalNumber,
 };
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
+
+mod codec;
+pub use codec::{DOCUMENT_INDEX_KEY_ENCODING_VERSION, MAX_DOCUMENT_INDEX_KEY_BYTES};
 
 const MAX_SPEC_BYTES: usize = 1024 * 1024;
 const MAX_PARTIAL_NODES: usize = 4096;
@@ -48,7 +51,8 @@ impl fmt::Debug for DocumentIndexKeyGenerator {
 
 /// Opaque equality/hash identity of an ordered tuple, independent of document
 /// representation. Compare only within one index; callers must supply index and
-/// collection identity. No persistent byte representation is promised yet.
+/// collection identity. The versioned byte codec preserves this equality; byte
+/// order is not BSON sort order and bytes do not contain index/collection IDs.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct DocumentIndexKey {
     components: Vec<Arc<Component>>,

@@ -5,7 +5,8 @@ use std::{collections::HashMap, process::Command};
 use briskdb::{
     core::EngineErrorKind,
     document::{
-        BsonDocument, BsonValue, DocumentIndexKeyGenerator, decode_document, encode_document,
+        BsonDocument, BsonValue, DocumentIndexKey, DocumentIndexKeyGenerator, decode_document,
+        encode_document,
     },
 };
 
@@ -83,8 +84,12 @@ fn index_keys_match_locked_membership_order_and_equality_partitions() {
                     let actual = BsonValue::Array(
                         keys.into_iter()
                             .map(|key| {
+                                let bytes = key.to_bytes().unwrap();
+                                let restored = DocumentIndexKey::from_bytes(&bytes).unwrap();
+                                assert_eq!(restored, key);
+                                assert_eq!(restored.to_bytes().unwrap(), bytes);
                                 let next = seen.len() as i32;
-                                BsonValue::Int32(*seen.entry(key).or_insert(next))
+                                BsonValue::Int32(*seen.entry(restored).or_insert(next))
                             })
                             .collect(),
                     );
