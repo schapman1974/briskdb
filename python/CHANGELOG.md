@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added synchronous/async `collection_exists` with targeted engine lookup,
+  typed boolean results, and the usual request/cancellation/result controls.
 - Added the non-retryable `IdempotencyConflictError` integrity category for
   the matching protocol-neutral engine error.
 - Split attached HTTP serving into data and administration listeners over the

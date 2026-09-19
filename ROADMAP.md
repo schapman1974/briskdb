@@ -510,7 +510,7 @@ requires an earlier dependency:
       direct zero-timestamp normalization, raw server-generated IDs, restart,
       concurrent duplicates, driver batch splitting, and boundary rejection.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
-      BSON matcher now powers embedded find/count and wire find. Includes dotted
+      BSON matcher now powers embedded and wire find/count. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
       bounded regex evaluation, eager validation, and cancellation. Filtering
       precedes global pagination; exact `$eq` IDs retain point routing (#180).
@@ -541,8 +541,17 @@ requires an earlier dependency:
       find now preserves natural-order ties, skip/limit, and projection across
       native/Python/wire batches using bounded top-key windows and retained
       last-key positions. Windows rescan until sorted indexes exist; key growth
-      is reaccounted against cursor quotas. Distinct, broader wire count helpers,
-      and remaining options still keep this issue open.
+      is reaccounted against cursor quotas. Wire `count` now shares engine
+      filtering and global skip/limit, including PyMongo's sync/async
+      `estimated_document_count()` and zero for absent collections. PyMongo's
+      aggregation-based `count_documents()`, distinct, and remaining options
+      still keep this issue open.
+    - [ ] [#166](https://github.com/schapman1974/briskdb/issues/166) — targeted
+      collection existence checks now share the engine across Rust, embedded
+      sync/async Python, and wire read/write namespace handling. Catalogs beyond
+      101 collections and large unrelated metadata no longer break wire data
+      commands. Missing probes create nothing. Full create/drop/list lifecycle,
+      database helpers, and metadata cursors remain open.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.

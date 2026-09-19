@@ -58,15 +58,22 @@ The current engine executes:
 | Command | Current behavior |
 | --- | --- |
 | `CreateCollection` | Provisions the catalog entry and fixed document table on every shard, then returns the active collection metadata |
+| `CollectionExists` | Checks one exact namespace without enumerating unrelated collections; returns a boolean without creating metadata |
 | `ListCollections` | Returns collection metadata for one exact database name |
 | `CreateIndex` | Declares index metadata and returns its name; non-built-in indexes remain pending until physical index work lands |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
 | `Find` | Evaluates BSON match expressions and returns a bounded batch with a continuation ID when needed |
-| `ContinueCursor` | Resumes a session-owned find in global natural order |
+| `ContinueCursor` | Resumes a session-owned find in natural or explicitly sorted order |
 | `KillCursor` | Releases a session-owned cursor; reports whether it existed |
 | `Count` | Evaluates the same match expressions, then applies global skip/limit |
 | `Delete` | Deletes one document selected by exact `_id` |
+
+`CollectionExists` uses an admitted, controlled manifest lookup and scalar result
+accounting. Its result is independent of catalog page size and unrelated metadata
+size. Missing databases/collections return false; names are exact and case-sensitive.
+The wire adapter uses this same command for absent-collection handling instead of
+listing the catalog. Existence and a later read/write are not one atomic operation.
 
 An exact `_id` filter, including `{_id: {$eq: value}}`, produces a
 `DocumentPlan::Point` with one collection and one physical shard. Other filters
@@ -229,7 +236,7 @@ authorizer before that connection can be reused.
 
 ## Current boundary
 
-Sort, update expressions, replacements,
+Update expressions, replacements,
 multi-document deletion, upsert, distinct, aggregation, metadata/aggregation
 cursors, and physical secondary-index builds remain later roadmap work.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`

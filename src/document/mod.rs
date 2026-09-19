@@ -32,14 +32,14 @@ pub use codec::{
     decode_document_with_options, encode_document, encode_document_with_options,
 };
 pub use command::{
-    DocumentAggregateRequest, DocumentCommand, DocumentCommandKind, DocumentContinueCursorRequest,
-    DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
-    DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
-    DocumentDropCollectionRequest, DocumentDropIndexRequest, DocumentFindRequest,
-    DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
-    DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
-    DocumentNamespace, DocumentReplaceRequest, DocumentRequest, DocumentRequestId,
-    DocumentUpdateRequest, MAX_DOCUMENT_INDEX_NAME_BYTES,
+    DocumentAggregateRequest, DocumentCollectionExistsRequest, DocumentCommand,
+    DocumentCommandKind, DocumentContinueCursorRequest, DocumentCountRequest,
+    DocumentCreateCollectionRequest, DocumentCreateIndexRequest, DocumentCursorId,
+    DocumentDeleteRequest, DocumentDistinctRequest, DocumentDropCollectionRequest,
+    DocumentDropIndexRequest, DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest,
+    DocumentKillCursorRequest, DocumentListCollectionsRequest, DocumentListIndexesRequest,
+    DocumentMutationScope, DocumentNamespace, DocumentReplaceRequest, DocumentRequest,
+    DocumentRequestId, DocumentUpdateRequest, MAX_DOCUMENT_INDEX_NAME_BYTES,
 };
 pub use error::{BsonError, BsonErrorContext, BsonErrorKind, BsonResult, DocumentCursorError};
 pub use key::{BSON_KEY_ENCODING_VERSION, BSON_MAX_CANONICAL_KEY_BYTES, CanonicalBsonKey};

@@ -298,6 +298,7 @@ impl DocumentDeleteResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DocumentResultKind {
     Acknowledged,
+    CollectionExists,
     Collection,
     Collections,
     Document,
@@ -317,6 +318,7 @@ pub enum DocumentResultKind {
 #[derive(Clone, PartialEq, Eq)]
 pub enum DocumentResult {
     Acknowledged(bool),
+    CollectionExists(bool),
     Collection(DocumentCollectionMetadata),
     Collections(Box<[DocumentCollectionMetadata]>),
     Document(Option<BsonDocument>),
@@ -335,6 +337,7 @@ impl DocumentResult {
     pub const fn kind(&self) -> DocumentResultKind {
         match self {
             Self::Acknowledged(_) => DocumentResultKind::Acknowledged,
+            Self::CollectionExists(_) => DocumentResultKind::CollectionExists,
             Self::Collection(_) => DocumentResultKind::Collection,
             Self::Collections(_) => DocumentResultKind::Collections,
             Self::Document(_) => DocumentResultKind::Document,
@@ -356,7 +359,9 @@ impl fmt::Debug for DocumentResult {
         let mut debug = formatter.debug_struct("DocumentResult");
         debug.field("kind", &self.kind());
         match self {
-            Self::Acknowledged(value) | Self::CursorKilled(value) => {
+            Self::Acknowledged(value)
+            | Self::CollectionExists(value)
+            | Self::CursorKilled(value) => {
                 debug.field("value", value);
             }
             Self::Collections(values) => {

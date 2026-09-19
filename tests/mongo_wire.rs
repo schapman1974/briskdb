@@ -112,6 +112,161 @@ async fn disconnected(stream: &mut TcpStream) {
 }
 
 #[tokio::test]
+async fn count_and_namespace_checks_do_not_enumerate_the_catalog() {
+    use briskdb::document::{
+        DocumentCollectionExistsRequest, DocumentCollectionOptions, DocumentCommand,
+        DocumentCreateCollectionRequest, DocumentNamespace, DocumentResult, DocumentWriteOptions,
+    };
+    let (_root, database, mut server) = setup().await;
+    let session = database.session();
+    let options = DocumentCollectionOptions::new(
+        BsonDocument::from_entries([("opaque", BsonValue::from("x".repeat(32 * 1024)))]).unwrap(),
+    )
+    .unwrap();
+    for index in 0..102 {
+        let collection_options = match index {
+            100 => DocumentCollectionOptions::new(
+                BsonDocument::from_entries([(
+                    "large_unrelated",
+                    BsonValue::from("x".repeat(1_100_000)),
+                )])
+                .unwrap(),
+            )
+            .unwrap(),
+            101 => options.clone(),
+            _ => DocumentCollectionOptions::empty(),
+        };
+        database
+            .execute_document(
+                &session,
+                engine_request(DocumentCommand::CreateCollection(
+                    DocumentCreateCollectionRequest::new(
+                        DocumentNamespace::new("wire", format!("collection_{index}")).unwrap(),
+                        collection_options,
+                        DocumentWriteOptions::new(),
+                    ),
+                )),
+            )
+            .await
+            .unwrap();
+    }
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let documents = (0..16)
+        .map(|index| {
+            BsonDocument::from_entries([
+                ("_id", BsonValue::Int32(index)),
+                ("group", BsonValue::Int32(index % 2)),
+            ])
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    stream
+        .write_all(&insert_sequence("collection_101", &documents))
+        .await
+        .unwrap();
+    assert_eq!(
+        response(&mut stream).await.1.get_first("n"),
+        Some(&BsonValue::Int32(16))
+    );
+    assert_eq!(
+        first_batch(
+            &send_command(
+                &mut stream,
+                &find_command("collection_101", BsonValue::Int32(7))
+            )
+            .await
+        )
+        .len(),
+        1
+    );
+    // Creating another collection must also work once the catalog exceeds a page.
+    assert_eq!(
+        send_command(
+            &mut stream,
+            &insert_command("new_collection", documents[0].clone())
+        )
+        .await
+        .get_first("n"),
+        Some(&BsonValue::Int32(1))
+    );
+    for (collection, filter, skip, limit, expected) in [
+        ("collection_101", BsonDocument::new(), 0, 0, 16),
+        ("collection_101", BsonDocument::new(), 3, 5, 5),
+        ("collection_101", BsonDocument::new(), 30, 5, 0),
+        (
+            "collection_101",
+            BsonDocument::from_entries([("group", BsonValue::Int32(1))]).unwrap(),
+            2,
+            0,
+            6,
+        ),
+        (
+            "collection_101",
+            BsonDocument::from_entries([("_id", BsonValue::Int32(7))]).unwrap(),
+            0,
+            0,
+            1,
+        ),
+        (
+            "collection_101",
+            BsonDocument::from_entries([("_id", BsonValue::Int32(7))]).unwrap(),
+            1,
+            0,
+            0,
+        ),
+        ("absent", BsonDocument::new(), 0, 0, 0),
+    ] {
+        let count = BsonDocument::from_entries([
+            ("count", BsonValue::from(collection)),
+            ("$db", BsonValue::from("wire")),
+            ("query", BsonValue::Document(filter)),
+            ("skip", BsonValue::Int64(skip)),
+            ("limit", BsonValue::Int64(limit)),
+            ("maxTimeMS", BsonValue::Int32(10_000)),
+        ])
+        .unwrap();
+        let reply = send_command(&mut stream, &count).await;
+        assert_eq!(
+            reply.get_first("n"),
+            Some(&BsonValue::Int64(expected)),
+            "{reply:?}"
+        );
+    }
+    // Missing reads must not create metadata, and probing/inserting an existing
+    // namespace must not replace its collection options.
+    let exists = database
+        .execute_document(
+            &session,
+            engine_request(DocumentCommand::CollectionExists(
+                DocumentCollectionExistsRequest::new(
+                    DocumentNamespace::new("wire", "absent").unwrap(),
+                ),
+            )),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exists.result(), &DocumentResult::CollectionExists(false));
+    let same_options = database
+        .execute_document(
+            &session,
+            engine_request(DocumentCommand::CreateCollection(
+                DocumentCreateCollectionRequest::new(
+                    DocumentNamespace::new("wire", "collection_101").unwrap(),
+                    options.clone(),
+                    DocumentWriteOptions::new(),
+                ),
+            )),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(same_options.result(), DocumentResult::Collection(value) if value.options() == &options)
+    );
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn modern_discovery_ping_and_unsupported_commands() {
     let (_root, database, mut server) = setup().await;
     let mut stream = TcpStream::connect(server.address()).await.unwrap();

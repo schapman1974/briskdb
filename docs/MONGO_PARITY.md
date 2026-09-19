@@ -41,7 +41,8 @@ database.close().await?;
 Ordinary PyMongo 4.17.0 synchronous and asynchronous clients can discover,
 ping, inspect build information, insert one or many documents, and run bounded
 find queries through the [shared BSON matcher](DOCUMENT_ENGINE.md), including
-multi-batch reads with `getMore` and explicit `killCursors` cleanup.
+multi-batch reads with `getMore` and explicit `killCursors` cleanup. The legacy
+`count` command and PyMongo `estimated_document_count()` also use this engine.
 Exact `_id` and `_id: {$eq: value}` filters keep single-shard routing;
 other filters scan and merge matching documents in durable natural order unless
 an explicit sort is supplied.
@@ -52,6 +53,8 @@ Ordered batches stop at the first duplicate; unordered batches continue after
 safe duplicate failures. First writes create the
 collection through the shared engine's durable catalog; reads of absent
 collections return an exhausted empty cursor without creating anything.
+Namespace checks target one collection through the engine, so reads and inserts
+remain usable beyond 101 collections and with large unrelated catalog metadata.
 
 For these data commands, unknown fields and unsupported option values fail
 before storage admission. The current option contract is:
@@ -64,6 +67,7 @@ before storage admission. The current option contract is:
 | `writeConcern` | Omitted/empty, or `w` equal to 0 or 1, `j: false`, and `wtimeout: 0`; no replication or stronger durability is promised |
 | `bypassDocumentValidation` | Only `false` |
 | Find `skip` / `limit` | Nonnegative integers; zero limit means no additional limit |
+| Count `query` / `skip` / `limit` | Shared BSON matcher with global skip/limit; nonnegative integers, zero limit unbounded; absent collection returns zero |
 | Find `projection` | Basic inclusion/exclusion document, dotted/nested paths, arrays, and `_id` rules; validated before missing-collection handling |
 | Find `sort` | Up to 32 ordinary fields with numeric `1`/`-1` directions; global BSON order with stable natural-order ties. Empty document preserves natural order. Metadata/expression sorts are unsupported. |
 | Find `batchSize` | Integer from 0 through 1000; zero opens an empty initial batch. Default 101. |
@@ -108,6 +112,17 @@ Large skips may require repeated scans and pages may be short at an internal
 window/memory boundary. Cursor key growth shares the existing retention quota.
 Real-driver tests cover chained sorts, find_one, projected-away sort fields,
 compound array keys, stable ties, byte-bounded batches, and restart.
+
+Counts are exact over the documents observed during the operation; the
+`estimated_document_count()` driver method currently uses this same count path,
+not an approximate cached statistic. Exact-ID queries remain point-routed; other
+queries use the shared scatter matcher (empty filters use per-shard row counts).
+Concurrent writes do not have a cross-shard snapshot guarantee. Count does not
+open a cursor. Invalid queries/options fail before absent-collection handling.
+Negative legacy count limits, hints, collation, comments, and read concern are
+explicitly rejected. PyMongo `count_documents()` sends an aggregation pipeline
+and remains unsupported until the shared aggregation slice lands; the native
+embedded `Session.count_documents()` already uses the engine count command.
 
 Updates, deletes, and metadata/aggregation cursors
 are not implemented by this checkpoint.

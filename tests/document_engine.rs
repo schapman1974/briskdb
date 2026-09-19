@@ -5,14 +5,14 @@ use std::time::{Duration, Instant};
 use briskdb::{
     core::{CancellationToken, Engine, EngineErrorKind, RequestContext, ResultLimits, Session},
     document::{
-        BsonDocument, BsonValue, DocumentAggregateRequest, DocumentCollectionMetadata,
-        DocumentCollectionOptions, DocumentCommand, DocumentCountRequest,
-        DocumentCreateCollectionRequest, DocumentCreateIndexRequest, DocumentDeleteRequest,
-        DocumentExecution, DocumentFilter, DocumentFindRequest, DocumentIndexLifecycle,
-        DocumentIndexRequest, DocumentInsertRequest, DocumentListCollectionsRequest,
-        DocumentListIndexesRequest, DocumentMutationScope, DocumentNamespace, DocumentPipeline,
-        DocumentPlan, DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId,
-        DocumentResult, DocumentWriteOptions,
+        BsonDocument, BsonValue, DocumentAggregateRequest, DocumentCollectionExistsRequest,
+        DocumentCollectionMetadata, DocumentCollectionOptions, DocumentCommand,
+        DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
+        DocumentDeleteRequest, DocumentExecution, DocumentFilter, DocumentFindRequest,
+        DocumentIndexLifecycle, DocumentIndexRequest, DocumentInsertRequest,
+        DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
+        DocumentNamespace, DocumentPipeline, DocumentPlan, DocumentProjection, DocumentReadOptions,
+        DocumentRequest, DocumentRequestId, DocumentResult, DocumentWriteOptions,
     },
 };
 use rusqlite::Connection;
@@ -81,6 +81,136 @@ async fn insert(
         )
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn collection_existence_is_targeted_bounded_read_only_and_persistent() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    // More than one default catalog page, with metadata far larger than the
+    // scalar result budget. Neither may interfere with a targeted probe.
+    for index in 0..102 {
+        let options = if index == 0 {
+            DocumentCollectionOptions::new(
+                BsonDocument::from_entries([("opaque", BsonValue::from("x".repeat(32 * 1024)))])
+                    .unwrap(),
+            )
+            .unwrap()
+        } else {
+            DocumentCollectionOptions::empty()
+        };
+        engine
+            .execute_document(
+                &session,
+                request(
+                    2,
+                    RequestContext::new(),
+                    DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                        DocumentNamespace::new("app", format!("other_{index}")).unwrap(),
+                        options,
+                        DocumentWriteOptions::new(),
+                    )),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    let probe = |database, collection| {
+        DocumentCommand::CollectionExists(DocumentCollectionExistsRequest::new(
+            DocumentNamespace::new(database, collection).unwrap(),
+        ))
+    };
+    for (database, collection, expected) in [
+        ("app", "events", true),
+        ("app", "other_0", true),
+        ("app", "missing", false),
+        ("missing", "events", false),
+        ("app", "Events", false),
+    ] {
+        let result = engine
+            .execute_document(
+                &session,
+                request(
+                    3,
+                    RequestContext::new().with_result_limits(ResultLimits::new(1, 34).unwrap()),
+                    probe(database, collection),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(result.plan().is_none());
+        assert_eq!(result.result(), &DocumentResult::CollectionExists(expected));
+    }
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    for (context, kind) in [
+        (
+            RequestContext::new().with_result_limits(ResultLimits::new(1, 33).unwrap()),
+            EngineErrorKind::LimitExceeded,
+        ),
+        (
+            RequestContext::new().with_cancellation_token(cancelled),
+            EngineErrorKind::Cancelled,
+        ),
+        (
+            RequestContext::new().with_deadline(Instant::now() - Duration::from_millis(1)),
+            EngineErrorKind::DeadlineExceeded,
+        ),
+    ] {
+        assert_eq!(
+            engine
+                .execute_document(&session, request(4, context, probe("app", "events")))
+                .await
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+    }
+    let listed = engine
+        .execute_document(
+            &session,
+            request(
+                5,
+                RequestContext::new(),
+                DocumentCommand::ListCollections(
+                    DocumentListCollectionsRequest::new(
+                        "app",
+                        DocumentReadOptions::new().with_batch_size(200).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(listed.result(), DocumentResult::Collections(items) if items.len() == 103));
+    session.close().await.unwrap();
+    assert_eq!(
+        engine
+            .execute_document(
+                &session,
+                request(6, RequestContext::new(), probe("app", "events"))
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::FailedPrecondition
+    );
+    engine.shutdown().await.unwrap();
+    let reopened = Engine::open(temp.path(), 2).await.unwrap();
+    for (collection, expected) in [("events", true), ("other_101", true), ("missing", false)] {
+        let result = reopened
+            .execute_document(
+                &reopened.session(),
+                request(7, RequestContext::new(), probe("app", collection)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.result(), &DocumentResult::CollectionExists(expected));
+    }
+    reopened.shutdown().await.unwrap();
 }
 
 #[tokio::test]
