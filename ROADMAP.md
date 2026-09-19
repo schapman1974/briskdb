@@ -554,7 +554,7 @@ requires an earlier dependency:
       outputs; missing/null/array/path semantics follow 4,888 additional locked
       oracle cases. It uses no retained cursor slot, rejects whole over-budget
       results, and remains a scan implementation without snapshot semantics.
-    - [ ] [#179](https://github.com/schapman1974/briskdb/issues/179) — shared basic
+    - [x] [#179](https://github.com/schapman1974/briskdb/issues/179) — shared basic
       aggregation core compiles `$match`, `$sort`, `$skip`, `$limit`, and `$count`
       eagerly and executes immutable BSON through shared stages.
       Matching and stable sorting reuse the authoritative implementations;
@@ -566,9 +566,10 @@ requires an earlier dependency:
       stream; count retains a counter, and sort materializes bounded input.
       Resource/error/cancellation cleanup and cursor ownership are tested.
       Basic-suite projection consumers now use the shared transforms below.
-      Grouping and PyMongo `count_documents()` are implemented below; full
-      candidate-corpus acceptance remains open.
-    - [ ] [#177](https://github.com/schapman1974/briskdb/issues/177) — shared
+      Grouping and PyMongo `count_documents()` are implemented below. Required CI
+      now runs every frozen basic-aggregation case through the real four-shard
+      BriskDB endpoint, in both sync/async modes, with no skips or corpus changes.
+    - [x] [#177](https://github.com/schapman1974/briskdb/issues/177) — shared
       `$project`/`$set`/`$addFields`/`$unset` stages and `$ifNull`/`$literal`/`$size`
       expressions now run across Rust, native Python, and wire aggregation.
       Field references, missing/null, arrays, `$$REMOVE`, collision/error order,
@@ -577,8 +578,12 @@ requires an earlier dependency:
       materialization boundaries so limits stop unused expression evaluation.
       Allocation amplification, depth/nodes/work, cancellation, cursor cleanup,
       sync/async clients, byte paging, and restart are covered. The frozen
-      projection-to-group identity case now uses the shared group stage below;
-      full candidate-corpus acceptance still needs collection lifecycle support.
+      projection-to-group identity case now uses the shared group stage below.
+      All frozen aggregation projection-stage and application aggregation cases
+      now pass through the real four-shard endpoint in both API modes. Combined
+      with the basic suite, required CI checks exactly 112 frozen executions and
+      rejects missing, duplicated, substituted, or skipped cases. The full
+      456-execution corpus and group-accumulator suite remain separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared
       `$group` supports literal/field/computed keys, recursive structured BSON identity, and
       all eight planned accumulators across Rust, sync/async native Python, and
