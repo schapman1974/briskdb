@@ -116,6 +116,36 @@ projection state counts against the existing cursor retention quota.
 Required CI compares 4,865 generated BSON projection cases with the locked
 oracle, separately from the full frozen command corpus.
 
+### Shared sorting keys (not yet connected to find)
+
+`DocumentSorter` compiles an ordinary nonempty BSON sort specification with up
+to 32 fields and numeric directions exactly `1` or `-1`. `key` returns an owned
+`DocumentSortKey` that compares using BSON semantics; callers must add a stable
+natural-order tie-breaker. Neither compilation nor key generation mutates the
+input, and debug/error messages do not expose document values. Metadata and
+expression sort specifications are explicitly rejected. Engine `find` and the
+wire adapter still reject sort options until the global paging integration.
+
+The shared implementation handles missing/null ties, the empty-array position
+between MinKey and null, direction-sensitive array member selection, dotted
+paths, and canonical numeric array indexes. Compound keys correlate values from
+the same array element. Parallel arrays and ambiguous numeric paths produce
+the locked contract's errors, including their precedence. Nonempty arrays
+selected by a numeric endpoint compare as whole BSON arrays.
+
+Compilation is capped at 1 MiB and 100 path components per field. Per-document
+key generation is limited to 16,384 total path candidates, one million work
+steps, a 64-MiB conservative temporary-allocation charge, and an 8-MiB owned-key
+charge. Candidate joins use an array-provenance index instead of an unbounded
+cross product. Cooperative check callbacks support cancellation/deadlines;
+storage integrations must invoke them in admitted blocking work. Both compiled
+specifications and owned keys expose conservative retention charges.
+
+Required CI compares 4,654 generated sorting cases with source-locked TinyMongo,
+including specification validation, all supported BSON families, stable ties,
+compound arrays, and error precedence. This is a shared-core checkpoint, not a
+claim that sorted wire reads or the full frozen command corpus pass.
+
 ### Matching and writes
 
 The matcher supports dotted paths, missing/null distinctions, numeric BSON

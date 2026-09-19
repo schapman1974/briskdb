@@ -40,6 +40,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "document_sorting"
+path = "fuzz_targets/document_sorting.rs"
+test = false
+doc = false
+bench = false
+
 # Keep cargo-fuzz out of the repository's root workspace. Cargo invokes this
 # manifest directly (`cargo fuzz ...`) and uses this package's checked-in lock.
 [workspace]

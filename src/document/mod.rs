@@ -15,6 +15,7 @@ mod options;
 mod plan;
 mod projection;
 mod result;
+mod sorting;
 mod value;
 
 pub(crate) use catalog::validate_namespace;
@@ -54,6 +55,7 @@ pub use result::{
     DocumentCursorBatch, DocumentDeleteResult, DocumentExecution, DocumentInsertResult,
     DocumentResult, DocumentResultKind, DocumentUpdateResult, DocumentWriteError,
 };
+pub use sorting::{DocumentSortKey, DocumentSorter};
 pub use value::{
     BsonBinary, BsonDateTime, BsonDecimal128, BsonDocument, BsonJavaScript, BsonObjectId,
     BsonRegex, BsonTimestamp, BsonUuid, BsonValue, UuidRepresentation,
