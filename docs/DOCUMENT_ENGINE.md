@@ -75,7 +75,9 @@ The current engine executes:
 | `Delete` | Deletes one or many matches; exact `_id` routes to one shard, other filters use the shared matcher |
 | `FindOneAndDelete` | Atomically deletes one shard-local selection and returns its projected pre-delete document |
 | `FindOneAndReplace` | Atomically replaces one shard-local selection and returns its projected before/after document; no upsert yet |
+| `FindOneAndUpdate` | Applies `$set`/`$unset` to one shard-local selection and returns its projected before/after document; no upsert yet |
 | `Replace` | Replaces one matching document, preserving `_id` and natural order; returns matched/modified counts, with no upsert yet |
+| `Update` | Applies `$set`/`$unset` to one or many matches; returns matched/modified counts, with one transaction per shard for many |
 
 `CollectionExists` uses an admitted, controlled manifest lookup and scalar result
 accounting. Its result is independent of catalog page size and unrelated metadata
@@ -198,6 +200,16 @@ the normalized post-image cap. The successful commit is not reclassified by late
 cancellation. The shared tests cover before/after concurrency, original-field
 sorting, projection/storage separation, native depth-100 records, wire response
 headroom, no-match/no-op results, and restart.
+
+`DocumentFindOneAndUpdateRequest` wraps an `Update` request with scope `One`
+and the same projection/sort and before/after options. It reuses `DocumentUpdater`
+and the preflighted returned-image write path rather than replacing unaffected
+fields. Sort reads original values, projection affects only the returned image,
+and a projected empty document is still a match. No-op updates return the chosen
+image; no match returns `Document(None)`. Invalid scopes, unsupported read/write
+options, and update specifications fail eagerly. The post-image cap, response
+size/depth checks, shard-local reselection, and late-cancellation commit boundary
+above apply equally to operator updates. Upsert remains unsupported.
 
 ### Filtered deletion and commit boundaries
 

@@ -1057,6 +1057,46 @@ impl DocumentFindOneAndReplaceRequest {
     }
 }
 
+/// Apply operators to one selected document and return its projected image.
+/// The wrapped update must have scope `One`; upsert remains unsupported.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentFindOneAndUpdateRequest {
+    update: DocumentUpdateRequest,
+    read_options: DocumentReadOptions,
+    return_after: bool,
+}
+
+impl DocumentFindOneAndUpdateRequest {
+    pub const fn new(update: DocumentUpdateRequest, read_options: DocumentReadOptions) -> Self {
+        Self {
+            update,
+            read_options,
+            return_after: false,
+        }
+    }
+    #[must_use]
+    pub const fn with_return_after(mut self, return_after: bool) -> Self {
+        self.return_after = return_after;
+        self
+    }
+    pub const fn namespace(&self) -> &DocumentNamespace {
+        self.update.namespace()
+    }
+    pub const fn update_request(&self) -> &DocumentUpdateRequest {
+        &self.update
+    }
+    pub const fn read_options(&self) -> &DocumentReadOptions {
+        &self.read_options
+    }
+    pub const fn return_after(&self) -> bool {
+        self.return_after
+    }
+    pub fn into_parts(self) -> (DocumentUpdateRequest, DocumentReadOptions, bool) {
+        (self.update, self.read_options, self.return_after)
+    }
+}
+
 /// Request to delete one or many matching documents.
 ///
 /// `One` selects the earliest match in durable natural order, then rechecks
@@ -1317,6 +1357,7 @@ pub enum DocumentCommandKind {
     Find,
     FindOneAndDelete,
     FindOneAndReplace,
+    FindOneAndUpdate,
     Aggregate,
     Count,
     Distinct,
@@ -1345,6 +1386,7 @@ pub enum DocumentCommand {
     Find(DocumentFindRequest),
     FindOneAndDelete(DocumentFindOneAndDeleteRequest),
     FindOneAndReplace(DocumentFindOneAndReplaceRequest),
+    FindOneAndUpdate(DocumentFindOneAndUpdateRequest),
     Aggregate(DocumentAggregateRequest),
     Count(DocumentCountRequest),
     Distinct(DocumentDistinctRequest),
@@ -1372,6 +1414,7 @@ impl DocumentCommand {
             Self::Find(_) => DocumentCommandKind::Find,
             Self::FindOneAndDelete(_) => DocumentCommandKind::FindOneAndDelete,
             Self::FindOneAndReplace(_) => DocumentCommandKind::FindOneAndReplace,
+            Self::FindOneAndUpdate(_) => DocumentCommandKind::FindOneAndUpdate,
             Self::Aggregate(_) => DocumentCommandKind::Aggregate,
             Self::Count(_) => DocumentCommandKind::Count,
             Self::Distinct(_) => DocumentCommandKind::Distinct,

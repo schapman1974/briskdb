@@ -218,7 +218,9 @@ impl Engine {
         let result_cancellation = cancellation.clone();
         let mutation_returns_document = matches!(
             &command,
-            DocumentCommand::FindOneAndDelete(_) | DocumentCommand::FindOneAndReplace(_)
+            DocumentCommand::FindOneAndDelete(_)
+                | DocumentCommand::FindOneAndReplace(_)
+                | DocumentCommand::FindOneAndUpdate(_)
         );
         let execution = match command {
             DocumentCommand::ListDatabaseNames(request) => {
@@ -874,6 +876,17 @@ impl Engine {
             }
             DocumentCommand::FindOneAndReplace(request) => {
                 self.run_document_find_replace(
+                    owner,
+                    request_id,
+                    request,
+                    cancellation,
+                    deadline,
+                    result_limits,
+                )
+                .await
+            }
+            DocumentCommand::FindOneAndUpdate(request) => {
+                self.run_document_find_update(
                     owner,
                     request_id,
                     request,

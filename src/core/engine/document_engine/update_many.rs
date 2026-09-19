@@ -111,6 +111,8 @@ impl Engine {
                                 record,
                                 &updater,
                                 max_document_bytes,
+                                single_mutation::MutationReturn::Counts,
+                                None,
                                 request_id,
                                 plan.clone(),
                                 limits,

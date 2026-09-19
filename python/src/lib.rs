@@ -16,13 +16,13 @@ use briskdb::document::{
     DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
     DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
     DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
-    DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest, DocumentFindRequest,
-    DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
-    DocumentListCollectionMetadataRequest, DocumentListCollectionsRequest,
-    DocumentListDatabaseNamesRequest, DocumentListIndexesRequest, DocumentMutationScope,
-    DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentReadOptions,
-    DocumentReplaceRequest, DocumentRequest, DocumentRequestId, DocumentSort, DocumentUpdate,
-    DocumentUpdateRequest, DocumentWriteOptions,
+    DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
+    DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentIndexRequest,
+    DocumentInsertRequest, DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
+    DocumentListCollectionsRequest, DocumentListDatabaseNamesRequest, DocumentListIndexesRequest,
+    DocumentMutationScope, DocumentNamespace, DocumentPipeline, DocumentProjection,
+    DocumentReadOptions, DocumentReplaceRequest, DocumentRequest, DocumentRequestId, DocumentSort,
+    DocumentUpdate, DocumentUpdateRequest, DocumentWriteOptions,
 };
 use briskdb::{
     BriskCursor, BriskDb, BriskSession, BriskTransaction,
@@ -1889,6 +1889,69 @@ impl Session {
         self.execute_document_command(
             py,
             DocumentCommand::FindOneAndReplace(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (database, collection, filter, update, *, projection = None, sort = None, return_document = false, upsert = false, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn find_one_and_update(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        filter: Py<PyAny>,
+        update: Py<PyAny>,
+        projection: Option<Py<PyAny>>,
+        sort: Option<Py<PyAny>>,
+        return_document: bool,
+        upsert: bool,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let filter = python_engine_result(DocumentFilter::new(extract_bson_document(
+            py,
+            filter.bind(py),
+            self.shared.uuid_representation,
+        )?))?;
+        let update = python_engine_result(DocumentUpdate::new(extract_bson_document(
+            py,
+            update.bind(py),
+            self.shared.uuid_representation,
+        )?))?;
+        let update = DocumentUpdateRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            filter,
+            update,
+            DocumentMutationScope::One,
+            DocumentWriteOptions::new().with_upsert(upsert),
+        );
+        let mut options = DocumentReadOptions::new();
+        if let Some(projection) = projection {
+            options = options.with_projection(document_projection(
+                py,
+                projection.bind(py),
+                self.shared.uuid_representation,
+            )?);
+        }
+        if let Some(sort) = sort {
+            options = options.with_sort(python_engine_result(DocumentSort::new(
+                extract_bson_document(py, sort.bind(py), self.shared.uuid_representation)?,
+            ))?);
+        }
+        let request = DocumentFindOneAndUpdateRequest::new(update, options)
+            .with_return_after(return_document);
+        self.execute_document_command(
+            py,
+            DocumentCommand::FindOneAndUpdate(request),
             request_id,
             timeout_ms,
             cancellation.as_deref(),

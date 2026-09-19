@@ -1068,6 +1068,36 @@ async fn find_and_modify_rejects_wire_envelope_depth_before_mutation() {
         )
         .await
         .unwrap();
+    for (operator, field, after) in [("$unset", "nested", false), ("$set", "changed", true)] {
+        let mutation = BsonDocument::from_entries([
+            ("findAndModify", BsonValue::from("deep")),
+            ("$db", BsonValue::from("wire")),
+            (
+                "query",
+                BsonValue::Document(
+                    BsonDocument::from_entries([("_id", BsonValue::from("deep"))]).unwrap(),
+                ),
+            ),
+            (
+                "update",
+                BsonValue::Document(
+                    BsonDocument::from_entries([(
+                        operator,
+                        BsonValue::Document(
+                            BsonDocument::from_entries([(field, BsonValue::Int32(1))]).unwrap(),
+                        ),
+                    )])
+                    .unwrap(),
+                ),
+            ),
+            ("new", BsonValue::Boolean(after)),
+        ])
+        .unwrap();
+        assert_eq!(
+            send_command(&mut stream, &mutation).await.get_first("code"),
+            Some(&BsonValue::Int32(10334))
+        );
+    }
     let replacement = BsonDocument::from_entries([
         ("findAndModify", BsonValue::from("deep")),
         ("$db", BsonValue::from("wire")),
@@ -1176,7 +1206,7 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
         matches!(reply.get_first("code"), Some(BsonValue::Int32(10334))),
         "{reply:?}"
     );
-    let replacement = BsonDocument::from_entries([
+    let mut replacement = BsonDocument::from_entries([
         ("findAndModify", BsonValue::from("items")),
         ("$db", BsonValue::from("wire")),
         (
@@ -1185,9 +1215,30 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
                 BsonDocument::from_entries([("_id", BsonValue::from("large"))]).unwrap(),
             ),
         ),
-        ("update", BsonValue::Document(BsonDocument::new())),
     ])
     .unwrap();
+    let mut update = replacement.clone();
+    update
+        .push(
+            "update",
+            BsonValue::Document(
+                BsonDocument::from_entries([(
+                    "$unset",
+                    BsonValue::Document(
+                        BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+                    ),
+                )])
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        send_command(&mut stream, &update).await.get_first("code"),
+        Some(&BsonValue::Int32(10334))
+    );
+    replacement
+        .push("update", BsonValue::Document(BsonDocument::new()))
+        .unwrap();
     assert_eq!(
         send_command(&mut stream, &replacement)
             .await

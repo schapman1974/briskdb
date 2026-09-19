@@ -59,8 +59,11 @@ with briskdb.open("./data", shards=4, documents=True) as db:
 ```
 
 The document API supports collection/index metadata, single-document insertion
-with generated IDs, shared BSON match-expression find/count, exact-`_id` deletion,
-and retained find cursors through synchronous and asyncio sessions. Continue a
+with generated IDs, BSON find/count/distinct, filtered deletes, replacements,
+`$set`/`$unset` updates, and retained cursors through synchronous and asyncio
+sessions. Find-one-and-delete returns a projected before-image;
+find-one-and-replace/update support sorted projected before/after images.
+Return size/depth checks precede mutation. Continue a
 non-null `result["cursor_id"]` with
 `session.get_more(database, collection, cursor_id, batch_size=101)`; stop early
 with `session.kill_cursor(database, collection, cursor_id)`. Cursors belong to
@@ -73,8 +76,11 @@ mutating stored documents. The projection persists across cursor batches.
 Pass `sort={"priority": -1, "_id": 1}` for global BSON sorting before skip/limit
 and projection; the sort persists across cursor batches. Stable ties use natural
 order. Sorted pages use bounded key windows and rescan until sorted indexes
-exist; large skips may need repeated scans. Secondary indexes remain `pending_build`; updates,
-additional aggregation expressions, and bulk-write Python helpers remain future work.
+exist; large skips may need repeated scans. Secondary indexes remain `pending_build`;
+other update operators, upserts, additional aggregation expressions, and bulk-write
+Python helpers remain future work. Multi-delete/update commit one shard at a time;
+failure rolls back the current shard, not earlier commits. See the
+[write boundaries](../docs/DOCUMENT_ENGINE.md#field-updates-and-single-record-write-boundaries).
 
 `session.drop_collection(database, collection)` and
 `session.drop_database(database)` return `{"kind": "namespace_dropped",

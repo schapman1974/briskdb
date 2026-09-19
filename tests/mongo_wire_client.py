@@ -10,6 +10,65 @@ from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timesta
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
 
 
+def find_update_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_find_update.items
+        collection.insert_many([{"_id": Int64(i), "group": i % 2, "rank": i, "done": False} for i in range(12)])
+        before = collection.find_one_and_update({"group": 0}, {"$set": {"rank": -1, "done": True, "stamp": Timestamp(0, 0)}}, sort=[("rank", -1)], projection={"rank": 1, "_id": 0})
+        assert before == {"rank": 10}
+        expected = {"_id": Int64(10), "group": 0, "rank": -1, "done": True, "stamp": Timestamp(0, 0)}
+        assert BSON.encode(collection.find_one({"_id": 10})) == BSON.encode(expected)
+        for after in [False, True]:
+            assert BSON.encode(collection.find_one_and_update({"_id": 10.0}, {"$set": {"done": True}}, return_document=after)) == BSON.encode(expected)
+            assert collection.find_one_and_update({"_id": 99}, {"$set": {}}, return_document=after) is None
+        assert collection.find_one_and_update({"_id": 10}, {"$unset": {"group": 1}}, return_document=True, projection={"group": 1, "_id": 0}) == {}
+        expected.pop("group")
+        assert BSON.encode(collection.find_one({"_id": 10})) == BSON.encode(expected)
+        reply = client.absent_find_update.command("findAndModify", "items", update={"$set": {}}, new=True)
+        assert reply["value"] is None and reply["lastErrorObject"] == {"n": 0, "updatedExisting": False}
+        assert "absent_find_update" not in client.list_database_names()
+        reply = client.wire_find_update.command("findAndModify", "items", query={"_id": 10}, update={"$set": {}}, new=True, fields={"missing": 1, "_id": 0})
+        assert reply["value"] == {} and reply["lastErrorObject"] == {"n": 1, "updatedExisting": True}
+        for expression, code in [({"$set": {"rank.x": 1}}, 28), ({"$unset": {"_id": 1}}, 66), ({"$set": {"a": 1}, "$unset": {"a.x": 1}}, 40)]:
+            try:
+                collection.find_one_and_update({"_id": 10}, expression)
+            except OperationFailure as error:
+                assert error.code == code
+            else:
+                raise AssertionError("expected atomic update rejection")
+            assert BSON.encode(collection.find_one({"_id": 10})) == BSON.encode(expected)
+        limited = client.wire_find_update.limited
+        limited.insert_one({"_id": 1, "small": True})
+        try:
+            limited.find_one_and_update({}, {"$set": {"large": "x" * 522000}}, return_document=True)
+        except OperationFailure as error:
+            assert error.code == 10334
+        else:
+            raise AssertionError("return envelope must be preflighted before update")
+        assert limited.find_one({}) == {"_id": 1, "small": True}
+        assert limited.find_one_and_update({}, {"$set": {"large": "x" * 522000}}, return_document=True, projection=["_id"]) == {"_id": 1}
+        try:
+            limited.find_one_and_update({}, {"$unset": {"large": 1}})
+        except OperationFailure as error:
+            assert error.code == 10334
+        else:
+            raise AssertionError("oversized before-image cannot commit")
+        assert limited.count_documents({"large": {"$type": "string"}}) == 1
+        concurrent = client.wire_find_update.concurrent
+        concurrent.insert_many([{"_id": i, "done": False} for i in range(24)])
+        def consume(after):
+            ids = []
+            while True:
+                image = concurrent.find_one_and_update({"done": False}, {"$set": {"done": True}}, return_document=after)
+                if image is None:
+                    return ids
+                assert image["done"] is after
+                ids.append(image["_id"])
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(consume, [False, True, False, True]))
+        assert sorted(i for ids in results for i in ids) == list(range(24))
+
+
 def update_many_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_update_many.items
@@ -149,7 +208,7 @@ def find_replace_smoke(uri):
             new=True, fields={"_id": 0})
         assert reply == {"ok": 1, "lastErrorObject": {"n": 1, "updatedExisting": True}, "value": {}}
         for options, code in [
-            ({"update": {"$set": {"value": 2}}}, 115), ({"update": [{"$set": {"value": 2}}]}, 115),
+            ({"update": {"$inc": {"value": 2}}}, 115), ({"update": [{"$set": {"value": 2}}]}, 115),
             ({"update": {}, "remove": True}, 72), ({"remove": True, "new": True}, 72),
             ({"remove": False}, 72), ({"update": {}, "upsert": True}, 72),
             ({"update": {}, "hint": "_id_"}, 72), ({"update": {}, "let": {}}, 72),
@@ -1070,6 +1129,8 @@ def lifecycle_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        row = client.wire_find_update.items.find_one({"_id": 10})
+        assert row["rank"] == -1 and row["done"] is True and "group" not in row and row["stamp"] == Timestamp(0, 0)
         assert client.wire_update_many.items.count_documents({"validated": True}) == 24
         assert client.wire_field_update.items.find_one({"_id": 1})["field23"] == 23
         assert BSON.encode(client.wire_find_replace.items.find_one({"_id": 10})) == BSON.encode({"_id": Int64(10), "value": "persisted", "hidden": True})
@@ -1201,6 +1262,14 @@ def metadata_smoke(uri):
 
 
 async def async_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_find_update.items
+        await collection.insert_many([{"_id": Int64(i), "rank": i, "keep": True} for i in range(6)])
+        before = await collection.find_one_and_update({}, {"$set": {"rank": -1}}, sort=[("rank", -1)], projection={"rank": 1, "_id": 0})
+        assert before == {"rank": 5}
+        after = await collection.find_one_and_update({"_id": 5.0}, {"$unset": {"rank": 1}}, return_document=True)
+        assert BSON.encode(after) == BSON.encode({"_id": Int64(5), "keep": True})
+        assert await collection.find_one_and_update({"_id": 99}, {"$set": {}}) is None
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         collection = client.async_update_many.items
         await collection.insert_many([{"_id": Int64(i), "value": 1} for i in range(6)])
@@ -1367,6 +1436,7 @@ if __name__ == "__main__":
         replacement_smoke(sys.argv[1])
         field_update_smoke(sys.argv[1])
         update_many_smoke(sys.argv[1])
+        find_update_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

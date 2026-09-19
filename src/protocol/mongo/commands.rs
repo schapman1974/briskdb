@@ -20,8 +20,9 @@ use crate::{
         DocumentContinueCursorRequest, DocumentCountRequest, DocumentCreateCollectionRequest,
         DocumentCursorError, DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
         DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
-        DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest, DocumentFindRequest,
-        DocumentInsertRequest, DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
+        DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
+        DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentInsertRequest,
+        DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
         DocumentListDatabaseNamesRequest, DocumentMatcher, DocumentMutationError,
         DocumentMutationScope, DocumentNamespace, DocumentPipeline, DocumentProjection,
         DocumentProjector, DocumentQueryError, DocumentReadOptions, DocumentReplaceRequest,
@@ -186,7 +187,7 @@ pub(super) enum Command {
     Delete(Vec<Result<DocumentDeleteRequest>>, bool),
     Updates(Vec<Result<DocumentCommand>>, bool),
     FindAndDelete(DocumentFindOneAndDeleteRequest),
-    FindAndReplace(DocumentFindOneAndReplaceRequest),
+    FindAndChange(DocumentCommand),
     Count(DocumentCountRequest),
     Distinct(DocumentDistinctRequest),
     Find(DocumentFindRequest, bool, Option<Duration>),
@@ -551,24 +552,38 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 else {
                     return Err(CommandError::unsupported());
                 };
-                if replacement
+                let command = if replacement
                     .iter()
                     .next()
                     .is_some_and(|(name, _)| name.starts_with('$'))
                 {
-                    return Err(CommandError::unsupported());
-                }
-                let replacement = DocumentReplaceRequest::new(
-                    namespace,
-                    DocumentFilter::new(filter)?,
-                    replacement.clone(),
-                    DocumentWriteOptions::new(),
-                )?
-                .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?;
-                Command::FindAndReplace(
-                    DocumentFindOneAndReplaceRequest::new(replacement, options)
-                        .with_return_after(return_after),
-                )
+                    DocumentUpdater::compile_with_check(replacement, &mut check)?;
+                    let update = DocumentUpdateRequest::new(
+                        namespace,
+                        DocumentFilter::new(filter)?,
+                        DocumentUpdate::new(replacement.clone())?,
+                        DocumentMutationScope::One,
+                        DocumentWriteOptions::new(),
+                    )
+                    .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?;
+                    DocumentCommand::FindOneAndUpdate(
+                        DocumentFindOneAndUpdateRequest::new(update, options)
+                            .with_return_after(return_after),
+                    )
+                } else {
+                    let replacement = DocumentReplaceRequest::new(
+                        namespace,
+                        DocumentFilter::new(filter)?,
+                        replacement.clone(),
+                        DocumentWriteOptions::new(),
+                    )?
+                    .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?;
+                    DocumentCommand::FindOneAndReplace(
+                        DocumentFindOneAndReplaceRequest::new(replacement, options)
+                            .with_return_after(return_after),
+                    )
+                };
+                Command::FindAndChange(command)
             }
         } else if name == "update" {
             let statements = write_documents(request, "updates")?;
@@ -1101,7 +1116,7 @@ impl Executor {
         // commits, not merely the larger OP_MSG envelope checked on delivery.
         let reply_limit = if matches!(
             &prepared.command,
-            Command::FindAndDelete(_) | Command::FindAndReplace(_)
+            Command::FindAndDelete(_) | Command::FindAndChange(_)
         ) {
             wire::MAX_BOOTSTRAP_BSON_BYTES - 4096
         } else {
@@ -1285,22 +1300,16 @@ impl Executor {
                     _ => Err(CommandError::unsupported()),
                 }
             }
-            Command::FindAndReplace(request) => {
-                let value = if !self
-                    .exists(session, identity, &context, request.namespace())
-                    .await?
-                {
+            Command::FindAndChange(command) => {
+                let namespace = match &command {
+                    DocumentCommand::FindOneAndReplace(request) => request.namespace(),
+                    DocumentCommand::FindOneAndUpdate(request) => request.namespace(),
+                    _ => unreachable!("parsed findAndModify mutation"),
+                };
+                let value = if !self.exists(session, identity, &context, namespace).await? {
                     None
                 } else {
-                    match self
-                        .call(
-                            session,
-                            identity,
-                            &context,
-                            DocumentCommand::FindOneAndReplace(request),
-                        )
-                        .await?
-                    {
+                    match self.call(session, identity, &context, command).await? {
                         DocumentResult::Document(value) => value,
                         _ => {
                             return Err(CommandError::new(

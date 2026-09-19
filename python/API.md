@@ -68,6 +68,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `update_one(database, collection, filter, update, *, upsert=False, ...)`
 - `update_many(database, collection, filter, update, *, upsert=False, ...)`
 - `find_one_and_replace(database, collection, filter, replacement, *, projection=None, sort=None, return_document=False, upsert=False, ...)`
+- `find_one_and_update(database, collection, filter, update, *, projection=None, sort=None, return_document=False, upsert=False, ...)`
 
 Both delete methods accept the shared BSON filters and return an acknowledged
 `deleted_count`. Exact `_id` filters route directly; other `delete_one` filters
@@ -121,6 +122,13 @@ document, not the stored replacement. Both post-image storage limits and exact
 returned size/depth budgets are checked before committing; failure leaves the
 original record intact. It shares replacement identity rules and normal request
 controls. `upsert=True` remains unsupported.
+
+`find_one_and_update` has the same return shape, projection/sort and boolean
+`return_document` options, request controls, and pre-commit output checks. It
+applies `$set`/`$unset` through the shared update engine, retaining untouched
+fields and exact ID representation. No match returns `document=None`, and
+no-op updates still return the selected image. Projection may produce `{}`
+without losing the match. Other operators and upsert remain unsupported.
 
 `list_collection_metadata` returns the usual `cursor` result, with a null plan.
 Continue or kill it using collection name `$cmd.listCollections`. Full rows

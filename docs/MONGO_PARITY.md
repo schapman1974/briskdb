@@ -19,12 +19,14 @@ CI and byte-compares the normalized result with the checked-in reference. The
 full report remains `reference-only`; partial candidate coverage is not folded
 into that report or treated as full parity.
 
-Required CI separately runs 152 exact sync/async executions in the frozen
+Required CI separately runs 162 exact sync/async executions in the frozen
 `test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
-`test_aggregation_contract`, and `test_group_accumulators_contract` modules,
+`test_aggregation_contract`, `test_group_accumulators_contract`, and
+`test_client_read_fidelity_contract` modules,
 plus four `test_talkpython_contract` cases: full-document replacement, application
 write-result metadata, binary ID/subtype equality, and distinct boolean/numeric IDs,
-and the CRUD top-level/nested `$unset` case,
+the CRUD top-level/nested `$unset` case, and three query-validation cases covering
+invalid field `$comment`, invalid `$not`, and operator typos across CRUD methods,
 against a real four-shard BriskDB listener.
 It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
 cleanup. The JUnit result is checked against the exact locked case/API set;
@@ -271,7 +273,7 @@ Mongo `findAndModify` now supports `remove: true`: shared filter, sort, projecti
 Runtime sort checks apply even to exact-ID routes. Return-value budgets fail
 before deletion, including documents inserted through the larger native BSON
 interface. Missing collections return null without creation after eager semantic
-validation. Operator-update forms, upsert, hint/collation/let,
+validation. Upsert, hint/collation/let,
 and unacknowledged findAndModify remain unsupported. Native Python exposes
 `find_one_and_delete` with the same shared execution and request controls.
 
@@ -282,8 +284,16 @@ post-image and the selected before/after reply before mutation. Replies include
 `value` (null on no match) and `lastErrorObject.n`/`updatedExisting`; a projected
 empty document still reports a match. Missing collections are not created, and
 validation remains eager. `remove:true` cannot be combined with `update` or
-`new:true`. Operator/pipeline updates and upsert remain unsupported. Native
+`new:true`. Pipeline updates and upsert remain unsupported. Native
 sync/async Python exposes `find_one_and_replace` with the same semantics.
+
+Operator `findAndModify` accepts `$set`/`$unset` documents in `update`, with the
+same query/sort/projection and boolean `new` options, through `FindOneAndUpdate`.
+It preserves untouched fields and shares operator validation, immutable-ID
+checks, post-image limits, and pre-commit return size/depth checks. No-ops still
+return an image; projected `{}` still sets `n:1` and `updatedExisting:true`.
+Missing namespaces return null without creation after eager validation. Native
+sync/async Python exposes `find_one_and_update` with identical image semantics.
 
 Wire `update` supports replacement statements and `$set`/`$unset` operator
 statements (`q` and a document `u`,
@@ -309,8 +319,8 @@ Python exposes `replace_one`, `update_one`, and `update_many` with the same engi
 controls. The field-update subset includes bounded object/array paths, immutable
 IDs, and exact modified counts. Its 4,008 source-locked oracle cases cover object
 paths only, not frozen legacy scalar/array/ID quirks; independent tests check
-those boundaries. Operator-update findAndModify and index metadata cursors
-remain unimplemented.
+those boundaries. Additional update operators and index metadata cursors remain
+unimplemented.
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required
 real-driver CI also verifies BSON fidelity, ordered/unordered duplicate failures,
