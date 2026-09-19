@@ -613,8 +613,13 @@ requires an earlier dependency:
       direction bytes. 64 source-locked valid ascending definitions verify exact
       names, key order, flags and pending metadata after restart. Independent tests
       cover descending/numeric aliases, controls and rejection atomicity. All
-      secondary declarations remain pending and enforce no uniqueness yet;
-      sparse/partial definitions, key tokens, physical build/recovery, write-time
+      secondary declarations remain pending and enforce no uniqueness yet.
+      The shared index-key generator now supplies bounded BSON-aware equality
+      tuples, one-level multikey deduplication, missing/null and empty-array
+      identities, and sparse/partial membership. 7,201 source-locked cases check
+      equality partitions, ordering and errors across 29,370 document evaluations.
+      Independent tests cover cancellation and resource limits. This helper does
+      not enable sparse/partial catalog options or activate indexes; physical build/recovery, write-time
       maintenance, wire index commands and metadata cursors remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted

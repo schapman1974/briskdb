@@ -426,6 +426,17 @@ not physical index support: secondary declarations still enforce no uniqueness,
 and wire index commands and metadata cursors remain unimplemented. The full frozen
 index suites remain open; no frozen expected result or allowance is changed.
 
+The shared index-key foundation now checks 7,201 additional source-locked cases
+(29,370 document evaluations) against unchanged index helpers. It compares exact
+opaque-token equality partitions and encounter order, sparse/partial membership,
+compound/multikey behavior and unsupported-value failures. It reuses canonical
+BSON identities and the shared matcher. Independent tests cover bounded work,
+eager validation, input immutability and interruption without partial results.
+This is not physical index activation, wire support or uniqueness enforcement.
+The frozen helper subset rejects intermediate/parallel arrays, object/nested-array
+keys, ObjectId/date keys and nonfinite numeric keys; broader MongoDB index values
+remain open. Sparse/partial options are not yet enabled in catalog commands.
+
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required
 real-driver CI also verifies BSON fidelity, ordered/unordered duplicate failures,

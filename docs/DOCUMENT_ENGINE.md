@@ -112,6 +112,41 @@ restart metadata. Descending/numeric-alias normalization, invalid inputs,
 resource limits and legacy metadata preservation are independently tested; no
 frozen expectations or compatibility allowances are changed.
 
+`DocumentIndexKeyGenerator` is the shared, immutable secondary-key foundation,
+not a physical index. It validates key definitions and compiles optional partial
+membership predicates with the existing matcher. Keys expose equality and hashing,
+not ordering or a persistent byte format; callers must scope identities to an index
+and collection. Ascending/descending directions do not change equality.
+
+It generates ordered compound tuples with at most one final array field, removes
+duplicate array entries in encounter order, equates missing with null, and gives
+empty arrays a separate identity. Sparse compound membership requires any indexed
+field to exist (including explicit null). Partial membership is evaluated before
+key extraction; sparse and partial cannot be combined. The partial subset permits
+nonempty `$and`/`$or`, equality, ranges, `$in`, `$type`, and `$exists: true`, with
+all branches eagerly validated. See MongoDB's [multikey](https://www.mongodb.com/docs/manual/core/indexes/index-types/index-multikey/),
+[sparse](https://www.mongodb.com/docs/manual/core/index-sparse/), and
+[partial](https://www.mongodb.com/docs/manual/core/index-partial/) index descriptions.
+
+The exact frozen helper subset rejects intermediate array traversal (including
+numeric path components), parallel arrays, object/nested-array key values,
+ObjectId/date key values, and nonfinite numbers. This is narrower than full MongoDB
+indexing; the built-in ID authority is separate. Code-with-scope keeps recursive,
+ordered BSON identity. Finite numeric aliases share canonical keys while booleans,
+strings, binary subtypes, and code remain distinct. No options are silently degraded.
+
+Generation validates input BSON and has independent per-call limits: 16,384 keys,
+8 MiB conservative charge per scalar/scope, 64 MiB cumulative work/retention charge,
+and one million traversal/work steps. Duplicate values still consume work. Shared
+scalar allocations avoid copying a large compound component into every tuple.
+Partial definitions are bounded to 1 MiB and 4,096 validation nodes, in addition
+to the matcher's own limits. Controlled entry points honor interruption during
+compilation, membership, traversal, deduplication and tuple assembly. Errors return
+no partial key set and do not mutate input or poison the immutable compiler.
+Required CI checks 7,201 cases (29,370 document evaluations) against unchanged
+frozen token equality partitions, order, membership and failures. This does not
+extend the frozen candidate command coverage or turn pending declarations ready.
+
 Namespace drops share the schema-migration gate and require sole-process
 ownership. Preflight errors leave data unchanged; interruption after the durable
 deletion intent requires reopen to finish the drop before ordinary operations
