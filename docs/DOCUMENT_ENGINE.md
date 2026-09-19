@@ -102,7 +102,38 @@ merge; `batch_size` bounds each returned page. An initial batch size of zero
 opens a cursor without reading documents. Continuations require a positive
 batch size and cannot change the original skip or limit.
 
-### Replacement and single-record write boundaries
+### Field updates and single-record write boundaries
+
+`Update` now executes scope `One` with `$set` and `$unset`, using the same
+locked selection/reselection and preflighted write path as replacement. A shared
+`DocumentUpdater` validates every operator, operand, path, and prefix conflict
+before namespace lookup or matching. It bounds specifications to 1 MiB/4,096
+operations, paths to 100 components, conservative retained values to 64 MiB,
+and traversal to one million steps. Cancellation/deadline checks run during
+compilation and application; array extension is charged before allocation.
+
+Only changed paths are edited. Untouched fields retain order and exact BSON
+types; new fields follow specification order. Missing `$set` parents become
+objects. Numeric paths traverse existing arrays (zero-based canonical ASCII
+indices); extension fills gaps with null. `$unset` removes object fields or
+sets an array slot to null without shifting positions; missing paths are no-ops.
+Scalar `$set` parents fail with code 28. Positional paths are unsupported.
+Conflicts/empty path components use codes 40/56; changed or removed `_id` uses
+code 66. Semantically equal ID aliases retain the original representation.
+Operator-assigned zero timestamps remain literal, unlike insert/replacement.
+Stored BSON byte comparison determines modified counts. No-op writes skip SQL.
+
+`DocumentUpdateRequest::with_max_document_bytes` caps the combined post-image,
+including retained fields. Result/plan/post-image checks precede SQL, so validation
+failures leave the record unchanged. Concurrent updates read the current document
+under the write lock rather than applying a stale client-side replacement.
+Scope `Many`, other operators, upsert, and secondary-index maintenance remain
+unimplemented. The 4,008 source-locked oracle cases intentionally cover non-ID
+object paths only: frozen TinyMongo's legacy scalar/array/ID behavior differs.
+Those boundaries have independent unit, transaction, and real-wire tests; the
+frozen corpus and intentional-difference allowances have not been changed.
+
+### Replacement and returned-image boundaries
 
 `Replace` shares the controlled single-record selection/reselection path with
 `FindOneAndDelete`. Exact-ID routes use one immediate write transaction. Other
@@ -577,7 +608,7 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 
 ## Current boundary
 
-Update expressions, replacement upsert, operator-update findAndModify,
+Other update operators, update-many, upsert, operator-update findAndModify,
 additional aggregation expressions/group-key forms,
 database statistics, index metadata cursors, and physical secondary-index builds
 remain later roadmap work. Collection metadata cursors are implemented.

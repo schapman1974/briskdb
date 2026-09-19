@@ -65,6 +65,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `delete_many(database, collection, filter, ...)`
 - `find_one_and_delete(database, collection, filter, *, projection=None, sort=None, ...)`
 - `replace_one(database, collection, filter, replacement, *, upsert=False, ...)`
+- `update_one(database, collection, filter, update, *, upsert=False, ...)`
 - `find_one_and_replace(database, collection, filter, replacement, *, projection=None, sort=None, return_document=False, upsert=False, ...)`
 
 Both delete methods accept the shared BSON filters and return an acknowledged
@@ -91,6 +92,17 @@ fail before writing. Top-level non-ID zero timestamps are stamped; nested values
 are preserved. `upsert=True` is explicitly unsupported in this checkpoint.
 Selection/replacement is atomic on the winning shard, not across shards. The
 usual request/result controls and missing-collection precondition apply.
+
+`update_one` returns the same `UpdateResult` as replacement and edits the first
+matching document atomically on its shard. This checkpoint supports `$set` and
+`$unset`, including dotted object paths and numeric indices in existing arrays.
+Untouched fields/types/order survive; operator-assigned zero timestamps stay
+literal. Missing unset paths are no-ops; unsetting an array slot leaves null.
+Invalid paths, conflicting prefixes, changed/removed IDs, or post-image/result
+limits fail before writing. Positional paths, other operators, `update_many`,
+and `upsert=True` remain unsupported. The normal controls and existing native
+missing-collection precondition apply. See the shared
+[field-update boundaries](../docs/DOCUMENT_ENGINE.md#field-updates-and-single-record-write-boundaries).
 
 `find_one_and_replace` returns `kind="document"` with the projected original
 document by default, or the projected post-image with `return_document=True`.

@@ -26,6 +26,7 @@ use crate::{
         DocumentMutationScope, DocumentNamespace, DocumentPipeline, DocumentProjection,
         DocumentProjector, DocumentQueryError, DocumentReadOptions, DocumentReplaceRequest,
         DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort, DocumentSorter,
+        DocumentUpdate, DocumentUpdateError, DocumentUpdateRequest, DocumentUpdater,
         DocumentWriteOptions, decode_document_batch_with_options, encode_document_with_options,
     },
 };
@@ -91,6 +92,19 @@ impl From<EngineError> for CommandError {
     fn from(error: EngineError) -> Self {
         let mut source = error.source();
         while let Some(cause) = source {
+            if let Some(update) = cause.downcast_ref::<DocumentUpdateError>() {
+                return Self::new(
+                    update.mongo_code(),
+                    match update {
+                        DocumentUpdateError::InvalidExpression => "FailedToParse",
+                        DocumentUpdateError::UnsupportedOperator => "CommandNotSupported",
+                        DocumentUpdateError::InvalidPath => "EmptyFieldName",
+                        DocumentUpdateError::ConflictingPaths => "ConflictingUpdateOperators",
+                        DocumentUpdateError::PathNotViable => "PathNotViable",
+                    },
+                    "invalid document update",
+                );
+            }
             if let Some(mutation) = cause.downcast_ref::<DocumentMutationError>() {
                 return Self::new(
                     mutation.mongo_code(),
@@ -170,7 +184,7 @@ pub(super) enum Command {
     DropDatabase(DocumentDropDatabaseRequest),
     Insert(DocumentInsertRequest),
     Delete(Vec<Result<DocumentDeleteRequest>>, bool),
-    Replace(Vec<Result<DocumentReplaceRequest>>, bool),
+    Updates(Vec<Result<DocumentCommand>>, bool),
     FindAndDelete(DocumentFindOneAndDeleteRequest),
     FindAndReplace(DocumentFindOneAndReplaceRequest),
     Count(DocumentCountRequest),
@@ -581,13 +595,6 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     let Some(BsonValue::Document(replacement)) = statement.get_first("u") else {
                         return Err(CommandError::unsupported());
                     };
-                    if replacement
-                        .iter()
-                        .next()
-                        .is_some_and(|(name, _)| name.starts_with('$'))
-                    {
-                        return Err(CommandError::unsupported());
-                    }
                     DocumentMatcher::compile_with_check(filter, &mut || {
                         if started.elapsed() >= timeout {
                             Err(EngineError::deadline_exceeded(
@@ -597,16 +604,43 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                             Ok(())
                         }
                     })?;
-                    Ok(DocumentReplaceRequest::new(
-                        namespace.clone(),
-                        DocumentFilter::new(filter.clone())?,
-                        replacement.clone(),
-                        DocumentWriteOptions::new(),
-                    )?
-                    .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?)
+                    if replacement
+                        .iter()
+                        .next()
+                        .is_some_and(|(name, _)| name.starts_with('$'))
+                    {
+                        DocumentUpdater::compile_with_check(replacement, &mut || {
+                            if started.elapsed() >= timeout {
+                                Err(EngineError::deadline_exceeded(
+                                    "Mongo command parsing deadline exceeded",
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        })?;
+                        return Ok(DocumentCommand::Update(
+                            DocumentUpdateRequest::new(
+                                namespace.clone(),
+                                DocumentFilter::new(filter.clone())?,
+                                DocumentUpdate::new(replacement.clone())?,
+                                DocumentMutationScope::One,
+                                DocumentWriteOptions::new(),
+                            )
+                            .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?,
+                        ));
+                    }
+                    Ok(DocumentCommand::Replace(
+                        DocumentReplaceRequest::new(
+                            namespace.clone(),
+                            DocumentFilter::new(filter.clone())?,
+                            replacement.clone(),
+                            DocumentWriteOptions::new(),
+                        )?
+                        .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?,
+                    ))
                 })
                 .collect();
-            Command::Replace(
+            Command::Updates(
                 updates,
                 !matches!(
                     request.body.get_first("ordered"),
@@ -1317,7 +1351,7 @@ impl Executor {
                     ("value", value.map_or(BsonValue::Null, BsonValue::Document)),
                 ]))
             }
-            Command::Replace(updates, ordered) => {
+            Command::Updates(updates, ordered) => {
                 let mut matched = 0i64;
                 let mut modified = 0i64;
                 let mut errors = Vec::new();
@@ -1325,19 +1359,15 @@ impl Executor {
                     let result = match update {
                         Err(error) => Err(error),
                         Ok(update) => {
-                            if !self
-                                .exists(session, identity, &context, update.namespace())
-                                .await?
-                            {
+                            let namespace = match &update {
+                                DocumentCommand::Replace(request) => request.namespace(),
+                                DocumentCommand::Update(request) => request.namespace(),
+                                _ => unreachable!("parsed update statement"),
+                            };
+                            if !self.exists(session, identity, &context, namespace).await? {
                                 continue;
                             }
-                            self.call(
-                                session,
-                                identity,
-                                &context,
-                                DocumentCommand::Replace(update),
-                            )
-                            .await
+                            self.call(session, identity, &context, update).await
                         }
                     };
                     match result {
@@ -1353,7 +1383,10 @@ impl Executor {
                             ));
                         }
                         Err(error)
-                            if matches!(error.code, 2 | 9 | 14 | 52 | 66 | 72 | 10334 | 115) =>
+                            if matches!(
+                                error.code,
+                                2 | 9 | 14 | 28 | 40 | 52 | 56 | 66 | 72 | 10334 | 115
+                            ) =>
                         {
                             // These validation/resource failures precede commit (the
                             // whole single-shard transaction rolls back on error).

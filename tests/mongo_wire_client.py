@@ -10,6 +10,71 @@ from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timesta
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
 
 
+def field_update_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_field_update.items
+        original = {"_id": Int64(1), "keep": Binary(b"data", 128), "v": 1, "array": [1, {"x": 2}]}
+        collection.insert_one(original)
+        expression = {"$set": {"v": Int64(1), "nested.0.x": "$literal", "stamp": Timestamp(0, 0)}, "$unset": {"array.0": "ignored"}}
+        result = collection.update_one({"keep": Binary(b"data", 128)}, expression)
+        assert (result.matched_count, result.modified_count, result.upserted_id) == (1, 1, None)
+        expected = {**original, "v": Int64(1), "array": [None, {"x": 2}], "nested": {"0": {"x": "$literal"}}, "stamp": Timestamp(0, 0)}
+        assert BSON.encode(collection.find_one({})) == BSON.encode(expected)
+        assert collection.update_one({"_id": 1.0}, expression).modified_count == 0
+        assert collection.update_one({}, {"$set": {"_id": 1.0}}).modified_count == 0
+        assert collection.update_one({"_id": 99}, {"$set": {}}).matched_count == 0
+        for expression, code in [
+            ({"$set": {"changed": True, "v.x": 1}}, 28),
+            ({"$set": {"_id": 2}}, 66), ({"$unset": {"_id": 1}}, 66),
+            ({"$set": {"a": 1}, "$unset": {"a.x": 1}}, 40),
+            ({"$set": {"a..b": 1}}, 56), ({"$set": {"array.$.x": 1}}, 115),
+            ({"$inc": {"v": 1}}, 115), ({"$set": 1}, 9),
+            ({"$set": {"array.9999999999999999999999999": 1}}, 10334),
+        ]:
+            try:
+                collection.update_one({}, expression)
+            except OperationFailure as error:
+                assert error.code == code, error
+            else:
+                raise AssertionError(("expected update rejection", code))
+            assert BSON.encode(collection.find_one({})) == BSON.encode(expected)
+        capped = client.wire_field_update.capped
+        capped.insert_one({"_id": 1, "old": "x" * 270000})
+        try:
+            capped.update_one({}, {"$set": {"new": "x" * 270000}})
+        except OperationFailure as error:
+            assert error.code == 10334
+        else:
+            raise AssertionError("combined post-image must respect the wire document cap")
+        assert "new" not in capped.find_one({})
+        for ordered in [True, False]:
+            batch = client.wire_field_update[f"batch_{ordered}"]
+            batch.insert_many([{"_id": i, "keep": True, "v": 0} for i in range(3)])
+            reply = client.wire_field_update.command("update", batch.name, ordered=ordered, updates=[
+                {"q": {"_id": 0}, "u": {"$set": {"v": 1}}},
+                {"q": {"_id": 1}, "u": {"$set": {"keep.x": 1}}},
+                {"q": {"_id": 2}, "u": {"v": 2}},
+            ])
+            assert (reply["n"], reply["nModified"]) == ((1, 1) if ordered else (2, 2)), reply
+            assert [(e["index"], e["code"]) for e in reply["writeErrors"]] == [(1, 28)]
+            assert batch.find_one({"_id": 1}) == {"_id": 1, "keep": True, "v": 0}
+        reply = client.absent_field_update.command("update", "items", updates=[{"q": {}, "u": {"$set": {"a": 1}, "$unset": {"a.x": 1}}}])
+        assert reply["writeErrors"][0]["code"] == 40
+        assert client.absent_field_update.items.update_one({}, {"$set": {"x": 1}}).matched_count == 0
+        assert "absent_field_update" not in client.list_database_names()
+        for options in [{"multi": True}, {"upsert": True}, {"arrayFilters": []}]:
+            reply = client.wire_field_update.command("update", "items", updates=[{"q": {}, "u": {"$set": {"x": 1}}, **options}])
+            assert reply["writeErrors"][0]["code"] == 72
+        # Leave room for the driver's monitor sockets within the listener's
+        # deliberate eight-connection admission limit.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda i: collection.update_one({"_id": 1}, {"$set": {f"field{i}": i}}), range(24)))
+        assert all(r.modified_count == 1 for r in results)
+        row = collection.find_one({})
+        assert all(row[f"field{i}"] == i for i in range(24))
+        assert row["keep"] == original["keep"]
+
+
 def find_replace_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_find_replace.items
@@ -123,7 +188,7 @@ def replacement_smoke(uri):
             assert batch.find_one({"_id": 1}) == {"_id": 1, "v": 0}
             assert batch.find_one({"_id": 2})["v"] == (0 if ordered else 1)
         for statement, code in [
-            ({"q": {}, "u": {"$set": {"v": 1}}}, 115),
+            ({"q": {}, "u": {"$inc": {"v": 1}}}, 115),
             ({"q": {}, "u": [{"$set": {"v": 1}}]}, 115),
             ({"q": {}, "u": {}, "multi": True}, 72),
             ({"q": {}, "u": {}, "upsert": True}, 72),
@@ -955,6 +1020,7 @@ def lifecycle_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert client.wire_field_update.items.find_one({"_id": 1})["field23"] == 23
         assert BSON.encode(client.wire_find_replace.items.find_one({"_id": 10})) == BSON.encode({"_id": Int64(10), "value": "persisted", "hidden": True})
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         assert BSON.encode(client.wire_replacement.items.find_one({"_id": 1})) == BSON.encode({"_id": Int64(1), "value": "persisted"})
@@ -1084,6 +1150,14 @@ def metadata_smoke(uri):
 
 
 async def async_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_field_update.items
+        await collection.insert_one({"_id": Int64(1), "value": 1, "keep": True})
+        result = await collection.update_one({"value": 1}, {"$set": {"value": Int64(1)}})
+        assert (result.matched_count, result.modified_count) == (1, 1)
+        assert (await collection.update_one({"_id": 1.0}, {"$set": {"value": Int64(1)}})).modified_count == 0
+        assert (await collection.update_one({}, {"$unset": {"keep": 1}})).modified_count == 1
+        assert BSON.encode(await collection.find_one({})) == BSON.encode({"_id": Int64(1), "value": Int64(1)})
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         collection = client.async_find_replace.items
         await collection.insert_many([{"_id": Int64(i), "rank": i} for i in range(4)])
@@ -1232,6 +1306,7 @@ if __name__ == "__main__":
         delete_smoke(sys.argv[1])
         find_delete_smoke(sys.argv[1])
         replacement_smoke(sys.argv[1])
+        field_update_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

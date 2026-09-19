@@ -5,8 +5,8 @@ use crate::{
     document::{
         BSON_MAX_NESTING_DEPTH, BsonCodecOptions, CanonicalBsonKey, DEFAULT_DOCUMENT_BATCH_SIZE,
         DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest, DocumentMutationError,
-        DocumentReplaceRequest, DocumentRequestId, DocumentSortKey, DocumentUpdateResult,
-        encode_document_with_options,
+        DocumentReplaceRequest, DocumentRequestId, DocumentSortKey, DocumentUpdateRequest,
+        DocumentUpdateResult, DocumentUpdater, encode_document_with_options,
     },
     sqlite_error,
 };
@@ -23,6 +23,10 @@ struct Candidate {
 #[derive(Clone)]
 enum Mutation {
     Delete,
+    Update {
+        updater: Arc<DocumentUpdater>,
+        max_document_bytes: usize,
+    },
     Replace {
         document: Arc<BsonDocument>,
         max_document_bytes: usize,
@@ -52,12 +56,59 @@ impl Mutation {
     fn no_match(&self) -> DocumentResult {
         match self {
             Self::Delete => DocumentResult::Document(None),
+            Self::Update { .. } => ReplacementReturn::Counts.no_match(),
             Self::Replace { returns, .. } => returns.no_match(),
         }
     }
 }
 
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_document_update(
+        &self,
+        owner: ConnectionOwner,
+        request_id: DocumentRequestId,
+        request: DocumentUpdateRequest,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        limits: ResultLimits,
+    ) -> EngineResult<DocumentExecution> {
+        let max_document_bytes = request.max_document_bytes();
+        let (namespace, filter, update, scope, options) = request.into_parts();
+        if scope != DocumentMutationScope::One {
+            return Err(unsupported(
+                "multi-document operator updates are not implemented",
+            ));
+        }
+        require_replacement_options(options)?;
+        let updater = self
+            .run_document_storage_task(
+                cancellation.clone(),
+                deadline,
+                move |cancellation, control| {
+                    DocumentUpdater::compile_with_check(update.document(), &mut || {
+                        ensure_document_cpu_active(cancellation, &control)
+                    })
+                },
+            )
+            .await?;
+        self.run_document_single_mutation(
+            owner,
+            request_id,
+            namespace,
+            filter,
+            DocumentReadOptions::new(),
+            Mutation::Update {
+                updater: Arc::new(updater),
+                max_document_bytes,
+            },
+            cancellation,
+            deadline,
+            limits,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_document_find_delete(
         &self,
@@ -402,6 +453,35 @@ fn mutate_record(
     control: &OperationControl,
 ) -> EngineResult<DocumentExecution> {
     match mutation {
+        Mutation::Update {
+            updater,
+            max_document_bytes,
+        } => {
+            let Some(record) = record else {
+                return Ok(DocumentExecution::new(
+                    request_id,
+                    Some(plan),
+                    mutation.no_match(),
+                ));
+            };
+            let post_image = updater.apply_with_check(record.document(), &mut || {
+                ensure_document_cpu_active(cancellation, control)
+            })?;
+            write_post_image(
+                storage,
+                transaction,
+                record,
+                post_image,
+                *max_document_bytes,
+                ReplacementReturn::Counts,
+                projection,
+                request_id,
+                plan,
+                limits,
+                cancellation,
+                control,
+            )
+        }
         Mutation::Delete => return_and_delete(
             storage,
             transaction,
@@ -449,7 +529,7 @@ fn replace_record(
     cancellation: &CancellationToken,
     control: &OperationControl,
 ) -> EngineResult<DocumentExecution> {
-    let mut check = || ensure_document_cpu_active(cancellation, control);
+    let check = || ensure_document_cpu_active(cancellation, control);
     check()?;
     let Some(record) = record else {
         return Ok(DocumentExecution::new(
@@ -500,6 +580,39 @@ fn replace_record(
             .push(name, value)
             .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
     }
+    write_post_image(
+        storage,
+        transaction,
+        record,
+        post_image,
+        max_document_bytes,
+        returns,
+        projection,
+        request_id,
+        plan,
+        limits,
+        cancellation,
+        control,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_post_image(
+    storage: &Storage,
+    transaction: &Transaction<'_>,
+    record: DocumentStorageRecord,
+    post_image: BsonDocument,
+    max_document_bytes: usize,
+    returns: ReplacementReturn,
+    projection: Option<&DocumentProjector>,
+    request_id: DocumentRequestId,
+    plan: DocumentPlan,
+    limits: ResultLimits,
+    cancellation: &CancellationToken,
+    control: &OperationControl,
+) -> EngineResult<DocumentExecution> {
+    let mut check = || ensure_document_cpu_active(cancellation, control);
+    check()?;
     let bytes = encode_document_with_options(
         &post_image,
         &BsonCodecOptions::new().with_max_document_bytes(max_document_bytes),

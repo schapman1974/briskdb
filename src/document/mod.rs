@@ -23,6 +23,7 @@ mod plan;
 mod projection;
 mod result;
 mod sorting;
+mod update;
 mod value;
 
 pub use aggregation::{DocumentAggregationStream, DocumentAggregator};
@@ -70,6 +71,7 @@ pub use result::{
     DocumentResult, DocumentResultKind, DocumentUpdateResult, DocumentWriteError,
 };
 pub use sorting::{DocumentSortKey, DocumentSorter};
+pub use update::{DocumentUpdateError, DocumentUpdater};
 pub use value::{
     BsonBinary, BsonDateTime, BsonDecimal128, BsonDocument, BsonJavaScript, BsonObjectId,
     BsonRegex, BsonTimestamp, BsonUuid, BsonValue, UuidRepresentation,

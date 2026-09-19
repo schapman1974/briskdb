@@ -516,8 +516,12 @@ requires an earlier dependency:
       timestamps are stamped, nested values are preserved. Rust, native sync/async
       Python, and ordered/unordered wire replacement batches share this path.
       Result/post-image limits and immutable-ID checks precede commit. No global
-      snapshot is claimed. Upsert, operator/array updates, and secondary-index
-      post-image validation remain open.
+      snapshot is claimed. Shared `update_one` now supports `$set`/`$unset`
+      across all three adapters, with object/array paths, eager conflict checks,
+      immutable IDs, exact modified counts, bounded growth, and literal timestamps.
+      4,008 source-locked object-path cases supplement transaction/wire tests.
+      Other operators, update-many, upsert, and secondary-index post-image
+      validation remain open.
     - [ ] [#175](https://github.com/schapman1974/briskdb/issues/175) — filtered
       delete-one/many now use the shared matcher across Rust, native sync/async
       Python, and Mongo wire. Exact IDs stay single-shard; delete-one rechecks
@@ -608,8 +612,8 @@ requires an earlier dependency:
       projection-to-group identity case now uses the shared group stage below.
       All frozen aggregation projection-stage and application aggregation cases
       now pass through the real four-shard endpoint in both API modes. Combined
-      with the basic/group-accumulator suites and the full-document replacement
-      contract, required CI checks exactly 144 frozen executions and
+      with the basic/group-accumulator suites, replacement, and three additional
+      application write/identity contracts, required CI checks exactly 150 frozen executions and
       rejects missing, duplicated, substituted, or skipped cases. The full
       456-execution corpus remains separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared

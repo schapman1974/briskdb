@@ -73,6 +73,10 @@ impl BsonDocument {
         self.entries
     }
 
+    pub(super) fn entries_mut(&mut self) -> &mut Vec<(String, BsonValue)> {
+        &mut self.entries
+    }
+
     pub fn get_first(&self, name: &str) -> Option<&BsonValue> {
         self.entries
             .iter()

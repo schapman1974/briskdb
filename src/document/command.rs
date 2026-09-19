@@ -829,6 +829,7 @@ pub struct DocumentUpdateRequest {
     update: DocumentUpdate,
     scope: DocumentMutationScope,
     write_options: DocumentWriteOptions,
+    max_document_bytes: usize,
 }
 
 impl DocumentUpdateRequest {
@@ -845,7 +846,20 @@ impl DocumentUpdateRequest {
             update,
             scope,
             write_options,
+            max_document_bytes: super::BSON_MAX_DOCUMENT_BYTES,
         }
+    }
+
+    pub fn with_max_document_bytes(mut self, bytes: usize) -> EngineResult<Self> {
+        if !(5..=super::BSON_MAX_DOCUMENT_BYTES).contains(&bytes) {
+            return Err(invalid_argument("invalid updated document byte limit"));
+        }
+        self.max_document_bytes = bytes;
+        Ok(self)
+    }
+
+    pub const fn max_document_bytes(&self) -> usize {
+        self.max_document_bytes
     }
 
     pub const fn namespace(&self) -> &DocumentNamespace {
