@@ -35,6 +35,76 @@ impl fmt::Display for DocumentCursorError {
 
 impl Error for DocumentCursorError {}
 
+/// Payload-free failures for document-index lifecycle operations.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentIndexError {
+    NotFound,
+    Protected,
+}
+
+impl DocumentIndexError {
+    pub const fn mongo_code(self) -> i32 {
+        match self {
+            Self::NotFound => 27,
+            Self::Protected => 72,
+        }
+    }
+
+    pub(crate) fn into_engine_error(self) -> EngineError {
+        EngineError::from_source(
+            match self {
+                Self::NotFound => EngineErrorKind::FailedPrecondition,
+                Self::Protected => EngineErrorKind::InvalidArgument,
+            },
+            self.to_string(),
+            self,
+        )
+    }
+}
+
+impl fmt::Display for DocumentIndexError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotFound => "document index not found",
+            Self::Protected => "the built-in document ID index cannot be dropped",
+        })
+    }
+}
+
+impl Error for DocumentIndexError {}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    #[test]
+    fn index_lifecycle_errors_retain_typed_payload_free_causes() {
+        for (cause, kind, code) in [
+            (
+                DocumentIndexError::NotFound,
+                EngineErrorKind::FailedPrecondition,
+                27,
+            ),
+            (
+                DocumentIndexError::Protected,
+                EngineErrorKind::InvalidArgument,
+                72,
+            ),
+        ] {
+            assert_eq!(cause.mongo_code(), code);
+            let error = cause
+                .into_engine_error()
+                .context("internal catalog operation");
+            assert_eq!(error.kind(), kind);
+            assert_eq!(
+                error.source().unwrap().downcast_ref::<DocumentIndexError>(),
+                Some(&cause)
+            );
+        }
+    }
+}
+
 /// Payload-free validation failures for document mutations.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

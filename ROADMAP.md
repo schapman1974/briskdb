@@ -625,6 +625,10 @@ requires an earlier dependency:
       drops without reuse. The version-17 manifest migration preserves exact
       legacy/import metadata; checksummed coverage, allocator exhaustion and
       rollback are tested. IDs do not change Python/wire metadata shapes.
+      Rust and native sync/async Python can now drop one pending declaration by
+      exact name. Built-in protection, pre-commit controls/budgets, concurrent
+      drops, crash recovery and ID non-reuse are covered. Physical-index drops,
+      wire commands and wildcard/field-alias removal remain open.
       This helper does
       not enable sparse/partial catalog options or activate indexes; physical build/recovery, write-time
       maintenance, wire index commands and metadata cursors remain open.

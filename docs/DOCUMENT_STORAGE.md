@@ -140,6 +140,14 @@ finishes the remaining shard prefix before publishing Ready. The crash suite
 exits a child process before/after intent, each shard transaction, each progress
 acknowledgement, and finalization, for both drop scopes with/without survivors.
 
+Pending secondary declarations can also be removed individually by exact name.
+The built-in index is protected. Declaration deletion, its identity-map cascade
+and semantic-root refresh commit atomically; the permanent allocation head does
+not decrease. No shard row or schema changes. A pre-commit process exit restores
+the declaration and ID on reopen; a post-commit exit preserves their absence.
+This metadata-only path rejects non-pending secondary lifecycles and does not
+stand in for a future recoverable physical-index drop.
+
 ## TinyMongo SQLite import
 
 Feature `tinymongo-import` selects `documents` and `sqlite-import`. Its public

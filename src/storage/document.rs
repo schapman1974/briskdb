@@ -153,8 +153,8 @@ mod enabled {
         document::{
             BsonDocument, BsonErrorContext, BsonValue, CanonicalBsonKey, DocumentCatalog,
             DocumentCollectionId, DocumentCollectionMetadata, DocumentCollectionOptions,
-            DocumentDatabaseId, DocumentIndexId, DocumentIndexLifecycle, DocumentIndexMetadata,
-            DocumentPlacement, encode_document,
+            DocumentDatabaseId, DocumentIndexError, DocumentIndexId, DocumentIndexLifecycle,
+            DocumentIndexMetadata, DocumentPlacement, encode_document,
         },
         sqlite_error,
     };
@@ -1050,6 +1050,88 @@ mod enabled {
                 false,
                 DocumentIndexLifecycle::PendingBuild,
             ))
+        }
+
+        /// Remove one pending declaration by exact name under Engine-held schema
+        /// admission. Physical indexes will require a separate recoverable drop.
+        pub(crate) fn drop_pending_document_index_controlled(
+            &self,
+            collection_id: DocumentCollectionId,
+            name: &str,
+            control: Arc<OperationControl>,
+        ) -> EngineResult<()> {
+            let result = (|| {
+                ensure_control_active(&control, "before dropping pending document index")?;
+                if matches!(name, "_id" | "_id_") {
+                    return Err(DocumentIndexError::Protected.into_engine_error());
+                }
+                if name.is_empty()
+                    || name.len() > manifest::MAX_DOCUMENT_INDEX_NAME_BYTES
+                    || name.contains('\0')
+                {
+                    return Err(EngineError::new(
+                        EngineErrorKind::InvalidArgument,
+                        "document index name is invalid",
+                    ));
+                }
+                let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+                run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
+                    configure_journal_mode(connection)?;
+                    let transaction = connection
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .map_err(sqlite_error::storage)?;
+                    require_ready_manifest(&transaction, self.shard_count())?;
+                    require_active_collection(&transaction, collection_id)?;
+                    let state = transaction
+                        .query_row(
+                            "SELECT is_builtin, lifecycle_state FROM briskdb_document_indexes
+                         WHERE collection_id = ?1 AND index_name = ?2",
+                            params![to_sqlite_id(collection_id)?, name],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                        )
+                        .optional()
+                        .map_err(sqlite_error::storage)?;
+                    let (built_in, lifecycle) =
+                        state.ok_or_else(|| DocumentIndexError::NotFound.into_engine_error())?;
+                    if built_in != 0 {
+                        return Err(DocumentIndexError::Protected.into_engine_error());
+                    }
+                    if lifecycle != INDEX_PENDING_BUILD {
+                        return Err(corrupt(
+                            "secondary document index is marked ready before physical index support",
+                        ));
+                    }
+                    let changed = transaction
+                        .execute(
+                            "DELETE FROM briskdb_document_indexes
+                         WHERE collection_id = ?1 AND index_name = ?2
+                           AND is_builtin = 0 AND lifecycle_state = ?3",
+                            params![to_sqlite_id(collection_id)?, name, INDEX_PENDING_BUILD],
+                        )
+                        .map_err(sqlite_error::storage)?;
+                    if changed != 1 {
+                        return Err(corrupt(
+                            "pending document index removal did not remove exactly one declaration",
+                        ));
+                    }
+                    // The identity mapping cascades; its permanent allocator is
+                    // intentionally untouched, including when the last secondary disappears.
+                    manifest::validate_document_catalog(&transaction, self.shard_count())?;
+                    manifest::refresh_manifest_digest(&transaction)?;
+                    require_ready_manifest(&transaction, self.shard_count())?;
+                    ensure_control_active(
+                        &control,
+                        "before committing pending document index removal",
+                    )?;
+                    #[cfg(test)]
+                    deletion_crash_checkpoint("index-before-commit", 0);
+                    transaction.commit().map_err(sqlite_error::storage)?;
+                    #[cfg(test)]
+                    deletion_crash_checkpoint("index-after-commit", 0);
+                    Ok(())
+                })
+            })();
+            self.fail_closed_on_corruption(result)
         }
 
         /// Validate and encode one document once before routing its write.
@@ -3086,6 +3168,92 @@ mod enabled {
 
         fn document(entries: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocument {
             BsonDocument::from_entries(entries).unwrap()
+        }
+
+        #[test]
+        fn pending_index_drop_crash_child() {
+            let Ok(root) = std::env::var("BRISKDB_TEST_DOCUMENT_INDEX_DROP_ROOT") else {
+                return;
+            };
+            let storage = Storage::open(root, 2).unwrap();
+            let collection = storage
+                .document_catalog()
+                .unwrap()
+                .collection("app", "one")
+                .unwrap()
+                .id();
+            let _admission = storage.enter_schema_operation().unwrap();
+            storage
+                .drop_pending_document_index_controlled(
+                    collection,
+                    "pending",
+                    OperationControl::new(None),
+                )
+                .unwrap();
+            panic!("configured index drop crash checkpoint was not reached");
+        }
+
+        #[test]
+        fn pending_index_drop_crash_boundaries_preserve_rows_and_allocator() {
+            for (checkpoint, committed) in [
+                ("index-before-commit:0", false),
+                ("index-after-commit:0", true),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let storage = Storage::open(temp.path(), 2).unwrap();
+                let collection = storage
+                    .create_document_collection("app", "one", &DocumentCollectionOptions::empty())
+                    .unwrap();
+                let spec = document([("a", BsonValue::Int64(1))]);
+                let index = storage
+                    .declare_document_index(collection.id(), "pending", &spec, true)
+                    .unwrap();
+                storage
+                    .insert_document(
+                        collection.id(),
+                        &document([("_id", BsonValue::Int32(7)), ("a", BsonValue::Int32(8))]),
+                    )
+                    .unwrap();
+                drop(storage);
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "storage::document::enabled::tests::pending_index_drop_crash_child",
+                        "--nocapture",
+                    ])
+                    .env("BRISKDB_TEST_DOCUMENT_INDEX_DROP_ROOT", temp.path())
+                    .env("BRISKDB_TEST_DOCUMENT_DROP_CRASH", checkpoint)
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    result.status.code(),
+                    Some(73),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let storage = Storage::open(temp.path(), 2).unwrap();
+                let catalog = storage.document_catalog().unwrap();
+                let recovered = catalog.collection("app", "one").unwrap();
+                assert_eq!(recovered.indexes()[0].id(), collection.indexes()[0].id());
+                assert_eq!(storage.document_count(collection.id()).unwrap(), 1);
+                let retained = recovered
+                    .indexes()
+                    .iter()
+                    .find(|index| index.name() == "pending");
+                assert_eq!(retained.is_none(), committed);
+                if let Some(retained) = retained {
+                    assert_eq!(retained.id(), index.id());
+                    assert!(retained.specification().representation_eq(&spec));
+                }
+                let redeclared = storage
+                    .declare_document_index(collection.id(), "pending", &spec, true)
+                    .unwrap();
+                if committed {
+                    assert!(redeclared.id() > index.id());
+                } else {
+                    assert_eq!(redeclared.id(), index.id());
+                }
+            }
         }
 
         #[test]

@@ -133,6 +133,9 @@ pending secondary indexes. The version-17 manifest upgrade preserves existing
 specification bytes; declarations and allocation commit together, and committed
 namespace drops never recycle IDs. These IDs are not new wire/Python fields and
 do not activate physical indexes, uniqueness enforcement, or index cursors.
+Native Rust/Python can remove a pending declaration by exact name, with built-in
+ID protection, transactional identity cleanup and non-reuse on recreation. This
+does not add the Mongo wire `dropIndexes` command or wildcard/field-alias removal.
 
 `listDatabases` on `admin` supports `nameOnly: true`, including ordinary
 sync/async PyMongo `list_database_names()` and

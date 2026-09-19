@@ -118,6 +118,19 @@ restart metadata. Descending/numeric-alias normalization, invalid inputs,
 resource limits and legacy metadata preservation are independently tested; no
 frozen expectations or compatibility allowances are changed.
 
+`DropIndex` now removes one pending declaration by its exact, case-sensitive name.
+It protects both `_id` and `_id_`, reports a typed not-found error for an absent
+index, and never interprets field aliases, key patterns or `*` as bulk selectors
+(`*` can still be an exact native index name). It neither creates a missing
+collection nor touches document rows or SQL indexes. Deletion, identity-map
+cascade and checksum refresh share one manifest transaction; the allocation
+high-water mark is retained, so recreating the name gets a new index ID.
+Result-budget and request-control failures before commit leave the declaration
+unchanged. A successful commit returns `Acknowledged(true)` without a later
+cancellation check turning that committed removal into an apparent failure.
+Crash tests cover both sides of commit. Physical-index deletion and Mongo wire
+`dropIndexes` remain future work.
+
 `DocumentIndexKeyGenerator` is the shared, immutable secondary-key foundation,
 not a physical index. It validates key definitions and compiles optional partial
 membership predicates with the existing matcher. Keys expose equality and hashing,

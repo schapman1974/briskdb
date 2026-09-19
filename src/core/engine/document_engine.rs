@@ -36,8 +36,8 @@ use crate::{
         BSON_MAX_DECODED_BYTES, BsonDocument, BsonErrorContext, BsonObjectId, BsonTimestamp,
         BsonValue, DocumentCollectionId, DocumentCollectionMetadata, DocumentCollectionOptions,
         DocumentCommand, DocumentCursorError, DocumentDeleteResult, DocumentExecution,
-        DocumentFilter, DocumentIndexMetadata, DocumentInsertResult, DocumentMatcher,
-        DocumentMutationScope, DocumentNamespace, DocumentPlan, DocumentPointPlan,
+        DocumentFilter, DocumentIndexError, DocumentIndexMetadata, DocumentInsertResult,
+        DocumentMatcher, DocumentMutationScope, DocumentNamespace, DocumentPlan, DocumentPointPlan,
         DocumentProjector, DocumentReadOptions, DocumentRequest, DocumentResult,
         DocumentScatterPlan, DocumentSorter, DocumentWriteError, DocumentWriteOptions,
         MAX_DOCUMENT_REQUEST_BYTES, encode_document,
@@ -961,9 +961,42 @@ impl Engine {
                 )
                 .await
             }
-            DocumentCommand::DropIndex(_) => Err(unsupported(
-                "this document command is modeled but requires a later document-semantics milestone",
-            )),
+            DocumentCommand::DropIndex(request) => {
+                let (namespace, name, options) = request.into_parts();
+                require_catalog_write_options(options)?;
+                if matches!(name.as_str(), "_id" | "_id_") {
+                    return Err(DocumentIndexError::Protected.into_engine_error());
+                }
+                // Preflight the exact acknowledgement before any manifest mutation.
+                enforce_execution_result_limits(
+                    &DocumentExecution::new(request_id, None, DocumentResult::Acknowledged(true)),
+                    result_limits,
+                )?;
+                self.run_document_storage_task(
+                    cancellation,
+                    deadline,
+                    move |cancellation, control| {
+                        let collection = storage.document_collection_controlled(
+                            namespace.database(),
+                            namespace.collection(),
+                            Arc::clone(&control),
+                        )?;
+                        let collection_id = require_collection(collection)?.id();
+                        ensure_document_cpu_active(cancellation, &control)?;
+                        storage.drop_pending_document_index_controlled(
+                            collection_id,
+                            &name,
+                            control,
+                        )
+                    },
+                )
+                .await?;
+                Ok(DocumentExecution::new(
+                    request_id,
+                    None,
+                    DocumentResult::Acknowledged(true),
+                ))
+            }
             DocumentCommand::CreateCollection(_)
             | DocumentCommand::DropCollection(_)
             | DocumentCommand::DropDatabase(_) => Err(EngineError::new(
