@@ -19,7 +19,7 @@ CI and byte-compares the normalized result with the checked-in reference. The
 full report remains `reference-only`; partial candidate coverage is not folded
 into that report or treated as full parity.
 
-Required CI separately runs 186 exact sync/async executions in the frozen
+Required CI separately runs 196 exact sync/async executions in the frozen
 `test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
 `test_aggregation_contract`, `test_group_accumulators_contract`, and
 `test_client_read_fidelity_contract` modules,
@@ -32,6 +32,8 @@ rename, numeric paths, operand/target errors, conflicts, and immutable IDs),
 plus literal pull-all equality and pull-all non-array target errors
 (two additional cases in both API modes),
 and the add-to-set non-array atomicity case through both update-one/update-many,
+plus five push/array-modifier cases covering bounded arrays, modifier order,
+plain push/add-to-set regressions, invalid modifiers, and non-array push targets,
 against a real four-shard BriskDB listener.
 It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
 cleanup. The JUnit result is checked against the exact locked case/API set;
@@ -292,7 +294,7 @@ validation remains eager. `remove:true` cannot be combined with `update` or
 `new:true`. Pipeline updates and upsert remain unsupported. Native
 sync/async Python exposes `find_one_and_replace` with the same semantics.
 
-Operator `findAndModify` accepts `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`
+Operator `findAndModify` accepts `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`
 documents in `update`, with the
 same query/sort/projection and boolean `new` options, through `FindOneAndUpdate`.
 It preserves untouched fields and shares operator validation, immutable-ID
@@ -301,7 +303,7 @@ return an image; projected `{}` still sets `n:1` and `updatedExisting:true`.
 Missing namespaces return null without creation after eager validation. Native
 sync/async Python exposes `find_one_and_update` with identical image semantics.
 
-Wire `update` supports replacement statements and `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll` operator
+Wire `update` supports replacement statements and `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push` operator
 statements (`q` and a document `u`,
 `upsert:false`) through shared `Replace`/`Update`. Only operator documents accept
 `multi:true`; replacement remains single-document. Both body arrays and
@@ -339,10 +341,16 @@ commit. Add-to-set supports literal values and `$each`, retaining existing
 duplicates/types; pull-all removes all literal BSON-equal matches. Numeric aliases
 compare equal, booleans stay distinct, and document field order matters. Strict
 numeric paths, operand/target errors, growth, comparison work, and cancellation
-are bounded. Its 16,245 source-locked update oracle cases include 4,008 object-only
-set/unset, 4,719 min/max, 3,078 pop/rename, and 4,440 array-membership cases. The
+are bounded. Push supports literal values and `$each`/`$position`/`$sort`/`$slice`,
+always inserting, stably sorting, then slicing. Scalar sort compares whole BSON
+values; compound sort follows the frozen document-only selectors, not query-sort
+array selection. Integral numeric positions/slices clamp at array boundaries.
+Scratch/comparison work and temporary growth remain bounded before final slicing.
+Its 20,704 source-locked update oracle cases include 4,008 object-only
+set/unset, 4,719 min/max, 3,078 pop/rename, 4,440 array-membership, and 4,459 push cases. The
 membership subset excludes ID writes and uses object-only add-to-set paths:
-legacy reference helpers restore IDs/overwrite scalar parents instead of
+push subset covers non-ID object/array paths. These
+legacy reference helpers restore IDs (and add-to-set overwrites scalar parents) instead of
 enforcing BriskDB's stricter safety rules. These boundaries have independent
 tests, not frozen allowances or rewritten expected results. Independent
 tests check resource and commit limits. Additional update operators and index metadata cursors remain

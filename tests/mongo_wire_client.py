@@ -31,6 +31,64 @@ def rolled_back_batch_smoke(database, collection, expression, code):
     assert [BSON.encode(row) for row in collection.find({})] == before
 
 
+def push_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_push.items
+        collection.insert_many([{"_id": Int64(i), "values": [Int64(3)], "keep": True} for i in range(12)])
+        expression = {"$push": {"values": {"$slice": 3, "$sort": 1, "$position": -1, "$each": [2, 1]}}}
+        result = collection.update_many({}, expression)
+        assert (result.matched_count, result.modified_count) == (12, 12)
+        assert collection.update_many({}, {"$push": {"values": {"$each": []}}}).modified_count == 0
+        assert BSON.encode({"v": collection.find_one({"_id": 0})["values"]}) == BSON.encode({"v": [1, 2, Int64(3)]})
+        assert collection.find_one_and_update({}, {"$push": {"values": [4, 5]}}, sort=[("_id", -1)], projection={"values": 1, "_id": 0}) == {"values": [1, 2, Int64(3)]}
+        assert collection.find_one_and_update({"_id": 11}, {"$push": {"values": {"$each": [Timestamp(0, 0), Binary(b"value", 128)], "$slice": -3}}}, return_document=True, projection={"values": 1, "_id": 0}) == {"values": [[4, 5], Timestamp(0, 0), Binary(b"value", 128)]}
+        before = BSON.encode(collection.find_one({"_id": 0}))
+        for expression, code in [
+            ({"$push": {"keep": 1}}, 2),
+            ({"$push": {"values": {"$each": None}}}, 2),
+            ({"$push": {"values": {"$each": [], "$slice": True}}}, 2),
+            ({"$push": {"values": {"$each": [], "$position": 0.5}}}, 2),
+            ({"$push": {"values": {"$each": [], "$sort": {}}}}, 2),
+            ({"$push": {"values.0.x": 1}}, 28),
+            ({"$push": {"values.01": 1}}, 28),
+        ]:
+            try:
+                collection.update_one({"_id": 0}, {"$set": {"atomic_marker": True}, **expression})
+            except OperationFailure as error:
+                assert error.code == code
+            else:
+                raise AssertionError("expected push rejection")
+            assert BSON.encode(collection.find_one({"_id": 0})) == before
+        rolled_back_batch_smoke(client.wire_push, collection, {"$push": {"keep": 1}}, 2)
+        identity = client.wire_push.identity
+        identity.insert_one({"_id": {"values": [1]}, "keep": True})
+        try:
+            identity.update_one({}, {"$push": {"_id.values": 2}})
+        except WriteError as error:
+            assert error.code == 66
+        else:
+            raise AssertionError("push must preserve identity")
+        assert identity.find_one()["_id"] == {"values": [1]}
+        queue = client.wire_push.concurrent
+        queue.insert_one({"_id": 1, "values": []})
+        def append(worker):
+            return sum(queue.update_one({}, {"$push": {"values": worker * 8 + step}}).modified_count for step in range(8))
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            assert sum(pool.map(append, range(4))) == 32
+        assert sorted(queue.find_one()["values"]) == list(range(32))
+        capped = client.wire_push.capped
+        capped.insert_one({"_id": 1, "values": ["x" * 280000]})
+        try:
+            capped.update_one({}, {"$push": {"values": "y" * 280000}})
+        except OperationFailure:
+            pass
+        else:
+            raise AssertionError("oversized push must fail before commit")
+        assert capped.find_one()["values"] == ["x" * 280000]
+        assert capped.update_one({}, {"$push": {"values": {"$each": ["y" * 280000], "$slice": -1}}}).modified_count == 1
+        assert capped.find_one()["values"] == ["y" * 280000]
+
+
 def array_membership_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_membership.items
@@ -1275,6 +1333,9 @@ def persisted_smoke(uri):
         assert sorted(client.wire_membership.concurrent.find_one()["values"]) == list(range(4))
         assert client.wire_membership.items.find_one({"_id": 11})["nested"] == {"0": {"values": []}}
         assert client.wire_membership.capped.find_one()["values"] == ["x" * 280000]
+        assert sorted(client.wire_push.concurrent.find_one()["values"]) == list(range(32))
+        assert client.wire_push.items.find_one({"_id": 11})["values"] == [[4, 5], Timestamp(0, 0), Binary(b"value", 128)]
+        assert client.wire_push.capped.find_one()["values"] == ["y" * 280000]
         assert client.wire_min_max.items.count_documents({"low": -32, "high": 32, "keep": True}) == 24
         row = client.wire_find_update.items.find_one({"_id": 10})
         assert row["rank"] == -1 and row["done"] is True and "group" not in row and row["stamp"] == Timestamp(0, 0)
@@ -1406,6 +1467,22 @@ def metadata_smoke(uri):
                 raise AssertionError(f"unsupported metadata command accepted: {command}")
         assert "rejected" not in database.list_collection_names()
         assert list(database.list_collections(nameOnly=True, authorizedCollections=True, filter={"info": {"$exists": True}})) == []
+
+
+async def async_push_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_push.items
+        await collection.insert_many([{"_id": i, "values": [Int64(3)]} for i in range(4)])
+        result = await collection.update_many({}, {"$push": {"values": {"$each": [2, 1], "$sort": 1}}})
+        assert (result.matched_count, result.modified_count) == (4, 4)
+        assert (await collection.update_one({}, {"$push": {"values": {"$each": []}}})).modified_count == 0
+        assert await collection.find_one_and_update({}, {"$push": {"values": {"$each": [4], "$slice": -2}}}, sort=[("_id", -1)], projection={"values": 1, "_id": 0}, return_document=True) == {"values": [Int64(3), 4]}
+        try:
+            await collection.update_many({}, {"$push": {"_id": 1}})
+        except WriteError as error:
+            assert error.code == 2
+        else:
+            raise AssertionError("async confirmed rollback must be a WriteError")
 
 
 async def async_array_membership_smoke(uri):
@@ -1626,10 +1703,12 @@ if __name__ == "__main__":
         min_max_smoke(sys.argv[1])
         pop_rename_smoke(sys.argv[1])
         array_membership_smoke(sys.argv[1])
+        push_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
         # Give the added operator cases their own bounded phase; retain the
         # existing discovery/CRUD phase's deadline as the suite grows.
         asyncio.run(asyncio.wait_for(async_pop_rename_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_array_membership_smoke(sys.argv[1]), timeout=20))
+        asyncio.run(asyncio.wait_for(async_push_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

@@ -107,7 +107,7 @@ batch size and cannot change the original skip or limit.
 ### Field updates and single-record write boundaries
 
 `Update` executes scopes `One` and `Many` with `$set`, `$unset`, `$min`, `$max`,
-`$pop`, `$rename`, `$addToSet`, and `$pullAll`, using the same
+`$pop`, `$rename`, `$addToSet`, `$pullAll`, and `$push`, using the same
 locked selection/reselection and preflighted write path as replacement. A shared
 `DocumentUpdater` validates every operator, operand, path, and prefix conflict
 before namespace lookup or matching. It bounds specifications to 1 MiB/4,096
@@ -162,6 +162,24 @@ in order. See Mongo's [$addToSet](https://www.mongodb.com/docs/manual/reference/
 and [$pullAll](https://www.mongodb.com/docs/manual/reference/operator/update/pullall/)
 definitions. Specification/element encounter order follows the frozen contract.
 
+`$push` appends one literal value (including a whole array), or uses `$each` with
+optional `$position`, `$sort`, and `$slice`. Processing is always insertion,
+stable sorting, then slicing, regardless of modifier field order. Missing targets
+become arrays, including empty `$each`; non-array targets and malformed modifiers
+fail with code 2. Positions count from the beginning or backward from the old
+array's end and clamp at the boundaries. Positive slices keep the prefix,
+negative slices keep the suffix, and zero clears the array. Finite integral BSON
+numbers are accepted, excluding booleans; huge integers clamp without expansion.
+Scalar sort compares whole BSON values. Compound sort supports at most 32 fields
+with 100 components each, follows documents only, and treats missing/scalar/array
+traversal as null, matching the frozen helper rather than query-sort array
+selection. Stable ties preserve stored types and encounter order. A fallible
+index merge charges scratch/output slots, comparisons, traversal, and cancellation
+before moving values. Temporary growth is bounded even when slicing discards it;
+the persisted document-size cap applies to the final post-image. See Mongo's
+[$push](https://www.mongodb.com/docs/manual/reference/operator/update/push/)
+definition; exact sorting and field-processing behavior follows the frozen input.
+
 Only changed paths are edited. Untouched fields retain order and exact BSON
 types; new fields follow specification order. Missing `$set` parents become
 objects. Numeric paths traverse existing arrays (zero-based canonical ASCII
@@ -178,7 +196,7 @@ including retained fields. Result/plan/post-image checks precede SQL, so validat
 failures leave the record unchanged. Concurrent updates read the current document
 under the write lock rather than applying a stale client-side replacement.
 Other operators, upsert, and secondary-index maintenance remain
-unimplemented. Of 16,245 source-locked update oracle cases, the original 4,008
+unimplemented. Of 20,704 source-locked update oracle cases, the original 4,008
 set/unset cases intentionally cover non-ID object paths only: frozen TinyMongo's
 legacy scalar/array/ID behavior differs. The 4,719 min/max cases additionally
 cover whole-value ordering, numeric array paths, scalar/null path errors,
@@ -186,7 +204,11 @@ immutable IDs, and conflicts. Another 3,078 cases cover pop/rename values, paths
 operand errors, missing fields, and identity. The additional 4,440 array-membership
 cases exclude ID writes; add-to-set cases use object paths only. Frozen legacy
 membership helpers silently restore changed IDs, and add-to-set overwrites
-scalar parents/does not implement numeric array paths. BriskDB rejects changed
+scalar parents/does not implement numeric array paths. Another 4,459 push cases
+cover object/array paths, blocked parents, values, fixed modifier
+order, numeric boundaries, stable compound sorting, slicing, and invalid operands
+without ID writes because frozen push also silently restores IDs.
+Across these legacy differences, BriskDB rejects changed
 IDs and blocked parents; independent tests cover those stricter boundaries,
 without changing frozen corpus/allowances. Independent unit, transaction, and real-wire tests
 check resource and commit boundaries. Frozen source, corpus, and intentional-

@@ -97,7 +97,7 @@ usual request/result controls and missing-collection precondition apply.
 
 `update_one` returns the same `UpdateResult` as replacement and edits the first
 matching document atomically on its shard. This checkpoint supports `$set`,
-`$unset`, `$min`, `$max`, `$pop`, `$rename`, `$addToSet`, and `$pullAll`, with dotted paths and numeric
+`$unset`, `$min`, `$max`, `$pop`, `$rename`, `$addToSet`, `$pullAll`, and `$push`, with dotted paths and numeric
 indices in existing arrays except rename's object-only traversal.
 Min/max compare whole BSON values, including null and arrays;
 equal values preserve their stored types. Missing fields/array slots receive the
@@ -113,6 +113,12 @@ Numeric aliases compare equal, booleans remain distinct, and document field
 order matters. Missing add-to-set targets become arrays (even with empty `$each`);
 missing pull-all targets are no-ops. Non-array targets and malformed modifiers
 fail atomically. Equality work and growth are bounded, including no-op updates.
+Push appends a literal value or uses `$each` with `$position`, `$sort`, and `$slice`,
+always inserting, stably sorting, then slicing. Integral numeric positions/slices
+clamp at array boundaries. Scalar sort compares whole BSON values; compound sort
+follows document-only selectors (missing/array traversal is null), not query-sort
+array selection. Temporary growth and sort work are bounded even when trimmed;
+the document-size cap applies after slicing. Missing push targets become arrays.
 Untouched fields/types/order survive; operator-assigned zero timestamps stay
 literal. Missing unset paths are no-ops; unsetting an array slot leaves null.
 Invalid paths, conflicting prefixes, changed/removed IDs, or post-image/result
@@ -140,7 +146,7 @@ controls. `upsert=True` remains unsupported.
 
 `find_one_and_update` has the same return shape, projection/sort and boolean
 `return_document` options, request controls, and pre-commit output checks. It
-applies the same eight operators through the shared update engine, retaining untouched
+applies the same nine operators through the shared update engine, retaining untouched
 fields and exact ID representation. No match returns `document=None`, and
 no-op updates still return the selected image. Projection may produce `{}`
 without losing the match. Other operators and upsert remain unsupported.
