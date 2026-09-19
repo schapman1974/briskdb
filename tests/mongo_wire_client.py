@@ -31,6 +31,81 @@ def rolled_back_batch_smoke(database, collection, expression, code):
     assert [BSON.encode(row) for row in collection.find({})] == before
 
 
+def operator_upsert_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_operator_upsert.items
+        for method, identifier in [(collection.update_one, None), (collection.update_many, Int64(2))]:
+            result = method({"_id": identifier, "counter": 3}, {"$inc": {"counter": 2}, "$set": {"stamp": Timestamp(0, 0)}}, upsert=True)
+            assert result.did_upsert and result.modified_count == 0
+            assert result.matched_count == (1 if identifier is None else 0)
+            assert BSON.encode({"v": result.upserted_id}) == BSON.encode({"v": identifier})
+            assert BSON.encode(collection.find_one({"_id": identifier})) == BSON.encode({"_id": identifier, "counter": 5, "stamp": Timestamp(0, 0)})
+            result = method({"_id": identifier}, {"$inc": {"counter": 2}}, upsert=True)
+            assert (result.matched_count, result.modified_count, result.did_upsert) == (1, 1, False)
+        assert collection.update_one({"tag": "chosen"}, {"$set": {"_id": "chosen"}}, upsert=True).upserted_id == "chosen"
+        assert isinstance(collection.update_many({"tag": "generated"}, {"$inc": {"counter": 1}}, upsert=True).upserted_id, ObjectId)
+        dotted = client.wire_operator_upsert.dotted
+        for method, identifier in [(dotted.update_one, Int64(1)), (dotted.update_many, Int64(2))]:
+            result = method({"_id.a": identifier, "_id.b": {"$eq": None}}, {"$inc": {"counter": 1}}, upsert=True)
+            assert BSON.encode({"v": result.upserted_id}) == BSON.encode({"v": {"a": identifier, "b": None}})
+            assert dotted.find_one({"_id": result.upserted_id}) == {"_id": result.upserted_id, "counter": 1}
+            result = method({"_id.ignored": {"$gt": 1}, "tag": identifier}, {"$set": {}}, upsert=True)
+            assert isinstance(result.upserted_id, ObjectId)
+        for multi in [False, True]:
+            for ordered in [True, False]:
+                batch = client.wire_operator_upsert[f"batch_{multi}_{ordered}"]
+                reply = batch.database.command("update", batch.name, ordered=ordered, updates=[
+                    {"q": {"_id": None}, "u": {"$inc": {"counter": 1}}, "multi": multi, "upsert": True},
+                    {"q": {"a": 1, "a.b": 2}, "u": {"$set": {}}, "multi": multi, "upsert": True},
+                    {"q": {"missing": True}, "u": {"$set": {"_id": None}}, "multi": multi, "upsert": True},
+                    {"q": {"_id": 3}, "u": {"$set": {"counter": 3}}, "multi": multi, "upsert": True},
+                ])
+                assert (reply["n"], reply["nModified"]) == ((1, 0) if ordered else (2, 0)), reply
+                assert [(error["index"], error["code"]) for error in reply["writeErrors"]] == ([(1, 54)] if ordered else [(1, 54), (2, 11000)])
+                assert reply["upserted"] == ([{"index": 0, "_id": None}] if ordered else [{"index": 0, "_id": None}, {"index": 3, "_id": 3}])
+                assert batch.count_documents({}) == (1 if ordered else 2)
+        concurrent = client.wire_operator_upsert.concurrent
+        def increment(index):
+            method = concurrent.update_one if index % 2 == 0 else concurrent.update_many
+            return method({"_id": Int64(999)}, {"$inc": {"counter": 1}}, upsert=True)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(increment, range(32)))
+        assert sum(result.did_upsert for result in results) == 1
+        assert sum(result.matched_count for result in results) == 31
+        assert sum(result.modified_count for result in results) == 31
+        assert concurrent.find_one() == {"_id": 999, "counter": 32}
+        for multi, write_type in [(False, pymongo.UpdateOne), (True, pymongo.UpdateMany)]:
+            bounded = client.wire_operator_upsert[f"bounded_{multi}"]
+            writes = [write_type({"slot": i}, {"$set": {"_id": str(i) + "x" * 127000}}, upsert=True) for i in range(5)]
+            writes.append(write_type({"slot": 9}, {"$set": {"_id": "small"}}, upsert=True))
+            try:
+                bounded.bulk_write(writes, ordered=False)
+            except BulkWriteError as error:
+                assert [(item["index"], item["code"]) for item in error.details["writeErrors"]] == [(4, 10334)], error.details
+                assert error.details["nUpserted"] == 5
+                assert [item["index"] for item in error.details["upserted"]] == [0, 1, 2, 3, 5]
+            else:
+                raise AssertionError("operator upsert aggregate reply must be preflighted")
+            assert bounded.count_documents({}) == 5 and bounded.find_one({"slot": 4}) is None
+            deep = client.wire_operator_upsert[f"deep_{multi}"]
+            identifier = 1
+            for _ in range(98):
+                identifier = {"nested": identifier}
+            method = deep.update_many if multi else deep.update_one
+            try:
+                method({"_id": identifier}, {"$set": {}}, upsert=True)
+            except WriteError as error:
+                assert error.code == 10334
+            else:
+                raise AssertionError("operator upsert reply depth must be preflighted")
+            assert deep.count_documents({}) == 0
+            assert method({"_id": 1}, {"$set": {}}, upsert=True).did_upsert
+            one_way = client.wire_operator_upsert[f"one_way_{multi}"].with_options(write_concern=pymongo.write_concern.WriteConcern(w=0))
+            method = one_way.update_many if multi else one_way.update_one
+            assert not method({"_id": 1}, {"$inc": {"counter": 1}}, upsert=True).acknowledged
+            assert one_way.find_one({"_id": 1}) == {"_id": 1, "counter": 1}
+
+
 def replacement_upsert_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_replace_upsert.items
@@ -543,7 +618,7 @@ def field_update_smoke(uri):
         assert reply["writeErrors"][0]["code"] == 40
         assert client.absent_field_update.items.update_one({}, {"$set": {"x": 1}}).matched_count == 0
         assert "absent_field_update" not in client.list_database_names()
-        for options in [{"multi": "yes"}, {"upsert": True}, {"arrayFilters": []}]:
+        for options in [{"multi": "yes"}, {"upsert": 1}, {"arrayFilters": []}]:
             reply = client.wire_field_update.command("update", "items", updates=[{"q": {}, "u": {"$set": {"x": 1}}, **options}])
             assert reply["writeErrors"][0]["code"] == 72
         # Leave room for the driver's monitor sockets within the listener's
@@ -1501,6 +1576,9 @@ def lifecycle_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert client.wire_operator_upsert.items.count_documents({}) == 4
+        assert client.wire_operator_upsert.items.find_one({"_id": None}) == {"_id": None, "counter": 7, "stamp": Timestamp(0, 0)}
+        assert client.wire_operator_upsert.concurrent.find_one() == {"_id": 999, "counter": 32}
         assert client.wire_pop_rename.queue.count_documents({"items": [], "keep": True}) == 12
         assert client.wire_pop_rename.items.find_one({"_id": 23})["nested"] == {"value": Binary(b"value", 128)}
         assert sorted(client.wire_membership.concurrent.find_one()["values"]) == list(range(4))
@@ -1650,6 +1728,19 @@ def metadata_smoke(uri):
                 raise AssertionError(f"unsupported metadata command accepted: {command}")
         assert "rejected" not in database.list_collection_names()
         assert list(database.list_collections(nameOnly=True, authorizedCollections=True, filter={"info": {"$exists": True}})) == []
+
+
+async def async_operator_upsert_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=15000) as client:
+        collection = client.wire_async_operator_upsert.items
+        for method, identifier in [(collection.update_one, None), (collection.update_many, Int64(2))]:
+            result = await method({"_id": identifier, "counter": 3}, {"$inc": {"counter": 2}, "$set": {"stamp": Timestamp(0, 0)}}, upsert=True)
+            assert result.did_upsert and result.modified_count == 0
+            assert BSON.encode(await collection.find_one({"_id": identifier})) == BSON.encode({"_id": identifier, "counter": 5, "stamp": Timestamp(0, 0)})
+            result = await method({"_id": identifier}, {"$inc": {"counter": 0}}, upsert=True)
+            assert (result.matched_count, result.modified_count, result.did_upsert) == (1, 0, False)
+        result = await collection.update_many({"tag": "generated"}, {"$set": {"stamp": Timestamp(0, 0)}}, upsert=True)
+        assert isinstance(result.upserted_id, ObjectId)
 
 
 async def async_replacement_upsert_smoke(uri):
@@ -1939,6 +2030,7 @@ if __name__ == "__main__":
         pull_smoke(sys.argv[1])
         increment_smoke(sys.argv[1])
         replacement_upsert_smoke(sys.argv[1])
+        operator_upsert_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
         # Give the added operator cases their own bounded phase; retain the
         # existing discovery/CRUD phase's deadline as the suite grows.
@@ -1948,5 +2040,6 @@ if __name__ == "__main__":
         asyncio.run(asyncio.wait_for(async_pull_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_increment_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_replacement_upsert_smoke(sys.argv[1]), timeout=20))
+        asyncio.run(asyncio.wait_for(async_operator_upsert_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

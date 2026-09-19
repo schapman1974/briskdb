@@ -146,6 +146,7 @@ impl CommandError {
                     9 => "FailedToParse",
                     115 => "CommandNotSupported",
                     224 => "QueryFeatureNotAllowed",
+                    54 => "NotSingleValueField",
                     _ => "BadValue",
                 };
                 return Self::new(code, name, "invalid or unsupported document query");
@@ -640,9 +641,6 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                         .next()
                         .is_some_and(|(name, _)| name.starts_with('$'))
                     {
-                        if upsert {
-                            return Err(CommandError::options()); // Operator upserts follow separately.
-                        }
                         DocumentUpdater::compile_with_check(replacement, &mut || {
                             if started.elapsed() >= timeout {
                                 Err(EngineError::deadline_exceeded(
@@ -662,7 +660,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                                 } else {
                                     DocumentMutationScope::One
                                 },
-                                DocumentWriteOptions::new(),
+                                DocumentWriteOptions::new().with_upsert(upsert),
                             )
                             .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?,
                         ));
@@ -1017,6 +1015,14 @@ fn valid_write_concern(value: &BsonValue) -> bool {
         "wtimeout" => matches!(value, BsonValue::Int32(0) | BsonValue::Int64(0)),
         _ => false,
     }))
+}
+
+fn is_upsert(command: &DocumentCommand) -> bool {
+    match command {
+        DocumentCommand::Replace(request) => request.write_options().upsert(),
+        DocumentCommand::Update(request) => request.write_options().upsert(),
+        _ => false,
+    }
 }
 
 fn write_documents(request: &Request, identifier: &str) -> Result<Vec<BsonDocument>> {
@@ -1390,10 +1396,9 @@ impl Executor {
                 let mut matched = 0i64;
                 let mut modified = 0i64;
                 let mut errors = Vec::new();
-                let has_upserts = updates.iter().any(|update| {
-                    matches!(update,
-                    Ok(DocumentCommand::Replace(request)) if request.write_options().upsert())
-                });
+                let has_upserts = updates
+                    .iter()
+                    .any(|update| update.as_ref().is_ok_and(is_upsert));
                 // Reserve fixed error/entry envelopes for the entire bounded
                 // batch. Engine result limits then preflight each potentially
                 // large returned ID before its document can commit.
@@ -1414,7 +1419,7 @@ impl Executor {
                                 DocumentCommand::Update(request) => request.namespace(),
                                 _ => unreachable!("parsed update statement"),
                             };
-                            let upsert = matches!(&update, DocumentCommand::Replace(request) if request.write_options().upsert());
+                            let upsert = is_upsert(&update);
                             if upsert {
                                 self.ensure_collection(session, identity, &context, namespace)
                                     .await?;
@@ -1473,6 +1478,7 @@ impl Executor {
                                         | 28
                                         | 40
                                         | 52
+                                        | 54
                                         | 56
                                         | 66
                                         | 72
@@ -1486,7 +1492,7 @@ impl Executor {
                                 ) =>
                         {
                             // Single mutations fail before commit. Multi updates
-                            // additionally require explicit rollback certification
+                            // additionally require no-write/rollback certification
                             // and no earlier changed shard, not just a familiar code.
                             errors.push(BsonValue::Document(error.write_document(index)));
                             if ordered {

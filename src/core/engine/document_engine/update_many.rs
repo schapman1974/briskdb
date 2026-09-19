@@ -14,7 +14,7 @@ impl Engine {
         owner: ConnectionOwner,
         request_id: DocumentRequestId,
         namespace: DocumentNamespace,
-        filter: DocumentFilter,
+        filter: Arc<DocumentFilter>,
         updater: Arc<DocumentUpdater>,
         max_document_bytes: usize,
         cancellation: CancellationToken,
@@ -28,7 +28,7 @@ impl Engine {
                 cancellation.clone(),
                 deadline,
                 move |cancellation, control| {
-                    let route = prepare_filter_route(&storage, filter, cancellation, &control)?;
+                    let route = prepare_filter_route(&storage, &filter, cancellation, &control)?;
                     let collection_id =
                         require_collection(storage.document_collection_controlled(
                             namespace.database(),
@@ -65,7 +65,7 @@ impl Engine {
             let updater = Arc::clone(&updater);
             let matcher = matcher.clone();
             let plan = plan.clone();
-            let mut key = key.clone();
+            let key = key.clone();
             totals = self
                 .run_document_shard_controlled(
                     shard,
@@ -76,67 +76,22 @@ impl Engine {
                         let transaction =
                             Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
                                 .map_err(sqlite_error::statement)?;
-                        let outcome = (|| {
-                            let point = key.is_some();
-                            let mut after = None;
-                            let (mut matched, mut modified) = totals;
-                            loop {
-                                ensure_document_cpu_active(cancellation, control)?;
-                                let record = if point {
-                                    match key.take() {
-                                        Some(key) => storage.get_document_on_connection(
-                                            &transaction,
-                                            collection_id,
-                                            shard,
-                                            &key,
-                                            cancellation,
-                                        )?,
-                                        None => None,
-                                    }
-                                } else {
-                                    deletion::next_match(
-                                        storage,
-                                        &transaction,
-                                        collection_id,
-                                        shard,
-                                        &mut after,
-                                        matcher.as_deref(),
-                                        cancellation,
-                                        control,
-                                    )?
-                                };
-                                let Some(record) = record else { break };
-                                let execution = single_mutation::update_record(
-                                    storage,
-                                    &transaction,
-                                    record,
-                                    &updater,
-                                    max_document_bytes,
-                                    single_mutation::MutationReturn::Counts,
-                                    None,
-                                    request_id,
-                                    plan.clone(),
-                                    limits,
-                                    cancellation,
-                                    control,
-                                )?;
-                                let DocumentResult::Update(result) = execution.into_parts().2
-                                else {
-                                    return Err(EngineError::new(
-                                        EngineErrorKind::Internal,
-                                        "unexpected field-update result",
-                                    ));
-                                };
-                                matched = matched
-                                    .checked_add(result.matched_count())
-                                    .ok_or_else(result_size_overflow)?;
-                                modified = modified
-                                    .checked_add(result.modified_count())
-                                    .ok_or_else(result_size_overflow)?;
-                            }
-                            ensure_document_cpu_active(cancellation, control)?;
-                            Ok((matched, modified))
-                        })();
+                        let outcome = update_shard_matches(
+                            storage,
+                            &transaction,
+                            collection_id,
+                            shard,
+                            key,
+                            matcher.as_deref(),
+                            &updater,
+                            max_document_bytes,
+                            request_id,
+                            &plan,
+                            limits,
+                            cancellation,
+                            control,
+                            totals,
+                        );
                         match outcome {
                             Ok(counts) => {
                                 // A commit/cleanup failure is never certified as a
@@ -166,6 +121,85 @@ impl Engine {
             counts(totals.0, totals.1)?,
         ))
     }
+}
+
+// Shared with the insertion-shard recheck of update-many upserts. The caller
+// owns commit/rollback certification; this helper never commits independently.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn update_shard_matches(
+    storage: &Storage,
+    transaction: &Transaction<'_>,
+    collection_id: DocumentCollectionId,
+    shard: u16,
+    mut key: Option<crate::document::CanonicalBsonKey>,
+    matcher: Option<&DocumentMatcher>,
+    updater: &DocumentUpdater,
+    max_document_bytes: usize,
+    request_id: DocumentRequestId,
+    plan: &DocumentPlan,
+    limits: ResultLimits,
+    cancellation: &CancellationToken,
+    control: &OperationControl,
+    totals: (u64, u64),
+) -> EngineResult<(u64, u64)> {
+    let point = key.is_some();
+    let mut after = None;
+    let (mut matched, mut modified) = totals;
+    loop {
+        ensure_document_cpu_active(cancellation, control)?;
+        let record = if point {
+            match key.take() {
+                Some(key) => storage.get_document_on_connection(
+                    transaction,
+                    collection_id,
+                    shard,
+                    &key,
+                    cancellation,
+                )?,
+                None => None,
+            }
+        } else {
+            deletion::next_match(
+                storage,
+                transaction,
+                collection_id,
+                shard,
+                &mut after,
+                matcher,
+                cancellation,
+                control,
+            )?
+        };
+        let Some(record) = record else { break };
+        let execution = single_mutation::update_record(
+            storage,
+            transaction,
+            record,
+            updater,
+            max_document_bytes,
+            single_mutation::MutationReturn::Counts,
+            None,
+            request_id,
+            plan.clone(),
+            limits,
+            cancellation,
+            control,
+        )?;
+        let DocumentResult::Update(result) = execution.into_parts().2 else {
+            return Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "unexpected field-update result",
+            ));
+        };
+        matched = matched
+            .checked_add(result.matched_count())
+            .ok_or_else(result_size_overflow)?;
+        modified = modified
+            .checked_add(result.modified_count())
+            .ok_or_else(result_size_overflow)?;
+    }
+    ensure_document_cpu_active(cancellation, control)?;
+    Ok((matched, modified))
 }
 
 fn counts(matched: u64, modified: u64) -> EngineResult<DocumentResult> {

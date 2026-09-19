@@ -33,7 +33,7 @@ impl Engine {
                 cancellation.clone(),
                 deadline,
                 move |cancellation, control| {
-                    let route = prepare_filter_route(&storage, filter, cancellation, &control)?;
+                    let route = prepare_filter_route(&storage, &filter, cancellation, &control)?;
                     let collection = storage.document_collection_controlled(
                         namespace.database(),
                         namespace.collection(),

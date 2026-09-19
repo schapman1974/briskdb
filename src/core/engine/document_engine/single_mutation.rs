@@ -1,6 +1,6 @@
 //! Atomic shard-local single-record mutations with preflighted results.
 
-mod replacement_upsert;
+mod upsert;
 
 use super::*;
 use crate::{
@@ -101,7 +101,7 @@ impl Engine {
             owner,
             request_id,
             namespace,
-            filter,
+            Arc::new(filter),
             read_options,
             Mutation::Update {
                 updater: Arc::new(updater),
@@ -131,7 +131,7 @@ impl Engine {
     ) -> EngineResult<DocumentExecution> {
         let max_document_bytes = request.max_document_bytes();
         let (namespace, filter, update, scope, options) = request.into_parts();
-        require_replacement_options(options)?;
+        require_replacement_options(options.with_upsert(false))?;
         let updater = self
             .run_document_storage_task(
                 cancellation.clone(),
@@ -144,13 +144,32 @@ impl Engine {
             )
             .await?;
         let updater = Arc::new(updater);
+        if options.upsert() {
+            return self
+                .run_document_upsert(
+                    owner,
+                    request_id,
+                    namespace,
+                    Arc::new(filter),
+                    Mutation::Update {
+                        updater,
+                        max_document_bytes,
+                        returns: MutationReturn::Counts,
+                    },
+                    scope,
+                    cancellation,
+                    deadline,
+                    limits,
+                )
+                .await;
+        }
         if scope == DocumentMutationScope::Many {
             return self
                 .run_document_update_many(
                     owner,
                     request_id,
                     namespace,
-                    filter,
+                    Arc::new(filter),
                     updater,
                     max_document_bytes,
                     cancellation,
@@ -163,7 +182,7 @@ impl Engine {
             owner,
             request_id,
             namespace,
-            filter,
+            Arc::new(filter),
             DocumentReadOptions::new(),
             Mutation::Update {
                 updater,
@@ -193,7 +212,7 @@ impl Engine {
             owner,
             request_id,
             namespace,
-            filter,
+            Arc::new(filter),
             options,
             Mutation::Delete,
             cancellation,
@@ -232,7 +251,7 @@ impl Engine {
             owner,
             request_id,
             namespace,
-            filter,
+            Arc::new(filter),
             DocumentReadOptions::new(),
             Mutation::Replace {
                 document: Arc::new(replacement),
@@ -265,7 +284,7 @@ impl Engine {
             owner,
             request_id,
             namespace,
-            filter,
+            Arc::new(filter),
             read_options,
             Mutation::Replace {
                 document: Arc::new(document),
@@ -289,7 +308,7 @@ impl Engine {
         owner: ConnectionOwner,
         request_id: DocumentRequestId,
         namespace: DocumentNamespace,
-        filter: DocumentFilter,
+        filter: Arc<DocumentFilter>,
         options: DocumentReadOptions,
         mutation: Mutation,
         cancellation: CancellationToken,
@@ -305,7 +324,7 @@ impl Engine {
                 deadline,
                 move |cancellation, control| {
                     let mut check = || ensure_document_cpu_active(cancellation, &control);
-                    let route = prepare_filter_route(&storage, filter, cancellation, &control)?;
+                    let route = prepare_filter_route(&storage, &filter, cancellation, &control)?;
                     let projection = options
                         .projection()
                         .map(|spec| {

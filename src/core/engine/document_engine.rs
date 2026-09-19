@@ -589,7 +589,7 @@ impl Engine {
                             let collection_id = require_collection(collection)?.id();
                             let route = prepare_filter_route(
                                 &catalog_storage,
-                                filter,
+                                &filter,
                                 cancellation,
                                 &control,
                             )?;
@@ -763,7 +763,7 @@ impl Engine {
                             let collection_id = require_collection(collection)?.id();
                             let route = prepare_filter_route(
                                 &catalog_storage,
-                                filter,
+                                &filter,
                                 cancellation,
                                 &control,
                             )?;
@@ -1803,17 +1803,17 @@ fn require_collection(
     })
 }
 
-enum FilterRoute {
+enum FilterRoute<'a> {
     Point(BsonValue),
     Scatter,
-    Filtered(DocumentFilter),
+    Filtered(&'a DocumentFilter),
 }
 
-fn classify_filter(
-    filter: DocumentFilter,
+fn classify_filter<'a>(
+    filter: &'a DocumentFilter,
     cancellation: &CancellationToken,
     control: &OperationControl,
-) -> EngineResult<FilterRoute> {
+) -> EngineResult<FilterRoute<'a>> {
     ensure_document_cpu_active(cancellation, control)?;
     if filter.is_empty() {
         return Ok(FilterRoute::Scatter);
@@ -1857,7 +1857,7 @@ fn is_literal_id_filter(
 
 fn prepare_filter_route(
     storage: &Storage,
-    filter: DocumentFilter,
+    filter: &DocumentFilter,
     cancellation: &CancellationToken,
     control: &OperationControl,
 ) -> EngineResult<PreparedFilterRoute> {

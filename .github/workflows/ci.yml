@@ -94,7 +94,8 @@ jobs:
           cargo +1.85.0 test --locked --no-default-features --features documents
           --test document_matcher_oracle --test document_projection_oracle
           --test document_sorting_oracle --test document_distinct_oracle
-          --test document_aggregation_oracle --test document_update_oracle -- --ignored --nocapture
+          --test document_aggregation_oracle --test document_update_oracle
+          --test document_upsert_oracle -- --ignored --nocapture
 
       - name: Run frozen supported contracts against BriskDB
         # The candidate checkpoint is deliberately separate from the full
