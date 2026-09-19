@@ -69,6 +69,7 @@ fn run_contract(uri: &str, report: &std::path::Path) -> std::process::Output {
             "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_preserve_immutable_id_semantics",
             "compat/mongo/v1/runner/contracts/test_update_operator_contract.py::test_new_update_operators_report_target_and_path_errors_atomically",
             "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_comment_remains_invalid_as_a_field_operator",
+            "compat/mongo/v1/runner/contracts/test_query_operator_contract.py::test_add_to_set_non_array_errors_report_code_2_and_leave_document_atomic",
             "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_pull_all_uses_literal_bson_equality",
             "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_array_updates_reject_non_array_targets[sync-briskdb-$pullAll-operand2]",
             "compat/mongo/v1/runner/contracts/test_array_update_contract.py::test_array_updates_reject_non_array_targets[async-briskdb-$pullAll-operand2]",
@@ -121,6 +122,7 @@ individual = {'tests.contracts.test_talkpython_contract::' + name for name in [
 ]}
 individual.update('tests.contracts.test_query_operator_contract::' + name for name in [
     'test_comment_remains_invalid_as_a_field_operator',
+    'test_add_to_set_non_array_errors_report_code_2_and_leave_document_atomic',
     'test_every_filtering_crud_entrypoint_rejects_invalid_not_operands',
     'test_every_filtering_crud_entrypoint_rejects_operator_typos',
 ])
@@ -145,11 +147,11 @@ expected = {(case['id'], api) for case in corpus['cases']
             for api in case['apis']}
 executions = ingest_junit(Path(sys.argv[1]), 'briskdb', corpus)['executions']
 actual = {(item['case_id'], item['api']) for item in executions}
-assert len(expected) == len(executions) == 184, 'locked suite coverage changed'
+assert len(expected) == len(executions) == 186, 'locked suite coverage changed'
 assert actual == expected, 'candidate suite omitted or substituted locked cases'
 assert all(item['outcome'] == 'passed' and item['target'] == 'briskdb-briskdb'
            for item in executions), 'candidate suite skipped or failed a case'
-print('Verified all 184 exact frozen candidate executions, with no skips.')
+print('Verified all 186 exact frozen candidate executions, with no skips.')
 "#,
             ])
             .arg(report)

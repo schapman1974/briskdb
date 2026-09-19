@@ -71,8 +71,9 @@ class PythonDocumentApiTests(unittest.TestCase):
                     self.assertEqual(session.update_one(DATABASE, COLLECTION, {"_id": 3}, {"$addToSet": {"empty": {"$each": []}}})["modified_count"], 1)
                     before = session.find(DATABASE, COLLECTION)["documents"]
                     for operator, operand in [("$addToSet", 1), ("$pullAll", [])]:
-                        with self.assertRaises(briskdb.InvalidArgumentError):
-                            session.update_one(DATABASE, COLLECTION, {}, {"$set": {"atomic_marker": True}, operator: {"keep": operand}})
+                        for method in (session.update_one, session.update_many):
+                            with self.assertRaises(briskdb.InvalidArgumentError):
+                                method(DATABASE, COLLECTION, {}, {"$set": {"atomic_marker": True}, operator: {"keep": operand}})
                     with self.assertRaises(briskdb.InvalidArgumentError):
                         session.update_many(DATABASE, COLLECTION, {"_id": 99}, {"$addToSet": {"values": {"$each": None}}})
                     with self.assertRaises(briskdb.LimitExceededError):
@@ -1550,6 +1551,8 @@ class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
                     result = await session.update_many(DATABASE, COLLECTION, {}, {"$addToSet": {"values": {"$each": [2, 2.0, [1, 2]]}}})
                     self.assertEqual((result["matched_count"], result["modified_count"]), (4, 4))
                     self.assertEqual((await session.find_one_and_update(DATABASE, COLLECTION, {}, {"$pullAll": {"values": [1, [1, 2]]}}, sort={"_id": -1}, projection={"values": 1, "_id": 0}, return_document=True))["document"], {"values": [True, 2]})
+                    with self.assertRaises(briskdb.InvalidArgumentError):
+                        await session.update_many(DATABASE, COLLECTION, {}, {"$addToSet": {"_id": 1}})
                     token = briskdb.CancellationToken(); token.cancel()
                     with self.assertRaises(briskdb.CancelledError):
                         await session.update_many(DATABASE, COLLECTION, {}, {"$pullAll": {"values": [True]}}, cancellation=token)

@@ -19,7 +19,7 @@ CI and byte-compares the normalized result with the checked-in reference. The
 full report remains `reference-only`; partial candidate coverage is not folded
 into that report or treated as full parity.
 
-Required CI separately runs 184 exact sync/async executions in the frozen
+Required CI separately runs 186 exact sync/async executions in the frozen
 `test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
 `test_aggregation_contract`, `test_group_accumulators_contract`, and
 `test_client_read_fidelity_contract` modules,
@@ -31,6 +31,7 @@ plus all nine non-upsert `test_update_operator_contract` cases (min/max, pop,
 rename, numeric paths, operand/target errors, conflicts, and immutable IDs),
 plus literal pull-all equality and pull-all non-array target errors
 (two additional cases in both API modes),
+and the add-to-set non-array atomicity case through both update-one/update-many,
 against a real four-shard BriskDB listener.
 It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
 cleanup. The JUnit result is checked against the exact locked case/API set;
@@ -313,16 +314,19 @@ Batch statements commit independently; operational failure may leave previous
 commits, so no all-or-nothing batch or retryable-write guarantee is implied.
 Multi updates commit one immediate transaction per shard, scanning bounded
 records in natural order. A runtime failure rolls back that shard but can leave
-earlier shards committed. Such failures return command errors, not indexed
-write errors or fabricated partial counts; even unordered batches stop. Eager
-parsing failures still use indexed errors and can safely continue unordered
-batches. This is neither a global transaction/snapshot nor exact MongoDB
-per-document or frozen TinyMongo collection-wide failure atomicity.
-The frozen add-to-set non-array atomicity case remains outside the candidate
-gate: its multi-update branch requires a driver `WriteError`, while the current
-conservative runtime-abort policy produces `OperationFailure` with the same code
-2. Independent tests cover code, unchanged documents, and batch abort; they are
-not counted as a passing frozen case. No reference/allowance is changed.
+earlier shards committed. Only explicit successful rollback plus zero earlier
+document modifications certifies a runtime statement failure as safe. For
+certified validation/resource failures, indexed `writeErrors` now preserve
+driver `WriteError` behavior: ordered batches stop; unordered batches may
+continue. Earlier no-op shard matches do not count as persisted changes.
+Earlier changed shards, uncertain commit/rollback outcomes, cancellation, and
+operational failures still produce command errors with no fabricated partial
+counts; unordered batches stop too. Parsing failures remain indexed as before.
+Raw-wire tests force provisional writes before rollback and prior committed
+shards, checking exact data after restart. The frozen add-to-set atomicity case
+now passes unchanged in both API modes. This remains neither a global
+transaction/snapshot nor exact MongoDB per-document or frozen TinyMongo
+collection-wide failure atomicity. No reference/allowance is changed.
 Other operators/pipeline updates, upserts, and update-command
 hint/sort/collation/arrayFilters remain explicit future work. Native sync/async
 Python exposes `replace_one`, `update_one`, and `update_many` with the same engine semantics and

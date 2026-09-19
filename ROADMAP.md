@@ -535,8 +535,12 @@ requires an earlier dependency:
       participate in eager conflicts. Typed operand/path/ID failures and budgets
       precede SQL. Concurrent consumers return each array element once.
       Update-many streams one transaction per shard: a failing shard rolls back,
-      earlier commits survive, and runtime wire errors abort without fabricated
-      partial counts. Cancellation/task-abort and continued-session tests cover
+      earlier commits survive. Explicit rollback with zero earlier modifications
+      now certifies validation failures for indexed wire write errors and
+      unordered continuation. Partial/uncertain or operational failures still
+      abort without fabricated counts. First-shard provisional writes, earlier
+      no-op shards, partial commits, ordered/unordered behavior, restart,
+      cancellation/task-abort, and continued-session tests cover
       this boundary. Other operators, upsert, and secondary-index post-image
       validation remain open.
     - [ ] [#175](https://github.com/schapman1974/briskdb/issues/175) — filtered
@@ -636,8 +640,8 @@ requires an earlier dependency:
       with the basic/group-accumulator suites, replacement, and three additional
       application write/identity contracts, nested unsetting, configured-client
       read fidelity, three cross-CRUD query-validation cases, and all nine
-      non-upsert update-operator contracts and two pull-all cases,
-      required CI checks exactly 184 frozen executions and
+      non-upsert update-operator contracts, two pull-all cases, and the add-to-set
+      non-array atomicity case, required CI checks exactly 186 frozen executions and
       rejects missing, duplicated, substituted, or skipped cases. The full
       456-execution corpus remains separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared

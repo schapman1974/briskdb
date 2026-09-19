@@ -67,6 +67,83 @@ impl fmt::Display for DocumentMutationError {
 
 impl Error for DocumentMutationError {}
 
+/// Internal evidence that a failed statement has no committed document changes.
+/// Only the mutation coordinator may attach this after successful rollback and
+/// after checking that earlier shards made no changes. The original typed cause
+/// remains in the error chain; this is not permission to retry operational errors.
+#[derive(Debug)]
+pub(crate) struct DocumentWriteRollback {
+    cause: EngineError,
+}
+
+impl DocumentWriteRollback {
+    pub(crate) fn wrap(cause: EngineError) -> EngineError {
+        EngineError::from_source(
+            cause.kind(),
+            "document update failed after confirmed rollback",
+            Self { cause },
+        )
+    }
+
+    #[cfg(any(feature = "mongo", test))]
+    pub(crate) fn is_certified(error: &EngineError) -> bool {
+        let mut source = error.source();
+        while let Some(cause) = source {
+            if cause.is::<Self>() {
+                return true;
+            }
+            source = cause.source();
+        }
+        false
+    }
+}
+
+impl fmt::Display for DocumentWriteRollback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("document statement has no committed changes")
+    }
+}
+
+impl Error for DocumentWriteRollback {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_evidence_preserves_classification_and_typed_causes_through_context() {
+        let error = DocumentMutationError::ImmutableId.into_engine_error();
+        assert!(!DocumentWriteRollback::is_certified(&error));
+        let error = DocumentWriteRollback::wrap(error).context("trusted diagnostic context");
+        assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+        assert!(DocumentWriteRollback::is_certified(&error));
+        let mut source = error.source();
+        let mut found = false;
+        while let Some(cause) = source {
+            if let Some(mutation) = cause.downcast_ref::<DocumentMutationError>() {
+                assert_eq!(*mutation, DocumentMutationError::ImmutableId);
+                found = true;
+            }
+            if cause.is::<DocumentWriteRollback>() {
+                assert_eq!(
+                    cause.to_string(),
+                    "document statement has no committed changes"
+                );
+            }
+            source = cause.source();
+        }
+        assert!(found);
+        assert!(!DocumentWriteRollback::is_certified(&EngineError::new(
+            EngineErrorKind::InvalidArgument,
+            "uncertified validation failure"
+        )));
+    }
+}
+
 /// Stable category for failures produced by the BSON value and codec layer.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

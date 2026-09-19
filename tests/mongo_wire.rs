@@ -527,6 +527,196 @@ async fn send_command(stream: &mut TcpStream, body: &BsonDocument) -> BsonDocume
     response
 }
 
+#[tokio::test]
+async fn multi_update_errors_distinguish_confirmed_rollback_from_prior_commits() {
+    fn doc<const N: usize>(fields: [(&str, BsonValue); N]) -> BsonDocument {
+        BsonDocument::from_entries(fields).unwrap()
+    }
+    fn shard_rows(root: &std::path::Path, shard: u16) -> Vec<BsonDocument> {
+        let connection =
+            rusqlite::Connection::open(root.join(format!("shards/{shard:04}.sqlite"))).unwrap();
+        let mut statement = connection
+            .prepare("SELECT document_bson FROM briskdb_documents_v1 ORDER BY natural_order")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|row| decode_document(&row.unwrap()).unwrap())
+            .collect()
+    }
+    fn statement(id: Option<BsonValue>, field: &str, value: BsonValue) -> BsonValue {
+        BsonValue::Document(doc([
+            (
+                "q",
+                BsonValue::Document(id.map(|id| doc([("_id", id)])).unwrap_or_default()),
+            ),
+            (
+                "u",
+                BsonValue::Document(doc([("$set", BsonValue::Document(doc([(field, value)])))])),
+            ),
+        ]))
+    }
+    fn batch(statements: Vec<BsonValue>, ordered: bool) -> BsonDocument {
+        doc([
+            ("update", BsonValue::from("items")),
+            ("updates", BsonValue::Array(statements)),
+            ("ordered", BsonValue::Boolean(ordered)),
+            ("$db", BsonValue::from("wire")),
+        ])
+    }
+    for (bad_shard, earlier_noops) in [(0, false), (1, true), (1, false)] {
+        for ordered in [true, false] {
+            let (root, database, mut server) = setup().await;
+            let mut stream = TcpStream::connect(server.address()).await.unwrap();
+            let documents: Vec<_> = (0..24)
+                .map(|id| {
+                    doc([
+                        ("_id", BsonValue::Int32(id)),
+                        ("items", BsonValue::Array(vec![])),
+                    ])
+                })
+                .collect();
+            stream
+                .write_all(&insert_sequence("items", &documents))
+                .await
+                .unwrap();
+            assert_eq!(
+                response(&mut stream).await.1.get_first("n"),
+                Some(&BsonValue::Int32(24))
+            );
+            if earlier_noops {
+                let statements = shard_rows(root.path(), 0)
+                    .iter()
+                    .map(|row| {
+                        statement(
+                            row.get_first("_id").cloned(),
+                            "items",
+                            BsonValue::Array(vec![BsonValue::Int32(1)]),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    send_command(&mut stream, &batch(statements, true))
+                        .await
+                        .get_first("ok"),
+                    Some(&BsonValue::Double(1.0))
+                );
+            }
+            let bad_rows = shard_rows(root.path(), bad_shard);
+            assert!(bad_rows.len() > 1);
+            // Fail after earlier records in this shard have changed privately,
+            // not just on the first record before any SQL has executed.
+            let bad_id = bad_rows.last().unwrap().get_first("_id").cloned();
+            assert_eq!(
+                send_command(
+                    &mut stream,
+                    &batch(vec![statement(bad_id, "items", BsonValue::Null)], true)
+                )
+                .await
+                .get_first("nModified"),
+                Some(&BsonValue::Int64(1))
+            );
+            let before: Vec<_> = (0..2).map(|shard| shard_rows(root.path(), shard)).collect();
+            let failing = BsonValue::Document(doc([
+                ("q", BsonValue::Document(BsonDocument::new())),
+                (
+                    "u",
+                    BsonValue::Document(doc([(
+                        "$addToSet",
+                        BsonValue::Document(doc([("items", BsonValue::Int32(1))])),
+                    )])),
+                ),
+                ("multi", BsonValue::Boolean(true)),
+            ]));
+            let reply = send_command(
+                &mut stream,
+                &batch(
+                    vec![
+                        failing,
+                        statement(
+                            Some(BsonValue::Int32(0)),
+                            "continued",
+                            BsonValue::Boolean(true),
+                        ),
+                    ],
+                    ordered,
+                ),
+            )
+            .await;
+            let partial = bad_shard == 1 && !earlier_noops;
+            if partial {
+                assert_eq!(reply.get_first("ok"), Some(&BsonValue::Double(0.0)));
+                assert_eq!(reply.get_first("code"), Some(&BsonValue::Int32(2)));
+                assert!(reply.get_first("writeErrors").is_none());
+                assert!(reply.get_first("n").is_none());
+                assert!(reply.get_first("nModified").is_none());
+            } else {
+                assert_eq!(reply.get_first("ok"), Some(&BsonValue::Double(1.0)));
+                let count = i64::from(!ordered);
+                assert_eq!(reply.get_first("n"), Some(&BsonValue::Int64(count)));
+                assert_eq!(reply.get_first("nModified"), Some(&BsonValue::Int64(count)));
+                let Some(BsonValue::Array(errors)) = reply.get_first("writeErrors") else {
+                    panic!("indexed errors: {reply:?}")
+                };
+                assert_eq!(errors.len(), 1);
+                let BsonValue::Document(error) = &errors[0] else {
+                    panic!("write error")
+                };
+                assert_eq!(error.get_first("index"), Some(&BsonValue::Int32(0)));
+                assert_eq!(error.get_first("code"), Some(&BsonValue::Int32(2)));
+            }
+            let mut expected = before;
+            for (shard, rows) in expected.iter_mut().enumerate() {
+                for row in rows {
+                    if partial && shard == 0 {
+                        *row = BsonDocument::from_entries(row.iter().map(|(field, value)| {
+                            (
+                                field,
+                                if field == "items" {
+                                    BsonValue::Array(vec![BsonValue::Int32(1)])
+                                } else {
+                                    value.clone()
+                                },
+                            )
+                        }))
+                        .unwrap();
+                    }
+                    if !partial && !ordered && row.get_first("_id") == Some(&BsonValue::Int32(0)) {
+                        row.push("continued", BsonValue::Boolean(true)).unwrap();
+                    }
+                }
+            }
+            for (shard, rows) in expected.iter().enumerate() {
+                let encode = |rows: &[BsonDocument]| {
+                    rows.iter()
+                        .map(|row| encode_document(row).unwrap())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(encode(&shard_rows(root.path(), shard as u16)), encode(rows));
+            }
+            assert_eq!(
+                send_command(&mut stream, &command("ping"))
+                    .await
+                    .get_first("ok"),
+                Some(&BsonValue::Double(1.0))
+            );
+            drop(stream);
+            server.close().await.unwrap();
+            database.close().await.unwrap();
+            let reopened = BriskDb::builder(root.path())
+                .with_shard_count(2)
+                .with_document_support(DocumentSupport::Enabled)
+                .open()
+                .await
+                .unwrap();
+            for (shard, rows) in expected.iter().enumerate() {
+                assert_eq!(shard_rows(root.path(), shard as u16), *rows);
+            }
+            reopened.close().await.unwrap();
+        }
+    }
+}
+
 fn live_cursor_id(body: &BsonDocument) -> i64 {
     let Some(BsonValue::Document(cursor)) = body.get_first("cursor") else {
         panic!("cursor: {body:?}");

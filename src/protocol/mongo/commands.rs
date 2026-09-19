@@ -39,6 +39,7 @@ pub(super) struct CommandError {
     code: i32,
     name: &'static str,
     message: &'static str,
+    rolled_back_update: bool,
 }
 
 impl CommandError {
@@ -47,6 +48,7 @@ impl CommandError {
             code,
             name,
             message,
+            rolled_back_update: false,
         }
     }
 
@@ -91,6 +93,15 @@ impl CommandError {
 
 impl From<EngineError> for CommandError {
     fn from(error: EngineError) -> Self {
+        let rolled_back_update = crate::document::DocumentWriteRollback::is_certified(&error);
+        let mut mapped = Self::from_engine_error(&error);
+        mapped.rolled_back_update = rolled_back_update;
+        mapped
+    }
+}
+
+impl CommandError {
+    fn from_engine_error(error: &EngineError) -> Self {
         let mut source = error.source();
         while let Some(cause) = source {
             if let Some(update) = cause.downcast_ref::<DocumentUpdateError>() {
@@ -1406,20 +1417,21 @@ impl Executor {
                             ));
                         }
                         Err(error)
-                            if safe_statement_error
+                            if (safe_statement_error || error.rolled_back_update)
                                 && matches!(
                                     error.code,
                                     2 | 9 | 14 | 28 | 40 | 52 | 56 | 66 | 72 | 10334 | 115
                                 ) =>
                         {
-                            // These validation/resource failures precede commit (the
-                            // whole single-shard transaction rolls back on error).
+                            // Single mutations fail before commit. Multi updates
+                            // additionally require explicit rollback certification
+                            // and no earlier changed shard, not just a familiar code.
                             errors.push(BsonValue::Document(error.write_document(index)));
                             if ordered {
                                 break;
                             }
                         }
-                        // Runtime multi-update errors can follow earlier shard
+                        // Uncertified multi-update errors can follow earlier shard
                         // commits, even for validation codes. Do not misreport a
                         // rolled-back statement or continue an unordered batch.
                         // Operational failures likewise have uncertain partial outcomes.

@@ -7,7 +7,28 @@ from datetime import datetime
 
 import pymongo
 from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timestamp
-from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
+from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure, WriteError
+
+
+def rolled_back_batch_smoke(database, collection, expression, code):
+    before = [BSON.encode(row) for row in collection.find({})]
+    try:
+        collection.update_many({}, expression)
+    except WriteError as error:
+        assert error.code == code
+    else:
+        raise AssertionError("confirmed rollback must be a driver WriteError")
+    for ordered in [True, False]:
+        reply = database.command("update", collection.name, ordered=ordered, updates=[
+            {"q": {}, "u": expression, "multi": True},
+            {"q": {"_id": 0}, "u": {"$set": {"continued_after_rollback": True}}},
+        ])
+        changed = 0 if ordered else 1
+        assert (reply["n"], reply["nModified"]) == (changed, changed)
+        assert [(error["index"], error["code"]) for error in reply["writeErrors"]] == [(0, code)]
+        assert collection.count_documents({"continued_after_rollback": True}) == changed
+    collection.update_one({"_id": 0}, {"$unset": {"continued_after_rollback": 1}})
+    assert [BSON.encode(row) for row in collection.find({})] == before
 
 
 def array_membership_smoke(uri):
@@ -44,16 +65,7 @@ def array_membership_smoke(uri):
             else:
                 raise AssertionError("expected array membership rejection")
             assert BSON.encode(collection.find_one({"_id": 0})) == before
-        try:
-            client.wire_membership.command("update", "items", ordered=False, updates=[
-                {"q": {}, "u": {"$addToSet": {"keep": 1}}, "multi": True},
-                {"q": {}, "u": {"$set": {"should_not_run": True}}},
-            ])
-        except OperationFailure as error:
-            assert error.code == 2 and "writeErrors" not in error.details
-        else:
-            raise AssertionError("runtime multi-update failure must abort")
-        assert collection.count_documents({"should_not_run": {"$exists": True}}) == 0
+        rolled_back_batch_smoke(client.wire_membership, collection, {"$addToSet": {"keep": 1}}, 2)
         queue = client.wire_membership.concurrent
         queue.insert_one({"_id": 1, "values": []})
         def add(worker):
@@ -93,16 +105,7 @@ def pop_rename_smoke(uri):
             else:
                 raise AssertionError("expected atomic pop/rename rejection")
             assert BSON.encode(collection.find_one({"_id": 0})) == before
-        try:
-            client.wire_pop_rename.command("update", "items", ordered=False, updates=[
-                {"q": {}, "u": {"$pop": {"keep": 1}}, "multi": True},
-                {"q": {}, "u": {"$set": {"should_not_run": True}}},
-            ])
-        except OperationFailure as error:
-            assert error.code == 14 and "writeErrors" not in error.details
-        else:
-            raise AssertionError("runtime multi-update failures must abort the batch")
-        assert collection.count_documents({"should_not_run": {"$exists": True}}) == 0
+        rolled_back_batch_smoke(client.wire_pop_rename, collection, {"$pop": {"keep": 1}}, 14)
         queue = client.wire_pop_rename.queue
         queue.insert_many([{"_id": i, "items": list(range(4)), "keep": True} for i in range(12)])
         def consume(_):
@@ -240,18 +243,9 @@ def update_many_smoke(uri):
         ])
         assert (reply["n"], reply["nModified"]) == (24, 24)
         assert reply["writeErrors"][0]["code"] == 40
-        # Runtime errors may follow committed shards. They must abort even an
-        # unordered batch, never claim a zero-write indexed statement failure.
-        try:
-            client.wire_update_many.command("update", "items", ordered=False, updates=[
-                {"q": {}, "u": {"$set": {"group.x": 1}}, "multi": True},
-                {"q": {}, "u": {"$set": {"must_not_run": True}}, "multi": True},
-            ])
-        except OperationFailure as error:
-            assert error.code == 28 and "writeErrors" not in error.details and "nModified" not in error.details
-        else:
-            raise AssertionError("multi runtime failure must abort the command")
-        assert collection.count_documents({"must_not_run": {"$exists": True}}) == 0
+        # This failure is in the first shard and explicitly rolls back. Raw-wire
+        # tests separately force later-shard failures after persisted changes.
+        rolled_back_batch_smoke(client.wire_update_many, collection, {"$set": {"group.x": 1}}, 28)
         assert client.absent_update_many.items.update_many({}, {"$set": {"x": 1}}).matched_count == 0
         assert "absent_update_many" not in client.list_database_names()
         concurrent = client.wire_update_many.concurrent
@@ -1422,6 +1416,12 @@ async def async_array_membership_smoke(uri):
         result = await collection.update_many({}, {"$addToSet": {"values": {"$each": [2, 2.0, [1, 2]]}}})
         assert (result.matched_count, result.modified_count) == (4, 4)
         assert await collection.find_one_and_update({}, {"$pullAll": {"values": [1, [1, 2]]}}, sort=[("_id", -1)], projection={"values": 1, "_id": 0}, return_document=True) == {"values": [True, 2]}
+        try:
+            await collection.update_many({}, {"$addToSet": {"_id": 1}})
+        except WriteError as error:
+            assert error.code == 2
+        else:
+            raise AssertionError("async confirmed rollback must be a WriteError")
         try:
             await collection.update_one({}, {"$addToSet": {"values": {"$each": None}}})
         except OperationFailure as error:
