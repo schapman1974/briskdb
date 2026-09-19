@@ -4,6 +4,7 @@
 //! protocol-neutral: the MongoDB listener, embedded document API, and storage
 //! layer all consume the same value and codec rules.
 
+mod aggregation;
 mod catalog;
 mod codec;
 mod command;
@@ -11,6 +12,7 @@ mod distinct;
 mod error;
 mod key;
 mod matcher;
+mod memory;
 mod number;
 mod options;
 mod plan;
@@ -19,6 +21,7 @@ mod result;
 mod sorting;
 mod value;
 
+pub use aggregation::DocumentAggregator;
 pub(crate) use catalog::validate_namespace;
 pub use catalog::{
     DOCUMENT_CATALOG_VERSION, DOCUMENT_INDEX_FORMAT_VERSION, DOCUMENT_SCHEMA_VERSION,

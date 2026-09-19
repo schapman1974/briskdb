@@ -715,47 +715,8 @@ fn join<'a>(
     Ok(())
 }
 
-fn document_bytes(document: &BsonDocument, budget: &mut Budget<'_>) -> EngineResult<usize> {
-    let mut bytes = 128;
-    for (name, value) in document.iter() {
-        bytes += name.len() + value_bytes(value, budget)?;
-        if bytes > MAX_KEY_BYTES {
-            return Err(limit());
-        }
-    }
-    Ok(bytes)
-}
-
 fn value_bytes(value: &BsonValue, budget: &mut Budget<'_>) -> EngineResult<usize> {
-    budget.step()?;
-    let bytes = 128
-        + match value {
-            BsonValue::String(value) => value.len(),
-            BsonValue::Document(value) => document_bytes(value, budget)?,
-            BsonValue::Array(values) => {
-                let mut bytes = 0;
-                for value in values {
-                    bytes += value_bytes(value, budget)?;
-                    if bytes > MAX_KEY_BYTES {
-                        return Err(limit());
-                    }
-                }
-                bytes
-            }
-            BsonValue::Binary(value) => value.bytes().len(),
-            BsonValue::RegularExpression(value) => value.pattern().len() + value.options().len(),
-            BsonValue::JavaScript(value) => {
-                value.code().len()
-                    + value
-                        .scope()
-                        .map_or(Ok(0), |scope| document_bytes(scope, budget))?
-            }
-            _ => 0,
-        };
-    if bytes > MAX_KEY_BYTES {
-        return Err(limit());
-    }
-    Ok(bytes)
+    super::memory::value_bytes(value, MAX_KEY_BYTES, &mut || budget.step())
 }
 
 #[cfg(test)]
