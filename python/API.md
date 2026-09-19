@@ -64,6 +64,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `delete_one(database, collection, filter, ...)`
 - `delete_many(database, collection, filter, ...)`
 - `find_one_and_delete(database, collection, filter, *, projection=None, sort=None, ...)`
+- `replace_one(database, collection, filter, replacement, *, upsert=False, ...)`
 
 Both delete methods accept the shared BSON filters and return an acknowledged
 `deleted_count`. Exact `_id` filters route directly; other `delete_one` filters
@@ -79,6 +80,16 @@ durable natural order breaks ties. Selection is rechecked under the winning
 shard's write lock, not a global cross-shard transaction/snapshot. Projection,
 sort, and result-budget failures are checked before deletion. Both native API
 styles forward the usual identity, deadline, cancellation, and result controls.
+
+`replace_one` returns `kind="update"`, `acknowledged`, `matched_count`,
+`modified_count`, and `upserted_id` (currently always `None`). It replaces the
+first matching document, preserves the original `_id` representation and natural
+order, and compares stored BSON bytes for modification counts. Equivalent
+numeric ID aliases are accepted; conflicting IDs and update-operator documents
+fail before writing. Top-level non-ID zero timestamps are stamped; nested values
+are preserved. `upsert=True` is explicitly unsupported in this checkpoint.
+Selection/replacement is atomic on the winning shard, not across shards. The
+usual request/result controls and missing-collection precondition apply.
 
 `list_collection_metadata` returns the usual `cursor` result, with a null plan.
 Continue or kill it using collection name `$cmd.listCollections`. Full rows
@@ -171,7 +182,7 @@ There is no pagination option or retained cursor. Request budgets apply to uniqu
 output values rather than unrelated input payloads; exceeding a bound fails the
 whole command. See the [distinct contract and limits](../docs/DOCUMENT_ENGINE.md#distinct-values).
 
-Updates, replacements, the other findAndModify forms, and native bulk-write helpers remain
+Operator updates, upserts, the other findAndModify forms, and native bulk-write helpers remain
 unsupported. There is no Python collection
 object or Python-hosted MongoDB network listener in this slice. The separate
 opt-in Rust Mongo listener also exposes batch inserts/deletes, retained finds

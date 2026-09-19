@@ -1351,9 +1351,6 @@ mod enabled {
         /// `false` means the target record no longer exists at the supplied
         /// natural order. A replacement cannot change the semantic `_id`.
         #[allow(clippy::too_many_arguments)]
-        // The protocol-neutral command model already reserves replacement;
-        // matcher/update semantics will consume this atomic storage primitive.
-        #[allow(dead_code)]
         pub(crate) fn replace_document_on_connection(
             &self,
             connection: &Connection,

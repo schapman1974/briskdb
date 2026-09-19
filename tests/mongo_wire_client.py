@@ -10,6 +10,82 @@ from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timesta
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
 
 
+def replacement_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_replacement.items
+        collection.insert_many([{"_id": Int64(i), "group": i % 2, "obsolete": True} for i in range(12)])
+        replacement = {"value": 7, "_id": 1.0}
+        result = collection.replace_one({"group": 1}, replacement)
+        assert (result.matched_count, result.modified_count, result.upserted_id) == (1, 1, None)
+        assert replacement == {"value": 7, "_id": 1.0}
+        row = collection.find_one({"_id": 1})
+        assert row == {"_id": 1, "value": 7} and list(row) == ["_id", "value"]
+        assert isinstance(row["_id"], Int64)
+        assert [row["_id"] for row in collection.find()] == list(range(12))
+        for value in (Int64(7), 7.0, Decimal128("7.00"), 7):
+            assert collection.replace_one({"_id": 1}, {"value": value}).modified_count == 1
+            assert collection.replace_one({"_id": 1}, {"value": value}).modified_count == 0
+        assert collection.replace_one({"_id": -1}, {}).matched_count == 0
+        assert client.absent_replacement.items.replace_one({}, {}).matched_count == 0
+        assert "absent_replacement" not in client.list_database_names()
+        for ordered in (True, False):
+            batch = client.wire_replacement[f"batch_{ordered}"]
+            batch.insert_many([{"_id": i, "v": 0} for i in range(3)])
+            try:
+                batch.bulk_write([pymongo.ReplaceOne({"_id": 0}, {"v": 1}),
+                    pymongo.ReplaceOne({"_id": 1}, {"_id": 10, "v": 1}),
+                    pymongo.ReplaceOne({"_id": 2}, {"v": 1})], ordered=ordered)
+            except BulkWriteError as error:
+                assert [(item["index"], item["code"]) for item in error.details["writeErrors"]] == [(1, 66)]
+                assert error.details["nMatched"] == error.details["nModified"] == (1 if ordered else 2)
+            else:
+                raise AssertionError("conflicting replacement ID must fail")
+            assert batch.find_one({"_id": 1}) == {"_id": 1, "v": 0}
+            assert batch.find_one({"_id": 2})["v"] == (0 if ordered else 1)
+        for statement, code in [
+            ({"q": {}, "u": {"$set": {"v": 1}}}, 115),
+            ({"q": {}, "u": [{"$set": {"v": 1}}]}, 115),
+            ({"q": {}, "u": {}, "multi": True}, 72),
+            ({"q": {}, "u": {}, "upsert": True}, 72),
+            ({"q": {}, "u": {}, "hint": "_id_"}, 72),
+            ({"q": {}, "u": {}, "sort": {"_id": 1}}, 72),
+            ({"q": {}, "u": {"value": 1, "$inc": {"n": 1}}}, 52),
+            ({"q": {"$where": "private"}, "u": {}}, 115),
+        ]:
+            reply = client.absent_replacement.command("update", "items", updates=[statement])
+            assert reply["ok"] == 1 and reply["n"] == reply["nModified"] == 0
+            assert reply["writeErrors"][0]["code"] == code, reply
+        assert "absent_replacement" not in client.list_database_names()
+        zero = Timestamp(0, 0)
+        collection.replace_one({"_id": 1}, {"a": zero, "b": zero, "nested": {"v": zero}})
+        row = collection.find_one({"_id": 1})
+        assert row["a"] != row["b"] and row["a"] != zero and row["nested"]["v"] == zero
+        # Body-array update statements, distinct from PyMongo's OP_MSG sequence.
+        reply = client.wire_replacement.command("update", "items", updates=[{"q": {"_id": 1}, "u": {"value": "persisted"}}])
+        assert reply == {"ok": 1, "n": 1, "nModified": 1}
+        # An old ID can make the normalized post-image too large despite a valid input.
+        large = client.wire_replacement.large_id
+        key = "k" * 270000
+        large.insert_one({"_id": key, "v": "keep"})
+        try:
+            large.replace_one({}, {"payload": "x" * 270000})
+        except OperationFailure as error:
+            assert error.code == 10334
+        else:
+            raise AssertionError("post-image must obey advertised BSON limit")
+        assert large.find_one({}) == {"_id": key, "v": "keep"}
+        concurrent = client.wire_replacement.concurrent
+        concurrent.insert_many([{"_id": i, "done": False} for i in range(24)])
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            outcomes = list(pool.map(lambda _: concurrent.replace_one({"done": False}, {"done": True}).modified_count, range(24)))
+        assert outcomes == [1] * 24 and concurrent.count_documents({"done": True}) == 24
+        from pymongo.write_concern import WriteConcern
+        unack = collection.with_options(write_concern=WriteConcern(w=0))
+        assert not unack.replace_one({"_id": 2}, {"unack": True}).acknowledged
+        client.admin.command("ping")
+        assert collection.find_one({"_id": 2})["unack"] is True
+
+
 def find_delete_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_find_delete.items
@@ -799,6 +875,10 @@ def lifecycle_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert BSON.encode(client.wire_replacement.items.find_one({"_id": 1})) == BSON.encode({"_id": Int64(1), "value": "persisted"})
+        assert client.wire_replacement.items.find_one({"_id": 2})["unack"] is True
+        assert BSON.encode(client.async_replacement.items.find_one({})) == BSON.encode({"_id": Int64(1), "value": Int64(1)})
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         assert [row["_id"] for row in client.wire_find_delete.items.find({})] == list(reversed(range(1, 10)))
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         assert [row["_id"] for row in client.wire_deletes.items.find({})] == list(reversed(range(1, 30, 2)))
@@ -922,6 +1002,15 @@ def metadata_smoke(uri):
 
 
 async def async_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_replacement.items
+        await collection.insert_one({"_id": Int64(1), "value": 1})
+        replacement = {"value": Int64(1)}
+        result = await collection.replace_one({"value": 1}, replacement)
+        assert (result.matched_count, result.modified_count) == (1, 1)
+        assert (await collection.replace_one({"_id": 1.0}, replacement)).modified_count == 0
+        assert (await collection.replace_one({"_id": 2}, {})).matched_count == 0
+        assert BSON.encode(await collection.find_one({})) == BSON.encode({"_id": Int64(1), "value": Int64(1)})
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         collection = client.async_find_delete.items
         await collection.insert_many([{"_id": i, "nested": {"v": Int64(i)}} for i in range(5)])
@@ -1053,5 +1142,6 @@ if __name__ == "__main__":
         metadata_smoke(sys.argv[1])
         delete_smoke(sys.argv[1])
         find_delete_smoke(sys.argv[1])
+        replacement_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

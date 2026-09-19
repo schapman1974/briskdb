@@ -16,8 +16,8 @@ use tokio::task::JoinHandle;
 mod aggregation;
 mod deletion;
 mod distinct;
-mod find_delete;
 mod metadata;
+mod single_mutation;
 mod sorting;
 
 use super::document_cursor::{
@@ -902,9 +902,18 @@ impl Engine {
                 )
                 .await
             }
-            DocumentCommand::Update(_)
-            | DocumentCommand::Replace(_)
-            | DocumentCommand::DropIndex(_) => Err(unsupported(
+            DocumentCommand::Replace(request) => {
+                self.run_document_replace(
+                    owner,
+                    request_id,
+                    request,
+                    cancellation,
+                    deadline,
+                    result_limits,
+                )
+                .await
+            }
+            DocumentCommand::Update(_) | DocumentCommand::DropIndex(_) => Err(unsupported(
                 "this document command is modeled but requires a later document-semantics milestone",
             )),
             DocumentCommand::CreateCollection(_)

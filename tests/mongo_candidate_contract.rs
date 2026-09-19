@@ -7,7 +7,7 @@ use std::process::Command;
 /// Kept separate from the reference-only report until the full corpus passes.
 #[tokio::test]
 #[ignore = "requires the frozen Mongo contract Python dependencies"]
-async fn frozen_aggregation_contracts_against_real_briskdb_endpoint() {
+async fn frozen_supported_contracts_against_real_briskdb_endpoint() {
     let root = tempfile::tempdir().unwrap();
     let database = BriskDb::builder(root.path())
         .with_shard_count(4)
@@ -58,6 +58,7 @@ fn run_contract(uri: &str, report: &std::path::Path) -> std::process::Output {
             "compat/mongo/v1/runner/contracts/test_aggregation_projection_stages_contract.py",
             "compat/mongo/v1/runner/contracts/test_aggregation_contract.py",
             "compat/mongo/v1/runner/contracts/test_group_accumulators_contract.py",
+            "compat/mongo/v1/runner/contracts/test_talkpython_contract.py::test_replace_one_preserves_id_and_replaces_the_full_document",
         ])
         .args([
             "--mongo-contract-target=briskdb",
@@ -92,14 +93,16 @@ modules = {
     'tests.contracts.test_group_accumulators_contract',
 }
 expected = {(case['id'], api) for case in corpus['cases']
-            if case['id'].split('::', 1)[0] in modules for api in case['apis']}
+            if (case['id'].split('::', 1)[0] in modules or case['id'] ==
+                'tests.contracts.test_talkpython_contract::test_replace_one_preserves_id_and_replaces_the_full_document')
+            for api in case['apis']}
 executions = ingest_junit(Path(sys.argv[1]), 'briskdb', corpus)['executions']
 actual = {(item['case_id'], item['api']) for item in executions}
-assert len(expected) == len(executions) == 142, 'locked suite coverage changed'
+assert len(expected) == len(executions) == 144, 'locked suite coverage changed'
 assert actual == expected, 'candidate suite omitted or substituted locked cases'
 assert all(item['outcome'] == 'passed' and item['target'] == 'briskdb-briskdb'
            for item in executions), 'candidate suite skipped or failed a case'
-print('Verified all 142 exact frozen candidate executions, with no skips.')
+print('Verified all 144 exact frozen candidate executions, with no skips.')
 "#,
             ])
             .arg(report)

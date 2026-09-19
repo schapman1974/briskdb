@@ -95,7 +95,7 @@ async with await briskdb.open_async("./data", shards=4, documents=True) as db:
 
 `AsyncSession` includes create/list collection and index calls plus
 `insert_one`, `find`, `count_documents`, `delete_one`, `delete_many`, and
-`find_one_and_delete`. They use the same
+`find_one_and_delete`, and `replace_one` (without upsert). They use the same
 request IDs, deadlines, cancellation tokens, result limits, BSON conversion,
 and point/scatter plans as their synchronous `Session` methods.
 

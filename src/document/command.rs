@@ -908,6 +908,7 @@ pub struct DocumentReplaceRequest {
     filter: DocumentFilter,
     replacement: BsonDocument,
     write_options: DocumentWriteOptions,
+    max_document_bytes: usize,
 }
 
 impl DocumentReplaceRequest {
@@ -918,12 +919,36 @@ impl DocumentReplaceRequest {
         write_options: DocumentWriteOptions,
     ) -> EngineResult<Self> {
         validate_document(&replacement)?;
+        if replacement.iter().any(|(name, _)| name.starts_with('$')) {
+            return Err(super::DocumentMutationError::InvalidReplacement.into_engine_error());
+        }
+        if let Some(id) = replacement.get_first("_id") {
+            super::CanonicalBsonKey::encode(id)
+                .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+        }
         Ok(Self {
             namespace,
             filter,
             replacement,
             write_options,
+            max_document_bytes: super::BSON_MAX_DOCUMENT_BYTES,
         })
+    }
+
+    /// Limit the normalized post-image, including the preserved `_id`.
+    /// Wire adapters can enforce their advertised BSON limit before commit.
+    pub fn with_max_document_bytes(mut self, bytes: usize) -> EngineResult<Self> {
+        if !(5..=super::BSON_MAX_DOCUMENT_BYTES).contains(&bytes) {
+            return Err(invalid_argument(
+                "replacement document byte limit is out of range",
+            ));
+        }
+        self.max_document_bytes = bytes;
+        Ok(self)
+    }
+
+    pub const fn max_document_bytes(&self) -> usize {
+        self.max_document_bytes
     }
 
     pub const fn namespace(&self) -> &DocumentNamespace {

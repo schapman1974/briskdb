@@ -22,11 +22,11 @@ use crate::{
         DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
         DocumentFindOneAndDeleteRequest, DocumentFindRequest, DocumentInsertRequest,
         DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
-        DocumentListDatabaseNamesRequest, DocumentMatcher, DocumentMutationScope,
-        DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentProjector,
-        DocumentQueryError, DocumentReadOptions, DocumentRequest, DocumentRequestId,
-        DocumentResult, DocumentSort, DocumentSorter, DocumentWriteOptions,
-        decode_document_batch_with_options, encode_document_with_options,
+        DocumentListDatabaseNamesRequest, DocumentMatcher, DocumentMutationError,
+        DocumentMutationScope, DocumentNamespace, DocumentPipeline, DocumentProjection,
+        DocumentProjector, DocumentQueryError, DocumentReadOptions, DocumentReplaceRequest,
+        DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort, DocumentSorter,
+        DocumentWriteOptions, decode_document_batch_with_options, encode_document_with_options,
     },
 };
 
@@ -91,6 +91,16 @@ impl From<EngineError> for CommandError {
     fn from(error: EngineError) -> Self {
         let mut source = error.source();
         while let Some(cause) = source {
+            if let Some(mutation) = cause.downcast_ref::<DocumentMutationError>() {
+                return Self::new(
+                    mutation.mongo_code(),
+                    match mutation {
+                        DocumentMutationError::ImmutableId => "ImmutableField",
+                        _ => "DollarPrefixedFieldName",
+                    },
+                    "invalid document replacement",
+                );
+            }
             if let Some(cursor) = cause.downcast_ref::<DocumentCursorError>() {
                 return Self::new(
                     cursor.mongo_code(),
@@ -160,6 +170,7 @@ pub(super) enum Command {
     DropDatabase(DocumentDropDatabaseRequest),
     Insert(DocumentInsertRequest),
     Delete(Vec<Result<DocumentDeleteRequest>>, bool),
+    Replace(Vec<Result<DocumentReplaceRequest>>, bool),
     FindAndDelete(DocumentFindOneAndDeleteRequest),
     Count(DocumentCountRequest),
     Distinct(DocumentDistinctRequest),
@@ -181,6 +192,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
         name,
         "insert"
             | "delete"
+            | "update"
             | "findAndModify"
             | "find"
             | "aggregate"
@@ -198,7 +210,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
     }
     Some((|| {
         let started = Instant::now();
-        if request.more_to_come && !matches!(name, "insert" | "delete") {
+        if request.more_to_come && !matches!(name, "insert" | "delete" | "update") {
             return Err(CommandError::options());
         }
         let namespace = if name == "listDatabases" {
@@ -260,13 +272,16 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 }
                 "documents" if name == "insert" => matches!(value, BsonValue::Array(_)),
                 "deletes" if name == "delete" => matches!(value, BsonValue::Array(_)),
-                "ordered" if matches!(name, "insert" | "delete") => {
+                "updates" if name == "update" => matches!(value, BsonValue::Array(_)),
+                "ordered" if matches!(name, "insert" | "delete" | "update") => {
                     matches!(value, BsonValue::Boolean(_))
                 }
-                "bypassDocumentValidation" if name == "insert" => {
+                "bypassDocumentValidation" if matches!(name, "insert" | "update") => {
                     matches!(value, BsonValue::Boolean(false))
                 }
-                "writeConcern" if matches!(name, "insert" | "delete") => valid_write_concern(value),
+                "writeConcern" if matches!(name, "insert" | "delete" | "update") => {
+                    valid_write_concern(value)
+                }
                 "writeConcern"
                     if matches!(name, "drop" | "dropDatabase" | "create" | "findAndModify") =>
                 {
@@ -284,6 +299,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                             | "listCollections"
                             | "listDatabases"
                             | "delete"
+                            | "update"
                             | "findAndModify"
                     ) =>
                 {
@@ -500,6 +516,63 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 DocumentFilter::new(filter)?,
                 options,
             ))
+        } else if name == "update" {
+            let statements = write_documents(request, "updates")?;
+            let updates = statements
+                .into_iter()
+                .map(|statement| {
+                    if statement
+                        .iter()
+                        .any(|(name, _)| !matches!(name, "q" | "u" | "multi" | "upsert"))
+                    {
+                        return Err(CommandError::options());
+                    }
+                    for option in ["multi", "upsert"] {
+                        if statement
+                            .get_first(option)
+                            .is_some_and(|value| !matches!(value, BsonValue::Boolean(false)))
+                        {
+                            return Err(CommandError::options());
+                        }
+                    }
+                    let Some(BsonValue::Document(filter)) = statement.get_first("q") else {
+                        return Err(CommandError::invalid());
+                    };
+                    let Some(BsonValue::Document(replacement)) = statement.get_first("u") else {
+                        return Err(CommandError::unsupported());
+                    };
+                    if replacement
+                        .iter()
+                        .next()
+                        .is_some_and(|(name, _)| name.starts_with('$'))
+                    {
+                        return Err(CommandError::unsupported());
+                    }
+                    DocumentMatcher::compile_with_check(filter, &mut || {
+                        if started.elapsed() >= timeout {
+                            Err(EngineError::deadline_exceeded(
+                                "Mongo command parsing deadline exceeded",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    })?;
+                    Ok(DocumentReplaceRequest::new(
+                        namespace.clone(),
+                        DocumentFilter::new(filter.clone())?,
+                        replacement.clone(),
+                        DocumentWriteOptions::new(),
+                    )?
+                    .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?)
+                })
+                .collect();
+            Command::Replace(
+                updates,
+                !matches!(
+                    request.body.get_first("ordered"),
+                    Some(BsonValue::Boolean(false))
+                ),
+            )
         } else if name == "delete" {
             let statements = write_documents(request, "deletes")?;
             let deletes = statements
@@ -1162,6 +1235,67 @@ impl Executor {
                     ),
                     ("value", value.map_or(BsonValue::Null, BsonValue::Document)),
                 ]))
+            }
+            Command::Replace(updates, ordered) => {
+                let mut matched = 0i64;
+                let mut modified = 0i64;
+                let mut errors = Vec::new();
+                for (index, update) in updates.into_iter().enumerate() {
+                    let result = match update {
+                        Err(error) => Err(error),
+                        Ok(update) => {
+                            if !self
+                                .exists(session, identity, &context, update.namespace())
+                                .await?
+                            {
+                                continue;
+                            }
+                            self.call(
+                                session,
+                                identity,
+                                &context,
+                                DocumentCommand::Replace(update),
+                            )
+                            .await
+                        }
+                    };
+                    match result {
+                        Ok(DocumentResult::Update(result)) => {
+                            matched += result.matched_count() as i64;
+                            modified += result.modified_count() as i64;
+                        }
+                        Ok(_) => {
+                            return Err(CommandError::new(
+                                1,
+                                "InternalError",
+                                "unexpected engine result",
+                            ));
+                        }
+                        Err(error)
+                            if matches!(error.code, 2 | 9 | 14 | 52 | 66 | 72 | 10334 | 115) =>
+                        {
+                            // These validation/resource failures precede commit (the
+                            // whole single-shard transaction rolls back on error).
+                            errors.push(BsonValue::Document(error.write_document(index)));
+                            if ordered {
+                                break;
+                            }
+                        }
+                        // A deadline, disconnect, or storage failure is not an
+                        // exact batch outcome; previous statements may have committed.
+                        Err(error) => return Err(error),
+                    }
+                }
+                let mut body = fields([
+                    ("ok", BsonValue::Double(1.0)),
+                    ("n", BsonValue::Int64(matched)),
+                    ("nModified", BsonValue::Int64(modified)),
+                ]);
+                if !errors.is_empty() {
+                    body.push("writeErrors", BsonValue::Array(errors))
+                        .expect("static field name");
+                }
+                Ok(body)
             }
             Command::Delete(deletes, ordered) => {
                 let mut count = 0i64;

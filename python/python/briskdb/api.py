@@ -615,6 +615,28 @@ class AsyncSession:
             cancellation=cancellation,
         )
 
+    async def replace_one(
+        self,
+        database: str,
+        collection: str,
+        filter: Any,
+        replacement: Any,
+        *,
+        upsert: bool = False,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.replace_one,
+            database, collection, filter, replacement,
+            upsert=upsert, request_id=request_id, timeout_ms=timeout_ms,
+            cancellation=cancellation, max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+        )
+
     async def find_one_and_delete(
         self,
         database: str,
