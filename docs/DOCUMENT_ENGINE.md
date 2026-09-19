@@ -72,7 +72,7 @@ The current engine executes:
 | `KillCursor` | Releases a session-owned cursor; reports whether it existed |
 | `Count` | Evaluates the same match expressions, then applies global skip/limit |
 | `Distinct` | Uses the same filters and global encounter order, with shared BSON identity and bounded unique values |
-| `Delete` | Deletes one document selected by exact `_id` |
+| `Delete` | Deletes one or many matches; exact `_id` routes to one shard, other filters use the shared matcher |
 
 `CollectionExists` uses an admitted, controlled manifest lookup and scalar result
 accounting. Its result is independent of catalog page size and unrelated metadata
@@ -98,6 +98,29 @@ restarts. `skip` and `limit` apply once across the whole cursor, after the
 merge; `batch_size` bounds each returned page. An initial batch size of zero
 opens a cursor without reading documents. Continuations require a positive
 batch size and cannot change the original skip or limit.
+
+### Filtered deletion and commit boundaries
+
+`Delete` validates its matcher, options, and fixed-size result/plan budget before
+writing. Exact-ID filters retain the direct one-shard path for both scopes.
+Filtered `One` scans each shard in natural order, retaining only the earliest
+candidate identity. It then acquires an immediate write transaction on that
+shard and rechecks both natural-order identity and the predicate. Concurrently
+deleted, replaced, or recreated candidates trigger reselection rather than a
+stale delete. With no concurrent writes, this removes the first globally
+inserted match. This does not promise a global concurrent snapshot.
+
+Filtered `Many` visits shards in ascending shard-ID order. Each shard scans and
+deletes inside one immediate transaction, reading one record at a time without
+materializing the matching set. A failure rolls back that shard; earlier shard
+commits remain. Cancellation, deadlines, shutdown, and task abort use the same
+worker/lease controls, including CPU-bound matcher checks. A failure or lost
+reply can therefore have a partial/unknown outcome; do not assume global
+rollback or blindly retry. Successful results report the total committed count.
+SQLite leases/transactions are released before returning. Namespace schema
+guards exclude concurrent DDL for the admitted shared command. Native Rust and
+Python retain their missing-collection precondition; Mongo wire deletes on an
+absent collection return zero after eager selector validation, without creating it.
 
 Find cursors retain the compiled query, collection identity, and last consumed
 natural-order position—not SQLite connections, transactions, schema guards, or

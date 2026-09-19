@@ -19,17 +19,19 @@ CI and byte-compares the normalized result with the checked-in reference. The
 full report remains `reference-only`; partial candidate coverage is not folded
 into that report or treated as full parity.
 
-Required CI separately runs all 112 sync/async executions in the frozen
+Required CI separately runs all 142 sync/async executions in the frozen
 `test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
-and `test_aggregation_contract` modules against a real four-shard BriskDB listener.
+`test_aggregation_contract`, and `test_group_accumulators_contract` modules
+against a real four-shard BriskDB listener.
 It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
 cleanup. The JUnit result is checked against the exact locked case/API set;
 missing, substituted, duplicate, skipped, or failed cases reject the gate.
 `target/mongo-parity/candidate-aggregation.xml` is uploaded alongside (not merged
 into) the full reference-only report. Frozen sources, corpus, adapters, reference
 results, and intentional-difference allowances are unchanged. This completes the
-basic and projection-stage suites (#179/#177), not the full 456-execution corpus
-or the separate group-accumulator suite (#176).
+basic and projection-stage suites (#179/#177) and the frozen group-accumulator
+cases. The full 456-execution corpus and partial-shard state merging (#176)
+remain open.
 
 To reproduce with the frozen runner's test dependencies installed:
 
@@ -252,8 +254,16 @@ Group keys use the existing expression subset without `$$REMOVE`/`$$ROOT` variab
 Partial-shard accumulator merging, additional expressions, and full
 candidate-corpus acceptance remain open.
 
-Updates, deletes, and metadata cursors
-are not implemented by this checkpoint.
+Mongo `delete` now supports filtered `delete_one`/`delete_many`, ordered and
+unordered selector batches, array and OP_MSG sequence forms, indexed validation
+errors, acknowledged results, and the existing unacknowledged write subset.
+Selectors use the shared BSON matcher and exact-ID routing. Missing collections
+return zero without creation. `limit` is exactly 0 (many) or 1 (one); collation,
+hint, let, retryable writes, and stronger write concerns remain unsupported.
+Operational errors abort the command and can follow committed shard writes;
+only prevalidated statement errors participate in ordered/unordered continuation.
+See [delete commit boundaries](DOCUMENT_ENGINE.md#filtered-deletion-and-commit-boundaries).
+Updates, findAndModify, and index metadata cursors remain unimplemented.
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required
 real-driver CI also verifies BSON fidelity, ordered/unordered duplicate failures,

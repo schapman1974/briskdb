@@ -557,6 +557,18 @@ class Session:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> DeleteOneResult: ...
+    def delete_many(
+        self,
+        database: str,
+        collection: str,
+        filter: BsonDocument,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> DeleteOneResult: ...
     def status(self) -> Status: ...
     def close(self) -> None: ...
     def __enter__(self) -> Session: ...

@@ -2037,6 +2037,43 @@ impl Session {
         )
     }
 
+    #[pyo3(signature = (database, collection, filter, *, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn delete_many(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        filter: Py<PyAny>,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let filter = DocumentFilter::new(extract_bson_document(
+            py,
+            filter.bind(py),
+            self.shared.uuid_representation,
+        )?);
+        let request = DocumentDeleteRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            python_engine_result(filter)?,
+            DocumentMutationScope::Many,
+            DocumentWriteOptions::new(),
+        );
+        self.execute_document_command(
+            py,
+            DocumentCommand::Delete(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
     fn status(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let shared = Arc::clone(&self.shared);
         let status = run_native(py, move || {

@@ -62,6 +62,15 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `count_documents(database, collection, filter=None, *, skip=0, limit=None, ...)`
 - `distinct(database, collection, field, filter=None, ...)`
 - `delete_one(database, collection, filter, ...)`
+- `delete_many(database, collection, filter, ...)`
+
+Both delete methods accept the shared BSON filters and return an acknowledged
+`deleted_count`. Exact `_id` filters route directly; other `delete_one` filters
+remove the first natural-order match after a shard-local identity/predicate
+recheck. `delete_many` commits one shard at a time. Later errors or cancellation
+can leave earlier commits in place: this is not a cross-shard transaction or
+snapshot. Request/result limits are checked before mutation; existing missing
+collection preconditions are unchanged. See [commit boundaries](../docs/DOCUMENT_ENGINE.md#filtered-deletion-and-commit-boundaries).
 
 `list_collection_metadata` returns the usual `cursor` result, with a null plan.
 Continue or kill it using collection name `$cmd.listCollections`. Full rows
@@ -114,7 +123,7 @@ This API deliberately mirrors the document engine's implemented boundary:
 `insert_one` generates a missing ObjectId while preserving explicit null and
 leaving the caller's document unchanged. Direct non-ID `Timestamp(0, 0)` fields
 are server-stamped; nested timestamps and timestamp IDs are preserved.
-Find/count use the [shared BSON matcher](../docs/DOCUMENT_ENGINE.md), including
+Find/count/delete use the [shared BSON matcher](../docs/DOCUMENT_ENGINE.md), including
 dotted paths, arrays, comparisons, logical operators, and bounded regexes.
 Filtering precedes global skip/limit; exact `_id`/`$eq` routes to one shard.
 Find returns a bounded page. When `cursor_id` is not `None`, use
@@ -153,13 +162,12 @@ There is no pagination option or retained cursor. Request budgets apply to uniqu
 output values rather than unrelated input payloads; exceeding a bound fails the
 whole command. See the [distinct contract and limits](../docs/DOCUMENT_ENGINE.md#distinct-values).
 
-Delete still requires an exact `_id`. Updates, replacements,
-aggregation and bulk-write helpers remain unsupported. There is no Python collection
+Updates, replacements, findAndModify, and native bulk-write helpers remain
+unsupported. There is no Python collection
 object or Python-hosted MongoDB network listener in this slice. The separate
-opt-in Rust Mongo listener also exposes batch inserts, retained finds, and
-`estimated_document_count()` through PyMongo. PyMongo's wire `count_documents()`
-uses aggregation and is still unsupported; this differs from the implemented
-native `Session.count_documents()` method above.
+opt-in Rust Mongo listener also exposes batch inserts/deletes, retained finds
+and aggregation, `estimated_document_count()`, and aggregation-backed
+`count_documents()` through PyMongo. These share the native document engine.
 
 ## Attached listeners
 

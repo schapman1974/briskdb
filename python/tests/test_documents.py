@@ -52,6 +52,37 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_filtered_deletes_order_types_controls_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for i in reversed(range(40)):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": i, "nested": {"v": i % 2}, "label": "remove"})
+                    identifier = uuid.uuid4()
+                    result = session.delete_one(DATABASE, COLLECTION, {"nested.v": 0}, request_id=identifier)
+                    self.assertEqual(result["request_id"], identifier)
+                    self.assertEqual(result["deleted_count"], 1)
+                    self.assertTrue(result["acknowledged"])
+                    self.assertEqual(session.find(DATABASE, COLLECTION, {"_id": 38})["documents"], [])
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.delete_many(DATABASE, COLLECTION, {}, max_result_bytes=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.delete_many(DATABASE, COLLECTION, {}, cancellation=token)
+                    with self.assertRaises(briskdb.UnsupportedError):
+                        session.delete_many(DATABASE, COLLECTION, {"$where": "secret"})
+                    result = session.delete_many(DATABASE, COLLECTION, {"nested.v": 0, "label": {"$regex": "^rem"}})
+                    self.assertEqual(result["deleted_count"], 19)
+                    self.assertEqual(session.delete_many(DATABASE, COLLECTION, {"_id": 39.0})["deleted_count"], 1)
+                    self.assertEqual(session.delete_one(DATABASE, COLLECTION, {})["deleted_count"], 1)
+                    self.assertEqual(session.count_documents(DATABASE, COLLECTION)["count"], 18)
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(session.delete_many(DATABASE, COLLECTION, {})["deleted_count"], 18)
+                    self.assertEqual(session.delete_many(DATABASE, COLLECTION, {})["deleted_count"], 0)
+
     def test_database_names_filter_limits_controls_and_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=2, documents=True) as database:
@@ -1182,6 +1213,22 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_filtered_deletes_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for i in range(12):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": i, "v": [i % 2]})
+                    self.assertEqual((await session.delete_one(DATABASE, COLLECTION, {"v": 0}))["deleted_count"], 1)
+                    identifier = uuid.uuid4()
+                    result = await session.delete_many(DATABASE, COLLECTION, {"v": 0}, request_id=identifier)
+                    self.assertEqual(result["request_id"], identifier)
+                    self.assertEqual(result["deleted_count"], 5)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.delete_many(DATABASE, COLLECTION, {}, max_result_bytes=1)
+                    self.assertEqual((await session.delete_many(DATABASE, COLLECTION, {}))["deleted_count"], 6)
+
     async def test_async_database_names_and_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

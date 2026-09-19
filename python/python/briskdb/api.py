@@ -615,6 +615,30 @@ class AsyncSession:
             cancellation=cancellation,
         )
 
+    async def delete_many(
+        self,
+        database: str,
+        collection: str,
+        filter: Any,
+        *,
+        request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None,
+        max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.delete_many,
+            database,
+            collection,
+            filter,
+            request_id=request_id,
+            max_result_rows=max_result_rows,
+            max_result_bytes=max_result_bytes,
+            timeout_ms=timeout_ms,
+            cancellation=cancellation,
+        )
+
     async def status(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._session.status)
 

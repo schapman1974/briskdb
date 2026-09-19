@@ -941,7 +941,7 @@ async fn document_commands_respect_disabled_host_support() {
 }
 
 #[tokio::test]
-async fn unacknowledged_insert_executes_without_emitting_a_reply() {
+async fn unacknowledged_writes_execute_without_emitting_a_reply() {
     let (_root, database, mut server) = setup().await;
     let mut stream = TcpStream::connect(server.address()).await.unwrap();
     let document = BsonDocument::from_entries([("_id", BsonValue::from("one-way"))]).unwrap();
@@ -964,6 +964,35 @@ async fn unacknowledged_insert_executes_without_emitting_a_reply() {
     assert!(
         matches!(first_batch(&body), [BsonValue::Document(actual)] if actual.representation_eq(&document))
     );
+    let delete = BsonDocument::from_entries([
+        ("delete", BsonValue::from("items")),
+        ("$db", BsonValue::from("wire")),
+        (
+            "deletes",
+            BsonValue::Array(vec![BsonValue::Document(
+                BsonDocument::from_entries([
+                    ("q", BsonValue::Document(BsonDocument::new())),
+                    ("limit", BsonValue::Int32(0)),
+                ])
+                .unwrap(),
+            )]),
+        ),
+        (
+            "writeConcern",
+            BsonValue::Document(BsonDocument::from_entries([("w", BsonValue::Int32(0))]).unwrap()),
+        ),
+    ])
+    .unwrap();
+    let mut bytes = packet(&delete, 3, 2);
+    bytes.extend_from_slice(&packet(
+        &find_command("items", BsonValue::from("one-way")),
+        4,
+        0,
+    ));
+    stream.write_all(&bytes).await.unwrap();
+    let (frame, body) = response(&mut stream).await;
+    assert_eq!(frame.response_to, 4);
+    assert!(first_batch(&body).is_empty());
     server.close().await.unwrap();
     database.close().await.unwrap();
 }

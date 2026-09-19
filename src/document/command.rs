@@ -964,6 +964,12 @@ impl fmt::Debug for DocumentReplaceRequest {
 }
 
 /// Request to delete one or many matching documents.
+///
+/// `One` selects the earliest match in durable natural order, then rechecks
+/// its identity and predicate in the owning shard's write transaction. `Many`
+/// commits one shard at a time, in shard-ID order. Neither provides a global
+/// snapshot or cross-shard transaction; a later error/cancellation can leave
+/// earlier shard commits in place. Exact `_id` filters route to one shard.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq)]
 pub struct DocumentDeleteRequest {
