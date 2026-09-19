@@ -973,44 +973,52 @@ mod enabled {
                         )
                         .optional()
                         .map_err(sqlite_error::storage)?;
-                    let stored_spec = if let Some((existing_spec, existing_unique, lifecycle)) =
-                        existing
-                    {
-                        // Legacy pending declarations can retain numeric direction
-                        // aliases. Normalizing a new request must not rewrite or
-                        // conflict with a semantically identical existing key list.
-                        if decode_metadata_document(&existing_spec, "document index specification")?
-                            != *specification
-                            || existing_unique != i64::from(unique)
-                            || lifecycle != INDEX_PENDING_BUILD
-                        {
-                            return Err(EngineError::new(
-                                EngineErrorKind::FailedPrecondition,
-                                "document index name already has a different declaration",
-                            ));
-                        }
-                        existing_spec
-                    } else {
-                        transaction
-                            .execute(
-                                "INSERT INTO briskdb_document_indexes (
+                    let stored_spec =
+                        if let Some((existing_spec, existing_unique, lifecycle)) = existing {
+                            // Legacy pending declarations can retain numeric direction
+                            // aliases. Normalizing a new request must not rewrite or
+                            // conflict with a semantically identical existing key list.
+                            let canonical_keys = !specification.is_empty()
+                                && specification
+                                    .iter()
+                                    .all(|(_, value)| matches!(value, BsonValue::Int32(1 | -1)));
+                            let same_spec = existing_spec == spec_bson
+                                || (canonical_keys
+                                    && decode_metadata_document(
+                                        &existing_spec,
+                                        "document index specification",
+                                    )? == *specification);
+                            if !same_spec
+                                || existing_unique != i64::from(unique)
+                                || lifecycle != INDEX_PENDING_BUILD
+                            {
+                                return Err(EngineError::new(
+                                    EngineErrorKind::FailedPrecondition,
+                                    "document index name already has a different declaration",
+                                ));
+                            }
+                            existing_spec
+                        } else {
+                            transaction
+                                .execute(
+                                    "INSERT INTO briskdb_document_indexes (
                                 collection_id, index_name, spec_bson, is_unique, is_builtin,
                                 index_format_version, lifecycle_state
                              ) VALUES (?1, ?2, ?3, ?4, 0, 1, ?5)",
-                                params![
-                                    to_sqlite_id(collection_id)?,
-                                    name,
-                                    spec_bson,
-                                    i64::from(unique),
-                                    INDEX_PENDING_BUILD
-                                ],
-                            )
-                            .map_err(sqlite_error::storage)?;
-                        manifest::validate_document_catalog(&transaction, self.shard_count())?;
-                        manifest::refresh_manifest_digest(&transaction)?;
-                        require_ready_manifest(&transaction, self.shard_count())?;
-                        spec_bson.clone()
-                    };
+                                    params![
+                                        to_sqlite_id(collection_id)?,
+                                        name,
+                                        spec_bson,
+                                        i64::from(unique),
+                                        INDEX_PENDING_BUILD
+                                    ],
+                                )
+                                .map_err(sqlite_error::storage)?;
+                            manifest::validate_document_catalog(&transaction, self.shard_count())?;
+                            manifest::refresh_manifest_digest(&transaction)?;
+                            require_ready_manifest(&transaction, self.shard_count())?;
+                            spec_bson.clone()
+                        };
                     ensure_control_active(
                         &control,
                         "before committing document index declaration",
@@ -3675,6 +3683,27 @@ mod enabled {
                 .declare_document_index(collection.id(), "legacy", &canonical, false)
                 .unwrap();
             assert!(result.specification().representation_eq(&legacy));
+            // Storage also retains older opaque specification envelopes. Do
+            // not broaden their existing byte-exact conflict behavior while
+            // recognizing normalized ordinary key directions.
+            let opaque = document([(
+                "key",
+                BsonValue::Document(document([("a", BsonValue::Int64(1))])),
+            )]);
+            storage
+                .declare_document_index(collection.id(), "opaque", &opaque, false)
+                .unwrap();
+            let different = document([(
+                "key",
+                BsonValue::Document(document([("a", BsonValue::Int32(1))])),
+            )]);
+            assert_eq!(
+                storage
+                    .declare_document_index(collection.id(), "opaque", &different, false)
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition
+            );
             drop(storage);
             let storage = Storage::open(temp.path(), 2).unwrap();
             let collection = storage

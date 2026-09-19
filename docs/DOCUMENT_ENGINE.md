@@ -99,7 +99,8 @@ An explicit short name can accommodate a long valid field path. `_id`/`_id_`
 remain reserved; this checkpoint does not add built-in-index redeclaration.
 Same-name declarations with identical ordered keys and uniqueness are idempotent;
 conflicts fail without catalog changes. Legacy numeric direction aliases compare
-semantically without rewriting their original stored BSON. Existing metadata is
+semantically without rewriting their original stored BSON. Opaque legacy
+specification envelopes retain byte-exact conflict checks. Existing metadata is
 still readable; new validation does not migrate or activate older declarations.
 
 All declared secondary indexes remain `PendingBuild`, including `unique` ones:
