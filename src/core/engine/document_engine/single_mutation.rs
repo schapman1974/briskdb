@@ -4,8 +4,9 @@ use super::*;
 use crate::{
     document::{
         BSON_MAX_NESTING_DEPTH, BsonCodecOptions, CanonicalBsonKey, DEFAULT_DOCUMENT_BATCH_SIZE,
-        DocumentFindOneAndDeleteRequest, DocumentMutationError, DocumentReplaceRequest,
-        DocumentRequestId, DocumentSortKey, DocumentUpdateResult, encode_document_with_options,
+        DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest, DocumentMutationError,
+        DocumentReplaceRequest, DocumentRequestId, DocumentSortKey, DocumentUpdateResult,
+        encode_document_with_options,
     },
     sqlite_error,
 };
@@ -25,16 +26,33 @@ enum Mutation {
     Replace {
         document: Arc<BsonDocument>,
         max_document_bytes: usize,
+        returns: ReplacementReturn,
     },
+}
+
+#[derive(Clone, Copy)]
+enum ReplacementReturn {
+    Counts,
+    Before,
+    After,
+}
+
+impl ReplacementReturn {
+    fn no_match(self) -> DocumentResult {
+        match self {
+            Self::Counts => DocumentResult::Update(
+                DocumentUpdateResult::new(0, 0, None).expect("zero update counts"),
+            ),
+            Self::Before | Self::After => DocumentResult::Document(None),
+        }
+    }
 }
 
 impl Mutation {
     fn no_match(&self) -> DocumentResult {
         match self {
             Self::Delete => DocumentResult::Document(None),
-            Self::Replace { .. } => DocumentResult::Update(
-                DocumentUpdateResult::new(0, 0, None).expect("zero update counts"),
-            ),
+            Self::Replace { returns, .. } => returns.no_match(),
         }
     }
 }
@@ -51,15 +69,7 @@ impl Engine {
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
         let (namespace, filter, options) = request.into_parts();
-        if options.skip() != 0
-            || options.limit().is_some()
-            || options.batch_size() != DEFAULT_DOCUMENT_BATCH_SIZE
-            || options.batch_byte_limit().is_some()
-        {
-            return Err(unsupported(
-                "find-one-and-delete accepts only projection and sort read options",
-            ));
-        }
+        require_single_mutation_read_options(&options)?;
         self.run_document_single_mutation(
             owner,
             request_id,
@@ -86,11 +96,7 @@ impl Engine {
     ) -> EngineResult<DocumentExecution> {
         let max_document_bytes = request.max_document_bytes();
         let (namespace, filter, replacement, options) = request.into_parts();
-        if !options.ordered() || options.upsert() || options.bypass_document_validation() {
-            return Err(unsupported(
-                "replacement upsert and non-default write options are not implemented",
-            ));
-        }
+        require_replacement_options(options)?;
         self.run_document_single_mutation(
             owner,
             request_id,
@@ -100,6 +106,44 @@ impl Engine {
             Mutation::Replace {
                 document: Arc::new(replacement),
                 max_document_bytes,
+                returns: ReplacementReturn::Counts,
+            },
+            cancellation,
+            deadline,
+            limits,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_document_find_replace(
+        &self,
+        owner: ConnectionOwner,
+        request_id: DocumentRequestId,
+        request: DocumentFindOneAndReplaceRequest,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        limits: ResultLimits,
+    ) -> EngineResult<DocumentExecution> {
+        let (replacement, read_options, return_after) = request.into_parts();
+        require_single_mutation_read_options(&read_options)?;
+        let max_document_bytes = replacement.max_document_bytes();
+        let (namespace, filter, document, write_options) = replacement.into_parts();
+        require_replacement_options(write_options)?;
+        self.run_document_single_mutation(
+            owner,
+            request_id,
+            namespace,
+            filter,
+            read_options,
+            Mutation::Replace {
+                document: Arc::new(document),
+                max_document_bytes,
+                returns: if return_after {
+                    ReplacementReturn::After
+                } else {
+                    ReplacementReturn::Before
+                },
             },
             cancellation,
             deadline,
@@ -322,6 +366,28 @@ impl Engine {
     }
 }
 
+fn require_single_mutation_read_options(options: &DocumentReadOptions) -> EngineResult<()> {
+    if options.skip() != 0
+        || options.limit().is_some()
+        || options.batch_size() != DEFAULT_DOCUMENT_BATCH_SIZE
+        || options.batch_byte_limit().is_some()
+    {
+        return Err(unsupported(
+            "single-record mutations accept only projection and sort read options",
+        ));
+    }
+    Ok(())
+}
+
+fn require_replacement_options(options: DocumentWriteOptions) -> EngineResult<()> {
+    if !options.ordered() || options.upsert() || options.bypass_document_validation() {
+        return Err(unsupported(
+            "replacement upsert and non-default write options are not implemented",
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mutate_record(
     mutation: &Mutation,
@@ -350,12 +416,15 @@ fn mutate_record(
         Mutation::Replace {
             document,
             max_document_bytes,
+            returns,
         } => replace_record(
             storage,
             transaction,
             record,
             document,
             *max_document_bytes,
+            *returns,
+            projection,
             request_id,
             plan,
             limits,
@@ -372,6 +441,8 @@ fn replace_record(
     record: Option<DocumentStorageRecord>,
     replacement: &BsonDocument,
     max_document_bytes: usize,
+    returns: ReplacementReturn,
+    projection: Option<&DocumentProjector>,
     request_id: DocumentRequestId,
     plan: DocumentPlan,
     limits: ResultLimits,
@@ -384,7 +455,7 @@ fn replace_record(
         return Ok(DocumentExecution::new(
             request_id,
             Some(plan),
-            DocumentResult::Update(DocumentUpdateResult::new(0, 0, None)?),
+            returns.no_match(),
         ));
     };
     if let Some(id) = replacement.get_first("_id") {
@@ -442,22 +513,42 @@ fn replace_record(
     let modified = bytes != before;
     drop(bytes);
     drop(before);
-    let execution = DocumentExecution::new(
-        request_id,
-        Some(plan),
-        DocumentResult::Update(DocumentUpdateResult::new(1, u64::from(modified), None)?),
+    // Prepare the write before consuming either image for projection. Retain
+    // its identity separately so returning the pre-image needs no extra clone.
+    let prepared = if modified {
+        Some(storage.prepare_document_write(&post_image)?)
+    } else {
+        None
+    };
+    let identity = (
+        record.collection_id(),
+        record.shard(),
+        record.id_key().clone(),
+        record.natural_order(),
     );
+    let result = match returns {
+        ReplacementReturn::Counts => {
+            DocumentResult::Update(DocumentUpdateResult::new(1, u64::from(modified), None)?)
+        }
+        ReplacementReturn::Before => DocumentResult::Document(Some(project_return_document(
+            record.into_document(),
+            projection,
+            &mut check,
+        )?)),
+        ReplacementReturn::After => DocumentResult::Document(Some(project_return_document(
+            post_image, projection, &mut check,
+        )?)),
+    };
+    let execution = DocumentExecution::new(request_id, Some(plan), result);
     enforce_execution_result_limits_with_check(&execution, limits, &mut check)?;
     check()?;
-    if modified {
-        let prepared = storage.prepare_document_write(&post_image)?;
-        check()?;
+    if let Some(prepared) = prepared {
         if !storage.replace_document_on_connection(
             transaction,
-            record.collection_id(),
-            record.shard(),
-            record.id_key(),
-            record.natural_order(),
+            identity.0,
+            identity.1,
+            &identity.2,
+            identity.3,
             &prepared,
             cancellation,
         )? {
@@ -538,27 +629,8 @@ fn return_and_delete(
         )
     });
     let document = record
-        .map(|record| {
-            let document = record.into_document();
-            match projection {
-                Some(projection) => {
-                    projection.project_owned_validated_with_check(document, &mut check)
-                }
-                None => Ok(document),
-            }
-        })
+        .map(|record| project_return_document(record.into_document(), projection, &mut check))
         .transpose()?;
-    if let Some(document) = document.as_ref() {
-        // The returned value is nested once in its result envelope. A stored
-        // document at the root depth ceiling must fail before mutation, not
-        // during reply serialization. This is an output limit, not corruption.
-        encode_document_with_options(
-            document,
-            &BsonCodecOptions::new().with_max_nesting_depth(BSON_MAX_NESTING_DEPTH - 1),
-        )
-        .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
-        check()?;
-    }
     let execution =
         DocumentExecution::new(request_id, Some(plan), DocumentResult::Document(document));
     // Validate the exact returned pre-image before the first durable write.
@@ -579,6 +651,26 @@ fn return_and_delete(
         }
     }
     Ok(execution)
+}
+
+fn project_return_document(
+    document: BsonDocument,
+    projection: Option<&DocumentProjector>,
+    check: &mut impl FnMut() -> EngineResult<()>,
+) -> EngineResult<BsonDocument> {
+    let document = match projection {
+        Some(projection) => projection.project_owned_validated_with_check(document, check)?,
+        None => document,
+    };
+    // The returned image is nested once in its result envelope. Reject a
+    // depth overflow before mutation, without classifying it as corruption.
+    encode_document_with_options(
+        &document,
+        &BsonCodecOptions::new().with_max_nesting_depth(BSON_MAX_NESTING_DEPTH - 1),
+    )
+    .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+    check()?;
+    Ok(document)
 }
 
 #[cfg(test)]

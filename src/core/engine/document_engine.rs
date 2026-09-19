@@ -215,7 +215,10 @@ impl Engine {
     ) -> EngineResult<DocumentExecution> {
         let storage = self.inner.database.storage.clone();
         let result_cancellation = cancellation.clone();
-        let mutation_returns_document = matches!(&command, DocumentCommand::FindOneAndDelete(_));
+        let mutation_returns_document = matches!(
+            &command,
+            DocumentCommand::FindOneAndDelete(_) | DocumentCommand::FindOneAndReplace(_)
+        );
         let execution = match command {
             DocumentCommand::ListDatabaseNames(request) => {
                 let names = self
@@ -859,6 +862,17 @@ impl Engine {
             }
             DocumentCommand::Delete(request) => {
                 self.run_document_delete(
+                    owner,
+                    request_id,
+                    request,
+                    cancellation,
+                    deadline,
+                    result_limits,
+                )
+                .await
+            }
+            DocumentCommand::FindOneAndReplace(request) => {
+                self.run_document_find_replace(
                     owner,
                     request_id,
                     request,

@@ -16,12 +16,12 @@ use briskdb::document::{
     DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
     DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
     DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
-    DocumentFindOneAndDeleteRequest, DocumentFindRequest, DocumentIndexRequest,
-    DocumentInsertRequest, DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
-    DocumentListCollectionsRequest, DocumentListDatabaseNamesRequest, DocumentListIndexesRequest,
-    DocumentMutationScope, DocumentNamespace, DocumentPipeline, DocumentProjection,
-    DocumentReadOptions, DocumentReplaceRequest, DocumentRequest, DocumentRequestId, DocumentSort,
-    DocumentWriteOptions,
+    DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest, DocumentFindRequest,
+    DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
+    DocumentListCollectionMetadataRequest, DocumentListCollectionsRequest,
+    DocumentListDatabaseNamesRequest, DocumentListIndexesRequest, DocumentMutationScope,
+    DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentReadOptions,
+    DocumentReplaceRequest, DocumentRequest, DocumentRequestId, DocumentSort, DocumentWriteOptions,
 };
 use briskdb::{
     BriskCursor, BriskDb, BriskSession, BriskTransaction,
@@ -1829,6 +1829,65 @@ impl Session {
         self.execute_document_command(
             py,
             DocumentCommand::FindOneAndDelete(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (database, collection, filter, replacement, *, projection = None, sort = None, return_document = false, upsert = false, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn find_one_and_replace(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        filter: Py<PyAny>,
+        replacement: Py<PyAny>,
+        projection: Option<Py<PyAny>>,
+        sort: Option<Py<PyAny>>,
+        return_document: bool,
+        upsert: bool,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let filter = python_engine_result(DocumentFilter::new(extract_bson_document(
+            py,
+            filter.bind(py),
+            self.shared.uuid_representation,
+        )?))?;
+        let replacement =
+            extract_bson_document(py, replacement.bind(py), self.shared.uuid_representation)?;
+        let replacement = python_engine_result(DocumentReplaceRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            filter,
+            replacement,
+            DocumentWriteOptions::new().with_upsert(upsert),
+        ))?;
+        let mut options = DocumentReadOptions::new();
+        if let Some(projection) = projection {
+            options = options.with_projection(document_projection(
+                py,
+                projection.bind(py),
+                self.shared.uuid_representation,
+            )?);
+        }
+        if let Some(sort) = sort {
+            options = options.with_sort(python_engine_result(DocumentSort::new(
+                extract_bson_document(py, sort.bind(py), self.shared.uuid_representation)?,
+            ))?);
+        }
+        let request = DocumentFindOneAndReplaceRequest::new(replacement, options)
+            .with_return_after(return_document);
+        self.execute_document_command(
+            py,
+            DocumentCommand::FindOneAndReplace(request),
             request_id,
             timeout_ms,
             cancellation.as_deref(),

@@ -52,6 +52,44 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_find_one_and_replace_returns_both_images_and_preflights_output(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for i in range(4):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": Int64(i), "rank": i})
+                    identifier = uuid.uuid4()
+                    result = session.find_one_and_replace(DATABASE, COLLECTION, {}, {"value": Int64(9)}, sort={"rank": -1}, projection={"rank": 1, "_id": 0}, request_id=identifier)
+                    self.assertEqual((result["kind"], result["document"], result["request_id"]), ("document", {"rank": 3}, identifier))
+                    after = session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 3.0}, {"value": Int64(9)}, return_document=True)["document"]
+                    self.assertEqual(bson_bytes(after), bson_bytes({"_id": Int64(3), "value": Int64(9)}))
+                    self.assertIsNone(session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 99}, {})["document"])
+                    with self.assertRaises((TypeError, ValueError)):
+                        session.find_one_and_replace(DATABASE, COLLECTION, {}, {}, return_document="after")
+                    large = {"payload": "x" * 600000}
+                    for return_after, replacement in [(True, large), (False, {})]:
+                        if not return_after:
+                            session.replace_one(DATABASE, COLLECTION, {"_id": 3}, large)
+                        before = session.find(DATABASE, COLLECTION, {"_id": 3})["documents"][0]
+                        with self.assertRaises(briskdb.LimitExceededError):
+                            session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 3}, replacement, return_document=return_after, max_result_bytes=128)
+                        self.assertEqual(session.find(DATABASE, COLLECTION, {"_id": 3})["documents"][0], before)
+                    deep = {}
+                    for _ in range(99):
+                        deep = {"nested": deep}
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 3}, deep, return_document=True)
+                    self.assertEqual(session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 3}, deep, return_document=True, projection=["_id"])["document"], {"_id": Int64(3)})
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 3}, {}, return_document=False)
+                    session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 3}, {"value": "persisted"}, projection=["_id"])
+                    with self.assertRaises(briskdb.UnsupportedError):
+                        session.find_one_and_replace(DATABASE, COLLECTION, {}, {}, upsert=True)
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(bson_bytes(session.find(DATABASE, COLLECTION, {"_id": 3})["documents"][0]), bson_bytes({"_id": Int64(3), "value": "persisted"}))
+
     def test_replace_one_preserves_id_and_reports_representation_changes(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -1286,6 +1324,26 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_find_one_and_replace_forwards_images_sort_projection_and_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for i in range(4):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": Int64(i), "rank": i})
+                    identifier = uuid.uuid4()
+                    result = await session.find_one_and_replace(DATABASE, COLLECTION, {}, {"value": Int64(9)}, sort={"rank": -1}, projection={"rank": 1, "_id": 0}, request_id=identifier)
+                    self.assertEqual((result["document"], result["request_id"]), ({"rank": 3}, identifier))
+                    result = await session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 3.0}, {"value": Int64(9)}, return_document=True)
+                    self.assertEqual(bson_bytes(result["document"]), bson_bytes({"_id": Int64(3), "value": Int64(9)}))
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.find_one_and_replace(DATABASE, COLLECTION, {}, {}, max_result_bytes=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        await session.find_one_and_replace(DATABASE, COLLECTION, {}, {}, cancellation=token)
+                    self.assertIsNone((await session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 99}, {}))["document"])
+
     async def test_async_replace_one_forwards_values_and_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

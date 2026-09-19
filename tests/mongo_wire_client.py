@@ -10,6 +10,86 @@ from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timesta
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
 
 
+def find_replace_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_find_replace.items
+        collection.insert_many([{"_id": Int64(i), "group": i % 2, "rank": i} for i in range(12)])
+        before = collection.find_one_and_replace({"group": 0}, {"value": Int64(9)},
+            sort=[("rank", -1)], projection={"rank": 1, "_id": 0})
+        assert before == {"rank": 10}
+        assert collection.find_one({"_id": 10}) == {"_id": 10, "value": 9}
+        replacement = {"_id": 10.0, "value": Int64(9)}
+        for after in (False, True):
+            value = collection.find_one_and_replace({"_id": 10}, replacement, return_document=after)
+            assert BSON.encode(value) == BSON.encode({"_id": Int64(10), "value": Int64(9)})
+            assert collection.find_one_and_replace({"_id": -1}, {}, return_document=after) is None
+        value = collection.find_one_and_replace({"_id": 10}, {"value": "persisted", "hidden": True},
+            projection={"value": 1, "_id": 0}, return_document=True)
+        assert value == {"value": "persisted"} and collection.find_one({"_id": 10})["hidden"] is True
+        assert client.absent_find_replace.items.find_one_and_replace({}, {}) is None
+        assert "absent_find_replace" not in client.list_database_names()
+        reply = client.absent_find_replace.command("findAndModify", "items", update={}, new=True)
+        assert reply == {"ok": 1, "lastErrorObject": {"n": 0, "updatedExisting": False}, "value": None}
+        reply = client.wire_find_replace.command("findAndModify", "items", query={"_id": 0}, update={},
+            new=True, fields={"_id": 0})
+        assert reply == {"ok": 1, "lastErrorObject": {"n": 1, "updatedExisting": True}, "value": {}}
+        for options, code in [
+            ({"update": {"$set": {"value": 2}}}, 115), ({"update": [{"$set": {"value": 2}}]}, 115),
+            ({"update": {}, "remove": True}, 72), ({"remove": True, "new": True}, 72),
+            ({"remove": False}, 72), ({"update": {}, "upsert": True}, 72),
+            ({"update": {}, "hint": "_id_"}, 72), ({"update": {}, "let": {}}, 72),
+            ({"update": {}, "writeConcern": {"w": 0}}, 72),
+            ({"update": {}, "query": {"$where": "private"}}, 115),
+            ({"update": {}, "fields": {"a": 1, "b": 0}}, 31254),
+        ]:
+            try:
+                client.absent_find_replace.command("findAndModify", "items", **options)
+            except OperationFailure as error:
+                # Projection uses the existing shared error taxonomy.
+                assert error.code == code, (options, error.code)
+            else:
+                raise AssertionError("invalid replacement command accepted")
+        try:
+            collection.find_one_and_replace({"_id": 1}, {"_id": 99})
+        except OperationFailure as error:
+            assert error.code == 66
+        else:
+            raise AssertionError("immutable ID changed")
+        assert collection.find_one({"_id": 1})["rank"] == 1
+        bounded = client.wire_find_replace.bounded
+        bounded.insert_one({"_id": 1, "value": "keep"})
+        large = {"payload": "x" * 522000}
+        try:
+            bounded.find_one_and_replace({}, large, return_document=True)
+        except OperationFailure as error:
+            assert error.code == 10334
+        else:
+            raise AssertionError("return-envelope budget must be checked before writing")
+        assert bounded.find_one({}) == {"_id": 1, "value": "keep"}
+        assert bounded.find_one_and_replace({}, large, return_document=True, projection=["_id"]) == {"_id": 1}
+        # Large post-image remains stored despite the small returned projection.
+        assert bounded.count_documents({"payload": {"$type": "string"}}) == 1
+        parallel = client.wire_find_replace.parallel
+        original = {"_id": 1, "a": [], "b": []}
+        parallel.insert_one(original)
+        for query in ({}, {"_id": 1}):
+            for after in (False, True):
+                try:
+                    parallel.find_one_and_replace(query, {}, sort=[("a", 1), ("b", 1)], return_document=after)
+                except OperationFailure as error:
+                    assert error.code == 2
+                else:
+                    raise AssertionError("invalid runtime sort must not replace")
+                assert parallel.find_one({}) == original
+        concurrent = client.wire_find_replace.concurrent
+        concurrent.insert_many([{"_id": i, "done": False} for i in range(24)])
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            values = list(pool.map(lambda after: concurrent.find_one_and_replace({"done": False}, {"done": True},
+                sort=[("_id", 1)], return_document=after), [False, True] * 12))
+        assert sorted(row["_id"] for row in values) == list(range(24))
+        assert [row["done"] for row in values] == [False, True] * 12
+
+
 def replacement_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_replacement.items
@@ -875,6 +955,8 @@ def lifecycle_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert BSON.encode(client.wire_find_replace.items.find_one({"_id": 10})) == BSON.encode({"_id": Int64(10), "value": "persisted", "hidden": True})
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         assert BSON.encode(client.wire_replacement.items.find_one({"_id": 1})) == BSON.encode({"_id": Int64(1), "value": "persisted"})
         assert client.wire_replacement.items.find_one({"_id": 2})["unack"] is True
         assert BSON.encode(client.async_replacement.items.find_one({})) == BSON.encode({"_id": Int64(1), "value": Int64(1)})
@@ -1002,6 +1084,13 @@ def metadata_smoke(uri):
 
 
 async def async_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_find_replace.items
+        await collection.insert_many([{"_id": Int64(i), "rank": i} for i in range(4)])
+        assert await collection.find_one_and_replace({}, {"value": Int64(9)}, sort=[("rank", -1)], projection={"rank": 1, "_id": 0}) == {"rank": 3}
+        value = await collection.find_one_and_replace({"_id": 3}, {"value": Int64(10)}, return_document=True)
+        assert BSON.encode(value) == BSON.encode({"_id": Int64(3), "value": Int64(10)})
+        assert await collection.find_one_and_replace({"_id": 99}, {}, return_document=True) is None
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         collection = client.async_replacement.items
         await collection.insert_one({"_id": Int64(1), "value": 1})
@@ -1143,5 +1232,6 @@ if __name__ == "__main__":
         delete_smoke(sys.argv[1])
         find_delete_smoke(sys.argv[1])
         replacement_smoke(sys.argv[1])
+        find_replace_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")
