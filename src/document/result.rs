@@ -309,6 +309,7 @@ pub enum DocumentResultKind {
     Collections,
     DatabaseNames,
     Document,
+    UpsertedDocument,
     Cursor,
     Count,
     Distinct,
@@ -318,6 +319,51 @@ pub enum DocumentResultKind {
     IndexName,
     Indexes,
     CursorKilled,
+}
+
+/// An insert performed by a find-and-modify upsert, with its optional returned
+/// image. A missing before-image and a null ID still represent an insertion.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DocumentUpsertedDocument {
+    upserted_id: BsonValue,
+    document: Option<BsonDocument>,
+}
+
+impl DocumentUpsertedDocument {
+    pub fn new(upserted_id: BsonValue, document: Option<BsonDocument>) -> EngineResult<Self> {
+        CanonicalBsonKey::encode(&upserted_id)
+            .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+        if let Some(document) = &document {
+            validate_result_document(document)?;
+        }
+        Ok(Self {
+            upserted_id,
+            document,
+        })
+    }
+
+    pub const fn upserted_id(&self) -> &BsonValue {
+        &self.upserted_id
+    }
+
+    pub const fn document(&self) -> Option<&BsonDocument> {
+        self.document.as_ref()
+    }
+
+    pub fn into_parts(self) -> (BsonValue, Option<BsonDocument>) {
+        (self.upserted_id, self.document)
+    }
+}
+
+impl fmt::Debug for DocumentUpsertedDocument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DocumentUpsertedDocument")
+            .field("upserted_id", &"<redacted>")
+            .field("image_present", &self.document.is_some())
+            .field("document", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Result of one protocol-neutral document command.
@@ -332,6 +378,7 @@ pub enum DocumentResult {
     Collections(Box<[DocumentCollectionMetadata]>),
     DatabaseNames(Box<[String]>),
     Document(Option<BsonDocument>),
+    UpsertedDocument(DocumentUpsertedDocument),
     Cursor(DocumentCursorBatch),
     Count(u64),
     Distinct(Box<[BsonValue]>),
@@ -353,6 +400,7 @@ impl DocumentResult {
             Self::Collections(_) => DocumentResultKind::Collections,
             Self::DatabaseNames(_) => DocumentResultKind::DatabaseNames,
             Self::Document(_) => DocumentResultKind::Document,
+            Self::UpsertedDocument(_) => DocumentResultKind::UpsertedDocument,
             Self::Cursor(_) => DocumentResultKind::Cursor,
             Self::Count(_) => DocumentResultKind::Count,
             Self::Distinct(_) => DocumentResultKind::Distinct,
@@ -386,6 +434,9 @@ impl fmt::Debug for DocumentResult {
             Self::Document(value) => {
                 debug.field("present", &value.is_some());
                 debug.field("document", &"<redacted>");
+            }
+            Self::UpsertedDocument(value) => {
+                debug.field("result", value);
             }
             Self::Cursor(value) => {
                 debug.field("cursor", value);
@@ -499,6 +550,26 @@ mod tests {
         let updated = DocumentUpdateResult::new(0, 0, Some(id.clone())).unwrap();
         assert!(updated.upserted_id().unwrap().representation_eq(&id));
         assert_eq!(DocumentDeleteResult::new(3).deleted_count(), 3);
+    }
+
+    #[test]
+    fn upserted_document_preserves_null_identity_images_and_redaction() {
+        let result = DocumentUpsertedDocument::new(BsonValue::Null, None).unwrap();
+        assert_eq!(result.upserted_id(), &BsonValue::Null);
+        assert!(result.document().is_none());
+        let result =
+            DocumentUpsertedDocument::new(BsonValue::from("secret-id"), Some(secret_document()))
+                .unwrap();
+        let debug = format!(
+            "{result:?} {:?}",
+            DocumentResult::UpsertedDocument(result.clone())
+        );
+        assert!(!debug.contains("secret-id"));
+        assert!(!debug.contains("hidden-value"));
+        assert_eq!(
+            result.into_parts(),
+            (BsonValue::from("secret-id"), Some(secret_document()))
+        );
     }
 
     #[test]

@@ -74,8 +74,8 @@ The current engine executes:
 | `Distinct` | Uses the same filters and global encounter order, with shared BSON identity and bounded unique values |
 | `Delete` | Deletes one or many matches; exact `_id` routes to one shard, other filters use the shared matcher |
 | `FindOneAndDelete` | Atomically deletes one shard-local selection and returns its projected pre-delete document |
-| `FindOneAndReplace` | Atomically replaces one shard-local selection and returns its projected before/after document; no upsert yet |
-| `FindOneAndUpdate` | Applies the supported field/array operators below to one shard-local selection and returns its projected before/after document; no upsert yet |
+| `FindOneAndReplace` | Replaces one shard-local selection or upserts, returning its projected before/after document and insertion metadata |
+| `FindOneAndUpdate` | Applies the supported field/array operators below to one shard-local selection or upserts, returning its projected before/after document and insertion metadata |
 | `Replace` | Replaces one match, preserving `_id` and natural order, or inserts a replacement upsert; returns counts and optional inserted ID |
 | `Update` | Applies the supported field/array operators below to one or many matches; returns matched/modified counts, with one transaction per shard for many |
 
@@ -340,7 +340,7 @@ than the general predicate budget), and concurrent same-ID upserts
 update the winner instead of inserting twice. Natural order is reserved outside
 the shard lock to preserve manifest/shard lock ordering; losing races may leave
 unused order numbers. Non-ID filters do not gain a global snapshot or uniqueness
-across shards. Find-and-modify upserts remain unsupported.
+across shards.
 
 `Update` also accepts `with_upsert(true)` for both one/many scopes. A no-match
 search derives a seed from positive direct/`$eq` equality clauses, including
@@ -363,7 +363,8 @@ No-write insertion preparation failures and explicitly rolled-back target-shard
 failures may be certified for safe unordered continuation; an initial many-update
 failure after earlier shard commits cannot receive that certificate.
 
-Required CI checks 1,772 source-locked upsert executions (886 cases in both scopes)
+Required CI checks 3,544 source-locked upsert executions (886 cases in both count
+scopes and both find-and-modify return modes)
 against unchanged TinyMongo `_document_for_upsert`, including exact persisted BSON,
 metadata and atomic errors for all eleven operators. That matrix covers the common
 direct/sole-`$eq`, non-overlapping object-path behavior and small integer increments.
@@ -375,11 +376,12 @@ limits, native/wire clients and restart.
 `DocumentFindOneAndReplaceRequest` wraps a validated `DocumentReplaceRequest`
 plus projection/sort read options. It defaults to the before-image;
 `with_return_after(true)` selects the post-image. `FindOneAndReplace` returns
-`Document(Some(image))` or `Document(None)` without creating a missing document.
+`Document(Some(image))` or `Document(None)` without creating a missing document
+when upsert is disabled.
 Sorting always uses the original stored values; projection only changes the
 returned image, never the persisted replacement. No-ops still return the selected
 image. Both forms share the same local reselection, ID/natural-order preservation,
-and write-option boundaries as `Replace`, except that upsert remains unsupported.
+and write-option boundaries as `Replace`, including replacement upserts.
 
 The normalized post-image and prepared write are validated before projection of
 the selected return image. Exact response size/plan budgets and a reserved
@@ -399,7 +401,24 @@ and a projected empty document is still a match. No-op updates return the chosen
 image; no match returns `Document(None)`. Invalid scopes, unsupported read/write
 options, and update specifications fail eagerly. The post-image cap, response
 size/depth checks, shard-local reselection, and late-cancellation commit boundary
-above apply equally to operator updates. Upsert remains unsupported.
+above apply equally to operator updates, including upserts.
+
+Both find-and-modify requests honor the wrapped write option `with_upsert(true)`.
+No-match synthesis follows the replacement/operator rules above. An insertion
+returns `DocumentResult::UpsertedDocument(DocumentUpsertedDocument)`, whose
+`upserted_id()` retains the exact BSON ID, including null. `document()` is `None`
+for the default before-image and the projected inserted document for the after-image.
+Matched operations, including projected-empty images, retain the ordinary
+`Document(Some(image))` result. Native Python keeps `kind: "document"` and exposes
+`did_upsert` plus `upserted_id` on every single-document result; no match and an
+inserted null ID are therefore unambiguous without a second read.
+
+The inserted ID and optional image share one result budget, even if projection
+excludes the ID or no image is returned. Metadata reserves one reply-container
+level; the image reserves its normal envelope level. All checks precede insertion.
+Sort controls selection of existing records, not synthesis of an inserted record.
+Concurrent same-ID rechecks retain projection/sort and return the actual atomic
+mutation image. Native namespaces must already exist; wire upserts may create them.
 
 ### Filtered deletion and commit boundaries
 
@@ -829,7 +848,7 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 
 ## Current boundary
 
-Other update operators, find-and-modify upserts,
+Other update operators,
 additional aggregation expressions/group-key forms,
 database statistics, index metadata cursors, and physical secondary-index builds
 remain later roadmap work. Collection metadata cursors are implemented.

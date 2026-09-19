@@ -132,7 +132,7 @@ experimental and opt-in; the exact contract lives in
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working; the opt-in `documents` feature adds a thin native document-command facade |
 | Same-host service and embedded processes sharing one ready root | Working on local filesystems |
-| Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, queries/cursors, basic aggregation, metadata, deletes, replacement/operator upserts, and field/array updates share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), remaining operators/find-and-modify upserts, and secondary indexes remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
+| Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, queries/cursors, basic aggregation, metadata, deletes, replacement/operator upserts (including find-and-modify), and field/array updates share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), remaining operators, and secondary indexes remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
 | Native Python extension | Typed sync/async SQL and opt-in BSON document commands; tagged releases build audited macOS/Linux ARM/x86 wheels |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
@@ -352,8 +352,7 @@ more valuable than a star. Start with the
 - Pre-1.0 storage and public-library compatibility can change between releases.
 - Python document commands support bounded BSON queries, basic aggregation,
   metadata/cursors, filtered deletes, replacements, and field/array updates.
-  Replacement and update-one/many operator upserts are supported; other update operators,
-  find-and-modify upserts,
+  Replacement, update-one/many, and find-and-modify upserts are supported; other update operators,
   native Python bulk-write helpers, and built
   secondary indexes remain planned. Multi-document writes commit per shard,
   without global atomicity or MongoDB per-document failure-boundary guarantees.

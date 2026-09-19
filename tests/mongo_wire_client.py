@@ -31,6 +31,83 @@ def rolled_back_batch_smoke(database, collection, expression, code):
     assert [BSON.encode(row) for row in collection.find({})] == before
 
 
+def find_upsert_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        database = client.wire_find_upsert
+        for replacement in (False, True):
+            collection = database[f"form_{replacement}"]
+            body = {"counter": 5, "stamp": Timestamp(0, 0), "hidden": True} if replacement else {"$inc": {"counter": 2}, "$set": {"stamp": Timestamp(0, 0), "hidden": True}}
+            for after, identifier in [(False, None), (True, Int64(1))]:
+                reply = database.command("findAndModify", collection.name, query={"_id": identifier, "counter": 3}, update=body, upsert=True, new=after, fields={"counter": 1, "_id": 0}, sort={"counter": -1})
+                assert reply["lastErrorObject"] == {"n": 1, "updatedExisting": False, "upserted": identifier}
+                assert BSON.encode({"v": reply["lastErrorObject"]["upserted"]}) == BSON.encode({"v": identifier})
+                assert reply["value"] == ({"counter": 5} if after else None)
+                stored = collection.find_one({"_id": identifier})
+                assert list(stored)[0] == "_id" and stored["hidden"]
+                assert (stored["stamp"] == Timestamp(0, 0)) == (not replacement)
+                reply = database.command("findAndModify", collection.name, query={"_id": identifier}, update=body, upsert=True, new=after, fields={"absent": 1, "_id": 0})
+                assert reply["lastErrorObject"] == {"n": 1, "updatedExisting": True}
+                assert reply["value"] == {}
+            method = collection.find_one_and_replace if replacement else collection.find_one_and_update
+            assert method({"generated": "before"}, body, upsert=True) is None
+            after = method({"generated": "after"}, body, upsert=True, return_document=pymongo.ReturnDocument.AFTER)
+            assert isinstance(after["_id"], ObjectId) and after["hidden"]
+            before = [BSON.encode(row) for row in collection.find({})]
+            for query, bad, code in [
+                ({"_id": 99}, {"_id": 98} if replacement else {"$set": {"_id": 98}}, 66),
+                ({"absent": True}, {"_id": None} if replacement else {"$set": {"_id": None}}, 11000),
+            ]:
+                try:
+                    method(query, bad, upsert=True)
+                except OperationFailure as error:
+                    assert error.code == code
+                else:
+                    raise AssertionError("find upsert must report the mutation failure")
+            assert [BSON.encode(row) for row in collection.find({})] == before
+        # The combined returned image plus inserted ID exceeds the reply budget
+        # even though the input document and each component fit independently.
+        limited = database.limited
+        for replacement in (False, True):
+            method = limited.find_one_and_replace if replacement else limited.find_one_and_update
+            fields = {"_id": "x" * 270000, "value": 1}
+            body = fields if replacement else {"$set": fields}
+            try:
+                method({"absent": True}, body, upsert=True, return_document=pymongo.ReturnDocument.AFTER)
+            except OperationFailure as error:
+                assert error.code == 10334
+            else:
+                raise AssertionError("combined reply budget must fail before insert")
+            assert limited.count_documents({}) == 0
+            image = method({"absent": True}, body, upsert=True, return_document=pymongo.ReturnDocument.AFTER, projection={"value": 1, "_id": 0})
+            assert image == {"value": 1}
+            limited.delete_many({})
+        # Find-and-modify nests metadata one level shallower than update batches.
+        deep_id = 1
+        for _ in range(98):
+            deep_id = {"nested": deep_id}
+        reply = database.command("findAndModify", "deep", query={"missing": True}, update={"_id": deep_id}, upsert=True, new=True, fields={"missing": 1, "_id": 0})
+        assert reply["value"] == {} and reply["lastErrorObject"]["upserted"] == deep_id
+        concurrent = database.concurrent
+        def increment(_):
+            return concurrent.find_one_and_update({"_id": Int64(999)}, {"$inc": {"counter": 1}}, upsert=True, return_document=pymongo.ReturnDocument.AFTER)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(increment, range(16)))
+        assert sorted(row["counter"] for row in results) == list(range(1, 17))
+        assert concurrent.count_documents({}) == 1
+        assert concurrent.find_one({}) == {"_id": Int64(999), "counter": 16}
+
+
+async def async_find_upsert_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        for replacement in (False, True):
+            collection = client.async_find_upsert[f"form_{replacement}"]
+            method = collection.find_one_and_replace if replacement else collection.find_one_and_update
+            body = {"value": Int64(7)} if replacement else {"$set": {"value": Int64(7)}}
+            assert await method({"_id": None}, body, upsert=True) is None
+            assert await method({"_id": Int64(1)}, body, upsert=True, return_document=pymongo.ReturnDocument.AFTER) == {"_id": Int64(1), "value": Int64(7)}
+            assert await method({"_id": None}, body, upsert=True, return_document=pymongo.ReturnDocument.AFTER, projection={"value": 1, "_id": 0}) == {"value": Int64(7)}
+
+
 def operator_upsert_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_operator_upsert.items
@@ -657,7 +734,7 @@ def find_replace_smoke(uri):
         for options, code in [
             ({"update": {"$mul": {"value": 2}}}, 115), ({"update": [{"$set": {"value": 2}}]}, 115),
             ({"update": {}, "remove": True}, 72), ({"remove": True, "new": True}, 72),
-            ({"remove": False}, 72), ({"update": {}, "upsert": True}, 72),
+            ({"remove": False}, 72), ({"update": {}, "upsert": 1}, 72),
             ({"update": {}, "hint": "_id_"}, 72), ({"update": {}, "let": {}}, 72),
             ({"update": {}, "writeConcern": {"w": 0}}, 72),
             ({"update": {}, "query": {"$where": "private"}}, 115),
@@ -2031,6 +2108,7 @@ if __name__ == "__main__":
         increment_smoke(sys.argv[1])
         replacement_upsert_smoke(sys.argv[1])
         operator_upsert_smoke(sys.argv[1])
+        find_upsert_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
         # Give the added operator cases their own bounded phase; retain the
         # existing discovery/CRUD phase's deadline as the suite grows.
@@ -2041,5 +2119,6 @@ if __name__ == "__main__":
         asyncio.run(asyncio.wait_for(async_increment_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_replacement_upsert_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_operator_upsert_smoke(sys.argv[1]), timeout=20))
+        asyncio.run(asyncio.wait_for(async_find_upsert_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

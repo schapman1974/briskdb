@@ -499,7 +499,7 @@ requires an earlier dependency:
       engine-owned cursors. Tests cover BSON fidelity, numeric-equivalent IDs,
       cross-interface access, restart, host enablement, one-way writes, and
       response limits. Missing collections read empty without creating metadata.
-      Additional update operators, find-and-modify upserts, index metadata cursors,
+      Additional update operators, index metadata cursors,
       and broader database options remain open.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
@@ -534,7 +534,7 @@ requires an earlier dependency:
       unbound ID, and retain literal zero timestamps. No advanced predicate
       simplification or global snapshot/uniqueness is promised. Result/depth limits,
       target-shard rechecks (all matches for many), and rollback-certified wire
-      errors share the replacement path. 1,772 source-locked upsert executions
+      errors share the replacement path. 3,544 source-locked upsert executions
       cover common frozen behavior; independent tests cover strict inference,
       null/generated/large IDs, concurrent counters, batches and restart.
       30,489 source-locked update cases supplement transaction/wire tests: 4,008
@@ -576,8 +576,9 @@ requires an earlier dependency:
       abort without fabricated counts. First-shard provisional writes, earlier
       no-op shards, partial commits, ordered/unordered behavior, restart,
       cancellation/task-abort, and continued-session tests cover
-      this boundary. Find-and-modify upserts and secondary-index post-image
-      validation remain open.
+      this boundary. Find-and-modify upserts now share the same synthesis and
+      recheck path, with explicit inserted IDs and optional before/after images.
+      Secondary-index post-image validation remains open.
     - [ ] [#175](https://github.com/schapman1974/briskdb/issues/175) — filtered
       delete-one/many now use the shared matcher across Rust, native sync/async
       Python, and Mongo wire. Exact IDs stay single-shard; delete-one rechecks
@@ -597,8 +598,12 @@ requires an earlier dependency:
       this path for all eleven supported field/array operators, preserving untouched fields and supporting
       sorted before/after images across Rust, native Python, and wire clients.
       Concurrent consumers, no-op/no-match/projected-empty replies, depth/size
-      rejection before writes, cancellation, and restart are tested. Other
-      operators, upserts, and secondary-index validation remain open.
+      rejection before writes, cancellation, and restart are tested. Both forms
+      now support upserts with null before-images, projected after-images, exact
+      inserted-ID metadata (including null), and combined ID/image preflight.
+      Concurrent same-ID insertion/update images are atomic; native sync/async
+      Python and wire replies preserve inserted-versus-matched distinctions.
+      Other operators and secondary-index validation remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

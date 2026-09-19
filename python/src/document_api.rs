@@ -32,6 +32,24 @@ pub(crate) fn execution_to_python(
     match result {
         DocumentResult::Document(document) => {
             output.set_item("kind", "document")?;
+            output.set_item("did_upsert", false)?;
+            output.set_item("upserted_id", py.None())?;
+            match document {
+                Some(document) => output.set_item(
+                    "document",
+                    bson_document_to_python(py, &document, uuid_representation, bson_types)?,
+                )?,
+                None => output.set_item("document", py.None())?,
+            }
+        }
+        DocumentResult::UpsertedDocument(result) => {
+            let (id, document) = result.into_parts();
+            output.set_item("kind", "document")?;
+            output.set_item("did_upsert", true)?;
+            output.set_item(
+                "upserted_id",
+                bson_value_to_python(py, &id, uuid_representation, bson_types)?,
+            )?;
             match document {
                 Some(document) => output.set_item(
                     "document",

@@ -1058,7 +1058,8 @@ impl DocumentFindOneAndReplaceRequest {
 }
 
 /// Apply operators to one selected document and return its projected image.
-/// The wrapped update must have scope `One`; upsert remains unsupported.
+/// The wrapped update must have scope `One`. Upserts return explicit inserted-ID
+/// metadata even when the requested before-image is absent.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentFindOneAndUpdateRequest {

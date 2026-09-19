@@ -342,13 +342,13 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 "query" | "fields" | "sort" if name == "findAndModify" => {
                     matches!(value, BsonValue::Document(_))
                 }
-                "remove" | "new" if name == "findAndModify" => {
+                "remove" | "new" | "upsert" if name == "findAndModify" => {
                     matches!(value, BsonValue::Boolean(_))
                 }
                 "update" if name == "findAndModify" => {
                     matches!(value, BsonValue::Document(_) | BsonValue::Array(_))
                 }
-                "upsert" | "bypassDocumentValidation" if name == "findAndModify" => {
+                "bypassDocumentValidation" if name == "findAndModify" => {
                     matches!(value, BsonValue::Boolean(false))
                 }
                 "nameOnly" | "authorizedCollections" if name == "listCollections" => {
@@ -524,7 +524,11 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 request.body.get_first("new"),
                 Some(BsonValue::Boolean(true))
             );
-            if remove && (return_after || request.body.get_first("update").is_some()) {
+            let upsert = matches!(
+                request.body.get_first("upsert"),
+                Some(BsonValue::Boolean(true))
+            );
+            if remove && (return_after || upsert || request.body.get_first("update").is_some()) {
                 return Err(CommandError::options());
             }
             if !remove && request.body.get_first("update").is_none() {
@@ -578,7 +582,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                         DocumentFilter::new(filter)?,
                         DocumentUpdate::new(replacement.clone())?,
                         DocumentMutationScope::One,
-                        DocumentWriteOptions::new(),
+                        DocumentWriteOptions::new().with_upsert(upsert),
                     )
                     .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?;
                     DocumentCommand::FindOneAndUpdate(
@@ -590,7 +594,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                         namespace,
                         DocumentFilter::new(filter)?,
                         replacement.clone(),
-                        DocumentWriteOptions::new(),
+                        DocumentWriteOptions::new().with_upsert(upsert),
                     )?
                     .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?;
                     DocumentCommand::FindOneAndReplace(
@@ -1021,6 +1025,12 @@ fn is_upsert(command: &DocumentCommand) -> bool {
     match command {
         DocumentCommand::Replace(request) => request.write_options().upsert(),
         DocumentCommand::Update(request) => request.write_options().upsert(),
+        DocumentCommand::FindOneAndReplace(request) => {
+            request.replacement_request().write_options().upsert()
+        }
+        DocumentCommand::FindOneAndUpdate(request) => {
+            request.update_request().write_options().upsert()
+        }
         _ => false,
     }
 }
@@ -1328,11 +1338,23 @@ impl Executor {
                     DocumentCommand::FindOneAndUpdate(request) => request.namespace(),
                     _ => unreachable!("parsed findAndModify mutation"),
                 };
-                let value = if !self.exists(session, identity, &context, namespace).await? {
-                    None
+                let upsert = is_upsert(&command);
+                let exists = if upsert {
+                    self.ensure_collection(session, identity, &context, namespace)
+                        .await?;
+                    true
+                } else {
+                    self.exists(session, identity, &context, namespace).await?
+                };
+                let (value, upserted_id) = if !exists {
+                    (None, None)
                 } else {
                     match self.call(session, identity, &context, command).await? {
-                        DocumentResult::Document(value) => value,
+                        DocumentResult::Document(value) => (value, None),
+                        DocumentResult::UpsertedDocument(result) => {
+                            let (id, image) = result.into_parts();
+                            (image, Some(id))
+                        }
                         _ => {
                             return Err(CommandError::new(
                                 1,
@@ -1342,15 +1364,22 @@ impl Executor {
                         }
                     }
                 };
+                let mut metadata = fields([
+                    (
+                        "n",
+                        BsonValue::Int32(i32::from(value.is_some() || upserted_id.is_some())),
+                    ),
+                    (
+                        "updatedExisting",
+                        BsonValue::Boolean(value.is_some() && upserted_id.is_none()),
+                    ),
+                ]);
+                if let Some(id) = upserted_id {
+                    metadata.push("upserted", id).expect("static field name");
+                }
                 Ok(fields([
                     ("ok", BsonValue::Double(1.0)),
-                    (
-                        "lastErrorObject",
-                        BsonValue::Document(fields([
-                            ("n", BsonValue::Int32(i32::from(value.is_some()))),
-                            ("updatedExisting", BsonValue::Boolean(value.is_some())),
-                        ])),
-                    ),
+                    ("lastErrorObject", BsonValue::Document(metadata)),
                     ("value", value.map_or(BsonValue::Null, BsonValue::Document)),
                 ]))
             }

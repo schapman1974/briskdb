@@ -64,6 +64,8 @@ def sync_contract(path: str) -> None:
     modified: int = document_session.replace_one("app", "notes", {}, {"body": "replacement"}, upsert=False)["modified_count"]
     did_upsert: bool = document_session.replace_one("app", "notes", {"_id": None}, {}, upsert=True)["did_upsert"]
     replaced: Optional[dict[str, object]] = document_session.find_one_and_replace("app", "notes", {}, {"body": "replacement"}, projection=["_id"], return_document=True)["document"]
+    inserted_image: bool = document_session.find_one_and_update("app", "notes", {"_id": None}, {"$set": {}}, upsert=True)["did_upsert"]
+    print(inserted_image)
     print(removed, modified, replaced, did_upsert)
     print(deleted_many)
     print(
@@ -127,6 +129,8 @@ async def async_contract(path: str) -> None:
     updated_image: Optional[dict[str, object]] = (await session.find_one_and_update("app", "typed", {}, {"$unset": {"body": 1}}, projection=["_id"]))["document"]
     modified: int = (await session.replace_one("app", "typed", {}, {"body": "replacement"}))["modified_count"]
     replaced: Optional[dict[str, object]] = (await session.find_one_and_replace("app", "typed", {}, {"body": "replacement"}, sort={"_id": 1}, return_document=True))["document"]
+    inserted_image: bool = (await session.find_one_and_replace("app", "typed", {"_id": None}, {}, upsert=True))["did_upsert"]
+    print(inserted_image)
     print(removed, modified, replaced)
     print(deleted_many)
     print(continued, killed, projected, exists, distinct)

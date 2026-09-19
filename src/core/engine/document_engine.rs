@@ -2273,6 +2273,14 @@ fn enforce_execution_result_limits_with_check(
                 budget.add_document(document, check)?;
             }
         }
+        DocumentResult::UpsertedDocument(result) => {
+            budget.add_rows(1)?;
+            budget.add_bytes(DOCUMENT_RESULT_ROW_BYTES + DOCUMENT_RESULT_VALUE_BYTES + 1)?;
+            budget.add_value(result.upserted_id(), check)?;
+            if let Some(document) = result.document() {
+                budget.add_document(document, check)?;
+            }
+        }
         DocumentResult::Cursor(batch) => {
             let namespace_bytes = batch
                 .namespace()

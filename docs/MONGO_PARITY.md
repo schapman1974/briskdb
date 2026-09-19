@@ -291,9 +291,9 @@ Replacement `findAndModify` accepts a replacement document in `update`, optional
 The shared `FindOneAndReplace` command validates both the normalized stored
 post-image and the selected before/after reply before mutation. Replies include
 `value` (null on no match) and `lastErrorObject.n`/`updatedExisting`; a projected
-empty document still reports a match. Missing collections are not created, and
+empty document still reports a match. Without upsert, missing collections are not created, and
 validation remains eager. `remove:true` cannot be combined with `update` or
-`new:true`. Pipeline updates and upsert remain unsupported. Native
+`new:true` or `upsert:true`. Pipeline updates remain unsupported. Native
 sync/async Python exposes `find_one_and_replace` with the same semantics.
 
 Operator `findAndModify` accepts `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`/`$inc`
@@ -302,8 +302,18 @@ same query/sort/projection and boolean `new` options, through `FindOneAndUpdate`
 It preserves untouched fields and shares operator validation, immutable-ID
 checks, post-image limits, and pre-commit return size/depth checks. No-ops still
 return an image; projected `{}` still sets `n:1` and `updatedExisting:true`.
-Missing namespaces return null without creation after eager validation. Native
+Without upsert, missing namespaces return null without creation after eager validation. Native
 sync/async Python exposes `find_one_and_update` with identical image semantics.
+
+Replacement and operator `findAndModify` accept boolean `upsert:true`, including
+creation of a missing namespace. An insertion returns `lastErrorObject` with
+`n:1`, `updatedExisting:false`, and `upserted` containing the exact inserted ID
+(including null). `value` is null for `new:false` and the projected inserted
+document for `new:true`. Existing matches retain `updatedExisting:true` without
+`upserted`, even for projected `{}` or no-op updates. Inserted-ID metadata plus
+the optional image are budgeted together before commit. Rechecks under the target
+shard write lock return the actual atomic image. `remove:true` plus `upsert:true`
+and unacknowledged findAndModify remain explicitly unsupported.
 
 Wire `update` supports replacement statements and `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`/`$inc` operator
 statements (`q` and a document `u`) through shared `Replace`/`Update`.
@@ -345,8 +355,8 @@ ID depth checks, one-way writes and duplicate handling share the replacement pat
 Many-scope target-shard rechecks update all new matches there without promising a
 global snapshot. Preparation failures before document writes and explicit successful
 target-shard rollback can certify safe unordered continuation; failures after earlier
-modified shards still abort. Another 1,772 source-locked executions compare exact
-stored BSON, metadata and errors with the unchanged upsert helper over its common
+modified shards still abort. Another 3,544 source-locked executions compare exact
+stored BSON, metadata, find-and-modify before/after images and errors with the unchanged upsert helper over its common
 direct/sole-equality object-path behavior. Legacy AND/literal-document inference,
 unsafe paths/IDs and numeric differences are independently tested, not waived.
 
@@ -365,7 +375,7 @@ shards, checking exact data after restart. The frozen add-to-set atomicity case
 now passes unchanged in both API modes. This remains neither a global
 transaction/snapshot nor exact MongoDB per-document or frozen TinyMongo
 collection-wide failure atomicity. No reference/allowance is changed.
-Other operators/pipeline updates, find-and-modify upserts, and update-command
+Other operators/pipeline updates and update-command
 hint/sort/collation/arrayFilters remain explicit future work. Native sync/async
 Python exposes `replace_one`, `update_one`, and `update_many` with the same engine semantics and
 controls. The field-update subset includes bounded object/array paths, immutable
