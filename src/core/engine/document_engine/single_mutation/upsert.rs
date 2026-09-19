@@ -2,7 +2,7 @@
 //! natural-order reservation must happen outside the shard write transaction.
 
 use super::*;
-use crate::document::DocumentWriteRollback;
+use crate::document::{DocumentUpsertedDocument, DocumentWriteRollback};
 
 impl Engine {
     #[allow(clippy::too_many_arguments)]
@@ -23,6 +23,7 @@ impl Engine {
             request_id,
             namespace,
             Arc::new(filter),
+            Arc::new(DocumentReadOptions::new()),
             Mutation::Replace {
                 document: Arc::new(replacement),
                 max_document_bytes,
@@ -43,19 +44,24 @@ impl Engine {
         request_id: DocumentRequestId,
         namespace: DocumentNamespace,
         filter: Arc<DocumentFilter>,
+        read_options: Arc<DocumentReadOptions>,
         mutation: Mutation,
         scope: DocumentMutationScope,
         cancellation: CancellationToken,
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
-        let max_document_bytes = match &mutation {
+        let (max_document_bytes, returns) = match &mutation {
             Mutation::Replace {
-                max_document_bytes, ..
+                max_document_bytes,
+                returns,
+                ..
             }
             | Mutation::Update {
-                max_document_bytes, ..
-            } => *max_document_bytes,
+                max_document_bytes,
+                returns,
+                ..
+            } => (*max_document_bytes, *returns),
             Mutation::Delete => unreachable!("delete cannot upsert"),
         };
         // Share the retained query rather than deep-cloning it for a possible
@@ -81,7 +87,7 @@ impl Engine {
                 request_id,
                 namespace.clone(),
                 Arc::clone(&filter),
-                DocumentReadOptions::new(),
+                Arc::clone(&read_options),
                 mutation.clone(),
                 cancellation.clone(),
                 deadline,
@@ -90,6 +96,7 @@ impl Engine {
             .await?
         };
         if !matches!(execution.result(), DocumentResult::Update(result) if result.matched_count() == 0)
+            && !matches!(execution.result(), DocumentResult::Document(None))
         {
             return Ok(execution);
         }
@@ -97,13 +104,24 @@ impl Engine {
         let plan = plan.expect("upsert search plan");
         let storage = self.inner.database.storage.clone();
         let prepare_mutation = mutation.clone();
-        let (collection_id, matcher, prepared, inserted, first_order) = self
+        let (collection_id, matcher, projection, sorter, prepared, inserted, first_order) = self
             .run_document_storage_task(
                 cancellation.clone(),
                 deadline,
                 move |cancellation, control| {
                     let mut check = || ensure_document_cpu_active(cancellation, &control);
                     check()?;
+                    let projection = read_options
+                        .projection()
+                        .map(|spec| {
+                            DocumentProjector::compile_with_check(spec.document(), &mut check)
+                        })
+                        .transpose()?;
+                    let sorter = read_options
+                        .sort()
+                        .filter(|spec| !spec.document().is_empty())
+                        .map(|spec| DocumentSorter::compile_with_check(spec.document(), &mut check))
+                        .transpose()?;
                     // Exact IDs already have a canonical point plan. Recompiling
                     // them as general predicates would impose the smaller query
                     // budget on IDs accepted by normal native point operations.
@@ -116,10 +134,11 @@ impl Engine {
                         )?)
                     };
                     let document = match &prepare_mutation {
-                        Mutation::Replace { document, .. } => synthesize_replacement(
+                        Mutation::Replace { document, .. } => synthesize_replacement_for_return(
                             filter.document(),
                             document,
                             max_document_bytes,
+                            returns,
                             &mut check,
                         )?,
                         Mutation::Update { updater, .. } => {
@@ -144,6 +163,7 @@ impl Engine {
                                 document.get_first("_id"),
                                 false,
                                 max_document_bytes,
+                                returns,
                                 &mut check,
                             )?
                         }
@@ -163,11 +183,26 @@ impl Engine {
                             Arc::clone(&control),
                         )?)?
                         .id();
-                    let inserted = DocumentExecution::new(
-                        request_id,
-                        Some(plan),
-                        DocumentResult::Update(DocumentUpdateResult::new(0, 0, Some(id))?),
-                    );
+                    let result = match returns {
+                        MutationReturn::Counts => {
+                            DocumentResult::Update(DocumentUpdateResult::new(0, 0, Some(id))?)
+                        }
+                        MutationReturn::Before | MutationReturn::After => {
+                            let image = if matches!(returns, MutationReturn::After) {
+                                Some(project_return_document(
+                                    document,
+                                    projection.as_ref(),
+                                    &mut check,
+                                )?)
+                            } else {
+                                None
+                            };
+                            DocumentResult::UpsertedDocument(DocumentUpsertedDocument::new(
+                                id, image,
+                            )?)
+                        }
+                    };
+                    let inserted = DocumentExecution::new(request_id, Some(plan), result);
                     enforce_execution_result_limits_with_check(&inserted, limits, &mut check)?;
                     check()?;
                     // Reservation can leave a gap if another writer wins, just like
@@ -178,7 +213,15 @@ impl Engine {
                         1,
                         Arc::clone(&control),
                     )?;
-                    Ok((collection_id, matcher, prepared, inserted, first_order))
+                    Ok((
+                        collection_id,
+                        matcher,
+                        projection,
+                        sorter,
+                        prepared,
+                        inserted,
+                        first_order,
+                    ))
                 },
             )
             // The completed search matched zero documents. This phase performs
@@ -240,13 +283,19 @@ impl Engine {
                         None
                     } else if let DocumentPlan::Point(point) = plan {
                         debug_assert_eq!(point.shard(), shard);
-                        storage.get_document_on_connection(
+                        let record = storage.get_document_on_connection(
                             &transaction,
                             collection_id,
                             shard,
                             point.id_key(),
                             cancellation,
-                        )?
+                        )?;
+                        if let (Some(sorter), Some(record)) = (sorter.as_ref(), record.as_ref()) {
+                            sorter.key_validated_with_check(record.document(), &mut || {
+                                ensure_document_cpu_active(cancellation, control)
+                            })?;
+                        }
+                        record
                     } else {
                         select_candidate(
                             storage,
@@ -254,7 +303,7 @@ impl Engine {
                             collection_id,
                             shard,
                             matcher.as_ref(),
-                            None,
+                            sorter.as_ref(),
                             None,
                             cancellation,
                             control,
@@ -279,7 +328,7 @@ impl Engine {
                             record,
                             request_id,
                             plan.clone(),
-                            None,
+                            projection.as_ref(),
                             limits,
                             cancellation,
                             control,
@@ -328,10 +377,27 @@ fn equality_id(query: &BsonDocument) -> Option<&BsonValue> {
     (!matches!(value, BsonValue::RegularExpression(_))).then_some(value)
 }
 
+#[cfg(test)]
 fn synthesize_replacement(
     query: &BsonDocument,
     replacement: &BsonDocument,
     max_document_bytes: usize,
+    check: &mut dyn FnMut() -> EngineResult<()>,
+) -> EngineResult<BsonDocument> {
+    synthesize_replacement_for_return(
+        query,
+        replacement,
+        max_document_bytes,
+        MutationReturn::Counts,
+        check,
+    )
+}
+
+fn synthesize_replacement_for_return(
+    query: &BsonDocument,
+    replacement: &BsonDocument,
+    max_document_bytes: usize,
+    returns: MutationReturn,
     check: &mut dyn FnMut() -> EngineResult<()>,
 ) -> EngineResult<BsonDocument> {
     check()?;
@@ -347,6 +413,7 @@ fn synthesize_replacement(
         replacement_id.or(query_id),
         true,
         max_document_bytes,
+        returns,
         check,
     )
 }
@@ -356,6 +423,7 @@ fn normalize_upsert(
     id: Option<&BsonValue>,
     stamp_timestamps: bool,
     max_document_bytes: usize,
+    returns: MutationReturn,
     check: &mut dyn FnMut() -> EngineResult<()>,
 ) -> EngineResult<BsonDocument> {
     check()?;
@@ -364,14 +432,16 @@ fn normalize_upsert(
     });
     CanonicalBsonKey::encode(&id)
         .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
-    // A wire upsert ID is nested inside both the upserted array and its entry.
-    // Reserve those two extra containers before any insert can commit; the
+    // Count replies nest the ID inside the upserted array and entry; find-and-
+    // modify replies nest it only inside lastErrorObject. Reserve the exact
+    // extra containers before any insert can commit; the
     // ordinary result-byte accounting alone cannot prove reply depth safety.
     let returned_id = BsonDocument::from_entries([("_id", id.clone())])
         .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
     encode_document_with_options(
         &returned_id,
-        &BsonCodecOptions::new().with_max_nesting_depth(BSON_MAX_NESTING_DEPTH - 2),
+        &BsonCodecOptions::new()
+            .with_max_nesting_depth(BSON_MAX_NESTING_DEPTH - returns.upsert_id_depth()),
     )
     .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
     check()?;

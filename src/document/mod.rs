@@ -70,7 +70,8 @@ pub use plan::{DocumentPlan, DocumentPointPlan, DocumentScatterPlan};
 pub use projection::DocumentProjector;
 pub use result::{
     DocumentCursorBatch, DocumentDeleteResult, DocumentExecution, DocumentInsertResult,
-    DocumentResult, DocumentResultKind, DocumentUpdateResult, DocumentWriteError,
+    DocumentResult, DocumentResultKind, DocumentUpdateResult, DocumentUpsertedDocument,
+    DocumentWriteError,
 };
 pub use sorting::{DocumentSortKey, DocumentSorter};
 pub use update::{DocumentUpdateError, DocumentUpdater};

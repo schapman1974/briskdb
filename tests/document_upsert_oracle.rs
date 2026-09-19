@@ -5,10 +5,10 @@ use briskdb::{
     document::{
         BsonDocument, BsonValue, DocumentCollectionOptions, DocumentCommand,
         DocumentCreateCollectionRequest, DocumentDeleteRequest, DocumentFilter,
-        DocumentFindRequest, DocumentMutationError, DocumentMutationScope, DocumentNamespace,
-        DocumentQueryError, DocumentReadOptions, DocumentRequest, DocumentRequestId,
-        DocumentResult, DocumentUpdate, DocumentUpdateError, DocumentUpdateRequest,
-        DocumentWriteOptions, decode_document, encode_document,
+        DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentMutationError,
+        DocumentMutationScope, DocumentNamespace, DocumentQueryError, DocumentReadOptions,
+        DocumentRequest, DocumentRequestId, DocumentResult, DocumentUpdate, DocumentUpdateError,
+        DocumentUpdateRequest, DocumentWriteOptions, decode_document, encode_document,
     },
 };
 use std::{error::Error, process::Command};
@@ -67,19 +67,28 @@ async fn operator_upserts_match_locked_oracle_in_both_scopes() {
         let Some(BsonValue::Document(update)) = case.get_first("update") else {
             panic!("update")
         };
-        for scope in [DocumentMutationScope::One, DocumentMutationScope::Many] {
-            let result = engine
-                .execute_document(
-                    &session,
-                    request(DocumentCommand::Update(DocumentUpdateRequest::new(
-                        namespace.clone(),
-                        DocumentFilter::new(query.clone()).unwrap(),
-                        DocumentUpdate::new(update.clone()).unwrap(),
-                        scope,
-                        DocumentWriteOptions::new().with_upsert(true),
-                    ))),
+        for mode in 0..4 {
+            let scope = if mode == 1 {
+                DocumentMutationScope::Many
+            } else {
+                DocumentMutationScope::One
+            };
+            let update = DocumentUpdateRequest::new(
+                namespace.clone(),
+                DocumentFilter::new(query.clone()).unwrap(),
+                DocumentUpdate::new(update.clone()).unwrap(),
+                scope,
+                DocumentWriteOptions::new().with_upsert(true),
+            );
+            let command = if mode < 2 {
+                DocumentCommand::Update(update)
+            } else {
+                DocumentCommand::FindOneAndUpdate(
+                    DocumentFindOneAndUpdateRequest::new(update, DocumentReadOptions::new())
+                        .with_return_after(mode == 3),
                 )
-                .await;
+            };
+            let result = engine.execute_document(&session, request(command)).await;
             if let Some(BsonValue::Int32(expected)) = case.get_first("error") {
                 let error = result.unwrap_err();
                 let mut source = error.source();
@@ -106,23 +115,41 @@ async fn operator_upserts_match_locked_oracle_in_both_scopes() {
                 assert_eq!(code, Some(*expected), "case {count}: {error}");
             } else {
                 let execution = result.unwrap_or_else(|error| panic!("case {count}: {error}"));
-                let DocumentResult::Update(result) = execution.result() else {
-                    panic!("update result")
-                };
-                assert_eq!(
-                    (
-                        result.matched_count(),
-                        result.modified_count(),
-                        result.did_upsert()
-                    ),
-                    (0, 0, true)
-                );
-                assert!(
-                    result
-                        .upserted_id()
-                        .unwrap()
-                        .representation_eq(&BsonValue::Int64(7))
-                );
+                match execution.result() {
+                    DocumentResult::Update(result) if mode < 2 => {
+                        assert_eq!(
+                            (
+                                result.matched_count(),
+                                result.modified_count(),
+                                result.did_upsert()
+                            ),
+                            (0, 0, true)
+                        );
+                        assert!(
+                            result
+                                .upserted_id()
+                                .unwrap()
+                                .representation_eq(&BsonValue::Int64(7))
+                        );
+                    }
+                    DocumentResult::UpsertedDocument(result) if mode >= 2 => {
+                        assert!(result.upserted_id().representation_eq(&BsonValue::Int64(7)));
+                        if mode == 2 {
+                            assert!(result.document().is_none());
+                        } else {
+                            let Some(BsonValue::Document(expected)) = case.get_first("result")
+                            else {
+                                panic!("expected image")
+                            };
+                            assert_eq!(
+                                encode_document(result.document().unwrap()).unwrap(),
+                                encode_document(expected).unwrap(),
+                                "image case {count}"
+                            );
+                        }
+                    }
+                    _ => panic!("unexpected result"),
+                }
             }
             let execution = engine
                 .execute_document(
@@ -170,10 +197,10 @@ async fn operator_upserts_match_locked_oracle_in_both_scopes() {
             count += 1;
         }
     }
-    assert_eq!(count, 1772);
+    assert_eq!(count, 3544);
     drop(session);
     drop(engine);
     println!(
-        "{count} source-locked operator-upsert executions passed, including exact stored BSON, insert metadata and atomic failures in both scopes"
+        "{count} source-locked operator-upsert executions passed, including exact stored BSON, insert metadata and atomic failures in both scopes and before/after find-and-modify images"
     );
 }

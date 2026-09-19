@@ -46,6 +46,13 @@ pub(super) enum MutationReturn {
 }
 
 impl MutationReturn {
+    fn upsert_id_depth(self) -> usize {
+        match self {
+            Self::Counts => 2,               // upserted array + entry
+            Self::Before | Self::After => 1, // lastErrorObject
+        }
+    }
+
     fn no_match(self) -> DocumentResult {
         match self {
             Self::Counts => DocumentResult::Update(
@@ -85,7 +92,7 @@ impl Engine {
                 "find-one-and-update requires single-document scope",
             ));
         }
-        require_replacement_options(write_options)?;
+        require_replacement_options(write_options.with_upsert(false))?;
         let updater = self
             .run_document_storage_task(
                 cancellation.clone(),
@@ -97,7 +104,7 @@ impl Engine {
                 },
             )
             .await?;
-        self.run_document_single_mutation(
+        self.run_document_find_mutation(
             owner,
             request_id,
             namespace,
@@ -112,6 +119,7 @@ impl Engine {
                     MutationReturn::Before
                 },
             },
+            write_options.upsert(),
             cancellation,
             deadline,
             limits,
@@ -151,6 +159,7 @@ impl Engine {
                     request_id,
                     namespace,
                     Arc::new(filter),
+                    Arc::new(DocumentReadOptions::new()),
                     Mutation::Update {
                         updater,
                         max_document_bytes,
@@ -183,7 +192,7 @@ impl Engine {
             request_id,
             namespace,
             Arc::new(filter),
-            DocumentReadOptions::new(),
+            Arc::new(DocumentReadOptions::new()),
             Mutation::Update {
                 updater,
                 max_document_bytes,
@@ -213,7 +222,7 @@ impl Engine {
             request_id,
             namespace,
             Arc::new(filter),
-            options,
+            Arc::new(options),
             Mutation::Delete,
             cancellation,
             deadline,
@@ -252,7 +261,7 @@ impl Engine {
             request_id,
             namespace,
             Arc::new(filter),
-            DocumentReadOptions::new(),
+            Arc::new(DocumentReadOptions::new()),
             Mutation::Replace {
                 document: Arc::new(replacement),
                 max_document_bytes,
@@ -279,8 +288,8 @@ impl Engine {
         require_single_mutation_read_options(&read_options)?;
         let max_document_bytes = replacement.max_document_bytes();
         let (namespace, filter, document, write_options) = replacement.into_parts();
-        require_replacement_options(write_options)?;
-        self.run_document_single_mutation(
+        require_replacement_options(write_options.with_upsert(false))?;
+        self.run_document_find_mutation(
             owner,
             request_id,
             namespace,
@@ -295,11 +304,57 @@ impl Engine {
                     MutationReturn::Before
                 },
             },
+            write_options.upsert(),
             cancellation,
             deadline,
             limits,
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_document_find_mutation(
+        &self,
+        owner: ConnectionOwner,
+        request_id: DocumentRequestId,
+        namespace: DocumentNamespace,
+        filter: Arc<DocumentFilter>,
+        options: DocumentReadOptions,
+        mutation: Mutation,
+        upsert: bool,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        limits: ResultLimits,
+    ) -> EngineResult<DocumentExecution> {
+        let options = Arc::new(options);
+        if upsert {
+            self.run_document_upsert(
+                owner,
+                request_id,
+                namespace,
+                filter,
+                options,
+                mutation,
+                DocumentMutationScope::One,
+                cancellation,
+                deadline,
+                limits,
+            )
+            .await
+        } else {
+            self.run_document_single_mutation(
+                owner,
+                request_id,
+                namespace,
+                filter,
+                options,
+                mutation,
+                cancellation,
+                deadline,
+                limits,
+            )
+            .await
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -309,7 +364,7 @@ impl Engine {
         request_id: DocumentRequestId,
         namespace: DocumentNamespace,
         filter: Arc<DocumentFilter>,
-        options: DocumentReadOptions,
+        options: Arc<DocumentReadOptions>,
         mutation: Mutation,
         cancellation: CancellationToken,
         deadline: Option<Instant>,

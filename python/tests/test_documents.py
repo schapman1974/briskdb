@@ -52,6 +52,53 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_find_upserts_images_metadata_controls_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for replacement in (False, True):
+                        method = session.find_one_and_replace if replacement else session.find_one_and_update
+                        body = {"counter": 5, "stamp": Timestamp(0, 0), "hidden": True} if replacement else {"$inc": {"counter": 2}, "$set": {"stamp": Timestamp(0, 0), "hidden": True}}
+                        for after in (False, True):
+                            identifier = None if not replacement and not after else Int64(2 * replacement + after)
+                            request_id = uuid.uuid4()
+                            result = method(DATABASE, COLLECTION, {"_id": identifier, "counter": 3}, body, upsert=True, return_document=after, projection={"counter": 1, "_id": 0}, sort={"counter": -1}, request_id=request_id)
+                            self.assertEqual((result["kind"], result["document"], result["did_upsert"], result["request_id"]), ("document", {"counter": 5} if after else None, True, request_id))
+                            self.assertEqual(bson_bytes({"v": result["upserted_id"]}), bson_bytes({"v": identifier}))
+                            stored = session.find(DATABASE, COLLECTION, {"_id": identifier})["documents"][0]
+                            self.assertEqual(list(stored)[0], "_id")
+                            self.assertTrue(stored["hidden"])
+                            self.assertEqual(stored["stamp"] == Timestamp(0, 0), not replacement)
+                            matched = method(DATABASE, COLLECTION, {"_id": identifier}, body, upsert=True, return_document=after, projection={"absent": 1, "_id": 0})
+                            self.assertEqual((matched["document"], matched["did_upsert"], matched["upserted_id"]), ({}, False, None))
+                        generated = method(DATABASE, COLLECTION, {"generated": replacement}, body, upsert=True)
+                        self.assertIsInstance(generated["upserted_id"], ObjectId)
+                        self.assertIsNone(generated["document"])
+                    large_id = "x" * 1_100_000
+                    result = session.find_one_and_update(DATABASE, COLLECTION, {"_id": large_id}, {"$set": {}}, upsert=True, max_result_bytes=16 * 1024 * 1024)
+                    self.assertEqual(result["upserted_id"], large_id)
+                    before = [bson_bytes(row) for row in session.find(DATABASE, COLLECTION, max_result_bytes=16 * 1024 * 1024)["documents"]]
+                    for replacement in (False, True):
+                        method = session.find_one_and_replace if replacement else session.find_one_and_update
+                        for after in (False, True):
+                            body = {"_id": "z" * 4000} if replacement else {"$set": {"_id": "z" * 4000}}
+                            with self.assertRaises(briskdb.LimitExceededError):
+                                method(DATABASE, COLLECTION, {"absent": True}, body, upsert=True, return_document=after, projection={"absent": 1, "_id": 0}, max_result_bytes=1000)
+                            body = {"value": 1} if replacement else {"$set": {"value": 1}}
+                            token = briskdb.CancellationToken()
+                            token.cancel()
+                            with self.assertRaises(briskdb.CancelledError):
+                                method(DATABASE, COLLECTION, {"_id": 999}, body, upsert=True, return_document=after, cancellation=token)
+                        with self.assertRaises(briskdb.InvalidArgumentError):
+                            method(DATABASE, COLLECTION, {"_id": 999}, {"_id": 998} if replacement else {"$set": {"_id": 998}}, upsert=True)
+                        with self.assertRaises(briskdb.UniqueViolationError):
+                            method(DATABASE, COLLECTION, {"absent": True}, {"_id": None} if replacement else {"$set": {"_id": None}}, upsert=True)
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION, max_result_bytes=16 * 1024 * 1024)["documents"]], before)
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION, max_result_bytes=16 * 1024 * 1024)["documents"]], before)
+
     def test_operator_upserts_seed_results_identity_controls_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -350,8 +397,7 @@ class PythonDocumentApiTests(unittest.TestCase):
                     self.assertIsNone(session.find_one_and_update(DATABASE, COLLECTION, {"_id": 99}, {"$set": {}})["document"])
                     with self.assertRaises((TypeError, ValueError)):
                         session.find_one_and_update(DATABASE, COLLECTION, {}, {"$set": {}}, return_document="after")
-                    with self.assertRaises(briskdb.UnsupportedError):
-                        session.find_one_and_update(DATABASE, COLLECTION, {}, {"$set": {}}, upsert=True)
+                    self.assertFalse(session.find_one_and_update(DATABASE, COLLECTION, {}, {"$set": {}}, upsert=True)["did_upsert"])
                     with self.assertRaises(briskdb.LimitExceededError):
                         session.find_one_and_update(DATABASE, COLLECTION, {"_id": 3}, {"$set": {"large": "x" * 600000}}, return_document=True, max_result_bytes=128)
                     self.assertEqual(bson_bytes(session.find(DATABASE, COLLECTION, {"_id": 3})["documents"][0]), bson_bytes(expected))
@@ -473,8 +519,7 @@ class PythonDocumentApiTests(unittest.TestCase):
                     with self.assertRaises(briskdb.LimitExceededError):
                         session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 3}, {}, return_document=False)
                     session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 3}, {"value": "persisted"}, projection=["_id"])
-                    with self.assertRaises(briskdb.UnsupportedError):
-                        session.find_one_and_replace(DATABASE, COLLECTION, {}, {}, upsert=True)
+                    self.assertFalse(session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 3}, {"value": "persisted"}, upsert=True)["did_upsert"])
             with briskdb.open(root, shards=4, documents=True) as database:
                 with database.session() as session:
                     self.assertEqual(bson_bytes(session.find(DATABASE, COLLECTION, {"_id": 3})["documents"][0]), bson_bytes({"_id": Int64(3), "value": "persisted"}))
@@ -1712,6 +1757,21 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_find_upserts_images_and_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for replacement in (False, True):
+                        method = session.find_one_and_replace if replacement else session.find_one_and_update
+                        body = {"value": Int64(7)} if replacement else {"$set": {"value": Int64(7)}}
+                        for after in (False, True):
+                            identifier = None if not replacement and not after else Int64(2 * replacement + after)
+                            result = await method(DATABASE, COLLECTION, {"_id": identifier}, body, upsert=True, return_document=after, projection={"value": 1, "_id": 0})
+                            self.assertEqual((result["did_upsert"], result["upserted_id"], result["document"]), (True, identifier, {"value": Int64(7)} if after else None))
+                            result = await method(DATABASE, COLLECTION, {"_id": identifier}, body, upsert=True, return_document=True, projection={"absent": 1, "_id": 0})
+                            self.assertEqual((result["document"], result["did_upsert"], result["upserted_id"]), ({}, False, None))
+
     async def test_async_operator_upserts_preserve_null_results_and_literals(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

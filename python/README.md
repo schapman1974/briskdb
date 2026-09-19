@@ -79,7 +79,13 @@ equalities (including `$and` clauses and dotted object paths) seed the new docum
 then operators run. Conflicting equality paths fail before insertion; range,
 regex, and alternative predicates do not supply values. Operator timestamps stay
 literal. An unbound `_id` can be supplied by the update; otherwise one is generated
-after applying operators. Find-and-modify upserts remain unsupported. Continue a
+after applying operators. `find_one_and_replace` and `find_one_and_update` accept
+`upsert=True` too. Their results retain `kind: "document"` and add `did_upsert`
+and `upserted_id`; an inserted null ID is distinct from no insertion. The default
+before-image is `None` on insertion, while `return_document=True` returns the
+projected inserted document. Matched images, including `{}`, report
+`did_upsert=False`. The ID metadata and image share the pre-commit result budget.
+Continue a
 non-null `result["cursor_id"]` with
 `session.get_more(database, collection, cursor_id, batch_size=101)`; stop early
 with `session.kill_cursor(database, collection, cursor_id)`. Cursors belong to
@@ -93,7 +99,7 @@ Pass `sort={"priority": -1, "_id": 1}` for global BSON sorting before skip/limit
 and projection; the sort persists across cursor batches. Stable ties use natural
 order. Sorted pages use bounded key windows and rescan until sorted indexes
 exist; large skips may need repeated scans. Secondary indexes remain `pending_build`;
-other update operators, remaining upsert forms, additional aggregation expressions, and bulk-write
+other update operators, additional aggregation expressions, and bulk-write
 Python helpers remain future work. Multi-delete/update commit one shard at a time;
 failure rolls back the current shard, not earlier commits. See the
 [write boundaries](../docs/DOCUMENT_ENGINE.md#field-updates-and-single-record-write-boundaries).

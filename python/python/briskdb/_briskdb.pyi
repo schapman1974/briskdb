@@ -128,6 +128,8 @@ class DeleteOneResult(DocumentExecution):
 class OneDocumentResult(DocumentExecution):
     kind: Literal["document"]
     document: Optional[BsonResultDocument]
+    did_upsert: bool
+    upserted_id: Any
 
 class UpdateResult(DocumentExecution):
     kind: Literal["update"]
