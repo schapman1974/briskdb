@@ -62,7 +62,10 @@ pub use error::{
     DocumentMutationError,
 };
 pub(crate) use index_definition::normalize_index_definition;
-pub use index_keys::{DocumentIndexKey, DocumentIndexKeyGenerator};
+pub use index_keys::{
+    DOCUMENT_INDEX_KEY_ENCODING_VERSION, DocumentIndexKey, DocumentIndexKeyGenerator,
+    MAX_DOCUMENT_INDEX_KEY_BYTES,
+};
 pub use key::{BSON_KEY_ENCODING_VERSION, BSON_MAX_CANONICAL_KEY_BYTES, CanonicalBsonKey};
 pub use matcher::{DocumentMatcher, DocumentQueryError};
 pub use options::{

@@ -224,6 +224,49 @@ order is not the BSON value order; callers use `BsonValue::cmp` for ranges and
 sorting. This key format is separate from SQL `CanonicalIndexKey`, whose SQL
 numeric, date, timestamp, and binary rules are intentionally different.
 
+### Secondary-index tuple keys
+
+`DocumentIndexKey` serializes equality tuples with `to_bytes` and validates them
+with `from_bytes`. Version 1 is `DOCUMENT_INDEX_KEY_ENCODING_VERSION`. The frame
+is independent of both `BBKY` and SQL `BIDX`; neither is accepted as a tuple frame.
+All framing integers are unsigned, fixed-width, big-endian `u32` values:
+
+| Field | Encoding |
+| --- | --- |
+| Magic | Four ASCII bytes `BDIK` |
+| Version | `1` |
+| Component count | `1..=32` |
+| Empty-array component | One tag byte `0`, no payload |
+| BSON-value component | Tag byte `1`, byte length, one complete canonical `BBKY` key |
+
+An empty final array has a separate tag rather than impersonating BSON null or
+the unsupported Undefined BSON type. Component order and tuple arity remain
+significant. Missing fields generate null components; numeric aliases and all
+other BSON identities retain the existing canonical-key rules. The frame omits
+collection/index identity, field names and sort directions. Callers must supply
+that scope; bytewise order is not BSON sort order.
+
+The codec accepts canonical BSON identities, including identities outside the
+current frozen secondary-index generator's supported value subset. Framing
+validity is not index eligibility or membership. Encoding does not activate any
+physical index or change the built-in ID key, manifest, catalog or shard format.
+
+`MAX_DOCUMENT_INDEX_KEY_BYTES` bounds a complete frame to 64 MiB; each value
+component is bounded to 8 MiB. Serialization preflights lengths before allocating.
+Decoding checks frame/count/component lengths before copying and delegates full
+nested identity validation to `CanonicalBsonKey`. Unknown versions/tags, malformed
+or noncanonical nested keys, oversized/truncated frames and trailing bytes report
+`DataCorruption`, without normalizing stored bytes or echoing payloads. Allocation
+failure remains a resource error. Controlled variants check interruption before
+and after each bounded component and return no successful prefix. The format is
+not a checksum or authentication mechanism; physical storage must still protect
+and validate its association with an index and source document.
+
+Fixed-byte fixtures, equality/hash round trips, malformed inputs, arbitrary-byte
+properties, size boundaries and cancellation tests cover the codec. The existing
+7,201 source-locked key cases also serialize and restore every generated key
+before comparing its equality partition with unchanged reference tokens.
+
 ## Validation and limits
 
 The default maximum document size is 16 MiB, the conservative retained-heap

@@ -430,7 +430,9 @@ The shared index-key foundation now checks 7,201 additional source-locked cases
 (29,370 document evaluations) against unchanged index helpers. It compares exact
 opaque-token equality partitions and encounter order, sparse/partial membership,
 compound/multikey behavior and unsupported-value failures. It reuses canonical
-BSON identities and the shared matcher. Independent tests cover bounded work,
+BSON identities and the shared matcher. Every generated key is also serialized
+and restored through the versioned tuple codec before oracle comparison; opaque
+reference tokens and the frozen generator remain unchanged. Independent tests cover bounded work,
 eager validation, input immutability and interruption without partial results.
 This is not physical index activation, wire support or uniqueness enforcement.
 The frozen helper subset rejects intermediate/parallel arrays, object/nested-array

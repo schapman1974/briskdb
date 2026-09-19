@@ -618,7 +618,10 @@ requires an earlier dependency:
       tuples, one-level multikey deduplication, missing/null and empty-array
       identities, and sparse/partial membership. 7,201 source-locked cases check
       equality partitions, ordering and errors across 29,370 document evaluations.
-      Independent tests cover cancellation and resource limits. This helper does
+      Generated keys now round-trip through the versioned, bounded `BDIK` tuple
+      codec before oracle comparisons. Fixed bytes, corrupt/future frames,
+      arbitrary inputs, cancellation and resource limits have independent tests.
+      This helper does
       not enable sparse/partial catalog options or activate indexes; physical build/recovery, write-time
       maintenance, wire index commands and metadata cursors remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust

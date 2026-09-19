@@ -115,8 +115,11 @@ frozen expectations or compatibility allowances are changed.
 `DocumentIndexKeyGenerator` is the shared, immutable secondary-key foundation,
 not a physical index. It validates key definitions and compiles optional partial
 membership predicates with the existing matcher. Keys expose equality and hashing,
-not ordering or a persistent byte format; callers must scope identities to an index
-and collection. Ascending/descending directions do not change equality.
+not ordering; callers must scope identities to an index and collection.
+Ascending/descending directions do not change equality. The versioned `BDIK`
+byte codec preserves tuple identities for later physical storage; see the
+[secondary-index key format](BSON.md#secondary-index-tuple-keys). It does not
+activate catalog entries or promise physical index coverage.
 
 It generates ordered compound tuples with at most one final array field, removes
 duplicate array entries in encounter order, equates missing with null, and gives
