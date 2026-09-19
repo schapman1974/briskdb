@@ -15,8 +15,8 @@ use briskdb::document::{
     DocumentCollectionOptions, DocumentCommand, DocumentContinueCursorRequest,
     DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
     DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
-    DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
-    DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
+    DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentDropIndexRequest,
+    DocumentFilter, DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
     DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentIndexRequest,
     DocumentInsertRequest, DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
     DocumentListCollectionsRequest, DocumentListDatabaseNamesRequest, DocumentListIndexesRequest,
@@ -1626,6 +1626,38 @@ impl Session {
             index,
             DocumentWriteOptions::new(),
         ));
+        self.execute_document_command(
+            py,
+            command,
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (database, collection, name, *, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn drop_index(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        name: String,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let command =
+            DocumentCommand::DropIndex(python_engine_result(DocumentDropIndexRequest::new(
+                python_engine_result(DocumentNamespace::new(database, collection))?,
+                name,
+                DocumentWriteOptions::new(),
+            ))?);
         self.execute_document_command(
             py,
             command,

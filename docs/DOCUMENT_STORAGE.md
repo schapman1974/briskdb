@@ -11,7 +11,7 @@ listener or a high-level embedded collection API.
 ## Logical catalog
 
 Manifest format 14 introduced document namespaces separate from the SQL table
-catalog, and the current format 16 retains that separation. A SQL table can
+catalog, and the current format 17 retains that separation. A SQL table can
 never become a collection through schema discovery. The manifest stores:
 
 - exact, case-sensitive database and collection names;
@@ -21,15 +21,16 @@ never become a collection through schema discovery. The manifest stores:
 - one mandatory unique `_id_` definition per active collection;
 - user index declarations and their `PendingBuild` or `Ready` lifecycle; and
 - checksummed, mutually exclusive provisioning and deletion journals; and
-- permanent database/collection identity high-water marks, never reset by drops.
+- permanent database/collection and index identity high-water marks, never reset
+  by drops.
 
 Database names contain 1 to 63 UTF-8 bytes. A complete
 `database.collection` namespace contains at most 255 UTF-8 bytes. Names are
 compared byte-for-byte and may not contain NUL. Mongo names are not normalized
 through BriskDB's lowercase SQL identifier rules.
 
-All six document catalog tables participate in semantic manifest digest
-version 8. Every supported mutation uses an immediate SQLite transaction,
+All eight document catalog tables participate in semantic manifest digest
+version 9. Every supported mutation uses an immediate SQLite transaction,
 validates the complete catalog, refreshes the digest, and commits the metadata
 as one unit. Startup validates exact table definitions, foreign keys, row and
 byte bounds, supported versions, namespace limits, built-in index state, and
@@ -139,6 +140,14 @@ it is not a rollback guarantee. Startup requires sole-process ownership and
 finishes the remaining shard prefix before publishing Ready. The crash suite
 exits a child process before/after intent, each shard transaction, each progress
 acknowledgement, and finalization, for both drop scopes with/without survivors.
+
+Pending secondary declarations can also be removed individually by exact name.
+The built-in index is protected. Declaration deletion, its identity-map cascade
+and semantic-root refresh commit atomically; the permanent allocation head does
+not decrease. No shard row or schema changes. A pre-commit process exit restores
+the declaration and ID on reopen; a post-commit exit preserves their absence.
+This metadata-only path rejects non-pending secondary lifecycles and does not
+stand in for a future recoverable physical-index drop.
 
 ## TinyMongo SQLite import
 

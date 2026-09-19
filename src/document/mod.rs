@@ -59,7 +59,7 @@ pub use distinct::DocumentDistinct;
 pub(crate) use error::DocumentWriteRollback;
 pub use error::{
     BsonError, BsonErrorContext, BsonErrorKind, BsonResult, DocumentCursorError,
-    DocumentMutationError,
+    DocumentIndexError, DocumentMutationError,
 };
 pub(crate) use index_definition::normalize_index_definition;
 pub use index_keys::{

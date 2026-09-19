@@ -387,6 +387,18 @@ class AsyncSession:
             cancellation=cancellation,
         )
 
+    async def drop_index(
+        self, database: str, collection: str, name: str, *,
+        request_id: Optional[UUID] = None, timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.drop_index, database, collection, name,
+            request_id=request_id, timeout_ms=timeout_ms, cancellation=cancellation,
+            max_result_rows=max_result_rows, max_result_bytes=max_result_bytes,
+        )
+
     async def list_indexes(
         self,
         database: str,

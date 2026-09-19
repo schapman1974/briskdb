@@ -53,7 +53,8 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `list_collections(database, *, skip=0, limit=None, batch_size=101, ...)`
 - `list_collection_metadata(database, filter=None, *, name_only=False, batch_size=101, batch_byte_limit=None, ...)`
 - `list_database_names(filter=None, ...)`
-- `create_index(database, collection, keys, *, name, unique=False, ...)`
+- `create_index(database, collection, keys, *, name=None, unique=False, ...)`
+- `drop_index(database, collection, name, ...)`
 - `list_indexes(database, collection, *, skip=0, limit=None, batch_size=101, ...)`
 - `insert_one(database, collection, document, ...)`
 - `find(database, collection, filter=None, *, projection=None, sort=None, skip=0, limit=None, batch_size=101, ...)`
@@ -193,6 +194,7 @@ plan. Payload keys are:
 | `collections` | ordered `collections` list |
 | `database_names` | `names` list of exact logical document database names |
 | `index_name` | `index_name` and `lifecycle="pending_build"` |
+| `acknowledged` | `acknowledged` boolean (pending-index removal) |
 | `indexes` | ordered `indexes` list |
 | `insert` | `acknowledged`, `inserted_count`, `inserted_ids` |
 | `cursor` | `namespace`, `cursor_id`, `exhausted`, `documents` |
@@ -211,6 +213,17 @@ Collection metadata contains `id`, `database_id`, `database`, `name`,
 metadata. Each index contains `name`, exact ordered `keys`, `unique`,
 `built_in`, and `lifecycle`. Secondary index declarations currently remain
 `pending_build`; the ready built-in `_id_` index is authoritative.
+
+`drop_index` is available on both sync and async sessions. It removes one pending
+declaration by exact, case-sensitive name and returns `kind="acknowledged"`,
+`acknowledged=True`, and a null plan. It never removes documents or the built-in
+ID index. `_id`/`_id_` raise `InvalidArgumentError`; missing indexes raise
+`FailedPreconditionError`, including a repeated drop. Field aliases, key-pattern
+selectors and bulk removal are not supported: `*` is only an exact native name,
+not a wildcard. Cancellation/deadline or insufficient result limits before
+commit leave the declaration intact. Recreating a removed name gets a new durable
+internal ID. Physical index builds/maintenance and Mongo wire `dropIndexes` are
+still unfinished.
 
 This API deliberately mirrors the document engine's implemented boundary:
 `insert_one` generates a missing ObjectId while preserving explicit null and

@@ -87,6 +87,10 @@ class CreateIndexResult(DocumentExecution):
     index_name: str
     lifecycle: Literal["pending_build"]
 
+class DropIndexResult(DocumentExecution):
+    kind: Literal["acknowledged"]
+    acknowledged: bool
+
 class ListIndexesResult(DocumentExecution):
     kind: Literal["indexes"]
     indexes: List[DocumentIndexInfo]
@@ -451,6 +455,12 @@ class Session:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> CreateIndexResult: ...
+    def drop_index(
+        self, database: str, collection: str, name: str, *,
+        request_id: Optional[UUID] = None, timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> DropIndexResult: ...
     def list_indexes(
         self,
         database: str,

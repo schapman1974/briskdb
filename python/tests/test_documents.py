@@ -52,6 +52,43 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_pending_index_drop_protection_controls_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    session.insert_one(DATABASE, COLLECTION, {"_id": 1, "label": "kept"})
+                    for name in ["label_1", "keep", "*"]:
+                        session.create_index(DATABASE, COLLECTION, {"label": 1}, name=name)
+                    before = session.list_indexes(DATABASE, COLLECTION)["indexes"]
+                    for name in ["_id", "_id_"]:
+                        with self.assertRaises(briskdb.InvalidArgumentError):
+                            session.drop_index(DATABASE, COLLECTION, name)
+                    for name in ["absent", "label", "LABEL_1"]:
+                        with self.assertRaises(briskdb.FailedPreconditionError):
+                            session.drop_index(DATABASE, COLLECTION, name)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.drop_index(DATABASE, COLLECTION, "label_1", max_result_bytes=33)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.drop_index(DATABASE, COLLECTION, "label_1", cancellation=token)
+                    self.assertEqual(session.list_indexes(DATABASE, COLLECTION)["indexes"], before)
+                    request_id = uuid.uuid4()
+                    result = session.drop_index(DATABASE, COLLECTION, "*", request_id=request_id, max_result_rows=1, max_result_bytes=34)
+                    self.assertEqual(result, {"request_id": request_id, "plan": None, "kind": "acknowledged", "acknowledged": True})
+                    remaining = session.list_indexes(DATABASE, COLLECTION)["indexes"]
+                    self.assertEqual([item["name"] for item in remaining], ["_id_", "keep", "label_1"])
+                    self.assertEqual(session.count_documents(DATABASE, COLLECTION)["count"], 1)
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(session.list_indexes(DATABASE, COLLECTION)["indexes"], remaining)
+                    with self.assertRaises(briskdb.FailedPreconditionError):
+                        session.drop_index(DATABASE, COLLECTION, "*")
+                    session.create_index(DATABASE, COLLECTION, {"label": 1}, name="*")
+                    session.drop_index(DATABASE, COLLECTION, "*")
+                    self.assertEqual(session.list_indexes(DATABASE, COLLECTION)["indexes"], remaining)
+
     def test_index_definitions_default_names_validation_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=2, documents=True) as database:
@@ -1786,6 +1823,28 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_pending_index_drop_forwards_controls_and_acknowledgement(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    await session.create_index(DATABASE, COLLECTION, {"label": 1})
+                    with self.assertRaises(briskdb.InvalidArgumentError):
+                        await session.drop_index(DATABASE, COLLECTION, "_id_")
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.drop_index(DATABASE, COLLECTION, "label_1", max_result_bytes=33)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        await session.drop_index(DATABASE, COLLECTION, "label_1", cancellation=token)
+                    self.assertEqual(len((await session.list_indexes(DATABASE, COLLECTION))["indexes"]), 2)
+                    request_id = uuid.uuid4()
+                    result = await session.drop_index(DATABASE, COLLECTION, "label_1", request_id=request_id, timeout_ms=5000, max_result_rows=1, max_result_bytes=34)
+                    self.assertEqual(result, {"request_id": request_id, "plan": None, "kind": "acknowledged", "acknowledged": True})
+                    with self.assertRaises(briskdb.FailedPreconditionError):
+                        await session.drop_index(DATABASE, COLLECTION, "label_1")
+                    self.assertEqual([index["name"] for index in (await session.list_indexes(DATABASE, COLLECTION))["indexes"]], ["_id_"])
+
     async def test_async_index_definitions_generate_names_and_remain_pending(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

@@ -177,13 +177,9 @@ pub(crate) fn execution_to_python(
             output.set_item("kind", "cursor_killed")?;
             output.set_item("killed", killed)?;
         }
-        // The Python surface only constructs commands from the currently
-        // executable engine slice. Keep future result variants explicit if a
-        // core change accidentally routes one through these methods.
-        DocumentResult::Acknowledged(_) => {
-            return Err(crate::error::unsupported(
-                "this document result is not exposed by the current Python API",
-            ));
+        DocumentResult::Acknowledged(acknowledged) => {
+            output.set_item("kind", "acknowledged")?;
+            output.set_item("acknowledged", acknowledged)?;
         }
         _ => {
             return Err(crate::error::unsupported(

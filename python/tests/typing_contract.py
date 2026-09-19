@@ -33,6 +33,8 @@ def sync_contract(path: str) -> None:
     index_lifecycle: Literal["pending_build"] = document_session.create_index(
         "app", "notes", {"body": 1}
     )["lifecycle"]
+    dropped_index: bool = document_session.drop_index("app", "notes", "body_1")["acknowledged"]
+    print(dropped_index)
     inserted: int = document_session.insert_one(
         "app", "notes", {"_id": 1, "body": "typed"}
     )["inserted_count"]
@@ -106,6 +108,8 @@ async def async_contract(path: str) -> None:
     outcome: str = await transaction.rollback()
     created = await session.create_collection("app", "typed")
     namespace: str = created["collection"]["namespace"]
+    dropped_index: bool = (await session.drop_index("app", "typed", "body_1"))["acknowledged"]
+    print(dropped_index)
     await session.insert_one("app", "typed", {"_id": 1})
     document_count: int = (await session.count_documents("app", "typed"))["count"]
     exists: bool = (await session.collection_exists("app", "typed"))["exists"]

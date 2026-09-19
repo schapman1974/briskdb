@@ -8,11 +8,12 @@ use briskdb::{
         BsonDocument, BsonValue, DocumentAggregateRequest, DocumentCollectionExistsRequest,
         DocumentCollectionMetadata, DocumentCollectionOptions, DocumentCommand,
         DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
-        DocumentDeleteRequest, DocumentExecution, DocumentFilter, DocumentFindRequest,
-        DocumentIndexLifecycle, DocumentIndexRequest, DocumentInsertRequest,
-        DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
-        DocumentNamespace, DocumentPipeline, DocumentPlan, DocumentProjection, DocumentReadOptions,
-        DocumentRequest, DocumentRequestId, DocumentResult, DocumentWriteOptions,
+        DocumentDeleteRequest, DocumentDropIndexRequest, DocumentExecution, DocumentFilter,
+        DocumentFindRequest, DocumentIndexError, DocumentIndexLifecycle, DocumentIndexMetadata,
+        DocumentIndexRequest, DocumentInsertRequest, DocumentListCollectionsRequest,
+        DocumentListIndexesRequest, DocumentMutationScope, DocumentNamespace, DocumentPipeline,
+        DocumentPlan, DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId,
+        DocumentResult, DocumentWriteOptions,
     },
 };
 use rusqlite::Connection;
@@ -81,6 +82,247 @@ async fn insert(
         )
         .await
         .unwrap()
+}
+
+async fn declare_pending_index(engine: &Engine, session: &Session, name: &str) {
+    let index = DocumentIndexRequest::new(
+        BsonDocument::from_entries([("label", BsonValue::Int32(1))]).unwrap(),
+    )
+    .unwrap()
+    .with_name(name)
+    .unwrap();
+    engine
+        .execute_document(
+            session,
+            request(
+                90,
+                RequestContext::new(),
+                DocumentCommand::CreateIndex(DocumentCreateIndexRequest::new(
+                    namespace(),
+                    index,
+                    DocumentWriteOptions::new(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+}
+
+async fn pending_indexes(engine: &Engine, session: &Session) -> Box<[DocumentIndexMetadata]> {
+    let result = engine
+        .execute_document(
+            session,
+            request(
+                91,
+                RequestContext::new(),
+                DocumentCommand::ListIndexes(DocumentListIndexesRequest::new(
+                    namespace(),
+                    DocumentReadOptions::new(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    let DocumentResult::Indexes(indexes) = result.into_parts().2 else {
+        panic!("indexes")
+    };
+    indexes
+}
+
+fn drop_index(name: &str) -> DocumentCommand {
+    DocumentCommand::DropIndex(
+        DocumentDropIndexRequest::new(namespace(), name, DocumentWriteOptions::new()).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn pending_index_drop_is_exact_bounded_protected_and_persistent() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    insert(
+        &engine,
+        &session,
+        2,
+        vec![document(BsonValue::Int32(1), "kept")],
+    )
+    .await;
+    for name in ["label_1", "keep", "*"] {
+        declare_pending_index(&engine, &session, name).await;
+    }
+    let before = pending_indexes(&engine, &session).await;
+    for (name, expected) in [
+        ("_id", DocumentIndexError::Protected),
+        ("_id_", DocumentIndexError::Protected),
+        ("label", DocumentIndexError::NotFound),
+        ("LABEL_1", DocumentIndexError::NotFound),
+        ("absent", DocumentIndexError::NotFound),
+    ] {
+        let error = engine
+            .execute_document(
+                &session,
+                request(3, RequestContext::new(), drop_index(name)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<DocumentIndexError>(),
+            Some(&expected)
+        );
+        assert_eq!(pending_indexes(&engine, &session).await, before);
+    }
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    for (context, kind) in [
+        (
+            RequestContext::new().with_result_limits(ResultLimits::new(1, 33).unwrap()),
+            EngineErrorKind::LimitExceeded,
+        ),
+        (
+            RequestContext::new().with_cancellation_token(cancelled),
+            EngineErrorKind::Cancelled,
+        ),
+        (
+            RequestContext::new().with_deadline(Instant::now() - Duration::from_millis(1)),
+            EngineErrorKind::DeadlineExceeded,
+        ),
+    ] {
+        let error = engine
+            .execute_document(&session, request(4, context, drop_index("label_1")))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), kind);
+        assert_eq!(pending_indexes(&engine, &session).await, before);
+    }
+    // '*' is an exact native name here, never a bulk-removal selector.
+    let result = engine
+        .execute_document(
+            &session,
+            request(
+                5,
+                RequestContext::new().with_result_limits(ResultLimits::new(1, 34).unwrap()),
+                drop_index("*"),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.result(), &DocumentResult::Acknowledged(true));
+    let remaining = pending_indexes(&engine, &session).await;
+    assert_eq!(
+        remaining.iter().map(|i| i.name()).collect::<Vec<_>>(),
+        ["_id_", "keep", "label_1"]
+    );
+    engine.shutdown().await.unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    assert_eq!(pending_indexes(&engine, &session).await, remaining);
+    let old_id = before.iter().find(|i| i.name() == "*").unwrap().id();
+    declare_pending_index(&engine, &session, "*").await;
+    assert!(
+        pending_indexes(&engine, &session)
+            .await
+            .iter()
+            .find(|i| i.name() == "*")
+            .unwrap()
+            .id()
+            > old_id
+    );
+    let connection = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM briskdb_document_index_identities",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        4
+    );
+    let count = engine
+        .execute_document(
+            &session,
+            request(
+                6,
+                RequestContext::new(),
+                DocumentCommand::Count(DocumentCountRequest::new(
+                    namespace(),
+                    DocumentFilter::empty(),
+                    DocumentReadOptions::new(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count.result(), &DocumentResult::Count(1));
+}
+
+#[tokio::test]
+async fn pending_index_drop_lock_wait_deadline_leaves_catalog_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    declare_pending_index(&engine, &session, "label_1").await;
+    let before = pending_indexes(&engine, &session).await;
+    let blocker = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let start = Instant::now();
+    let error = engine
+        .execute_document(
+            &session,
+            request(
+                7,
+                RequestContext::new().with_deadline(start + Duration::from_millis(50)),
+                drop_index("label_1"),
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::DeadlineExceeded);
+    assert!(start.elapsed() < Duration::from_secs(1));
+    blocker.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(pending_indexes(&engine, &session).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pending_index_drops_commit_exactly_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    declare_pending_index(&engine, &session, "label_1").await;
+    let mut workers = tokio::task::JoinSet::new();
+    for n in 0..4 {
+        let engine = engine.clone();
+        workers.spawn(async move {
+            engine
+                .execute_document(
+                    &engine.session(),
+                    request(10 + n, RequestContext::new(), drop_index("label_1")),
+                )
+                .await
+        });
+    }
+    let mut successes = 0;
+    while let Some(result) = workers.join_next().await {
+        match result.unwrap() {
+            Ok(result) => {
+                assert_eq!(result.result(), &DocumentResult::Acknowledged(true));
+                successes += 1;
+            }
+            Err(error) => assert_eq!(
+                std::error::Error::source(&error)
+                    .unwrap()
+                    .downcast_ref::<DocumentIndexError>(),
+                Some(&DocumentIndexError::NotFound)
+            ),
+        }
+    }
+    assert_eq!(successes, 1);
+    assert_eq!(pending_indexes(&engine, &session).await.len(), 1);
 }
 
 #[tokio::test]
