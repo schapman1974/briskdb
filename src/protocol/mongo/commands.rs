@@ -98,6 +98,8 @@ impl From<EngineError> for CommandError {
                     update.mongo_code(),
                     match update {
                         DocumentUpdateError::InvalidExpression => "FailedToParse",
+                        DocumentUpdateError::BadValue => "BadValue",
+                        DocumentUpdateError::TypeMismatch => "TypeMismatch",
                         DocumentUpdateError::UnsupportedOperator => "CommandNotSupported",
                         DocumentUpdateError::InvalidPath => "EmptyFieldName",
                         DocumentUpdateError::ConflictingPaths => "ConflictingUpdateOperators",

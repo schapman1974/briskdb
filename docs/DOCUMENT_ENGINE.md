@@ -75,9 +75,9 @@ The current engine executes:
 | `Delete` | Deletes one or many matches; exact `_id` routes to one shard, other filters use the shared matcher |
 | `FindOneAndDelete` | Atomically deletes one shard-local selection and returns its projected pre-delete document |
 | `FindOneAndReplace` | Atomically replaces one shard-local selection and returns its projected before/after document; no upsert yet |
-| `FindOneAndUpdate` | Applies `$set`/`$unset`/`$min`/`$max` to one shard-local selection and returns its projected before/after document; no upsert yet |
+| `FindOneAndUpdate` | Applies the supported field/array operators below to one shard-local selection and returns its projected before/after document; no upsert yet |
 | `Replace` | Replaces one matching document, preserving `_id` and natural order; returns matched/modified counts, with no upsert yet |
-| `Update` | Applies `$set`/`$unset`/`$min`/`$max` to one or many matches; returns matched/modified counts, with one transaction per shard for many |
+| `Update` | Applies the supported field/array operators below to one or many matches; returns matched/modified counts, with one transaction per shard for many |
 
 `CollectionExists` uses an admitted, controlled manifest lookup and scalar result
 accounting. Its result is independent of catalog page size and unrelated metadata
@@ -106,7 +106,8 @@ batch size and cannot change the original skip or limit.
 
 ### Field updates and single-record write boundaries
 
-`Update` executes scopes `One` and `Many` with `$set`, `$unset`, `$min`, and `$max`, using the same
+`Update` executes scopes `One` and `Many` with `$set`, `$unset`, `$min`, `$max`,
+`$pop`, and `$rename`, using the same
 locked selection/reselection and preflighted write path as replacement. A shared
 `DocumentUpdater` validates every operator, operand, path, and prefix conflict
 before namespace lookup or matching. It bounds specifications to 1 MiB/4,096
@@ -127,6 +128,26 @@ step/cancellation budget, including no-ops. See Mongo's
 definitions; specification-order field processing still follows the frozen
 TinyMongo input rather than claiming MongoDB 5+ lexicographic processing.
 
+`$pop` accepts numeric values exactly -1 (front) or 1 (back), including numeric
+BSON aliases but not booleans. It removes one array element without creating
+missing paths; empty or absent arrays are no-ops. Non-array targets fail with
+code 14, blocked paths with code 28, and invalid operands with code 9. Numeric
+array paths are supported. Element traversal is charged before mutation.
+
+`$rename` moves a present field to a different, non-overlapping string path.
+Existing destinations are overwritten in place; new destinations append in
+specification order. Empty source parents remain. Missing sources are no-ops,
+even if the destination would be blocked. Both paths participate in eager
+cross-operation conflict checks. Rename can move whole array values but cannot
+traverse arrays: numeric array components fail with code 2, nonnumeric ones with
+code 28. Self/prefix renames, non-string/NUL destinations, and positional paths
+fail eagerly. Present-source moves from/to `_id` or its children fail with code
+66 even when the destination value would compare equal. Source cloning and both
+paths are bounded, and errors discard the private post-image before any SQL
+write. See Mongo's [$pop](https://www.mongodb.com/docs/manual/reference/operator/update/pop/)
+and [$rename](https://www.mongodb.com/docs/manual/reference/operator/update/rename/)
+definitions; exact field ordering follows the frozen reference.
+
 Only changed paths are edited. Untouched fields retain order and exact BSON
 types; new fields follow specification order. Missing `$set` parents become
 objects. Numeric paths traverse existing arrays (zero-based canonical ASCII
@@ -143,11 +164,12 @@ including retained fields. Result/plan/post-image checks precede SQL, so validat
 failures leave the record unchanged. Concurrent updates read the current document
 under the write lock rather than applying a stale client-side replacement.
 Other operators, upsert, and secondary-index maintenance remain
-unimplemented. Of 8,727 source-locked update oracle cases, the original 4,008
+unimplemented. Of 11,805 source-locked update oracle cases, the original 4,008
 set/unset cases intentionally cover non-ID object paths only: frozen TinyMongo's
 legacy scalar/array/ID behavior differs. The 4,719 min/max cases additionally
 cover whole-value ordering, numeric array paths, scalar/null path errors,
-immutable IDs, and conflicts. Independent unit, transaction, and real-wire tests
+immutable IDs, and conflicts. Another 3,078 cases cover pop/rename values, paths,
+operand errors, missing fields, and identity. Independent unit, transaction, and real-wire tests
 check resource and commit boundaries. Frozen source, corpus, and intentional-
 difference allowances have not been changed.
 

@@ -63,8 +63,8 @@ fn field_updates_match_locked_oracle() {
         assert_eq!(encode_document(document).unwrap(), before);
         count += 1;
     }
-    assert_eq!(count, 8727);
+    assert_eq!(count, 11805);
     println!(
-        "{count} source-locked field update cases passed (4008 object-only set/unset; 4719 min/max)"
+        "{count} source-locked field update cases passed (4008 object-only set/unset; 4719 min/max; 3078 pop/rename)"
     );
 }
