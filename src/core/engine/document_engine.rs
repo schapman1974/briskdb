@@ -84,6 +84,36 @@ impl Engine {
                     .await
                 }
             }
+            DocumentCommand::DropCollection(request) => {
+                let (namespace, options) = request.into_parts();
+                if let Err(error) = require_catalog_write_options(options) {
+                    Err(error)
+                } else {
+                    self.run_document_drop_namespace(
+                        &mut operation,
+                        session,
+                        request_id,
+                        namespace.database().to_owned(),
+                        Some(namespace.collection().to_owned()),
+                    )
+                    .await
+                }
+            }
+            DocumentCommand::DropDatabase(request) => {
+                let (database, options) = request.into_parts();
+                if let Err(error) = require_catalog_write_options(options) {
+                    Err(error)
+                } else {
+                    self.run_document_drop_namespace(
+                        &mut operation,
+                        session,
+                        request_id,
+                        database,
+                        None,
+                    )
+                    .await
+                }
+            }
             command => {
                 let schema_operation = match self.inner.database.storage.enter_schema_operation() {
                     Ok(guard) => guard,
@@ -850,15 +880,16 @@ impl Engine {
                 )
                 .await
             }
-            DocumentCommand::DropCollection(_)
-            | DocumentCommand::Update(_)
+            DocumentCommand::Update(_)
             | DocumentCommand::Replace(_)
             | DocumentCommand::DropIndex(_) => Err(unsupported(
                 "this document command is modeled but requires a later document-semantics milestone",
             )),
-            DocumentCommand::CreateCollection(_) => Err(EngineError::new(
+            DocumentCommand::CreateCollection(_)
+            | DocumentCommand::DropCollection(_)
+            | DocumentCommand::DropDatabase(_) => Err(EngineError::new(
                 EngineErrorKind::Internal,
-                "document collection creation reached the data-command coordinator",
+                "document namespace mutation reached the data-command coordinator",
             )),
         }?;
         if execution_result_is_mutation(execution.result()) {
@@ -956,6 +987,63 @@ impl Engine {
                 .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
             {
                 storage_for_corruption.record_schema_degraded();
+            }
+            worker_control.complete(result)
+        });
+        operation.wait_started(join).await
+    }
+
+    async fn run_document_drop_namespace(
+        &self,
+        operation: &mut Operation,
+        session: &Session,
+        request_id: crate::document::DocumentRequestId,
+        database: String,
+        collection: Option<String>,
+    ) -> EngineResult<DocumentExecution> {
+        let migration = self.inner.database.storage.begin_schema_migration()?;
+        let session_preflight = operation.wait_pending(self.ready_session(session)).await?;
+        require_document_session_ready(&session_preflight)?;
+        drop(session_preflight);
+        operation
+            .wait_pending(async {
+                migration.wait_for_quiescence().await;
+                Ok(())
+            })
+            .await?;
+        let session = operation.wait_pending(self.ready_session(session)).await?;
+        require_document_session_ready(&session)?;
+        let worker = operation.wait_pending(self.inner.workers.acquire()).await?;
+        operation.check_before_start()?;
+        let lease = operation.take_lease();
+        let worker_control = Arc::clone(&operation.control);
+        let result_limits = operation.result_limits;
+        let storage = self.inner.database.storage.clone();
+        let connections = self.inner.connections.clone();
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _session = session;
+            let result = enforce_execution_result_limits(
+                &DocumentExecution::new(request_id, None, DocumentResult::NamespaceDropped(true)),
+                result_limits,
+            )
+            .and_then(|_| connections.retire_idle_for_schema_migration())
+            .and_then(|_| {
+                storage.drop_document_namespace_controlled(
+                    &database,
+                    collection.as_deref(),
+                    migration,
+                    Arc::clone(&worker_control),
+                )
+            })
+            .map(|existed| {
+                DocumentExecution::new(request_id, None, DocumentResult::NamespaceDropped(existed))
+            });
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                storage.record_schema_degraded();
             }
             worker_control.complete(result)
         });
@@ -2065,6 +2153,7 @@ fn enforce_execution_result_limits_with_check(
     match execution.result() {
         DocumentResult::Acknowledged(_)
         | DocumentResult::CollectionExists(_)
+        | DocumentResult::NamespaceDropped(_)
         | DocumentResult::CursorKilled(_) => {
             budget.add_rows(1)?;
             budget.add_bytes(DOCUMENT_RESULT_ROW_BYTES + DOCUMENT_RESULT_VALUE_BYTES + 1)?;
@@ -2251,6 +2340,7 @@ fn execution_result_is_mutation(result: &DocumentResult) -> bool {
     matches!(
         result,
         DocumentResult::Acknowledged(_)
+            | DocumentResult::NamespaceDropped(_)
             | DocumentResult::Collection(_)
             | DocumentResult::Insert(_)
             | DocumentResult::Update(_)
@@ -2300,6 +2390,150 @@ mod tests {
         document::{DocumentCollectionOptions, DocumentCreateCollectionRequest, DocumentRequestId},
         storage::SchemaGateState,
     };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_drop_recovers_after_cancel_deadline_and_task_abort() {
+        use crate::document::DocumentDropDatabaseRequest;
+        use rusqlite::{Connection, TransactionBehavior};
+
+        for mode in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let engine = Engine::open(root.path(), 2).await.unwrap();
+            let session = Arc::new(engine.session());
+            let identity = DocumentRequestId::new([9; 16]).unwrap();
+            for database in ["drop_me", "keep_me"] {
+                engine
+                    .execute_document(
+                        &session,
+                        DocumentRequest::new(
+                            identity,
+                            RequestContext::new(),
+                            DocumentCommand::CreateCollection(
+                                DocumentCreateCollectionRequest::new(
+                                    DocumentNamespace::new(database, "items").unwrap(),
+                                    DocumentCollectionOptions::empty(),
+                                    DocumentWriteOptions::new(),
+                                ),
+                            ),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut blocker = Connection::open(root.path().join("shards/0000.sqlite")).unwrap();
+            let transaction = blocker
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let token = CancellationToken::new();
+            let mut context = RequestContext::new().with_cancellation_token(token.clone());
+            if mode == 1 {
+                context = context.with_timeout(Duration::from_secs(2)).unwrap();
+            }
+            let task_engine = engine.clone();
+            let task_session = Arc::clone(&session);
+            let task = tokio::spawn(async move {
+                task_engine
+                    .execute_document(
+                        &task_session,
+                        DocumentRequest::new(
+                            identity,
+                            context,
+                            DocumentCommand::DropDatabase(
+                                DocumentDropDatabaseRequest::new(
+                                    "drop_me",
+                                    DocumentWriteOptions::new(),
+                                )
+                                .unwrap(),
+                            ),
+                        ),
+                    )
+                    .await
+            });
+            let manifest = Connection::open(root.path().join("manifest.sqlite")).unwrap();
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    let pending: i64 = manifest
+                        .query_row(
+                            "SELECT COUNT(*) FROM briskdb_document_deletion",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    if pending == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("drop intent must be durable before interruption");
+            match mode {
+                0 => {
+                    token.cancel();
+                }
+                2 => task.abort(),
+                _ => (),
+            }
+            let result = timeout(Duration::from_secs(3), task).await.unwrap();
+            if mode == 2 {
+                assert!(result.unwrap_err().is_cancelled());
+            } else {
+                assert_eq!(
+                    result.unwrap().unwrap_err().kind(),
+                    if mode == 0 {
+                        EngineErrorKind::Cancelled
+                    } else {
+                        EngineErrorKind::DeadlineExceeded
+                    }
+                );
+            }
+            // Wait for a detached worker to release its session and migration guard.
+            drop(
+                timeout(Duration::from_secs(2), session.inner.lock())
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(
+                engine
+                    .inner
+                    .database
+                    .storage
+                    .enter_schema_operation()
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::FailedPrecondition
+            );
+            let pending: i64 = manifest
+                .query_row(
+                    "SELECT COUNT(*) FROM briskdb_document_deletion",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(pending, 1);
+            transaction.rollback().unwrap();
+            drop(blocker);
+            drop(manifest);
+            engine.shutdown().await.unwrap();
+            drop(session);
+            drop(engine);
+            let reopened = Engine::open(root.path(), 2).await.unwrap();
+            let storage = &reopened.inner.database.storage;
+            assert!(
+                storage
+                    .document_collection_controlled("drop_me", "items", OperationControl::new(None))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                storage
+                    .document_collection_controlled("keep_me", "items", OperationControl::new(None))
+                    .unwrap()
+                    .is_some()
+            );
+            reopened.shutdown().await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn distinct_releases_admission_on_cancel_deadline_and_task_abort() {
@@ -2593,6 +2827,15 @@ mod tests {
 
     #[tokio::test]
     async fn collection_creation_excludes_schema_operations_before_waiting_for_its_session() {
+        lifecycle_excludes_schema_operations_before_waiting_for_its_session(false).await;
+    }
+
+    #[tokio::test]
+    async fn collection_drop_excludes_schema_operations_before_waiting_for_its_session() {
+        lifecycle_excludes_schema_operations_before_waiting_for_its_session(true).await;
+    }
+
+    async fn lifecycle_excludes_schema_operations_before_waiting_for_its_session(drop: bool) {
         let temp = tempfile::tempdir().unwrap();
         let engine = Engine::open_with_options(temp.path(), 2, EngineOptions::new(1, 1).unwrap())
             .await
@@ -2600,6 +2843,23 @@ mod tests {
         let first_holder_session = Arc::new(engine.session());
         let second_holder_session = Arc::new(engine.session());
         let create_session = Arc::new(engine.session());
+        if drop {
+            engine
+                .execute_document(
+                    &create_session,
+                    DocumentRequest::new(
+                        DocumentRequestId::new([1; 16]).unwrap(),
+                        RequestContext::new(),
+                        DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                            DocumentNamespace::new("app", "events").unwrap(),
+                            DocumentCollectionOptions::empty(),
+                            DocumentWriteOptions::new(),
+                        )),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
         let (first_started_tx, first_started_rx) = oneshot::channel();
         let (first_release_tx, first_release_rx) = std::sync::mpsc::channel();
         let first_engine = engine.clone();
@@ -2641,11 +2901,20 @@ mod tests {
         let create_session_for_task = Arc::clone(&create_session);
         let create = tokio::spawn(async move {
             let namespace = DocumentNamespace::new("app", "events").unwrap();
-            let command = DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
-                namespace,
-                DocumentCollectionOptions::empty(),
-                DocumentWriteOptions::new(),
-            ));
+            let command = if drop {
+                DocumentCommand::DropCollection(
+                    crate::document::DocumentDropCollectionRequest::new(
+                        namespace,
+                        DocumentWriteOptions::new(),
+                    ),
+                )
+            } else {
+                DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                    namespace,
+                    DocumentCollectionOptions::empty(),
+                    DocumentWriteOptions::new(),
+                ))
+            };
             create_engine
                 .execute_document(
                     &create_session_for_task,
@@ -2686,12 +2955,25 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(matches!(created.result(), DocumentResult::Collection(_)));
+        if drop {
+            assert_eq!(created.result(), &DocumentResult::NamespaceDropped(true));
+        } else {
+            assert!(matches!(created.result(), DocumentResult::Collection(_)));
+        }
         engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn collection_creation_rejects_its_own_transaction_before_schema_quiescence() {
+        lifecycle_rejects_its_own_transaction_before_schema_quiescence(false).await;
+    }
+
+    #[tokio::test]
+    async fn database_drop_rejects_its_own_transaction_before_schema_quiescence() {
+        lifecycle_rejects_its_own_transaction_before_schema_quiescence(true).await;
+    }
+
+    async fn lifecycle_rejects_its_own_transaction_before_schema_quiescence(drop: bool) {
         let temp = tempfile::tempdir().unwrap();
         let engine = Engine::open(temp.path(), 2).await.unwrap();
         let session = engine.session();
@@ -2710,11 +2992,21 @@ mod tests {
                 lifecycle, schema,
             ));
 
-        let command = DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
-            DocumentNamespace::new("app", "events").unwrap(),
-            DocumentCollectionOptions::empty(),
-            DocumentWriteOptions::new(),
-        ));
+        let command = if drop {
+            DocumentCommand::DropDatabase(
+                crate::document::DocumentDropDatabaseRequest::new(
+                    "app",
+                    DocumentWriteOptions::new(),
+                )
+                .unwrap(),
+            )
+        } else {
+            DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                DocumentNamespace::new("app", "events").unwrap(),
+                DocumentCollectionOptions::empty(),
+                DocumentWriteOptions::new(),
+            ))
+        };
         let error = timeout(
             Duration::from_secs(2),
             engine.execute_document(

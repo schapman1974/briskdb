@@ -18,7 +18,8 @@ use crate::{
         BsonCodecOptions, BsonDocument, BsonValue, DocumentAggregateRequest, DocumentAggregator,
         DocumentCollectionExistsRequest, DocumentCollectionOptions, DocumentCommand,
         DocumentContinueCursorRequest, DocumentCountRequest, DocumentCreateCollectionRequest,
-        DocumentCursorError, DocumentCursorId, DocumentDistinctRequest, DocumentFilter,
+        DocumentCursorError, DocumentCursorId, DocumentDistinctRequest,
+        DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
         DocumentFindRequest, DocumentInsertRequest, DocumentKillCursorRequest, DocumentMatcher,
         DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentProjector,
         DocumentQueryError, DocumentReadOptions, DocumentRequest, DocumentRequestId,
@@ -150,6 +151,8 @@ fn fields<const N: usize>(entries: [(&str, BsonValue); N]) -> BsonDocument {
 }
 
 pub(super) enum Command {
+    DropCollection(DocumentDropCollectionRequest),
+    DropDatabase(DocumentDropDatabaseRequest),
     Insert(DocumentInsertRequest),
     Count(DocumentCountRequest),
     Distinct(DocumentDistinctRequest),
@@ -169,7 +172,15 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
     let (name, value) = request.body.iter().next()?;
     if !matches!(
         name,
-        "insert" | "find" | "aggregate" | "count" | "distinct" | "getMore" | "killCursors"
+        "insert"
+            | "find"
+            | "aggregate"
+            | "count"
+            | "distinct"
+            | "getMore"
+            | "killCursors"
+            | "drop"
+            | "dropDatabase"
     ) {
         return None;
     }
@@ -178,18 +189,25 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
         if request.more_to_come && name != "insert" {
             return Err(CommandError::options());
         }
-        let collection = if name == "getMore" {
-            request
-                .body
-                .get_first("collection")
-                .ok_or_else(CommandError::invalid)?
+        let namespace = if name == "dropDatabase" {
+            if !matches!(value, BsonValue::Int32(1) | BsonValue::Int64(1)) {
+                return Err(CommandError::invalid());
+            }
+            DocumentNamespace::new(&request.database, "_")?
         } else {
-            value
+            let collection = if name == "getMore" {
+                request
+                    .body
+                    .get_first("collection")
+                    .ok_or_else(CommandError::invalid)?
+            } else {
+                value
+            };
+            let BsonValue::String(collection) = collection else {
+                return Err(CommandError::invalid());
+            };
+            DocumentNamespace::new(&request.database, collection)?
         };
-        let BsonValue::String(collection) = collection else {
-            return Err(CommandError::invalid());
-        };
-        let namespace = DocumentNamespace::new(&request.database, collection)?;
         let mut timeout = Duration::from_secs(15);
         let mut cursor_budget = None;
         for (field, value) in request.body.iter().skip(1) {
@@ -217,6 +235,15 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     matches!(value, BsonValue::Boolean(false))
                 }
                 "writeConcern" if name == "insert" => valid_write_concern(value),
+                "writeConcern" if matches!(name, "drop" | "dropDatabase") => {
+                    valid_write_concern(value)
+                        && matches!(value, BsonValue::Document(doc)
+                        if !matches!(doc.get_first("w"), Some(BsonValue::Int32(0) | BsonValue::Int64(0))))
+                }
+                // PyMongo's drop_database helper always sends its default None.
+                "comment" if matches!(name, "drop" | "dropDatabase") => {
+                    matches!(value, BsonValue::Null)
+                }
                 "filter" if name == "find" => matches!(value, BsonValue::Document(_)),
                 "pipeline" if name == "aggregate" => {
                     if !matches!(value, BsonValue::Array(_)) {
@@ -282,7 +309,22 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 return Err(CommandError::options());
             }
         }
-        let mut command = if name == "insert" {
+        let mut command = if matches!(name, "drop" | "dropDatabase") {
+            if !request.sequences.is_empty() {
+                return Err(CommandError::options());
+            }
+            if name == "drop" {
+                Command::DropCollection(DocumentDropCollectionRequest::new(
+                    namespace,
+                    DocumentWriteOptions::new(),
+                ))
+            } else {
+                Command::DropDatabase(DocumentDropDatabaseRequest::new(
+                    &request.database,
+                    DocumentWriteOptions::new(),
+                )?)
+            }
+        } else if name == "insert" {
             let documents = insert_documents(request)?;
             let ordered = !matches!(
                 request.body.get_first("ordered"),
@@ -758,6 +800,43 @@ impl Executor {
             ));
         }
         match command {
+            Command::DropCollection(request) => {
+                match self
+                    .call(
+                        session,
+                        identity,
+                        &context,
+                        DocumentCommand::DropCollection(request),
+                    )
+                    .await?
+                {
+                    DocumentResult::NamespaceDropped(true) => {
+                        Ok(fields([("ok", BsonValue::Double(1.0))]))
+                    }
+                    DocumentResult::NamespaceDropped(false) => Err(CommandError::new(
+                        26,
+                        "NamespaceNotFound",
+                        "collection does not exist",
+                    )),
+                    _ => Err(CommandError::unsupported()),
+                }
+            }
+            Command::DropDatabase(request) => {
+                match self
+                    .call(
+                        session,
+                        identity,
+                        &context,
+                        DocumentCommand::DropDatabase(request),
+                    )
+                    .await?
+                {
+                    DocumentResult::NamespaceDropped(_) => {
+                        Ok(fields([("ok", BsonValue::Double(1.0))]))
+                    }
+                    _ => Err(CommandError::unsupported()),
+                }
+            }
             Command::Insert(insert) => {
                 self.ensure_collection(session, identity, &context, insert.namespace())
                     .await?;

@@ -36,14 +36,16 @@ It may update `manifest.sqlite`, shard metadata, schema generations, or other
 files in the data directory. Treat startup of a newer binary as a storage
 mutation even when application rows do not change.
 
-The current version-15 migration accepts every exact historical version 1
-through 14. Its v14-to-v15 manifest transaction changes only the downgrade
-fence and header version; the manifest table set and semantic digest version
-remain unchanged. A later eligible keyed write may lazily create the exact
-optional receipt table inside its target shard. Because a version-14 binary
-does not recognize that table as valid storage-owned state, the version-15
-manifest fence is installed for every upgraded root before idempotent execution
-is available.
+The current version-16 migration accepts every exact historical version 1
+through 15. The v14-to-v15 transaction installs the idempotency-receipt
+downgrade fence; later eligible keyed writes may lazily create the optional
+shard-local receipt table. The v15-to-v16 transaction adds document identity
+high-water marks initialized from existing IDs, an empty deletion journal,
+semantic digest version 8, and the version-16 fence. It changes no shard or
+application row. Later explicit namespace drops use the recoverable deletion
+journal; interruption after durable intent may complete the drop on restart.
+Version-15 and older binaries refuse an upgraded root before they can ignore
+that intent or recycle a dropped identity.
 
 ## Required upgrade procedure
 

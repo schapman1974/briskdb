@@ -30,6 +30,10 @@ pub(crate) fn execution_to_python(
     }
 
     match result {
+        DocumentResult::NamespaceDropped(existed) => {
+            output.set_item("kind", "namespace_dropped")?;
+            output.set_item("existed", existed)?;
+        }
         DocumentResult::CollectionExists(exists) => {
             output.set_item("kind", "collection_exists")?;
             output.set_item("exists", exists)?;

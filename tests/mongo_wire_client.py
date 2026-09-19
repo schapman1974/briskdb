@@ -658,6 +658,61 @@ def aggregation_smoke(uri):
             raise AssertionError("broadcast amplification must be bounded")
 
 
+def lifecycle_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        client.drop_database("wire_lifecycle")
+        database = client.wire_lifecycle
+        database.one.drop()  # PyMongo suppresses a missing-namespace error.
+        for name in ("one", "two"):
+            database[name].insert_many([{"_id": index, "v": Int64(index)} for index in range(40)])
+        client.wire_lifecycle_keep.one.insert_one({"_id": 1, "keep": True})
+        for command, value, options, code in [
+            ("drop", "one", {"comment": "private-data"}, 72),
+            ("drop", "absent", {"writeConcern": {"w": 0}}, 72),
+            ("dropDatabase", 1, {"writeConcern": {"w": "majority"}}, 72),
+            ("dropDatabase", True, {}, 2), ("dropDatabase", 0, {}, 2),
+            ("drop", Code("one"), {}, 2), ("drop", "one", {"maxTimeMS": -1}, 2),
+        ]:
+            try:
+                database.command(command, value, **options)
+            except OperationFailure as error:
+                assert error.code == code, (command, options, error.code)
+                assert "private-data" not in str(error)
+            else:
+                raise AssertionError("invalid lifecycle commands must fail before mutation")
+        for aggregate in (False, True):
+            if aggregate:
+                cursor = database.one.aggregate([{"$sort": {"_id": -1}}], batchSize=1)
+            else:
+                cursor = database.one.find(batch_size=1)
+            next(cursor)
+            identifier = cursor.cursor_id
+            assert identifier
+            database.drop_collection("one")
+            database.one.insert_many([{"_id": index, "new": True} for index in range(100, 140)])
+            for _ in range(2):
+                try:
+                    database.command("getMore", identifier, collection="one", batchSize=1)
+                except OperationFailure as error:
+                    assert error.code == 43
+                else:
+                    raise AssertionError("an old wire cursor must not read a recreated collection")
+            cursor.close()
+        assert database.two.count_documents({}) == 40
+        assert client.wire_lifecycle_keep.one.find_one({"_id": 1}) == {"_id": 1, "keep": True}
+        client.drop_database("wire_lifecycle")
+        assert database.one.count_documents({}) == database.two.count_documents({}) == 0
+        client.drop_database("wire_lifecycle")
+        try:
+            database.command("drop", "absent")
+        except OperationFailure as error:
+            assert error.code == 26
+        else:
+            raise AssertionError("raw missing collection drop must return NamespaceNotFound")
+        database.recreated.insert_one({"_id": 1, "after_drop": True})
+        assert client.wire_lifecycle_keep.one.count_documents({}) == 1
+
+
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         assert client.wire_data.items.find_one({"_id": "typed"})["decimal"] == Decimal128("1.250")
@@ -684,12 +739,24 @@ def persisted_smoke(uri):
         assert [row["_id"] for row in client.wire_aggregate.items.aggregate([{"$sort": {"_id": -1}}, {"$limit": 7}], batchSize=2)] == list(reversed(range(173, 180)))
         assert list(client.wire_aggregate.transforms.aggregate([{"$project": {"_id": 0, "n": {"$size": "$items"}, "source": 1}}])) == [{"source": Int64(9), "n": 3}]
         assert list(client.wire_aggregate.items.aggregate([{"$group": {"_id": "$group", "n": {"$sum": 1}}}])) == [{"_id": key, "n": 60} for key in range(3)]
+        assert client.wire_lifecycle.one.count_documents({}) == 0
+        assert client.wire_lifecycle.two.count_documents({}) == 0
+        assert client.wire_lifecycle.recreated.find_one({"_id": 1}) == {"_id": 1, "after_drop": True}
+        assert client.wire_lifecycle_keep.one.find_one({"_id": 1}) == {"_id": 1, "keep": True}
+        assert client.async_lifecycle.items.count_documents({}) == 0
 
 
 async def async_smoke(uri):
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000, maxPoolSize=3) as client:
         assert (await client.admin.command("ping"))["ok"] == 1
         check_hello(await client.admin.command("hello"))
+        await client.async_lifecycle.items.insert_one({"_id": 1})
+        await client.async_lifecycle.items.drop()
+        assert await client.async_lifecycle.items.count_documents({}) == 0
+        await client.async_lifecycle.items.insert_one({"_id": 2})
+        await client.drop_database("async_lifecycle")
+        await client.drop_database("async_lifecycle")
+        assert await client.async_lifecycle.items.count_documents({}) == 0
         assert await client.wire_count.items.estimated_document_count(maxTimeMS=10000) == 37
         assert (await client.wire_count.command("count", "items", query={"group": 1}, skip=3, limit=5))["n"] == 5
         assert await client.wire_count.items.count_documents({"group": 1}, skip=3, limit=5) == 5
@@ -782,5 +849,6 @@ if __name__ == "__main__":
         count_smoke(sys.argv[1])
         distinct_smoke(sys.argv[1])
         aggregation_smoke(sys.argv[1])
+        lifecycle_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

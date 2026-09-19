@@ -52,13 +52,36 @@ byte budgets for either materialized or streamed reads. The existing
 Retained cursors, continuation tokens, global ordering, and general SQL
 pagination remain Phase 7 work.
 
-The on-disk format advances from manifest version 14 to 15. The automatic
+The on-disk format advances to manifest version 16, accepting exact source
+versions 1 through 15 through ordered transactional migrations. The automatic
 v14-to-v15 manifest transaction changes only the downgrade fence; the manifest
 table set and semantic digest version remain unchanged. Keyed execution may
 then create the exact optional shard-local `briskdb_idempotency_receipts_v1`
-table. Older binaries refuse the version-15 manifest. In-place downgrade is
+table. The v15-to-v16 transaction adds permanent document identity high-water
+marks, an empty namespace-deletion journal, semantic digest version 8, and the
+version-16 downgrade fence. Existing catalog IDs initialize the high-water marks;
+the migration changes no shard or application row. Older binaries refuse the
+version-16 manifest. In-place downgrade is
 unsupported; rollback requires the complete stopped-server backup made before
 upgrade.
+
+Document `DropCollection` and `DropDatabase` now share a durable engine path
+across Rust, native sync/async Python (`drop_collection` / `drop_database`), and
+Mongo wire `drop` / `dropDatabase`. Native results are `NamespaceDropped(bool)`
+and Python `namespace_dropped` with `existed`, respectively. A missing target is
+false natively; raw wire collection drop reports NamespaceNotFound (26), while
+missing database drop succeeds. Wire replies are minimal acknowledgements, not
+invented index counts or metadata. PyMongo's default `comment: null` is accepted;
+non-null comments, unacknowledged drops, replication concerns, and other
+unsupported options fail before mutation.
+
+Drops preserve unrelated namespaces and SQL storage. IDs never recycle, so
+retained find/aggregate cursors cannot cross a drop/recreate boundary. Operations
+require sole-process schema ownership. Cancellation before durable intent does
+not mutate data; interruption afterwards fences the root until reopen rolls
+the authorized drop forward. This is recoverable deletion, not cross-shard
+transactional rollback. Explicit wire creation and metadata cursor helpers
+remain follow-up work in issue #166.
 
 The administration HTTP listener now exposes versioned operational endpoints
 for readiness, relational catalog inspection, migration progress and exact

@@ -350,6 +350,37 @@ impl DocumentListCollectionsRequest {
     }
 }
 
+/// Request to drop a logical database and all of its document collections.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentDropDatabaseRequest {
+    database: String,
+    write_options: DocumentWriteOptions,
+}
+
+impl DocumentDropDatabaseRequest {
+    pub fn new(
+        database: impl Into<String>,
+        write_options: DocumentWriteOptions,
+    ) -> EngineResult<Self> {
+        let database = database.into();
+        validate_database_name(&database)?;
+        Ok(Self {
+            database,
+            write_options,
+        })
+    }
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+    pub const fn write_options(&self) -> &DocumentWriteOptions {
+        &self.write_options
+    }
+    pub fn into_parts(self) -> (String, DocumentWriteOptions) {
+        (self.database, self.write_options)
+    }
+}
+
 macro_rules! namespace_options_request {
     (
         $(#[$meta:meta])*
@@ -1106,6 +1137,7 @@ pub enum DocumentCommandKind {
     CollectionExists,
     ListCollections,
     DropCollection,
+    DropDatabase,
     Find,
     Aggregate,
     Count,
@@ -1129,6 +1161,7 @@ pub enum DocumentCommand {
     CollectionExists(DocumentCollectionExistsRequest),
     ListCollections(DocumentListCollectionsRequest),
     DropCollection(DocumentDropCollectionRequest),
+    DropDatabase(DocumentDropDatabaseRequest),
     Find(DocumentFindRequest),
     Aggregate(DocumentAggregateRequest),
     Count(DocumentCountRequest),
@@ -1151,6 +1184,7 @@ impl DocumentCommand {
             Self::CollectionExists(_) => DocumentCommandKind::CollectionExists,
             Self::ListCollections(_) => DocumentCommandKind::ListCollections,
             Self::DropCollection(_) => DocumentCommandKind::DropCollection,
+            Self::DropDatabase(_) => DocumentCommandKind::DropDatabase,
             Self::Find(_) => DocumentCommandKind::Find,
             Self::Aggregate(_) => DocumentCommandKind::Aggregate,
             Self::Count(_) => DocumentCommandKind::Count,

@@ -58,6 +58,16 @@ collections return an exhausted empty cursor without creating anything.
 Namespace checks target one collection through the engine, so reads and inserts
 remain usable beyond 101 collections and with large unrelated catalog metadata.
 
+PyMongo sync/async collection and database drops now use the shared durable
+`DropCollection` / `DropDatabase` engine commands. Raw `drop` takes a collection
+string and reports NamespaceNotFound (26) when absent; `dropDatabase` takes
+integer 1 and succeeds even when absent. Success replies contain `ok: 1.0` only.
+Drops preserve unrelated namespaces and SQL storage, and stale cursors cannot
+read a recreated collection. Interruption after durable intent requires reopen
+to finish deletion before normal operations resume; this is not rollback.
+Explicit wire `create`, database listings, and collection metadata cursors remain
+unimplemented. See [the recovery contract](DOCUMENT_STORAGE.md#namespace-deletion-and-restart).
+
 For these data commands, unknown fields and unsupported option values fail
 before storage admission. The current option contract is:
 
@@ -66,7 +76,8 @@ before storage admission. The current option contract is:
 | `maxTimeMS` | Nonnegative integer; a positive value narrows the 15-second command deadline. Find and aggregate retain the remaining execution budget across batches; client idle time is not charged. Positive getMore values require unsupported tailable/awaitData semantics and are rejected. |
 | `$readPreference` | A document containing only a recognized `mode`; the standalone engine serves the request |
 | `ordered` | Boolean; defaults to `true`, with ordered/unordered partial-failure behavior |
-| `writeConcern` | Omitted/empty, or `w` equal to 0 or 1, `j: false`, and `wtimeout: 0`; no replication or stronger durability is promised |
+| Insert `writeConcern` | Omitted/empty, or `w` equal to 0 or 1, `j: false`, and `wtimeout: 0`; no replication or stronger durability is promised |
+| Drop `writeConcern` / `comment` | Same concern subset except `w: 0` is rejected; comment must be omitted or null (PyMongo's default). No replication or unacknowledged drop. |
 | `bypassDocumentValidation` | Only `false` |
 | Find `skip` / `limit` | Nonnegative integers; zero limit means no additional limit |
 | Count `query` / `skip` / `limit` | Shared BSON matcher with global skip/limit; nonnegative integers, zero limit unbounded; absent collection returns zero |

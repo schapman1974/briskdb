@@ -41,6 +41,9 @@ def sync_contract(path: str) -> None:
     )["documents"]
     count: int = document_session.count_documents("app", "notes")["count"]
     exists: bool = document_session.collection_exists("app", "notes")["exists"]
+    dropped_collection: bool = document_session.drop_collection("app", "missing")["existed"]
+    dropped_database: bool = document_session.drop_database("missing")["existed"]
+    print(dropped_collection, dropped_database)
     distinct: List[object] = document_session.distinct("app", "notes", "body")["values"]
     aggregated: List[dict[str, object]] = document_session.aggregate("app", "notes", [{"$count": "n"}], batch_size=1)["documents"]
     print(aggregated)
@@ -90,6 +93,9 @@ async def async_contract(path: str) -> None:
     await session.insert_one("app", "typed", {"_id": 1})
     document_count: int = (await session.count_documents("app", "typed"))["count"]
     exists: bool = (await session.collection_exists("app", "typed"))["exists"]
+    dropped_collection: bool = (await session.drop_collection("app", "missing"))["existed"]
+    dropped_database: bool = (await session.drop_database("missing"))["existed"]
+    print(dropped_collection, dropped_database)
     distinct: List[object] = (await session.distinct("app", "typed", "_id"))["values"]
     aggregated: List[dict[str, object]] = (await session.aggregate("app", "typed", [{"$count": "n"}], batch_size=1))["documents"]
     print(aggregated)
