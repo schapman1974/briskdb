@@ -9,6 +9,7 @@ mod codec;
 mod command;
 mod error;
 mod key;
+mod matcher;
 mod number;
 mod options;
 mod plan;
@@ -40,6 +41,7 @@ pub use command::{
 };
 pub use error::{BsonError, BsonErrorContext, BsonErrorKind, BsonResult};
 pub use key::{BSON_KEY_ENCODING_VERSION, BSON_MAX_CANONICAL_KEY_BYTES, CanonicalBsonKey};
+pub use matcher::{DocumentMatcher, DocumentQueryError};
 pub use options::{
     DEFAULT_DOCUMENT_BATCH_SIZE, DocumentFilter, DocumentPipeline, DocumentProjection,
     DocumentReadOptions, DocumentSort, DocumentUpdate, DocumentWriteOptions,

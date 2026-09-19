@@ -225,7 +225,6 @@ mod enabled {
             &self.id_key
         }
 
-        #[cfg(test)]
         pub(crate) const fn document(&self) -> &BsonDocument {
             &self.document
         }

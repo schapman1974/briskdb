@@ -24,7 +24,7 @@ jobs:
   mongo-contract:
     name: Mongo compatibility contract
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -78,6 +78,21 @@ jobs:
             --output target/mongo-parity/tinymongo-memory.json
           cmp compat/mongo/v1/reference-results.json \
             target/mongo-parity/tinymongo-memory.json
+
+      - name: Install Rust 1.85 for candidate matcher conformance
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Restore matcher build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mongo-matcher-1.85
+
+      - name: Compare Rust matcher with source-locked TinyMongo
+        env:
+          BRISKDB_MONGO_ORACLE_PYTHON: python
+        run: >-
+          cargo +1.85.0 test --locked --no-default-features --features documents
+          --test document_matcher_oracle -- --ignored --nocapture
 
       - name: Generate Mongo parity report
         run: |

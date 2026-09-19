@@ -319,6 +319,7 @@ dependencies = [
  "bytes",
  "clap",
  "criterion",
+ "fancy-regex",
  "futures",
  "getrandom 0.4.3",
  "hyper",

@@ -24,10 +24,10 @@ use crate::{
         BSON_MAX_DECODED_BYTES, BsonDocument, BsonErrorContext, BsonObjectId, BsonTimestamp,
         BsonValue, DocumentCollectionId, DocumentCollectionMetadata, DocumentCollectionOptions,
         DocumentCommand, DocumentDeleteResult, DocumentExecution, DocumentFilter,
-        DocumentIndexMetadata, DocumentInsertResult, DocumentMutationScope, DocumentNamespace,
-        DocumentPlan, DocumentPointPlan, DocumentReadOptions, DocumentRequest, DocumentResult,
-        DocumentScatterPlan, DocumentWriteError, DocumentWriteOptions, MAX_DOCUMENT_REQUEST_BYTES,
-        encode_document,
+        DocumentIndexMetadata, DocumentInsertResult, DocumentMatcher, DocumentMutationScope,
+        DocumentNamespace, DocumentPlan, DocumentPointPlan, DocumentReadOptions, DocumentRequest,
+        DocumentResult, DocumentScatterPlan, DocumentWriteError, DocumentWriteOptions,
+        MAX_DOCUMENT_REQUEST_BYTES, encode_document,
     },
     storage::{
         ConnectionOwner, DocumentStorageRecord, MAX_DOCUMENT_SHARD_SCAN_RECORDS, PooledConnection,
@@ -500,13 +500,14 @@ impl Engine {
                             documents,
                         )
                     }
-                    PreparedFilterRoute::Scatter => {
+                    PreparedFilterRoute::Scatter(matcher) => {
                         let documents = self
                             .scan_document_collection(
                                 owner,
                                 collection_id,
                                 cancellation,
                                 deadline,
+                                matcher,
                                 &options,
                                 result_limits,
                             )
@@ -582,9 +583,10 @@ impl Engine {
                             u64::from(found),
                         )
                     }
-                    PreparedFilterRoute::Scatter => {
+                    PreparedFilterRoute::Scatter(matcher) => {
                         let mut count = 0_u64;
                         for shard in 0..self.shard_count() {
+                            let matcher = matcher.clone();
                             let shard_count = self
                                 .run_document_shard(
                                     shard,
@@ -592,6 +594,26 @@ impl Engine {
                                     cancellation.clone(),
                                     deadline,
                                     move |storage, connection, cancellation| {
+                                        if let Some(matcher) = matcher {
+                                            let mut after = None;
+                                            let mut count = 0_u64;
+                                            while let Some(record) = next_matching_document(
+                                                storage,
+                                                connection,
+                                                collection_id,
+                                                shard,
+                                                after,
+                                                Some(&matcher),
+                                                cancellation,
+                                                deadline,
+                                            )? {
+                                                after = Some(record.natural_order());
+                                                count = count.checked_add(1).ok_or_else(|| {
+                                                    limit_exceeded("document count overflowed")
+                                                })?;
+                                            }
+                                            return Ok(count);
+                                        }
                                         storage.count_document_shard_on_connection(
                                             connection,
                                             collection_id,
@@ -927,6 +949,7 @@ impl Engine {
         collection_id: DocumentCollectionId,
         cancellation: CancellationToken,
         deadline: Option<Instant>,
+        matcher: Option<Arc<DocumentMatcher>>,
         options: &DocumentReadOptions,
         limits: ResultLimits,
     ) -> EngineResult<Vec<BsonDocument>> {
@@ -938,25 +961,27 @@ impl Engine {
             Vec::with_capacity(usize::from(self.shard_count()));
         let mut retained_bytes = 0_u64;
         for shard in 0..self.shard_count() {
-            let page = self
+            let matcher = matcher.clone();
+            let record = self
                 .run_document_shard(
                     shard,
                     owner,
                     cancellation.clone(),
                     deadline,
                     move |storage, connection, cancellation| {
-                        storage.scan_document_shard_on_connection(
+                        next_matching_document(
+                            storage,
                             connection,
                             collection_id,
                             shard,
                             None,
-                            DOCUMENT_MERGE_PAGE_SIZE,
+                            matcher.as_deref(),
                             cancellation,
+                            deadline,
                         )
                     },
                 )
                 .await?;
-            let record = page.into_iter().next();
             if let Some(record) = &record {
                 validate_point_record(record, collection_id, shard, record.id_key())?;
                 retained_bytes = retained_bytes
@@ -1022,25 +1047,27 @@ impl Engine {
 
             let shard = u16::try_from(shard_index).expect("document shard index fits u16");
             let after = Some(natural_order);
-            let page = self
+            let matcher = matcher.clone();
+            let next = self
                 .run_document_shard(
                     shard,
                     owner,
                     cancellation.clone(),
                     deadline,
                     move |storage, connection, cancellation| {
-                        storage.scan_document_shard_on_connection(
+                        next_matching_document(
+                            storage,
                             connection,
                             collection_id,
                             shard,
                             after,
-                            DOCUMENT_MERGE_PAGE_SIZE,
+                            matcher.as_deref(),
                             cancellation,
+                            deadline,
                         )
                     },
                 )
                 .await?;
-            let next = page.into_iter().next();
             if let Some(next) = &next {
                 validate_point_record(next, collection_id, shard, next.id_key())?;
                 retained_bytes = retained_bytes
@@ -1066,6 +1093,58 @@ impl Engine {
             ));
         }
         Ok(documents)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn next_matching_document(
+    storage: &Storage,
+    connection: &mut PooledConnection,
+    collection_id: DocumentCollectionId,
+    shard: u16,
+    mut after: Option<u64>,
+    matcher: Option<&DocumentMatcher>,
+    cancellation: &CancellationToken,
+    deadline: Option<Instant>,
+) -> EngineResult<Option<DocumentStorageRecord>> {
+    let mut check = || {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(EngineError::deadline_exceeded(
+                "document matcher deadline exceeded",
+            ));
+        }
+        if cancellation.is_cancelled() {
+            return Err(EngineError::new(
+                EngineErrorKind::Cancelled,
+                "document matcher cancelled",
+            ));
+        }
+        Ok(())
+    };
+    loop {
+        check()?;
+        let record = storage
+            .scan_document_shard_on_connection(
+                connection,
+                collection_id,
+                shard,
+                after,
+                DOCUMENT_MERGE_PAGE_SIZE,
+                cancellation,
+            )?
+            .into_iter()
+            .next();
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        if let Some(matcher) = matcher {
+            if !matcher.matches_with_check(record.document(), &mut check)? {
+                after = Some(record.natural_order());
+                continue;
+            }
+        }
+        check()?;
+        return Ok(Some(record));
     }
 }
 
@@ -1156,6 +1235,7 @@ fn require_collection(
 enum FilterRoute {
     Point(BsonValue),
     Scatter,
+    Filtered(DocumentFilter),
 }
 
 enum PreparedFilterRoute {
@@ -1163,7 +1243,7 @@ enum PreparedFilterRoute {
         id_key: crate::document::CanonicalBsonKey,
         shard: u16,
     },
-    Scatter,
+    Scatter(Option<Arc<DocumentMatcher>>),
 }
 
 fn classify_filter(
@@ -1175,18 +1255,21 @@ fn classify_filter(
     if filter.is_empty() {
         return Ok(FilterRoute::Scatter);
     }
-    let mut entries = filter.into_document().into_entries().into_iter();
-    match (entries.next(), entries.next()) {
-        (Some((name, value)), None)
-            if name == "_id" && is_literal_id_filter(&value, cancellation, control)? =>
-        {
-            ensure_document_cpu_active(cancellation, control)?;
-            Ok(FilterRoute::Point(value))
+    if filter.document().len() == 1 {
+        if let Some(value) = filter.document().get_first("_id") {
+            if is_literal_id_filter(value, cancellation, control)? {
+                return Ok(FilterRoute::Point(value.clone()));
+            }
+            if let BsonValue::Document(expression) = value {
+                if expression.len() == 1 {
+                    if let Some(value) = expression.get_first("$eq") {
+                        return Ok(FilterRoute::Point(value.clone()));
+                    }
+                }
+            }
         }
-        _ => Err(unsupported(
-            "document matcher expressions require the query semantics milestone",
-        )),
     }
+    Ok(FilterRoute::Filtered(filter))
 }
 
 fn is_literal_id_filter(
@@ -1221,7 +1304,13 @@ fn prepare_filter_route(
             ensure_document_cpu_active(cancellation, control)?;
             Ok(PreparedFilterRoute::Point { id_key, shard })
         }
-        FilterRoute::Scatter => Ok(PreparedFilterRoute::Scatter),
+        FilterRoute::Scatter => Ok(PreparedFilterRoute::Scatter(None)),
+        FilterRoute::Filtered(filter) => {
+            let matcher = DocumentMatcher::compile_with_check(filter.document(), &mut || {
+                ensure_document_cpu_active(cancellation, control)
+            })?;
+            Ok(PreparedFilterRoute::Scatter(Some(Arc::new(matcher))))
+        }
     }
 }
 
@@ -1232,7 +1321,9 @@ fn require_point_filter(
 ) -> EngineResult<BsonValue> {
     match classify_filter(filter, cancellation, control)? {
         FilterRoute::Point(id) => Ok(id),
-        FilterRoute::Scatter => Err(unsupported("this mutation requires an exact _id filter")),
+        FilterRoute::Scatter | FilterRoute::Filtered(_) => {
+            Err(unsupported("this mutation requires an exact _id filter"))
+        }
     }
 }
 

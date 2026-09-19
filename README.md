@@ -132,7 +132,7 @@ experimental and opt-in; the exact contract lives in
 | Debian package and hardened systemd service | Published |
 | Rust library entrypoint with optional attached listeners | Working; the opt-in `documents` feature adds a thin native document-command facade |
 | Same-host service and embedded processes sharing one ready root | Working on local filesystems |
-| Native MongoDB wire protocol with TinyMongo parity | [Versioned parity contract](docs/MONGO_PARITY.md), [Rust BSON foundation](docs/BSON.md), [document storage/import](docs/DOCUMENT_STORAGE.md), the first [protocol-neutral document commands](docs/DOCUMENT_ENGINE.md), and their embedded Rust facade landed; remaining matcher/write semantics and the listener remain [planned](https://github.com/schapman1974/briskdb/issues/160) |
+| Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, batch inserts, and bounded find queries now share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), write/index semantics, and retained cursors remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
 | Native Python extension | Typed sync/async SQL and opt-in BSON document commands; tagged releases build audited macOS/Linux ARM/x86 wheels |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
@@ -268,8 +268,9 @@ with briskdb.open("./data", shards=4, documents=True) as db:
 
 PyMongo remains optional and is loaded only when a document method runs, so a
 SQL-only installation has no BSON dependency. The current slice supports
-collection/index metadata, single-document inserts with optional `_id`, empty or exact-`_id`
-find/count, and exact-`_id` deletion. Secondary index declarations remain
+collection/index metadata, single-document inserts with optional `_id`, BSON
+match-expression find/count, and exact-`_id` deletion. Finds must fit one batch.
+Secondary index declarations remain
 `pending_build`.
 
 See the [Python quickstart](python/README.md) for sync and asyncio write/read
@@ -302,9 +303,9 @@ and integrity metadata. Application rows stay in ordinary SQLite files.
 
 ## Where this is going
 
-- **MongoDB:** complete the matcher, write, index, cursor, and aggregation
-  semantics behind the native embedded command facade, then add a Rust Mongo
-  listener and differential TinyMongo parity.
+- **MongoDB:** extend the shared matcher and opt-in Rust listener with write,
+  index, cursor, and aggregation semantics, then prove differential TinyMongo
+  parity across embedded and wire clients.
 - **More wire protocols:** broader PostgreSQL client compatibility and a MySQL
   listener, all sharing the same engine behavior.
 - **Serverless storage:** atomic snapshots, object-store adapters, and fenced
@@ -348,8 +349,8 @@ more valuable than a star. Start with the
 - Multi-process access is same-host/local-filesystem only. Schema, catalog,
   upgrade, and recovery work requires sole-process ownership.
 - Pre-1.0 storage and public-library compatibility can change between releases.
-- Python document commands generate missing ObjectIds and currently only
-  implement empty or exact-`_id` filters. Updates, aggregation, embedded bulk writes,
+- Python document commands generate missing ObjectIds and support bounded BSON
+  find/count filters. Updates, aggregation, embedded bulk writes,
   retained document cursors, and built secondary indexes are still planned.
 - Ubuntu 24.04 x86-64 receives the full required Rust CI suite. Python wheels
   receive native build, audit, install, restart, corruption, and concurrency

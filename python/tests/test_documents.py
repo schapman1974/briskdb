@@ -52,6 +52,32 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_general_matcher_filters_before_global_skip_limit_and_count(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            database, session = self.open_session(root)
+            for index in range(24):
+                session.insert_one(DATABASE, COLLECTION, {
+                    "_id": index,
+                    "items": [{"kind": "quiz", "score": index}],
+                    "name": "Alpha" if index % 2 == 0 else "Beta",
+                })
+            query = {
+                "items": {"$elemMatch": {"kind": "quiz", "score": {"$gte": 12}}},
+                "name": {"$regex": "^alpha$", "$options": "i"},
+            }
+            found = session.find(DATABASE, COLLECTION, query, skip=1, limit=3, batch_size=3)
+            self.assertEqual([doc["_id"] for doc in found["documents"]], [14, 16, 18])
+            self.assertEqual(session.count_documents(DATABASE, COLLECTION, query)["count"], 6)
+            self.assertEqual(session.count_documents(DATABASE, COLLECTION, query, skip=1, limit=3)["count"], 3)
+            self.assertEqual(session.find(DATABASE, COLLECTION, {"_id": {"$eq": 7.0}})["documents"][0]["_id"], 7)
+            session.close()
+            database.close()
+            database = briskdb.open(root, documents=True)
+            session = database.session()
+            self.assertEqual(session.count_documents(DATABASE, COLLECTION, query)["count"], 6)
+            session.close()
+            database.close()
+
     def test_native_document_signatures_match_the_typed_api(self) -> None:
         for method_name in ("find", "list_collections", "list_indexes"):
             with self.subTest(method=method_name):

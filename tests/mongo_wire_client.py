@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pymongo
-from bson import Binary, Decimal128, Int64, ObjectId, Timestamp
+from bson import Binary, Decimal128, Int64, ObjectId, Regex, Timestamp
 from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
 
 
@@ -79,7 +79,7 @@ def document_smoke(uri):
         assert collection.find_one({"_id": "near-limit"}) == boundary
         assert client.other_database.items.find_one({"_id": "typed"}) is None
         for arguments, code in [
-            ({"filter": {"value": "unsupported"}}, 115),
+            ({"filter": {"$where": "unsupported"}}, 115),
             ({"filter": {"_id": "typed"}, "projection": {"integer": 1}}, 72),
             ({"filter": {"_id": "typed"}, "lsid": {"id": Binary(b"0" * 16, 4)}}, 72),
         ]:
@@ -155,6 +155,58 @@ def batch_smoke(uri):
         assert client.wire_batches.timestamps.find_one({"_id": "second"})["nonzero"] == Timestamp(0, 1)
 
 
+def query_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        collection = client.wire_queries.items
+        collection.insert_many([
+            {"_id": "missing"},
+            {"_id": "null", "v": None},
+            {"_id": "array", "v": [2, 7, 12], "items": [{"score": 1}, {"score": 5}]},
+            {"_id": "number", "v": 7.0, "items": [{"other": 1}, {"score": 2}]},
+            {"_id": "string", "v": "Abxc"},
+            {"_id": "nested", "v": [[1, 2]], "items": [[{"score": 1}]]},
+        ])
+        cases = [
+            ({"v": None}, ["missing", "null"]),
+            ({"v": {"$ne": None}}, ["array", "nested", "number", "string"]),
+            ({"v": {"$elemMatch": {"$gte": 5, "$lt": 10}}}, ["array"]),
+            ({"v": {"$in": [7]}}, ["array", "number"]),
+            ({"v": {"$type": "array"}}, ["array", "nested"]),
+            ({"v": {"$regex": "ab.c", "$options": "i"}}, ["string"]),
+            ({"items.score": {"$gt": 1}}, ["array", "number"]),
+            ({"v.0": [1, 2]}, ["nested"]),
+            ({"$or": [{"v": 7}, {"v": "Abxc"}]}, ["array", "number", "string"]),
+            ({"$nor": [{"v": {"$exists": True}}]}, ["missing"]),
+            ({"_id": {"$eq": "number"}}, ["number"]),
+        ]
+        for query, expected in cases:
+            assert sorted(item["_id"] for item in collection.find(query)) == expected, query
+        assert len(list(collection.find())) == 6
+        assert [item["_id"] for item in collection.find({"v": {"$ne": None}}).skip(1).limit(2)] == ["number", "string"]
+        assert collection.find_one({"v": {"$type": "number"}})["_id"] == "array"
+        result = client.wire_queries.command("find", "items", filter={}, batchSize=2, singleBatch=True)
+        assert result["cursor"]["id"] == 0
+        assert [item["_id"] for item in result["cursor"]["firstBatch"]] == ["missing", "null"]
+        for database in [client.wire_queries, client.invalid_query_must_not_create]:
+            for query, code in [
+                ({"v": {"$not": {}}}, 2),
+                ({"$or": [{}, {"v": {"$size": "bad"}}]}, 2),
+                ({"v": {"$type": True}}, 14),
+                ({"v": {"$type": []}}, 9),
+                ({"v": {"$regex": "["}}, 51091),
+                ({"v": {"$regex": "x", "$options": "q"}}, 51108),
+                ({"v": {"$regex": Regex("x", "i"), "$options": "i"}}, 51075),
+                ({"$where": "not executed"}, 115),
+            ]:
+                try:
+                    database.command("find", "items", filter=query)
+                except OperationFailure as error:
+                    assert error.code == code, (query, error)
+                else:
+                    raise AssertionError("all branches must validate, even for an absent collection")
+        assert client.admin.command("ping")["ok"] == 1
+
+
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         assert client.wire_data.items.find_one({"_id": "typed"})["decimal"] == Decimal128("1.250")
@@ -165,6 +217,7 @@ def persisted_smoke(uri):
         assert client.wire_batches.split.find_one({"_id": 1000}) == {"_id": 1000}
         assert client.wire_batches.timestamps.find_one({"_id": "first"})["stamp"].time > 0
         assert client.async_data.batches.find_one({"_id": 2}) == {"_id": 2}
+        assert sorted(item["_id"] for item in client.wire_queries.items.find({"v": {"$in": [7]}})) == ["array", "number"]
 
 
 async def async_smoke(uri):
@@ -196,6 +249,8 @@ async def async_smoke(uri):
         else:
             raise AssertionError("async unordered batch must report duplicate and continue")
         assert await client.async_data.batches.find_one({"_id": 2}) == {"_id": 2}
+        rows = await client.wire_queries.items.find({"items.score": {"$gt": 1}}).to_list()
+        assert sorted(item["_id"] for item in rows) == ["array", "number"]
 
 
 if __name__ == "__main__":
@@ -206,5 +261,6 @@ if __name__ == "__main__":
         sync_smoke(sys.argv[1])
         document_smoke(sys.argv[1])
         batch_smoke(sys.argv[1])
+        query_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, exact-ID find, BSON, and rejection passed")
