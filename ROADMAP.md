@@ -499,8 +499,16 @@ requires an earlier dependency:
       a zero-ID cursor. Tests cover BSON fidelity, numeric-equivalent IDs,
       cross-interface access, restart, host enablement, one-way writes, and
       response limits. Missing collections read empty without creating metadata.
-      Insert batches, server-generated IDs, updates/deletes, retained cursors,
-      general queries, and full collection lifecycle remain open.
+      Updates/deletes, retained cursors, general queries, and full collection
+      lifecycle remain open.
+    - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
+      unordered insert batches use canonical-ID routing and contiguous
+      single-shard worker grouping. Missing IDs receive ObjectIds; explicit
+      nulls are preserved. Duplicate failures retain input indices and partial
+      success counts. Preflight validation and result budgets precede document
+      writes, with no cross-shard atomicity promise. Tests cover BSON types,
+      direct zero-timestamp normalization, raw server-generated IDs, restart,
+      concurrent duplicates, driver batch splitting, and boundary rejection.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.

@@ -1,6 +1,15 @@
 //! Protocol-neutral document command execution through engine-owned resources.
 
-use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    cmp::Reverse,
+    collections::BinaryHeap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use tokio::task::JoinHandle;
 
@@ -12,12 +21,13 @@ use crate::{
         wait_pending,
     },
     document::{
-        BSON_MAX_DECODED_BYTES, BsonDocument, BsonErrorContext, BsonValue, DocumentCollectionId,
-        DocumentCollectionMetadata, DocumentCollectionOptions, DocumentCommand,
-        DocumentDeleteResult, DocumentExecution, DocumentFilter, DocumentIndexMetadata,
-        DocumentInsertResult, DocumentMutationScope, DocumentNamespace, DocumentPlan,
-        DocumentPointPlan, DocumentReadOptions, DocumentRequest, DocumentResult,
-        DocumentScatterPlan, DocumentWriteOptions, MAX_DOCUMENT_REQUEST_BYTES, encode_document,
+        BSON_MAX_DECODED_BYTES, BsonDocument, BsonErrorContext, BsonObjectId, BsonTimestamp,
+        BsonValue, DocumentCollectionId, DocumentCollectionMetadata, DocumentCollectionOptions,
+        DocumentCommand, DocumentDeleteResult, DocumentExecution, DocumentFilter,
+        DocumentIndexMetadata, DocumentInsertResult, DocumentMutationScope, DocumentNamespace,
+        DocumentPlan, DocumentPointPlan, DocumentReadOptions, DocumentRequest, DocumentResult,
+        DocumentScatterPlan, DocumentWriteError, DocumentWriteOptions, MAX_DOCUMENT_REQUEST_BYTES,
+        encode_document,
     },
     storage::{
         ConnectionOwner, DocumentStorageRecord, MAX_DOCUMENT_SHARD_SCAN_RECORDS, PooledConnection,
@@ -29,6 +39,8 @@ const DOCUMENT_RESULT_ENVELOPE_BYTES: u64 = 16;
 const DOCUMENT_RESULT_ROW_BYTES: u64 = 8;
 const DOCUMENT_RESULT_VALUE_BYTES: u64 = 9;
 const DOCUMENT_MERGE_PAGE_SIZE: usize = 1;
+const DOCUMENT_WRITE_ERROR_BYTES: u64 = 64;
+static SERVER_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 const _: () = assert!(DOCUMENT_MERGE_PAGE_SIZE <= MAX_DOCUMENT_SHARD_SCAN_RECORDS);
 
 impl Engine {
@@ -268,11 +280,7 @@ impl Engine {
             DocumentCommand::Insert(request) => {
                 let (namespace, documents, options) = request.into_parts();
                 require_insert_options(options)?;
-                if documents.len() != 1 {
-                    return Err(unsupported(
-                        "multi-document inserts require the bulk-write result semantics milestone",
-                    ));
-                }
+                let batch = documents.len() > 1;
                 let catalog_storage = storage.clone();
                 let collection_id = self
                     .run_document_storage_task(
@@ -337,39 +345,99 @@ impl Engine {
                         },
                     )
                     .await?;
-                for (offset, prepared_document) in prepared.into_iter().enumerate() {
-                    let natural_order = first_order
-                        .checked_add(u64::try_from(offset).expect("bounded insert count fits u64"))
-                        .ok_or_else(|| {
-                            EngineError::new(
-                                EngineErrorKind::LimitExceeded,
-                                "document natural-order identity overflowed",
-                            )
-                        })?;
-                    let shard = prepared_document.shard();
-                    let write = prepared_document;
-                    self.run_document_shard(
-                        shard,
-                        owner,
-                        cancellation.clone(),
-                        deadline,
-                        move |storage, connection, cancellation| {
-                            storage.insert_prepared_document_on_connection(
-                                connection,
-                                collection_id,
-                                natural_order,
-                                shard,
-                                &write,
-                                cancellation,
-                            )
-                        },
+                // Allocate all result bookkeeping before the first write. A
+                // duplicate is a safe per-item failure; interruption and storage
+                // failures still abort without claiming multi-shard atomicity.
+                let mut inserted_ids = Vec::new();
+                let mut write_errors = Vec::new();
+                inserted_ids.try_reserve_exact(ids.len()).map_err(|error| {
+                    EngineError::from_source(
+                        EngineErrorKind::OutOfMemory,
+                        "unable to reserve insert results",
+                        error,
                     )
-                    .await?;
+                })?;
+                write_errors.try_reserve_exact(ids.len()).map_err(|error| {
+                    EngineError::from_source(
+                        EngineErrorKind::OutOfMemory,
+                        "unable to reserve insert errors",
+                        error,
+                    )
+                })?;
+                let mut pending = prepared.into_iter().zip(ids).enumerate().peekable();
+                while let Some((_, (first, _))) = pending.peek() {
+                    let shard = first.shard();
+                    // One lease/worker handles each contiguous same-shard run.
+                    // This groups an entire single-shard batch without reordering
+                    // cross-shard inputs or promising transactional batch writes.
+                    let (remaining, successes, failures, stopped) = self
+                        .run_document_shard(
+                            shard,
+                            owner,
+                            cancellation.clone(),
+                            deadline,
+                            move |storage, connection, cancellation| {
+                                let mut stopped = false;
+                                while pending
+                                    .peek()
+                                    .is_some_and(|(_, (write, _))| write.shard() == shard)
+                                {
+                                    let (offset, (write, id)) =
+                                        pending.next().expect("peeked insert");
+                                    let natural_order = first_order
+                                        .checked_add(
+                                            u64::try_from(offset)
+                                                .expect("bounded insert count fits u64"),
+                                        )
+                                        .ok_or_else(|| {
+                                            limit_exceeded(
+                                                "document natural-order identity overflowed",
+                                            )
+                                        })?;
+                                    match storage.insert_prepared_document_on_connection(
+                                        connection,
+                                        collection_id,
+                                        natural_order,
+                                        shard,
+                                        &write,
+                                        cancellation,
+                                    ) {
+                                        Ok(()) => inserted_ids.push(id),
+                                        Err(error)
+                                            if batch
+                                                && error.kind()
+                                                    == EngineErrorKind::UniqueViolation =>
+                                        {
+                                            write_errors.push(DocumentWriteError::new(
+                                                offset,
+                                                error.kind(),
+                                            ));
+                                            if options.ordered() {
+                                                stopped = true;
+                                                break;
+                                            }
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+                                Ok((pending, inserted_ids, write_errors, stopped))
+                            },
+                        )
+                        .await?;
+                    pending = remaining;
+                    inserted_ids = successes;
+                    write_errors = failures;
+                    if stopped {
+                        break;
+                    }
                 }
                 Ok(DocumentExecution::new(
                     request_id,
                     Some(plan),
-                    DocumentResult::Insert(DocumentInsertResult::from_validated(ids)),
+                    DocumentResult::Insert(DocumentInsertResult::from_batch(
+                        inserted_ids,
+                        write_errors,
+                    )),
                 ))
             }
             DocumentCommand::Find(request) => {
@@ -1029,11 +1097,6 @@ fn require_catalog_write_options(options: DocumentWriteOptions) -> EngineResult<
 }
 
 fn require_insert_options(options: DocumentWriteOptions) -> EngineResult<()> {
-    if !options.ordered() {
-        return Err(unsupported(
-            "unordered document inserts require the bulk-write semantics milestone",
-        ));
-    }
     if options.upsert() {
         return Err(EngineError::new(
             EngineErrorKind::InvalidArgument,
@@ -1259,6 +1322,7 @@ fn prepare_documents(
     })?;
     for document in documents {
         ensure_document_cpu_active(cancellation, control)?;
+        let document = prepare_insert_document(document)?;
         let id = document
             .get_unique("_id")
             .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?
@@ -1268,13 +1332,90 @@ fn prepare_documents(
                     "document inserts require an explicit _id",
                 )
             })?;
-        let write = storage.prepare_document_write(document)?;
+        let write = storage.prepare_document_write(&document)?;
         ensure_document_cpu_active(cancellation, control)?;
         prepared.push(write);
         ids.push(id.clone());
     }
     ensure_document_cpu_active(cancellation, control)?;
     Ok((prepared, ids))
+}
+
+/// Insert write normalization, independent of any wire protocol.
+/// An absent ID is generated; explicit null and all nested timestamps survive.
+fn prepare_insert_document(document: &BsonDocument) -> EngineResult<Cow<'_, BsonDocument>> {
+    let missing_id = document.get_first("_id").is_none();
+    let stamp = |name: &str, value: &BsonValue| {
+        name != "_id"
+            && matches!(value, BsonValue::Timestamp(value) if value.time() == 0 && value.increment() == 0)
+    };
+    if !missing_id && !document.iter().any(|(name, value)| stamp(name, value)) {
+        return Ok(Cow::Borrowed(document));
+    }
+    let mut normalized = BsonDocument::new();
+    normalized
+        .try_reserve(document.len() + usize::from(missing_id))
+        .map_err(|error| {
+            EngineError::from_source(
+                EngineErrorKind::OutOfMemory,
+                "unable to normalize insert document",
+                error,
+            )
+        })?;
+    if missing_id {
+        normalized
+            .push(
+                "_id",
+                BsonValue::ObjectId(BsonObjectId::from_bytes(bson::oid::ObjectId::new().bytes())),
+            )
+            .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+    }
+    for (name, value) in document.iter() {
+        let value = if stamp(name, value) {
+            BsonValue::Timestamp(next_server_timestamp()?)
+        } else {
+            value.clone()
+        };
+        normalized
+            .push(name, value)
+            .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+    }
+    Ok(Cow::Owned(normalized))
+}
+
+fn next_server_timestamp() -> EngineResult<BsonTimestamp> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u32::try_from(elapsed.as_secs()).ok())
+        .ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::NumericOutOfRange,
+                "server clock exceeds BSON timestamp range",
+            )
+        })?;
+    let mut next = 0;
+    SERVER_TIMESTAMP
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+            let old_seconds = (previous >> 32) as u32;
+            let increment = previous as u32;
+            let (seconds, increment) = if seconds > old_seconds {
+                (seconds, 1)
+            } else if increment == u32::MAX {
+                (old_seconds.checked_add(1)?, 1)
+            } else {
+                (old_seconds, increment + 1)
+            };
+            next = (u64::from(seconds) << 32) | u64::from(increment);
+            Some(next)
+        })
+        .map_err(|_| {
+            EngineError::new(
+                EngineErrorKind::NumericOutOfRange,
+                "server timestamp exhausted",
+            )
+        })?;
+    Ok(BsonTimestamp::new((next >> 32) as u32, next as u32))
 }
 
 fn apply_point_read(
@@ -1526,7 +1667,8 @@ fn enforce_execution_result_limits_with_check(
             }
         }
         DocumentResult::Insert(result) => {
-            budget.add_rows(result.inserted_ids().len())?;
+            budget.add_rows(result.inserted_ids().len() + result.write_errors().len())?;
+            budget.add_bytes(result.write_errors().len() as u64 * DOCUMENT_WRITE_ERROR_BYTES)?;
             for id in result.inserted_ids() {
                 budget.add_value(id, check)?;
             }
@@ -1613,6 +1755,9 @@ fn enforce_insert_execution_limits(
     ensure_document_cpu_active(cancellation, control)?;
     budget.add_plan(plan)?;
     budget.add_rows(ids.len())?;
+    if ids.len() > 1 {
+        budget.add_bytes(ids.len() as u64 * DOCUMENT_WRITE_ERROR_BYTES)?;
+    }
     for id in ids {
         ensure_document_cpu_active(cancellation, control)?;
         budget.add_value(id, &mut check)?;

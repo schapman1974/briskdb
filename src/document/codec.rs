@@ -149,6 +149,38 @@ pub fn decode_document_with_options(
     decode_raw_document(raw, options, &mut budget, 1, "$")
 }
 
+/// Decode a bounded batch with one aggregate retained-heap budget. The document
+/// byte and nesting limits still apply independently to every document.
+pub fn decode_document_batch_with_options(
+    documents: &[&[u8]],
+    options: &BsonCodecOptions,
+) -> BsonResult<Vec<BsonDocument>> {
+    options.validate()?;
+    if documents.len() as u64 > super::MAX_DOCUMENT_BATCH_SIZE {
+        return Err(BsonError::new(
+            BsonErrorKind::Oversized,
+            "BSON batch document limit exceeded",
+        ));
+    }
+    let mut budget = DecodeBudget::new(options.max_decoded_bytes);
+    budget.consume(
+        documents.len() * size_of::<BsonDocument>(),
+        "$",
+        "document batch slots",
+    )?;
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(documents.len())
+        .map_err(|_| allocation_failure("$", "document batch"))?;
+    for bytes in documents {
+        validate_top_level_frame(bytes, options)?;
+        let raw = RawDocument::from_bytes(bytes)
+            .map_err(|error| map_raw_error(error, "$", "invalid BSON document frame"))?;
+        decoded.push(decode_raw_document(raw, options, &mut budget, 1, "$")?);
+    }
+    Ok(decoded)
+}
+
 /// Encode one BSON document using the safe default policy.
 pub fn encode_document(document: &BsonDocument) -> BsonResult<Vec<u8>> {
     encode_document_with_options(document, &BsonCodecOptions::default())
@@ -940,6 +972,23 @@ fn push_bounded_to(target: &mut String, value: &str, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_batch_shares_one_decode_budget() {
+        let document =
+            BsonDocument::from_entries([("text", BsonValue::String("x".repeat(1500)))]).unwrap();
+        let encoded = encode_document(&document).unwrap();
+        let options = BsonCodecOptions::new().with_max_decoded_bytes(3000);
+        assert!(decode_document_with_options(&encoded, &options).is_ok());
+        let error =
+            decode_document_batch_with_options(&[&encoded, &encoded], &options).unwrap_err();
+        assert_eq!(error.kind(), BsonErrorKind::Oversized);
+        let decoded =
+            decode_document_batch_with_options(&[&encoded, &encoded], &BsonCodecOptions::new())
+                .unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[1].representation_eq(&document));
+    }
 
     fn empty_key_null_document(element_count: usize) -> Vec<u8> {
         let len = 5 + element_count * 2;

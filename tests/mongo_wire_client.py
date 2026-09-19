@@ -7,7 +7,7 @@ from datetime import datetime
 
 import pymongo
 from bson import Binary, Decimal128, Int64, ObjectId, Timestamp
-from pymongo.errors import DuplicateKeyError, OperationFailure
+from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
 
 
 def check_hello(reply):
@@ -93,11 +93,78 @@ def document_smoke(uri):
         assert client.wire_data.items.find_one({"_id": "typed"})["decimal"] == Decimal128("1.250")
 
 
+def batch_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000, maxPoolSize=3) as client:
+        for ordered in [True, False]:
+            collection = client.wire_batches[f"ordered_{ordered}"]
+            documents = [{"_id": identifier, "position": index} for index, identifier in enumerate([1, 1.0, 2, 2.0, 3])]
+            try:
+                collection.insert_many(documents, ordered=ordered)
+            except BulkWriteError as error:
+                assert error.details["nInserted"] == (1 if ordered else 3)
+                assert [(item["index"], item["code"]) for item in error.details["writeErrors"]] == (
+                    [(1, 11000)] if ordered else [(1, 11000), (3, 11000)]
+                )
+                assert error.details["writeConcernErrors"] == []
+            else:
+                raise AssertionError("duplicates must report batch indices and partial success")
+            assert collection.find_one({"_id": 1}) == documents[0]
+            assert (collection.find_one({"_id": 3}) is None) == ordered
+        generated = [{"value": "generated"}, {"_id": None}, {"value": "generated again"}]
+        result = client.wire_batches.generated.insert_many(generated)
+        assert result.inserted_ids == [item["_id"] for item in generated]
+        assert result.inserted_ids[1] is None
+        assert all(isinstance(result.inserted_ids[index], ObjectId) for index in [0, 2])
+        for item in generated:
+            assert client.wire_batches.generated.find_one({"_id": item["_id"]}) == item
+        # The driver's advertised maxWriteBatchSize split must preserve results.
+        documents = [{"_id": number} for number in range(1001)]
+        result = client.wire_batches.split.insert_many(documents)
+        assert result.inserted_ids == list(range(1001))
+        for number in [0, 999, 1000]:
+            assert client.wire_batches.split.find_one({"_id": number}) == {"_id": number}
+        # Contending connections must not admit BSON-equal duplicate IDs.
+        collection = client.wire_batches.concurrent
+        collection.insert_one({"_id": "seed"})
+        def insert_contended(_):
+            try:
+                return len(collection.insert_many([{"_id": number} for number in range(20)], ordered=False).inserted_ids)
+            except BulkWriteError as error:
+                assert all(item["code"] == 11000 for item in error.details["writeErrors"])
+                return error.details["nInserted"]
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            assert sum(pool.map(insert_contended, range(3))) == 20
+        # Only direct zero timestamps are server-stamped, never nested values or IDs.
+        zero = Timestamp(0, 0)
+        documents = [
+            {"_id": "first", "stamp": zero, "second": zero, "nested": {"stamp": zero}, "array": [zero]},
+            {"_id": "second", "stamp": zero, "nonzero": Timestamp(0, 1)},
+            {"_id": zero, "stamp": zero},
+        ]
+        client.wire_batches.timestamps.insert_many(documents)
+        stamps = []
+        for document in documents:
+            actual = client.wire_batches.timestamps.find_one({"_id": document["_id"]})
+            assert actual["stamp"].time > 0
+            stamps.append(actual["stamp"])
+            assert document["stamp"] == zero
+        actual = client.wire_batches.timestamps.find_one({"_id": "first"})
+        assert actual["nested"]["stamp"] == actual["array"][0] == zero
+        assert actual["second"] != actual["stamp"]
+        assert len(set(stamps)) == len(stamps)
+        assert client.wire_batches.timestamps.find_one({"_id": "second"})["nonzero"] == Timestamp(0, 1)
+
+
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
         assert client.wire_data.items.find_one({"_id": "typed"})["decimal"] == Decimal128("1.250")
         assert client.wire_data.items.find_one({"_id": None})["value"] == "typed id"
         assert client.async_data.items.find_one({"_id": "async"})["value"] == "async write"
+        assert client.wire_batches.ordered_True.find_one({"_id": 3}) is None
+        assert client.wire_batches.ordered_False.find_one({"_id": 3})["position"] == 4
+        assert client.wire_batches.split.find_one({"_id": 1000}) == {"_id": 1000}
+        assert client.wire_batches.timestamps.find_one({"_id": "first"})["stamp"].time > 0
+        assert client.async_data.batches.find_one({"_id": 2}) == {"_id": 2}
 
 
 async def async_smoke(uri):
@@ -121,6 +188,14 @@ async def async_smoke(uri):
             assert error.code == 11000
         else:
             raise AssertionError("async duplicate insert must fail")
+        try:
+            await client.async_data.batches.insert_many([{"_id": 1}, {"_id": 1.0}, {"_id": 2}], ordered=False)
+        except BulkWriteError as error:
+            assert error.details["nInserted"] == 2
+            assert [(item["index"], item["code"]) for item in error.details["writeErrors"]] == [(1, 11000)]
+        else:
+            raise AssertionError("async unordered batch must report duplicate and continue")
+        assert await client.async_data.batches.find_one({"_id": 2}) == {"_id": 2}
 
 
 if __name__ == "__main__":
@@ -130,5 +205,6 @@ if __name__ == "__main__":
     else:
         sync_smoke(sys.argv[1])
         document_smoke(sys.argv[1])
+        batch_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
-    print("PyMongo 4.17.0 discovery, single insert, exact-ID find, BSON, and rejection passed")
+    print("PyMongo 4.17.0 discovery, insert batches, exact-ID find, BSON, and rejection passed")

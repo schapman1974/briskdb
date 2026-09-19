@@ -61,7 +61,7 @@ This first engine slice executes:
 | `ListCollections` | Returns collection metadata for one exact database name |
 | `CreateIndex` | Declares index metadata and returns its name; non-built-in indexes remain pending until physical index work lands |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
-| `Insert` | Inserts one document containing an explicit `_id`; the typed request retains batch shape for later bulk-write semantics |
+| `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
 | `Find` | Supports an empty filter or an exact top-level `{_id: value}` filter and returns one exhausted cursor batch |
 | `Count` | Supports an empty filter or an exact top-level `{_id: value}` filter |
 | `Delete` | Deletes one document selected by exact `_id` |
@@ -79,6 +79,22 @@ and returned documents. It accounts returned rows and encoded BSON bytes
 against the effective `ResultLimits`; exceeding either bound fails the whole
 command rather than returning a partial batch.
 
+Insert batches preflight every document and the result budget before writing.
+Each document routes by its canonical BSON `_id`. Contiguous same-shard inputs
+share one connection lease and worker without changing input order. Writes
+commit individually: ordered batches stop at the first duplicate; unordered
+batches continue after duplicates and return every error's input index alongside
+successful IDs. A single-document duplicate remains a `UniqueViolation` engine
+error. Other failures, including cancellation and storage errors, stop the
+command; earlier successful writes may remain. No cross-shard atomicity is
+promised.
+
+Missing IDs become BSON ObjectIds in the engine-owned copy. Explicit null IDs
+are preserved. Direct, non-`_id` `Timestamp(0, 0)` fields receive distinct server
+timestamps, while nested/array timestamps and timestamp-valued IDs are untouched.
+Callers' BSON documents are not mutated. Inspect `DocumentInsertResult::write_errors`
+before treating a batch result as wholly successful.
+
 ## Execution and storage boundary
 
 Document commands use the same engine lifecycle, session serialization,
@@ -95,15 +111,13 @@ authorizer before that connection can be reused.
 ## Current boundary
 
 General match expressions, projection, sort, update expressions, replacements,
-multi-document insertion or deletion, upsert, distinct, aggregation, retained
+multi-document deletion, upsert, distinct, aggregation, retained
 cursors, and physical secondary-index builds remain later roadmap work.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
-category. Inserts require caller-supplied `_id` values until generated document
-IDs land.
+category.
 
-This release does not add a MongoDB listener, a collection-oriented Rust
-convenience API, or the Python document API. Those later adapters will
-translate into this engine boundary instead of implementing routing or storage
-behavior themselves. See [the Mongo parity contract](MONGO_PARITY.md),
+The opt-in Mongo listener and embedded document adapters translate into this
+engine boundary instead of implementing routing or storage behavior themselves.
+See [the Mongo parity contract](MONGO_PARITY.md),
 [the BSON contract](BSON.md), and [document storage](DOCUMENT_STORAGE.md) for
 the adjacent contracts.

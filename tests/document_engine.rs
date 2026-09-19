@@ -789,28 +789,6 @@ async fn unsupported_document_semantics_fail_at_the_engine_boundary() {
         .unwrap_err();
     assert_eq!(error.kind(), EngineErrorKind::Unsupported);
 
-    let multi_insert = DocumentInsertRequest::new(
-        namespace(),
-        vec![
-            document(BsonValue::Int32(97), "x"),
-            document(BsonValue::Int32(98), "y"),
-        ],
-        DocumentWriteOptions::new(),
-    )
-    .unwrap();
-    let error = engine
-        .execute_document(
-            &session,
-            request(
-                47,
-                RequestContext::new(),
-                DocumentCommand::Insert(multi_insert),
-            ),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), EngineErrorKind::Unsupported);
-
     let insert = DocumentInsertRequest::new(
         namespace(),
         vec![document(BsonValue::Int32(99), "z")],
@@ -867,6 +845,261 @@ async fn unsupported_document_semantics_fail_at_the_engine_boundary() {
         .unwrap_err();
     assert_eq!(error.kind(), EngineErrorKind::Unsupported);
 
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn insert_batches_preserve_partial_results_ordering_and_restart() {
+    async fn route(engine: &Engine, session: &Session, id: i32) -> u16 {
+        let found = engine
+            .execute_document(
+                session,
+                request(
+                    90,
+                    RequestContext::new(),
+                    DocumentCommand::Find(DocumentFindRequest::new(
+                        namespace(),
+                        DocumentFilter::new(
+                            BsonDocument::from_entries([("_id", BsonValue::Int32(id))]).unwrap(),
+                        )
+                        .unwrap(),
+                        DocumentReadOptions::new(),
+                    )),
+                ),
+            )
+            .await
+            .unwrap();
+        let Some(DocumentPlan::Point(plan)) = found.plan() else {
+            panic!("expected point route");
+        };
+        plan.shard()
+    }
+    for (same_shard, ordered) in [(true, true), (true, false), (false, true), (false, false)] {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::open(temp.path(), 4).await.unwrap();
+        let session = engine.session();
+        create_collection(&engine, &session, 1).await;
+        let first_shard = route(&engine, &session, 1).await;
+        let mut last_id = None;
+        for id in 2..64 {
+            if (route(&engine, &session, id).await == first_shard) == same_shard {
+                last_id = Some(id);
+                break;
+            }
+        }
+        let last_id = last_id.expect("same-shard and different-shard IDs exist");
+        let documents = vec![
+            document(BsonValue::Int32(1), "a"),
+            document(BsonValue::Double(1.0), "duplicate"),
+            document(BsonValue::Int32(last_id), "c"),
+        ];
+        let execution = engine
+            .execute_document(
+                &session,
+                request(
+                    2,
+                    RequestContext::new(),
+                    DocumentCommand::Insert(
+                        DocumentInsertRequest::new(
+                            namespace(),
+                            documents,
+                            DocumentWriteOptions::new().with_ordered(ordered),
+                        )
+                        .unwrap(),
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+        let DocumentResult::Insert(result) = execution.result() else {
+            panic!("expected insert result");
+        };
+        assert_eq!(
+            result.inserted_ids(),
+            if ordered {
+                vec![BsonValue::Int32(1)]
+            } else {
+                vec![BsonValue::Int32(1), BsonValue::Int32(last_id)]
+            }
+        );
+        assert_eq!(result.write_errors().len(), 1);
+        let Some(DocumentPlan::Scatter(plan)) = execution.plan() else {
+            panic!("expected batch plan");
+        };
+        assert_eq!(plan.shards().len(), if same_shard { 1 } else { 2 });
+        assert_eq!(result.write_errors()[0].index(), 1);
+        assert_eq!(
+            result.write_errors()[0].kind(),
+            EngineErrorKind::UniqueViolation
+        );
+        engine.shutdown().await.unwrap();
+        let engine = Engine::open(temp.path(), 4).await.unwrap();
+        let session = engine.session();
+        let rows = engine
+            .execute_document(
+                &session,
+                request(
+                    3,
+                    RequestContext::new(),
+                    DocumentCommand::Find(DocumentFindRequest::new(
+                        namespace(),
+                        DocumentFilter::empty(),
+                        DocumentReadOptions::new(),
+                    )),
+                ),
+            )
+            .await
+            .unwrap();
+        let DocumentResult::Cursor(rows) = rows.result() else {
+            panic!("expected cursor");
+        };
+        assert_eq!(rows.documents().len(), if ordered { 1 } else { 2 });
+        assert_eq!(
+            rows.documents()[0].get_first("label"),
+            Some(&BsonValue::from("a"))
+        );
+        // A batch may legitimately have zero successes and a first-item error.
+        let result = engine
+            .execute_document(
+                &session,
+                request(
+                    4,
+                    RequestContext::new(),
+                    DocumentCommand::Insert(
+                        DocumentInsertRequest::new(
+                            namespace(),
+                            vec![
+                                document(BsonValue::Int32(1), "d"),
+                                document(BsonValue::Int32(3), "e"),
+                            ],
+                            DocumentWriteOptions::new(),
+                        )
+                        .unwrap(),
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+        let DocumentResult::Insert(result) = result.result() else {
+            panic!("expected insert result");
+        };
+        assert!(result.inserted_ids().is_empty());
+        assert_eq!(result.write_errors()[0].index(), 0);
+        engine.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn insert_normalizes_missing_ids_and_only_direct_zero_timestamps() {
+    use briskdb::document::BsonTimestamp;
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 4).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    let zero = BsonValue::Timestamp(BsonTimestamp::new(0, 0));
+    let source = BsonDocument::from_entries([
+        ("first", zero.clone()),
+        ("second", zero.clone()),
+        (
+            "nested",
+            BsonValue::Document(BsonDocument::from_entries([("value", zero.clone())]).unwrap()),
+        ),
+        ("array", BsonValue::Array(vec![zero.clone()])),
+    ])
+    .unwrap();
+    let result = insert(
+        &engine,
+        &session,
+        2,
+        vec![
+            source.clone(),
+            BsonDocument::from_entries([("_id", BsonValue::Null), ("stamp", zero.clone())])
+                .unwrap(),
+            BsonDocument::from_entries([("_id", zero.clone()), ("stamp", zero.clone())]).unwrap(),
+        ],
+    )
+    .await;
+    let DocumentResult::Insert(result) = result.result() else {
+        panic!("expected insert result");
+    };
+    assert!(matches!(result.inserted_ids()[0], BsonValue::ObjectId(_)));
+    assert_eq!(result.inserted_ids()[1], BsonValue::Null);
+    assert_eq!(result.inserted_ids()[2], zero);
+    assert!(source.get_first("_id").is_none());
+    assert_eq!(source.get_first("first"), Some(&zero));
+    let rows = engine
+        .execute_document(
+            &session,
+            request(
+                3,
+                RequestContext::new(),
+                DocumentCommand::Find(DocumentFindRequest::new(
+                    namespace(),
+                    DocumentFilter::empty(),
+                    DocumentReadOptions::new(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    let DocumentResult::Cursor(rows) = rows.result() else {
+        panic!("expected cursor");
+    };
+    let first = &rows.documents()[0];
+    assert_eq!(first.iter().next().unwrap().0, "_id");
+    assert_ne!(first.get_first("first"), Some(&zero));
+    assert_ne!(first.get_first("first"), first.get_first("second"));
+    assert_eq!(first.get_first("nested"), source.get_first("nested"));
+    assert_eq!(first.get_first("array"), source.get_first("array"));
+    assert_ne!(rows.documents()[2].get_first("stamp"), Some(&zero));
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn batch_result_limits_fail_before_any_document_write() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 4).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    let command = DocumentCommand::Insert(
+        DocumentInsertRequest::new(
+            namespace(),
+            vec![
+                document(BsonValue::Int32(1), "a"),
+                document(BsonValue::Int32(2), "b"),
+            ],
+            DocumentWriteOptions::new(),
+        )
+        .unwrap(),
+    );
+    let error = engine
+        .execute_document(
+            &session,
+            request(
+                2,
+                RequestContext::new().with_result_limits(ResultLimits::new(1, 1_000_000).unwrap()),
+                command,
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::LimitExceeded);
+    let count = engine
+        .execute_document(
+            &session,
+            request(
+                3,
+                RequestContext::new(),
+                DocumentCommand::Count(DocumentCountRequest::new(
+                    namespace(),
+                    DocumentFilter::empty(),
+                    DocumentReadOptions::new(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(count.result(), DocumentResult::Count(0)));
     engine.shutdown().await.unwrap();
 }
 

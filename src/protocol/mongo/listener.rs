@@ -24,7 +24,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A caller-owned Mongo listener. Does not close the borrowed engine,
 /// install signal handlers, or enable any listener through default features.
-/// Supports discovery and an initial single-insert/exact-ID-find slice. Data
+/// Supports discovery, insert batches, and literal exact-ID finds. Data
 /// commands require the host's `DocumentSupport::Enabled` setting.
 pub struct MongoServer {
     address: SocketAddr,

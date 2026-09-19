@@ -57,6 +57,28 @@ fn packet(body: &BsonDocument, request_id: i32, flags: u32) -> BytesMut {
     encoded
 }
 
+fn insert_sequence(collection: &str, documents: &[BsonDocument]) -> BytesMut {
+    let body = BsonDocument::from_entries([
+        ("insert", BsonValue::from(collection)),
+        ("$db", BsonValue::from("wire")),
+    ])
+    .unwrap();
+    let mut bytes = packet(&body, 77, 0);
+    let mut sequence = BytesMut::new();
+    sequence.put_i32_le(0);
+    sequence.extend_from_slice(b"documents\0");
+    for document in documents {
+        sequence.extend_from_slice(&encode_document(document).unwrap());
+    }
+    let length = sequence.len() as i32;
+    sequence[..4].copy_from_slice(&length.to_le_bytes());
+    bytes.put_u8(1);
+    bytes.extend_from_slice(&sequence);
+    let length = bytes.len() as i32;
+    bytes[..4].copy_from_slice(&length.to_le_bytes());
+    bytes
+}
+
 async fn response(stream: &mut TcpStream) -> (Frame, BsonDocument) {
     timeout(Duration::from_secs(5), async {
         let mut length = [0; 4];
@@ -434,7 +456,7 @@ async fn rejected_data_commands_and_missing_reads_do_not_create_collections() {
     let mut stream = TcpStream::connect(server.address()).await.unwrap();
     let document = BsonDocument::from_entries([("_id", BsonValue::Int32(1))]).unwrap();
     for (field, value) in [
-        ("ordered", BsonValue::Boolean(false)),
+        ("ordered", BsonValue::Int32(0)),
         ("bypassDocumentValidation", BsonValue::Boolean(true)),
         ("txnNumber", BsonValue::Int64(1)),
         (
@@ -571,6 +593,140 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
         matches!(reply.get_first("code"), Some(BsonValue::Int32(10334))),
         "{reply:?}"
     );
+    assert!(matches!(
+        send_command(&mut stream, &command("ping"))
+            .await
+            .get_first("ok"),
+        Some(BsonValue::Double(1.0))
+    ));
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn raw_insert_generates_unique_ids_preserves_null_and_survives_reopen() {
+    use briskdb::document::{
+        DocumentCommand, DocumentFilter, DocumentFindRequest, DocumentNamespace,
+        DocumentReadOptions, DocumentResult,
+    };
+    let (root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let documents = [
+        BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+        BsonDocument::from_entries([("_id", BsonValue::Null)]).unwrap(),
+        BsonDocument::from_entries([("value", BsonValue::Int32(2))]).unwrap(),
+    ];
+    stream
+        .write_all(&insert_sequence("generated", &documents))
+        .await
+        .unwrap();
+    let (_, inserted) = response(&mut stream).await;
+    assert!(matches!(inserted.get_first("n"), Some(BsonValue::Int32(3))));
+    let execution = database
+        .execute_document(
+            &database.session(),
+            engine_request(DocumentCommand::Find(DocumentFindRequest::new(
+                DocumentNamespace::new("wire", "generated").unwrap(),
+                DocumentFilter::empty(),
+                DocumentReadOptions::new(),
+            ))),
+        )
+        .await
+        .unwrap();
+    let DocumentResult::Cursor(batch) = execution.into_parts().2 else {
+        panic!("expected documents");
+    };
+    let stored = batch.into_parts().2;
+    assert_eq!(stored.len(), 3);
+    let ids: Vec<_> = stored
+        .iter()
+        .map(|doc| doc.get_first("_id").unwrap().clone())
+        .collect();
+    assert!(matches!(ids[0], BsonValue::ObjectId(_)));
+    assert!(matches!(ids[1], BsonValue::Null));
+    assert!(matches!(ids[2], BsonValue::ObjectId(_)));
+    assert_ne!(ids[0], ids[2]);
+    assert_eq!(stored[0].iter().next().unwrap().0, "_id");
+    assert!(documents[0].get_first("_id").is_none());
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+    let database = BriskDb::builder(root.path())
+        .with_shard_count(2)
+        .with_document_support(DocumentSupport::Enabled)
+        .open()
+        .await
+        .unwrap();
+    let mut server = MongoServer::start(&database, "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    for (id, expected) in ids.into_iter().zip(stored) {
+        let reply = send_command(&mut stream, &find_command("generated", id)).await;
+        assert!(
+            matches!(first_batch(&reply), [BsonValue::Document(actual)] if actual.representation_eq(&expected))
+        );
+    }
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn batch_memory_and_generated_id_size_limits_fail_before_catalog_creation() {
+    use briskdb::document::{
+        BsonCodecOptions, DocumentCommand, DocumentListCollectionsRequest, DocumentReadOptions,
+        DocumentResult, decode_document_with_options,
+    };
+    let (_root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    // Each document fits its own budget; the sequence as a whole must not get
+    // a fresh four-MiB allocation budget for every document.
+    let amplified =
+        BsonDocument::from_entries((0..14000).map(|index| (format!("k{index}"), BsonValue::Null)))
+            .unwrap();
+    let options = BsonCodecOptions::new().with_max_decoded_bytes(4 * 1024 * 1024);
+    decode_document_with_options(&encode_document(&amplified).unwrap(), &options).unwrap();
+    stream
+        .write_all(&insert_sequence(
+            "amplified",
+            &[amplified.clone(), amplified],
+        ))
+        .await
+        .unwrap();
+    let (_, reply) = response(&mut stream).await;
+    assert!(
+        matches!(reply.get_first("code"), Some(BsonValue::Int32(10334))),
+        "{reply:?}"
+    );
+    // Exactly one byte too large after adding the generated ObjectId element.
+    let oversize =
+        BsonDocument::from_entries([("value", BsonValue::String("x".repeat(512 * 1024 - 33)))])
+            .unwrap();
+    assert_eq!(
+        encode_document(&oversize).unwrap().len() + 17,
+        512 * 1024 + 1
+    );
+    stream
+        .write_all(&insert_sequence(
+            "oversize",
+            &[BsonDocument::new(), oversize],
+        ))
+        .await
+        .unwrap();
+    let (_, reply) = response(&mut stream).await;
+    assert!(matches!(
+        reply.get_first("code"),
+        Some(BsonValue::Int32(10334))
+    ));
+    let execution = database
+        .execute_document(
+            &database.session(),
+            engine_request(DocumentCommand::ListCollections(
+                DocumentListCollectionsRequest::new("wire", DocumentReadOptions::new()).unwrap(),
+            )),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(execution.result(), DocumentResult::Collections(items) if items.is_empty()));
     assert!(matches!(
         send_command(&mut stream, &command("ping"))
             .await
