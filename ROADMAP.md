@@ -546,8 +546,9 @@ requires an earlier dependency:
       is reaccounted against cursor quotas. Wire `count` now shares engine
       filtering and global skip/limit, including PyMongo's sync/async
       `estimated_document_count()` and zero for absent collections. PyMongo's
-      aggregation-based `count_documents()` and remaining options still keep
-      this issue open. Distinct now shares one bounded BSON extractor across
+      aggregation-based `count_documents()` now also works, including filtering,
+      skip/limit, absent namespaces, async calls, and restart; remaining options
+      still keep this issue open. Distinct shares one bounded BSON extractor across
       Rust, native sync/async Python, and wire clients. Global natural-order
       reads preserve the first exact representation and charge only unique
       outputs; missing/null/array/path semantics follow 4,888 additional locked
@@ -565,8 +566,8 @@ requires an earlier dependency:
       stream; count retains a counter, and sort materializes bounded input.
       Resource/error/cancellation cleanup and cursor ownership are tested.
       Basic-suite projection consumers now use the shared transforms below.
-      Grouping is implemented below; full candidate-corpus acceptance and aggregation-based
-      PyMongo `count_documents()` remain open.
+      Grouping and PyMongo `count_documents()` are implemented below; full
+      candidate-corpus acceptance remains open.
     - [ ] [#177](https://github.com/schapman1974/briskdb/issues/177) — shared
       `$project`/`$set`/`$addFields`/`$unset` stages and `$ifNull`/`$literal`/`$size`
       expressions now run across Rust, native Python, and wire aggregation.
@@ -579,15 +580,17 @@ requires an earlier dependency:
       projection-to-group identity case now uses the shared group stage below;
       full candidate-corpus acceptance still needs collection lifecycle support.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared
-      `$group` supports null/field keys, recursive structured BSON identity, and
+      `$group` supports literal/field/computed keys, recursive structured BSON identity, and
       all eight planned accumulators across Rust, sync/async native Python, and
       PyMongo. It retains bounded states in established global input order,
       including first/last and ordered Decimal128/mixed-numeric arithmetic.
-      Another 9,509 locked-oracle pipelines pass in both execution modes;
+      The 9,509 accumulator and 5,663 key pipelines pass in both execution modes;
+      5,424 use explicit unchanged-reference expression/group composition for
+      key forms outside the frozen group grammar. All others use identical pipelines;
       arithmetic double NaN bits are unspecified and normalized only in tagged
       numeric outputs. Separate tests cover unencodable-reference integer sums,
       memory/BSON limits, cancellation, byte paging, cleanup, and restart.
-      Literal/computed group keys, partial-shard accumulator-state merging, and
+      Partial-shard accumulator-state merging and
       full candidate-corpus acceptance remain open. No disk spill or snapshot.
     - [ ] [#166](https://github.com/schapman1974/briskdb/issues/166) — targeted
       collection existence checks now share the engine across Rust, embedded

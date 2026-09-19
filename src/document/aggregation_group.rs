@@ -51,11 +51,6 @@ impl Group {
             return Err(query_error(2));
         };
         let key = spec.get_first("_id").ok_or_else(|| query_error(2))?;
-        if !matches!(key, BsonValue::Null)
-            && !matches!(key, BsonValue::String(path) if path.starts_with('$') && !path.starts_with("$$") && path.len() > 1)
-        {
-            return Err(query_error(115));
-        }
         let mut budget = Budget::new(check);
         let key = Expression::compile(key, false, &mut budget, 1)?;
         let mut accumulators = Vec::new();
@@ -419,6 +414,138 @@ mod tests {
     }
 
     #[test]
+    fn computed_keys_preserve_identity_missing_and_literal_representation() {
+        let rows = [
+            doc(&[("v", BsonValue::Int64(1))]),
+            doc(&[("v", BsonValue::Double(1.0))]),
+            doc(&[]),
+            doc(&[("v", BsonValue::Null)]),
+        ];
+        let before: Vec<_> = rows
+            .iter()
+            .map(|row| encode_document(row).unwrap())
+            .collect();
+        for (key, expected) in [
+            (BsonValue::Int32(1), vec![(BsonValue::Int32(1), 4)]),
+            (
+                BsonValue::Document(doc(&[("0", field("$v")), ("a.b", field("$missing"))])),
+                vec![
+                    (BsonValue::Document(doc(&[("0", BsonValue::Int64(1))])), 2),
+                    (BsonValue::Document(doc(&[])), 1),
+                    (BsonValue::Document(doc(&[("0", BsonValue::Null)])), 1),
+                ],
+            ),
+            (
+                BsonValue::Array(vec![field("$v"), field("$missing")]),
+                vec![
+                    (
+                        BsonValue::Array(vec![BsonValue::Int64(1), BsonValue::Null]),
+                        2,
+                    ),
+                    (BsonValue::Array(vec![BsonValue::Null, BsonValue::Null]), 2),
+                ],
+            ),
+            (
+                BsonValue::Document(doc(&[("$literal", field("$$REMOVE"))])),
+                vec![(field("$$REMOVE"), 4)],
+            ),
+        ] {
+            let runner = plan(vec![stage(key, &["$sum"], BsonValue::Int32(1))]);
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(key, count)| {
+                    encode_document(&doc(&[("_id", key), ("sum", BsonValue::Int32(count))]))
+                        .unwrap()
+                })
+                .collect();
+            let actual = runner.execute(&rows).unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|row| encode_document(row).unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let mut stream = runner.into_stream();
+            for row in &rows {
+                assert!(stream.push(row.clone()).unwrap().is_none());
+            }
+            assert_eq!(
+                stream
+                    .finish()
+                    .unwrap()
+                    .iter()
+                    .map(|row| encode_document(row).unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert_eq!(
+            rows.iter()
+                .map(|row| encode_document(row).unwrap())
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn computed_keys_validate_eagerly_and_runtime_failures_poison_the_stream() {
+        for key in [
+            field("$$REMOVE"),
+            BsonValue::Array(vec![field("$$REMOVE")]),
+            BsonValue::Document(doc(&[("nested", field("$$ROOT"))])),
+        ] {
+            let pipeline = DocumentPipeline::new(vec![
+                doc(&[("$limit", BsonValue::Int32(1))]),
+                stage(key, &[], BsonValue::Null),
+            ])
+            .unwrap();
+            assert_eq!(
+                DocumentAggregator::compile(&pipeline).unwrap_err().kind(),
+                EngineErrorKind::Unsupported
+            );
+        }
+        let group = stage(
+            BsonValue::Document(doc(&[("$size", field("$v"))])),
+            &["$sum"],
+            BsonValue::Int32(1),
+        );
+        let rows = [
+            doc(&[("v", BsonValue::Array(vec![]))]),
+            doc(&[("v", BsonValue::Null)]),
+        ];
+        let runner = plan(vec![group.clone()]);
+        assert!(runner.execute(&rows).is_err());
+        let mut stream = runner.into_stream();
+        assert!(stream.push(rows[0].clone()).unwrap().is_none());
+        assert!(stream.push(rows[1].clone()).is_err());
+        assert_eq!(
+            stream.finish().unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert_eq!(
+            plan(vec![doc(&[("$limit", BsonValue::Int32(1))]), group])
+                .execute(&rows)
+                .unwrap()[0]
+                .get_first("_id"),
+            Some(&BsonValue::Int32(0))
+        );
+        // Computed key copies consume the same working budget as accumulator
+        // expressions, before any oversized key can be retained.
+        let key = BsonValue::Array(vec![field("$v"); 80]);
+        let mut stream = plan(vec![stage(key, &[], BsonValue::Null)]).into_stream();
+        let row = doc(&[("v", BsonValue::String("x".repeat(1024 * 1024)))]);
+        assert_eq!(
+            stream.push(row).unwrap_err().kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        assert_eq!(
+            stream.finish().unwrap_err().kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+    }
+
+    #[test]
     fn group_identity_representations_field_order_missing_and_source_immutability() {
         let rows = [
             doc(&[("k", BsonValue::Int64(1))]),
@@ -690,7 +817,13 @@ mod tests {
     #[test]
     fn group_compile_push_and_finish_check_every_cancellation_and_deadline_checkpoint() {
         let pipeline = DocumentPipeline::new(vec![stage(
-            field("$k"),
+            BsonValue::Document(doc(&[
+                ("key", field("$k")),
+                (
+                    "array",
+                    BsonValue::Array(vec![field("$k"), field("$missing")]),
+                ),
+            ])),
             &[
                 "$sum",
                 "$avg",

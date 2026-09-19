@@ -349,13 +349,15 @@ still requires collection lifecycle support for the frozen harness.
 
 ### Aggregation groups and numeric accumulators
 
-`$group` supports `_id: null` or a field reference, including fields containing
-compound documents or arrays. Missing keys become null. Groups retain first
+`$group` supports literal BSON, field references, and computed keys using the
+existing `$literal`/`$ifNull`/`$size`, object, and array expressions. Missing keys
+become null; missing object members are omitted and missing array elements
+become null. Groups retain first
 encounter order and the first exact key representation using shared recursive
 BSON identity; numeric aliases compare equal while document field order matters.
-Computed/constant keys other than null remain unsupported under the frozen
-reference grammar. Accumulator expressions reuse the transformation evaluator
-without `$$REMOVE`. All shapes, output names, expressions, and error precedence
+Keys and accumulator expressions reuse the transformation evaluator without
+variables such as `$$REMOVE` or `$$ROOT`; `$literal` can retain those strings as
+data. All shapes, output names, expressions, and error precedence
 are validated even for absent collections and empty inputs.
 
 Supported accumulators are `$addToSet`, `$avg`, `$first`, `$last`, `$max`, `$min`,
@@ -400,8 +402,14 @@ before any result is delivered, even if a later limit/project would shrink it.
 Failures poison the execution and release its cursor without partial group
 results. No disk spill, indexed grouping, or snapshot is promised.
 
-Required CI adds 9,509 source-locked grouping pipelines, each tested in both
-execution modes. Comparisons retain exact BSON except arithmetic Double NaN
+Required CI covers 9,509 accumulator pipelines and 5,663 additional key pipelines,
+each tested in both execution modes. Of these, 24 and 5,400 respectively use
+explicit composition: the unchanged frozen `$set` evaluator calculates a key
+into a collision-free temporary field before its unchanged field-key `$group`.
+Rust executes the original pipeline; both forms are retained in each case. This
+checks expression/group composition, not support for the extended key grammar
+in the frozen implementation. All other cases execute identical pipelines.
+Comparisons retain exact BSON except arithmetic Double NaN
 bits in explicitly tagged numeric output fields; input/pass-through NaNs remain
 byte-for-byte comparisons. The unchanged reference produces all expectations;
 unencodable integer totals are separate Rust edge tests, not coerced oracle
@@ -409,6 +417,13 @@ outputs. Tests also cover structured identity, stage ordering, numeric quantum,
 resource limits, every cancellation/deadline checkpoint, cursor cleanup,
 cross-shard byte paging, sync/async native and wire clients, and restart. Full
 frozen command-corpus acceptance and partial-shard state merging remain open.
+
+PyMongo `count_documents()` now works through its actual `$match`, optional
+`$skip`/`$limit`, and constant-key `$group` pipeline, without adapter rewrites.
+Sync/async calls, absent namespaces, filtering, eager option errors, and restart
+are tested. It inherits aggregation's consumed-row/work bounds; unlike the
+legacy count command, explicit `limit=0` is an invalid `$limit` (15958).
+Native Python's count helper continues to use the separate engine count command.
 
 ### Aggregate commands and cursors
 

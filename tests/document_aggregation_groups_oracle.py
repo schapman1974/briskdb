@@ -7,7 +7,8 @@ from datetime import datetime
 
 from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
-from document_aggregation_oracle import emit as reference_emit, locked_sources
+from document_aggregation_oracle import locked_sources
+from document_aggregation_keys_oracle import emit_keys as reference_emit
 
 
 def emit(documents, pipeline, numeric_nan_fields=("avg", "sum")):

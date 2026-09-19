@@ -16,14 +16,17 @@ import tinymongo.table_backends as backend
 from tinymongo.errors import OperationFailure, TinyMongoNotSupportedError
 
 
-def emit(documents, pipeline, numeric_nan_fields=()):
-    envelope = BSON(BSON.encode({"documents": documents, "pipeline": pipeline})).decode()
+def emit(documents, pipeline, numeric_nan_fields=(), reference_pipeline=None):
+    envelope = {"documents": documents, "pipeline": pipeline}
+    if reference_pipeline is not None:
+        envelope["reference_pipeline"] = reference_pipeline
+    envelope = BSON(BSON.encode(envelope)).decode()
     before = BSON.encode(envelope)
     case = dict(envelope)
     if numeric_nan_fields:
         case["numeric_nan_fields"] = list(numeric_nan_fields)
     try:
-        case["result"] = aggregation.AggregationEngine().run(envelope["documents"], envelope["pipeline"])
+        case["result"] = aggregation.AggregationEngine().run(envelope["documents"], envelope.get("reference_pipeline", envelope["pipeline"]))
     except TinyMongoNotSupportedError:
         case["error"] = 115
     except OperationFailure as error:

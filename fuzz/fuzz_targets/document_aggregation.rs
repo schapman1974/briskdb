@@ -146,12 +146,25 @@ fuzz_target!(|data: &[u8]| {
                 )
                 .unwrap();
         }
-        exercise(
-            &[envelope.clone(), envelope],
-            DocumentPipeline::new(vec![
-                BsonDocument::from_entries([("$group", BsonValue::Document(group))]).unwrap(),
-            ])
-            .unwrap(),
-        );
+        for key in [
+            BsonValue::from("$v"),
+            BsonValue::Int32(1),
+            BsonValue::Document(
+                BsonDocument::from_entries([("value", BsonValue::from("$v"))]).unwrap(),
+            ),
+            BsonValue::Array(vec![BsonValue::from("$v"), BsonValue::from("$missing")]),
+        ] {
+            let mut spec = BsonDocument::from_entries([("_id", key)]).unwrap();
+            for (name, value) in group.iter().skip(1) {
+                spec.push(name, value.clone()).unwrap();
+            }
+            exercise(
+                &[envelope.clone(), envelope.clone()],
+                DocumentPipeline::new(vec![
+                    BsonDocument::from_entries([("$group", BsonValue::Document(spec))]).unwrap(),
+                ])
+                .unwrap(),
+            );
+        }
     }
 });
