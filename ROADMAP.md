@@ -499,7 +499,7 @@ requires an earlier dependency:
       engine-owned cursors. Tests cover BSON fidelity, numeric-equivalent IDs,
       cross-interface access, restart, host enablement, one-way writes, and
       response limits. Missing collections read empty without creating metadata.
-      Updates/deletes, metadata/aggregation cursors, and full collection
+      Updates/deletes, metadata cursors, and full collection
       lifecycle remain open.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
@@ -510,14 +510,14 @@ requires an earlier dependency:
       direct zero-timestamp normalization, raw server-generated IDs, restart,
       concurrent duplicates, driver batch splitting, and boundary rejection.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
-      BSON matcher now powers embedded and wire find/count. Includes dotted
+      BSON matcher now powers embedded and wire find/count/distinct/aggregate. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
       bounded regex evaluation, eager validation, and cancellation. Filtering
       precedes global pagination; exact `$eq` IDs retain point routing (#180).
       Required CI compares a generated BSON matrix with the locked oracle;
       real sync/async PyMongo and embedded Python tests cover queries/restart.
       Remaining work includes broader dialect/consumer conformance,
-      sorting/read helpers (#172), and write/index/pipeline reuse.
+      remaining read helpers (#172), and write/index reuse.
     - [ ] [#168](https://github.com/schapman1974/briskdb/issues/168) — retained find
       cursors now support global filter/skip/limit paging, empty initial batches,
       byte-bounded pages, getMore, and killCursors. Native Rust/Python cursors are
@@ -525,8 +525,10 @@ requires an earlier dependency:
       Count/retention quotas, idle expiry, cumulative wire time budgets,
       cancellation/error cleanup, and engine shutdown bound resources without
       retaining SQLite leases. Required tests exercise real sync/async drivers,
-      restart, ownership, byte limits, and exhaustion. Metadata and aggregation
-      cursor consumers remain open; no cross-batch snapshot is promised.
+      restart, ownership, byte limits, and exhaustion. Aggregate cursors now
+      share the same ownership/cleanup/quotas, retaining streaming stage counters
+      or bounded blocking-stage results. Metadata cursor consumers remain open;
+      no cross-shard or cross-batch snapshot is promised.
     - [ ] [#172](https://github.com/schapman1974/briskdb/issues/172) — basic find
       projection now shares one Rust transform across embedded and wire APIs.
       Inclusion/exclusion, nested/dotted paths, array traversal, `_id` rules,
@@ -553,13 +555,17 @@ requires an earlier dependency:
       results, and remains a scan implementation without snapshot semantics.
     - [ ] [#179](https://github.com/schapman1974/briskdb/issues/179) — shared basic
       aggregation core compiles `$match`, `$sort`, `$skip`, `$limit`, and `$count`
-      eagerly and executes immutable BSON through bounded materialized stages.
+      eagerly and executes immutable BSON through shared stages.
       Matching and stable sorting reuse the authoritative implementations;
       exact numeric stage arguments, empty counts, stage ordering, cancellation,
       and resource limits are tested. Required CI compares 5,134 whole pipelines
-      with the locked TinyMongo source. Engine/wire aggregate dispatch and
-      retained aggregate cursors remain open; this core alone does not enable
-      PyMongo `aggregate()` or aggregation-based `count_documents()`.
+      with the locked TinyMongo source in both materialized and incremental modes.
+      Native Rust, sync/async Python, and real PyMongo `aggregate()` now share
+      global source reads and retained, byte-bounded cursors. Simple prefixes
+      stream; count retains a counter, and sort materializes bounded input.
+      Resource/error/cancellation cleanup and cursor ownership are tested.
+      Projection/expression stages (#177), groups (#176), related full-contract
+      cases, and aggregation-based PyMongo `count_documents()` remain open.
     - [ ] [#166](https://github.com/schapman1974/briskdb/issues/166) — targeted
       collection existence checks now share the engine across Rust, embedded
       sync/async Python, and wire read/write namespace handling. Catalogs beyond

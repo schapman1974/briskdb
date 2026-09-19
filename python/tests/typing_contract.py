@@ -42,6 +42,8 @@ def sync_contract(path: str) -> None:
     count: int = document_session.count_documents("app", "notes")["count"]
     exists: bool = document_session.collection_exists("app", "notes")["exists"]
     distinct: List[object] = document_session.distinct("app", "notes", "body")["values"]
+    aggregated: List[dict[str, object]] = document_session.aggregate("app", "notes", [{"$count": "n"}], batch_size=1)["documents"]
+    print(aggregated)
     continued: List[dict[str, object]] = document_session.get_more("app", "notes", 1)["documents"]
     killed: bool = document_session.kill_cursor("app", "notes", 1)["killed"]
     deleted: int = document_session.delete_one("app", "notes", {"_id": 1})[
@@ -89,6 +91,8 @@ async def async_contract(path: str) -> None:
     document_count: int = (await session.count_documents("app", "typed"))["count"]
     exists: bool = (await session.collection_exists("app", "typed"))["exists"]
     distinct: List[object] = (await session.distinct("app", "typed", "_id"))["values"]
+    aggregated: List[dict[str, object]] = (await session.aggregate("app", "typed", [{"$count": "n"}], batch_size=1))["documents"]
+    print(aggregated)
     projected: List[dict[str, object]] = (await session.find("app", "typed", projection={"_id": 1}, sort={"_id": -1}))["documents"]
     continued: List[dict[str, object]] = (await session.get_more("app", "typed", 1))["documents"]
     killed: bool = (await session.kill_cursor("app", "typed", 1))["killed"]

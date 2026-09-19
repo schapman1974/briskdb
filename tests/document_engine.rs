@@ -971,7 +971,11 @@ async fn unsupported_document_semantics_fail_at_the_engine_boundary() {
                 DocumentCommand::Aggregate(
                     DocumentAggregateRequest::new(
                         namespace(),
-                        DocumentPipeline::new(Vec::<BsonDocument>::new()).unwrap(),
+                        DocumentPipeline::new(vec![
+                            BsonDocument::from_entries([("$unsupported", BsonValue::Null)])
+                                .unwrap(),
+                        ])
+                        .unwrap(),
                         DocumentReadOptions::new(),
                     )
                     .unwrap(),

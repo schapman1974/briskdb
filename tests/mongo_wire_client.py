@@ -26,7 +26,7 @@ def sync_smoke(uri):
         with ThreadPoolExecutor(max_workers=3) as pool:
             assert all(pool.map(lambda _: client.admin.command("ping")["ok"] == 1, range(12)))
         try:
-            client.example.command("aggregate", "items", pipeline=[], cursor={})
+            client.example.command("unsupportedCommand", "items")
         except OperationFailure as error:
             assert error.code == 59
         else:
@@ -428,9 +428,75 @@ def count_smoke(uri):
         try:
             collection.count_documents({})
         except OperationFailure as error:
-            assert error.code == 59
+            assert error.code == 115
         else:
             raise AssertionError("aggregation count helper is not implemented yet")
+
+
+def aggregation_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000, maxPoolSize=3) as client:
+        collection = client.wire_aggregate.items
+        documents = [{"_id": Int64(index), "group": index % 3, "value": Int64((179 - index) % 7)} for index in range(180)]
+        collection.insert_many(documents)
+        assert list(client.unwritten_aggregate.items.aggregate([])) == []
+        assert list(client.unwritten_aggregate.items.aggregate([{"$count": "n"}])) == []
+        assert list(collection.aggregate([], batchSize=7)) == documents
+        selected = [row for row in reversed(documents) if row["group"] == 1][3:33]
+        expected = sorted(selected, key=lambda row: row["value"])
+        stages = [{"$sort": {"_id": -1}}, {"$match": {"group": 1}}, {"$skip": 3}, {"$limit": 30}, {"$sort": {"value": 1}}]
+        actual = list(collection.aggregate(stages, batchSize=4, maxTimeMS=15000, allowDiskUse=False))
+        assert BSON.encode({"rows": actual}) == BSON.encode({"rows": expected})
+        assert list(collection.aggregate([{"$skip": 7}, {"$limit": 30}, {"$match": {"group": 1}}, {"$skip": 1}, {"$limit": 6}], batchSize=1)) == [row for row in documents[7:37] if row["group"] == 1][1:7]
+        assert list(collection.aggregate([{"$match": {"group": 1}}, {"$skip": Decimal128("3.0")}, {"$limit": 7.0}, {"$count": "n"}])) == [{"n": 7}]
+        assert list(collection.aggregate([{"$count": "n"}, {"$count": "again"}])) == [{"again": 1}]
+        first = client.wire_aggregate.command("aggregate", "items", pipeline=stages, cursor={"batchSize": 0})["cursor"]
+        assert first["firstBatch"] == [] and first["id"] != 0
+        identifier = first["id"]
+        result = client.wire_aggregate.command("getMore", identifier, collection="items", batchSize=2)["cursor"]
+        assert result["nextBatch"] == expected[:2]
+        client.wire_aggregate.command("killCursors", "items", cursors=[identifier])
+        try:
+            client.wire_aggregate.command("getMore", identifier, collection="items")
+        except OperationFailure as error:
+            assert error.code == 43
+        else:
+            raise AssertionError("aggregate kill must release retained results")
+        for pipeline, options, code in [
+            (None, {}, 14), ({}, {}, 14), ([1], {}, 2), ([{}], {}, 2),
+            ([{"$skip": 0, "$limit": 1}], {}, 2), ([{"$skip": True}], {}, 5107200),
+            ([{"$limit": 0}], {}, 15958), ([{"$count": Code("private")}], {}, 40156),
+            ([{"$count": "private.field"}], {}, 40160), ([{"$sort": {}}], {}, 15976),
+            ([{"$match": {"$where": "private"}}], {}, 115),
+            ([{"$group": {"_id": 1, "n": {"$sum": 1}}}], {}, 115),
+            ([], {"allowDiskUse": True}, 72), ([], {"hint": "_id_"}, 72),
+            ([], {"comment": "private"}, 72), ([], {"readConcern": {"level": "local"}}, 72),
+            ([], {"cursor": []}, 14), ([], {"cursor": {"unknown": 1}}, 72),
+            ([], {"cursor": {"batchSize": -1}}, 2),
+        ]:
+            for database in [client.wire_aggregate, client.unwritten_aggregate]:
+                arguments = {"pipeline": pipeline, "cursor": {}}
+                arguments.update(options)
+                try:
+                    database.command("aggregate", "items", **arguments)
+                except OperationFailure as error:
+                    assert error.code == code, (arguments, error.code)
+                    assert "private" not in str(error)
+                else:
+                    raise AssertionError("invalid pipeline/options must fail before absent-collection handling")
+        # Byte limits page valid output rather than eagerly building a reply
+        # larger than the wire envelope. Sorting still uses a bounded core.
+        large = client.wire_aggregate.large
+        large.insert_many([{"_id": index, "payload": "x" * 400000} for index in range(5)])
+        first = client.wire_aggregate.command("aggregate", "large", pipeline=[{"$sort": {"_id": -1}}], cursor={"batchSize": 1000})["cursor"]
+        assert len(first["firstBatch"]) == 2
+        rows = first["firstBatch"]
+        identifier = first["id"]
+        while identifier:
+            page = client.wire_aggregate.command("getMore", identifier, collection="large", batchSize=1000)["cursor"]
+            rows.extend(page["nextBatch"])
+            identifier = page["id"]
+        assert [row["_id"] for row in rows] == [4, 3, 2, 1, 0]
+        assert list(collection.find({})) == documents
 
 
 def persisted_smoke(uri):
@@ -454,6 +520,8 @@ def persisted_smoke(uri):
         values = client.wire_distinct.ordered.distinct("v")
         assert values == list(range(17)) and all(isinstance(value, Int64) for value in values)
         assert client.wire_distinct.items.distinct("nested.a") == ["first", "second"]
+        assert list(client.wire_aggregate.items.aggregate([{"$count": "n"}])) == [{"n": 180}]
+        assert [row["_id"] for row in client.wire_aggregate.items.aggregate([{"$sort": {"_id": -1}}, {"$limit": 7}], batchSize=2)] == list(reversed(range(173, 180)))
 
 
 async def async_smoke(uri):
@@ -467,10 +535,24 @@ async def async_smoke(uri):
         assert isinstance(values[0], Int64) and len(values) == 5
         assert await client.wire_distinct.items.distinct("nested.a", maxTimeMS=10000) == ["first", "second"]
         assert await client.unwritten_distinct.items.distinct("v") == []
+        aggregate = await client.wire_aggregate.items.aggregate([{"$match": {"group": 1}}, {"$sort": {"_id": -1}}, {"$skip": 2}, {"$limit": 7}], batchSize=2)
+        assert [row["_id"] for row in await aggregate.to_list()] == [172, 169, 166, 163, 160, 157, 154]
+        aggregate = await client.wire_aggregate.items.aggregate([{"$count": "n"}])
+        assert await aggregate.to_list() == [{"n": 180}]
+        aggregate = await client.wire_aggregate.items.aggregate([], batchSize=1)
+        assert (await aggregate.__anext__())["_id"] == 0
+        identifier = aggregate.cursor_id
+        await aggregate.close()
+        try:
+            await client.wire_aggregate.command("getMore", identifier, collection="items")
+        except OperationFailure as error:
+            assert error.code == 43
+        else:
+            raise AssertionError("async aggregate close must release its cursor")
         replies = await asyncio.gather(*(client.admin.command("ping") for _ in range(12)))
         assert all(reply["ok"] == 1 for reply in replies)
         try:
-            await client.example.command("aggregate", "items", pipeline=[], cursor={})
+            await client.example.command("unsupportedCommand", "items")
         except OperationFailure as error:
             assert error.code == 59
         else:
@@ -526,5 +608,6 @@ if __name__ == "__main__":
         sorting_smoke(sys.argv[1])
         count_smoke(sys.argv[1])
         distinct_smoke(sys.argv[1])
+        aggregation_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

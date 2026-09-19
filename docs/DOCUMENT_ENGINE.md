@@ -64,7 +64,8 @@ The current engine executes:
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
 | `Find` | Evaluates BSON match expressions and returns a bounded batch with a continuation ID when needed |
-| `ContinueCursor` | Resumes a session-owned find in natural or explicitly sorted order |
+| `Aggregate` | Executes the shared five-stage pipeline over global natural-order input and returns a retained cursor |
+| `ContinueCursor` | Resumes a session-owned find or aggregate cursor |
 | `KillCursor` | Releases a session-owned cursor; reports whether it existed |
 | `Count` | Evaluates the same match expressions, then applies global skip/limit |
 | `Distinct` | Uses the same filters and global encounter order, with shared BSON identity and bounded unique values |
@@ -285,7 +286,7 @@ fields retain their distinct frozen validation errors. Generic stage-shape and
 non-document match errors have no numeric code in the reference; the typed core
 represents those as BadValue (2). Other stages are explicitly unsupported here.
 
-The initial executor materializes input and stage output. It admits at most
+The borrowed `DocumentAggregator::execute` API materializes input and stage output. It admits at most
 65,536 input rows and 64 MiB of conservative working-data retention, including
 sort keys, plus a separate 64 MiB compiled-plan quota. BSON is structurally
 validated and its retained size checked before cloning. All stages share a
@@ -301,14 +302,54 @@ Required CI compares 5,134 whole-pipeline cases with the source-locked TinyMongo
 runner, including stage permutations, BSON families, repeated sorts, numeric
 boundaries, and eager errors. Unit tests cover each cancellation/deadline
 checkpoint, memory/row/work limits, immutable inputs and redacted diagnostics.
-This is currently a protocol-neutral core only: native/wire aggregate commands,
-storage reads and retained aggregate cursors are the next integration slice.
+Both materialized and incremental modes run against every oracle case.
+
+### Aggregate commands and cursors
+
+`DocumentCommand::Aggregate`, native Python `Session.aggregate`/`AsyncSession.aggregate`,
+and sync/async PyMongo `aggregate()` now share that compiled core. The engine's
+`DocumentAggregationStream` moves owned source documents through a streaming
+match/skip/limit prefix. The first count retains only a counter; the first sort
+retains bounded input. Finalization feeds blocking-stage output through the
+remaining shared executor. A prefix limit stops further source consumption.
+Streams admit at most 65,536 consumed inputs and four million checked steps
+over their entire lifetime, including finalization; bounds do not reset per
+cursor batch. A failed push poisons the stream. Simple pipelines are not fully
+buffered merely for wire delivery. The borrowed `DocumentAggregator::execute`
+API above remains an explicitly materialized alternative.
+
+Collection reads currently use controlled one-document source pages in global
+durable natural order, with a bounded shard frontier independent of caller
+output limits. All pipeline CPU work runs in admitted workers with cancellation
+and deadlines. This first integration uses scatter plans even for exact-ID
+matches; predicate/index pushdown and more efficient frontier reuse remain later
+optimizations. Repeated frontier probes can increase read work. No cross-shard
+snapshot is promised. Streaming batches can see concurrent changes; once a
+blocking stage has produced retained results, that buffered remainder is fixed.
+
+Aggregate cursors use the same 8-per-session/32-global registry, 64 MiB aggregate
+retention quota, namespace ownership, 600-second idle expiry, and error/close/
+kill/shutdown cleanup as find. Retention includes the compiled pipeline, sort
+input and buffered results, including queue allocation left after popping rows.
+Empty initial batches defer source reads. Continuations enforce unchanged query
+semantics, positive batch sizes, and retained soft byte caps. Hard result limits
+fail the current request and discard its cursor; previous delivered batches
+cannot be retracted. No SQLite lease or schema gate survives a request.
+
+Native aggregate read options accept only batch size/byte cap; skip/limit belong
+in the pipeline and find-style sort/projection options are rejected. Python
+accepts a list of stage mappings and returns the existing cursor result shape;
+`get_more`/`kill_cursor` work unchanged. Its pipeline conversion shares one BSON
+wrapper budget (16 MiB encoded/64 MiB conservative heap), rather than one allowance
+per stage. Tests exercise both driver styles, exact BSON, repeated sorts,
+cross-shard counters, source data exceeding sort retention with tiny count output,
+restart, shared cursor quotas, byte paging, and deterministic admission interruption.
 
 ## Current boundary
 
 Update expressions, replacements,
-multi-document deletion, upsert, aggregate command dispatch, metadata/aggregation
-cursors, and physical secondary-index builds remain later roadmap work.
+multi-document deletion, upsert, aggregation expressions/projections/groups,
+metadata cursors, and physical secondary-index builds remain later roadmap work.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
 category.
 

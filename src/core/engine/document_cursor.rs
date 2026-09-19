@@ -1,8 +1,9 @@
-//! Bounded, session-owned cursor positions. No SQLite handles or document
-//! result buffers are retained between requests.
+//! Bounded, session-owned cursors. No SQLite handles survive a request. Find
+//! retains positions; aggregation also accounts for pipeline state and any
+//! bounded results produced by blocking stages.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
@@ -10,8 +11,9 @@ use std::{
 use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
     document::{
-        CanonicalBsonKey, DocumentCollectionId, DocumentCursorError, DocumentCursorId,
-        DocumentMatcher, DocumentNamespace, DocumentProjector, DocumentSortKey, DocumentSorter,
+        BsonDocument, CanonicalBsonKey, DocumentAggregationStream, DocumentCollectionId,
+        DocumentCursorError, DocumentCursorId, DocumentMatcher, DocumentNamespace,
+        DocumentProjector, DocumentSortKey, DocumentSorter,
     },
     storage::ConnectionOwner,
 };
@@ -41,6 +43,38 @@ pub(super) struct CursorState {
     pub skip: u64,
     pub remaining: Option<u64>,
     pub batch_byte_limit: Option<u64>,
+    pub aggregation: Option<AggregateCursor>,
+}
+
+pub(super) struct AggregateCursor {
+    pub runner: Option<DocumentAggregationStream>,
+    pub pending: VecDeque<AggregateRow>,
+    pub bytes: usize,
+    pub source_exhausted: bool,
+}
+
+pub(super) struct AggregateRow {
+    pub document: BsonDocument,
+    pub encoded_len: usize,
+    pub retained_bytes: usize,
+}
+
+impl AggregateCursor {
+    fn retained_bytes(&self) -> usize {
+        self.bytes
+            .saturating_add(
+                self.runner
+                    .as_ref()
+                    .map_or(0, |runner| runner.retained_bytes()),
+            )
+            // Pop-front does not shrink VecDeque's backing allocation.
+            .saturating_add(
+                self.pending
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<AggregateRow>()),
+            )
+            .saturating_add(512)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,6 +86,11 @@ pub(super) struct SortPosition {
 impl CursorState {
     fn retained_bytes(&self) -> usize {
         4096usize
+            .saturating_add(
+                self.aggregation
+                    .as_ref()
+                    .map_or(0, |state| state.retained_bytes()),
+            )
             .saturating_add(
                 self.sorter
                     .as_ref()
@@ -328,6 +367,7 @@ mod tests {
             namespace: DocumentNamespace::new("app", "items").unwrap(),
             collection_id: DocumentCollectionId::from_validated(1),
             source: CursorSource::Scatter(None),
+            aggregation: None,
             projection: None,
             sorter: None,
             sort_after: None,
@@ -392,6 +432,37 @@ mod tests {
         assert_eq!(registry.0.lock().unwrap().entries.len(), 6);
         registry.close();
         assert!(registry.0.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn aggregate_retention_includes_backing_capacity_and_growth_releases_failed_leases() {
+        use crate::document::{DocumentAggregator, DocumentPipeline};
+        let registry = Arc::new(CursorRegistry::default());
+        let owner = ConnectionOwner::new(1);
+        let mut cursor = state();
+        cursor.aggregation = Some(AggregateCursor {
+            runner: Some(
+                DocumentAggregator::compile(&DocumentPipeline::new(Vec::new()).unwrap())
+                    .unwrap()
+                    .into_stream(),
+            ),
+            pending: VecDeque::with_capacity(128),
+            bytes: 0,
+            source_exhausted: false,
+        });
+        assert!(cursor.retained_bytes() >= 4096 + 128 * std::mem::size_of::<AggregateRow>());
+        let namespace = cursor.namespace.clone();
+        let id = registry.insert(owner, cursor).unwrap();
+        let mut lease = registry.checkout(owner, &namespace, id).unwrap();
+        let mut cursor = lease.state.take().unwrap();
+        cursor.aggregation.as_mut().unwrap().bytes = MAX_RETAINED_BYTES;
+        assert_eq!(
+            lease.complete(Some(cursor)).unwrap_err().kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        assert!(registry.checkout(owner, &namespace, id).is_err());
+        assert!(registry.0.lock().unwrap().entries.is_empty());
+        assert!(registry.insert(owner, state()).is_ok());
     }
 
     #[test]

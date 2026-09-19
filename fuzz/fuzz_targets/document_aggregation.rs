@@ -13,14 +13,33 @@ fn exercise(source: &[BsonDocument], pipeline: DocumentPipeline) {
             .collect();
         let first = runner.execute(source);
         let second = runner.execute_with_check(source, &mut || Ok(()));
+        let streamed = (|| -> briskdb::core::EngineResult<Vec<BsonDocument>> {
+            let mut stream = runner.into_stream();
+            let mut result = Vec::new();
+            for document in source.iter().cloned() {
+                if stream.is_input_exhausted() {
+                    break;
+                }
+                if let Some(document) = stream.push(document)? {
+                    result.push(document);
+                }
+            }
+            result.extend(stream.finish()?);
+            Ok(result)
+        })();
         match (first, second) {
             (Ok(left), Ok(right)) => {
-                let encode = |rows: Vec<BsonDocument>| {
+                let encode = |rows: &[BsonDocument]| {
                     rows.iter()
                         .map(|row| encode_document(row).unwrap())
                         .collect::<Vec<_>>()
                 };
-                assert_eq!(encode(left), encode(right));
+                assert_eq!(encode(&left), encode(&right));
+                // Streaming and materialization can hit different resource
+                // bounds, but successful outputs must have identical BSON.
+                if let Ok(streamed) = streamed {
+                    assert_eq!(encode(&left), encode(&streamed));
+                }
             }
             (Err(left), Err(right)) => assert_eq!(left.kind(), right.kind()),
             _ => panic!("execution must be deterministic"),

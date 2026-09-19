@@ -49,26 +49,44 @@ fn aggregation_matches_the_locked_tinymongo_oracle() {
         let before = encode_document(&case).unwrap();
         let actual =
             DocumentAggregator::compile(&pipeline).and_then(|runner| runner.execute(&source));
-        if let Some(BsonValue::Int32(expected)) = case.get_first("error") {
-            let error = actual.expect_err(&format!("case {count}: {case:?}"));
-            let code = error
-                .source()
-                .and_then(|source| source.downcast_ref::<DocumentQueryError>())
-                .map(|error| error.mongo_code());
-            assert_eq!(code, Some(*expected), "case {count}: {case:?}: {error:?}");
-        } else {
-            let actual = actual.unwrap_or_else(|error| panic!("case {count}: {case:?}: {error:?}"));
-            let encode = |value| {
-                encode_document(&BsonDocument::from_entries([("result", value)]).unwrap()).unwrap()
-            };
-            // Compare exact BSON, including field order and numeric variants.
-            assert_eq!(
-                encode(BsonValue::Array(
-                    actual.into_iter().map(BsonValue::Document).collect()
-                )),
-                encode(case.get_first("result").unwrap().clone()),
-                "case {count}: {case:?}"
-            );
+        let streamed = DocumentAggregator::compile(&pipeline).and_then(|runner| {
+            let mut stream = runner.into_stream();
+            let mut result = Vec::new();
+            for document in source.iter().cloned() {
+                if stream.is_input_exhausted() {
+                    break;
+                }
+                if let Some(document) = stream.push(document)? {
+                    result.push(document);
+                }
+            }
+            result.extend(stream.finish()?);
+            Ok(result)
+        });
+        for actual in [actual, streamed] {
+            if let Some(BsonValue::Int32(expected)) = case.get_first("error") {
+                let error = actual.expect_err(&format!("case {count}: {case:?}"));
+                let code = error
+                    .source()
+                    .and_then(|source| source.downcast_ref::<DocumentQueryError>())
+                    .map(|error| error.mongo_code());
+                assert_eq!(code, Some(*expected), "case {count}: {case:?}: {error:?}");
+            } else {
+                let actual =
+                    actual.unwrap_or_else(|error| panic!("case {count}: {case:?}: {error:?}"));
+                let encode = |value| {
+                    encode_document(&BsonDocument::from_entries([("result", value)]).unwrap())
+                        .unwrap()
+                };
+                // Compare exact BSON, including field order and numeric variants.
+                assert_eq!(
+                    encode(BsonValue::Array(
+                        actual.into_iter().map(BsonValue::Document).collect()
+                    )),
+                    encode(case.get_first("result").unwrap().clone()),
+                    "case {count}: {case:?}"
+                );
+            }
         }
         assert_eq!(encode_document(&case).unwrap(), before);
         assert_eq!(source, documents("documents"));

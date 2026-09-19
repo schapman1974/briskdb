@@ -21,7 +21,7 @@ mod result;
 mod sorting;
 mod value;
 
-pub use aggregation::DocumentAggregator;
+pub use aggregation::{DocumentAggregationStream, DocumentAggregator};
 pub(crate) use catalog::validate_namespace;
 pub use catalog::{
     DOCUMENT_CATALOG_VERSION, DOCUMENT_INDEX_FORMAT_VERSION, DOCUMENT_SCHEMA_VERSION,

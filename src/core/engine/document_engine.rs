@@ -13,10 +13,13 @@ use std::{
 
 use tokio::task::JoinHandle;
 
+mod aggregation;
 mod distinct;
 mod sorting;
 
-use super::document_cursor::{CursorSource as PreparedFilterRoute, CursorState};
+use super::document_cursor::{
+    AggregateCursor, AggregateRow, CursorSource as PreparedFilterRoute, CursorState,
+};
 use super::{Engine, Operation, flatten_join, pending_cancellation_reason, retire_if_broken};
 use crate::{
     core::{
@@ -531,6 +534,7 @@ impl Engine {
                     namespace: namespace.clone(),
                     collection_id,
                     source: route,
+                    aggregation: None,
                     projection,
                     sorter,
                     sort_after: None,
@@ -834,8 +838,19 @@ impl Engine {
                 )
                 .await
             }
+            DocumentCommand::Aggregate(request) => {
+                self.run_document_aggregate(
+                    owner,
+                    session,
+                    request_id,
+                    request,
+                    cancellation,
+                    deadline,
+                    result_limits,
+                )
+                .await
+            }
             DocumentCommand::DropCollection(_)
-            | DocumentCommand::Aggregate(_)
             | DocumentCommand::Update(_)
             | DocumentCommand::Replace(_)
             | DocumentCommand::DropIndex(_) => Err(unsupported(
@@ -1089,6 +1104,25 @@ impl Engine {
 
     #[allow(clippy::too_many_arguments)]
     async fn read_document_page(
+        &self,
+        owner: ConnectionOwner,
+        state: &mut CursorState,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        options: &DocumentReadOptions,
+        limits: ResultLimits,
+    ) -> EngineResult<(Vec<BsonDocument>, bool)> {
+        if state.aggregation.is_some() {
+            self.read_aggregate_page(owner, state, cancellation, deadline, options, limits)
+                .await
+        } else {
+            self.read_document_source_page(owner, state, cancellation, deadline, options, limits)
+                .await
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_document_source_page(
         &self,
         owner: ConnectionOwner,
         state: &mut CursorState,
@@ -2412,9 +2446,9 @@ mod tests {
             .await
             .unwrap();
 
-        for mode in 0..6 {
+        for mode in 0..12 {
             let mut options = DocumentReadOptions::new().with_batch_size(0).unwrap();
-            if mode >= 3 {
+            if (3..6).contains(&mode) {
                 options = options.with_sort(
                     crate::document::DocumentSort::new(
                         BsonDocument::from_entries([("v", BsonValue::Int32(1))]).unwrap(),
@@ -2422,18 +2456,39 @@ mod tests {
                     .unwrap(),
                 );
             }
+            let command = if mode >= 6 {
+                let stages = if mode >= 9 {
+                    vec![
+                        BsonDocument::from_entries([(
+                            "$sort",
+                            BsonValue::Document(
+                                BsonDocument::from_entries([("v", BsonValue::Int32(1))]).unwrap(),
+                            ),
+                        )])
+                        .unwrap(),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                DocumentCommand::Aggregate(
+                    crate::document::DocumentAggregateRequest::new(
+                        namespace.clone(),
+                        crate::document::DocumentPipeline::new(stages).unwrap(),
+                        options,
+                    )
+                    .unwrap(),
+                )
+            } else {
+                DocumentCommand::Find(DocumentFindRequest::new(
+                    namespace.clone(),
+                    DocumentFilter::empty(),
+                    options,
+                ))
+            };
             let opened = engine
                 .execute_document(
                     &session,
-                    DocumentRequest::new(
-                        identity,
-                        RequestContext::new(),
-                        DocumentCommand::Find(DocumentFindRequest::new(
-                            namespace.clone(),
-                            DocumentFilter::empty(),
-                            options,
-                        )),
-                    ),
+                    DocumentRequest::new(identity, RequestContext::new(), command),
                 )
                 .await
                 .unwrap();

@@ -15,14 +15,15 @@ use crate::{
     BriskDb, CancellationToken, DocumentSupport,
     core::{EngineError, EngineErrorKind, RequestContext, ResultLimits, Session},
     document::{
-        BsonCodecOptions, BsonDocument, BsonValue, DocumentCollectionExistsRequest,
-        DocumentCollectionOptions, DocumentCommand, DocumentContinueCursorRequest,
-        DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCursorError,
-        DocumentCursorId, DocumentDistinctRequest, DocumentFilter, DocumentFindRequest,
-        DocumentInsertRequest, DocumentKillCursorRequest, DocumentMatcher, DocumentNamespace,
-        DocumentProjection, DocumentProjector, DocumentQueryError, DocumentReadOptions,
-        DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort, DocumentSorter,
-        DocumentWriteOptions, decode_document_batch_with_options, encode_document_with_options,
+        BsonCodecOptions, BsonDocument, BsonValue, DocumentAggregateRequest, DocumentAggregator,
+        DocumentCollectionExistsRequest, DocumentCollectionOptions, DocumentCommand,
+        DocumentContinueCursorRequest, DocumentCountRequest, DocumentCreateCollectionRequest,
+        DocumentCursorError, DocumentCursorId, DocumentDistinctRequest, DocumentFilter,
+        DocumentFindRequest, DocumentInsertRequest, DocumentKillCursorRequest, DocumentMatcher,
+        DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentProjector,
+        DocumentQueryError, DocumentReadOptions, DocumentRequest, DocumentRequestId,
+        DocumentResult, DocumentSort, DocumentSorter, DocumentWriteOptions,
+        decode_document_batch_with_options, encode_document_with_options,
     },
 };
 
@@ -153,6 +154,7 @@ pub(super) enum Command {
     Count(DocumentCountRequest),
     Distinct(DocumentDistinctRequest),
     Find(DocumentFindRequest, bool, Option<Duration>),
+    Aggregate(DocumentAggregateRequest, Option<Duration>),
     GetMore(DocumentContinueCursorRequest),
     KillCursors(DocumentNamespace, Vec<DocumentCursorId>),
 }
@@ -167,7 +169,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
     let (name, value) = request.body.iter().next()?;
     if !matches!(
         name,
-        "insert" | "find" | "count" | "distinct" | "getMore" | "killCursors"
+        "insert" | "find" | "aggregate" | "count" | "distinct" | "getMore" | "killCursors"
     ) {
         return None;
     }
@@ -203,7 +205,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                             return Err(CommandError::options());
                         }
                         timeout = timeout.min(Duration::from_millis(millis));
-                        if name == "find" {
+                        if matches!(name, "find" | "aggregate") {
                             cursor_budget = Some(Duration::from_millis(millis));
                         }
                     }
@@ -216,6 +218,27 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 }
                 "writeConcern" if name == "insert" => valid_write_concern(value),
                 "filter" if name == "find" => matches!(value, BsonValue::Document(_)),
+                "pipeline" if name == "aggregate" => {
+                    if !matches!(value, BsonValue::Array(_)) {
+                        return Err(CommandError::new(
+                            14,
+                            "TypeMismatch",
+                            "aggregate pipeline must be an array",
+                        ));
+                    }
+                    true
+                }
+                "cursor" if name == "aggregate" => {
+                    if !matches!(value, BsonValue::Document(_)) {
+                        return Err(CommandError::new(
+                            14,
+                            "TypeMismatch",
+                            "aggregate cursor must be a document",
+                        ));
+                    }
+                    true
+                }
+                "allowDiskUse" if name == "aggregate" => matches!(value, BsonValue::Boolean(false)),
                 "query" if name == "count" => matches!(value, BsonValue::Document(_)),
                 "key" if name == "distinct" => {
                     if !matches!(value, BsonValue::String(_)) {
@@ -352,6 +375,51 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 single_batch,
                 cursor_budget,
             )
+        } else if name == "aggregate" {
+            if !request.sequences.is_empty() {
+                return Err(CommandError::options());
+            }
+            let Some(BsonValue::Array(stages)) = request.body.get_first("pipeline") else {
+                return Err(CommandError::invalid());
+            };
+            let pipeline = DocumentPipeline::new(
+                stages
+                    .iter()
+                    .map(|stage| match stage {
+                        BsonValue::Document(stage) => Ok(stage.clone()),
+                        _ => Err(CommandError::invalid()),
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )?;
+            let Some(BsonValue::Document(cursor)) = request.body.get_first("cursor") else {
+                return Err(CommandError::invalid());
+            };
+            let mut options = DocumentReadOptions::new();
+            for (field, value) in cursor.iter() {
+                if field != "batchSize" {
+                    return Err(CommandError::options());
+                }
+                let size = unsigned(value)?;
+                if size > 1000 {
+                    return Err(CommandError::unsupported());
+                }
+                options = options.with_batch_size(size)?;
+            }
+            DocumentAggregator::compile_with_check(&pipeline, &mut || {
+                if started.elapsed() >= timeout {
+                    Err(EngineError::deadline_exceeded(
+                        "Mongo aggregate parsing deadline exceeded",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })?;
+            options =
+                options.with_batch_byte_limit((wire::MAX_BOOTSTRAP_MESSAGE_BYTES - 8192) as u64)?;
+            Command::Aggregate(
+                DocumentAggregateRequest::new(namespace, pipeline, options)?,
+                cursor_budget,
+            )
         } else if name == "distinct" {
             if !request.sequences.is_empty() {
                 return Err(CommandError::options());
@@ -460,7 +528,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 "command deadline exceeded",
             ));
         }
-        if let Command::Find(_, _, budget) = &mut command {
+        if let Command::Find(_, _, budget) | Command::Aggregate(_, budget) = &mut command {
             *budget = budget.map(|budget| budget.saturating_sub(elapsed));
         }
         Ok(Prepared {
@@ -795,28 +863,40 @@ impl Executor {
                     )),
                 }
             }
-            Command::Find(find, single_batch, budget) => {
+            command @ (Command::Find(..) | Command::Aggregate(..)) => {
                 let started = Instant::now();
-                let namespace = find.namespace().clone();
-                if !self
-                    .exists(session, identity, &context, find.namespace())
-                    .await?
-                {
+                let (namespace, command, single_batch, empty_single_batch, budget) = match command {
+                    Command::Find(find, single_batch, budget) => {
+                        let namespace = find.namespace().clone();
+                        let empty = single_batch && find.read_options().batch_size() == 0;
+                        (
+                            namespace,
+                            DocumentCommand::Find(find),
+                            single_batch,
+                            empty,
+                            budget,
+                        )
+                    }
+                    Command::Aggregate(aggregate, budget) => (
+                        aggregate.namespace().clone(),
+                        DocumentCommand::Aggregate(aggregate),
+                        false,
+                        false,
+                        budget,
+                    ),
+                    _ => unreachable!("cursor command"),
+                };
+                if !self.exists(session, identity, &context, &namespace).await? {
                     return Ok(cursor_reply(namespace.to_string(), None, Vec::new(), false));
                 }
-                if single_batch && find.read_options().batch_size() == 0 {
+                if empty_single_batch {
                     return Ok(cursor_reply(namespace.to_string(), None, Vec::new(), false));
                 }
                 // Mongo drivers may use a different pooled socket for getMore.
                 // Retain this cursor's engine ownership separately from TCP.
                 let cursor_session = Arc::new(self.session());
                 match self
-                    .call(
-                        &cursor_session,
-                        identity,
-                        &context,
-                        DocumentCommand::Find(find),
-                    )
+                    .call(&cursor_session, identity, &context, command)
                     .await?
                 {
                     DocumentResult::Cursor(batch) => {
