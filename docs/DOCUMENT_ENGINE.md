@@ -116,15 +116,39 @@ projection state counts against the existing cursor retention quota.
 Required CI compares 4,865 generated BSON projection cases with the locked
 oracle, separately from the full frozen command corpus.
 
-### Shared sorting keys (not yet connected to find)
+### Global sorting and retained pages
 
 `DocumentSorter` compiles an ordinary nonempty BSON sort specification with up
 to 32 fields and numeric directions exactly `1` or `-1`. `key` returns an owned
 `DocumentSortKey` that compares using BSON semantics; callers must add a stable
 natural-order tie-breaker. Neither compilation nor key generation mutates the
 input, and debug/error messages do not expose document values. Metadata and
-expression sort specifications are explicitly rejected. Engine `find` and the
-wire adapter still reject sort options until the global paging integration.
+expression sort specifications are explicitly rejected. Engine `find` accepts
+`DocumentReadOptions::with_sort`; wire clients can use ordinary PyMongo
+`find(...).sort(...)` and `find_one(..., sort=...)`. An empty find sort document
+leaves natural order unchanged.
+
+Sorting uses original matched values before global skip/limit and projection.
+Equal BSON keys use durable natural order as the tie-breaker across shards and
+pages. Exact-ID queries retain point routing while still validating their sort
+keys. Cursors retain the compiled sort and last consumed key/position, and
+reject attempts to change the sort on continuation. Growing keys are charged
+again against the shared cursor retention quota; an over-quota continuation
+fails and releases its cursor.
+
+Until sorted indexes are available, each bounded window rescans matching
+documents on all shards. A window retains at most 1024 keys and a conservative
+64-MiB heap charge (plus the current bounded input/key while considering it),
+then fetches only selected documents. Large skips can span several windows;
+memory-bound or window-bound pages may be shorter than the requested batch.
+Result byte limits apply after projection. Cancellation/deadlines cover scans,
+key derivation, heap extraction, and fetches in admitted workers. No result
+documents or SQLite leases are retained between requests. Selected rows are
+rechecked after fetch, so deletion, a changed filter match, or a changed sort
+key cannot return an unrelated/nonmatching row at the old position. Concurrent
+writes do not have cross-batch snapshot semantics; moved sort keys can be missed
+or encountered again at a later position. This is bounded in-memory sorting,
+not indexed sorting or external spill-to-disk execution.
 
 The shared implementation handles missing/null ties, the empty-array position
 between MinKey and null, direction-sensitive array member selection, dotted
@@ -143,8 +167,9 @@ specifications and owned keys expose conservative retention charges.
 
 Required CI compares 4,654 generated sorting cases with source-locked TinyMongo,
 including specification validation, all supported BSON families, stable ties,
-compound arrays, and error precedence. This is a shared-core checkpoint, not a
-claim that sorted wire reads or the full frozen command corpus pass.
+compound arrays, and error precedence. Native and real sync/async driver tests
+also cover global paging, stable ties, projection, byte bounds, and restart.
+This does not claim that the full frozen command corpus passes.
 
 ### Matching and writes
 

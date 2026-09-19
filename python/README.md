@@ -70,7 +70,10 @@ under concurrent writes. Request result limits still fail the whole command if
 exceeded. Pass `projection={"body": 1, "_id": 0}` or `projection=["body"]` to
 select returned fields; nested/array paths and exclusion are supported without
 mutating stored documents. The projection persists across cursor batches.
-Secondary indexes remain `pending_build`; sort, updates,
+Pass `sort={"priority": -1, "_id": 1}` for global BSON sorting before skip/limit
+and projection; the sort persists across cursor batches. Stable ties use natural
+order. Sorted pages use bounded key windows and rescan until sorted indexes
+exist; large skips may need repeated scans. Secondary indexes remain `pending_build`; updates,
 aggregation, and bulk-write Python helpers remain future work.
 
 Pass `shards` when creating a data directory. Later calls may omit it and use
