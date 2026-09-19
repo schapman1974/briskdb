@@ -96,7 +96,11 @@ Wire byte limits apply to returned documents after projection. Required CI adds
 4,865 projection comparisons against the source-locked oracle and real-driver
 checks for nested arrays, continuation, unchanged storage, and restart.
 
-Sorting, updates, deletes, and metadata/aggregation cursors
+The shared Rust `DocumentSorter` now derives bounded BSON ordering keys, with
+4,654 source-locked differential cases in required CI. Global sorted paging is
+the next integration slice; find sort options still fail explicitly.
+
+Sorted reads, updates, deletes, and metadata/aggregation cursors
 are not implemented by this checkpoint.
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required

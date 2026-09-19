@@ -535,8 +535,11 @@ requires an earlier dependency:
       cancellation, resource bounds, and cursor retention accounting are tested.
       Required CI compares 4,865 cases against the locked projection oracle;
       real sync/async drivers and Python APIs cover paging and unchanged storage.
-      Global sorting, distinct, broader wire count helpers, and remaining options
-      still keep this issue open.
+      Shared BSON sort keys now cover stable semantic ties, dotted/numeric
+      paths, correlated compound arrays, and parallel-array errors, with 4,654
+      additional locked-oracle cases and bounded/cancellable work. Connecting
+      sorting to global paged reads, distinct, broader wire count helpers, and
+      remaining options still keep this issue open.
 11. [ ] **Implement online resharding and rebalance.** Add durable bucket
     movement, generation-aware retries, verification, and a supported offline
     reshard path before online movement.
