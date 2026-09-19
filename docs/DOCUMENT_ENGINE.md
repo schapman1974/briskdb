@@ -67,6 +67,7 @@ The current engine executes:
 | `ContinueCursor` | Resumes a session-owned find in natural or explicitly sorted order |
 | `KillCursor` | Releases a session-owned cursor; reports whether it existed |
 | `Count` | Evaluates the same match expressions, then applies global skip/limit |
+| `Distinct` | Uses the same filters and global encounter order, with shared BSON identity and bounded unique values |
 | `Delete` | Deletes one document selected by exact `_id` |
 
 `CollectionExists` uses an admitted, controlled manifest lookup and scalar result
@@ -234,10 +235,41 @@ The engine grants its pooled connection only the narrow read/write operations
 needed for one admitted document storage primitive, then restores the ordinary
 authorizer before that connection can be reused.
 
+### Distinct values
+
+`DocumentDistinct` is the shared incremental extractor/deduplicator used by
+`DocumentCommand::Distinct`, native Python `Session.distinct`, and the wire
+`distinct` command. Required CI compares 4,888 cases with the source-locked
+TinyMongo implementation. Missing paths contribute nothing; null is a value.
+A final array contributes its immediate members, including nested arrays as
+values. Dotted components traverse mappings only, not intermediate arrays or
+numeric array positions. Empty/dollar/numeric components are literal mapping
+keys. A NUL-containing key cannot match valid stored BSON and yields no values.
+These are frozen TinyMongo semantics, not a claim of all MongoDB distinct rules.
+
+Deduplication uses the shared `BsonValue` identity: boolean and numeric values
+are different families, numeric aliases compare equal, and embedded document
+field order matters. The first encountered exact BSON representation is kept.
+The engine reads in global durable natural order and filters original documents;
+exact-ID filters retain point routing. Internal one-document pages reuse the
+bounded merge without allocating a retained cursor, even if a session already
+has its maximum public cursors. There is no cross-shard snapshot guarantee or
+indexed distinct optimization; filtering/frontier probes can be repeated between
+internal pages. Request deadlines bound that work.
+
+Collector bounds are 65,536 unique values, 8 MiB conservative heap charge per
+value, 64 MiB retained state, 1 MiB/100 components per field, and one million
+checked extraction steps per source document. Request row/byte limits are charged
+for each new output value before retaining it, not for unrelated source payloads.
+Exceeded limits or cancellation fail the whole command, never return a partial
+success, and leave the session reusable. The public collector is unusable after
+any failed push. Native distinct rejects projection/sort/pagination options;
+wire hints, collation, read concern, and comments are not implemented yet.
+
 ## Current boundary
 
 Update expressions, replacements,
-multi-document deletion, upsert, distinct, aggregation, metadata/aggregation
+multi-document deletion, upsert, aggregation, metadata/aggregation
 cursors, and physical secondary-index builds remain later roadmap work.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
 category.

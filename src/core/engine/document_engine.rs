@@ -13,6 +13,7 @@ use std::{
 
 use tokio::task::JoinHandle;
 
+mod distinct;
 mod sorting;
 
 use super::document_cursor::{CursorSource as PreparedFilterRoute, CursorState};
@@ -822,9 +823,19 @@ impl Engine {
                     DocumentResult::Delete(DocumentDeleteResult::new(u64::from(deleted))),
                 ))
             }
+            DocumentCommand::Distinct(request) => {
+                self.run_document_distinct(
+                    owner,
+                    request_id,
+                    request,
+                    cancellation,
+                    deadline,
+                    result_limits,
+                )
+                .await
+            }
             DocumentCommand::DropCollection(_)
             | DocumentCommand::Aggregate(_)
-            | DocumentCommand::Distinct(_)
             | DocumentCommand::Update(_)
             | DocumentCommand::Replace(_)
             | DocumentCommand::DropIndex(_) => Err(unsupported(
@@ -2255,6 +2266,124 @@ mod tests {
         document::{DocumentCollectionOptions, DocumentCreateCollectionRequest, DocumentRequestId},
         storage::SchemaGateState,
     };
+
+    #[tokio::test]
+    async fn distinct_releases_admission_on_cancel_deadline_and_task_abort() {
+        use crate::document::DocumentDistinctRequest;
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::open_with_options(root.path(), 2, EngineOptions::new(1, 1).unwrap())
+            .await
+            .unwrap();
+        let session = Arc::new(engine.session());
+        let namespace = DocumentNamespace::new("app", "distinct_cancel").unwrap();
+        let identity = DocumentRequestId::new([8; 16]).unwrap();
+        engine
+            .execute_document(
+                &session,
+                DocumentRequest::new(
+                    identity,
+                    RequestContext::new(),
+                    DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                        namespace.clone(),
+                        DocumentCollectionOptions::empty(),
+                        DocumentWriteOptions::new(),
+                    )),
+                ),
+            )
+            .await
+            .unwrap();
+        for mode in 0..3 {
+            let permit = engine
+                .inner
+                .connections
+                .acquire_for_owner(0, ConnectionOwner::new(engine.session().id().get()))
+                .await
+                .unwrap();
+            let token = CancellationToken::new();
+            let mut context = RequestContext::new().with_cancellation_token(token.clone());
+            if mode == 1 {
+                context = context.with_timeout(Duration::from_secs(2)).unwrap();
+            }
+            let request = DocumentRequest::new(
+                identity,
+                context,
+                DocumentCommand::Distinct(
+                    DocumentDistinctRequest::new(
+                        namespace.clone(),
+                        "v",
+                        DocumentFilter::empty(),
+                        DocumentReadOptions::new(),
+                    )
+                    .unwrap(),
+                ),
+            );
+            let task_engine = engine.clone();
+            let task_session = Arc::clone(&session);
+            let task =
+                tokio::spawn(
+                    async move { task_engine.execute_document(&task_session, request).await },
+                );
+            timeout(Duration::from_secs(1), async {
+                while engine.inner.connections.snapshot().unwrap().shards[0].queued != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("distinct must reach pool admission");
+            match mode {
+                0 => {
+                    token.cancel();
+                }
+                2 => task.abort(),
+                _ => (),
+            }
+            let result = timeout(Duration::from_secs(3), task).await.unwrap();
+            if mode == 2 {
+                assert!(result.unwrap_err().is_cancelled());
+            } else {
+                assert_eq!(
+                    result.unwrap().unwrap_err().kind(),
+                    if mode == 0 {
+                        EngineErrorKind::Cancelled
+                    } else {
+                        EngineErrorKind::DeadlineExceeded
+                    }
+                );
+            }
+            let session_guard = timeout(Duration::from_secs(2), session.inner.lock())
+                .await
+                .unwrap();
+            assert_eq!(
+                engine.inner.connections.snapshot().unwrap().shards[0].queued,
+                0
+            );
+            drop(session_guard);
+            drop(permit);
+            let result = engine
+                .execute_document(
+                    &session,
+                    DocumentRequest::new(
+                        identity,
+                        RequestContext::new(),
+                        DocumentCommand::Distinct(
+                            DocumentDistinctRequest::new(
+                                namespace.clone(),
+                                "v",
+                                DocumentFilter::empty(),
+                                DocumentReadOptions::new(),
+                            )
+                            .unwrap(),
+                        ),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(result.result(), DocumentResult::Distinct(values) if values.is_empty())
+            );
+        }
+        engine.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn cursor_continuations_release_state_on_cancel_deadline_and_task_abort() {

@@ -93,7 +93,7 @@ jobs:
         run: >-
           cargo +1.85.0 test --locked --no-default-features --features documents
           --test document_matcher_oracle --test document_projection_oracle
-          --test document_sorting_oracle -- --ignored --nocapture
+          --test document_sorting_oracle --test document_distinct_oracle -- --ignored --nocapture
 
       - name: Generate Mongo parity report
         run: |

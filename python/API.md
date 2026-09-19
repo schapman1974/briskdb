@@ -58,6 +58,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `get_more(database, collection, cursor_id, *, batch_size=101, ...)`
 - `kill_cursor(database, collection, cursor_id, ...)`
 - `count_documents(database, collection, filter=None, *, skip=0, limit=None, ...)`
+- `distinct(database, collection, field, filter=None, ...)`
 - `delete_one(database, collection, filter, ...)`
 
 Every method also accepts `request_id`, `timeout_ms`, `cancellation`,
@@ -82,6 +83,7 @@ plan. Payload keys are:
 | `cursor` | `namespace`, `cursor_id`, `exhausted`, `documents` |
 | `cursor_killed` | `killed` boolean |
 | `count` | `count` |
+| `distinct` | ordered `values` list, preserving first BSON representations |
 | `delete` | `acknowledged`, `deleted_count` |
 
 `collection_exists` checks one exact namespace without enumerating the catalog,
@@ -128,6 +130,14 @@ windows currently rescan matching documents; large skips may require several
 scans and an internal window/memory boundary may return a short batch. Metadata
 and expression sorts are unsupported. Python pair-list sort shorthand is not
 part of the embedded API; ordinary PyMongo chaining works through the wire API.
+
+`distinct` uses the shared BSON matcher and identity in global encounter order.
+Missing values are omitted, null is retained, and only a final array is flattened
+one level. Intermediate arrays are not traversed by dotted paths. Empty and
+numeric components are literal mapping keys; BSON Code is not a string key.
+There is no pagination option or retained cursor. Request budgets apply to unique
+output values rather than unrelated input payloads; exceeding a bound fails the
+whole command. See the [distinct contract and limits](../docs/DOCUMENT_ENGINE.md#distinct-values).
 
 Delete still requires an exact `_id`. Updates, replacements,
 aggregation and bulk-write helpers remain unsupported. There is no Python collection

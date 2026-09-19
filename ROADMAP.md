@@ -544,8 +544,13 @@ requires an earlier dependency:
       is reaccounted against cursor quotas. Wire `count` now shares engine
       filtering and global skip/limit, including PyMongo's sync/async
       `estimated_document_count()` and zero for absent collections. PyMongo's
-      aggregation-based `count_documents()`, distinct, and remaining options
-      still keep this issue open.
+      aggregation-based `count_documents()` and remaining options still keep
+      this issue open. Distinct now shares one bounded BSON extractor across
+      Rust, native sync/async Python, and wire clients. Global natural-order
+      reads preserve the first exact representation and charge only unique
+      outputs; missing/null/array/path semantics follow 4,888 additional locked
+      oracle cases. It uses no retained cursor slot, rejects whole over-budget
+      results, and remains a scan implementation without snapshot semantics.
     - [ ] [#166](https://github.com/schapman1974/briskdb/issues/166) — targeted
       collection existence checks now share the engine across Rust, embedded
       sync/async Python, and wire read/write namespace handling. Catalogs beyond

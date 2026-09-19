@@ -42,7 +42,8 @@ Ordinary PyMongo 4.17.0 synchronous and asynchronous clients can discover,
 ping, inspect build information, insert one or many documents, and run bounded
 find queries through the [shared BSON matcher](DOCUMENT_ENGINE.md), including
 multi-batch reads with `getMore` and explicit `killCursors` cleanup. The legacy
-`count` command and PyMongo `estimated_document_count()` also use this engine.
+`count` command, PyMongo `estimated_document_count()`, and `distinct()` also use
+this engine through both synchronous and asynchronous clients.
 Exact `_id` and `_id: {$eq: value}` filters keep single-shard routing;
 other filters scan and merge matching documents in durable natural order unless
 an explicit sort is supplied.
@@ -68,6 +69,7 @@ before storage admission. The current option contract is:
 | `bypassDocumentValidation` | Only `false` |
 | Find `skip` / `limit` | Nonnegative integers; zero limit means no additional limit |
 | Count `query` / `skip` / `limit` | Shared BSON matcher with global skip/limit; nonnegative integers, zero limit unbounded; absent collection returns zero |
+| Distinct `key` / `query` | BSON string key and optional document filter; shared identity and global encounter order, absent collection returns an empty values array |
 | Find `projection` | Basic inclusion/exclusion document, dotted/nested paths, arrays, and `_id` rules; validated before missing-collection handling |
 | Find `sort` | Up to 32 ordinary fields with numeric `1`/`-1` directions; global BSON order with stable natural-order ties. Empty document preserves natural order. Metadata/expression sorts are unsupported. |
 | Find `batchSize` | Integer from 0 through 1000; zero opens an empty initial batch. Default 101. |
@@ -123,6 +125,17 @@ Negative legacy count limits, hints, collation, comments, and read concern are
 explicitly rejected. PyMongo `count_documents()` sends an aggregation pipeline
 and remains unsupported until the shared aggregation slice lands; the native
 embedded `Session.count_documents()` already uses the engine count command.
+
+Distinct uses the [shared extractor and resource bounds](DOCUMENT_ENGINE.md#distinct-values).
+It retains the first exact BSON representation, skips missing paths, includes
+null, and flattens only the final array by one level. Dotted components traverse
+documents, not intermediate arrays: this follows the frozen TinyMongo source.
+Invalid keys/filters/options fail before absent-collection handling. Distinct is
+a single bounded reply, not a cursor; bootstrap row/byte limits also apply.
+Real-driver tests cover semantic aliases, arrays, filtered point reads, global
+order, async calls, restart, unchanged storage, and whole-result byte rejection.
+Required CI adds 4,888 frozen-oracle extraction/identity cases without modifying
+the full candidate command corpus or its allowlists.
 
 Updates, deletes, and metadata/aggregation cursors
 are not implemented by this checkpoint.

@@ -52,6 +52,50 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_distinct_preserves_first_representation_paths_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    documents = [
+                        {"_id": 0, "v": [Int64(1), True, None, [2, 3]], "nested": {"a": ["first", "second"]}},
+                        {"_id": 1, "v": [1.0, False, [2.0, Int64(3)]], "nested": [{"a": "no-fanout"}]},
+                        {"_id": 2, "v": Decimal128("1.00"), "": "empty-key", "payload": "x" * 100000},
+                        {"_id": 3},
+                    ]
+                    for document in documents:
+                        session.insert_one(DATABASE, COLLECTION, document)
+                    result = session.distinct(DATABASE, COLLECTION, "v", max_result_rows=5, max_result_bytes=512)
+                    expected = [Int64(1), True, None, [2, 3], False]
+                    self.assertEqual(bson_bytes({"values": result["values"]}), bson_bytes({"values": expected}))
+                    self.assertEqual(result["kind"], "distinct")
+                    self.assertEqual(result["plan"]["kind"], "scatter")
+                    self.assertEqual(session.distinct(DATABASE, COLLECTION, "nested.a")["values"], ["first", "second"])
+                    self.assertEqual(session.distinct(DATABASE, COLLECTION, "")["values"], ["empty-key"])
+                    self.assertEqual(session.distinct(DATABASE, COLLECTION, "v\x00")["values"], [])
+                    point = session.distinct(DATABASE, COLLECTION, "v", {"_id": 2}, max_result_bytes=256)
+                    self.assertEqual(point["plan"]["kind"], "point")
+                    self.assertIsInstance(point["values"][0], Decimal128)
+                    for field in [Code("v"), None, 1, [], False]:
+                        with self.assertRaises(briskdb.TypeMismatchError):
+                            session.distinct(DATABASE, COLLECTION, field)
+                    for query in [[], (), 0, False, ""]:
+                        with self.assertRaises(briskdb.TypeMismatchError):
+                            session.distinct(DATABASE, COLLECTION, "v", query)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.distinct(DATABASE, COLLECTION, "v", max_result_rows=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.distinct(DATABASE, COLLECTION, "v", cancellation=token)
+                    for document in documents:
+                        found = session.find(DATABASE, COLLECTION, {"_id": document["_id"]})["documents"][0]
+                        self.assertEqual(bson_bytes(found), bson_bytes(document))
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    values = session.distinct(DATABASE, COLLECTION, "v")["values"]
+                    self.assertEqual(bson_bytes({"values": values}), bson_bytes({"values": expected}))
+
     def test_collection_existence_uses_scalar_result_and_request_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=2, documents=True) as database:
@@ -911,6 +955,24 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_distinct_preserves_values_and_forwards_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=4, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    await session.insert_one(DATABASE, COLLECTION, {"_id": 1, "v": [Int64(2), 2.0, None]})
+                    identifier = uuid.uuid4()
+                    result = await session.distinct(DATABASE, COLLECTION, "v", request_id=identifier)
+                    self.assertEqual(result["request_id"], identifier)
+                    self.assertEqual(result["values"], [Int64(2), None])
+                    self.assertIsInstance(result["values"][0], Int64)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.distinct(DATABASE, COLLECTION, "v", max_result_rows=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        await session.distinct(DATABASE, COLLECTION, "v", cancellation=token)
+
     async def test_async_collection_existence_forwards_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

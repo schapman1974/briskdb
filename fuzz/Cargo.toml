@@ -47,6 +47,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "document_distinct"
+path = "fuzz_targets/document_distinct.rs"
+test = false
+doc = false
+bench = false
+
 # Keep cargo-fuzz out of the repository's root workspace. Cargo invokes this
 # manifest directly (`cargo fuzz ...`) and uses this package's checked-in lock.
 [workspace]
