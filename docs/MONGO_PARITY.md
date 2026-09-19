@@ -126,9 +126,12 @@ Concurrent writes do not have a cross-shard snapshot guarantee. Count does not
 open a cursor. Invalid queries/options fail before absent-collection handling.
 Negative legacy count limits, hints, collation, comments, and read concern are
 explicitly rejected. PyMongo `count_documents()` sends an aggregation pipeline
-ending in `$group` with a literal `_id: 1`; that key form remains unsupported
-(code 115), although grouping by null or a field now works. The native
-embedded `Session.count_documents()` already uses the engine count command.
+ending in `$group` with a literal `_id: 1`; it now works through the shared
+aggregation core, including sync/async filtering, skip/limit, missing namespaces,
+and restart. It inherits aggregation's consumed-row/work bounds and rejects an
+explicit `limit=0` (15958), unlike legacy count. Unsupported aggregate options
+remain rejected. Native embedded `Session.count_documents()` uses the separate
+engine count command.
 
 Distinct uses the [shared extractor and resource bounds](DOCUMENT_ENGINE.md#distinct-values).
 It retains the first exact BSON representation, skips missing paths, includes
@@ -158,9 +161,11 @@ original-input assignment semantics, nested arrays/missing values, eager errors,
 and lazy limit consumption are preserved. Transform allocation/work/depth limits
 bound computed-output amplification before delivery. Real sync/async driver tests
 cover paging, expanded result byte caps, runtime-error cleanup, and restart.
-Shared `$group` now supports null/field keys (including structured field values)
+Shared `$group` now supports literal, field, and computed keys (including objects/arrays)
 and all eight planned accumulators: addToSet, avg, first, last, max, min, push,
-and sum. Required CI adds 9,509 pipelines in both execution modes. Grouping follows
+and sum. Required CI covers 9,509 accumulator and 5,663 key pipelines in both modes;
+5,424 explicitly compare against frozen expression-plus-group composition, since
+the frozen group grammar itself rejects non-null literal/computed keys. Grouping follows
 the global input order and retains bounded accumulator state, with exact BSON
 identity and Decimal128/mixed-numeric semantics. Arithmetic Double NaN payloads
 are deliberately canonicalized; other representations remain exact. See the
@@ -168,8 +173,9 @@ are deliberately canonicalized; other representations remain exact. See the
 for integer result-type/overflow boundaries versus the frozen reference and
 MongoDB. Real-driver tests cover structured/numeric results, byte paging,
 whole-group size/memory rejection, no partial group replies, cleanup and restart.
-Literal/computed group keys, partial-shard accumulator merging, additional
-expressions, and full candidate-corpus acceptance remain open.
+Group keys use the existing expression subset without `$$REMOVE`/`$$ROOT` variables.
+Partial-shard accumulator merging, additional expressions, and full
+candidate-corpus acceptance remain open.
 
 Updates, deletes, and metadata cursors
 are not implemented by this checkpoint.

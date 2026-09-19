@@ -117,6 +117,102 @@ async fn drain(
 }
 
 #[tokio::test]
+async fn computed_keys_and_literal_count_pipeline_survive_paging_and_reopen() {
+    let documents = source_rows();
+    let (root, engine) = setup(documents.clone()).await;
+    let group = |key| {
+        BsonValue::Document(doc(&[
+            ("_id", key),
+            (
+                "n",
+                BsonValue::Document(doc(&[("$sum", BsonValue::Int32(1))])),
+            ),
+        ]))
+    };
+    let compound = pipeline(&[(
+        "$group",
+        group(BsonValue::Document(doc(&[
+            ("team", BsonValue::from("$group")),
+            ("missing", BsonValue::from("$absent")),
+        ]))),
+    )]);
+    let count = pipeline(&[
+        (
+            "$match",
+            BsonValue::Document(doc(&[("group", BsonValue::Int32(1))])),
+        ),
+        ("$skip", BsonValue::Int32(3)),
+        ("$limit", BsonValue::Int32(7)),
+        ("$group", group(BsonValue::Int32(1))),
+    ]);
+    let expected: Vec<_> = (0..3)
+        .map(|key| {
+            doc(&[
+                (
+                    "_id",
+                    BsonValue::Document(doc(&[("team", BsonValue::Int32(key))])),
+                ),
+                ("n", BsonValue::Int32(60)),
+            ])
+        })
+        .collect();
+    for reopen in [false, true] {
+        let current;
+        let database = if reopen {
+            engine.shutdown().await.unwrap();
+            current = Engine::open(root.path(), 4).await.unwrap();
+            &current
+        } else {
+            &engine
+        };
+        let session = database.session();
+        let first = call(
+            database,
+            &session,
+            aggregate(
+                compound.clone(),
+                DocumentReadOptions::new().with_batch_size(0).unwrap(),
+            ),
+        )
+        .await;
+        let rows = drain(database, &session, first, 1).await;
+        assert_eq!(encoded(&rows), encoded(&expected));
+        let (_, rows) = cursor(
+            call(
+                database,
+                &session,
+                aggregate(count.clone(), DocumentReadOptions::new()),
+            )
+            .await,
+        );
+        assert_eq!(
+            encoded(&rows),
+            encoded(&[doc(&[
+                ("_id", BsonValue::Int32(1)),
+                ("n", BsonValue::Int32(7))
+            ])])
+        );
+        let first = call(
+            database,
+            &session,
+            aggregate(
+                DocumentPipeline::new(vec![]).unwrap(),
+                DocumentReadOptions::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            encoded(&drain(database, &session, first, 17).await),
+            encoded(&documents)
+        );
+        drop(session);
+        if reopen {
+            database.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn groups_follow_global_sorted_input_and_page_exact_results_after_reopen() {
     let documents = source_rows();
     let before = encoded(&documents);

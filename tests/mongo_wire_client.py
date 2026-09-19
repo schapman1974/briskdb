@@ -423,14 +423,26 @@ def count_smoke(uri):
                     assert "private-data" not in str(error)
                 else:
                     raise AssertionError("invalid count options must fail before existence handling")
-        # PyMongo count_documents uses an aggregation pipeline; do not pretend
-        # that adding the legacy count command implements that separate API.
-        try:
-            collection.count_documents({})
-        except OperationFailure as error:
-            assert error.code == 115
-        else:
-            raise AssertionError("aggregation count helper is not implemented yet")
+        # Exercise the driver's actual match/skip/limit/literal-group pipeline.
+        for query, options, expected in [
+            ({}, {}, 37), ({"group": 1}, {}, 12),
+            ({"group": 1}, {"skip": 3, "limit": 5}, 5),
+            ({"group": 1}, {"skip": 3}, 9), ({}, {"skip": Int64(2**63 - 1)}, 0),
+            ({"$and": [{"group": 1}, {"_id": {"$gt": 10}}]}, {}, 8),
+            ({"_id": Int64(7)}, {}, 1), ({"_id": -1}, {}, 0),
+        ]:
+            assert collection.count_documents(query, maxTimeMS=10000, **options) == expected
+            assert client.unwritten_count.items.count_documents(query, **options) == 0
+        for options, code in [({"limit": 0}, 15958), ({"skip": -1}, 5107200),
+                              ({"hint": "_id_"}, 72), ({"comment": "private-data"}, 72)]:
+            for target in [collection, client.unwritten_count.items]:
+                try:
+                    target.count_documents({}, **options)
+                except OperationFailure as error:
+                    assert error.code == code, (options, error.code)
+                    assert "private-data" not in str(error)
+                else:
+                    raise AssertionError("invalid count_documents options must fail eagerly")
 
 
 def aggregation_smoke(uri):
@@ -463,6 +475,12 @@ def aggregation_smoke(uri):
                                      "ids": [row["_id"] for row in source], "values": list(dict.fromkeys(row["value"] for row in source)),
                                      "min": Int64(0), "max": Int64(6)})
         assert BSON.encode({"rows": list(collection.aggregate(grouped, batchSize=1))}) == BSON.encode({"rows": grouped_expected})
+        for key, expected_key in [({"team": "$group", "missing": "$absent"}, lambda n: {"team": n}),
+                                  (["$group", "$absent"], lambda n: [n, None])]:
+            result = list(collection.aggregate([{"$group": {"_id": key, "n": {"$sum": 1}}}], batchSize=1))
+            assert BSON.encode({"rows": result}) == BSON.encode({"rows": [{"_id": expected_key(n), "n": 60} for n in range(3)]})
+        for key in [Int64(1), Code("$literal"), {"$private": [Binary(b"abc", 128), Decimal128("1.00")]}]:
+            assert BSON.encode({"rows": list(collection.aggregate([{"$group": {"_id": {"$literal": key}, "n": {"$sum": 1}}}]))}) == BSON.encode({"rows": [{"_id": key, "n": 180}]})
         assert list(client.unwritten_aggregate.items.aggregate([{"$group": {"_id": None, "n": {"$sum": 1}}}])) == []
         precision = client.wire_aggregate.precision
         precision.insert_many([{"_id": 1, "v": Decimal128("1.00")}, {"_id": 2, "v": 2.1}])
@@ -488,7 +506,9 @@ def aggregation_smoke(uri):
             ([{"$limit": 0}], {}, 15958), ([{"$count": Code("private")}], {}, 40156),
             ([{"$count": "private.field"}], {}, 40160), ([{"$sort": {}}], {}, 15976),
             ([{"$match": {"$where": "private"}}], {}, 115),
-            ([{"$group": {"_id": 1, "n": {"$sum": 1}}}], {}, 115),
+            ([{"$group": {"_id": {"private": "$$REMOVE"}}}], {}, 115),
+            ([{"$group": {"_id": ["$$ROOT"]}}], {}, 115),
+            ([{"$group": {"_id": {"$size": []}}}], {}, 16020),
             ([{"$group": {"_id": None, "private.path": {"$sum": 1}}}], {}, 40235),
             ([{"$group": {"_id": None, "private": {"$first": "$$REMOVE"}}}], {}, 115),
             ([{"$group": {"_id": None, "private": {"$avg": []}}}], {}, 40237),
@@ -543,6 +563,20 @@ def aggregation_smoke(uri):
                 else:
                     raise AssertionError("oversized grouping must fail without partial replies and release the cursor")
         assert list(collection.find({})) == documents
+
+        key_errors = client.wire_aggregate.key_errors
+        key_errors.insert_many([{"_id": 1, "v": []}, {"_id": 2, "v": None}])
+        bad_key = [{"$group": {"_id": {"$size": "$v"}, "n": {"$sum": 1}}}]
+        first = client.wire_aggregate.command("aggregate", "key_errors", pipeline=bad_key, cursor={"batchSize": 0})["cursor"]
+        assert first["firstBatch"] == [] and first["id"]
+        for code in (17124, 43):
+            try:
+                client.wire_aggregate.command("getMore", first["id"], collection="key_errors", batchSize=1)
+            except OperationFailure as error:
+                assert error.code == code and "cursor" not in error.details
+            else:
+                raise AssertionError("key failure must return no partial groups and release its cursor")
+        assert list(key_errors.aggregate([{"$limit": 1}] + bad_key)) == [{"_id": 0, "n": 1}]
 
         transformed = client.wire_aggregate.transforms
         original = {"_id": Int64(1), "source": Int64(9), "a": {"y": 2, "x": Int64(1), "old": 0},
@@ -642,6 +676,7 @@ def persisted_smoke(uri):
         assert [row["_id"] for row in client.wire_sorting.items.find({}, {"_id": 1}).sort("_id", -1).batch_size(4)] == list(reversed(range(36)))
         assert client.wire_count.items.estimated_document_count() == 37
         assert client.wire_count.command("count", "items", query={"group": 1}, skip=3)["n"] == 9
+        assert client.wire_count.items.count_documents({"group": 1}, skip=3, limit=5) == 5
         values = client.wire_distinct.ordered.distinct("v")
         assert values == list(range(17)) and all(isinstance(value, Int64) for value in values)
         assert client.wire_distinct.items.distinct("nested.a") == ["first", "second"]
@@ -657,6 +692,8 @@ async def async_smoke(uri):
         check_hello(await client.admin.command("hello"))
         assert await client.wire_count.items.estimated_document_count(maxTimeMS=10000) == 37
         assert (await client.wire_count.command("count", "items", query={"group": 1}, skip=3, limit=5))["n"] == 5
+        assert await client.wire_count.items.count_documents({"group": 1}, skip=3, limit=5) == 5
+        assert await client.unwritten_count.items.count_documents({}) == 0
         assert await client.unwritten_count.items.estimated_document_count() == 0
         values = await client.wire_distinct.items.distinct("v")
         assert isinstance(values[0], Int64) and len(values) == 5
@@ -668,6 +705,8 @@ async def async_smoke(uri):
         assert await aggregate.to_list() == [{"n": 180}]
         aggregate = await client.wire_aggregate.items.aggregate([{"$sort": {"_id": -1}}, {"$group": {"_id": "$group", "n": {"$sum": 1}, "first": {"$first": "$_id"}, "last": {"$last": "$_id"}}}], batchSize=1)
         assert await aggregate.to_list() == [{"_id": key, "n": 60, "first": Int64(177 + key), "last": Int64(key)} for key in (2, 1, 0)]
+        aggregate = await client.wire_aggregate.items.aggregate([{"$group": {"_id": {"team": "$group"}, "n": {"$sum": 1}}}], batchSize=1)
+        assert await aggregate.to_list() == [{"_id": {"team": key}, "n": 60} for key in range(3)]
         aggregate = await client.wire_aggregate.transforms.aggregate([
             {"$addFields": {"items.tag": "$source", "secret": "$$REMOVE"}},
             {"$project": {"_id": 0, "n": {"$size": "$items"}, "copy": {"$ifNull": ["$absent", "$source"]}}},

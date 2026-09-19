@@ -10,7 +10,7 @@ use briskdb::document::{
 #[test]
 #[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
 fn aggregation_matches_the_locked_tinymongo_oracle() {
-    compare("document_aggregation_oracle.py", 5000, 32 * 1024 * 1024);
+    compare("document_aggregation_oracle.py", 5000, 32 * 1024 * 1024, 0);
 }
 
 #[test]
@@ -20,6 +20,7 @@ fn aggregation_transforms_match_the_locked_tinymongo_oracle() {
         "document_aggregation_transforms_oracle.py",
         5000,
         64 * 1024 * 1024,
+        0,
     );
 }
 
@@ -30,10 +31,22 @@ fn aggregation_groups_match_the_locked_tinymongo_oracle() {
         "document_aggregation_groups_oracle.py",
         8000,
         96 * 1024 * 1024,
+        24,
     );
 }
 
-fn compare(script: &str, minimum: usize, maximum_bytes: usize) {
+#[test]
+#[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
+fn aggregation_group_keys_match_frozen_expression_group_composition() {
+    compare(
+        "document_aggregation_keys_oracle.py",
+        5000,
+        128 * 1024 * 1024,
+        5400,
+    );
+}
+
+fn compare(script: &str, minimum: usize, maximum_bytes: usize, expected_composed: usize) {
     let python = std::env::var("BRISKDB_MONGO_ORACLE_PYTHON").unwrap_or_else(|_| "python3".into());
     let output = Command::new(python)
         .arg(
@@ -51,9 +64,11 @@ fn compare(script: &str, minimum: usize, maximum_bytes: usize) {
     assert!(output.stdout.len() < maximum_bytes);
     let mut bytes = output.stdout.as_slice();
     let mut count = 0;
+    let mut composed = 0;
     while !bytes.is_empty() {
         let length = i32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
         let case = decode_document(&bytes[..length]).unwrap();
+        composed += usize::from(case.get_first("reference_pipeline").is_some());
         bytes = &bytes[length..];
         let documents = |field| {
             let Some(BsonValue::Array(values)) = case.get_first(field) else {
@@ -123,7 +138,13 @@ fn compare(script: &str, minimum: usize, maximum_bytes: usize) {
         count > minimum,
         "expected the complete pipeline matrix, got {count}"
     );
-    println!("{count} source-locked TinyMongo aggregation cases passed ({script})");
+    assert_eq!(
+        composed, expected_composed,
+        "composition coverage must remain explicit"
+    );
+    println!(
+        "{count} source-locked TinyMongo aggregation cases passed ({script}); {composed} use explicit frozen-stage composition for extended group keys"
+    );
 }
 
 fn normalize_arithmetic_nans(value: BsonValue, fields: Option<&BsonValue>) -> BsonValue {

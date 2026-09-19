@@ -74,7 +74,7 @@ Pass `sort={"priority": -1, "_id": 1}` for global BSON sorting before skip/limit
 and projection; the sort persists across cursor batches. Stable ties use natural
 order. Sorted pages use bounded key windows and rescan until sorted indexes
 exist; large skips may need repeated scans. Secondary indexes remain `pending_build`; updates,
-additional aggregation expressions/group-key forms, and bulk-write Python helpers remain future work.
+additional aggregation expressions, and bulk-write Python helpers remain future work.
 
 `session.aggregate(database, collection, pipeline, batch_size=101)` accepts a list
 of `$match`, `$sort`, `$skip`, `$limit`, `$count`, `$project`, `$set`, `$addFields`,
@@ -90,14 +90,17 @@ and `$$REMOVE`. Assignments read the original input; no pipeline stage changes
 stored documents. A later limit stops unused expression evaluation, including
 after a sort. Each transform specification has a 1-MiB/4,096-node/depth-100 bound;
 per-row allocation-work and step limits reject computed-output amplification.
-Group keys may be null or a field reference, including fields containing arrays
-or compound documents. Supported accumulators are `$addToSet`, `$avg`, `$first`,
+Group keys may be literal BSON, field references, or computed objects/arrays and
+the existing `$literal`/`$ifNull`/`$size` expressions. Variables such as `$$REMOVE`
+and `$$ROOT` are not supported in group expressions (use `$literal` to retain
+such strings as data). Supported accumulators are `$addToSet`, `$avg`, `$first`,
 `$last`, `$max`, `$min`, `$push`, and `$sum`. They share global input order, BSON
 identity, Decimal128 arithmetic, memory limits and cursor cleanup with Rust and
 PyMongo; see the [numeric and grouping contract](../docs/DOCUMENT_ENGINE.md#aggregation-groups-and-numeric-accumulators)
 for result-type boundaries. Group results must each fit BSON before delivery.
 Native `count_documents()` remains the separate direct engine count helper;
-PyMongo's version still needs its literal `_id: 1` group-key form.
+PyMongo's version now runs its actual constant-key aggregation pipeline, with
+aggregation row/work limits and an error for explicit `limit=0`.
 
 Pass `shards` when creating a data directory. Later calls may omit it and use
 the count stored in the manifest. Passing the wrong count raises
