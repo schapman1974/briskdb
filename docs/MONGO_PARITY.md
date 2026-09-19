@@ -19,11 +19,12 @@ CI and byte-compares the normalized result with the checked-in reference. The
 full report remains `reference-only`; partial candidate coverage is not folded
 into that report or treated as full parity.
 
-Required CI separately runs 150 exact sync/async executions in the frozen
+Required CI separately runs 152 exact sync/async executions in the frozen
 `test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
 `test_aggregation_contract`, and `test_group_accumulators_contract` modules,
 plus four `test_talkpython_contract` cases: full-document replacement, application
 write-result metadata, binary ID/subtype equality, and distinct boolean/numeric IDs,
+and the CRUD top-level/nested `$unset` case,
 against a real four-shard BriskDB listener.
 It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
 cleanup. The JUnit result is checked against the exact locked case/API set;
@@ -286,7 +287,8 @@ sync/async Python exposes `find_one_and_replace` with the same semantics.
 
 Wire `update` supports replacement statements and `$set`/`$unset` operator
 statements (`q` and a document `u`,
-`multi:false`, `upsert:false`) through shared `Replace`. Both body arrays and
+`upsert:false`) through shared `Replace`/`Update`. Only operator documents accept
+`multi:true`; replacement remains single-document. Both body arrays and
 OP_MSG `updates` sequences preserve ordered/unordered per-statement errors and
 `n`/`nModified`; an immutable-ID violation is code 66. Missing collections return
 zero only after eager validation, without creating metadata. Normalized
@@ -294,9 +296,16 @@ post-images, including retained IDs, must fit the advertised 512 KiB BSON cap
 before mutation. Existing bounded write-concern and one-way write handling apply.
 Batch statements commit independently; operational failure may leave previous
 commits, so no all-or-nothing batch or retryable-write guarantee is implied.
-Other operators/pipeline updates, upserts, multi updates, and update-command
+Multi updates commit one immediate transaction per shard, scanning bounded
+records in natural order. A runtime failure rolls back that shard but can leave
+earlier shards committed. Such failures return command errors, not indexed
+write errors or fabricated partial counts; even unordered batches stop. Eager
+parsing failures still use indexed errors and can safely continue unordered
+batches. This is neither a global transaction/snapshot nor exact MongoDB
+per-document or frozen TinyMongo collection-wide failure atomicity.
+Other operators/pipeline updates, upserts, and update-command
 hint/sort/collation/arrayFilters remain explicit future work. Native sync/async
-Python exposes `replace_one` and `update_one` with the same engine semantics and
+Python exposes `replace_one`, `update_one`, and `update_many` with the same engine semantics and
 controls. The field-update subset includes bounded object/array paths, immutable
 IDs, and exact modified counts. Its 4,008 source-locked oracle cases cover object
 paths only, not frozen legacy scalar/array/ID quirks; independent tests check

@@ -581,13 +581,16 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     {
                         return Err(CommandError::options());
                     }
-                    for option in ["multi", "upsert"] {
-                        if statement
-                            .get_first(option)
-                            .is_some_and(|value| !matches!(value, BsonValue::Boolean(false)))
-                        {
-                            return Err(CommandError::options());
-                        }
+                    let multi = match statement.get_first("multi") {
+                        None | Some(BsonValue::Boolean(false)) => false,
+                        Some(BsonValue::Boolean(true)) => true,
+                        _ => return Err(CommandError::options()),
+                    };
+                    if statement
+                        .get_first("upsert")
+                        .is_some_and(|value| !matches!(value, BsonValue::Boolean(false)))
+                    {
+                        return Err(CommandError::options());
                     }
                     let Some(BsonValue::Document(filter)) = statement.get_first("q") else {
                         return Err(CommandError::invalid());
@@ -623,11 +626,18 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                                 namespace.clone(),
                                 DocumentFilter::new(filter.clone())?,
                                 DocumentUpdate::new(replacement.clone())?,
-                                DocumentMutationScope::One,
+                                if multi {
+                                    DocumentMutationScope::Many
+                                } else {
+                                    DocumentMutationScope::One
+                                },
                                 DocumentWriteOptions::new(),
                             )
                             .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?,
                         ));
+                    }
+                    if multi {
+                        return Err(CommandError::options());
                     }
                     Ok(DocumentCommand::Replace(
                         DocumentReplaceRequest::new(
@@ -1356,9 +1366,11 @@ impl Executor {
                 let mut modified = 0i64;
                 let mut errors = Vec::new();
                 for (index, update) in updates.into_iter().enumerate() {
+                    let mut safe_statement_error = true;
                     let result = match update {
                         Err(error) => Err(error),
                         Ok(update) => {
+                            safe_statement_error = !matches!(&update, DocumentCommand::Update(request) if request.scope() == DocumentMutationScope::Many);
                             let namespace = match &update {
                                 DocumentCommand::Replace(request) => request.namespace(),
                                 DocumentCommand::Update(request) => request.namespace(),
@@ -1383,10 +1395,11 @@ impl Executor {
                             ));
                         }
                         Err(error)
-                            if matches!(
-                                error.code,
-                                2 | 9 | 14 | 28 | 40 | 52 | 56 | 66 | 72 | 10334 | 115
-                            ) =>
+                            if safe_statement_error
+                                && matches!(
+                                    error.code,
+                                    2 | 9 | 14 | 28 | 40 | 52 | 56 | 66 | 72 | 10334 | 115
+                                ) =>
                         {
                             // These validation/resource failures precede commit (the
                             // whole single-shard transaction rolls back on error).
@@ -1395,8 +1408,10 @@ impl Executor {
                                 break;
                             }
                         }
-                        // A deadline, disconnect, or storage failure is not an
-                        // exact batch outcome; previous statements may have committed.
+                        // Runtime multi-update errors can follow earlier shard
+                        // commits, even for validation codes. Do not misreport a
+                        // rolled-back statement or continue an unordered batch.
+                        // Operational failures likewise have uncertain partial outcomes.
                         Err(error) => return Err(error),
                     }
                 }

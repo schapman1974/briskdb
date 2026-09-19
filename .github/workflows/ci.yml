@@ -87,7 +87,7 @@ jobs:
         with:
           shared-key: mongo-matcher-1.85
 
-      - name: Compare Rust BSON queries with source-locked TinyMongo
+      - name: Compare Rust document semantics with source-locked TinyMongo
         env:
           BRISKDB_MONGO_ORACLE_PYTHON: python
         run: >-
@@ -96,7 +96,7 @@ jobs:
           --test document_sorting_oracle --test document_distinct_oracle
           --test document_aggregation_oracle --test document_update_oracle -- --ignored --nocapture
 
-      - name: Run frozen aggregation suites against BriskDB
+      - name: Run frozen supported contracts against BriskDB
         # The candidate checkpoint is deliberately separate from the full
         # reference-only report: unimplemented suites are not allowlisted.
         env:

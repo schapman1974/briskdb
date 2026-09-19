@@ -104,7 +104,7 @@ batch size and cannot change the original skip or limit.
 
 ### Field updates and single-record write boundaries
 
-`Update` now executes scope `One` with `$set` and `$unset`, using the same
+`Update` executes scopes `One` and `Many` with `$set` and `$unset`, using the same
 locked selection/reselection and preflighted write path as replacement. A shared
 `DocumentUpdater` validates every operator, operand, path, and prefix conflict
 before namespace lookup or matching. It bounds specifications to 1 MiB/4,096
@@ -127,11 +127,30 @@ Stored BSON byte comparison determines modified counts. No-op writes skip SQL.
 including retained fields. Result/plan/post-image checks precede SQL, so validation
 failures leave the record unchanged. Concurrent updates read the current document
 under the write lock rather than applying a stale client-side replacement.
-Scope `Many`, other operators, upsert, and secondary-index maintenance remain
+Other operators, upsert, and secondary-index maintenance remain
 unimplemented. The 4,008 source-locked oracle cases intentionally cover non-ID
 object paths only: frozen TinyMongo's legacy scalar/array/ID behavior differs.
 Those boundaries have independent unit, transaction, and real-wire tests; the
 frozen corpus and intentional-difference allowances have not been changed.
+
+Scope `Many` streams matching records in natural order within ascending shard
+IDs, holding one immediate write transaction per shard. Exact-ID predicates
+remain point-routed. Original IDs/order are unchanged, so even a no-op or a
+still-matching post-image is visited only once per scan. Counts include every
+match and only byte-different writes; the fixed-size result/plan is preflighted
+before the first commit. The transformation and post-image checks are shared
+with scope `One`, with one current record/post-image retained at a time.
+
+On validation, cancellation, or storage failure, the current shard rolls back;
+earlier committed shards remain changed. There is no cross-shard snapshot or
+all-or-nothing transaction, nor a claim of MongoDB's individual-document failure
+boundary or frozen TinyMongo's collection-wide validation boundary. Successful
+final commits are not reclassified by late cancellation. Wire parsing errors
+remain indexed statement errors, but a runtime multi-update failure aborts the
+whole command (including unordered batches) without fabricated partial counts.
+Native callers receive an error, not a successful result with guessed counts.
+Tests deterministically cover later-shard validation failure, cancellation/task
+abort after an earlier commit, restart, and continued session/lock usability.
 
 ### Replacement and returned-image boundaries
 
@@ -608,7 +627,7 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 
 ## Current boundary
 
-Other update operators, update-many, upsert, operator-update findAndModify,
+Other update operators, upsert, operator-update findAndModify,
 additional aggregation expressions/group-key forms,
 database statistics, index metadata cursors, and physical secondary-index builds
 remain later roadmap work. Collection metadata cursors are implemented.

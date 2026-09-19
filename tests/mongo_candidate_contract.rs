@@ -62,6 +62,7 @@ fn run_contract(uri: &str, report: &std::path::Path) -> std::process::Output {
             "compat/mongo/v1/runner/contracts/test_talkpython_contract.py::test_write_result_metadata_used_by_the_application",
             "compat/mongo/v1/runner/contracts/test_talkpython_contract.py::test_binary_ids_use_bson_equality_without_losing_subtype",
             "compat/mongo/v1/runner/contracts/test_talkpython_contract.py::test_boolean_and_numeric_ids_are_bson_distinct",
+            "compat/mongo/v1/runner/contracts/test_crud_contract.py::test_unset_removes_top_level_and_nested_fields",
         ])
         .args([
             "--mongo-contract-target=briskdb",
@@ -102,15 +103,16 @@ individual = {'tests.contracts.test_talkpython_contract::' + name for name in [
     'test_boolean_and_numeric_ids_are_bson_distinct',
 ]}
 expected = {(case['id'], api) for case in corpus['cases']
-            if (case['id'].split('::', 1)[0] in modules or case['id'] in individual)
+            if (case['id'].split('::', 1)[0] in modules or case['id'] in individual or
+                case['id'] == 'tests.contracts.test_crud_contract::test_unset_removes_top_level_and_nested_fields')
             for api in case['apis']}
 executions = ingest_junit(Path(sys.argv[1]), 'briskdb', corpus)['executions']
 actual = {(item['case_id'], item['api']) for item in executions}
-assert len(expected) == len(executions) == 150, 'locked suite coverage changed'
+assert len(expected) == len(executions) == 152, 'locked suite coverage changed'
 assert actual == expected, 'candidate suite omitted or substituted locked cases'
 assert all(item['outcome'] == 'passed' and item['target'] == 'briskdb-briskdb'
            for item in executions), 'candidate suite skipped or failed a case'
-print('Verified all 150 exact frozen candidate executions, with no skips.')
+print('Verified all 152 exact frozen candidate executions, with no skips.')
 "#,
             ])
             .arg(report)

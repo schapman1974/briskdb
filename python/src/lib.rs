@@ -1983,6 +1983,51 @@ impl Session {
         )
     }
 
+    #[pyo3(signature = (database, collection, filter, update, *, upsert = false, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn update_many(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        filter: Py<PyAny>,
+        update: Py<PyAny>,
+        upsert: bool,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let filter = python_engine_result(DocumentFilter::new(extract_bson_document(
+            py,
+            filter.bind(py),
+            self.shared.uuid_representation,
+        )?))?;
+        let update = python_engine_result(DocumentUpdate::new(extract_bson_document(
+            py,
+            update.bind(py),
+            self.shared.uuid_representation,
+        )?))?;
+        let request = DocumentUpdateRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            filter,
+            update,
+            DocumentMutationScope::Many,
+            DocumentWriteOptions::new().with_upsert(upsert),
+        );
+        self.execute_document_command(
+            py,
+            DocumentCommand::Update(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
     #[pyo3(signature = (database, collection, pipeline, *, batch_size = 101, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
     #[allow(clippy::too_many_arguments)]
     fn aggregate(
