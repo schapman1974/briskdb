@@ -1,7 +1,8 @@
-//! Replacement upserts. Namespace creation remains an adapter/catalog operation;
+//! Replacement/operator upserts. Namespace creation is an adapter/catalog operation;
 //! natural-order reservation must happen outside the shard write transaction.
 
 use super::*;
+use crate::document::DocumentWriteRollback;
 
 impl Engine {
     #[allow(clippy::too_many_arguments)]
@@ -17,45 +18,85 @@ impl Engine {
         let max_document_bytes = request.max_document_bytes();
         let (namespace, filter, replacement, options) = request.into_parts();
         require_replacement_options(options.with_upsert(false))?;
-        // The retained query is needed only after a miss. Clone bounded BSON on
-        // a controlled worker, never on the async coordinator.
-        let (filter, first_filter, replacement) = self
-            .run_document_storage_task(
-                cancellation.clone(),
-                deadline,
-                move |cancellation, control| {
-                    ensure_document_cpu_active(cancellation, &control)?;
-                    let first = filter.clone();
-                    ensure_document_cpu_active(cancellation, &control)?;
-                    Ok((Arc::new(filter), first, Arc::new(replacement)))
-                },
-            )
-            .await?;
-        let execution = self
-            .run_document_single_mutation(
+        self.run_document_upsert(
+            owner,
+            request_id,
+            namespace,
+            Arc::new(filter),
+            Mutation::Replace {
+                document: Arc::new(replacement),
+                max_document_bytes,
+                returns: MutationReturn::Counts,
+            },
+            DocumentMutationScope::One,
+            cancellation,
+            deadline,
+            limits,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_document_upsert(
+        &self,
+        owner: ConnectionOwner,
+        request_id: DocumentRequestId,
+        namespace: DocumentNamespace,
+        filter: Arc<DocumentFilter>,
+        mutation: Mutation,
+        scope: DocumentMutationScope,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+        limits: ResultLimits,
+    ) -> EngineResult<DocumentExecution> {
+        let max_document_bytes = match &mutation {
+            Mutation::Replace {
+                max_document_bytes, ..
+            }
+            | Mutation::Update {
+                max_document_bytes, ..
+            } => *max_document_bytes,
+            Mutation::Delete => unreachable!("delete cannot upsert"),
+        };
+        // Share the retained query rather than deep-cloning it for a possible
+        // miss. Routing borrows it on a controlled worker in both phases.
+        let execution = if let (Mutation::Update { updater, .. }, DocumentMutationScope::Many) =
+            (&mutation, scope)
+        {
+            self.run_document_update_many(
                 owner,
                 request_id,
                 namespace.clone(),
-                first_filter,
-                DocumentReadOptions::new(),
-                Mutation::Replace {
-                    document: Arc::clone(&replacement),
-                    max_document_bytes,
-                    returns: MutationReturn::Counts,
-                },
+                Arc::clone(&filter),
+                Arc::clone(updater),
+                max_document_bytes,
                 cancellation.clone(),
                 deadline,
                 limits,
             )
-            .await?;
+            .await?
+        } else {
+            self.run_document_single_mutation(
+                owner,
+                request_id,
+                namespace.clone(),
+                Arc::clone(&filter),
+                DocumentReadOptions::new(),
+                mutation.clone(),
+                cancellation.clone(),
+                deadline,
+                limits,
+            )
+            .await?
+        };
         if !matches!(execution.result(), DocumentResult::Update(result) if result.matched_count() == 0)
         {
             return Ok(execution);
         }
         let (_, plan, _) = execution.into_parts();
-        let plan = plan.expect("replacement plan");
+        let plan = plan.expect("upsert search plan");
         let storage = self.inner.database.storage.clone();
-        let prepare_replacement = Arc::clone(&replacement);
+        let prepare_mutation = mutation.clone();
         let (collection_id, matcher, prepared, inserted, first_order) = self
             .run_document_storage_task(
                 cancellation.clone(),
@@ -74,12 +115,40 @@ impl Engine {
                             &mut check,
                         )?)
                     };
-                    let document = synthesize_replacement(
-                        filter.document(),
-                        &prepare_replacement,
-                        max_document_bytes,
-                        &mut check,
-                    )?;
+                    let document = match &prepare_mutation {
+                        Mutation::Replace { document, .. } => synthesize_replacement(
+                            filter.document(),
+                            document,
+                            max_document_bytes,
+                            &mut check,
+                        )?,
+                        Mutation::Update { updater, .. } => {
+                            let seed = if let Some(matcher) = &matcher {
+                                matcher.upsert_seed_with_check(&mut check)?
+                            } else {
+                                // A proven point ID can exceed the general
+                                // matcher budget; never recompile it as a query.
+                                BsonDocument::from_entries([(
+                                    "_id",
+                                    equality_id(filter.document())
+                                        .expect("point identity")
+                                        .clone(),
+                                )])
+                                .map_err(|error| {
+                                    error.into_engine_error(BsonErrorContext::ClientInput)
+                                })?
+                            };
+                            let document = updater.apply_with_check(&seed, &mut check)?;
+                            normalize_upsert(
+                                &document,
+                                document.get_first("_id"),
+                                false,
+                                max_document_bytes,
+                                &mut check,
+                            )?
+                        }
+                        Mutation::Delete => unreachable!("delete cannot upsert"),
+                    };
                     let id = document.get_first("_id").expect("upsert identity").clone();
                     let prepared = storage.prepare_document_write(&document)?;
                     enforce_prepared_write_budget(
@@ -112,7 +181,10 @@ impl Engine {
                     Ok((collection_id, matcher, prepared, inserted, first_order))
                 },
             )
-            .await?;
+            // The completed search matched zero documents. This phase performs
+            // no document writes (a natural-order reservation can leave a gap).
+            .await
+            .map_err(DocumentWriteRollback::wrap)?;
         let shard = prepared.shard();
         self.run_document_shard_controlled(
             shard,
@@ -123,74 +195,120 @@ impl Engine {
                 let transaction =
                     Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
                         .map_err(sqlite_error::statement)?;
-                // Recheck the target shard under its write lock. Exact-ID
-                // concurrent upserts therefore update the winner, not a stale
-                // missing document. Non-ID queries do not promise a global
-                // snapshot or uniqueness without a supporting unique index.
-                let plan = inserted.plan().expect("upsert plan");
-                let record = if let DocumentPlan::Point(point) = plan {
-                    debug_assert_eq!(point.shard(), shard);
-                    storage.get_document_on_connection(
-                        &transaction,
-                        collection_id,
-                        shard,
-                        point.id_key(),
-                        cancellation,
-                    )?
-                } else {
-                    select_candidate(
-                        storage,
-                        &transaction,
-                        collection_id,
-                        shard,
-                        matcher.as_ref(),
-                        None,
-                        None,
-                        cancellation,
-                        control,
-                    )?
-                    .map(|current| {
+                let outcome = (|| {
+                    // Recheck the target shard under its write lock. Exact-ID
+                    // concurrent upserts therefore update the winner, not a stale
+                    // missing document. Non-ID queries do not promise a global
+                    // snapshot or uniqueness without a supporting unique index.
+                    let plan = inserted.plan().expect("upsert plan");
+                    let record = if scope == DocumentMutationScope::Many {
+                        let Mutation::Update { updater, .. } = &mutation else {
+                            unreachable!("only operator updates have many scope")
+                        };
+                        let key = match plan {
+                            DocumentPlan::Point(point) => {
+                                debug_assert_eq!(point.shard(), shard);
+                                Some(point.id_key().clone())
+                            }
+                            _ => None,
+                        };
+                        let (matched, modified) = update_many::update_shard_matches(
+                            storage,
+                            &transaction,
+                            collection_id,
+                            shard,
+                            key,
+                            matcher.as_ref(),
+                            updater,
+                            max_document_bytes,
+                            request_id,
+                            plan,
+                            limits,
+                            cancellation,
+                            control,
+                            (0, 0),
+                        )?;
+                        if matched != 0 {
+                            return Ok(DocumentExecution::new(
+                                request_id,
+                                Some(plan.clone()),
+                                DocumentResult::Update(DocumentUpdateResult::new(
+                                    matched, modified, None,
+                                )?),
+                            ));
+                        }
+                        None
+                    } else if let DocumentPlan::Point(point) = plan {
+                        debug_assert_eq!(point.shard(), shard);
                         storage.get_document_on_connection(
                             &transaction,
                             collection_id,
                             shard,
-                            &current.key,
+                            point.id_key(),
                             cancellation,
-                        )
-                    })
-                    .transpose()?
-                    .flatten()
-                };
-                let execution = if record.is_some() {
-                    replace_record(
-                        storage,
-                        &transaction,
-                        record,
-                        &replacement,
-                        max_document_bytes,
-                        MutationReturn::Counts,
-                        None,
-                        request_id,
-                        plan.clone(),
-                        limits,
-                        cancellation,
-                        control,
-                    )?
-                } else {
+                        )?
+                    } else {
+                        select_candidate(
+                            storage,
+                            &transaction,
+                            collection_id,
+                            shard,
+                            matcher.as_ref(),
+                            None,
+                            None,
+                            cancellation,
+                            control,
+                        )?
+                        .map(|current| {
+                            storage.get_document_on_connection(
+                                &transaction,
+                                collection_id,
+                                shard,
+                                &current.key,
+                                cancellation,
+                            )
+                        })
+                        .transpose()?
+                        .flatten()
+                    };
+                    let execution = if record.is_some() {
+                        mutate_record(
+                            &mutation,
+                            storage,
+                            &transaction,
+                            record,
+                            request_id,
+                            plan.clone(),
+                            None,
+                            limits,
+                            cancellation,
+                            control,
+                        )?
+                    } else {
+                        ensure_document_cpu_active(cancellation, control)?;
+                        storage.insert_prepared_document_on_connection(
+                            &transaction,
+                            collection_id,
+                            first_order,
+                            shard,
+                            &prepared,
+                            cancellation,
+                        )?;
+                        inserted
+                    };
                     ensure_document_cpu_active(cancellation, control)?;
-                    storage.insert_prepared_document_on_connection(
-                        &transaction,
-                        collection_id,
-                        first_order,
-                        shard,
-                        &prepared,
-                        cancellation,
-                    )?;
-                    inserted
-                };
-                ensure_document_cpu_active(cancellation, control)?;
-                transaction.commit().map_err(sqlite_error::statement)?;
-                Ok(execution)
+                    Ok(execution)
+                })();
+                match outcome {
+                    Ok(execution) => {
+                        transaction.commit().map_err(sqlite_error::statement)?;
+                        Ok(execution)
+                    }
+                    Err(error) => {
+                        transaction.rollback().map_err(sqlite_error::statement)?;
+                        Err(DocumentWriteRollback::wrap(error))
+                    }
+                }
             },
         )
         .await
@@ -224,7 +342,24 @@ fn synthesize_replacement(
             return Err(DocumentMutationError::ImmutableId.into_engine_error());
         }
     }
-    let id = replacement_id.or(query_id).cloned().unwrap_or_else(|| {
+    normalize_upsert(
+        replacement,
+        replacement_id.or(query_id),
+        true,
+        max_document_bytes,
+        check,
+    )
+}
+
+fn normalize_upsert(
+    replacement: &BsonDocument,
+    id: Option<&BsonValue>,
+    stamp_timestamps: bool,
+    max_document_bytes: usize,
+    check: &mut dyn FnMut() -> EngineResult<()>,
+) -> EngineResult<BsonDocument> {
+    check()?;
+    let id = id.cloned().unwrap_or_else(|| {
         BsonValue::ObjectId(BsonObjectId::from_bytes(bson::oid::ObjectId::new().bytes()))
     });
     CanonicalBsonKey::encode(&id)
@@ -247,7 +382,9 @@ fn synthesize_replacement(
     for (name, value) in replacement.iter().filter(|(name, _)| *name != "_id") {
         check()?;
         let value = match value {
-            BsonValue::Timestamp(value) if value.time() == 0 && value.increment() == 0 => {
+            BsonValue::Timestamp(value)
+                if stamp_timestamps && value.time() == 0 && value.increment() == 0 =>
+            {
                 BsonValue::Timestamp(next_server_timestamp()?)
             }
             value => value.clone(),

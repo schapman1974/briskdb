@@ -499,7 +499,7 @@ requires an earlier dependency:
       engine-owned cursors. Tests cover BSON fidelity, numeric-equivalent IDs,
       cross-interface access, restart, host enablement, one-way writes, and
       response limits. Missing collections read empty without creating metadata.
-      Additional update operators, upserts, index metadata cursors,
+      Additional update operators, find-and-modify upserts, index metadata cursors,
       and broader database options remain open.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
@@ -528,6 +528,15 @@ requires an earlier dependency:
       `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`/`$inc`
       across all three adapters, with object/array paths, eager conflict checks,
       immutable IDs, exact modified counts, bounded growth, and literal timestamps.
+      Both scopes now support operator upserts: positive direct/`$eq`/`$and`
+      equalities seed strict dotted object paths; overlapping equalities fail
+      with code 54. Operators run before missing-ID generation, can provide an
+      unbound ID, and retain literal zero timestamps. No advanced predicate
+      simplification or global snapshot/uniqueness is promised. Result/depth limits,
+      target-shard rechecks (all matches for many), and rollback-certified wire
+      errors share the replacement path. 1,772 source-locked upsert executions
+      cover common frozen behavior; independent tests cover strict inference,
+      null/generated/large IDs, concurrent counters, batches and restart.
       30,489 source-locked update cases supplement transaction/wire tests: 4,008
       object-only set/unset, 4,719 min/max, 3,078 pop/rename, and 4,440 non-ID
       membership cases (object-only add-to-set paths), 4,459 push cases, and 5,573
@@ -567,7 +576,7 @@ requires an earlier dependency:
       abort without fabricated counts. First-shard provisional writes, earlier
       no-op shards, partial commits, ordered/unordered behavior, restart,
       cancellation/task-abort, and continued-session tests cover
-      this boundary. Operator/find-and-modify upserts and secondary-index post-image
+      this boundary. Find-and-modify upserts and secondary-index post-image
       validation remain open.
     - [ ] [#175](https://github.com/schapman1974/briskdb/issues/175) — filtered
       delete-one/many now use the shared matcher across Rust, native sync/async
@@ -666,12 +675,14 @@ requires an earlier dependency:
       with the basic/group-accumulator suites, replacement, and three additional
       application write/identity contracts, nested unsetting, configured-client
       read fidelity, three cross-CRUD query-validation cases, and all nine
-      non-upsert update-operator contracts, the add-to-set non-array atomicity case,
+      non-upsert update-operator contracts and both upsert-operator contracts,
+      the add-to-set non-array atomicity case,
       the complete array-update suite, and three pull/BSON-comparison cases,
       plus missing-counter, CRUD increment metadata, Decimal promotion, and
       Decimal representation/no-op contracts, plus replacement-upsert equality
-      IDs, field order, numeric aliases, and ID conflicts,
-      required CI checks exactly 238 frozen executions and
+      IDs, field order, numeric aliases, and ID conflicts, operator-upsert CRUD
+      metadata and zero-timestamp write boundaries,
+      required CI checks exactly 246 frozen executions and
       rejects missing, duplicated, substituted, or skipped cases. The full
       456-execution corpus remains separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared

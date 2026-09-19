@@ -14,6 +14,7 @@ use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
 mod pull;
 mod regex_compat;
+mod upsert;
 pub(super) use pull::PullMatcher;
 
 /// Optional value/allocation accounting for an updater sharing this matcher.

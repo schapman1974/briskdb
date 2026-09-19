@@ -33,7 +33,7 @@ impl Engine {
                 deadline,
                 move |cancellation, control| {
                     let distinct = DocumentDistinct::new(&field)?;
-                    let source = prepare_filter_route(&storage, filter, cancellation, &control)?;
+                    let source = prepare_filter_route(&storage, &filter, cancellation, &control)?;
                     let collection = storage.document_collection_controlled(
                         lookup.database(),
                         lookup.collection(),

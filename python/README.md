@@ -74,7 +74,12 @@ query ID or generating an ObjectId when the replacement omits one. Insertions
 return zero matched/modified counts and `did_upsert=True`, including null IDs;
 matches return `did_upsert=False`. Native upserts require an existing collection.
 Reply and document bounds precede insertion; same-ID races update the winner.
-Operator and find-and-modify upserts remain unsupported. Continue a
+`update_one` and `update_many` also accept `upsert=True`: positive direct/`$eq`
+equalities (including `$and` clauses and dotted object paths) seed the new document,
+then operators run. Conflicting equality paths fail before insertion; range,
+regex, and alternative predicates do not supply values. Operator timestamps stay
+literal. An unbound `_id` can be supplied by the update; otherwise one is generated
+after applying operators. Find-and-modify upserts remain unsupported. Continue a
 non-null `result["cursor_id"]` with
 `session.get_more(database, collection, cursor_id, batch_size=101)`; stop early
 with `session.kill_cursor(database, collection, cursor_id)`. Cursors belong to

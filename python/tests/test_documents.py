@@ -52,6 +52,42 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_operator_upserts_seed_results_identity_controls_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for method, identifier in [(session.update_one, None), (session.update_many, Int64(2))]:
+                        request_id = uuid.uuid4()
+                        result = method(DATABASE, COLLECTION, {"_id": identifier, "counter": 3, "seed_stamp": Timestamp(0, 0)}, {"$inc": {"counter": 2}, "$set": {"stamp": Timestamp(0, 0)}}, upsert=True, request_id=request_id)
+                        self.assertEqual((result["matched_count"], result["modified_count"], result["did_upsert"], result["request_id"]), (0, 0, True, request_id))
+                        self.assertEqual(bson_bytes({"v": result["upserted_id"]}), bson_bytes({"v": identifier}))
+                        self.assertEqual(bson_bytes(session.find(DATABASE, COLLECTION, {"_id": identifier})["documents"][0]), bson_bytes({"_id": identifier, "counter": 5, "seed_stamp": Timestamp(0, 0), "stamp": Timestamp(0, 0)}))
+                        result = method(DATABASE, COLLECTION, {"_id": identifier}, {"$inc": {"counter": 2}}, upsert=True)
+                        self.assertEqual((result["matched_count"], result["modified_count"], result["did_upsert"]), (1, 1, False))
+                    self.assertEqual(session.update_one(DATABASE, COLLECTION, {"tag": "chosen"}, {"$set": {"_id": "chosen"}}, upsert=True)["upserted_id"], "chosen")
+                    generated = session.update_many(DATABASE, COLLECTION, {"tag": "generated"}, {"$inc": {"counter": 1}}, upsert=True)
+                    self.assertIsInstance(generated["upserted_id"], ObjectId)
+                    large_id = "x" * 1_100_000
+                    self.assertEqual(session.update_one(DATABASE, COLLECTION, {"_id": large_id}, {"$inc": {"counter": 1}}, upsert=True, max_result_bytes=16 * 1024 * 1024)["upserted_id"], large_id)
+                    before = [bson_bytes(row) for row in session.find(DATABASE, COLLECTION, max_result_bytes=16 * 1024 * 1024)["documents"]]
+                    for method in (session.update_one, session.update_many):
+                        with self.assertRaises(briskdb.InvalidArgumentError):
+                            method(DATABASE, COLLECTION, {"_id": 99}, {"$set": {"_id": 98}}, upsert=True)
+                        with self.assertRaises(briskdb.InvalidQueryError):
+                            method(DATABASE, COLLECTION, {"a": 1, "a.b": 2}, {"$set": {}}, upsert=True)
+                        with self.assertRaises(briskdb.UniqueViolationError):
+                            method(DATABASE, COLLECTION, {"missing": True}, {"$set": {"_id": None}}, upsert=True)
+                        with self.assertRaises(briskdb.LimitExceededError):
+                            method(DATABASE, COLLECTION, {"_id": 99}, {"$set": {}}, upsert=True, max_result_bytes=1)
+                        token = briskdb.CancellationToken(); token.cancel()
+                        with self.assertRaises(briskdb.CancelledError):
+                            method(DATABASE, COLLECTION, {"_id": 99}, {"$set": {}}, upsert=True, cancellation=token)
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION, max_result_bytes=16 * 1024 * 1024)["documents"]], before)
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION, max_result_bytes=16 * 1024 * 1024)["documents"]], before)
+
     def test_replacement_upsert_preserves_large_native_point_ids(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=2, documents=True) as database:
@@ -358,8 +394,7 @@ class PythonDocumentApiTests(unittest.TestCase):
                     token = briskdb.CancellationToken(); token.cancel()
                     with self.assertRaises(briskdb.CancelledError):
                         session.update_many(DATABASE, COLLECTION, {}, {"$unset": {"group": 1}}, cancellation=token)
-                    with self.assertRaises(briskdb.UnsupportedError):
-                        session.update_many(DATABASE, COLLECTION, {}, expression, upsert=True)
+                    self.assertFalse(session.update_many(DATABASE, COLLECTION, {}, {"$set": {}}, upsert=True)["did_upsert"])
                     self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION)["documents"]], [bson_bytes(row) for row in before])
                     result = session.update_many(DATABASE, COLLECTION, {}, expression)
                     self.assertEqual((result["matched_count"], result["modified_count"]), (24, 11))
@@ -390,9 +425,9 @@ class PythonDocumentApiTests(unittest.TestCase):
                         session.update_one(DATABASE, COLLECTION, {}, {"$set": {"a.9999999999999999999999999": 1}})
                     with self.assertRaises(briskdb.LimitExceededError):
                         session.update_one(DATABASE, COLLECTION, {}, {"$set": {"changed": 1}}, max_result_bytes=1)
-                    for update, options in [({"$mul": {"v": 1}}, {}), ({"$set": {"v": 2}}, {"upsert": True})]:
-                        with self.assertRaises(briskdb.UnsupportedError):
-                            session.update_one(DATABASE, COLLECTION, {}, update, **options)
+                    with self.assertRaises(briskdb.UnsupportedError):
+                        session.update_one(DATABASE, COLLECTION, {}, {"$mul": {"v": 1}})
+                    self.assertFalse(session.update_one(DATABASE, COLLECTION, {}, {"$set": {}}, upsert=True)["did_upsert"])
                     token = briskdb.CancellationToken(); token.cancel()
                     with self.assertRaises(briskdb.CancelledError):
                         session.update_one(DATABASE, COLLECTION, {}, {"$set": {"v": 2}}, cancellation=token)
@@ -1672,6 +1707,21 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_operator_upserts_preserve_null_results_and_literals(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for method, identifier in [(session.update_one, None), (session.update_many, Int64(2))]:
+                        result = await method(DATABASE, COLLECTION, {"_id": identifier, "counter": 3}, {"$inc": {"counter": 2}, "$set": {"stamp": Timestamp(0, 0)}}, upsert=True)
+                        self.assertEqual((result["matched_count"], result["modified_count"], result["did_upsert"]), (0, 0, True))
+                        self.assertEqual(bson_bytes({"v": result["upserted_id"]}), bson_bytes({"v": identifier}))
+                        self.assertEqual(bson_bytes((await session.find(DATABASE, COLLECTION, {"_id": identifier}))["documents"][0]), bson_bytes({"_id": identifier, "counter": 5, "stamp": Timestamp(0, 0)}))
+                        result = await method(DATABASE, COLLECTION, {"_id": identifier}, {"$inc": {"counter": 0}}, upsert=True)
+                        self.assertEqual((result["matched_count"], result["modified_count"], result["did_upsert"]), (1, 0, False))
+                    result = await session.update_many(DATABASE, COLLECTION, {"tag": "generated"}, {"$set": {"stamp": Timestamp(0, 0)}}, upsert=True)
+                    self.assertIsInstance(result["upserted_id"], ObjectId)
+
     async def test_async_replacement_upsert_distinguishes_null_identity(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

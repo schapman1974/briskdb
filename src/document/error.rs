@@ -68,8 +68,9 @@ impl fmt::Display for DocumentMutationError {
 impl Error for DocumentMutationError {}
 
 /// Internal evidence that a failed statement has no committed document changes.
-/// Only the mutation coordinator may attach this after successful rollback and
-/// after checking that earlier shards made no changes. The original typed cause
+/// Only the mutation coordinator may attach this during preflight before any
+/// document write, or after successful rollback and verification that earlier
+/// shards made no changes. The original typed cause
 /// remains in the error chain; this is not permission to retry operational errors.
 #[derive(Debug)]
 pub(crate) struct DocumentWriteRollback {
@@ -80,7 +81,7 @@ impl DocumentWriteRollback {
     pub(crate) fn wrap(cause: EngineError) -> EngineError {
         EngineError::from_source(
             cause.kind(),
-            "document update failed after confirmed rollback",
+            "document update failed with no committed document changes",
             Self { cause },
         )
     }

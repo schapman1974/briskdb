@@ -44,6 +44,367 @@ fn inc(fields: BsonDocument) -> BsonDocument {
     doc([("$inc", BsonValue::Document(fields))])
 }
 
+fn operator_upsert(
+    filter: BsonDocument,
+    expression: BsonDocument,
+    scope: DocumentMutationScope,
+) -> DocumentCommand {
+    DocumentCommand::Update(DocumentUpdateRequest::new(
+        ns(),
+        DocumentFilter::new(filter).unwrap(),
+        DocumentUpdate::new(expression).unwrap(),
+        scope,
+        DocumentWriteOptions::new().with_upsert(true),
+    ))
+}
+
+#[tokio::test]
+async fn operator_upserts_infer_and_literals_but_skip_inference_for_matches() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    for (id, scope) in [
+        (100, DocumentMutationScope::One),
+        (200, DocumentMutationScope::Many),
+    ] {
+        let literal = BsonValue::Document(doc([("b", BsonValue::Int64(1))]));
+        let filter = doc([(
+            "$and",
+            BsonValue::Array(vec![
+                BsonValue::Document(doc([("_id", BsonValue::Int64(id))])),
+                BsonValue::Document(doc([("a", literal.clone())])),
+                BsonValue::Document(doc([(
+                    "nested.value",
+                    BsonValue::Document(doc([
+                        ("$eq", BsonValue::Int32(4)),
+                        ("$lt", BsonValue::Int32(8)),
+                    ])),
+                )])),
+                BsonValue::Document(doc([(
+                    "ignored",
+                    BsonValue::Document(doc([(
+                        "$in",
+                        BsonValue::Array(vec![BsonValue::Int32(1)]),
+                    )])),
+                )])),
+            ]),
+        )]);
+        let execution = engine
+            .execute_document(
+                &session,
+                request(
+                    operator_upsert(filter, inc(doc([("counter", BsonValue::Int32(1))])), scope),
+                    RequestContext::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        let DocumentResult::Update(result) = execution.result() else {
+            panic!("update")
+        };
+        assert!(result.did_upsert());
+        let current = rows(&engine, &session).await;
+        let row = current
+            .iter()
+            .find(|row| row.get_first("_id") == Some(&BsonValue::Int64(id)))
+            .unwrap();
+        assert!(row.representation_eq(&doc([
+            ("_id", BsonValue::Int64(id)),
+            ("a", literal.clone()),
+            (
+                "nested",
+                BsonValue::Document(doc([("value", BsonValue::Int32(4))]))
+            ),
+            ("counter", BsonValue::Int32(1)),
+        ])));
+        // These equalities overlap, but this request matches an existing row:
+        // insertion-only inference errors must not reject an ordinary update.
+        let execution = engine
+            .execute_document(
+                &session,
+                request(
+                    operator_upsert(
+                        doc([
+                            ("_id", BsonValue::Int64(id)),
+                            ("a", literal),
+                            ("a.b", BsonValue::Int32(1)),
+                        ]),
+                        inc(doc([("counter", BsonValue::Int32(1))])),
+                        scope,
+                    ),
+                    RequestContext::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        let DocumentResult::Update(result) = execution.result() else {
+            panic!("update")
+        };
+        assert_eq!(
+            (
+                result.matched_count(),
+                result.modified_count(),
+                result.did_upsert()
+            ),
+            (1, 1, false)
+        );
+    }
+}
+
+#[tokio::test]
+async fn operator_upserts_seed_equalities_keep_literal_timestamps_and_survive_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let zero = BsonValue::Timestamp(BsonTimestamp::new(0, 0));
+    for (id, scope) in [
+        (100, DocumentMutationScope::One),
+        (200, DocumentMutationScope::Many),
+    ] {
+        let filter = doc([
+            ("_id", BsonValue::Int64(id)),
+            ("counter", BsonValue::Int32(3)),
+            (
+                "values",
+                BsonValue::Array(vec![BsonValue::Int32(1), BsonValue::Int32(2)]),
+            ),
+            ("nested.source", BsonValue::from("copy")),
+            ("stamp", zero.clone()),
+            (
+                "ignored",
+                BsonValue::Document(doc([("$gt", BsonValue::Int32(99))])),
+            ),
+        ]);
+        let expression = doc([
+            (
+                "$inc",
+                BsonValue::Document(doc([("counter", BsonValue::Int32(2))])),
+            ),
+            (
+                "$pop",
+                BsonValue::Document(doc([("values", BsonValue::Int32(-1))])),
+            ),
+            (
+                "$rename",
+                BsonValue::Document(doc([(
+                    "nested.source",
+                    BsonValue::from("nested.destination"),
+                )])),
+            ),
+            (
+                "$set",
+                BsonValue::Document(doc([("literal", zero.clone())])),
+            ),
+        ]);
+        let execution = engine
+            .execute_document(
+                &session,
+                request(
+                    operator_upsert(filter, expression.clone(), scope),
+                    RequestContext::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        let DocumentResult::Update(result) = execution.result() else {
+            panic!("update")
+        };
+        assert_eq!(
+            (
+                result.matched_count(),
+                result.modified_count(),
+                result.did_upsert()
+            ),
+            (0, 0, true)
+        );
+        assert!(
+            result
+                .upserted_id()
+                .unwrap()
+                .representation_eq(&BsonValue::Int64(id))
+        );
+        let current = rows(&engine, &session).await;
+        let row = current
+            .iter()
+            .find(|row| row.get_first("_id") == Some(&BsonValue::Int64(id)))
+            .unwrap();
+        assert!(row.representation_eq(&doc([
+            ("_id", BsonValue::Int64(id)),
+            ("counter", BsonValue::Int32(5)),
+            ("values", BsonValue::Array(vec![BsonValue::Int32(2)])),
+            (
+                "nested",
+                BsonValue::Document(doc([("destination", BsonValue::from("copy"))]))
+            ),
+            ("stamp", zero.clone()),
+            ("literal", zero.clone()),
+        ])));
+        let execution = engine
+            .execute_document(
+                &session,
+                request(
+                    operator_upsert(doc([("_id", BsonValue::Int64(id))]), expression, scope),
+                    RequestContext::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        let DocumentResult::Update(result) = execution.result() else {
+            panic!("update")
+        };
+        assert_eq!(
+            (
+                result.matched_count(),
+                result.modified_count(),
+                result.did_upsert()
+            ),
+            (1, 1, false)
+        );
+    }
+    let before: Vec<_> = rows(&engine, &session)
+        .await
+        .iter()
+        .map(|row| encode_document(row).unwrap())
+        .collect();
+    for scope in [DocumentMutationScope::One, DocumentMutationScope::Many] {
+        for (filter, expression) in [
+            (
+                doc([("_id", BsonValue::Int32(900))]),
+                set(doc([("_id", BsonValue::Int32(901))])),
+            ),
+            (
+                doc([("missing", BsonValue::Boolean(true))]),
+                set(doc([("_id", BsonValue::Int32(0))])),
+            ),
+            (
+                doc([("a", BsonValue::Int32(1)), ("a.b", BsonValue::Int32(2))]),
+                set(BsonDocument::new()),
+            ),
+            (
+                doc([("_id.part", BsonValue::Int32(1))]),
+                set(BsonDocument::new()),
+            ),
+        ] {
+            assert!(
+                engine
+                    .execute_document(
+                        &session,
+                        request(
+                            operator_upsert(filter, expression, scope),
+                            RequestContext::new()
+                        )
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        for context in [
+            RequestContext::new().with_result_limits(ResultLimits::new(1, 1).unwrap()),
+            {
+                let token = CancellationToken::new();
+                token.cancel();
+                RequestContext::new().with_cancellation_token(token)
+            },
+        ] {
+            assert!(
+                engine
+                    .execute_document(
+                        &session,
+                        request(
+                            operator_upsert(
+                                doc([("_id", BsonValue::Int32(999))]),
+                                set(BsonDocument::new()),
+                                scope
+                            ),
+                            context
+                        )
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    assert_eq!(
+        rows(&engine, &session)
+            .await
+            .iter()
+            .map(|row| encode_document(row).unwrap())
+            .collect::<Vec<_>>(),
+        before
+    );
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(
+        rows(&engine, &engine.session())
+            .await
+            .iter()
+            .map(|row| encode_document(row).unwrap())
+            .collect::<Vec<_>>(),
+        before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_operator_upserts_insert_once_and_preserve_every_increment() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(root.path(), 4).await.unwrap());
+    seed(&engine, &engine.session()).await;
+    let mut workers = Vec::new();
+    for worker in 0..4 {
+        let engine = Arc::clone(&engine);
+        workers.push(tokio::spawn(async move {
+            let session = engine.session();
+            let scope = if worker % 2 == 0 {
+                DocumentMutationScope::One
+            } else {
+                DocumentMutationScope::Many
+            };
+            let mut totals = (0, 0, 0);
+            for _ in 0..8 {
+                let execution = engine
+                    .execute_document(
+                        &session,
+                        request(
+                            operator_upsert(
+                                doc([("_id", BsonValue::Int64(999))]),
+                                inc(doc([("counter", BsonValue::Int32(1))])),
+                                scope,
+                            ),
+                            RequestContext::new(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                let DocumentResult::Update(result) = execution.result() else {
+                    panic!("update")
+                };
+                totals.0 += u64::from(result.did_upsert());
+                totals.1 += result.matched_count();
+                totals.2 += result.modified_count();
+            }
+            totals
+        }));
+    }
+    let mut totals = (0, 0, 0);
+    for worker in workers {
+        let counts = worker.await.unwrap();
+        totals.0 += counts.0;
+        totals.1 += counts.1;
+        totals.2 += counts.2;
+    }
+    assert_eq!(totals, (1, 31, 31));
+    let current = rows(&engine, &engine.session()).await;
+    assert_eq!(current.len(), 25);
+    assert!(current.last().unwrap().representation_eq(&doc([
+        ("_id", BsonValue::Int64(999)),
+        ("counter", BsonValue::Int32(32))
+    ])));
+}
+
 #[tokio::test]
 async fn increment_counts_decimal_noops_images_preflight_and_restart() {
     use briskdb::document::BsonDecimal128;
