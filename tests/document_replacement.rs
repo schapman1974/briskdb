@@ -53,6 +53,281 @@ fn extrema(low: i32, high: i32) -> BsonDocument {
     ])
 }
 
+fn membership(operator: &str, values: Vec<BsonValue>) -> BsonDocument {
+    let values = BsonValue::Array(values);
+    let operand = if operator == "$addToSet" {
+        BsonValue::Document(doc([("$each", values)]))
+    } else {
+        values
+    };
+    doc([(operator, BsonValue::Document(doc([("items", operand)])))])
+}
+
+#[tokio::test]
+async fn array_membership_counts_images_atomic_errors_limits_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let add = membership(
+        "$addToSet",
+        vec![
+            BsonValue::Int64(1),
+            BsonValue::Double(1.0),
+            BsonValue::Boolean(true),
+            BsonValue::Int32(2),
+        ],
+    );
+    assert_eq!(
+        many_counts(&engine, &session, BsonDocument::new(), add.clone()).await,
+        (24, 24)
+    );
+    assert_eq!(
+        many_counts(&engine, &session, BsonDocument::new(), add).await,
+        (24, 0)
+    );
+    assert_eq!(
+        update_counts(
+            &engine,
+            &session,
+            doc([("_id", BsonValue::Int32(0))]),
+            membership("$pullAll", vec![BsonValue::Double(1.0)])
+        )
+        .await,
+        (1, 1)
+    );
+    let options = DocumentReadOptions::new()
+        .with_sort(DocumentSort::new(doc([("_id", BsonValue::Int32(-1))])).unwrap())
+        .with_projection(
+            DocumentProjection::new(doc([
+                ("items", BsonValue::Int32(1)),
+                ("_id", BsonValue::Int32(0)),
+            ]))
+            .unwrap(),
+        );
+    let before = engine
+        .execute_document(
+            &session,
+            request(
+                find_update(
+                    BsonDocument::new(),
+                    membership("$pullAll", vec![BsonValue::Int32(2)]),
+                    options.clone(),
+                    false,
+                ),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .2;
+    let DocumentResult::Document(Some(before)) = before else {
+        panic!("before image")
+    };
+    assert_eq!(
+        encode_document(&before).unwrap(),
+        encode_document(&doc([(
+            "items",
+            BsonValue::Array(vec![
+                BsonValue::Int64(1),
+                BsonValue::Boolean(true),
+                BsonValue::Int32(2)
+            ])
+        )]))
+        .unwrap()
+    );
+    let after = engine
+        .execute_document(
+            &session,
+            request(
+                find_update(
+                    doc([("_id", BsonValue::Int32(23))]),
+                    membership("$addToSet", vec![BsonValue::Int32(3)]),
+                    options,
+                    true,
+                ),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .2;
+    assert_eq!(
+        after,
+        DocumentResult::Document(Some(doc([(
+            "items",
+            BsonValue::Array(vec![
+                BsonValue::Int64(1),
+                BsonValue::Boolean(true),
+                BsonValue::Int32(3)
+            ])
+        )])))
+    );
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            membership("$pullAll", vec![BsonValue::Int32(1), BsonValue::Int32(2)])
+        )
+        .await,
+        (24, 24)
+    );
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            membership("$pullAll", vec![BsonValue::Int32(1), BsonValue::Int32(2)])
+        )
+        .await,
+        (24, 0)
+    );
+    let before = rows(&engine, &session).await;
+    for (operator, operand) in [
+        ("$addToSet", BsonValue::Null),
+        ("$pullAll", BsonValue::Array(vec![])),
+    ] {
+        let expression = doc([
+            (
+                "$set",
+                BsonValue::Document(doc([("atomic_marker", BsonValue::Boolean(true))])),
+            ),
+            (operator, BsonValue::Document(doc([("done", operand)]))),
+        ]);
+        for command in [
+            DocumentCommand::Update(update(BsonDocument::new(), expression.clone())),
+            update_many(BsonDocument::new(), expression.clone()),
+            find_update(
+                BsonDocument::new(),
+                expression.clone(),
+                DocumentReadOptions::new(),
+                true,
+            ),
+        ] {
+            assert!(
+                engine
+                    .execute_document(&session, request(command, RequestContext::new()))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    let capped = update(
+        BsonDocument::new(),
+        membership("$addToSet", vec![BsonValue::from("x".repeat(512))]),
+    )
+    .with_max_document_bytes(128)
+    .unwrap();
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(DocumentCommand::Update(capped), RequestContext::new())
+            )
+            .await
+            .is_err()
+    );
+    for after in [false, true] {
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    request(
+                        find_update(
+                            BsonDocument::new(),
+                            membership("$addToSet", vec![BsonValue::Null]),
+                            DocumentReadOptions::new(),
+                            after
+                        ),
+                        RequestContext::new().with_result_limits(ResultLimits::new(1, 1).unwrap())
+                    )
+                )
+                .await
+                .is_err()
+        );
+    }
+    let token = CancellationToken::new();
+    token.cancel();
+    assert!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    update_many(
+                        BsonDocument::new(),
+                        membership("$pullAll", vec![BsonValue::Boolean(true)])
+                    ),
+                    RequestContext::new().with_cancellation_token(token)
+                )
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(rows(&engine, &session).await, before);
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(rows(&engine, &engine.session()).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_array_membership_updates_do_not_duplicate_or_lose_values() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(root.path(), 4).await.unwrap());
+    let session = engine.session();
+    seed(&engine, &session).await;
+    for operator in ["$addToSet", "$pullAll"] {
+        let mut workers = Vec::new();
+        for worker in 0..4 {
+            let engine = Arc::clone(&engine);
+            workers.push(tokio::spawn(async move {
+                let session = engine.session();
+                let mut modified = 0;
+                for _ in 0..4 {
+                    let (matched, changed) = many_counts(
+                        &engine,
+                        &session,
+                        BsonDocument::new(),
+                        membership(
+                            operator,
+                            vec![BsonValue::Int64(worker), BsonValue::Double(worker as f64)],
+                        ),
+                    )
+                    .await;
+                    assert_eq!(matched, 24);
+                    modified += changed;
+                }
+                modified
+            }));
+        }
+        let mut modified = 0;
+        for worker in workers {
+            modified += worker.await.unwrap();
+        }
+        assert_eq!(modified, 96);
+        for row in rows(&engine, &session).await {
+            let Some(BsonValue::Array(values)) = row.get_first("items") else {
+                panic!("array")
+            };
+            let mut values = values.clone();
+            values.sort();
+            assert_eq!(
+                values,
+                if operator == "$addToSet" {
+                    (0..4).map(BsonValue::Int64).collect()
+                } else {
+                    vec![]
+                }
+            );
+            assert_eq!(row.get_first("done"), Some(&BsonValue::Boolean(false)));
+        }
+    }
+}
+
 fn pop_rename() -> BsonDocument {
     doc([
         (
