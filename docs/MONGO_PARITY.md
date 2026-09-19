@@ -43,7 +43,8 @@ ping, inspect build information, insert one or many documents, and run bounded
 find queries through the [shared BSON matcher](DOCUMENT_ENGINE.md), including
 multi-batch reads with `getMore` and explicit `killCursors` cleanup. The legacy
 `count` command, PyMongo `estimated_document_count()`, and `distinct()` also use
-this engine through both synchronous and asynchronous clients.
+this engine through both synchronous and asynchronous clients. Basic aggregation
+pipelines also use retained cursors over the shared global document engine.
 Exact `_id` and `_id: {$eq: value}` filters keep single-shard routing;
 other filters scan and merge matching documents in durable natural order unless
 an explicit sort is supplied.
@@ -62,7 +63,7 @@ before storage admission. The current option contract is:
 
 | Option | Accepted behavior |
 | --- | --- |
-| `maxTimeMS` | Nonnegative integer; a positive value narrows the 15-second command deadline. Find retains the remaining execution budget across batches; client idle time is not charged. Positive getMore values require unsupported tailable/awaitData semantics and are rejected. |
+| `maxTimeMS` | Nonnegative integer; a positive value narrows the 15-second command deadline. Find and aggregate retain the remaining execution budget across batches; client idle time is not charged. Positive getMore values require unsupported tailable/awaitData semantics and are rejected. |
 | `$readPreference` | A document containing only a recognized `mode`; the standalone engine serves the request |
 | `ordered` | Boolean; defaults to `true`, with ordered/unordered partial-failure behavior |
 | `writeConcern` | Omitted/empty, or `w` equal to 0 or 1, `j: false`, and `wtimeout: 0`; no replication or stronger durability is promised |
@@ -73,6 +74,8 @@ before storage admission. The current option contract is:
 | Find `projection` | Basic inclusion/exclusion document, dotted/nested paths, arrays, and `_id` rules; validated before missing-collection handling |
 | Find `sort` | Up to 32 ordinary fields with numeric `1`/`-1` directions; global BSON order with stable natural-order ties. Empty document preserves natural order. Metadata/expression sorts are unsupported. |
 | Find `batchSize` | Integer from 0 through 1000; zero opens an empty initial batch. Default 101. |
+| Aggregate `pipeline` / `cursor` | Required stage array and cursor document; cursor accepts only `batchSize` from 0 through 1000 (default 101). Basic match/sort/skip/limit/count stages; absent collection returns empty after validation. |
+| Aggregate `allowDiskUse` | Only `false`; there is no disk spill |
 | `getMore` `batchSize` | Integer from 1 through 1000; default 101. Pages also end at the wire byte budget. |
 | Find `singleBatch` | Boolean; `true` intentionally returns only the first batch, with cursor ID zero |
 
@@ -123,7 +126,8 @@ Concurrent writes do not have a cross-shard snapshot guarantee. Count does not
 open a cursor. Invalid queries/options fail before absent-collection handling.
 Negative legacy count limits, hints, collation, comments, and read concern are
 explicitly rejected. PyMongo `count_documents()` sends an aggregation pipeline
-and remains unsupported until the shared aggregation slice lands; the native
+ending in `$group`; that stage remains unsupported (code 115), even though basic
+`aggregate()` now works. The native
 embedded `Session.count_documents()` already uses the engine count command.
 
 Distinct uses the [shared extractor and resource bounds](DOCUMENT_ENGINE.md#distinct-values).
@@ -138,15 +142,18 @@ Required CI adds 4,888 frozen-oracle extraction/identity cases without modifying
 the full candidate command corpus or its allowlists.
 
 The shared [basic aggregation core](DOCUMENT_ENGINE.md#basic-aggregation-core)
-now validates and executes bounded materialized `$match`/`$sort`/`$skip`/`$limit`/
-`$count` pipelines over caller-provided BSON. Required CI compares 5,134 complete
-pipelines against the frozen implementation, separately from the full candidate
-command corpus. Aggregate command dispatch and retained result cursors are not
-connected yet; neither PyMongo `aggregate()` nor `count_documents()` is enabled
-by this core-only checkpoint. Expressions/projections and group accumulators
-remain separate roadmap work.
+validates `$match`/`$sort`/`$skip`/`$limit`/`$count` before reading storage. Native
+and wire aggregate commands now use incremental global execution and the normal
+cursor registry. Streaming stages retain counters, count avoids retaining source
+documents, and sort uses bounded materialization; no spill or indexed aggregation
+is promised. Required CI compares 5,134 complete pipelines in both execution
+modes against the frozen implementation, separately from the full candidate
+command corpus. Real-driver tests cover sync/async paging, empty initial batches,
+pooled-socket handoff, byte caps, cleanup, validation and restart. Hints, comments,
+collation, read concern, sessions and other unimplemented options fail explicitly.
+Expressions/projections and group accumulators remain separate roadmap work.
 
-Updates, deletes, and metadata/aggregation cursors
+Updates, deletes, and metadata cursors
 are not implemented by this checkpoint.
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required

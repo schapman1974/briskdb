@@ -130,6 +130,33 @@ impl DocumentAggregator {
         self.retained_bytes
     }
 
+    /// Consume the compiled plan into an incremental, single-use execution.
+    pub fn into_stream(self) -> DocumentAggregationStream {
+        let boundary = self
+            .stages
+            .iter()
+            .position(|stage| matches!(stage, Stage::Sort(_) | Stage::Count(_)))
+            .unwrap_or(self.stages.len());
+        DocumentAggregationStream {
+            plan: self,
+            boundary,
+            rows: Vec::new(),
+            count: 0,
+            bytes: 0,
+            steps: 0,
+            consumed: 0,
+            exhausted: false,
+            failed: false,
+        }
+    }
+
+    pub(crate) fn document_retained_bytes(
+        document: &BsonDocument,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<usize> {
+        Ok(memory::document_bytes(document, MAX_BYTES - ROW_BYTES, check)? + ROW_BYTES)
+    }
+
     pub fn execute(&self, documents: &[BsonDocument]) -> EngineResult<Vec<BsonDocument>> {
         self.execute_with_check(documents, &mut || Ok(()))
     }
@@ -160,58 +187,241 @@ impl DocumentAggregator {
                 retained_bytes,
             });
         }
-        for stage in &self.stages {
-            budget.step()?;
-            rows = match stage {
-                Stage::Match(matcher) => select(rows, &mut budget, |_, row, budget| {
-                    matcher.matches_with_check(&row.document, &mut || budget.step())
-                })?,
-                Stage::Sort(sorter) => sort(rows, sorter, &mut budget)?,
-                Stage::Skip(amount) => {
-                    select(rows, &mut budget, |index, _, _| Ok(index as u64 >= *amount))?
-                }
-                Stage::Limit(amount) => {
-                    select(
-                        rows,
-                        &mut budget,
-                        |index, _, _| Ok((index as u64) < *amount),
-                    )?
-                }
-                Stage::Count(field) => {
-                    let amount = rows.len();
-                    // Drop input before allocating a new result document.
-                    for _row in rows {
-                        budget.step()?;
-                    }
-                    if amount == 0 {
-                        Vec::new()
-                    } else {
-                        // The row bound currently guarantees Int32. Keep the
-                        // promotion explicit if that bound changes later.
-                        let value = i32::try_from(amount)
-                            .map_or_else(|_| BsonValue::Int64(amount as i64), BsonValue::Int32);
-                        let document = BsonDocument::from_entries([(field.clone(), value)])
-                            .expect("validated count field");
-                        let retained_bytes =
-                            memory::document_bytes(&document, MAX_BYTES - ROW_BYTES, &mut || {
-                                budget.step()
-                            })? + ROW_BYTES;
-                        vec![Row {
-                            document,
-                            retained_bytes,
-                        }]
-                    }
-                }
-            };
-        }
-        let mut result = Vec::new();
-        for row in rows {
-            budget.step()?;
-            result.push(row.document);
-        }
-        budget.step()?;
-        Ok(result)
+        let rows = execute_stages(&self.stages, rows, &mut budget)?;
+        output_documents(rows, &mut budget)
     }
+}
+
+/// Incremental execution of a compiled basic pipeline. Match/skip/limit stages
+/// emit at most one owned row per input; the first count retains only a counter,
+/// and the first sort buffers bounded rows. `finish` flushes any blocking stage
+/// through the remaining shared stage executor. Engine-validated source rows
+/// are moved without cloning. Public pushes copy only rows retained by a sort,
+/// so caller-reserved spare BSON capacity cannot escape retention accounting.
+///
+/// At most 65,536 consumed inputs and four million checked work steps are
+/// admitted over the entire stream, including finalization. A failed push
+/// poisons the stream, so a caller cannot convert a failed scan into a successful
+/// final result. Earlier delivered batches cannot be retracted. Callers stop
+/// reading input when `is_input_exhausted` becomes true, then call `finish`.
+pub struct DocumentAggregationStream {
+    plan: DocumentAggregator,
+    boundary: usize,
+    rows: Vec<Row>,
+    count: usize,
+    bytes: usize,
+    steps: usize,
+    consumed: usize,
+    exhausted: bool,
+    failed: bool,
+}
+
+impl fmt::Debug for DocumentAggregationStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DocumentAggregationStream")
+            .field("consumed", &self.consumed)
+            .field("failed", &self.failed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DocumentAggregationStream {
+    pub fn retained_bytes(&self) -> usize {
+        self.plan
+            .retained_bytes
+            .saturating_add(self.bytes)
+            .saturating_add(512)
+    }
+
+    pub const fn is_input_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    pub fn push(&mut self, document: BsonDocument) -> EngineResult<Option<BsonDocument>> {
+        self.push_with_check(document, &mut || Ok(()))
+    }
+
+    pub fn push_with_check(
+        &mut self,
+        document: BsonDocument,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<Option<BsonDocument>> {
+        self.push_checked(document, true, check)
+    }
+
+    pub(crate) fn push_validated_with_check(
+        &mut self,
+        document: BsonDocument,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<Option<BsonDocument>> {
+        self.push_checked(document, false, check)
+    }
+
+    fn push_checked(
+        &mut self,
+        document: BsonDocument,
+        validate: bool,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<Option<BsonDocument>> {
+        if self.failed {
+            return Err(failed_stream());
+        }
+        self.failed = true;
+        let mut budget = Budget {
+            check,
+            steps: self.steps,
+        };
+        let result = (|| {
+            budget.step()?;
+            if validate {
+                encode_document(&document)
+                    .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+            }
+            if self.exhausted {
+                return Ok(None);
+            }
+            if self.consumed == MAX_ROWS {
+                return Err(limit());
+            }
+            self.consumed += 1;
+            let retained_bytes =
+                DocumentAggregator::document_retained_bytes(&document, &mut || budget.step())?;
+            for stage in &mut self.plan.stages[..self.boundary] {
+                budget.step()?;
+                match stage {
+                    Stage::Match(matcher) => {
+                        if !matcher.matches_with_check(&document, &mut || budget.step())? {
+                            return Ok(None);
+                        }
+                    }
+                    Stage::Skip(remaining) => {
+                        if *remaining != 0 {
+                            *remaining -= 1;
+                            return Ok(None);
+                        }
+                    }
+                    Stage::Limit(remaining) => {
+                        if *remaining == 0 {
+                            self.exhausted = true;
+                            return Ok(None);
+                        }
+                        *remaining -= 1;
+                        self.exhausted |= *remaining == 0;
+                    }
+                    _ => unreachable!("prefix has no blocking stage"),
+                }
+            }
+            budget.step()?;
+            match self.plan.stages.get(self.boundary) {
+                Some(Stage::Sort(_)) => {
+                    add_bytes(&mut self.bytes, retained_bytes)?;
+                    self.rows.push(Row {
+                        document: if validate { document.clone() } else { document },
+                        retained_bytes,
+                    });
+                    Ok(None)
+                }
+                Some(Stage::Count(_)) => {
+                    self.count += 1;
+                    Ok(None)
+                }
+                None => Ok(Some(document)),
+                _ => unreachable!("boundary is the first blocking stage"),
+            }
+        })();
+        self.steps = budget.steps;
+        if result.is_ok() {
+            self.failed = false;
+        }
+        result
+    }
+
+    pub fn finish(self) -> EngineResult<Vec<BsonDocument>> {
+        self.finish_with_check(&mut || Ok(()))
+    }
+
+    pub fn finish_with_check(
+        self,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<Vec<BsonDocument>> {
+        if self.failed {
+            return Err(failed_stream());
+        }
+        let mut budget = Budget {
+            check,
+            steps: self.steps,
+        };
+        budget.step()?;
+        let rows = match self.plan.stages.get(self.boundary) {
+            Some(Stage::Sort(sorter)) => sort(self.rows, sorter, &mut budget)?,
+            Some(Stage::Count(field)) => count_row(field, self.count, &mut budget)?,
+            None => return Ok(Vec::new()),
+            _ => unreachable!("boundary is the first blocking stage"),
+        };
+        let rows = execute_stages(&self.plan.stages[self.boundary + 1..], rows, &mut budget)?;
+        output_documents(rows, &mut budget)
+    }
+}
+
+fn failed_stream() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::FailedPrecondition,
+        "document aggregation stream has failed",
+    )
+}
+
+fn execute_stages(
+    stages: &[Stage],
+    mut rows: Vec<Row>,
+    budget: &mut Budget<'_>,
+) -> EngineResult<Vec<Row>> {
+    for stage in stages {
+        budget.step()?;
+        rows = match stage {
+            Stage::Match(matcher) => select(rows, budget, |_, row, budget| {
+                matcher.matches_with_check(&row.document, &mut || budget.step())
+            })?,
+            Stage::Sort(sorter) => sort(rows, sorter, budget)?,
+            Stage::Skip(amount) => select(rows, budget, |index, _, _| Ok(index as u64 >= *amount))?,
+            Stage::Limit(amount) => {
+                select(rows, budget, |index, _, _| Ok((index as u64) < *amount))?
+            }
+            Stage::Count(field) => {
+                let amount = rows.len();
+                // Drop input before allocating a new result document.
+                for _row in rows {
+                    budget.step()?;
+                }
+                count_row(field, amount, budget)?
+            }
+        };
+    }
+    Ok(rows)
+}
+
+fn count_row(field: &str, amount: usize, budget: &mut Budget<'_>) -> EngineResult<Vec<Row>> {
+    if amount == 0 {
+        return Ok(Vec::new());
+    }
+    let value =
+        i32::try_from(amount).map_or_else(|_| BsonValue::Int64(amount as i64), BsonValue::Int32);
+    let document = BsonDocument::from_entries([(field, value)]).expect("validated count field");
+    let retained_bytes =
+        DocumentAggregator::document_retained_bytes(&document, &mut || budget.step())?;
+    Ok(vec![Row {
+        document,
+        retained_bytes,
+    }])
+}
+
+fn output_documents(rows: Vec<Row>, budget: &mut Budget<'_>) -> EngineResult<Vec<BsonDocument>> {
+    let mut result = Vec::new();
+    for row in rows {
+        budget.step()?;
+        result.push(row.document);
+    }
+    budget.step()?;
+    Ok(result)
 }
 
 struct Row {
@@ -619,5 +829,172 @@ mod tests {
         assert!(runner.execute(&[document]).is_err());
         let duplicate = doc(&[("v", BsonValue::Int32(1)), ("v", BsonValue::Int32(2))]);
         assert!(runner.execute(&[duplicate]).is_err());
+    }
+
+    #[test]
+    fn streaming_prefixes_stop_input_and_count_retains_only_a_counter() {
+        let spec = pipeline(&[
+            ("$limit", BsonValue::Int32(3)),
+            (
+                "$match",
+                BsonValue::Document(doc(&[("group", BsonValue::Int32(1))])),
+            ),
+            ("$count", BsonValue::String("private-count".into())),
+        ]);
+        let mut stream = DocumentAggregator::compile(&spec).unwrap().into_stream();
+        let bytes = stream.retained_bytes();
+        for document in rows().into_iter().take(3) {
+            assert!(stream.push(document).unwrap().is_none());
+            assert_eq!(stream.retained_bytes(), bytes);
+        }
+        assert!(stream.is_input_exhausted());
+        assert!(!format!("{stream:?}").contains("private"));
+        assert_eq!(
+            stream.finish().unwrap(),
+            [doc(&[("private-count", BsonValue::Int32(1))])]
+        );
+        let mut stream = DocumentAggregator::compile(&pipeline(&[]))
+            .unwrap()
+            .into_stream();
+        for document in rows() {
+            let before = encode_document(&document).unwrap();
+            let result = stream.push(document).unwrap().unwrap();
+            assert_eq!(encode_document(&result).unwrap(), before);
+            assert!(stream.rows.is_empty());
+        }
+        assert!(stream.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stream_push_and_finish_interruptions_poison_without_successful_finalization() {
+        for spec in [
+            pipeline(&[("$count", BsonValue::String("n".into()))]),
+            pipeline(&[
+                (
+                    "$sort",
+                    BsonValue::Document(doc(&[("group", BsonValue::Int32(-1))])),
+                ),
+                ("$limit", BsonValue::Int32(2)),
+            ]),
+        ] {
+            let mut baseline = DocumentAggregator::compile(&spec).unwrap().into_stream();
+            let document = rows().remove(0);
+            let mut push_steps = 0;
+            baseline
+                .push_with_check(document.clone(), &mut || {
+                    push_steps += 1;
+                    Ok(())
+                })
+                .unwrap();
+            let mut finish_steps = 0;
+            baseline
+                .finish_with_check(&mut || {
+                    finish_steps += 1;
+                    Ok(())
+                })
+                .unwrap();
+            for kind in [
+                EngineErrorKind::Cancelled,
+                EngineErrorKind::DeadlineExceeded,
+            ] {
+                for stop in 1..=push_steps {
+                    let mut stream = DocumentAggregator::compile(&spec).unwrap().into_stream();
+                    let mut steps = 0;
+                    assert_eq!(
+                        stream
+                            .push_with_check(document.clone(), &mut || {
+                                steps += 1;
+                                if steps == stop {
+                                    Err(EngineError::new(kind, "test interruption"))
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .unwrap_err()
+                            .kind(),
+                        kind
+                    );
+                    assert_eq!(
+                        stream.push(document.clone()).unwrap_err().kind(),
+                        EngineErrorKind::FailedPrecondition
+                    );
+                    assert_eq!(
+                        stream.finish().unwrap_err().kind(),
+                        EngineErrorKind::FailedPrecondition
+                    );
+                }
+                for stop in 1..=finish_steps {
+                    let mut stream = DocumentAggregator::compile(&spec).unwrap().into_stream();
+                    stream.push(document.clone()).unwrap();
+                    let mut steps = 0;
+                    assert_eq!(
+                        stream
+                            .finish_with_check(&mut || {
+                                steps += 1;
+                                if steps == stop {
+                                    Err(EngineError::new(kind, "test interruption"))
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .unwrap_err()
+                            .kind(),
+                        kind
+                    );
+                }
+            }
+        }
+        let mut stream = DocumentAggregator::compile(&pipeline(&[]))
+            .unwrap()
+            .into_stream();
+        stream.consumed = MAX_ROWS;
+        assert_eq!(
+            stream.push(BsonDocument::new()).unwrap_err().kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        assert!(stream.finish().is_err());
+        let mut stream = DocumentAggregator::compile(&pipeline(&[]))
+            .unwrap()
+            .into_stream();
+        stream.steps = MAX_STEPS;
+        assert_eq!(
+            stream.push(BsonDocument::new()).unwrap_err().kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        let mut stream = DocumentAggregator::compile(&pipeline(&[(
+            "$sort",
+            BsonValue::Document(doc(&[("v", BsonValue::Int32(1))])),
+        )]))
+        .unwrap()
+        .into_stream();
+        stream.bytes = MAX_BYTES;
+        assert_eq!(
+            stream.push(BsonDocument::new()).unwrap_err().kind(),
+            EngineErrorKind::LimitExceeded
+        );
+        assert!(stream.finish().is_err());
+    }
+
+    #[test]
+    fn public_stream_does_not_retain_unaccounted_caller_reserved_capacity() {
+        let mut payload = String::with_capacity(1024 * 1024);
+        payload.push('x');
+        let original = BsonDocument::from_entries([("v", BsonValue::String(payload))]).unwrap();
+        let mut stream = DocumentAggregator::compile(&pipeline(&[(
+            "$sort",
+            BsonValue::Document(doc(&[("v", BsonValue::Int32(1))])),
+        )]))
+        .unwrap()
+        .into_stream();
+        stream.push(original).unwrap();
+        let Some(BsonValue::String(value)) = stream.rows[0].document.get_first("v") else {
+            panic!("string");
+        };
+        assert!(value.capacity() < 1024);
+        assert!(stream.retained_bytes() < 4096);
+        assert_eq!(
+            stream.finish().unwrap(),
+            [doc(&[("v", BsonValue::String("x".into()))])]
+        );
     }
 }

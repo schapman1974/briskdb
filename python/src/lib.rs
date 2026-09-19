@@ -11,13 +11,14 @@ use std::{
 };
 
 use briskdb::document::{
-    DocumentCollectionExistsRequest, DocumentCollectionOptions, DocumentCommand,
-    DocumentContinueCursorRequest, DocumentCountRequest, DocumentCreateCollectionRequest,
-    DocumentCreateIndexRequest, DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
-    DocumentFilter, DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest,
-    DocumentKillCursorRequest, DocumentListCollectionsRequest, DocumentListIndexesRequest,
-    DocumentMutationScope, DocumentNamespace, DocumentProjection, DocumentReadOptions,
-    DocumentRequest, DocumentRequestId, DocumentSort, DocumentWriteOptions,
+    BsonValue, DocumentAggregateRequest, DocumentCollectionExistsRequest,
+    DocumentCollectionOptions, DocumentCommand, DocumentContinueCursorRequest,
+    DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
+    DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest, DocumentFilter,
+    DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
+    DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
+    DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentReadOptions, DocumentRequest,
+    DocumentRequestId, DocumentSort, DocumentWriteOptions,
 };
 use briskdb::{
     BriskCursor, BriskDb, BriskSession, BriskTransaction,
@@ -1665,18 +1666,66 @@ impl Session {
         )
     }
 
+    #[pyo3(signature = (database, collection, pipeline, *, batch_size = 101, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn aggregate(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        pipeline: Py<PyAny>,
+        batch_size: u64,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        if pipeline.bind(py).cast::<PyList>().is_err() {
+            return Err(crate::error::type_mismatch(
+                "aggregate pipeline must be a list",
+            ));
+        }
+        // One conversion budget covers the entire Python pipeline, not one
+        // independent heap allowance per stage. BSON conversion remains the
+        // sole authority for values, depth, cycles and exact representations.
+        let wrapper = PyDict::new(py);
+        wrapper.set_item("pipeline", pipeline.bind(py))?;
+        let wrapper = extract_bson_document(py, wrapper.as_any(), self.shared.uuid_representation)?;
+        let BsonValue::Array(values) = wrapper.into_entries().pop().expect("pipeline wrapper").1
+        else {
+            unreachable!("Python list converts to BSON array");
+        };
+        let stages = values
+            .into_iter()
+            .map(|value| match value {
+                BsonValue::Document(stage) => Ok(stage),
+                _ => Err(crate::error::type_mismatch(
+                    "aggregate stages must be documents",
+                )),
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let request = python_engine_result(DocumentAggregateRequest::new(
+            python_engine_result(DocumentNamespace::new(database, collection))?,
+            python_engine_result(DocumentPipeline::new(stages))?,
+            document_read_options(0, None, batch_size)?,
+        ))?;
+        self.execute_document_command(
+            py,
+            DocumentCommand::Aggregate(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
     #[pyo3(signature = (
-        database,
-        collection,
-        filter = None,
-        *,
-        skip = 0,
-        limit = None,
-        request_id = None,
-        timeout_ms = None,
-        cancellation = None,
-        max_result_rows = None,
-        max_result_bytes = None,
+        database, collection, filter = None, *, skip = 0, limit = None,
+        request_id = None, timeout_ms = None, cancellation = None,
+        max_result_rows = None, max_result_bytes = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn count_documents(

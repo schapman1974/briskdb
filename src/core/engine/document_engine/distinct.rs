@@ -48,6 +48,7 @@ impl Engine {
             namespace,
             collection_id,
             source,
+            aggregation: None,
             projection: None,
             sorter: None,
             sort_after: None,

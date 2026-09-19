@@ -52,6 +52,51 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_aggregate_streaming_and_sorted_cursors_keep_bson_controls_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            documents = [{"_id": Int64(index), "group": index % 3, "value": Decimal128(str(index))} for index in range(32)]
+            pipeline = [{"$sort": {"_id": -1}}, {"$match": {"group": 1}}, {"$skip": Decimal128("1.0")}, {"$limit": 6.0}]
+            before = bson_bytes({"pipeline": pipeline})
+            expected = [row for row in reversed(documents) if row["group"] == 1][1:7]
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for document in documents:
+                        session.insert_one(DATABASE, COLLECTION, document)
+                    identifier = uuid.uuid4()
+                    page = session.aggregate(DATABASE, COLLECTION, pipeline, batch_size=0, request_id=identifier)
+                    self.assertEqual(page["request_id"], identifier)
+                    self.assertEqual(page["kind"], "cursor")
+                    self.assertEqual(page["plan"]["kind"], "scatter")
+                    self.assertEqual(page["documents"], [])
+                    result = []
+                    while page["cursor_id"] is not None:
+                        page = session.get_more(DATABASE, COLLECTION, page["cursor_id"], batch_size=2)
+                        result.extend(page["documents"])
+                    self.assertEqual(bson_bytes({"rows": result}), bson_bytes({"rows": expected}))
+                    self.assertEqual(bson_bytes({"pipeline": pipeline}), before)
+                    self.assertEqual(session.aggregate(DATABASE, COLLECTION, [{"$count": "n"}])["documents"], [{"n": 32}])
+                    self.assertEqual(session.aggregate(DATABASE, COLLECTION, [{"$skip": 7}, {"$limit": 10}, {"$match": {"group": 1}}])["documents"], [row for row in documents[7:17] if row["group"] == 1])
+                    self.assertEqual(session.find(DATABASE, COLLECTION)["documents"], documents)
+                    for invalid in [None, {}, (), False, [1], ["private"]]:
+                        with self.assertRaises(briskdb.TypeMismatchError):
+                            session.aggregate(DATABASE, COLLECTION, invalid)
+                    for invalid in [[{}], [{"$limit": 0}], [{"$count": Code("private")}]]:
+                        with self.assertRaises(briskdb.BriskDBError) as raised:
+                            session.aggregate(DATABASE, COLLECTION, invalid)
+                        self.assertNotIn("private", str(raised.exception))
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.aggregate(DATABASE, COLLECTION, [], batch_size=2, max_result_rows=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.aggregate(DATABASE, COLLECTION, [], cancellation=token)
+                    page = session.aggregate(DATABASE, COLLECTION, [], batch_size=1)
+                    self.assertTrue(session.kill_cursor(DATABASE, COLLECTION, page["cursor_id"])["killed"])
+            with briskdb.open(root, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(bson_bytes({"rows": session.aggregate(DATABASE, COLLECTION, pipeline)["documents"]}), bson_bytes({"rows": expected}))
+
     def test_distinct_preserves_first_representation_paths_and_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -233,7 +278,7 @@ class PythonDocumentApiTests(unittest.TestCase):
             database.close()
 
     def test_native_document_signatures_match_the_typed_api(self) -> None:
-        for method_name in ("find", "get_more", "list_collections", "list_indexes"):
+        for method_name in ("find", "aggregate", "get_more", "list_collections", "list_indexes"):
             with self.subTest(method=method_name):
                 signature = inspect.signature(getattr(briskdb.Session, method_name))
                 self.assertEqual(signature.parameters["batch_size"].default, 101)
@@ -955,6 +1000,30 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_aggregate_paging_count_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=3, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for index in range(8):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": Int64(index)})
+                    identifier = uuid.uuid4()
+                    page = await session.aggregate(DATABASE, COLLECTION, [{"$sort": {"_id": -1}}], batch_size=2, request_id=identifier)
+                    self.assertEqual(page["request_id"], identifier)
+                    rows = page["documents"]
+                    while page["cursor_id"] is not None:
+                        page = await session.get_more(DATABASE, COLLECTION, page["cursor_id"], batch_size=2)
+                        rows.extend(page["documents"])
+                    self.assertEqual(rows, [{"_id": Int64(index)} for index in reversed(range(8))])
+                    count = await session.aggregate(DATABASE, COLLECTION, [{"$count": "n"}], max_result_rows=1, max_result_bytes=256)
+                    self.assertEqual(count["documents"], [{"n": 8}])
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.aggregate(DATABASE, COLLECTION, [], batch_size=2, max_result_rows=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        await session.aggregate(DATABASE, COLLECTION, [], cancellation=token)
+
     async def test_async_distinct_preserves_values_and_forwards_limits(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=4, documents=True) as database:

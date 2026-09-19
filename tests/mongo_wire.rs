@@ -300,7 +300,7 @@ async fn modern_discovery_ping_and_unsupported_commands() {
         matches!(body.get_first("compression"), Some(BsonValue::Array(items)) if items.is_empty())
     );
     let mut coalesced = packet(&command("ping"), 43, 0);
-    coalesced.extend_from_slice(&packet(&command("aggregate"), 44, 0));
+    coalesced.extend_from_slice(&packet(&command("unsupportedCommand"), 44, 0));
     stream.write_all(&coalesced).await.unwrap();
     assert_eq!(response(&mut stream).await.0.response_to, 43);
     let (frame, body) = response(&mut stream).await;
@@ -554,6 +554,106 @@ fn cursor_more(collection: &str, id: i64, batch: i32) -> BsonDocument {
         ("$db", BsonValue::from("wire")),
     ])
     .unwrap()
+}
+
+fn cursor_aggregate(collection: &str, batch: i32, sorted: bool) -> BsonDocument {
+    let pipeline = if sorted {
+        vec![BsonValue::Document(
+            BsonDocument::from_entries([(
+                "$sort",
+                BsonValue::Document(
+                    BsonDocument::from_entries([("_id", BsonValue::Int32(-1))]).unwrap(),
+                ),
+            )])
+            .unwrap(),
+        )]
+    } else {
+        Vec::new()
+    };
+    BsonDocument::from_entries([
+        ("aggregate", BsonValue::from(collection)),
+        ("pipeline", BsonValue::Array(pipeline)),
+        (
+            "cursor",
+            BsonValue::Document(
+                BsonDocument::from_entries([("batchSize", BsonValue::Int32(batch))]).unwrap(),
+            ),
+        ),
+        ("$db", BsonValue::from("wire")),
+    ])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn aggregate_cursors_follow_pool_handoff_disconnect_and_shared_limits() {
+    let (_root, database, mut server) = setup().await;
+    let mut writer = TcpStream::connect(server.address()).await.unwrap();
+    let documents: Vec<_> = (0..12)
+        .map(|id| BsonDocument::from_entries([("_id", BsonValue::Int32(id))]).unwrap())
+        .collect();
+    writer
+        .write_all(&insert_sequence("aggregate_items", &documents))
+        .await
+        .unwrap();
+    assert_eq!(
+        response(&mut writer).await.1.get_first("n"),
+        Some(&BsonValue::Int32(12))
+    );
+    for sorted in [false, true] {
+        let mut first = TcpStream::connect(server.address()).await.unwrap();
+        let opened =
+            send_command(&mut first, &cursor_aggregate("aggregate_items", 2, sorted)).await;
+        let id = live_cursor_id(&opened);
+        assert!(id > 0);
+        let mut second = TcpStream::connect(server.address()).await.unwrap();
+        let rejected = send_command(&mut second, &cursor_more("wrong", id, 2)).await;
+        assert_eq!(rejected.get_first("code"), Some(&BsonValue::Int32(43)));
+        assert_eq!(
+            live_cursor_id(
+                &send_command(&mut second, &cursor_more("aggregate_items", id, 2)).await
+            ),
+            id
+        );
+        first.shutdown().await.unwrap();
+        disconnected(&mut first).await;
+        assert_eq!(
+            live_cursor_id(
+                &send_command(&mut second, &cursor_more("aggregate_items", id, 2)).await
+            ),
+            id
+        );
+        second.shutdown().await.unwrap();
+        disconnected(&mut second).await;
+        assert_eq!(
+            send_command(&mut writer, &cursor_more("aggregate_items", id, 2))
+                .await
+                .get_first("code"),
+            Some(&BsonValue::Int32(43))
+        );
+    }
+    let mut ids = Vec::new();
+    for index in 0..8 {
+        let command = if index % 2 == 0 {
+            cursor_find("aggregate_items", 0)
+        } else {
+            cursor_aggregate("aggregate_items", 0, false)
+        };
+        ids.push(live_cursor_id(&send_command(&mut writer, &command).await));
+    }
+    assert!(ids.iter().all(|id| *id > 0));
+    assert_eq!(
+        send_command(&mut writer, &cursor_aggregate("aggregate_items", 0, true))
+            .await
+            .get_first("code"),
+        Some(&BsonValue::Int32(10334))
+    );
+    // Unacknowledged aggregate requests must never open an unreachable cursor.
+    let mut bytes = packet(&cursor_aggregate("aggregate_items", 0, false), 100, 2);
+    bytes.extend_from_slice(&packet(&command("ping"), 101, 0));
+    writer.write_all(&bytes).await.unwrap();
+    assert_eq!(response(&mut writer).await.0.response_to, 101);
+    server.close().await.unwrap();
+    database.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -932,6 +1032,20 @@ async fn embedded_oversized_document_returns_a_bounded_error_and_keeps_socket_us
     // The oversized document is followed by another row, so the engine retains
     // a continuation before the wire encoder rejects the batch. That error
     // must discard the cursor instead of leaking an inaccessible slot.
+    assert_eq!(
+        send_command(&mut stream, &cursor_more("items", id, 1))
+            .await
+            .get_first("code"),
+        Some(&BsonValue::Int32(10334))
+    );
+    assert_eq!(
+        send_command(&mut stream, &cursor_more("items", id, 1))
+            .await
+            .get_first("code"),
+        Some(&BsonValue::Int32(43))
+    );
+    let id = live_cursor_id(&send_command(&mut stream, &cursor_aggregate("items", 1, false)).await);
+    assert!(id > 0);
     assert_eq!(
         send_command(&mut stream, &cursor_more("items", id, 1))
             .await
