@@ -10,6 +10,56 @@ from bson import BSON, Binary, Code, Decimal128, Int64, ObjectId, Regex, Timesta
 from pymongo.errors import BulkWriteError, CollectionInvalid, DuplicateKeyError, OperationFailure
 
 
+def update_many_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
+        collection = client.wire_update_many.items
+        collection.insert_many([{"_id": Int64(i), "group": i % 2, "done": False, "array": [1, 2]} for i in range(24)])
+        expression = {"$set": {"done": True, "value": Int64(1), "stamp": Timestamp(0, 0)}, "$unset": {"array.0": 1}}
+        result = collection.update_many({"group": 0}, expression)
+        assert (result.matched_count, result.modified_count, result.upserted_id) == (12, 12, None)
+        result = collection.update_many({"group": 0}, expression)
+        assert (result.matched_count, result.modified_count) == (12, 0)
+        assert collection.update_many({"_id": 1.0}, expression).modified_count == 1
+        assert collection.update_many({"_id": 99}, expression).matched_count == 0
+        result = collection.update_many({}, expression)
+        assert (result.matched_count, result.modified_count) == (24, 11)
+        rows = list(collection.find({}))
+        assert [row["_id"] for row in rows] == list(range(24))
+        assert all(type(row["_id"]) is Int64 and type(row["value"]) is Int64 and row["array"] == [None, 2] and row["stamp"] == Timestamp(0, 0) for row in rows)
+        # Eager syntax errors are still safe indexed failures; unordered batches
+        # may continue when the failed statement never reached execution.
+        reply = client.wire_update_many.command("update", "items", ordered=False, updates=[
+            {"q": {}, "u": {"$set": {"a": 1, "a.b": 2}}, "multi": True},
+            {"q": {}, "u": {"$set": {"validated": True}}, "multi": True},
+        ])
+        assert (reply["n"], reply["nModified"]) == (24, 24)
+        assert reply["writeErrors"][0]["code"] == 40
+        # Runtime errors may follow committed shards. They must abort even an
+        # unordered batch, never claim a zero-write indexed statement failure.
+        try:
+            client.wire_update_many.command("update", "items", ordered=False, updates=[
+                {"q": {}, "u": {"$set": {"group.x": 1}}, "multi": True},
+                {"q": {}, "u": {"$set": {"must_not_run": True}}, "multi": True},
+            ])
+        except OperationFailure as error:
+            assert error.code == 28 and "writeErrors" not in error.details and "nModified" not in error.details
+        else:
+            raise AssertionError("multi runtime failure must abort the command")
+        assert collection.count_documents({"must_not_run": {"$exists": True}}) == 0
+        assert client.absent_update_many.items.update_many({}, {"$set": {"x": 1}}).matched_count == 0
+        assert "absent_update_many" not in client.list_database_names()
+        concurrent = client.wire_update_many.concurrent
+        concurrent.insert_many([{"_id": i, "done": False} for i in range(24)])
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: concurrent.update_many({"done": False}, {"$set": {"done": True}}), range(4)))
+        assert sum(result.matched_count for result in results) == sum(result.modified_count for result in results) == 24
+        assert concurrent.count_documents({"done": True}) == 24
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda i: concurrent.update_many({}, {"$set": {f"worker{i}": i}}), range(4)))
+        assert all(result.matched_count == result.modified_count == 24 for result in results)
+        assert all(all(row[f"worker{i}"] == i for i in range(4)) for row in concurrent.find({}))
+
+
 def field_update_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000) as client:
         collection = client.wire_field_update.items
@@ -62,7 +112,7 @@ def field_update_smoke(uri):
         assert reply["writeErrors"][0]["code"] == 40
         assert client.absent_field_update.items.update_one({}, {"$set": {"x": 1}}).matched_count == 0
         assert "absent_field_update" not in client.list_database_names()
-        for options in [{"multi": True}, {"upsert": True}, {"arrayFilters": []}]:
+        for options in [{"multi": "yes"}, {"upsert": True}, {"arrayFilters": []}]:
             reply = client.wire_field_update.command("update", "items", updates=[{"q": {}, "u": {"$set": {"x": 1}}, **options}])
             assert reply["writeErrors"][0]["code"] == 72
         # Leave room for the driver's monitor sockets within the listener's
@@ -1020,6 +1070,7 @@ def lifecycle_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert client.wire_update_many.items.count_documents({"validated": True}) == 24
         assert client.wire_field_update.items.find_one({"_id": 1})["field23"] == 23
         assert BSON.encode(client.wire_find_replace.items.find_one({"_id": 10})) == BSON.encode({"_id": Int64(10), "value": "persisted", "hidden": True})
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
@@ -1150,6 +1201,14 @@ def metadata_smoke(uri):
 
 
 async def async_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.async_update_many.items
+        await collection.insert_many([{"_id": Int64(i), "value": 1} for i in range(6)])
+        result = await collection.update_many({}, {"$set": {"value": Int64(1)}})
+        assert (result.matched_count, result.modified_count) == (6, 6)
+        assert (await collection.update_many({}, {"$set": {"value": Int64(1)}})).modified_count == 0
+        assert (await collection.update_many({"_id": 3.0}, {"$unset": {"value": 1}})).modified_count == 1
+        assert await collection.find_one({"_id": 3}) == {"_id": Int64(3)}
     async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         collection = client.async_field_update.items
         await collection.insert_one({"_id": Int64(1), "value": 1, "keep": True})
@@ -1307,6 +1366,7 @@ if __name__ == "__main__":
         find_delete_smoke(sys.argv[1])
         replacement_smoke(sys.argv[1])
         field_update_smoke(sys.argv[1])
+        update_many_smoke(sys.argv[1])
         find_replace_smoke(sys.argv[1])
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

@@ -340,6 +340,12 @@ class AsyncSession:
         timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
         max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
     ) -> UpdateResult: ...
+    async def update_many(
+        self, database: str, collection: str, filter: BsonDocument, update: BsonDocument, *,
+        upsert: bool = False, request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> UpdateResult: ...
     async def find_one_and_delete(
         self,
         database: str,

@@ -19,6 +19,7 @@ mod distinct;
 mod metadata;
 mod single_mutation;
 mod sorting;
+mod update_many;
 
 use super::document_cursor::{
     AggregateCursor, AggregateRow, CursorSource as PreparedFilterRoute, CursorState,

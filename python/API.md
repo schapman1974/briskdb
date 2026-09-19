@@ -66,6 +66,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `find_one_and_delete(database, collection, filter, *, projection=None, sort=None, ...)`
 - `replace_one(database, collection, filter, replacement, *, upsert=False, ...)`
 - `update_one(database, collection, filter, update, *, upsert=False, ...)`
+- `update_many(database, collection, filter, update, *, upsert=False, ...)`
 - `find_one_and_replace(database, collection, filter, replacement, *, projection=None, sort=None, return_document=False, upsert=False, ...)`
 
 Both delete methods accept the shared BSON filters and return an acknowledged
@@ -99,10 +100,18 @@ matching document atomically on its shard. This checkpoint supports `$set` and
 Untouched fields/types/order survive; operator-assigned zero timestamps stay
 literal. Missing unset paths are no-ops; unsetting an array slot leaves null.
 Invalid paths, conflicting prefixes, changed/removed IDs, or post-image/result
-limits fail before writing. Positional paths, other operators, `update_many`,
+limits fail before writing. Positional paths, other operators,
 and `upsert=True` remain unsupported. The normal controls and existing native
 missing-collection precondition apply. See the shared
 [field-update boundaries](../docs/DOCUMENT_ENGINE.md#field-updates-and-single-record-write-boundaries).
+
+`update_many` uses the same operators and controls, returning aggregate matched
+and modified counts on success. It commits one shard-local transaction at a time.
+A failure rolls back the current shard, but earlier commits remain. Cancellation
+and task abort have the same partial-commit boundary; callers receive an error,
+not guessed partial counts. There is no cross-shard snapshot/transaction or exact
+MongoDB per-document failure-atomicity claim. Result/plan delivery limits are
+checked before the first write, and exact-ID filters remain point-routed.
 
 `find_one_and_replace` returns `kind="document"` with the projected original
 document by default, or the projected post-image with `return_document=True`.

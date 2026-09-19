@@ -39,6 +39,286 @@ fn set(fields: BsonDocument) -> BsonDocument {
     doc([("$set", BsonValue::Document(fields))])
 }
 
+fn update_many(filter: BsonDocument, expression: BsonDocument) -> DocumentCommand {
+    DocumentCommand::Update(DocumentUpdateRequest::new(
+        ns(),
+        DocumentFilter::new(filter).unwrap(),
+        DocumentUpdate::new(expression).unwrap(),
+        DocumentMutationScope::Many,
+        DocumentWriteOptions::new(),
+    ))
+}
+
+async fn many_counts(
+    engine: &Engine,
+    session: &Session,
+    filter: BsonDocument,
+    expression: BsonDocument,
+) -> (u64, u64) {
+    let execution = engine
+        .execute_document(
+            session,
+            request(update_many(filter, expression), RequestContext::new()),
+        )
+        .await
+        .unwrap();
+    let DocumentResult::Update(result) = execution.into_parts().2 else {
+        panic!("update result")
+    };
+    (result.matched_count(), result.modified_count())
+}
+
+fn shard_rows(connection: &Connection) -> Vec<BsonDocument> {
+    connection
+        .prepare("SELECT document_bson FROM briskdb_documents_v1 ORDER BY natural_order")
+        .unwrap()
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .map(|bytes| briskdb::document::decode_document(&bytes.unwrap()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn update_many_counts_filters_noops_point_routes_and_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let expression = set(doc([
+        ("done", BsonValue::Boolean(true)),
+        ("value", BsonValue::Int64(1)),
+    ]));
+    let filter = doc([("group", BsonValue::Int32(0))]);
+    assert_eq!(
+        many_counts(&engine, &session, filter.clone(), expression.clone()).await,
+        (12, 12)
+    );
+    assert_eq!(
+        many_counts(&engine, &session, filter, expression.clone()).await,
+        (12, 0)
+    );
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            doc([("_id", BsonValue::Double(1.0))]),
+            expression.clone()
+        )
+        .await,
+        (1, 1)
+    );
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            doc([("_id", BsonValue::Int32(-1))]),
+            expression.clone()
+        )
+        .await,
+        (0, 0)
+    );
+    assert_eq!(
+        many_counts(&engine, &session, BsonDocument::new(), expression).await,
+        (24, 11)
+    );
+    assert_eq!(
+        many_counts(
+            &engine,
+            &session,
+            BsonDocument::new(),
+            doc([(
+                "$unset",
+                BsonValue::Document(doc([("group", BsonValue::Null)]))
+            )])
+        )
+        .await,
+        (24, 24)
+    );
+    let expected = rows(&engine, &session).await;
+    for (index, row) in expected.iter().enumerate() {
+        assert_eq!(row.get_first("_id"), Some(&BsonValue::Int32(index as i32)));
+        assert!(matches!(row.get_first("value"), Some(BsonValue::Int64(1))));
+        assert!(row.get_first("group").is_none());
+    }
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(rows(&engine, &engine.session()).await, expected);
+}
+
+#[tokio::test]
+async fn update_many_eager_validation_and_result_limits_precede_first_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let before = rows(&engine, &session).await;
+    let expression = set(doc([("done", BsonValue::Boolean(true))]));
+    for context in [
+        RequestContext::new().with_result_limits(ResultLimits::new(1, 1).unwrap()),
+        RequestContext::new().with_deadline(Instant::now() - Duration::from_secs(1)),
+    ] {
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    request(
+                        update_many(BsonDocument::new(), expression.clone()),
+                        context
+                    )
+                )
+                .await
+                .is_err()
+        );
+    }
+    for filter in [BsonDocument::new(), doc([("_id", BsonValue::Int32(-1))])] {
+        assert!(
+            engine
+                .execute_document(
+                    &session,
+                    request(
+                        update_many(
+                            filter,
+                            set(doc([("a", BsonValue::Null), ("a.b", BsonValue::Null)]))
+                        ),
+                        RequestContext::new()
+                    )
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(rows(&engine, &session).await, before);
+}
+
+#[tokio::test]
+async fn update_many_validation_rolls_back_current_shard_but_preserves_prior_commits() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let shards: Vec<_> = (0..4)
+        .map(|shard| {
+            Connection::open(root.path().join(format!("shards/{shard:04}.sqlite"))).unwrap()
+        })
+        .collect();
+    let last = shard_rows(&shards[3]).pop().unwrap();
+    update_counts(
+        &engine,
+        &session,
+        doc([("_id", last.get_first("_id").unwrap().clone())]),
+        set(doc([("target", BsonValue::Int32(1))])),
+    )
+    .await;
+    let before = shard_rows(&shards[3]);
+    assert!(before.len() > 1);
+    let error = engine
+        .execute_document(
+            &session,
+            request(
+                update_many(
+                    BsonDocument::new(),
+                    set(doc([
+                        ("done", BsonValue::Boolean(true)),
+                        ("target.x", BsonValue::Int32(1)),
+                    ])),
+                ),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+    for shard in &shards[..3] {
+        let rows = shard_rows(shard);
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|row| row.get_first("done") == Some(&BsonValue::Boolean(true)))
+        );
+    }
+    assert_eq!(shard_rows(&shards[3]), before);
+    assert_eq!(rows(&engine, &session).await.len(), 24);
+    let expected = rows(&engine, &session).await;
+    drop(shards);
+    drop(session);
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    assert_eq!(rows(&engine, &engine.session()).await, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_many_cancellation_and_abort_keep_prior_commits_and_release_locks() {
+    for abort in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::open(root.path(), 2).await.unwrap();
+        let session = Arc::new(engine.session());
+        seed(&engine, &session).await;
+        let first = Connection::open(root.path().join("shards/0000.sqlite")).unwrap();
+        let mut second = Connection::open(root.path().join("shards/0001.sqlite")).unwrap();
+        let blocker = second
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let before = shard_rows(&blocker);
+        assert!(!before.is_empty());
+        let cancellation = CancellationToken::new();
+        let task_engine = engine.clone();
+        let task_session = Arc::clone(&session);
+        let context = RequestContext::new().with_cancellation_token(cancellation.clone());
+        let task = tokio::spawn(async move {
+            task_engine
+                .execute_document(
+                    &task_session,
+                    request(
+                        update_many(
+                            BsonDocument::new(),
+                            set(doc([("done", BsonValue::Boolean(true))])),
+                        ),
+                        context,
+                    ),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if shard_rows(&first)
+                    .iter()
+                    .all(|row| row.get_first("done") == Some(&BsonValue::Boolean(true)))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if abort {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            cancellation.cancel();
+            assert_eq!(
+                task.await.unwrap().unwrap_err().kind(),
+                EngineErrorKind::Cancelled
+            );
+        }
+        assert_eq!(shard_rows(&blocker), before);
+        blocker.rollback().unwrap();
+        assert_eq!(
+            many_counts(
+                &engine,
+                &session,
+                BsonDocument::new(),
+                set(doc([("done", BsonValue::Boolean(true))]))
+            )
+            .await,
+            (24, before.len() as u64)
+        );
+    }
+}
+
 async fn update_counts(
     engine: &Engine,
     session: &Session,

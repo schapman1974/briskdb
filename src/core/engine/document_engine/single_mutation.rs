@@ -75,11 +75,6 @@ impl Engine {
     ) -> EngineResult<DocumentExecution> {
         let max_document_bytes = request.max_document_bytes();
         let (namespace, filter, update, scope, options) = request.into_parts();
-        if scope != DocumentMutationScope::One {
-            return Err(unsupported(
-                "multi-document operator updates are not implemented",
-            ));
-        }
         require_replacement_options(options)?;
         let updater = self
             .run_document_storage_task(
@@ -92,6 +87,22 @@ impl Engine {
                 },
             )
             .await?;
+        let updater = Arc::new(updater);
+        if scope == DocumentMutationScope::Many {
+            return self
+                .run_document_update_many(
+                    owner,
+                    request_id,
+                    namespace,
+                    filter,
+                    updater,
+                    max_document_bytes,
+                    cancellation,
+                    deadline,
+                    limits,
+                )
+                .await;
+        }
         self.run_document_single_mutation(
             owner,
             request_id,
@@ -99,7 +110,7 @@ impl Engine {
             filter,
             DocumentReadOptions::new(),
             Mutation::Update {
-                updater: Arc::new(updater),
+                updater,
                 max_document_bytes,
             },
             cancellation,
@@ -464,17 +475,12 @@ fn mutate_record(
                     mutation.no_match(),
                 ));
             };
-            let post_image = updater.apply_with_check(record.document(), &mut || {
-                ensure_document_cpu_active(cancellation, control)
-            })?;
-            write_post_image(
+            update_record(
                 storage,
                 transaction,
                 record,
-                post_image,
+                updater,
                 *max_document_bytes,
-                ReplacementReturn::Counts,
-                projection,
                 request_id,
                 plan,
                 limits,
@@ -512,6 +518,38 @@ fn mutate_record(
             control,
         ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn update_record(
+    storage: &Storage,
+    transaction: &Transaction<'_>,
+    record: DocumentStorageRecord,
+    updater: &DocumentUpdater,
+    max_document_bytes: usize,
+    request_id: DocumentRequestId,
+    plan: DocumentPlan,
+    limits: ResultLimits,
+    cancellation: &CancellationToken,
+    control: &OperationControl,
+) -> EngineResult<DocumentExecution> {
+    let post_image = updater.apply_with_check(record.document(), &mut || {
+        ensure_document_cpu_active(cancellation, control)
+    })?;
+    write_post_image(
+        storage,
+        transaction,
+        record,
+        post_image,
+        max_document_bytes,
+        ReplacementReturn::Counts,
+        None,
+        request_id,
+        plan,
+        limits,
+        cancellation,
+        control,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

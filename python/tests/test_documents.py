@@ -52,6 +52,38 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_update_many_counts_controls_and_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for i in range(24):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": Int64(i), "group": i % 2, "v": 1})
+                    identifier = uuid.uuid4()
+                    expression = {"$set": {"v": Int64(1), "stamp": Timestamp(0, 0)}}
+                    result = session.update_many(DATABASE, COLLECTION, {"group": 0}, expression, request_id=identifier)
+                    self.assertEqual((result["matched_count"], result["modified_count"], result["request_id"], result["upserted_id"]), (12, 12, identifier, None))
+                    self.assertEqual(session.update_many(DATABASE, COLLECTION, {"group": 0}, expression)["modified_count"], 0)
+                    self.assertEqual(session.update_many(DATABASE, COLLECTION, {"_id": 1.0}, expression)["modified_count"], 1)
+                    self.assertEqual(session.update_many(DATABASE, COLLECTION, {"_id": 99}, expression)["matched_count"], 0)
+                    before = session.find(DATABASE, COLLECTION)["documents"]
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.update_many(DATABASE, COLLECTION, {}, {"$unset": {"group": 1}}, max_result_bytes=1)
+                    with self.assertRaises(briskdb.InvalidArgumentError):
+                        session.update_many(DATABASE, COLLECTION, {}, {"$set": {"v.x": 2}})
+                    token = briskdb.CancellationToken(); token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.update_many(DATABASE, COLLECTION, {}, {"$unset": {"group": 1}}, cancellation=token)
+                    with self.assertRaises(briskdb.UnsupportedError):
+                        session.update_many(DATABASE, COLLECTION, {}, expression, upsert=True)
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION)["documents"]], [bson_bytes(row) for row in before])
+                    result = session.update_many(DATABASE, COLLECTION, {}, expression)
+                    self.assertEqual((result["matched_count"], result["modified_count"]), (24, 11))
+                    expected = session.find(DATABASE, COLLECTION)["documents"]
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual([bson_bytes(row) for row in session.find(DATABASE, COLLECTION)["documents"]], [bson_bytes(row) for row in expected])
+
     def test_update_one_preserves_fields_and_preflights_failures(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -1376,6 +1408,26 @@ class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(briskdb.CancelledError):
                         await session.find_one_and_replace(DATABASE, COLLECTION, {}, {}, cancellation=token)
                     self.assertIsNone((await session.find_one_and_replace(DATABASE, COLLECTION, {"_id": 99}, {}))["document"])
+
+    async def test_async_update_many_forwards_values_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for i in range(6):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": Int64(i), "v": 1})
+                    identifier = uuid.uuid4()
+                    expression = {"$set": {"v": Int64(1)}}
+                    result = await session.update_many(DATABASE, COLLECTION, {}, expression, request_id=identifier)
+                    self.assertEqual((result["matched_count"], result["modified_count"], result["request_id"]), (6, 6, identifier))
+                    self.assertEqual((await session.update_many(DATABASE, COLLECTION, {}, expression))["modified_count"], 0)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.update_many(DATABASE, COLLECTION, {}, {"$unset": {"v": 1}}, max_result_bytes=1)
+                    token = briskdb.CancellationToken(); token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        await session.update_many(DATABASE, COLLECTION, {}, {"$unset": {"v": 1}}, cancellation=token)
+                    result = await session.update_many(DATABASE, COLLECTION, {}, {"$unset": {"v": 1}})
+                    self.assertEqual((result["matched_count"], result["modified_count"]), (6, 6))
 
     async def test_async_update_one_forwards_values_and_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
