@@ -19,7 +19,7 @@ CI and byte-compares the normalized result with the checked-in reference. The
 full report remains `reference-only`; partial candidate coverage is not folded
 into that report or treated as full parity.
 
-Required CI separately runs 224 exact sync/async executions in the frozen
+Required CI separately runs 238 exact sync/async executions in the frozen
 `test_aggregation_basic_stages_contract`, `test_aggregation_projection_stages_contract`,
 `test_aggregation_contract`, `test_group_accumulators_contract`, and
 `test_client_read_fidelity_contract` modules,
@@ -33,7 +33,8 @@ plus the complete `test_array_update_contract` suite, the add-to-set non-array
 atomicity case through both update-one/update-many, and three BSON comparison
 cases covering pull ranges, missing/array paths, and embedded IDs,
 plus missing-counter and CRUD increment metadata cases and two Decimal128
-increment promotion/representation contracts,
+increment promotion/representation contracts, plus replacement-upsert equality
+IDs (four parameter cases), ID-first order, numeric ID aliases, and ID conflicts,
 against a real four-shard BriskDB listener.
 It uses the unchanged BriskDB PyMongo adapter, including ordinary database-drop
 cleanup. The JUnit result is checked against the exact locked case/API set;
@@ -304,16 +305,33 @@ Missing namespaces return null without creation after eager validation. Native
 sync/async Python exposes `find_one_and_update` with identical image semantics.
 
 Wire `update` supports replacement statements and `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`/`$inc` operator
-statements (`q` and a document `u`,
-`upsert:false`) through shared `Replace`/`Update`. Only operator documents accept
+statements (`q` and a document `u`) through shared `Replace`/`Update`.
+Replacement statements additionally accept boolean `upsert:true`; operator
+statements still require absent/false upsert. Only operator documents accept
 `multi:true`; replacement remains single-document. Both body arrays and
 OP_MSG `updates` sequences preserve ordered/unordered per-statement errors and
 `n`/`nModified`; an immutable-ID violation is code 66. Missing collections return
-zero only after eager validation, without creating metadata. Normalized
+zero only after eager validation, without creating metadata, unless a replacement
+upsert requests namespace creation. Normalized
 post-images, including retained IDs, must fit the advertised 512 KiB BSON cap
 before mutation. Existing bounded write-concern and one-way write handling apply.
 Batch statements commit independently; operational failure may leave previous
 commits, so no all-or-nothing batch or retryable-write guarantee is implied.
+
+Replacement upserts retain a direct/sole-`$eq` query ID (not regex), prefer a
+BSON-equal replacement ID's exact representation, or generate an ObjectId.
+Other query fields are not copied. Insertions report `n:1`, `nModified:0`, and
+`upserted:[{index, _id}]`, including null IDs; matches report normal counts without
+an upsert entry. PyMongo's null-ID `matched_count` is 1 despite an insertion;
+`did_upsert` and the raw result distinguish it. Native counts remain 0/0 on insert.
+Same-ID races recheck under the target shard's write lock. Duplicate errors are
+indexed code 11000 and follow ordered/unordered continuation. Whole-batch reply
+headroom and returned-ID depth are preflighted before each document commit;
+oversized IDs cannot silently insert and then fail reply encoding. Tests cover
+null/generated IDs, exact BSON, concurrency, mixed batches, large-ID sequence
+budgets, reply-depth rejection, one-way writes, and restart. Non-ID predicates
+do not gain cross-shard uniqueness or global snapshot semantics.
+
 Multi updates commit one immediate transaction per shard, scanning bounded
 records in natural order. A runtime failure rolls back that shard but can leave
 earlier shards committed. Only explicit successful rollback plus zero earlier
@@ -329,7 +347,7 @@ shards, checking exact data after restart. The frozen add-to-set atomicity case
 now passes unchanged in both API modes. This remains neither a global
 transaction/snapshot nor exact MongoDB per-document or frozen TinyMongo
 collection-wide failure atomicity. No reference/allowance is changed.
-Other operators/pipeline updates, upserts, and update-command
+Other operators/pipeline updates, operator/find-and-modify upserts, and update-command
 hint/sort/collation/arrayFilters remain explicit future work. Native sync/async
 Python exposes `replace_one`, `update_one`, and `update_many` with the same engine semantics and
 controls. The field-update subset includes bounded object/array paths, immutable

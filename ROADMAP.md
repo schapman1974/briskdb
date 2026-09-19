@@ -516,7 +516,15 @@ requires an earlier dependency:
       timestamps are stamped, nested values are preserved. Rust, native sync/async
       Python, and ordered/unordered wire replacement batches share this path.
       Result/post-image limits and immutable-ID checks precede commit. No global
-      snapshot is claimed. Shared `update_one`/`update_many` support
+      snapshot is claimed. Replacement upserts now infer direct/sole-equality IDs,
+      preserve null and numeric representations, or generate ObjectIds. Same-ID
+      races recheck under the target shard lock; result/post-image limits and
+      returned-ID depth precede commit. Wire batches preflight aggregate reply
+      budgets, preserve indexed upsert metadata/duplicate errors, and create
+      missing namespaces; native calls require existing collections. Both expose
+      unambiguous upsert presence, with native counts 0/0 on insertion.
+      Mixed batches, deep/large IDs, one-way writes, concurrency, and restart
+      are covered. Shared `update_one`/`update_many` support
       `$set`/`$unset`/`$min`/`$max`/`$pop`/`$rename`/`$addToSet`/`$pullAll`/`$push`/`$pull`/`$inc`
       across all three adapters, with object/array paths, eager conflict checks,
       immutable IDs, exact modified counts, bounded growth, and literal timestamps.
@@ -559,7 +567,7 @@ requires an earlier dependency:
       abort without fabricated counts. First-shard provisional writes, earlier
       no-op shards, partial commits, ordered/unordered behavior, restart,
       cancellation/task-abort, and continued-session tests cover
-      this boundary. Upsert and secondary-index post-image
+      this boundary. Operator/find-and-modify upserts and secondary-index post-image
       validation remain open.
     - [ ] [#175](https://github.com/schapman1974/briskdb/issues/175) — filtered
       delete-one/many now use the shared matcher across Rust, native sync/async
@@ -661,8 +669,9 @@ requires an earlier dependency:
       non-upsert update-operator contracts, the add-to-set non-array atomicity case,
       the complete array-update suite, and three pull/BSON-comparison cases,
       plus missing-counter, CRUD increment metadata, Decimal promotion, and
-      Decimal representation/no-op contracts,
-      required CI checks exactly 224 frozen executions and
+      Decimal representation/no-op contracts, plus replacement-upsert equality
+      IDs, field order, numeric aliases, and ID conflicts,
+      required CI checks exactly 238 frozen executions and
       rejects missing, duplicated, substituted, or skipped cases. The full
       456-execution corpus remains separate open work.
     - [ ] [#176](https://github.com/schapman1974/briskdb/issues/176) — shared

@@ -68,7 +68,13 @@ and `$slice` in fixed insertion-sort-slice order, with bounded growth and stable
 whole-BSON/document-field sorting. Pull removes literal values or applies bounded
 query predicates to array members without creating missing fields. Increment
 preserves numeric width, rejects integer overflow, handles Decimal128 promotion
-and rounded no-ops, and safely updates concurrent counters. Continue a
+and rounded no-ops, and safely updates concurrent counters.
+`replace_one(..., upsert=True)` inserts on no match, retaining an equality-bound
+query ID or generating an ObjectId when the replacement omits one. Insertions
+return zero matched/modified counts and `did_upsert=True`, including null IDs;
+matches return `did_upsert=False`. Native upserts require an existing collection.
+Reply and document bounds precede insertion; same-ID races update the winner.
+Operator and find-and-modify upserts remain unsupported. Continue a
 non-null `result["cursor_id"]` with
 `session.get_more(database, collection, cursor_id, batch_size=101)`; stop early
 with `session.kill_cursor(database, collection, cursor_id)`. Cursors belong to
@@ -82,7 +88,7 @@ Pass `sort={"priority": -1, "_id": 1}` for global BSON sorting before skip/limit
 and projection; the sort persists across cursor batches. Stable ties use natural
 order. Sorted pages use bounded key windows and rescan until sorted indexes
 exist; large skips may need repeated scans. Secondary indexes remain `pending_build`;
-other update operators, upserts, additional aggregation expressions, and bulk-write
+other update operators, remaining upsert forms, additional aggregation expressions, and bulk-write
 Python helpers remain future work. Multi-delete/update commit one shard at a time;
 failure rolls back the current shard, not earlier commits. See the
 [write boundaries](../docs/DOCUMENT_ENGINE.md#field-updates-and-single-record-write-boundaries).

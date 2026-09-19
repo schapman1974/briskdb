@@ -135,6 +135,7 @@ class UpdateResult(DocumentExecution):
     matched_count: int
     modified_count: int
     upserted_id: Any
+    did_upsert: bool
 
 class CloseReport(TypedDict):
     already_closed: bool

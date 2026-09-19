@@ -615,12 +615,11 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                         Some(BsonValue::Boolean(true)) => true,
                         _ => return Err(CommandError::options()),
                     };
-                    if statement
-                        .get_first("upsert")
-                        .is_some_and(|value| !matches!(value, BsonValue::Boolean(false)))
-                    {
-                        return Err(CommandError::options());
-                    }
+                    let upsert = match statement.get_first("upsert") {
+                        None | Some(BsonValue::Boolean(false)) => false,
+                        Some(BsonValue::Boolean(true)) => true,
+                        _ => return Err(CommandError::options()),
+                    };
                     let Some(BsonValue::Document(filter)) = statement.get_first("q") else {
                         return Err(CommandError::invalid());
                     };
@@ -641,6 +640,9 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                         .next()
                         .is_some_and(|(name, _)| name.starts_with('$'))
                     {
+                        if upsert {
+                            return Err(CommandError::options()); // Operator upserts follow separately.
+                        }
                         DocumentUpdater::compile_with_check(replacement, &mut || {
                             if started.elapsed() >= timeout {
                                 Err(EngineError::deadline_exceeded(
@@ -673,7 +675,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                             namespace.clone(),
                             DocumentFilter::new(filter.clone())?,
                             replacement.clone(),
-                            DocumentWriteOptions::new(),
+                            DocumentWriteOptions::new().with_upsert(upsert),
                         )?
                         .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES)?,
                     ))
@@ -1388,6 +1390,19 @@ impl Executor {
                 let mut matched = 0i64;
                 let mut modified = 0i64;
                 let mut errors = Vec::new();
+                let has_upserts = updates.iter().any(|update| {
+                    matches!(update,
+                    Ok(DocumentCommand::Replace(request)) if request.write_options().upsert())
+                });
+                // Reserve fixed error/entry envelopes for the entire bounded
+                // batch. Engine result limits then preflight each potentially
+                // large returned ID before its document can commit.
+                let reply_reserve = 4096 + updates.len() * 256;
+                let mut upserted = Vec::new();
+                let mut upserted_bytes = 0;
+                upserted.try_reserve_exact(updates.len()).map_err(|_| {
+                    CommandError::new(10334, "BSONObjectTooLarge", "update result budget exceeded")
+                })?;
                 for (index, update) in updates.into_iter().enumerate() {
                     let mut safe_statement_error = true;
                     let result = match update {
@@ -1399,16 +1414,48 @@ impl Executor {
                                 DocumentCommand::Update(request) => request.namespace(),
                                 _ => unreachable!("parsed update statement"),
                             };
-                            if !self.exists(session, identity, &context, namespace).await? {
+                            let upsert = matches!(&update, DocumentCommand::Replace(request) if request.write_options().upsert());
+                            if upsert {
+                                self.ensure_collection(session, identity, &context, namespace)
+                                    .await?;
+                            } else if !self.exists(session, identity, &context, namespace).await? {
                                 continue;
                             }
-                            self.call(session, identity, &context, update).await
+                            let statement_context = if has_upserts {
+                                let remaining = wire::MAX_BOOTSTRAP_BSON_BYTES
+                                    .saturating_sub(reply_reserve + upserted_bytes)
+                                    .max(1);
+                                context.clone().with_result_limits(
+                                    ResultLimits::new(1000, remaining as u64)
+                                        .expect("positive bounded result"),
+                                )
+                            } else {
+                                context.clone()
+                            };
+                            self.call(session, identity, &statement_context, update)
+                                .await
                         }
                     };
                     match result {
                         Ok(DocumentResult::Update(result)) => {
-                            matched += result.matched_count() as i64;
-                            modified += result.modified_count() as i64;
+                            let (count, changed, id) = result.into_parts();
+                            matched += count as i64;
+                            modified += changed as i64;
+                            if let Some(id) = id {
+                                matched += 1; // Wire n includes inserted upserts, including null IDs.
+                                let entry = fields([
+                                    ("index", BsonValue::Int32(index as i32)),
+                                    ("_id", id),
+                                ]);
+                                upserted_bytes += encode_document_with_options(
+                                    &entry,
+                                    &BsonCodecOptions::new()
+                                        .with_max_document_bytes(wire::MAX_BOOTSTRAP_BSON_BYTES),
+                                )
+                                .map_err(|_| CommandError::invalid())?
+                                .len();
+                                upserted.push(BsonValue::Document(entry));
+                            }
                         }
                         Ok(_) => {
                             return Err(CommandError::new(
@@ -1430,6 +1477,7 @@ impl Executor {
                                         | 66
                                         | 72
                                         | 10334
+                                        | 11000
                                         | 115
                                         | 224
                                         | 51075
@@ -1459,6 +1507,10 @@ impl Executor {
                 ]);
                 if !errors.is_empty() {
                     body.push("writeErrors", BsonValue::Array(errors))
+                        .expect("static field name");
+                }
+                if !upserted.is_empty() {
+                    body.push("upserted", BsonValue::Array(upserted))
                         .expect("static field name");
                 }
                 Ok(body)

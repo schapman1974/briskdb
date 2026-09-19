@@ -1,5 +1,7 @@
 //! Atomic shard-local single-record mutations with preflighted results.
 
+mod replacement_upsert;
+
 use super::*;
 use crate::{
     document::{
@@ -211,6 +213,18 @@ impl Engine {
         deadline: Option<Instant>,
         limits: ResultLimits,
     ) -> EngineResult<DocumentExecution> {
+        if request.write_options().upsert() {
+            return self
+                .run_document_replacement_upsert(
+                    owner,
+                    request_id,
+                    request,
+                    cancellation,
+                    deadline,
+                    limits,
+                )
+                .await;
+        }
         let max_document_bytes = request.max_document_bytes();
         let (namespace, filter, replacement, options) = request.into_parts();
         require_replacement_options(options)?;

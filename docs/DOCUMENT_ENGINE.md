@@ -76,7 +76,7 @@ The current engine executes:
 | `FindOneAndDelete` | Atomically deletes one shard-local selection and returns its projected pre-delete document |
 | `FindOneAndReplace` | Atomically replaces one shard-local selection and returns its projected before/after document; no upsert yet |
 | `FindOneAndUpdate` | Applies the supported field/array operators below to one shard-local selection and returns its projected before/after document; no upsert yet |
-| `Replace` | Replaces one matching document, preserving `_id` and natural order; returns matched/modified counts, with no upsert yet |
+| `Replace` | Replaces one match, preserving `_id` and natural order, or inserts a replacement upsert; returns counts and optional inserted ID |
 | `Update` | Applies the supported field/array operators below to one or many matches; returns matched/modified counts, with one transaction per shard for many |
 
 `CollectionExists` uses an admitted, controlled manifest lookup and scalar result
@@ -234,7 +234,7 @@ arithmetic as described above. No-op writes skip SQL.
 including retained fields. Result/plan/post-image checks precede SQL, so validation
 failures leave the record unchanged. Concurrent updates read the current document
 under the write lock rather than applying a stale client-side replacement.
-Other operators, upsert, and secondary-index maintenance remain
+Other operators, operator upserts, and secondary-index maintenance remain
 unimplemented. Of 30,489 source-locked update oracle cases, the original 4,008
 set/unset cases intentionally cover non-ID object paths only: frozen TinyMongo's
 legacy scalar/array/ID behavior differs. The 4,719 min/max cases additionally
@@ -306,8 +306,8 @@ Only direct non-ID `Timestamp(0, 0)` fields receive server timestamps, matching
 insert normalization; nested timestamps and explicit nulls remain unchanged.
 Modification counts compare encoded BSON bytes, including type and field order,
 not query equality. An identical post-image skips the SQL write. Replacement
-documents reject top-level update operators before execution. Upsert and
-non-default write options remain unsupported.
+documents reject top-level update operators before execution. Replacement upserts
+are supported as described below; other non-default write options remain unsupported.
 
 Request/plan/result budgets and normalized post-image size are checked before
 commit. `DocumentReplaceRequest::with_max_document_bytes` lets wire adapters
@@ -317,6 +317,31 @@ transaction. Successful commits are not reclassified by late cancellation.
 Declared secondary indexes are still pending; their physical uniqueness and
 post-image validation belong to the index milestone, not this checkpoint.
 
+`Replace` with `DocumentWriteOptions::with_upsert(true)` first follows the normal
+replacement path. On no match, it inserts a normalized replacement: an explicit
+replacement `_id` wins; otherwise a top-level literal or sole `$eq` query `_id`
+is retained, even with other query fields; otherwise an ObjectId is generated.
+Regex predicates do not supply IDs. Conflicting query/replacement IDs fail with
+code 66; BSON-equal aliases retain the replacement's representation. Explicit
+null IDs are preserved. Other query fields are not copied into the replacement.
+The inserted ID is first; direct zero timestamps receive server values.
+
+An inserted replacement returns `matched_count: 0`, `modified_count: 0`, and
+`upserted_id: Some(id)`. Rust and native Python expose `did_upsert`, so an inserted
+null ID is distinguishable from no upsert. Native commands require an existing
+collection; the wire adapter creates missing namespaces as for inserts. Failed
+wire upserts can therefore leave an empty collection, but validation/result
+failure never commits a document. Returned IDs reserve two reply-container levels,
+and post-image/result limits are checked before natural-order reservation or SQL.
+
+The insertion shard rechecks the original predicate under an immediate write
+transaction. Exact-ID plans remain point lookups (including native IDs larger
+than the general predicate budget), and concurrent same-ID upserts
+update the winner instead of inserting twice. Natural order is reserved outside
+the shard lock to preserve manifest/shard lock ordering; losing races may leave
+unused order numbers. Non-ID filters do not gain a global snapshot or uniqueness
+across shards. Operator and find-and-modify upserts remain unsupported.
+
 `DocumentFindOneAndReplaceRequest` wraps a validated `DocumentReplaceRequest`
 plus projection/sort read options. It defaults to the before-image;
 `with_return_after(true)` selects the post-image. `FindOneAndReplace` returns
@@ -324,7 +349,7 @@ plus projection/sort read options. It defaults to the before-image;
 Sorting always uses the original stored values; projection only changes the
 returned image, never the persisted replacement. No-ops still return the selected
 image. Both forms share the same local reselection, ID/natural-order preservation,
-and write-option boundaries as `Replace`.
+and write-option boundaries as `Replace`, except that upsert remains unsupported.
 
 The normalized post-image and prepared write are validated before projection of
 the selected return image. Exact response size/plan budgets and a reserved
@@ -774,7 +799,7 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 
 ## Current boundary
 
-Other update operators, upsert, operator-update findAndModify,
+Other update operators, operator/find-and-modify upserts,
 additional aggregation expressions/group-key forms,
 database statistics, index metadata cursors, and physical secondary-index builds
 remain later roadmap work. Collection metadata cursors are implemented.
