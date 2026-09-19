@@ -2339,6 +2339,52 @@ async fn concurrent_exact_id_replacement_upserts_insert_once_and_recheck_winners
     );
 }
 
+#[tokio::test]
+async fn replacement_upsert_keeps_large_native_ids_on_the_point_route() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    seed(&engine, &session).await;
+    let id = BsonValue::from("x".repeat(1_100_000));
+    for (iteration, expected) in [(0, (0, 0, true)), (1, (1, 0, false))] {
+        let filter_id = if iteration == 0 {
+            id.clone()
+        } else {
+            BsonValue::Document(doc([("$eq", id.clone())]))
+        };
+        let execution = engine
+            .execute_document(
+                &session,
+                request(
+                    DocumentCommand::Replace(replace_upsert(
+                        doc([("_id", filter_id)]),
+                        doc([("v", BsonValue::Int32(1))]),
+                    )),
+                    RequestContext::new()
+                        .with_result_limits(ResultLimits::new(1, 16 * 1024 * 1024).unwrap()),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(execution.plan(), Some(DocumentPlan::Point(_))));
+        let DocumentResult::Update(result) = execution.result() else {
+            panic!("update")
+        };
+        assert_eq!(
+            (
+                result.matched_count(),
+                result.modified_count(),
+                result.did_upsert()
+            ),
+            expected
+        );
+        if result.did_upsert() {
+            assert_eq!(result.upserted_id(), Some(&id));
+        }
+    }
+    engine.shutdown().await.unwrap();
+}
+
 fn find_update(
     filter: BsonDocument,
     expression: BsonDocument,

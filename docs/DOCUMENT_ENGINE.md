@@ -335,7 +335,8 @@ failure never commits a document. Returned IDs reserve two reply-container level
 and post-image/result limits are checked before natural-order reservation or SQL.
 
 The insertion shard rechecks the original predicate under an immediate write
-transaction. Exact-ID plans remain point lookups, and concurrent same-ID upserts
+transaction. Exact-ID plans remain point lookups (including native IDs larger
+than the general predicate budget), and concurrent same-ID upserts
 update the winner instead of inserting twice. Natural order is reserved outside
 the shard lock to preserve manifest/shard lock ordering; losing races may leave
 unused order numbers. Non-ID filters do not gain a global snapshot or uniqueness

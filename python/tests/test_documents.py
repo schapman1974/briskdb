@@ -52,6 +52,18 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_replacement_upsert_preserves_large_native_point_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    identifier = "x" * 1_100_000
+                    result = session.replace_one(DATABASE, COLLECTION, {"_id": identifier}, {"value": 7}, upsert=True, max_result_bytes=16 * 1024 * 1024)
+                    self.assertEqual((result["matched_count"], result["modified_count"], result["did_upsert"]), (0, 0, True))
+                    self.assertEqual(result["upserted_id"], identifier)
+                    result = session.replace_one(DATABASE, COLLECTION, {"_id": {"$eq": identifier}}, {"value": 7}, upsert=True, max_result_bytes=16 * 1024 * 1024)
+                    self.assertEqual((result["matched_count"], result["modified_count"], result["did_upsert"]), (1, 0, False))
+
     def test_replacement_upsert_ids_results_controls_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:

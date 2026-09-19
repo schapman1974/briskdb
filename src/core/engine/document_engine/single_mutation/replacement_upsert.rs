@@ -63,8 +63,17 @@ impl Engine {
                 move |cancellation, control| {
                     let mut check = || ensure_document_cpu_active(cancellation, &control);
                     check()?;
-                    let matcher =
-                        DocumentMatcher::compile_with_check(filter.document(), &mut check)?;
+                    // Exact IDs already have a canonical point plan. Recompiling
+                    // them as general predicates would impose the smaller query
+                    // budget on IDs accepted by normal native point operations.
+                    let matcher = if matches!(&plan, DocumentPlan::Point(_)) {
+                        None
+                    } else {
+                        Some(DocumentMatcher::compile_with_check(
+                            filter.document(),
+                            &mut check,
+                        )?)
+                    };
                     let document = synthesize_replacement(
                         filter.document(),
                         &prepare_replacement,
@@ -134,7 +143,7 @@ impl Engine {
                         &transaction,
                         collection_id,
                         shard,
-                        Some(&matcher),
+                        matcher.as_ref(),
                         None,
                         None,
                         cancellation,
