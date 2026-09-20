@@ -115,6 +115,14 @@ but never reduces the allocation high-water mark, including when the catalog
 becomes empty. Restart validates mapping coverage and checksums. These identities
 do not activate secondary indexes or change native Python/wire metadata shapes.
 
+Native sparse/partial declarations retain the same six-field v2 BSON envelope as
+imported TinyMongo indexes: `v`, `name`, `key`, `unique`, `sparse`, and
+`partialFilterExpression` (a document or null). Ordinary native declarations keep
+their flat-key encoding. The engine validates membership expressions and the
+complete 1 MiB envelope before catalog mutation; declaration bytes, identity and
+checksum still commit together. No existing metadata is rewritten. Interpreting
+supported keys/options does not mark a pending index Ready or touch shard data.
+
 ## Namespace deletion and restart
 
 Dropping a collection or logical document database requires sole-process schema

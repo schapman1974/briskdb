@@ -4398,6 +4398,64 @@ mod tests {
     }
 
     #[test]
+    fn advanced_import_envelopes_match_native_declarations_without_rewriting() {
+        use crate::document::{
+            DocumentFilter, DocumentIndexId, DocumentIndexMetadata, DocumentIndexRequest,
+            normalize_index_request,
+        };
+
+        for (sparse, partial) in [
+            (true, JsonValue::Null),
+            (
+                false,
+                serde_json::json!({"active": true, "rank": {"$gte": 2}}),
+            ),
+        ] {
+            let source = serde_json::json!({
+                "v": 2, "name": "advanced", "key": [["email", 1], ["rank", 1]],
+                "unique": true, "sparse": sparse, "partialFilterExpression": partial,
+            });
+            let logical = parse_index_metadata(&source, false).unwrap();
+            let keys = BsonDocument::from_entries(
+                logical
+                    .keys
+                    .iter()
+                    .map(|(field, direction)| (field.clone(), BsonValue::Int32(*direction))),
+            )
+            .unwrap();
+            let mut request = DocumentIndexRequest::new(keys.clone())
+                .unwrap()
+                .with_name("advanced")
+                .unwrap()
+                .with_unique(true)
+                .with_sparse(sparse);
+            if let Some(filter) = &logical.partial_filter {
+                request = request.with_partial_filter(DocumentFilter::new(filter.clone()).unwrap());
+            }
+            let imported = import_indexes(vec![logical], &CancellationToken::new()).unwrap();
+            let stored_bytes = encode_document(imported[0].specification()).unwrap();
+            let (native, name, unique) = normalize_index_request(request, &mut || Ok(())).unwrap();
+            assert_eq!(encode_document(&native).unwrap(), stored_bytes);
+            let metadata = DocumentIndexMetadata::from_validated_parts(
+                DocumentIndexId::from_validated(1),
+                name,
+                imported[0].specification().clone(),
+                unique,
+                false,
+                DocumentIndexLifecycle::PendingBuild,
+            );
+            let definition = metadata.definition().unwrap();
+            assert_eq!(definition.keys(), &keys);
+            assert_eq!(definition.sparse(), sparse);
+            assert_eq!(definition.partial_filter().is_some(), !sparse);
+            assert_eq!(
+                encode_document(metadata.specification()).unwrap(),
+                stored_bytes
+            );
+        }
+    }
+
+    #[test]
     fn atomic_import_cleans_failed_stage_and_retry_publishes_verified_receipt() {
         let temporary = TempDir::new().unwrap();
         let source_path = temporary.path().join("app.sqlite");

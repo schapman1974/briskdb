@@ -629,8 +629,12 @@ requires an earlier dependency:
       exact name. Built-in protection, pre-commit controls/budgets, concurrent
       drops, crash recovery and ID non-reuse are covered. Physical-index drops,
       wire commands and wildcard/field-alias removal remain open.
-      This helper does
-      not enable sparse/partial catalog options or activate indexes; physical build/recovery, write-time
+      Native Rust and sync/async Python declarations now accept sparse/partial
+      options through the shared eager predicate validator. Exact membership
+      metadata uses the existing import envelope, preserves IDs across restart,
+      and has a combined size bound. Ordinary encodings are unchanged; unknown
+      legacy envelopes remain opaque/readable. These declarations do not scan
+      records or activate indexes. Physical build/recovery, write-time
       maintenance, wire index commands and metadata cursors remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted

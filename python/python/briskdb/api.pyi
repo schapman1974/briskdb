@@ -190,6 +190,8 @@ class AsyncSession:
         *,
         name: Optional[str] = None,
         unique: bool = False,
+        sparse: bool = False,
+        partial_filter: Optional[BsonDocument] = None,
         request_id: Optional[UUID] = None,
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,

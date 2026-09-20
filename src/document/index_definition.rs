@@ -1,19 +1,163 @@
-//! Bounded, protocol-neutral normalization of ordinary index key declarations.
+//! Bounded index-declaration normalization and borrowed retained-metadata views.
 //!
 //! This does not build an index or make a pending declaration enforce uniqueness.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt};
 
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
 use super::{
-    BsonCodecOptions, BsonDocument, BsonErrorContext, BsonValue, MAX_DOCUMENT_INDEX_NAME_BYTES,
-    encode_document_with_options,
+    BsonCodecOptions, BsonDocument, BsonErrorContext, BsonValue, DocumentFilter,
+    DocumentIndexKeyGenerator, DocumentIndexMetadata, DocumentIndexRequest,
+    MAX_DOCUMENT_INDEX_NAME_BYTES, encode_document_with_options,
 };
 
 const MAX_INDEX_FIELDS: usize = 32;
 const MAX_PATH_COMPONENTS: usize = 100;
 const MAX_SPEC_BYTES: usize = 1024 * 1024;
+
+/// Borrowed keys and membership options from an understood catalog encoding.
+///
+/// This view does not normalize or rewrite stored BSON, validate documents,
+/// activate an index, or confer planner/uniqueness authority. Compile the keys
+/// and options with [`DocumentIndexKeyGenerator`] before using their semantics.
+#[derive(Clone, Copy)]
+pub struct DocumentIndexDefinition<'a> {
+    keys: &'a BsonDocument,
+    sparse: bool,
+    partial_filter: Option<&'a BsonDocument>,
+}
+
+impl<'a> DocumentIndexDefinition<'a> {
+    pub const fn keys(self) -> &'a BsonDocument {
+        self.keys
+    }
+
+    pub const fn sparse(self) -> bool {
+        self.sparse
+    }
+
+    pub const fn partial_filter(self) -> Option<&'a BsonDocument> {
+        self.partial_filter
+    }
+}
+
+impl fmt::Debug for DocumentIndexDefinition<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DocumentIndexDefinition")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Recognize only flat numeric keys or the exact supported v2 envelope. In
+/// particular, fields named `key`, `v`, or `sparse` are ordinary flat keys when
+/// their values are directions. Unknown legacy envelopes remain opaque/readable.
+pub(crate) fn index_definition_view(
+    index: &DocumentIndexMetadata,
+) -> Option<DocumentIndexDefinition<'_>> {
+    let specification = index.specification();
+    if flat_numeric_keys(specification) {
+        return Some(DocumentIndexDefinition {
+            keys: specification,
+            sparse: false,
+            partial_filter: None,
+        });
+    }
+    let built_in = index.is_built_in();
+    if specification.len() != if built_in { 4 } else { 6 }
+        || !matches!(specification.get_first("v"), Some(BsonValue::Int32(2)))
+        || !matches!(specification.get_first("name"), Some(BsonValue::String(name)) if name == index.name())
+        || !matches!(specification.get_first("unique"), Some(BsonValue::Boolean(unique)) if *unique == index.is_unique())
+    {
+        return None;
+    }
+    let Some(BsonValue::Document(keys)) = specification.get_first("key") else {
+        return None;
+    };
+    if !flat_numeric_keys(keys) {
+        return None;
+    }
+    let (sparse, partial_filter) = if built_in {
+        (false, None)
+    } else {
+        let Some(BsonValue::Boolean(sparse)) = specification.get_first("sparse") else {
+            return None;
+        };
+        let partial = match specification.get_first("partialFilterExpression")? {
+            BsonValue::Null => None,
+            BsonValue::Document(filter) => Some(filter),
+            _ => return None,
+        };
+        if *sparse && partial.is_some() {
+            return None;
+        }
+        (*sparse, partial)
+    };
+    // The required distinct field lookups plus exact count reject duplicates
+    // and unknown options without silently discarding their meaning.
+    Some(DocumentIndexDefinition {
+        keys,
+        sparse,
+        partial_filter,
+    })
+}
+
+fn flat_numeric_keys(keys: &BsonDocument) -> bool {
+    !keys.is_empty()
+        && keys.len() <= MAX_INDEX_FIELDS
+        && keys.iter().all(|(_, value)| {
+            matches!(
+                value,
+                BsonValue::Int32(_)
+                    | BsonValue::Int64(_)
+                    | BsonValue::Double(_)
+                    | BsonValue::Decimal128(_)
+            ) && (value == &BsonValue::Int32(1) || value == &BsonValue::Int32(-1))
+        })
+}
+
+/// Preserve the flat encoding for ordinary declarations. Advanced declarations
+/// use the same ordered v2 BSON envelope already retained by TinyMongo import.
+pub(crate) fn normalize_index_request(
+    index: DocumentIndexRequest,
+    check: &mut dyn FnMut() -> EngineResult<()>,
+) -> EngineResult<(BsonDocument, String, bool)> {
+    let (keys, name, unique, sparse, partial) = index.into_parts();
+    let (keys, name) = normalize_index_definition(&keys, name.as_deref(), check)?;
+    if !sparse && partial.is_none() {
+        return Ok((keys, name, unique));
+    }
+    // Reuse the source-locked membership dialect, including eager validation
+    // of every predicate branch and rejection of sparse + partial together.
+    DocumentIndexKeyGenerator::compile_with_check(
+        &keys,
+        sparse,
+        partial.as_ref().map(DocumentFilter::document),
+        check,
+    )?;
+    let specification = BsonDocument::from_entries([
+        ("v", BsonValue::Int32(2)),
+        ("name", BsonValue::String(name.clone())),
+        ("key", BsonValue::Document(keys)),
+        ("unique", BsonValue::Boolean(unique)),
+        ("sparse", BsonValue::Boolean(sparse)),
+        (
+            "partialFilterExpression",
+            partial
+                .map(|filter| BsonValue::Document(filter.into_document()))
+                .unwrap_or(BsonValue::Null),
+        ),
+    ])
+    .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+    // Bound the complete retained envelope, not just keys and filter separately.
+    encode_document_with_options(
+        &specification,
+        &BsonCodecOptions::new().with_max_document_bytes(MAX_SPEC_BYTES),
+    )
+    .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+    check()?;
+    Ok((specification, name, unique))
+}
 
 pub(crate) fn normalize_index_definition(
     keys: &BsonDocument,
@@ -113,7 +257,288 @@ fn limit(message: &'static str) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::BsonDecimal128;
+    use crate::document::{
+        BsonDecimal128, DocumentIndexId, DocumentIndexLifecycle, encode_document,
+    };
+
+    fn document<const N: usize>(entries: [(&str, BsonValue); N]) -> BsonDocument {
+        BsonDocument::from_entries(entries).unwrap()
+    }
+
+    fn metadata(
+        specification: BsonDocument,
+        name: &str,
+        unique: bool,
+        built_in: bool,
+    ) -> DocumentIndexMetadata {
+        DocumentIndexMetadata::from_validated_parts(
+            DocumentIndexId::from_validated(1),
+            name.into(),
+            specification,
+            unique,
+            built_in,
+            if built_in {
+                DocumentIndexLifecycle::Ready
+            } else {
+                DocumentIndexLifecycle::PendingBuild
+            },
+        )
+    }
+
+    fn advanced_request(sparse: bool, partial: Option<BsonDocument>) -> DocumentIndexRequest {
+        let mut request = DocumentIndexRequest::new(document([
+            ("profile.name", BsonValue::Int64(1)),
+            ("rank", BsonValue::Double(-1.0)),
+        ]))
+        .unwrap()
+        .with_unique(true)
+        .with_sparse(sparse)
+        .with_name("advanced")
+        .unwrap();
+        if let Some(filter) = partial {
+            request = request.with_partial_filter(DocumentFilter::new(filter).unwrap());
+        }
+        request
+    }
+
+    #[test]
+    fn advanced_declarations_retain_the_import_envelope_and_exact_partial_bson() {
+        let filter = document([
+            ("active", BsonValue::Boolean(true)),
+            (
+                "rank",
+                BsonValue::Document(document([("$gte", BsonValue::Int64(2))])),
+            ),
+        ]);
+        for (sparse, partial) in [(true, None), (false, Some(filter.clone()))] {
+            let (spec, name, unique) =
+                normalize_index_request(advanced_request(sparse, partial.clone()), &mut || Ok(()))
+                    .unwrap();
+            assert_eq!(name, "advanced");
+            assert!(unique);
+            assert_eq!(
+                spec.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+                [
+                    "v",
+                    "name",
+                    "key",
+                    "unique",
+                    "sparse",
+                    "partialFilterExpression"
+                ]
+            );
+            let bytes = encode_document(&spec).unwrap();
+            let index = metadata(spec, &name, unique, false);
+            let definition = index.definition().unwrap();
+            assert_eq!(definition.sparse(), sparse);
+            assert_eq!(
+                definition
+                    .partial_filter()
+                    .map(|filter| encode_document(filter).unwrap()),
+                partial
+                    .as_ref()
+                    .map(|filter| encode_document(filter).unwrap())
+            );
+            assert_eq!(
+                encode_document(definition.keys()).unwrap(),
+                encode_document(&document([
+                    ("profile.name", BsonValue::Int32(1)),
+                    ("rank", BsonValue::Int32(-1))
+                ]))
+                .unwrap()
+            );
+            let generator = DocumentIndexKeyGenerator::compile(
+                definition.keys(),
+                definition.sparse(),
+                definition.partial_filter(),
+            )
+            .unwrap();
+            assert!(generator.keys(&BsonDocument::new()).unwrap().is_empty());
+            let member = document([
+                ("active", BsonValue::Boolean(true)),
+                ("rank", BsonValue::Int32(3)),
+            ]);
+            assert_eq!(generator.keys(&member).unwrap().len(), 1);
+            assert_eq!(encode_document(index.specification()).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn ordinary_keys_named_like_options_remain_flat_and_builtin_view_is_distinct() {
+        let keys = document([
+            ("v", BsonValue::Int32(1)),
+            ("name", BsonValue::Int32(1)),
+            ("key", BsonValue::Int32(-1)),
+            ("unique", BsonValue::Int32(1)),
+            ("sparse", BsonValue::Int32(1)),
+            ("partialFilterExpression", BsonValue::Int32(1)),
+        ]);
+        let request = DocumentIndexRequest::new(keys.clone())
+            .unwrap()
+            .with_name("flat")
+            .unwrap();
+        let (spec, _, _) = normalize_index_request(request, &mut || Ok(())).unwrap();
+        assert_eq!(
+            encode_document(&spec).unwrap(),
+            encode_document(&keys).unwrap()
+        );
+        let index = metadata(spec, "flat", false, false);
+        let definition = index.definition().unwrap();
+        assert_eq!(definition.keys(), &keys);
+        assert!(!definition.sparse());
+        assert!(definition.partial_filter().is_none());
+        let builtin = metadata(
+            document([
+                ("v", BsonValue::Int32(2)),
+                ("name", BsonValue::from("_id_")),
+                (
+                    "key",
+                    BsonValue::Document(document([("_id", BsonValue::Int32(1))])),
+                ),
+                ("unique", BsonValue::Boolean(true)),
+            ]),
+            "_id_",
+            true,
+            true,
+        );
+        assert_eq!(
+            builtin.definition().unwrap().keys(),
+            &document([("_id", BsonValue::Int32(1))])
+        );
+        assert!(!builtin.definition().unwrap().sparse());
+    }
+
+    #[test]
+    fn unknown_or_inconsistent_envelopes_are_not_silently_reinterpreted() {
+        let (spec, _, _) =
+            normalize_index_request(advanced_request(true, None), &mut || Ok(())).unwrap();
+        for (field, value) in [
+            ("v", BsonValue::Int32(3)),
+            ("v", BsonValue::Double(2.0)),
+            ("name", BsonValue::from("other")),
+            ("unique", BsonValue::Boolean(false)),
+            ("sparse", BsonValue::Int32(1)),
+            ("key", BsonValue::String("opaque".into())),
+            ("partialFilterExpression", BsonValue::Boolean(false)),
+            (
+                "partialFilterExpression",
+                BsonValue::Document(document([("active", BsonValue::Boolean(true))])),
+            ),
+        ] {
+            let changed = BsonDocument::from_entries(spec.iter().map(|(key, original)| {
+                (
+                    key,
+                    if key == field {
+                        value.clone()
+                    } else {
+                        original.clone()
+                    },
+                )
+            }))
+            .unwrap();
+            let bytes = encode_document(&changed).unwrap();
+            let index = metadata(changed, "advanced", true, false);
+            assert!(index.definition().is_none(), "{field}");
+            assert_eq!(encode_document(index.specification()).unwrap(), bytes);
+        }
+        for field in ["unknown", "sparse"] {
+            let mut changed = spec.clone();
+            changed.push(field, BsonValue::Boolean(true)).unwrap();
+            assert!(
+                metadata(changed, "advanced", true, false)
+                    .definition()
+                    .is_none()
+            );
+        }
+        let missing = BsonDocument::from_entries(
+            spec.iter()
+                .filter(|(field, _)| *field != "sparse")
+                .map(|(field, value)| (field, value.clone())),
+        )
+        .unwrap();
+        assert!(
+            metadata(missing, "advanced", true, false)
+                .definition()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invalid_membership_and_sparse_partial_combinations_fail_eagerly() {
+        let good = document([("active", BsonValue::Boolean(true))]);
+        let unsupported = document([(
+            "rank",
+            BsonValue::Document(document([("$ne", BsonValue::Int32(2))])),
+        )]);
+        let invalid_or = document([(
+            "$or",
+            BsonValue::Array(vec![
+                BsonValue::Document(good.clone()),
+                BsonValue::Document(unsupported.clone()),
+            ]),
+        )]);
+        for (sparse, partial) in [
+            (true, good),
+            (false, BsonDocument::new()),
+            (false, unsupported),
+            (false, invalid_or),
+        ] {
+            let error =
+                normalize_index_request(advanced_request(sparse, Some(partial)), &mut || Ok(()))
+                    .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Unsupported);
+        }
+    }
+
+    #[test]
+    fn aggregate_envelope_has_one_bound_even_when_each_payload_fits() {
+        let keys =
+            BsonDocument::from_entries([("k".repeat(600 * 1024), BsonValue::Int32(1))]).unwrap();
+        let filter = document([("value", BsonValue::String("v".repeat(600 * 1024)))]);
+        assert!(encode_document(&keys).unwrap().len() < MAX_SPEC_BYTES);
+        assert!(encode_document(&filter).unwrap().len() < MAX_SPEC_BYTES);
+        let request = DocumentIndexRequest::new(keys)
+            .unwrap()
+            .with_name("bounded")
+            .unwrap()
+            .with_partial_filter(DocumentFilter::new(filter).unwrap());
+        assert_eq!(
+            normalize_index_request(request, &mut || Ok(()))
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::LimitExceeded
+        );
+    }
+
+    #[test]
+    fn advanced_normalization_checks_interruption_without_changing_input() {
+        let request = advanced_request(
+            false,
+            Some(document([("active", BsonValue::Boolean(true))])),
+        );
+        let before = request.clone();
+        let mut total = 0;
+        normalize_index_request(request.clone(), &mut || {
+            total += 1;
+            Ok(())
+        })
+        .unwrap();
+        for stop in [1, 2, total / 2, total] {
+            let mut calls = 0;
+            let error = normalize_index_request(request.clone(), &mut || {
+                calls += 1;
+                if calls == stop {
+                    Err(EngineError::new(EngineErrorKind::Cancelled, "cancelled"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+            assert_eq!(calls, stop);
+            assert_eq!(request, before);
+        }
+    }
 
     #[test]
     fn ordered_directions_have_canonical_bson_and_deterministic_names() {

@@ -61,7 +61,8 @@ pub use error::{
     BsonError, BsonErrorContext, BsonErrorKind, BsonResult, DocumentCursorError,
     DocumentIndexError, DocumentMutationError,
 };
-pub(crate) use index_definition::normalize_index_definition;
+pub use index_definition::DocumentIndexDefinition;
+pub(crate) use index_definition::{normalize_index_definition, normalize_index_request};
 pub use index_keys::{
     DOCUMENT_INDEX_KEY_ENCODING_VERSION, DocumentIndexKey, DocumentIndexKeyGenerator,
     MAX_DOCUMENT_INDEX_KEY_BYTES,

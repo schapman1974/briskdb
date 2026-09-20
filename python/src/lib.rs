@@ -1593,6 +1593,8 @@ impl Session {
         *,
         name = None,
         unique = false,
+        sparse = false,
+        partial_filter = None,
         request_id = None,
         timeout_ms = None,
         cancellation = None,
@@ -1608,6 +1610,8 @@ impl Session {
         keys: Py<PyAny>,
         name: Option<String>,
         unique: bool,
+        sparse: bool,
+        partial_filter: Option<Py<PyAny>>,
         request_id: Option<Py<PyAny>>,
         timeout_ms: Option<u64>,
         cancellation: Option<PyRef<'_, CancellationToken>>,
@@ -1617,9 +1621,18 @@ impl Session {
         self.require_document_support()?;
         let namespace = python_engine_result(DocumentNamespace::new(database, collection))?;
         let keys = extract_bson_document(py, keys.bind(py), self.shared.uuid_representation)?;
-        let mut index = python_engine_result(DocumentIndexRequest::new(keys))?.with_unique(unique);
+        let mut index = python_engine_result(DocumentIndexRequest::new(keys))?
+            .with_unique(unique)
+            .with_sparse(sparse);
         if let Some(name) = name {
             index = python_engine_result(index.with_name(name))?;
+        }
+        if let Some(filter) = partial_filter {
+            index = index.with_partial_filter(document_filter(
+                py,
+                Some(&filter),
+                self.shared.uuid_representation,
+            )?);
         }
         let command = DocumentCommand::CreateIndex(DocumentCreateIndexRequest::new(
             namespace,

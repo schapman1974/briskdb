@@ -446,7 +446,12 @@ eager validation, input immutability and interruption without partial results.
 This is not physical index activation, wire support or uniqueness enforcement.
 The frozen helper subset rejects intermediate/parallel arrays, object/nested-array
 keys, ObjectId/date keys and nonfinite numeric keys; broader MongoDB index values
-remain open. Sparse/partial options are not yet enabled in catalog commands.
+remain open. Native Rust and sync/async Python declarations now accept sparse or
+partial options after shared eager validation. The complete retained envelope is
+bounded; exact filter BSON, IDs and membership options survive restart. Existing
+flat declarations remain byte-compatible, and unknown legacy envelopes remain
+opaque/readable. These options are metadata-only until physical activation;
+native validation does not scan records and wire index commands remain open.
 
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required

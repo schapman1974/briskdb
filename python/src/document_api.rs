@@ -271,7 +271,10 @@ fn index_to_python(
 ) -> PyResult<Py<PyAny>> {
     let output = PyDict::new(py);
     output.set_item("name", index.name())?;
-    let keys = if index.is_built_in() {
+    let definition = index.definition();
+    let keys = if let Some(definition) = definition {
+        definition.keys()
+    } else if index.is_built_in() {
         match index.specification().get_first("key") {
             Some(BsonValue::Document(keys)) => keys,
             _ => index.specification(),
@@ -284,6 +287,17 @@ fn index_to_python(
         bson_document_to_python(py, keys, uuid_representation, bson_types)?,
     )?;
     output.set_item("unique", index.is_unique())?;
+    if let Some(definition) = definition {
+        if definition.sparse() {
+            output.set_item("sparse", true)?;
+        }
+        if let Some(filter) = definition.partial_filter() {
+            output.set_item(
+                "partial_filter",
+                bson_document_to_python(py, filter, uuid_representation, bson_types)?,
+            )?;
+        }
+    }
     output.set_item("built_in", index.is_built_in())?;
     let lifecycle = match index.lifecycle() {
         DocumentIndexLifecycle::Ready => "ready",

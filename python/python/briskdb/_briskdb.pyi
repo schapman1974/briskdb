@@ -45,7 +45,11 @@ class DocumentPlacementInfo(TypedDict):
     code: int
     version: int
 
-class DocumentIndexInfo(TypedDict):
+class DocumentIndexMembership(TypedDict, total=False):
+    sparse: bool
+    partial_filter: BsonResultDocument
+
+class DocumentIndexInfo(DocumentIndexMembership):
     name: str
     keys: BsonResultDocument
     unique: bool
@@ -449,6 +453,8 @@ class Session:
         *,
         name: Optional[str] = None,
         unique: bool = False,
+        sparse: bool = False,
+        partial_filter: Optional[BsonDocument] = None,
         request_id: Optional[UUID] = None,
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,

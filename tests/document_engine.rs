@@ -9,11 +9,11 @@ use briskdb::{
         DocumentCollectionMetadata, DocumentCollectionOptions, DocumentCommand,
         DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
         DocumentDeleteRequest, DocumentDropIndexRequest, DocumentExecution, DocumentFilter,
-        DocumentFindRequest, DocumentIndexError, DocumentIndexLifecycle, DocumentIndexMetadata,
-        DocumentIndexRequest, DocumentInsertRequest, DocumentListCollectionsRequest,
-        DocumentListIndexesRequest, DocumentMutationScope, DocumentNamespace, DocumentPipeline,
-        DocumentPlan, DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId,
-        DocumentResult, DocumentWriteOptions,
+        DocumentFindRequest, DocumentIndexError, DocumentIndexKeyGenerator, DocumentIndexLifecycle,
+        DocumentIndexMetadata, DocumentIndexRequest, DocumentInsertRequest,
+        DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
+        DocumentNamespace, DocumentPipeline, DocumentPlan, DocumentProjection, DocumentReadOptions,
+        DocumentRequest, DocumentRequestId, DocumentResult, DocumentWriteOptions, encode_document,
     },
 };
 use rusqlite::Connection;
@@ -133,6 +133,281 @@ fn drop_index(name: &str) -> DocumentCommand {
     DocumentCommand::DropIndex(
         DocumentDropIndexRequest::new(namespace(), name, DocumentWriteOptions::new()).unwrap(),
     )
+}
+
+fn create_index_command(index: DocumentIndexRequest) -> DocumentCommand {
+    DocumentCommand::CreateIndex(DocumentCreateIndexRequest::new(
+        namespace(),
+        index,
+        DocumentWriteOptions::new(),
+    ))
+}
+
+fn partial_index_filter() -> BsonDocument {
+    BsonDocument::from_entries([
+        (
+            "sequence",
+            BsonValue::Document(
+                BsonDocument::from_entries([("$gte", BsonValue::Int64(0))]).unwrap(),
+            ),
+        ),
+        ("label", BsonValue::from("same")),
+    ])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn sparse_partial_declarations_preserve_options_ids_and_exact_bson_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    let keys = BsonDocument::from_entries([
+        ("label", BsonValue::Int64(1)),
+        ("sequence", BsonValue::Double(-1.0)),
+    ])
+    .unwrap();
+    let sparse = DocumentIndexRequest::new(keys.clone())
+        .unwrap()
+        .with_unique(true)
+        .with_sparse(true);
+    let partial = DocumentIndexRequest::new(keys)
+        .unwrap()
+        .with_name("partial")
+        .unwrap()
+        .with_unique(true)
+        .with_partial_filter(DocumentFilter::new(partial_index_filter()).unwrap());
+    for index in [&sparse, &partial] {
+        engine
+            .execute_document(
+                &session,
+                request(
+                    2,
+                    RequestContext::new(),
+                    create_index_command(index.clone()),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    let before = pending_indexes(&engine, &session).await;
+    let specs: Vec<_> = before
+        .iter()
+        .map(|index| encode_document(index.specification()).unwrap())
+        .collect();
+    assert_eq!(before.len(), 3);
+    for index in before.iter().filter(|index| !index.is_built_in()) {
+        assert_eq!(index.lifecycle(), DocumentIndexLifecycle::PendingBuild);
+        assert!(index.is_unique());
+        let definition = index.definition().unwrap();
+        assert_eq!(
+            definition
+                .keys()
+                .iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            ["label", "sequence"]
+        );
+        if index.name() == "partial" {
+            assert!(!definition.sparse());
+            assert_eq!(
+                encode_document(definition.partial_filter().unwrap()).unwrap(),
+                encode_document(&partial_index_filter()).unwrap()
+            );
+        } else {
+            assert_eq!(index.name(), "label_1_sequence_-1");
+            assert!(definition.sparse());
+            assert!(definition.partial_filter().is_none());
+        }
+        let generator = DocumentIndexKeyGenerator::compile(
+            definition.keys(),
+            definition.sparse(),
+            definition.partial_filter(),
+        )
+        .unwrap();
+        assert!(generator.keys(&BsonDocument::new()).unwrap().is_empty());
+        assert_eq!(
+            generator
+                .keys(&document(BsonValue::Int32(1), "same"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    // Same normalized definitions retain both identity and exact stored bytes.
+    for index in [&sparse, &partial] {
+        engine
+            .execute_document(
+                &session,
+                request(
+                    3,
+                    RequestContext::new(),
+                    create_index_command(index.clone()),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(pending_indexes(&engine, &session).await, before);
+    for conflict in [
+        sparse.clone().with_sparse(false),
+        partial.clone().with_unique(false),
+    ] {
+        assert_eq!(
+            engine
+                .execute_document(
+                    &session,
+                    request(4, RequestContext::new(), create_index_command(conflict))
+                )
+                .await
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::FailedPrecondition
+        );
+        assert_eq!(pending_indexes(&engine, &session).await, before);
+    }
+    // Declaring a unique index still does not activate it or reject documents.
+    let inserted = insert(
+        &engine,
+        &session,
+        5,
+        vec![
+            document(BsonValue::Int32(1), "same"),
+            document(BsonValue::Int32(2), "same"),
+        ],
+    )
+    .await;
+    let DocumentResult::Insert(result) = inserted.result() else {
+        panic!("insert")
+    };
+    assert_eq!(result.inserted_ids().len(), 2);
+    assert!(result.write_errors().is_empty());
+    engine.shutdown().await.unwrap();
+    drop(session);
+    drop(engine);
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    let reopened = pending_indexes(&engine, &session).await;
+    assert_eq!(reopened, before);
+    assert_eq!(
+        reopened
+            .iter()
+            .map(|index| encode_document(index.specification()).unwrap())
+            .collect::<Vec<_>>(),
+        specs
+    );
+    // The metadata-only drop path also removes advanced envelopes unchanged.
+    engine
+        .execute_document(
+            &session,
+            request(6, RequestContext::new(), drop_index("partial")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending_indexes(&engine, &session).await.len(), 2);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sparse_partial_validation_limits_and_controls_leave_no_declaration() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    let before = pending_indexes(&engine, &session).await;
+    let base = DocumentIndexRequest::new(
+        BsonDocument::from_entries([("label", BsonValue::Int32(1))]).unwrap(),
+    )
+    .unwrap()
+    .with_name("bounded")
+    .unwrap();
+    let invalid = BsonDocument::from_entries([(
+        "private",
+        BsonValue::Document(BsonDocument::from_entries([("$ne", BsonValue::Int32(1))]).unwrap()),
+    )])
+    .unwrap();
+    let invalid_branch = BsonDocument::from_entries([(
+        "$or",
+        BsonValue::Array(vec![
+            BsonValue::Document(partial_index_filter()),
+            BsonValue::Document(invalid.clone()),
+        ]),
+    )])
+    .unwrap();
+    for index in [
+        base.clone()
+            .with_sparse(true)
+            .with_partial_filter(DocumentFilter::new(partial_index_filter()).unwrap()),
+        base.clone().with_partial_filter(DocumentFilter::empty()),
+        base.clone()
+            .with_partial_filter(DocumentFilter::new(invalid).unwrap()),
+        base.clone()
+            .with_partial_filter(DocumentFilter::new(invalid_branch).unwrap()),
+    ] {
+        let error = engine
+            .execute_document(
+                &session,
+                request(2, RequestContext::new(), create_index_command(index)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Unsupported);
+        assert!(!error.to_string().contains("private"));
+        assert_eq!(pending_indexes(&engine, &session).await, before);
+    }
+    let valid = base.with_partial_filter(DocumentFilter::new(partial_index_filter()).unwrap());
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    for (context, kind) in [
+        (
+            RequestContext::new().with_result_limits(ResultLimits::new(1, 1).unwrap()),
+            EngineErrorKind::LimitExceeded,
+        ),
+        (
+            RequestContext::new().with_cancellation_token(cancelled),
+            EngineErrorKind::Cancelled,
+        ),
+        (
+            RequestContext::new().with_deadline(Instant::now() - Duration::from_millis(1)),
+            EngineErrorKind::DeadlineExceeded,
+        ),
+    ] {
+        assert_eq!(
+            engine
+                .execute_document(
+                    &session,
+                    request(3, context, create_index_command(valid.clone()))
+                )
+                .await
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+        assert_eq!(pending_indexes(&engine, &session).await, before);
+    }
+    let blocker = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let start = Instant::now();
+    let result = engine
+        .execute_document(
+            &session,
+            request(
+                4,
+                RequestContext::new()
+                    .with_timeout(Duration::from_millis(50))
+                    .unwrap(),
+                create_index_command(valid),
+            ),
+        )
+        .await;
+    assert_eq!(
+        result.unwrap_err().kind(),
+        EngineErrorKind::DeadlineExceeded
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
+    blocker.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(pending_indexes(&engine, &session).await, before);
+    engine.shutdown().await.unwrap();
 }
 
 #[tokio::test]

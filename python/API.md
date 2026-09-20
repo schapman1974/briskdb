@@ -53,7 +53,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `list_collections(database, *, skip=0, limit=None, batch_size=101, ...)`
 - `list_collection_metadata(database, filter=None, *, name_only=False, batch_size=101, batch_byte_limit=None, ...)`
 - `list_database_names(filter=None, ...)`
-- `create_index(database, collection, keys, *, name=None, unique=False, ...)`
+- `create_index(database, collection, keys, *, name=None, unique=False, sparse=False, partial_filter=None, ...)`
 - `drop_index(database, collection, name, ...)`
 - `list_indexes(database, collection, *, skip=0, limit=None, batch_size=101, ...)`
 - `insert_one(database, collection, document, ...)`
@@ -213,6 +213,22 @@ Collection metadata contains `id`, `database_id`, `database`, `name`,
 metadata. Each index contains `name`, exact ordered `keys`, `unique`,
 `built_in`, and `lifecycle`. Secondary index declarations currently remain
 `pending_build`; the ready built-in `_id_` index is authoritative.
+
+Both sync and async `create_index` accept `sparse=True` or a `partial_filter`
+mapping, but not both. The shared index validator checks the supported predicate
+subset eagerly, including branches that would otherwise short-circuit. Empty
+filters and unsupported operators (such as `$ne`) raise `UnsupportedError`.
+Keys, name and filter together have a 1 MiB stored-specification limit. This is a
+declaration only: it does not scan existing records, accelerate queries, or enforce
+uniqueness yet, and its result still says `lifecycle="pending_build"`.
+
+Recognized advanced index metadata reports normalized ordered `keys` plus optional
+`sparse=True` or `partial_filter` fields; absence means no such membership option.
+Filters preserve their BSON types and field order across restart. Same-name
+advanced declarations require the same normalized envelope bytes, not merely
+logically equivalent predicates. Recognized imported v2 metadata is presented the
+same way; unknown legacy envelopes retain their previous opaque `keys` value and
+are not silently interpreted. Ordinary and built-in result shapes are unchanged.
 
 `drop_index` is available on both sync and async sessions. It removes one pending
 declaration by exact, case-sensitive name and returns `kind="acknowledged"`,

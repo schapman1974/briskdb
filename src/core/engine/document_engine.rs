@@ -304,22 +304,14 @@ impl Engine {
             DocumentCommand::CreateIndex(request) => {
                 let (namespace, index, write_options) = request.into_parts();
                 require_catalog_write_options(write_options)?;
-                if index.sparse() || index.partial_filter().is_some() {
-                    return Err(unsupported(
-                        "sparse and partial document indexes require the document-index execution milestone",
-                    ));
-                }
-                let (keys, name, unique, _, _) = index.into_parts();
-                let (keys, name) = self
+                let (specification, name, unique) = self
                     .run_document_storage_task(
                         cancellation.clone(),
                         deadline,
                         move |cancellation, control| {
-                            crate::document::normalize_index_definition(
-                                &keys,
-                                name.as_deref(),
-                                &mut || ensure_document_cpu_active(cancellation, &control),
-                            )
+                            crate::document::normalize_index_request(index, &mut || {
+                                ensure_document_cpu_active(cancellation, &control)
+                            })
                         },
                     )
                     .await?;
@@ -357,7 +349,7 @@ impl Engine {
                         metadata_storage.declare_document_index_controlled(
                             collection_id,
                             &metadata_name,
-                            &keys,
+                            &specification,
                             unique,
                             control,
                         )
