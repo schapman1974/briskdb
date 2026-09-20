@@ -194,6 +194,13 @@ impl DocumentIndexMetadata {
         &self.specification
     }
 
+    /// Borrow keys/options from a recognized flat or v2 specification without
+    /// rewriting it. Unknown legacy encodings remain available as raw BSON via
+    /// `specification()`, but return `None` here rather than losing options.
+    pub fn definition(&self) -> Option<super::DocumentIndexDefinition<'_>> {
+        super::index_definition::index_definition_view(self)
+    }
+
     /// Return whether duplicate semantic keys are forbidden.
     pub const fn is_unique(&self) -> bool {
         self.unique

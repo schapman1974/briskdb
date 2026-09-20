@@ -109,10 +109,28 @@ Declarations and ID allocation share one transaction; idempotent calls retain
 the same ID. IDs remain internal to Rust metadata for now: Python/wire result
 shapes are unchanged, and SQL indexes use a separate identity space.
 
+Native declarations also accept sparse or partial membership, using the shared
+source-locked key generator to validate the predicate eagerly before catalog
+mutation. The supported partial subset includes nonempty `$and`/`$or`, equality,
+ordered comparisons, `$in`, `$type`, and `$exists: true`. Empty partial filters,
+unsupported branches and combining sparse with partial are rejected. The complete
+retained specification, including keys, name and filter, is bounded to 1 MiB.
+
+Ordinary declarations retain their existing flat-key encoding. Sparse/partial
+declarations use the exact ordered v2 envelope already used by TinyMongo import;
+the filter's BSON representation is preserved. Repeating the same normalized
+envelope is idempotent and keeps its ID. Advanced envelopes retain byte-exact
+conflict checks; semantic predicate equivalence is not inferred. No older
+specification is rewritten and there is no new storage format.
+`DocumentIndexMetadata::definition()` offers a borrowed keys/options view for
+recognized flat or v2 encodings; unknown legacy envelopes remain readable through
+`specification()` and return no interpreted view. The view itself is not a
+membership validator or authority: consumers must compile it before execution.
+
 All declared secondary indexes remain `PendingBuild`, including `unique` ones:
-they are not query authorities or uniqueness constraints. Sparse/partial options,
-physical builds, write-time maintenance, wire index commands, and index cursors
-remain future work. Required CI compares 64 valid ascending integer-key definitions
+they are not query authorities or uniqueness constraints. Declarations do not
+scan or validate existing records. Physical builds, write-time maintenance, wire
+index commands, and index cursors remain future work. Required CI compares 64 valid ascending integer-key definitions
 against unchanged TinyMongo index source, including names, key order, flags and
 restart metadata. Descending/numeric-alias normalization, invalid inputs,
 resource limits and legacy metadata preservation are independently tested; no

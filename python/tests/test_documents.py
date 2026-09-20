@@ -52,6 +52,55 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_sparse_partial_declarations_validate_preserve_options_and_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    keys = OrderedDict([("label", Int64(1)), ("rank", -1.0)])
+                    partial = SON([("rank", {"$gte": Int64(2)}), ("active", True)])
+                    before = bson_bytes(partial)
+                    request_id = uuid.uuid4()
+                    sparse_result = session.create_index(DATABASE, COLLECTION, keys, sparse=True, unique=True, request_id=request_id)
+                    self.assertEqual(sparse_result["request_id"], request_id)
+                    self.assertEqual((sparse_result["index_name"], sparse_result["lifecycle"]), ("label_1_rank_-1", "pending_build"))
+                    session.create_index(DATABASE, COLLECTION, keys, name="partial", partial_filter=partial, unique=True)
+                    for _ in range(2):
+                        session.create_index(DATABASE, COLLECTION, keys, sparse=True, unique=True)
+                        session.create_index(DATABASE, COLLECTION, keys, name="partial", partial_filter=partial, unique=True)
+                    indexes = session.list_indexes(DATABASE, COLLECTION)["indexes"]
+                    self.assertEqual([item["name"] for item in indexes], ["_id_", "label_1_rank_-1", "partial"])
+                    self.assertEqual(bson_bytes(indexes[1]["keys"]), bson_bytes({"label": 1, "rank": -1}))
+                    self.assertTrue(indexes[1]["sparse"])
+                    self.assertNotIn("partial_filter", indexes[1])
+                    self.assertNotIn("sparse", indexes[2])
+                    self.assertEqual(bson_bytes(indexes[2]["partial_filter"]), before)
+                    self.assertEqual(bson_bytes(partial), before)
+                    self.assertEqual([item["lifecycle"] for item in indexes[1:]], ["pending_build", "pending_build"])
+                    for options in [{"sparse": True, "partial_filter": {"active": True}}, {"partial_filter": {}}, {"partial_filter": {"rank": {"$ne": 1}}}, {"partial_filter": {"$or": [{"active": True}, {"rank": {"$ne": 1}}]}}]:
+                        with self.assertRaises(briskdb.UnsupportedError):
+                            session.create_index(DATABASE, COLLECTION, keys, name="invalid", **options)
+                    with self.assertRaises(briskdb.FailedPreconditionError):
+                        session.create_index(DATABASE, COLLECTION, keys, unique=True)
+                    with self.assertRaises(briskdb.FailedPreconditionError):
+                        session.create_index(DATABASE, COLLECTION, keys, name="partial", partial_filter={"active": False}, unique=True)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.create_index(DATABASE, COLLECTION, keys, name="bounded", sparse=True, max_result_bytes=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.create_index(DATABASE, COLLECTION, keys, name="cancelled", partial_filter=partial, cancellation=token)
+                    self.assertEqual(session.list_indexes(DATABASE, COLLECTION)["indexes"], indexes)
+                    # Pending declarations do not enforce uniqueness or affect reads.
+                    for identifier in (1, 2):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": identifier, "label": "same", "rank": 3, "active": True})
+                    self.assertEqual(session.count_documents(DATABASE, COLLECTION)["count"], 2)
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(session.list_indexes(DATABASE, COLLECTION)["indexes"], indexes)
+                    session.drop_index(DATABASE, COLLECTION, "partial")
+                    self.assertEqual(len(session.list_indexes(DATABASE, COLLECTION)["indexes"]), 2)
+
     def test_pending_index_drop_protection_controls_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=2, documents=True) as database:
@@ -1823,6 +1872,33 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_sparse_partial_declarations_forward_options_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    request_id = uuid.uuid4()
+                    result = await session.create_index(DATABASE, COLLECTION, {"label": 1}, sparse=True, request_id=request_id, timeout_ms=5000)
+                    self.assertEqual(result["request_id"], request_id)
+                    self.assertEqual(result["lifecycle"], "pending_build")
+                    partial = {"active": True}
+                    await session.create_index(DATABASE, COLLECTION, {"label": 1}, name="partial", unique=True, partial_filter=partial)
+                    indexes = (await session.list_indexes(DATABASE, COLLECTION))["indexes"]
+                    self.assertTrue(indexes[1]["sparse"])
+                    self.assertEqual(indexes[2]["partial_filter"], partial)
+                    with self.assertRaises(briskdb.UnsupportedError):
+                        await session.create_index(DATABASE, COLLECTION, {"label": 1}, name="invalid", sparse=True, partial_filter=partial)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.create_index(DATABASE, COLLECTION, {"label": 1}, name="bounded", partial_filter=partial, max_result_bytes=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        await session.create_index(DATABASE, COLLECTION, {"label": 1}, name="cancelled", sparse=True, cancellation=token)
+                    self.assertEqual((await session.list_indexes(DATABASE, COLLECTION))["indexes"], indexes)
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    self.assertEqual((await session.list_indexes(DATABASE, COLLECTION))["indexes"], indexes)
+
     async def test_async_pending_index_drop_forwards_controls_and_acknowledgement(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

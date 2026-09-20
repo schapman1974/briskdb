@@ -31,8 +31,13 @@ def sync_contract(path: str) -> None:
         "app", "notes", request_id=request_id
     )["collection"]["id"]
     index_lifecycle: Literal["pending_build"] = document_session.create_index(
-        "app", "notes", {"body": 1}
+        "app", "notes", {"body": 1}, sparse=True
     )["lifecycle"]
+    document_session.create_index("app", "notes", {"body": 1}, name="partial", partial_filter={"active": True})
+    index_metadata = document_session.list_indexes("app", "notes")["indexes"][0]
+    sparse: bool = index_metadata.get("sparse", False)
+    partial: Optional[dict[str, object]] = index_metadata.get("partial_filter")
+    print(sparse, partial)
     dropped_index: bool = document_session.drop_index("app", "notes", "body_1")["acknowledged"]
     print(dropped_index)
     inserted: int = document_session.insert_one(
@@ -108,6 +113,12 @@ async def async_contract(path: str) -> None:
     outcome: str = await transaction.rollback()
     created = await session.create_collection("app", "typed")
     namespace: str = created["collection"]["namespace"]
+    await session.create_index("app", "typed", {"body": 1}, sparse=True)
+    await session.create_index("app", "typed", {"body": 1}, name="partial", partial_filter={"active": True})
+    index_metadata = (await session.list_indexes("app", "typed"))["indexes"][0]
+    sparse: bool = index_metadata.get("sparse", False)
+    partial: Optional[dict[str, object]] = index_metadata.get("partial_filter")
+    print(sparse, partial)
     dropped_index: bool = (await session.drop_index("app", "typed", "body_1"))["acknowledged"]
     print(dropped_index)
     await session.insert_one("app", "typed", {"_id": 1})
