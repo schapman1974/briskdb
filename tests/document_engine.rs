@@ -1227,6 +1227,143 @@ async fn request_controls_and_session_ownership_are_enforced() {
 }
 
 #[tokio::test]
+async fn insert_and_point_delete_lock_waits_honor_controls_and_release_leases() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    insert(
+        &engine,
+        &session,
+        2,
+        vec![document(BsonValue::Int32(1), "original")],
+    )
+    .await;
+    let blockers: Vec<_> = (0..2)
+        .map(|shard| {
+            let connection = Connection::open(
+                temp.path()
+                    .join("shards")
+                    .join(format!("{shard:04}.sqlite")),
+            )
+            .unwrap();
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            connection
+        })
+        .collect();
+    for delete in [false, true] {
+        for deadline in [false, true] {
+            let command = if delete {
+                DocumentCommand::Delete(DocumentDeleteRequest::new(
+                    namespace(),
+                    DocumentFilter::new(
+                        BsonDocument::from_entries([("_id", BsonValue::Int32(1))]).unwrap(),
+                    )
+                    .unwrap(),
+                    DocumentMutationScope::One,
+                    DocumentWriteOptions::new(),
+                ))
+            } else {
+                DocumentCommand::Insert(
+                    DocumentInsertRequest::new(
+                        namespace(),
+                        vec![document(BsonValue::Int32(2), "new")],
+                        DocumentWriteOptions::new(),
+                    )
+                    .unwrap(),
+                )
+            };
+            let cancellation = CancellationToken::new();
+            let context = if deadline {
+                RequestContext::new().with_deadline(Instant::now() + Duration::from_millis(50))
+            } else {
+                RequestContext::new().with_cancellation_token(cancellation.clone())
+            };
+            let started = Instant::now();
+            let execute = engine.execute_document(&session, request(3, context, command));
+            let cancel = async {
+                if !deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    cancellation.cancel();
+                }
+            };
+            let (result, ()) = tokio::join!(execute, cancel);
+            assert_eq!(
+                result.unwrap_err().kind(),
+                if deadline {
+                    EngineErrorKind::DeadlineExceeded
+                } else {
+                    EngineErrorKind::Cancelled
+                }
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "shard write lock ignored request controls"
+            );
+        }
+    }
+    for blocker in blockers {
+        blocker.execute_batch("ROLLBACK").unwrap();
+    }
+    let found = engine
+        .execute_document(
+            &session,
+            request(
+                4,
+                RequestContext::new(),
+                DocumentCommand::Find(DocumentFindRequest::new(
+                    namespace(),
+                    DocumentFilter::empty(),
+                    DocumentReadOptions::new(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    let DocumentResult::Cursor(cursor) = found.result() else {
+        panic!("expected cursor")
+    };
+    assert_eq!(cursor.documents().len(), 1);
+    assert_eq!(
+        cursor.documents()[0].get_first("label"),
+        Some(&BsonValue::from("original"))
+    );
+    insert(
+        &engine,
+        &session,
+        5,
+        vec![document(BsonValue::Int32(2), "new")],
+    )
+    .await;
+    for expected in [1, 0] {
+        let result = engine
+            .execute_document(
+                &session,
+                request(
+                    6,
+                    RequestContext::new(),
+                    DocumentCommand::Delete(DocumentDeleteRequest::new(
+                        namespace(),
+                        DocumentFilter::new(
+                            BsonDocument::from_entries([("_id", BsonValue::Int32(1))]).unwrap(),
+                        )
+                        .unwrap(),
+                        DocumentMutationScope::One,
+                        DocumentWriteOptions::new(),
+                    )),
+                ),
+            )
+            .await
+            .unwrap();
+        let DocumentResult::Delete(result) = result.result() else {
+            panic!("expected delete")
+        };
+        assert_eq!(result.deleted_count(), expected);
+    }
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn manifest_write_lock_waits_honor_document_deadlines() {
     let temp = tempfile::tempdir().unwrap();
     let engine = Engine::open(temp.path(), 2).await.unwrap();

@@ -91,6 +91,16 @@ structures, but BSON matching remains authoritative; SQLite candidates may
 never exclude a true Mongo match. Secondary index declarations remain
 `PendingBuild` until issue #174 installs and verifies their physical authority.
 
+All shard-local insert, replace and delete storage primitives require a
+caller-owned Rust transaction and reject handles whose SQLite transaction has
+already rolled back. Ordinary inserts commit one immediate transaction per
+input; exact-ID deletes also use an explicit immediate transaction. This closes
+the autocommit paths before future index-entry maintenance adds more statements
+to each mutation. It does not create physical entries or activate indexes.
+Cancellation before commit rolls back the current input; earlier batch commits
+remain. Subprocess tests cover process death after the write, before commit and
+after commit, including the durable prefix of an interrupted insert batch.
+
 ## Provisioning and restart
 
 Collection creation first commits the database, provisioning collection,
