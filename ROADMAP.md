@@ -634,7 +634,12 @@ requires an earlier dependency:
       metadata uses the existing import envelope, preserves IDs across restart,
       and has a combined size bound. Ordinary encodings are unchanged; unknown
       legacy envelopes remain opaque/readable. These declarations do not scan
-      records or activate indexes. Physical build/recovery, write-time
+      records or activate indexes. Document insert/replace/delete primitives now
+      require active caller-owned transactions, including explicit per-input
+      transactions for inserts and exact-ID deletes. Duplicate batch continuation
+      requires successful rollback; controls, transaction failures and process
+      crashes verify the committed-prefix boundary. No physical index is activated.
+      Physical build/recovery, write-time
       maintenance, wire index commands and metadata cursors remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted

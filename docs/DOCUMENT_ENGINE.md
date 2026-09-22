@@ -527,7 +527,8 @@ mutation image. Native namespaces must already exist; wire upserts may create th
 ### Filtered deletion and commit boundaries
 
 `Delete` validates its matcher, options, and fixed-size result/plan budget before
-writing. Exact-ID filters retain the direct one-shard path for both scopes.
+writing. Exact-ID filters retain the direct one-shard path for both scopes,
+with an explicit immediate transaction and a control check before commit.
 Filtered `One` scans each shard in natural order, retaining only the earliest
 candidate identity. It then acquires an immediate write transaction on that
 shard and rechecks both natural-order identity and the predicate. Concurrently
@@ -689,10 +690,14 @@ command rather than returning a partial batch.
 
 Insert batches preflight every document and the result budget before writing.
 Each document routes by its canonical BSON `_id`. Contiguous same-shard inputs
-share one connection lease and worker without changing input order. Writes
-commit individually: ordered batches stop at the first duplicate; unordered
-batches continue after duplicates and return every error's input index alongside
-successful IDs. A single-document duplicate remains a `UniqueViolation` engine
+share one connection lease and worker without changing input order. Every input
+owns an explicit immediate shard transaction, with cancellation/deadline checks
+before admission and before commit. Ordered batches stop at the first duplicate;
+unordered batches continue only after the failed input's rollback succeeds and
+return every error's input index alongside successful IDs. Rollback evidence is
+local to that input, not a no-changes certificate for the enclosing batch. Begin,
+commit and rollback failures stop the command. A successful commit is not changed
+into a late cancellation error. A single-document duplicate remains a `UniqueViolation` engine
 error. Other failures, including cancellation and storage errors, stop the
 command; earlier successful writes may remain. No cross-shard atomicity is
 promised.

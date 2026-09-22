@@ -20,6 +20,9 @@ mod metadata;
 mod single_mutation;
 mod sorting;
 mod update_many;
+mod write_transaction;
+
+use write_transaction::write_transaction;
 
 use super::document_cursor::{
     AggregateCursor, AggregateRow, CursorSource as PreparedFilterRoute, CursorState,
@@ -482,12 +485,12 @@ impl Engine {
                     // This groups an entire single-shard batch without reordering
                     // cross-shard inputs or promising transactional batch writes.
                     let (remaining, successes, failures, stopped) = self
-                        .run_document_shard(
+                        .run_document_shard_controlled(
                             shard,
                             owner,
                             cancellation.clone(),
                             deadline,
-                            move |storage, connection, cancellation| {
+                            move |storage, connection, cancellation, control| {
                                 let mut stopped = false;
                                 while pending
                                     .peek()
@@ -505,30 +508,36 @@ impl Engine {
                                                 "document natural-order identity overflowed",
                                             )
                                         })?;
-                                    match storage.insert_prepared_document_on_connection(
+                                    // One transaction per input, not per batch: future
+                                    // index maintenance must commit with this record,
+                                    // while earlier successful inputs remain committed.
+                                    match write_transaction(
                                         connection,
-                                        collection_id,
-                                        natural_order,
-                                        shard,
-                                        &write,
                                         cancellation,
+                                        control,
+                                        |transaction| {
+                                            storage.insert_prepared_document_on_connection(
+                                                transaction,
+                                                collection_id,
+                                                natural_order,
+                                                shard,
+                                                &write,
+                                                cancellation,
+                                            )
+                                        },
                                     ) {
                                         Ok(()) => inserted_ids.push(id),
-                                        Err(error)
-                                            if batch
-                                                && error.kind()
-                                                    == EngineErrorKind::UniqueViolation =>
-                                        {
+                                        Err(error) if batch && error.is_rolled_back_duplicate() => {
                                             write_errors.push(DocumentWriteError::new(
                                                 offset,
-                                                error.kind(),
+                                                EngineErrorKind::UniqueViolation,
                                             ));
                                             if options.ordered() {
                                                 stopped = true;
                                                 break;
                                             }
                                         }
-                                        Err(error) => return Err(error),
+                                        Err(error) => return Err(error.into_engine_error()),
                                     }
                                 }
                                 Ok((pending, inserted_ids, write_errors, stopped))

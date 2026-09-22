@@ -66,19 +66,22 @@ impl Engine {
         let count = match route {
             PreparedFilterRoute::Point { id_key, shard } => {
                 let deleted = self
-                    .run_document_shard(
+                    .run_document_shard_controlled(
                         shard,
                         owner,
                         cancellation,
                         deadline,
-                        move |storage, connection, cancellation| {
-                            storage.delete_document_on_connection(
-                                connection,
-                                collection_id,
-                                shard,
-                                &id_key,
-                                cancellation,
-                            )
+                        move |storage, connection, cancellation, control| {
+                            write_transaction(connection, cancellation, control, |transaction| {
+                                storage.delete_document_on_connection(
+                                    transaction,
+                                    collection_id,
+                                    shard,
+                                    &id_key,
+                                    cancellation,
+                                )
+                            })
+                            .map_err(write_transaction::WriteTransactionError::into_engine_error)
                         },
                     )
                     .await?;

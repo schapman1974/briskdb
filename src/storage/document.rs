@@ -146,7 +146,7 @@ mod enabled {
         sync::Arc,
     };
 
-    use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+    use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
     use crate::{
         core::{CancellationToken, EngineError, EngineErrorKind, EngineResult, OperationControl},
@@ -1417,11 +1417,12 @@ mod enabled {
                 prepared,
                 cancellation,
             )?;
+            ensure_document_operation_not_cancelled(cancellation, "before committing document")?;
             transaction.commit().map_err(sqlite_error::storage)?;
             Ok(())
         }
 
-        /// Insert one prepared record through an already-leased shard handle.
+        /// Insert one prepared record within a caller-owned shard transaction.
         ///
         /// Transaction ownership remains with the engine. The caller supplies
         /// the lease's physical shard identity and arms SQLite's progress and
@@ -1429,13 +1430,14 @@ mod enabled {
         #[allow(clippy::too_many_arguments)]
         pub(crate) fn insert_prepared_document_on_connection(
             &self,
-            connection: &Connection,
+            connection: &Transaction<'_>,
             collection_id: DocumentCollectionId,
             natural_order: u64,
             shard: u16,
             prepared: &PreparedDocumentWrite,
             cancellation: &CancellationToken,
         ) -> EngineResult<()> {
+            require_write_transaction(connection)?;
             ensure_document_operation_not_cancelled(cancellation, "before inserting document")?;
             self.validate_prepared_document_route(shard, prepared)?;
             require_schema(connection)?;
@@ -1472,7 +1474,7 @@ mod enabled {
         #[allow(clippy::too_many_arguments)]
         pub(crate) fn replace_document_on_connection(
             &self,
-            connection: &Connection,
+            connection: &Transaction<'_>,
             collection_id: DocumentCollectionId,
             shard: u16,
             id_key: &CanonicalBsonKey,
@@ -1480,6 +1482,7 @@ mod enabled {
             replacement: &PreparedDocumentWrite,
             cancellation: &CancellationToken,
         ) -> EngineResult<bool> {
+            require_write_transaction(connection)?;
             ensure_document_operation_not_cancelled(cancellation, "before replacing document")?;
             self.validate_document_key_route(shard, id_key)?;
             if replacement.id_key != *id_key {
@@ -1520,15 +1523,16 @@ mod enabled {
             Ok(changed == 1)
         }
 
-        /// Delete one exact canonical `_id` through an already-leased handle.
+        /// Delete one exact canonical `_id` within a caller-owned transaction.
         pub(crate) fn delete_document_on_connection(
             &self,
-            connection: &Connection,
+            connection: &Transaction<'_>,
             collection_id: DocumentCollectionId,
             shard: u16,
             id_key: &CanonicalBsonKey,
             cancellation: &CancellationToken,
         ) -> EngineResult<bool> {
+            require_write_transaction(connection)?;
             ensure_document_operation_not_cancelled(cancellation, "before deleting document")?;
             self.validate_document_key_route(shard, id_key)?;
             require_schema(connection)?;
@@ -3123,6 +3127,20 @@ mod enabled {
         })
     }
 
+    // A Transaction handle can outlive a SQL ROLLBACK (including SQLite's
+    // automatic rollback on some failures). Never let a subsequent mutation
+    // silently fall back to autocommit, even when the Rust type is correct.
+    fn require_write_transaction(transaction: &Transaction<'_>) -> EngineResult<()> {
+        if transaction.is_autocommit() {
+            Err(EngineError::new(
+                EngineErrorKind::Internal,
+                "document mutation requires an active shard transaction",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn hash_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
@@ -3644,6 +3662,78 @@ mod enabled {
                     .unwrap(),
                 1
             );
+        }
+
+        #[test]
+        fn document_mutations_reject_transaction_handles_after_rollback() {
+            for automatic in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let storage = Storage::open(temp.path(), 2).unwrap();
+                let collection = storage
+                    .create_document_collection("app", "items", &DocumentCollectionOptions::empty())
+                    .unwrap();
+                let original = document([("_id", BsonValue::Int32(1))]);
+                storage.insert_document(collection.id(), &original).unwrap();
+                let prepared = storage.prepare_document_write(&original).unwrap();
+                let mut connection = storage.open_unconfigured_shard(prepared.shard()).unwrap();
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                if automatic {
+                    let error = transaction.execute_batch(
+                        "INSERT OR ROLLBACK INTO briskdb_documents_v1 SELECT * FROM briskdb_documents_v1"
+                    ).unwrap_err();
+                    assert_eq!(
+                        sqlite_error::statement(error).kind(),
+                        EngineErrorKind::UniqueViolation
+                    );
+                } else {
+                    transaction.execute_batch("ROLLBACK").unwrap();
+                }
+                assert!(transaction.is_autocommit());
+                let cancellation = CancellationToken::new();
+                let insert = storage
+                    .insert_prepared_document_on_connection(
+                        &transaction,
+                        collection.id(),
+                        2,
+                        prepared.shard(),
+                        &prepared,
+                        &cancellation,
+                    )
+                    .unwrap_err();
+                let replace = storage
+                    .replace_document_on_connection(
+                        &transaction,
+                        collection.id(),
+                        prepared.shard(),
+                        prepared.id_key(),
+                        1,
+                        &prepared,
+                        &cancellation,
+                    )
+                    .unwrap_err();
+                let delete = storage
+                    .delete_document_on_connection(
+                        &transaction,
+                        collection.id(),
+                        prepared.shard(),
+                        prepared.id_key(),
+                        &cancellation,
+                    )
+                    .unwrap_err();
+                for error in [insert, replace, delete] {
+                    assert_eq!(error.kind(), EngineErrorKind::Internal);
+                }
+                drop(transaction);
+                assert!(
+                    storage
+                        .get_document(collection.id(), &BsonValue::Int32(1))
+                        .unwrap()
+                        .unwrap()
+                        .representation_eq(&original)
+                );
+            }
         }
 
         #[test]
