@@ -17,6 +17,21 @@ struct Journal {
     next: u16,
 }
 
+struct BuildOutcome {
+    metadata: DocumentIndexMetadata,
+    before: u64,
+    after: u64,
+}
+
+#[cfg(test)]
+fn build_checkpoint(created: bool, point: &str, shard: u16) {
+    if created {
+        checkpoint(&format!("create-{point}"), shard);
+    } else {
+        checkpoint(point, shard);
+    }
+}
+
 #[cfg(test)]
 fn checkpoint(point: &str, shard: u16) {
     if std::env::var("BRISKDB_TEST_DOCUMENT_INDEX_OPERATION_CRASH")
@@ -333,9 +348,51 @@ impl Storage {
         database: &str,
         collection_name: &str,
         name: &str,
-        mut migration: SchemaMigrationGuard,
+        migration: SchemaMigrationGuard,
         control: Arc<OperationControl>,
     ) -> EngineResult<DocumentIndexMetadata> {
+        self.build_or_create_document_index(
+            database,
+            collection_name,
+            name,
+            None,
+            migration,
+            control,
+        )
+        .map(|outcome| outcome.metadata)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_built_document_index_controlled(
+        &self,
+        namespace: &DocumentNamespace,
+        name: &str,
+        specification: &BsonDocument,
+        unique: bool,
+        migration: SchemaMigrationGuard,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<(u64, u64)> {
+        self.build_or_create_document_index(
+            namespace.database(),
+            namespace.collection(),
+            name,
+            Some((specification, unique)),
+            migration,
+            control,
+        )
+        .map(|outcome| (outcome.before, outcome.after))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_or_create_document_index(
+        &self,
+        database: &str,
+        collection_name: &str,
+        name: &str,
+        declaration: Option<(&BsonDocument, bool)>,
+        mut migration: SchemaMigrationGuard,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<BuildOutcome> {
         let result = (|| {
             ensure_control_active(&control, "before building document index")?;
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
@@ -354,11 +411,85 @@ impl Storage {
                         "document collection does not exist",
                     )
                 })?;
-            let target = collection
+            let existing = collection
                 .indexes()
                 .iter()
-                .find(|index| index.name() == name)
+                .find(|index| index.name() == name);
+            if let Some((specification, unique)) = declaration {
+                if unique {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Unsupported,
+                        "physical unique document indexes require global uniqueness authority",
+                    ));
+                }
+                if let Some(existing) = existing {
+                    let canonical_keys = !specification.is_empty()
+                        && specification
+                            .iter()
+                            .all(|(_, value)| matches!(value, BsonValue::Int32(1 | -1)));
+                    let same_spec = existing.specification().representation_eq(specification)
+                        || (canonical_keys && existing.specification() == specification);
+                    if !same_spec || existing.is_unique() != unique {
+                        return Err(EngineError::new(
+                            EngineErrorKind::FailedPrecondition,
+                            "document index name already has a different declaration",
+                        ));
+                    }
+                }
+            }
+            let addition = if let (None, Some((specification, unique))) = (existing, declaration) {
+                let bytes = encode_document(specification)
+                    .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+                let id = run_manifest_controlled(
+                    &mut connection,
+                    Arc::clone(&control),
+                    |connection| {
+                        require_ready_manifest(connection, self.shard_count())?;
+                        let (count, retained, high): (i64, i64, i64) = connection.query_row(
+                        "SELECT (SELECT count(*) FROM briskdb_document_indexes),
+                         coalesce((SELECT sum(length(options_bson)) FROM briskdb_document_collections), 0)
+                           + coalesce((SELECT sum(length(spec_bson)) FROM briskdb_document_indexes), 0),
+                         index_high_water FROM briskdb_document_index_allocator WHERE singleton = 1",
+                        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    ).map_err(sqlite_error::storage)?;
+                        if count as usize >= manifest::MAX_DOCUMENT_INDEXES
+                            || (retained as usize).saturating_add(bytes.len())
+                                > manifest::MAX_DOCUMENT_CATALOG_BSON_BYTES
+                        {
+                            return Err(EngineError::new(
+                                EngineErrorKind::LimitExceeded,
+                                "document index declaration exceeds catalog capacity",
+                            ));
+                        }
+                        let next = high.checked_add(1).ok_or_else(|| {
+                            EngineError::new(
+                                EngineErrorKind::LimitExceeded,
+                                "document index identity space is exhausted",
+                            )
+                        })?;
+                        Ok(DocumentIndexId::from_validated(next as u64))
+                    },
+                )?;
+                Some(DocumentIndexMetadata::from_validated_parts(
+                    id,
+                    name.to_owned(),
+                    specification.clone(),
+                    unique,
+                    false,
+                    DocumentIndexLifecycle::PendingBuild,
+                ))
+            } else {
+                None
+            };
+            let created = addition.is_some();
+            let target = existing
+                .or(addition.as_ref())
                 .ok_or_else(|| DocumentIndexError::NotFound.into_engine_error())?;
+            let before = collection
+                .indexes()
+                .iter()
+                .filter(|index| index.lifecycle() == DocumentIndexLifecycle::Ready)
+                .count() as u64;
             if target.is_built_in() {
                 return Err(DocumentIndexError::Protected.into_engine_error());
             }
@@ -371,10 +502,13 @@ impl Storage {
             let current = compile_ready_indexes(&catalog, &mut || {
                 ensure_control_active(&control, "while preparing document index authority")
             })?;
-            let future =
-                compile_indexes_with_candidate(&catalog, Some(target.id()), None, &mut || {
-                    ensure_control_active(&control, "while preparing document index build")
-                })?;
+            let future = compile_indexes_with_addition(
+                &catalog,
+                Some(target.id()),
+                None,
+                addition.as_ref().map(|index| (collection.id(), index)),
+                &mut || ensure_control_active(&control, "while preparing document index build"),
+            )?;
             let prepared = future
                 .get(&collection.id())
                 .ok_or_else(|| corrupt("document index build omitted its collection"))?;
@@ -437,7 +571,11 @@ impl Storage {
             }
             if target.lifecycle() == DocumentIndexLifecycle::Ready {
                 migration.publish_ready()?;
-                return Ok(target.clone());
+                return Ok(BuildOutcome {
+                    metadata: target.clone(),
+                    before,
+                    after: before,
+                });
             }
             let mut operation = vec![0_u8; 32];
             getrandom::fill(&mut operation).map_err(|error| {
@@ -451,10 +589,33 @@ impl Storage {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(sqlite_error::storage)?;
                 require_ready_manifest(&transaction, self.shard_count())?;
+                if created {
+                    let bytes = encode_document(target.specification())
+                        .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+                    transaction.execute(
+                        "INSERT INTO briskdb_document_indexes
+                         (collection_id, index_name, spec_bson, is_unique, is_builtin, index_format_version, lifecycle_state)
+                         VALUES (?1, ?2, ?3, 0, 0, 1, 2)",
+                        params![to_sqlite_id(collection.id())?, name, bytes],
+                    ).map_err(sqlite_error::storage)?;
+                    allocate_index_identity(&transaction, to_sqlite_id(collection.id())?, name)?;
+                    let actual: i64 = transaction.query_row(
+                        "SELECT index_id FROM briskdb_document_index_identities WHERE collection_id = ?1 AND index_name = ?2",
+                        params![to_sqlite_id(collection.id())?, name], |row| row.get(0),
+                    ).map_err(sqlite_error::storage)?;
+                    if actual as u64 != target.id().get() {
+                        return Err(corrupt(
+                            "prospective document index identity changed under exclusive ownership",
+                        ));
+                    }
+                }
+                // A new declaration is published together with an existing v19
+                // DROP cleanup obligation. Until activation cancels it, restart
+                // must remove the provisional definition as well as its entries.
                 transaction
                     .execute(
-                        "INSERT INTO briskdb_document_index_operation VALUES (1, ?1, 1, ?2, ?3, 0)",
-                        params![target.id().get() as i64, operation, self.shard_count()],
+                        "INSERT INTO briskdb_document_index_operation VALUES (1, ?1, ?4, ?2, ?3, 0)",
+                        params![target.id().get() as i64, operation, self.shard_count(), if created { DROP } else { BUILD }],
                     )
                     .map_err(sqlite_error::storage)?;
                 manifest::refresh_manifest_digest(&transaction)?;
@@ -462,20 +623,19 @@ impl Storage {
                 ensure_control_active(&control, "before committing document index build intent")?;
                 migration.mark_pending_on_drop();
                 #[cfg(test)]
-                checkpoint("before-intent", 0);
+                build_checkpoint(created, "before-intent", 0);
                 transaction.commit().map_err(sqlite_error::storage)?;
                 #[cfg(test)]
-                checkpoint("after-intent", 0);
+                build_checkpoint(created, "after-intent", 0);
                 Ok(())
             })?;
             let mut journal = Journal {
                 index: target.id(),
-                kind: BUILD,
+                kind: if created { DROP } else { BUILD },
                 operation,
                 next: 0,
             };
-            while journal.next < self.shard_count() {
-                let shard = journal.next;
+            for shard in 0..self.shard_count() {
                 let mut source = self.open_unconfigured_shard(shard)?;
                 run_provisioning_step(&mut source, Some(&control), |source| {
                     self.validate_unconfigured_shard_nonterminal(source, shard)?;
@@ -535,14 +695,18 @@ impl Storage {
                     )?;
                     ensure_control_active(&control, "before committing document index shard")?;
                     #[cfg(test)]
-                    checkpoint("before-shard", shard);
+                    build_checkpoint(created, "before-shard", shard);
                     transaction.commit().map_err(sqlite_error::storage)?;
                     #[cfg(test)]
-                    checkpoint("after-shard", shard);
+                    build_checkpoint(created, "after-shard", shard);
                     Ok(())
                 })?;
-                advance(self, &mut connection, &journal, shard + 1, Some(&control))?;
-                journal.next = shard + 1;
+                if !created {
+                    advance(self, &mut connection, &journal, shard + 1, Some(&control))?;
+                    journal.next = shard + 1;
+                }
+                // New-index DROP progress stays at zero: recovery must clean
+                // every shard, including those whose build already committed.
             }
             let metadata = run_manifest_controlled(
                 &mut connection,
@@ -553,8 +717,8 @@ impl Storage {
                         .map_err(sqlite_error::storage)?;
                     manifest::current_integrity(&transaction, self.shard_count())?;
                     let removed = transaction.execute("DELETE FROM briskdb_document_index_operation WHERE singleton = 1
-                    AND index_id = ?1 AND operation_id = ?2 AND operation_kind = 1 AND next_shard = shard_count",
-                    params![target.id().get() as i64, journal.operation]).map_err(sqlite_error::storage)?;
+                    AND index_id = ?1 AND operation_id = ?2 AND operation_kind = ?3 AND next_shard = ?4",
+                    params![target.id().get() as i64, journal.operation, journal.kind, journal.next]).map_err(sqlite_error::storage)?;
                     let activated = transaction.execute("UPDATE briskdb_document_indexes SET lifecycle_state = 1
                     WHERE collection_id = ?1 AND index_name = ?2 AND is_builtin = 0 AND is_unique = 0 AND lifecycle_state = 2",
                     params![to_sqlite_id(collection.id())?, name]).map_err(sqlite_error::storage)?;
@@ -572,16 +736,20 @@ impl Storage {
                         .ok_or_else(|| corrupt("activated document index disappeared"))?;
                     ensure_control_active(&control, "before publishing document index authority")?;
                     #[cfg(test)]
-                    checkpoint("before-activation", 0);
+                    build_checkpoint(created, "before-activation", 0);
                     transaction.commit().map_err(sqlite_error::storage)?;
                     #[cfg(test)]
-                    checkpoint("after-activation", 0);
+                    build_checkpoint(created, "after-activation", 0);
                     Ok(metadata)
                 },
             )?;
             self.publish_document_indexes(future)?;
             migration.publish_ready()?;
-            Ok(metadata)
+            Ok(BuildOutcome {
+                metadata,
+                before,
+                after: before + 1,
+            })
         })();
         self.fail_closed_on_corruption(result)
     }

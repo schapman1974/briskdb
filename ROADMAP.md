@@ -692,6 +692,14 @@ requires an earlier dependency:
       existing native catalog API. Cursors retain bounded identity/name state,
       exclude newly allocated IDs, invalidate on collection recreation and share
       byte/row/time/ownership limits. Reopen and real-driver tests cover both APIs.
+      Combined native `CreateBuiltIndex` / sync/async `create_built_index` now
+      preflights, declares and builds a non-unique index in one exclusive
+      operation, with Ready counts for future wire responses. A new declaration
+      is coupled to v19 cleanup intent until activation; interrupted creation
+      removes that declaration on reopen, while preexisting Pending declarations
+      survive aborted builds. Crash/recovery and admitted-cancellation tests
+      preserve records, surviving entries and nonreused index identities.
+      This is the creation prerequisite, not yet wire `createIndexes`.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

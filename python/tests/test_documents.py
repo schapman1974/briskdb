@@ -52,6 +52,35 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_combined_index_creation_build_counts_options_and_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    session.insert_one(DATABASE, COLLECTION, {"_id": 1, "value": [1, 2], "active": True})
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    for control, error in [({"max_result_bytes": 1}, briskdb.LimitExceededError), ({"cancellation": token}, briskdb.CancelledError), ({"unique": True}, briskdb.UnsupportedError)]:
+                        with self.assertRaises(error):
+                            session.create_built_index(DATABASE, COLLECTION, {"value": 1}, **control)
+                        self.assertEqual(len(session.list_indexes(DATABASE, COLLECTION)["indexes"]), 1)
+                    identity = uuid.uuid4()
+                    result = session.create_built_index(DATABASE, COLLECTION, {"value": 1}, sparse=True, request_id=identity, timeout_ms=5000)
+                    self.assertEqual((result["request_id"], result["kind"], result["index_name"], result["lifecycle"], result["num_indexes_before"], result["num_indexes_after"]), (identity, "index_built", "value_1", "ready", 1, 2))
+                    retry = session.create_built_index(DATABASE, COLLECTION, {"value": Int64(1)}, sparse=True)
+                    self.assertEqual((retry["num_indexes_before"], retry["num_indexes_after"]), (2, 2))
+                    session.create_built_index(DATABASE, COLLECTION, {"value": 1, "tail": -1}, name="partial", partial_filter={"active": True})
+                    session.create_index(DATABASE, COLLECTION, {"other": 1})
+                    result = session.create_built_index(DATABASE, COLLECTION, {"other": 1})
+                    self.assertEqual((result["num_indexes_before"], result["num_indexes_after"]), (3, 4))
+                    session.update_one(DATABASE, COLLECTION, {"_id": 1}, {"$set": {"value": [3, 4], "active": False}})
+                    metadata = session.list_index_metadata(DATABASE, COLLECTION)["documents"]
+                    self.assertEqual(metadata[-1], {"name": "value_1", "key": {"value": 1}, "sparse": True})
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(session.list_index_metadata(DATABASE, COLLECTION)["documents"], metadata)
+                    self.assertEqual(session.count_documents(DATABASE, COLLECTION, {"value": 4})["count"], 1)
+
     def test_paged_built_index_metadata_and_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=2, documents=True) as database:
@@ -1942,6 +1971,27 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_combined_index_creation_build_forwards_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.create_built_index(DATABASE, COLLECTION, {"value": 1}, max_result_bytes=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        await session.create_built_index(DATABASE, COLLECTION, {"value": 1}, cancellation=token)
+                    identity = uuid.uuid4()
+                    result = await session.create_built_index(DATABASE, COLLECTION, {"value": 1}, name="partial", partial_filter={"active": True}, request_id=identity, timeout_ms=5000)
+                    self.assertEqual((result["request_id"], result["lifecycle"], result["num_indexes_before"], result["num_indexes_after"]), (identity, "ready", 1, 2))
+                    self.assertEqual((await session.list_index_metadata(DATABASE, COLLECTION))["documents"][1], {"name": "partial", "key": {"value": 1}, "partialFilterExpression": {"active": True}})
+                    await session.insert_one(DATABASE, COLLECTION, {"_id": 1, "value": [1, 2], "active": True})
+                    await session.drop_index(DATABASE, COLLECTION, "partial")
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    self.assertEqual(len((await session.list_index_metadata(DATABASE, COLLECTION))["documents"]), 1)
+
     async def test_async_paged_built_index_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

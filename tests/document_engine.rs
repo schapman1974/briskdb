@@ -150,6 +150,200 @@ fn build_index(name: &str) -> DocumentCommand {
     )
 }
 
+fn create_built_index(index: DocumentIndexRequest) -> DocumentCommand {
+    DocumentCommand::CreateBuiltIndex(DocumentCreateIndexRequest::new(
+        namespace(),
+        index,
+        DocumentWriteOptions::new(),
+    ))
+}
+
+#[tokio::test]
+async fn combined_index_creation_preflights_controls_and_reports_exclusive_ready_counts() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    let definition = || {
+        DocumentIndexRequest::new(
+            BsonDocument::from_entries([("label", BsonValue::Int32(1))]).unwrap(),
+        )
+        .unwrap()
+        .with_name("label")
+        .unwrap()
+    };
+    assert_eq!(
+        engine
+            .execute_document(
+                &session,
+                request(1, RequestContext::new(), create_built_index(definition()))
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::InvalidArgument
+    );
+    create_collection(&engine, &session, 2).await;
+    insert(
+        &engine,
+        &session,
+        3,
+        vec![document(BsonValue::Int32(1), "same")],
+    )
+    .await;
+    declare_pending_index(&engine, &session, "pending").await;
+    let original = pending_indexes(&engine, &session).await;
+    let token = CancellationToken::new();
+    token.cancel();
+    for (context, kind) in [
+        (
+            RequestContext::new().with_cancellation_token(token),
+            EngineErrorKind::Cancelled,
+        ),
+        (
+            RequestContext::new().with_deadline(Instant::now() - Duration::from_secs(1)),
+            EngineErrorKind::DeadlineExceeded,
+        ),
+        (
+            RequestContext::new().with_result_limits(ResultLimits::new(1, 53).unwrap()),
+            EngineErrorKind::LimitExceeded,
+        ),
+    ] {
+        assert_eq!(
+            engine
+                .execute_document(
+                    &session,
+                    request(4, context, create_built_index(definition()))
+                )
+                .await
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+        assert_eq!(pending_indexes(&engine, &session).await, original);
+    }
+    assert_eq!(
+        engine
+            .execute_document(
+                &session,
+                request(
+                    5,
+                    RequestContext::new(),
+                    create_built_index(definition().with_unique(true))
+                )
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::Unsupported
+    );
+    assert_eq!(pending_indexes(&engine, &session).await, original);
+    for (seed, before, after) in [(6, 1, 2), (7, 2, 2)] {
+        let execution = engine
+            .execute_document(
+                &session,
+                request(
+                    seed,
+                    RequestContext::new().with_result_limits(ResultLimits::new(1, 54).unwrap()),
+                    create_built_index(definition()),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            execution.request_id(),
+            DocumentRequestId::new([seed; 16]).unwrap()
+        );
+        assert!(execution.plan().is_none());
+        assert_eq!(
+            execution.result(),
+            &DocumentResult::IndexBuilt {
+                name: "label".to_owned(),
+                before,
+                after
+            }
+        );
+    }
+    let changed = DocumentIndexRequest::new(
+        BsonDocument::from_entries([("sequence", BsonValue::Int32(1))]).unwrap(),
+    )
+    .unwrap()
+    .with_name("label")
+    .unwrap();
+    assert_eq!(
+        engine
+            .execute_document(
+                &session,
+                request(8, RequestContext::new(), create_built_index(changed))
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::FailedPrecondition
+    );
+    let original_pending_id = original
+        .iter()
+        .find(|i| i.name() == "pending")
+        .unwrap()
+        .id();
+    let result = engine
+        .execute_document(
+            &session,
+            request(
+                9,
+                RequestContext::new(),
+                create_built_index(definition().with_name("pending").unwrap()),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.result(),
+        &DocumentResult::IndexBuilt {
+            name: "pending".to_owned(),
+            before: 2,
+            after: 3
+        }
+    );
+    let indexes = pending_indexes(&engine, &session).await;
+    assert_eq!(
+        indexes.iter().find(|i| i.name() == "pending").unwrap().id(),
+        original_pending_id
+    );
+    assert!(
+        indexes
+            .iter()
+            .all(|i| i.lifecycle() == DocumentIndexLifecycle::Ready)
+    );
+    insert(
+        &engine,
+        &session,
+        10,
+        vec![document(BsonValue::Int32(2), "later")],
+    )
+    .await;
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    assert_eq!(pending_indexes(&engine, &session).await, indexes);
+    let result = engine
+        .execute_document(
+            &session,
+            request(11, RequestContext::new(), create_built_index(definition())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.result(),
+        &DocumentResult::IndexBuilt {
+            name: "label".to_owned(),
+            before: 3,
+            after: 3
+        }
+    );
+    engine.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn nonunique_index_build_controls_maintenance_and_reopen() {
     let temp = tempfile::tempdir().unwrap();

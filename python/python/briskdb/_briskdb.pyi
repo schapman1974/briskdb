@@ -91,6 +91,13 @@ class CreateIndexResult(DocumentExecution):
     index_name: str
     lifecycle: Literal["pending_build", "ready"]
 
+class CreateBuiltIndexResult(DocumentExecution):
+    kind: Literal["index_built"]
+    index_name: str
+    lifecycle: Literal["ready"]
+    num_indexes_before: int
+    num_indexes_after: int
+
 class DropIndexResult(DocumentExecution):
     kind: Literal["acknowledged"]
     acknowledged: bool
@@ -470,6 +477,13 @@ class Session:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> CreateIndexResult: ...
+    def create_built_index(
+        self, database: str, collection: str, keys: BsonDocument, *,
+        name: Optional[str] = None, unique: bool = False, sparse: bool = False,
+        partial_filter: Optional[BsonDocument] = None, request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> CreateBuiltIndexResult: ...
     def build_index(
         self, database: str, collection: str, name: str, *,
         request_id: Optional[UUID] = None, timeout_ms: Optional[int] = None,

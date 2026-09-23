@@ -170,6 +170,17 @@ pub(crate) fn execution_to_python(
             output.set_item("index_name", name)?;
             output.set_item("lifecycle", "ready")?;
         }
+        DocumentResult::IndexBuilt {
+            name,
+            before,
+            after,
+        } => {
+            output.set_item("kind", "index_built")?;
+            output.set_item("index_name", name)?;
+            output.set_item("lifecycle", "ready")?;
+            output.set_item("num_indexes_before", before)?;
+            output.set_item("num_indexes_after", after)?;
+        }
         DocumentResult::Indexes(indexes) => {
             output.set_item("kind", "indexes")?;
             let values = PyList::empty(py);

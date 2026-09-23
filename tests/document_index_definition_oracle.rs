@@ -23,6 +23,16 @@ fn request(command: DocumentCommand) -> DocumentRequest {
 #[tokio::test]
 #[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
 async fn built_index_metadata_matches_locked_client_after_build_drop_and_reopen() {
+    assert_built_index_metadata(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
+async fn combined_index_creation_matches_locked_client_metadata_and_reopen() {
+    assert_built_index_metadata(true).await;
+}
+
+async fn assert_built_index_metadata(combined: bool) {
     use briskdb::document::{
         DocumentBuildIndexRequest, DocumentContinueCursorRequest, DocumentDropIndexRequest,
         DocumentFilter, DocumentListIndexMetadataRequest,
@@ -96,33 +106,63 @@ async fn built_index_metadata_matches_locked_client_after_build_drop_and_reopen(
                 definition =
                     definition.with_partial_filter(DocumentFilter::new(partial.clone()).unwrap());
             }
-            engine
+            let definition = DocumentCreateIndexRequest::new(
+                namespace.clone(),
+                definition,
+                DocumentWriteOptions::new(),
+            );
+            let execution = engine
                 .execute_document(
                     &session,
-                    request(DocumentCommand::CreateIndex(
-                        DocumentCreateIndexRequest::new(
-                            namespace.clone(),
-                            definition,
-                            DocumentWriteOptions::new(),
-                        ),
-                    )),
+                    request(if combined {
+                        DocumentCommand::CreateBuiltIndex(definition.clone())
+                    } else {
+                        DocumentCommand::CreateIndex(definition.clone())
+                    }),
                 )
                 .await
                 .unwrap();
-            engine
-                .execute_document(
-                    &session,
-                    request(DocumentCommand::BuildIndex(
-                        DocumentBuildIndexRequest::new(
-                            namespace.clone(),
-                            name,
-                            DocumentWriteOptions::new(),
-                        )
-                        .unwrap(),
-                    )),
-                )
-                .await
-                .unwrap();
+            if combined {
+                let before = expected.len().max(1) as u64;
+                assert_eq!(
+                    execution.result(),
+                    &DocumentResult::IndexBuilt {
+                        name: name.clone(),
+                        before,
+                        after: before + 1,
+                    }
+                );
+                let retry = engine
+                    .execute_document(
+                        &session,
+                        request(DocumentCommand::CreateBuiltIndex(definition)),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    retry.result(),
+                    &DocumentResult::IndexBuilt {
+                        name: name.clone(),
+                        before: before + 1,
+                        after: before + 1,
+                    }
+                );
+            } else {
+                engine
+                    .execute_document(
+                        &session,
+                        request(DocumentCommand::BuildIndex(
+                            DocumentBuildIndexRequest::new(
+                                namespace.clone(),
+                                name,
+                                DocumentWriteOptions::new(),
+                            )
+                            .unwrap(),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+            }
         }
         let Some(BsonValue::Array(rows)) = event.get_first("expected") else {
             panic!("expected")
