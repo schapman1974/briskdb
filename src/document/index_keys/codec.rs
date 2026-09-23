@@ -38,6 +38,34 @@ impl DocumentIndexKey {
         &self,
         check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<Vec<u8>> {
+        let length = self.encoded_len_with_check(check)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).map_err(allocation)?;
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&DOCUMENT_INDEX_KEY_ENCODING_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&(self.components.len() as u32).to_be_bytes());
+        for component in &self.components {
+            check()?;
+            match component.as_ref() {
+                Component::EmptyArray => bytes.push(EMPTY_ARRAY),
+                Component::Value(key) => {
+                    bytes.push(VALUE);
+                    bytes.extend_from_slice(&(key.as_bytes().len() as u32).to_be_bytes());
+                    bytes.extend_from_slice(key.as_bytes());
+                }
+            }
+            check()?;
+        }
+        check()?;
+        Ok(bytes)
+    }
+
+    // Let the multi-index preparer charge output before allocating it. Keep
+    // this preflight shared with serialization so framing charges cannot drift.
+    pub(super) fn encoded_len_with_check(
+        &self,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<usize> {
         check()?;
         if self.components.is_empty() || self.components.len() > MAX_COMPONENTS {
             return Err(limit());
@@ -60,25 +88,7 @@ impl DocumentIndexKey {
                 .ok_or_else(limit)?;
         }
         check()?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(length).map_err(allocation)?;
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&DOCUMENT_INDEX_KEY_ENCODING_VERSION.to_be_bytes());
-        bytes.extend_from_slice(&(self.components.len() as u32).to_be_bytes());
-        for component in &self.components {
-            check()?;
-            match component.as_ref() {
-                Component::EmptyArray => bytes.push(EMPTY_ARRAY),
-                Component::Value(key) => {
-                    bytes.push(VALUE);
-                    bytes.extend_from_slice(&(key.as_bytes().len() as u32).to_be_bytes());
-                    bytes.extend_from_slice(key.as_bytes());
-                }
-            }
-            check()?;
-        }
-        check()?;
-        Ok(bytes)
+        Ok(length)
     }
 
     /// Validate and own a complete persisted tuple. Malformed/future frames are

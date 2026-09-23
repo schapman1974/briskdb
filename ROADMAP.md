@@ -658,6 +658,12 @@ requires an earlier dependency:
       transactions for inserts and exact-ID deletes. Duplicate batch continuation
       requires successful rollback; controls, transaction failures and process
       crashes verify the committed-prefix boundary. No physical index is activated.
+      Collection-wide preparation now compiles pending definitions and generates
+      collection/index-scoped BDIK frames under shared work, memory and key-count
+      bounds. Unknown definitions, late index failures and cancellation discard
+      the whole result; input and catalog bytes remain unchanged. Reopen tests
+      preserve IDs/options, and pending uniqueness still does not constrain writes.
+      This is preflight only, not physical authority or a freshness guarantee.
       Physical build/recovery, write-time
       maintenance, wire index commands and metadata cursors remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust

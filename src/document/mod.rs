@@ -65,7 +65,8 @@ pub use index_definition::DocumentIndexDefinition;
 pub(crate) use index_definition::{normalize_index_definition, normalize_index_request};
 pub use index_keys::{
     DOCUMENT_INDEX_KEY_ENCODING_VERSION, DocumentIndexKey, DocumentIndexKeyGenerator,
-    MAX_DOCUMENT_INDEX_KEY_BYTES,
+    DocumentIndexPreparation, MAX_DOCUMENT_INDEX_KEY_BYTES, MAX_DOCUMENT_PREPARED_INDEXES,
+    PreparedDocumentIndexEntries, PreparedDocumentIndexKeys,
 };
 pub use key::{BSON_KEY_ENCODING_VERSION, BSON_MAX_CANONICAL_KEY_BYTES, CanonicalBsonKey};
 pub use matcher::{DocumentMatcher, DocumentQueryError};
