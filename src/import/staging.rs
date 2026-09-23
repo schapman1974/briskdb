@@ -591,6 +591,26 @@ struct TargetLock {
     _file: File,
 }
 
+#[cfg(unix)]
+impl Drop for TargetLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        // Closing just this descriptor can leave the lock held by a concurrent
+        // fork until exec closes its inherited descriptor. End our ownership
+        // explicitly, after staging cleanup/publication and before reacquisition.
+        loop {
+            // SAFETY: this guard still owns a live descriptor; flock retains no
+            // Rust pointers or descriptors. Only a successfully acquired guard
+            // reaches this destructor.
+            let result = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+            if result == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+    }
+}
+
 impl TargetLock {
     fn acquire(parent: &Path, destination: &Path) -> EngineResult<Self> {
         let digest = blake3::hash(destination.as_os_str().as_encoded_bytes());
@@ -942,6 +962,35 @@ mod tests {
         assert_eq!(busy.kind(), EngineErrorKind::Busy);
         drop(first);
         drop(StagingLayout::create(&source, &destination).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_lock_release_does_not_wait_for_an_inherited_descriptor_to_close() {
+        let temp = TempDir::new().unwrap();
+        let destination = temp.path().join("database");
+        let first = TargetLock::acquire(temp.path(), &destination).unwrap();
+        // A concurrent fork can retain this open-file description until exec,
+        // even though Rust opened the descriptor close-on-exec. A duplicate
+        // exercises the same lock lifetime without a timing-dependent fork.
+        let inherited = first._file.try_clone().unwrap();
+        assert_eq!(
+            TargetLock::acquire(temp.path(), &destination)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Busy
+        );
+        drop(first);
+        let second = TargetLock::acquire(temp.path(), &destination).unwrap();
+        drop(inherited);
+        assert_eq!(
+            TargetLock::acquire(temp.path(), &destination)
+                .unwrap_err()
+                .kind(),
+            EngineErrorKind::Busy
+        );
+        drop(second);
+        drop(TargetLock::acquire(temp.path(), &destination).unwrap());
     }
 
     #[test]
