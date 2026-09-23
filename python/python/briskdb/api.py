@@ -404,6 +404,20 @@ class AsyncSession:
             cancellation=cancellation,
         )
 
+    async def create_built_index(
+        self, database: str, collection: str, keys: Any, *,
+        name: Optional[str] = None, unique: bool = False, sparse: bool = False,
+        partial_filter: Any = None, request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.create_built_index, database, collection, keys,
+            name=name, unique=unique, sparse=sparse, partial_filter=partial_filter,
+            request_id=request_id, timeout_ms=timeout_ms, cancellation=cancellation,
+            max_result_rows=max_result_rows, max_result_bytes=max_result_bytes,
+        )
+
     async def build_index(
         self, database: str, collection: str, name: str, *,
         request_id: Optional[UUID] = None, timeout_ms: Optional[int] = None,

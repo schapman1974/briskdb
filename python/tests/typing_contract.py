@@ -50,6 +50,7 @@ def sync_contract(path: str) -> None:
     )["lifecycle"]
     document_session.create_index("app", "notes", {"body": 1}, name="partial", partial_filter={"active": True})
     built_lifecycle: Literal["pending_build", "ready"] = document_session.build_index("app", "notes", "partial")["lifecycle"]
+    ready_count: int = document_session.create_built_index("app", "notes", {"body": 1}, sparse=True)["num_indexes_after"]
     print(built_lifecycle)
     index_metadata = document_session.list_indexes("app", "notes")["indexes"][0]
     sparse: bool = index_metadata.get("sparse", False)
@@ -134,6 +135,7 @@ async def async_contract(path: str) -> None:
     namespace: str = created["collection"]["namespace"]
     await session.create_index("app", "typed", {"body": 1}, sparse=True)
     await session.build_index("app", "typed", "body_1")
+    ready_count: int = (await session.create_built_index("app", "typed", {"body": 1}, sparse=True))["num_indexes_after"]
     await session.create_index("app", "typed", {"body": 1}, name="partial", partial_filter={"active": True})
     index_metadata = (await session.list_indexes("app", "typed"))["indexes"][0]
     sparse: bool = index_metadata.get("sparse", False)

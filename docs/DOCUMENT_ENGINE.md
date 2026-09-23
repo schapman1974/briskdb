@@ -65,6 +65,7 @@ The current engine executes:
 | `ListDatabaseNames` | Returns `DatabaseNames(Box<[String]>)` from a validated document catalog snapshot; shared filters on `name` and logical combinations, normal request controls, no disk statistics |
 | `CreateIndex` | Validates and normalizes ordered keys, resolves a bounded default/explicit name, and declares pending index metadata; it does not build or enforce a secondary index |
 | `BuildIndex` | Explicitly builds a declared non-unique index under sole-process/exclusive schema admission; returns `IndexReady(name)` after complete publication; queries still scan |
+| `CreateBuiltIndex` | Creates and builds one non-unique index on an existing collection; returns `IndexBuilt { name, before, after }` with Ready counts under the same exclusive admission |
 | `DropIndex` | Removes an exact pending declaration or recoverably removes a built non-unique index and its derived entries; never removes BSON records |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `ListIndexMetadata` | Pages BSON metadata for built indexes only, built-in first then by name; shares cursor controls and excludes pending declarations |
@@ -198,6 +199,16 @@ transactionally by every record write and verified on reopen. Interrupted builds
 require reopening; startup discards the unpublished derived entries, leaving the
 declaration pending. Shared preparation bounds apply across all Ready indexes,
 not independently per index. Unique builds currently return Unsupported.
+`CreateBuiltIndex(DocumentCreateIndexRequest)` combines normalization, declaration
+and build under that admission. Preflight failures leave no new declaration or
+allocated identity. Matching Ready retries are idempotent; matching Pending
+declarations keep their original identity and abort behavior. For a new index,
+the declaration and v19 DROP cleanup obligation commit together, with the cleanup
+cursor held at zero until final activation cancels the obligation. Reopening an
+interrupted operation removes both the new declaration and its derived entries,
+without reusing its committed identity. No format version changes. `before` and
+`after` count Ready indexes (including `_id_`, excluding unrelated Pending
+declarations); result limits are checked before durable intent.
 Cross-shard uniqueness, safe planner candidates and
 wire index creation/removal remain open under #174. Ready-index discovery is
 implemented through `ListIndexMetadata` and Mongo `listIndexes`.

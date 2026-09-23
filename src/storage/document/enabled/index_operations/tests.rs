@@ -30,6 +30,135 @@ fn drop_built(storage: &Storage, name: &str) -> EngineResult<()> {
     )
 }
 
+fn create_built(storage: &Storage, name: &str, field: &str) -> EngineResult<(u64, u64)> {
+    let migration = storage.begin_schema_migration()?;
+    migration.wait_for_quiescence_blocking();
+    storage.create_built_document_index_controlled(
+        &DocumentNamespace::new("app", "items").unwrap(),
+        name,
+        &BsonDocument::from_entries([(field, BsonValue::Int32(1))]).unwrap(),
+        false,
+        migration,
+        OperationControl::new(None),
+    )
+}
+
+fn high_water(root: &Path) -> i64 {
+    Connection::open(root.join("manifest.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT index_high_water FROM briskdb_document_index_allocator",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn combined_creation_publishes_entries_counts_and_shared_cache_without_record_rewrites() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    let peer = Storage::open(temp.path(), 2).unwrap();
+    let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+    let high = high_water(temp.path());
+    assert_eq!(create_built(&storage, "new", "value").unwrap(), (1, 2));
+    assert_eq!(high_water(temp.path()), high + 1);
+    let entries = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
+    assert_eq!(entries.iter().map(Vec::len).sum::<usize>(), 24);
+    assert_eq!(create_built(&storage, "new", "value").unwrap(), (2, 2));
+    assert_eq!(high_water(temp.path()), high + 1);
+    assert_eq!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1"),
+        entries
+    );
+    assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+    assert_eq!(
+        create_built(&storage, "new", "other").unwrap_err().kind(),
+        EngineErrorKind::FailedPrecondition
+    );
+    assert_eq!(create_built(&storage, "value", "value").unwrap(), (2, 3));
+    assert_eq!(high_water(temp.path()), high + 1); // reuses the existing Pending identity
+    assert!(
+        peer.document_index_is_ready(&DocumentNamespace::new("app", "items").unwrap(), "new")
+            .unwrap()
+    );
+    peer.insert_document(collection, &document(50, BsonValue::Int32(99)))
+        .unwrap();
+    assert_eq!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1")
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        50
+    );
+    drop(peer);
+    drop(storage);
+    let storage = Storage::open(temp.path(), 2).unwrap();
+    assert_eq!(create_built(&storage, "new", "value").unwrap(), (3, 3));
+}
+
+#[test]
+fn combined_creation_preflight_failures_leave_catalog_allocator_and_entries_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    storage
+        .insert_document(
+            collection,
+            &document(
+                50,
+                BsonValue::ObjectId(crate::document::BsonObjectId::from_bytes([7; 12])),
+            ),
+        )
+        .unwrap();
+    let catalog = storage.document_catalog().unwrap();
+    let high = high_water(temp.path());
+    assert_eq!(
+        create_built(&storage, "new", "value").unwrap_err().kind(),
+        EngineErrorKind::Unsupported
+    );
+    assert_eq!(storage.document_catalog().unwrap(), catalog);
+    assert_eq!(high_water(temp.path()), high);
+    assert!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1")
+            .iter()
+            .all(Vec::is_empty)
+    );
+    // The rejected name remains available, and the root remains usable.
+    assert_eq!(create_built(&storage, "new", "other").unwrap(), (1, 2));
+    drop(storage);
+    drop(Storage::open(temp.path(), 2).unwrap());
+}
+
+#[test]
+fn combined_creation_combined_key_budget_rejects_before_allocating_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    storage
+        .insert_document(
+            collection,
+            &document(
+                50,
+                BsonValue::Array((0..9000).map(BsonValue::Int32).collect()),
+            ),
+        )
+        .unwrap();
+    build(&storage, "value").unwrap();
+    let high = high_water(temp.path());
+    let catalog = storage.document_catalog().unwrap();
+    let entries = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
+    assert_eq!(
+        create_built(&storage, "new", "value").unwrap_err().kind(),
+        EngineErrorKind::LimitExceeded
+    );
+    assert_eq!(high_water(temp.path()), high);
+    assert_eq!(storage.document_catalog().unwrap(), catalog);
+    assert_eq!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1"),
+        entries
+    );
+    drop(storage.enter_schema_operation().unwrap());
+}
+
 #[test]
 fn built_drop_preserves_records_surviving_entries_and_allocator_without_stale_caches() {
     use crate::document::BsonObjectId;
@@ -507,7 +636,9 @@ fn index_operation_crash_child() {
         .parse()
         .unwrap();
     let storage = Storage::open(root, count).unwrap();
-    if std::env::var("BRISKDB_TEST_INDEX_OPERATION_DROP").as_deref() == Ok("1") {
+    if let Ok(name) = std::env::var("BRISKDB_TEST_INDEX_OPERATION_CREATE") {
+        create_built(&storage, &name, "value").unwrap();
+    } else if std::env::var("BRISKDB_TEST_INDEX_OPERATION_DROP").as_deref() == Ok("1") {
         drop_built(&storage, "value").unwrap();
     } else {
         build(&storage, "value").unwrap();
@@ -520,7 +651,12 @@ fn crash(root: &Path, count: u16, point: &str) {
 }
 
 fn crash_mode(root: &Path, count: u16, point: &str, dropping: bool) {
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    crash_operation(root, count, point, dropping, None);
+}
+
+fn crash_operation(root: &Path, count: u16, point: &str, dropping: bool, creating: Option<&str>) {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
         .args([
             "--exact",
             "storage::document::enabled::index_operations::tests::index_operation_crash_child",
@@ -532,9 +668,13 @@ fn crash_mode(root: &Path, count: u16, point: &str, dropping: bool) {
         .env(
             "BRISKDB_TEST_INDEX_OPERATION_DROP",
             if dropping { "1" } else { "0" },
-        )
-        .output()
-        .unwrap();
+        );
+    if let Some(name) = creating {
+        child.env("BRISKDB_TEST_INDEX_OPERATION_CREATE", name);
+    } else {
+        child.env_remove("BRISKDB_TEST_INDEX_OPERATION_CREATE");
+    }
+    let output = child.output().unwrap();
     assert_eq!(
         output.status.code(),
         Some(75),
@@ -542,6 +682,140 @@ fn crash_mode(root: &Path, count: u16, point: &str, dropping: bool) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn every_combined_creation_boundary_removes_only_unfinished_new_declarations() {
+    for count in [2, 4] {
+        let mut points = vec![
+            "create-before-intent:0".to_owned(),
+            "create-after-intent:0".to_owned(),
+            "create-before-activation:0".to_owned(),
+            "create-after-activation:0".to_owned(),
+        ];
+        for shard in 0..count {
+            for point in ["create-before-shard", "create-after-shard"] {
+                points.push(format!("{point}:{shard}"));
+            }
+        }
+        for point in points {
+            let temp = tempfile::tempdir().unwrap();
+            let (storage, _) = setup(temp.path(), count);
+            build(&storage, "value").unwrap();
+            let records = snapshot(temp.path(), count, "briskdb_documents_v1");
+            let entries = snapshot(temp.path(), count, "briskdb_document_index_entries_v1");
+            let high = high_water(temp.path());
+            drop(storage);
+            crash_operation(temp.path(), count, &point, false, Some("new"));
+            let storage = Storage::open(temp.path(), count).unwrap();
+            let catalog = storage.document_catalog().unwrap();
+            let indexes = catalog.collection("app", "items").unwrap().indexes();
+            let activated = point == "create-after-activation:0";
+            assert_eq!(indexes.len(), if activated { 3 } else { 2 }, "{point}");
+            assert!(
+                indexes
+                    .iter()
+                    .all(|i| i.lifecycle() == DocumentIndexLifecycle::Ready)
+            );
+            assert_eq!(
+                high_water(temp.path()),
+                high + i64::from(point != "create-before-intent:0")
+            );
+            assert_eq!(
+                snapshot(temp.path(), count, "briskdb_documents_v1"),
+                records
+            );
+            if !activated {
+                assert_eq!(
+                    snapshot(temp.path(), count, "briskdb_document_index_entries_v1"),
+                    entries
+                );
+            }
+            let before_retry = high_water(temp.path());
+            assert_eq!(
+                create_built(&storage, "new", "value").unwrap(),
+                if activated { (3, 3) } else { (2, 3) }
+            );
+            assert_eq!(
+                high_water(temp.path()),
+                before_retry + i64::from(!activated)
+            );
+            drop(storage);
+            drop(Storage::open(temp.path(), count).unwrap());
+        }
+    }
+    // The combined API must preserve an already-declared Pending index on abort.
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    let catalog = storage.document_catalog().unwrap();
+    let high = high_water(temp.path());
+    drop(storage);
+    crash_operation(temp.path(), 2, "before-activation:0", false, Some("value"));
+    let storage = Storage::open(temp.path(), 2).unwrap();
+    assert_eq!(storage.document_catalog().unwrap(), catalog);
+    assert_eq!(high_water(temp.path()), high);
+    assert!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1")
+            .iter()
+            .all(Vec::is_empty)
+    );
+    assert_eq!(create_built(&storage, "value", "value").unwrap(), (1, 2));
+}
+
+#[test]
+fn combined_creation_cleanup_can_itself_restart_at_every_commit_boundary() {
+    let count = 2;
+    let mut points = vec![
+        "cleanup-before-completion:0".to_owned(),
+        "cleanup-after-completion:0".to_owned(),
+    ];
+    for shard in 0..count {
+        for point in [
+            "cleanup-before-shard",
+            "cleanup-after-shard",
+            "before-cursor",
+            "after-cursor",
+        ] {
+            points.push(format!("{point}:{shard}"));
+        }
+    }
+    for point in points {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, _) = setup(temp.path(), count);
+        build(&storage, "value").unwrap();
+        let entries = snapshot(temp.path(), count, "briskdb_document_index_entries_v1");
+        let records = snapshot(temp.path(), count, "briskdb_documents_v1");
+        let high = high_water(temp.path());
+        drop(storage);
+        crash_operation(
+            temp.path(),
+            count,
+            "create-before-activation:0",
+            false,
+            Some("new"),
+        );
+        crash(temp.path(), count, &point);
+        let storage = Storage::open(temp.path(), count).unwrap();
+        assert_eq!(
+            snapshot(temp.path(), count, "briskdb_document_index_entries_v1"),
+            entries
+        );
+        assert_eq!(
+            snapshot(temp.path(), count, "briskdb_documents_v1"),
+            records
+        );
+        assert_eq!(high_water(temp.path()), high + 1);
+        assert_eq!(
+            storage
+                .document_catalog()
+                .unwrap()
+                .collection("app", "items")
+                .unwrap()
+                .indexes()
+                .len(),
+            2
+        );
+    }
 }
 
 #[test]
@@ -674,6 +948,95 @@ fn cancelled_admitted_drop_stays_fenced_until_reopen_finishes_cleanup() {
             .iter()
             .all(Vec::is_empty)
     );
+}
+
+#[test]
+fn cancelled_admitted_creation_stays_fenced_until_reopen_removes_its_new_declaration() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    let catalog = storage.document_catalog().unwrap();
+    let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+    let entries = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
+    let high = high_water(temp.path());
+    let blocker = storage.open_unconfigured_shard(0).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let control = OperationControl::new(None);
+    let observer_control = Arc::clone(&control);
+    let manifest_path = temp.path().join("manifest.sqlite");
+    let observer = std::thread::spawn(move || {
+        let connection = Connection::open(manifest_path).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let admitted: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM briskdb_document_index_operation WHERE operation_kind=2 AND next_shard=0)", [], |row| row.get(0)).unwrap();
+            if admitted {
+                assert!(
+                    observer_control.request_cancel(crate::core::CancellationReason::Cancelled)
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "creation intent was not admitted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let migration = storage.begin_schema_migration().unwrap();
+    migration.wait_for_quiescence_blocking();
+    let error = storage
+        .create_built_document_index_controlled(
+            &DocumentNamespace::new("app", "items").unwrap(),
+            "new",
+            &BsonDocument::from_entries([("value", BsonValue::Int32(1))]).unwrap(),
+            false,
+            migration,
+            control,
+        )
+        .unwrap_err();
+    observer.join().unwrap();
+    assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+    assert!(storage.enter_schema_operation().is_err());
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    drop(storage);
+    let storage = Storage::open(temp.path(), 2).unwrap();
+    assert_eq!(storage.document_catalog().unwrap(), catalog);
+    assert_eq!(high_water(temp.path()), high + 1);
+    assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+    assert_eq!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1"),
+        entries
+    );
+    assert_eq!(create_built(&storage, "new", "value").unwrap(), (2, 3));
+    assert_eq!(high_water(temp.path()), high + 2);
+}
+
+#[test]
+fn combined_creation_exhausted_identity_space_fails_before_intent() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    drop(storage);
+    let mut connection = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute(
+            "UPDATE briskdb_document_index_allocator SET index_high_water=?1",
+            [i64::MAX],
+        )
+        .unwrap();
+    manifest::refresh_manifest_digest(&transaction).unwrap();
+    transaction.commit().unwrap();
+    let storage = Storage::open(temp.path(), 2).unwrap();
+    let catalog = storage.document_catalog().unwrap();
+    assert_eq!(
+        create_built(&storage, "new", "value").unwrap_err().kind(),
+        EngineErrorKind::LimitExceeded
+    );
+    assert_eq!(storage.document_catalog().unwrap(), catalog);
+    assert!(load(&connection).unwrap().is_none());
+    assert_eq!(high_water(temp.path()), i64::MAX);
+    assert_eq!(create_built(&storage, "value", "value").unwrap(), (1, 2));
 }
 
 #[test]

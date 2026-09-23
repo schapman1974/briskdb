@@ -16,6 +16,7 @@ from ._briskdb import (
     CountDocumentsResult,
     CreateCollectionResult,
     CreateIndexResult,
+    CreateBuiltIndexResult,
     DropIndexResult,
     Database,
     DatabaseNamesResult,
@@ -204,6 +205,13 @@ class AsyncSession:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> CreateIndexResult: ...
+    async def create_built_index(
+        self, database: str, collection: str, keys: BsonDocument, *,
+        name: Optional[str] = None, unique: bool = False, sparse: bool = False,
+        partial_filter: Optional[BsonDocument] = None, request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> CreateBuiltIndexResult: ...
     async def build_index(
         self, database: str, collection: str, name: str, *,
         request_id: Optional[UUID] = None, timeout_ms: Optional[int] = None,

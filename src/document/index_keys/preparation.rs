@@ -75,9 +75,9 @@ impl DocumentIndexPreparation {
     /// Storage selects only authoritative Ready indexes for maintenance, or
     /// one explicitly journaled index for a build. Selection itself is not a
     /// freshness proof: its caller must retain schema admission/ownership.
-    pub(crate) fn compile_selected_with_check(
+    pub(crate) fn compile_selected_with_check<'a>(
         collection_id: DocumentCollectionId,
-        metadata: &[DocumentIndexMetadata],
+        metadata: impl IntoIterator<Item = &'a DocumentIndexMetadata>,
         include: impl Fn(&DocumentIndexMetadata) -> bool,
         check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<Self> {

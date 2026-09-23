@@ -61,8 +61,9 @@ static SERVER_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 const _: () = assert!(DOCUMENT_MERGE_PAGE_SIZE <= MAX_DOCUMENT_SHARD_SCAN_RECORDS);
 
 enum DocumentIndexOperation {
-    Build,
-    Drop,
+    Build(String),
+    Drop(String),
+    Create(crate::document::DocumentIndexRequest),
 }
 
 impl Engine {
@@ -93,8 +94,22 @@ impl Engine {
                         session,
                         request_id,
                         namespace,
-                        name,
-                        DocumentIndexOperation::Build,
+                        DocumentIndexOperation::Build(name),
+                    )
+                    .await
+                }
+            }
+            DocumentCommand::CreateBuiltIndex(request) => {
+                let (namespace, index, options) = request.into_parts();
+                if let Err(error) = require_catalog_write_options(options) {
+                    Err(error)
+                } else {
+                    self.run_document_index_operation(
+                        &mut operation,
+                        session,
+                        request_id,
+                        namespace,
+                        DocumentIndexOperation::Create(index),
                     )
                     .await
                 }
@@ -176,8 +191,7 @@ impl Engine {
                             session,
                             request_id,
                             namespace,
-                            name,
-                            DocumentIndexOperation::Drop,
+                            DocumentIndexOperation::Drop(name),
                         )
                         .await
                     }
@@ -1098,6 +1112,7 @@ impl Engine {
                 ))
             }
             DocumentCommand::CreateCollection(_)
+            | DocumentCommand::CreateBuiltIndex(_)
             | DocumentCommand::BuildIndex(_)
             | DocumentCommand::DropCollection(_)
             | DocumentCommand::DropDatabase(_) => Err(EngineError::new(
@@ -1143,7 +1158,6 @@ impl Engine {
         session: &Session,
         request_id: crate::document::DocumentRequestId,
         namespace: DocumentNamespace,
-        name: String,
         action: DocumentIndexOperation,
     ) -> EngineResult<DocumentExecution> {
         let migration = self.inner.database.storage.begin_schema_migration()?;
@@ -1162,42 +1176,75 @@ impl Engine {
         operation.check_before_start()?;
         let lease = operation.take_lease();
         let worker_control = Arc::clone(&operation.control);
+        let cancellation = operation.cancellation.clone();
         let result_limits = operation.result_limits;
         let storage = self.inner.database.storage.clone();
         let connections = self.inner.connections.clone();
         let join = worker.spawn(move || {
             let _lease = lease;
             let _session = session;
-            // Allocate and validate the response before durable build/drop intent.
-            let execution = DocumentExecution::new(
-                request_id,
-                None,
-                match action {
-                    DocumentIndexOperation::Build => DocumentResult::IndexReady(name.clone()),
-                    DocumentIndexOperation::Drop => DocumentResult::Acknowledged(true),
-                },
-            );
-            let result = enforce_execution_result_limits(&execution, result_limits)
-                .and_then(|_| connections.retire_idle_for_schema_migration())
-                .and_then(|_| match action {
-                    DocumentIndexOperation::Build => storage
-                        .build_document_index_controlled(
+            let result: EngineResult<DocumentExecution> = (|| {
+                let (name, declaration, response) = match action {
+                    DocumentIndexOperation::Create(index) => {
+                        let (specification, name, unique) =
+                            crate::document::normalize_index_request(index, &mut || {
+                                ensure_document_cpu_active(&cancellation, &worker_control)
+                            })?;
+                        let response = DocumentResult::IndexBuilt {
+                            name: name.clone(),
+                            before: 0,
+                            after: 0,
+                        };
+                        (name, Some((specification, unique)), response)
+                    }
+                    DocumentIndexOperation::Build(name) => {
+                        let response = DocumentResult::IndexReady(name.clone());
+                        (name, None, response)
+                    }
+                    DocumentIndexOperation::Drop(name) => {
+                        (name, None, DocumentResult::Acknowledged(true))
+                    }
+                };
+                // Allocate and validate the exact response before durable intent;
+                // filling two fixed-width counters after commit cannot fail.
+                let execution = DocumentExecution::new(request_id, None, response);
+                enforce_execution_result_limits(&execution, result_limits)?;
+                connections.retire_idle_for_schema_migration()?;
+                let (_, _, mut response) = execution.into_parts();
+                match &mut response {
+                    DocumentResult::IndexBuilt { before, after, .. } => {
+                        let (specification, unique) =
+                            declaration.as_ref().expect("create definition");
+                        (*before, *after) = storage.create_built_document_index_controlled(
+                            &namespace,
+                            &name,
+                            specification,
+                            *unique,
+                            migration,
+                            Arc::clone(&worker_control),
+                        )?;
+                    }
+                    DocumentResult::IndexReady(_) => {
+                        storage.build_document_index_controlled(
                             namespace.database(),
                             namespace.collection(),
                             &name,
                             migration,
                             Arc::clone(&worker_control),
-                        )
-                        .map(|_| ()),
-                    DocumentIndexOperation::Drop => storage.drop_built_document_index_controlled(
-                        namespace.database(),
-                        namespace.collection(),
-                        &name,
-                        migration,
-                        Arc::clone(&worker_control),
-                    ),
-                })
-                .map(|_| execution);
+                        )?;
+                    }
+                    DocumentResult::Acknowledged(_) => storage
+                        .drop_built_document_index_controlled(
+                            namespace.database(),
+                            namespace.collection(),
+                            &name,
+                            migration,
+                            Arc::clone(&worker_control),
+                        )?,
+                    _ => unreachable!("only index build/drop responses are constructed"),
+                }
+                Ok(DocumentExecution::new(request_id, None, response))
+            })();
             if result
                 .as_ref()
                 .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
@@ -2540,6 +2587,11 @@ fn enforce_execution_result_limits_with_check(
             budget.add_bytes(DOCUMENT_RESULT_ROW_BYTES + DOCUMENT_RESULT_VALUE_BYTES)?;
             budget.add_bytes(u64::try_from(name.len()).unwrap_or(u64::MAX))?;
         }
+        DocumentResult::IndexBuilt { name, .. } => {
+            budget.add_rows(1)?;
+            budget.add_bytes(DOCUMENT_RESULT_ROW_BYTES + DOCUMENT_RESULT_VALUE_BYTES + 16)?;
+            budget.add_bytes(u64::try_from(name.len()).unwrap_or(u64::MAX))?;
+        }
         DocumentResult::Indexes(indexes) => {
             budget.add_rows(indexes.len())?;
             for index in indexes {
@@ -2671,6 +2723,7 @@ fn execution_result_is_mutation(result: &DocumentResult) -> bool {
             | DocumentResult::Delete(_)
             | DocumentResult::IndexName(_)
             | DocumentResult::IndexReady(_)
+            | DocumentResult::IndexBuilt { .. }
             | DocumentResult::CursorKilled(_)
     )
 }

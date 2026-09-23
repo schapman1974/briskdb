@@ -490,7 +490,14 @@ partial options after shared eager validation. The complete retained envelope is
 bounded; exact filter BSON, IDs and membership options survive restart. Existing
 flat declarations remain byte-compatible, and unknown legacy envelopes remain
 opaque/readable. These options are metadata-only until physical activation;
-native validation does not scan records and wire index creation/removal remain open.
+native declaration validation does not scan records and wire index creation/removal remain open.
+The separate native `CreateBuiltIndex` / sync/async `create_built_index` helper
+now combines declaration and physical non-unique build on an existing collection,
+with exclusive before/after Ready counts. Preflight rejects unsupported data and
+combined budgets without publishing metadata. Restart removes newly created
+unfinished declarations and entries, but preserves preexisting Pending ones.
+It reuses the v19 cleanup journal and does not change the frozen contract or
+claim wire creation, secondary uniqueness, or planner acceleration.
 
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required

@@ -302,6 +302,7 @@ impl DocumentDeleteResult {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DocumentResultKind {
+    IndexBuilt,
     Acknowledged,
     CollectionExists,
     NamespaceDropped,
@@ -388,6 +389,12 @@ pub enum DocumentResult {
     IndexName(String),
     /// A built non-unique index with complete, maintained physical entries.
     IndexReady(String),
+    /// Ready-index counts observed under the same exclusive build admission.
+    IndexBuilt {
+        name: String,
+        before: u64,
+        after: u64,
+    },
     Indexes(Box<[DocumentIndexMetadata]>),
     CursorKilled(bool),
 }
@@ -410,6 +417,7 @@ impl DocumentResult {
             Self::Update(_) => DocumentResultKind::Update,
             Self::Delete(_) => DocumentResultKind::Delete,
             Self::IndexName(_) | Self::IndexReady(_) => DocumentResultKind::IndexName,
+            Self::IndexBuilt { .. } => DocumentResultKind::IndexBuilt,
             Self::Indexes(_) => DocumentResultKind::Indexes,
             Self::CursorKilled(_) => DocumentResultKind::CursorKilled,
         }
@@ -462,7 +470,10 @@ impl fmt::Debug for DocumentResult {
             Self::Indexes(values) => {
                 debug.field("index_count", &values.len());
             }
-            Self::Collection(_) | Self::IndexName(_) | Self::IndexReady(_) => {
+            Self::Collection(_)
+            | Self::IndexName(_)
+            | Self::IndexReady(_)
+            | Self::IndexBuilt { .. } => {
                 debug.field("payload", &"<redacted>");
             }
         }

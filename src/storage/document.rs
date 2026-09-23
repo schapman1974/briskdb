@@ -247,6 +247,16 @@ mod enabled {
         excluded: Option<DocumentIndexId>,
         check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<DocumentIndexPreparations> {
+        compile_indexes_with_addition(catalog, candidate, excluded, None, check)
+    }
+
+    fn compile_indexes_with_addition(
+        catalog: &DocumentCatalog,
+        candidate: Option<DocumentIndexId>,
+        excluded: Option<DocumentIndexId>,
+        addition: Option<(DocumentCollectionId, &DocumentIndexMetadata)>,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<DocumentIndexPreparations> {
         let mut compiled = DocumentIndexPreparations {
             collections: HashMap::new(),
             ready_names: HashMap::new(),
@@ -255,9 +265,18 @@ mod enabled {
         let mut names_retained = 0_usize;
         for collection in catalog.collections() {
             check()?;
+            // A prospective declaration participates in the same combined
+            // bounds without cloning the catalog or publishing draft metadata.
+            let metadata = || {
+                collection.indexes().iter().chain(
+                    addition
+                        .filter(|(id, _)| *id == collection.id())
+                        .map(|(_, index)| index),
+                )
+            };
             let preparation = DocumentIndexPreparation::compile_selected_with_check(
                 collection.id(),
-                collection.indexes(),
+                metadata(),
                 |index| {
                     Some(index.id()) != excluded
                         && (index.lifecycle() == DocumentIndexLifecycle::Ready
@@ -277,7 +296,7 @@ mod enabled {
                     )
                 })?;
             let selected = || {
-                collection.indexes().iter().filter(|index| {
+                metadata().filter(|index| {
                     !index.is_built_in()
                         && Some(index.id()) != excluded
                         && (index.lifecycle() == DocumentIndexLifecycle::Ready

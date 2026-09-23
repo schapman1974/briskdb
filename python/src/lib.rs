@@ -1738,6 +1738,55 @@ impl Session {
         )
     }
 
+    #[pyo3(signature = (database, collection, keys, *, name = None, unique = false, sparse = false, partial_filter = None, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn create_built_index(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        keys: Py<PyAny>,
+        name: Option<String>,
+        unique: bool,
+        sparse: bool,
+        partial_filter: Option<Py<PyAny>>,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let namespace = python_engine_result(DocumentNamespace::new(database, collection))?;
+        let keys = extract_bson_document(py, keys.bind(py), self.shared.uuid_representation)?;
+        let mut index = python_engine_result(DocumentIndexRequest::new(keys))?
+            .with_unique(unique)
+            .with_sparse(sparse);
+        if let Some(name) = name {
+            index = python_engine_result(index.with_name(name))?;
+        }
+        if let Some(filter) = partial_filter {
+            index = index.with_partial_filter(document_filter(
+                py,
+                Some(&filter),
+                self.shared.uuid_representation,
+            )?);
+        }
+        self.execute_document_command(
+            py,
+            DocumentCommand::CreateBuiltIndex(DocumentCreateIndexRequest::new(
+                namespace,
+                index,
+                DocumentWriteOptions::new(),
+            )),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
     #[pyo3(signature = (database, collection, name, *, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
     #[allow(clippy::too_many_arguments)]
     fn build_index(

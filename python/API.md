@@ -210,6 +210,7 @@ plan. Payload keys are:
 | `collections` | ordered `collections` list |
 | `database_names` | `names` list of exact logical document database names |
 | `index_name` | `index_name` and `lifecycle="pending_build"` or `"ready"` |
+| `index_built` | `index_name`, `lifecycle="ready"`, `num_indexes_before`, `num_indexes_after` |
 | `acknowledged` | `acknowledged` boolean (pending or built index removal) |
 | `indexes` | ordered `indexes` list |
 | `insert` | `acknowledged`, `inserted_count`, `inserted_ids` |
@@ -254,6 +255,26 @@ Queries still scan; this does not accelerate them or enforce secondary uniquenes
 session.create_index("app", "events", {"kind": 1}, name="by_kind")
 session.build_index("app", "events", "by_kind")  # lifecycle: ready
 ```
+
+To create and build in one operation, sync and async sessions also provide
+`create_built_index(database, collection, keys, ...)`, with the same keys, name,
+sparse/partial options and request controls as `create_index`. The collection
+must already exist. It returns `kind="index_built"`, `lifecycle="ready"`, and
+Ready-index counts before/after (including `_id_`, excluding Pending declarations)
+observed under the same exclusive admission. A matching Ready retry leaves both
+counts equal. Unique secondary builds remain unsupported.
+
+```python
+result = session.create_built_index("app", "events", {"kind": 1}, name="by_kind")
+assert result["lifecycle"] == "ready"
+```
+
+Preflight failures leave no new declaration. Interruption after durable intent
+requires closing/reopening the root; recovery removes a newly created unfinished
+declaration and its derived entries. If the declaration existed before this
+call, recovery preserves it as Pending, just like `build_index`. Committed index
+identities are never reused. This native helper does not yet enable Mongo wire
+`createIndexes`, query acceleration, or secondary uniqueness.
 
 Recognized advanced index metadata reports normalized ordered `keys` plus optional
 `sparse=True` or `partial_filter` fields; absence means no such membership option.
