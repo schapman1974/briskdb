@@ -585,6 +585,16 @@ CREATE TABLE briskdb_document_index_storage (
     CHECK (lifecycle_state <> 1 OR next_shard = shard_count)
 ) STRICT;
 
+CREATE TABLE briskdb_document_index_operation (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    index_id INTEGER NOT NULL CHECK (index_id > 0),
+    operation_kind INTEGER NOT NULL CHECK (operation_kind IN (1, 2, 3)),
+    operation_id BLOB NOT NULL CHECK (typeof(operation_id) = 'blob' AND length(operation_id) = 32),
+    shard_count INTEGER NOT NULL CHECK (shard_count BETWEEN 2 AND 64),
+    next_shard INTEGER NOT NULL CHECK (next_shard BETWEEN 0 AND shard_count),
+    FOREIGN KEY (index_id) REFERENCES briskdb_document_index_identities (index_id)
+) STRICT;
+
 CREATE TABLE briskdb_shard_layout (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     layout_id BLOB NOT NULL
@@ -2212,6 +2222,7 @@ returning:
    document identities, the deletion journal, and semantic digest version 8.
    The v16-to-v17 step adds permanent index identities and semantic digest version 9.
    The v17-to-v18 step adds the physical index-layout journal and digest version 10.
+   The v18-to-v19 step adds the document index-operation journal and digest version 11.
    Older formats therefore cannot be mistaken for checksummed,
    authoritative-catalog, allocator-authority, recoverable provisioning, or
    durable logical-to-physical DDL identity.

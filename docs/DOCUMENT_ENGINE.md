@@ -64,6 +64,7 @@ The current engine executes:
 | `ListCollectionMetadata` | Filters and pages BSON collection metadata through the shared cursor registry; `name_only` restricts both output and filtering to name/type |
 | `ListDatabaseNames` | Returns `DatabaseNames(Box<[String]>)` from a validated document catalog snapshot; shared filters on `name` and logical combinations, normal request controls, no disk statistics |
 | `CreateIndex` | Validates and normalizes ordered keys, resolves a bounded default/explicit name, and declares pending index metadata; it does not build or enforce a secondary index |
+| `BuildIndex` | Explicitly builds a declared non-unique index under sole-process/exclusive schema admission; returns `IndexReady(name)` after complete publication; queries still scan |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
 | `Find` | Evaluates BSON match expressions and returns a bounded batch with a continuation ID when needed |
@@ -121,16 +122,17 @@ declarations use the exact ordered v2 envelope already used by TinyMongo import;
 the filter's BSON representation is preserved. Repeating the same normalized
 envelope is idempotent and keeps its ID. Advanced envelopes retain byte-exact
 conflict checks; semantic predicate equivalence is not inferred. No older
-specification is rewritten and there is no new storage format.
+specification is rewritten; declarations reuse the existing specification encoding.
 `DocumentIndexMetadata::definition()` offers a borrowed keys/options view for
 recognized flat or v2 encodings; unknown legacy envelopes remain readable through
 `specification()` and return no interpreted view. The view itself is not a
 membership validator or authority: consumers must compile it before execution.
 
-All declared secondary indexes remain `PendingBuild`, including `unique` ones:
+New secondary declarations start `PendingBuild`, including `unique` ones:
 they are not query authorities or uniqueness constraints. Declarations do not
-scan or validate existing records. Physical builds, write-time maintenance, wire
-index commands, and index cursors remain future work. Required CI compares 64 valid ascending integer-key definitions
+scan or validate existing records. Explicit non-unique builds and transactional
+maintenance are implemented separately below; wire index commands and index
+cursors remain future work. Required CI compares 64 valid ascending integer-key definitions
 against unchanged TinyMongo index source, including names, key order, flags and
 restart metadata. Descending/numeric-alias normalization, invalid inputs,
 resource limits and legacy metadata preservation are independently tested; no
@@ -448,8 +450,9 @@ commit. `DocumentReplaceRequest::with_max_document_bytes` lets wire adapters
 enforce their smaller advertised BSON limit, including a retained ID larger
 than the incoming replacement. Validation failure rolls back the local
 transaction. Successful commits are not reclassified by late cancellation.
-Declared secondary indexes are still pending; their physical uniqueness and
-post-image validation belong to the index milestone, not this checkpoint.
+Pending secondary declarations remain non-enforcing. Ready non-unique indexes
+validate the post-image against the combined index-key bounds and replace their
+entries in the same record transaction. Secondary uniqueness remains unfinished.
 
 `Replace` with `DocumentWriteOptions::with_upsert(true)` first follows the normal
 replacement path. On no match, it inserts a normalized replacement: an explicit

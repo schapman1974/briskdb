@@ -442,7 +442,7 @@ numeric directions and generates bounded default names before catalog mutation.
 Required CI compares 64 valid ascending integer-key definitions with the unchanged
 frozen index model, including pending metadata after restart. Descending/numeric
 aliases and invalid/resource-limited definitions have independent tests. This is
-not physical index support: secondary declarations still enforce no uniqueness,
+not itself physical index support: secondary declarations still enforce no uniqueness,
 and wire index commands and metadata cursors remain unimplemented. The full frozen
 index suites remain open; no frozen expected result or allowance is changed.
 
@@ -454,7 +454,7 @@ BSON identities and the shared matcher. Every generated key is also serialized
 and restored through the versioned tuple codec before oracle comparison; opaque
 reference tokens and the frozen generator remain unchanged. Independent tests cover bounded work,
 eager validation, input immutability and interruption without partial results.
-This is not physical index activation, wire support or uniqueness enforcement.
+This pure helper is not physical index activation, wire support or uniqueness enforcement.
 The frozen helper subset rejects intermediate/parallel arrays, object/nested-array
 keys, ObjectId/date keys and nonfinite numeric keys; broader MongoDB index values
 remain open. Native Rust and sync/async Python declarations now accept sparse or
