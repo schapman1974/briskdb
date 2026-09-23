@@ -101,6 +101,14 @@ Cancellation before commit rolls back the current input; earlier batch commits
 remain. Subprocess tests cover process death after the write, before commit and
 after commit, including the durable prefix of an interrupted insert batch.
 
+The pure `DocumentIndexPreparation` helper now prepares all secondary definitions
+from a collection snapshot under one bounded budget, returning scoped encoded
+keys only if every index succeeds. It preserves empty sparse/partial membership
+and excludes the built-in ID index. It does not access storage or certify current
+catalog authority; the future physical path must fence the snapshot and commit
+entries with the document. Pending declarations remain non-enforcing. See the
+[shared-engine preparation contract](DOCUMENT_ENGINE.md#implemented-commands).
+
 ## Provisioning and restart
 
 Collection creation first commits the database, provisioning collection,

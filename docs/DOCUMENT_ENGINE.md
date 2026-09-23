@@ -158,6 +158,28 @@ byte codec preserves tuple identities for later physical storage; see the
 [secondary-index key format](BSON.md#secondary-index-tuple-keys). It does not
 activate catalog entries or promise physical index coverage.
 
+`DocumentIndexPreparation::compile(&collection_metadata)` compiles all secondary
+declarations in one catalog snapshot, including pending indexes, for future build
+and write preflight. Its `prepare(&document)` returns collection/index-scoped
+BDIK frames only after every index succeeds. The built-in `_id_` remains owned
+by record storage; sparse/partial exclusions retain an empty list for that index.
+Unknown imported definitions fail explicitly instead of losing their options.
+Compilation and preparation each share a 64 MiB conservative work budget and
+one million checkpoints; preparation allows at most 16,384 total keys across
+at most 64 secondary indexes. Encoded outputs and vector overhead are charged
+before allocation, and repeated scalar/path work does not reset per index.
+Input BSON is validated once, including when there are no secondary indexes.
+The controlled methods discard all partial work on cancellation or error and
+remain reusable. Debug output omits definitions and values.
+
+This pure helper does not touch storage, enforce declared uniqueness, change
+index lifecycles, or establish catalog freshness. A compiled snapshot may be
+stale after a drop; physical callers must fence metadata and maintain entries
+atomically with the document. Ordinary writes still ignore non-enforcing pending
+declarations. Physical schema/build/recovery, transactional maintenance,
+cross-shard uniqueness, safe planner candidates, and wire index commands remain
+open under #174; this helper alone does not make secondary indexes usable.
+
 It generates ordered compound tuples with at most one final array field, removes
 duplicate array entries in encounter order, equates missing with null, and gives
 empty arrays a separate identity. Sparse compound membership requires any indexed

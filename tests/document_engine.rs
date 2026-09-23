@@ -10,10 +10,11 @@ use briskdb::{
         DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
         DocumentDeleteRequest, DocumentDropIndexRequest, DocumentExecution, DocumentFilter,
         DocumentFindRequest, DocumentIndexError, DocumentIndexKeyGenerator, DocumentIndexLifecycle,
-        DocumentIndexMetadata, DocumentIndexRequest, DocumentInsertRequest,
-        DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
-        DocumentNamespace, DocumentPipeline, DocumentPlan, DocumentProjection, DocumentReadOptions,
-        DocumentRequest, DocumentRequestId, DocumentResult, DocumentWriteOptions, encode_document,
+        DocumentIndexMetadata, DocumentIndexPreparation, DocumentIndexRequest,
+        DocumentInsertRequest, DocumentListCollectionsRequest, DocumentListIndexesRequest,
+        DocumentMutationScope, DocumentNamespace, DocumentPipeline, DocumentPlan,
+        DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId,
+        DocumentResult, DocumentWriteOptions, encode_document,
     },
 };
 use rusqlite::Connection;
@@ -305,6 +306,158 @@ async fn sparse_partial_declarations_preserve_options_ids_and_exact_bson_after_r
         .await
         .unwrap();
     assert_eq!(pending_indexes(&engine, &session).await.len(), 2);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn collection_index_preparation_preserves_reopened_scope_without_activating_indexes() {
+    async fn snapshot(engine: &Engine, session: &Session) -> DocumentCollectionMetadata {
+        let execution = engine
+            .execute_document(
+                session,
+                request(
+                    70,
+                    RequestContext::new(),
+                    DocumentCommand::ListCollections(
+                        DocumentListCollectionsRequest::new("app", DocumentReadOptions::new())
+                            .unwrap(),
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+        let DocumentResult::Collections(collections) = execution.result() else {
+            panic!("collections")
+        };
+        assert_eq!(collections.len(), 1);
+        collections[0].clone()
+    }
+    fn prepared_bytes(
+        preparation: &DocumentIndexPreparation,
+        input: &BsonDocument,
+    ) -> Vec<(u64, Vec<Vec<u8>>)> {
+        preparation
+            .prepare(input)
+            .unwrap()
+            .indexes()
+            .iter()
+            .map(|index| (index.index_id().get(), index.keys().to_vec()))
+            .collect()
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 4).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    let keys = BsonDocument::from_entries([("label", BsonValue::Int32(1))]).unwrap();
+    for index in [
+        DocumentIndexRequest::new(keys.clone())
+            .unwrap()
+            .with_name("ordinary")
+            .unwrap()
+            .with_unique(true),
+        DocumentIndexRequest::new(keys.clone())
+            .unwrap()
+            .with_name("sparse")
+            .unwrap()
+            .with_sparse(true),
+        DocumentIndexRequest::new(keys)
+            .unwrap()
+            .with_name("partial")
+            .unwrap()
+            .with_partial_filter(DocumentFilter::new(partial_index_filter()).unwrap()),
+    ] {
+        engine
+            .execute_document(
+                &session,
+                request(2, RequestContext::new(), create_index_command(index)),
+            )
+            .await
+            .unwrap();
+    }
+    let input = document(BsonValue::Int32(1), "same");
+    let metadata = snapshot(&engine, &session).await;
+    let preparation = DocumentIndexPreparation::compile(&metadata).unwrap();
+    let before = prepared_bytes(&preparation, &input);
+    assert_eq!(before.len(), 3);
+    assert!(before.iter().all(|(_, keys)| keys.len() == 1));
+    assert_eq!(preparation.collection_id(), metadata.id());
+
+    let unsupported = BsonDocument::from_entries([
+        ("_id", BsonValue::Int32(3)),
+        ("label", BsonValue::Document(BsonDocument::new())),
+    ])
+    .unwrap();
+    assert_eq!(
+        preparation.prepare(&unsupported).unwrap_err().kind(),
+        EngineErrorKind::Unsupported
+    );
+    // Preparation failures do not mutate the catalog, and pending indexes are
+    // still non-enforcing: both duplicate keys and unsupported values may exist.
+    assert_eq!(snapshot(&engine, &session).await, metadata);
+    let inserted = insert(
+        &engine,
+        &session,
+        3,
+        vec![
+            input.clone(),
+            document(BsonValue::Int32(2), "same"),
+            unsupported,
+        ],
+    )
+    .await;
+    let DocumentResult::Insert(result) = inserted.result() else {
+        panic!("insert")
+    };
+    assert_eq!(result.inserted_ids().len(), 3);
+    assert!(result.write_errors().is_empty());
+    assert_eq!(snapshot(&engine, &session).await, metadata);
+    assert!(
+        metadata
+            .indexes()
+            .iter()
+            .filter(|index| !index.is_built_in())
+            .all(|index| index.lifecycle() == DocumentIndexLifecycle::PendingBuild)
+    );
+    engine.shutdown().await.unwrap();
+    drop(session);
+    drop(engine);
+
+    let engine = Engine::open(temp.path(), 4).await.unwrap();
+    let session = engine.session();
+    let reopened = snapshot(&engine, &session).await;
+    assert_eq!(reopened, metadata);
+    let fresh = DocumentIndexPreparation::compile(&reopened).unwrap();
+    assert_eq!(prepared_bytes(&fresh, &input), before);
+    // A compiled snapshot is explicitly not catalog authority. After a drop,
+    // callers must acquire and compile fresh metadata before physical work.
+    engine
+        .execute_document(
+            &session,
+            request(4, RequestContext::new(), drop_index("ordinary")),
+        )
+        .await
+        .unwrap();
+    let changed = snapshot(&engine, &session).await;
+    assert_eq!(prepared_bytes(&preparation, &input), before);
+    let refreshed = DocumentIndexPreparation::compile(&changed).unwrap();
+    assert_eq!(refreshed.prepare(&input).unwrap().indexes().len(), 2);
+    let count = engine
+        .execute_document(
+            &session,
+            request(
+                5,
+                RequestContext::new(),
+                DocumentCommand::Count(DocumentCountRequest::new(
+                    namespace(),
+                    DocumentFilter::empty(),
+                    DocumentReadOptions::new(),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(count.result(), DocumentResult::Count(3)));
     engine.shutdown().await.unwrap();
 }
 

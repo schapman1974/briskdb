@@ -12,7 +12,12 @@ use super::{
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
 mod codec;
+mod preparation;
 pub use codec::{DOCUMENT_INDEX_KEY_ENCODING_VERSION, MAX_DOCUMENT_INDEX_KEY_BYTES};
+pub use preparation::{
+    DocumentIndexPreparation, MAX_DOCUMENT_PREPARED_INDEXES, PreparedDocumentIndexEntries,
+    PreparedDocumentIndexKeys,
+};
 
 const MAX_SPEC_BYTES: usize = 1024 * 1024;
 const MAX_PARTIAL_NODES: usize = 4096;
@@ -141,11 +146,16 @@ impl DocumentIndexKeyGenerator {
         check()?;
         encode_document(document)
             .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
-        let mut budget = Budget {
-            steps: 0,
-            bytes: 0,
-            check,
-        };
+        self.keys_validated_with_budget(document, &mut Budget::new(check))
+    }
+
+    // The collection-wide preparer validates BSON once, then shares this same
+    // budget across every generator. Never expose this unchecked entry point.
+    fn keys_validated_with_budget(
+        &self,
+        document: &BsonDocument,
+        budget: &mut Budget<'_>,
+    ) -> EngineResult<Vec<DocumentIndexKey>> {
         budget.step()?;
         if let Some(partial) = &self.partial {
             if !partial.matches_with_check(document, &mut || budget.step())? {
@@ -156,7 +166,7 @@ impl DocumentIndexKeyGenerator {
         let mut selected = Vec::new();
         let mut arrays = 0;
         for path in &self.paths {
-            let value = nested_value(document, path, &mut budget)?;
+            let value = nested_value(document, path, budget)?;
             arrays += usize::from(matches!(value, Some(BsonValue::Array(_))));
             selected.push(value);
         }
@@ -170,7 +180,7 @@ impl DocumentIndexKeyGenerator {
         let mut components = Vec::new();
         let mut key_count: usize = 1;
         for value in selected {
-            let values = component_keys(value, &mut budget)?;
+            let values = component_keys(value, budget)?;
             // At most one component has more than one key. Keep the explicit
             // product check so future traversal changes cannot bypass bounds.
             key_count = key_count
@@ -179,6 +189,7 @@ impl DocumentIndexKeyGenerator {
                 .ok_or_else(limit)?;
             components.push(values);
         }
+        budget.keys(key_count)?;
         let mut output = Vec::new();
         // Arc sharing bounds allocations, but consumers must eventually hash or
         // persist every full tuple. Charge expanded key bytes as well: a large
@@ -367,10 +378,20 @@ fn validate_partial(
 struct Budget<'a> {
     steps: usize,
     bytes: usize,
+    keys: usize,
     check: &'a mut dyn FnMut() -> EngineResult<()>,
 }
 
-impl Budget<'_> {
+impl<'a> Budget<'a> {
+    fn new(check: &'a mut dyn FnMut() -> EngineResult<()>) -> Self {
+        Self {
+            steps: 0,
+            bytes: 0,
+            keys: 0,
+            check,
+        }
+    }
+
     fn step(&mut self) -> EngineResult<()> {
         (self.check)()?;
         self.steps += 1;
@@ -385,6 +406,15 @@ impl Budget<'_> {
             .bytes
             .checked_add(amount)
             .filter(|n| *n <= MAX_WORK_BYTES)
+            .ok_or_else(limit)?;
+        Ok(())
+    }
+
+    fn keys(&mut self, amount: usize) -> EngineResult<()> {
+        self.keys = self
+            .keys
+            .checked_add(amount)
+            .filter(|n| *n <= MAX_KEYS)
             .ok_or_else(limit)?;
         Ok(())
     }
