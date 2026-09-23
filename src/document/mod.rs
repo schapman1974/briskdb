@@ -48,7 +48,7 @@ pub use command::{
     DocumentCreateCollectionRequest, DocumentCreateIndexRequest, DocumentCreateIndexesRequest,
     DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
     DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentDropIndexRequest,
-    DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
+    DocumentDropIndexesRequest, DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
     DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentIndexRequest,
     DocumentInsertRequest, DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
     DocumentListCollectionsRequest, DocumentListDatabaseNamesRequest,

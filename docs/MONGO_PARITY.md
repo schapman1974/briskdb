@@ -163,6 +163,23 @@ New unique secondary builds return 115; unknown options (including TTL, backgrou
 collation and commit quorum), descending `_id` creation and document sequences are
 not supported. These builds maintain entries but do not accelerate reads yet.
 
+Mongo `dropIndexes` and sync/async PyMongo `drop_index` / `drop_indexes` now use
+the shared engine's exclusive removal path. String selectors accept an exact
+name, an unambiguous legacy single-field alias, or `*` for every secondary
+definition (including native Pending declarations). `_id` / `_id_` are protected
+with code 72; missing namespaces/indexes report 26/27. The reply's `nIndexesWas`
+counts Ready indexes under the same admission, including the built-in ID index.
+No namespace is implicitly created, no document is deleted, and allocator history
+is retained. Validated options include bounded `maxTimeMS`, acknowledged write
+concern, and null comments; document sequences and unsupported options fail before
+removal. Key documents and name arrays are not implemented (code 14); see the
+broader [Mongo command syntax](https://www.mongodb.com/docs/manual/reference/command/dropindexes/).
+Exact names take priority over aliases; ambiguous aliases return 115 rather than
+depending on backend-specific ordering. Field/name selectors are bounded to 255
+UTF-8 bytes. Completed removals remain committed after an error; recovery finishes
+only the currently admitted drop, leaving later indexes intact. Wildcard removal
+is not a cross-index atomic transaction.
+
 The shared Rust index catalog now assigns stable, root-wide IDs to built-in and
 pending secondary indexes. The version-17 manifest upgrade preserves existing
 specification bytes; declarations and allocation commit together, and committed
@@ -170,7 +187,7 @@ namespace drops never recycle IDs. These IDs are not new wire/Python fields and
 do not activate physical indexes, uniqueness enforcement, or index cursors.
 Native Rust/Python can remove a pending declaration by exact name, with built-in
 ID protection, transactional identity cleanup and non-reuse on recreation. This
-does not add the Mongo wire `dropIndexes` command or wildcard/field-alias removal.
+is independent of the wire selection/removal path described above.
 
 The version-18 upgrade adds empty physical secondary-index storage with a
 checksummed, restartable per-shard layout upgrade and an older-binary fence.
@@ -180,7 +197,7 @@ activation by itself. Version 19 adds explicit native Rust/Python non-unique
 builds with journaled shard progress, atomic Ready publication, transactional
 entry maintenance and restart coverage/checksum validation. Unpublished builds
 are discarded on reopen without changing BSON or declaration IDs. Global
-uniqueness, planner use and Mongo wire index removal remain
+uniqueness, planner use and broader selector compatibility remain
 open under #174. Native
 Rust and sync/async Python can also drop built indexes through the existing exact
 name API. A journaled, sole-process cleanup removes derived entries and metadata,
@@ -482,7 +499,7 @@ Required CI compares 64 valid ascending integer-key definitions with the unchang
 frozen index model, including pending metadata after restart. Descending/numeric
 aliases and invalid/resource-limited definitions have independent tests. This is
 not itself physical index support: secondary declarations still enforce no uniqueness,
-and wire index removal remains unimplemented. Required CI also compares
+and planner acceleration remains unimplemented. Required CI also compares
 six build/drop/recreation discovery states and the reopened result with the
 source-locked TinyMongo client, including built-in/name order and exact options.
 Only ordered key pairs are represented as BSON documents for transport. The full frozen
@@ -504,7 +521,8 @@ partial options after shared eager validation. The complete retained envelope is
 bounded; exact filter BSON, IDs and membership options survive restart. Existing
 flat declarations remain byte-compatible, and unknown legacy envelopes remain
 opaque/readable. These options are metadata-only until physical activation;
-native declaration validation does not scan records and wire index removal remains open.
+native declaration validation does not scan records; wire removal uses the separate
+exclusive lifecycle described above.
 The separate native `CreateBuiltIndex` / sync/async `create_built_index` helper
 now combines declaration and physical non-unique build on an existing collection,
 with exclusive before/after Ready counts. Preflight rejects unsupported data and

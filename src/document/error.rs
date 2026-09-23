@@ -39,6 +39,7 @@ impl Error for DocumentCursorError {}
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentIndexError {
+    CollectionNotFound,
     NotFound,
     Protected,
     OptionsConflict,
@@ -49,6 +50,7 @@ pub enum DocumentIndexError {
 impl DocumentIndexError {
     pub const fn mongo_code(self) -> i32 {
         match self {
+            Self::CollectionNotFound => 26,
             Self::NotFound => 27,
             Self::Protected => 72,
             Self::OptionsConflict => 85,
@@ -60,9 +62,10 @@ impl DocumentIndexError {
     pub(crate) fn into_engine_error(self) -> EngineError {
         EngineError::from_source(
             match self {
-                Self::NotFound | Self::OptionsConflict | Self::KeySpecsConflict => {
-                    EngineErrorKind::FailedPrecondition
-                }
+                Self::CollectionNotFound
+                | Self::NotFound
+                | Self::OptionsConflict
+                | Self::KeySpecsConflict => EngineErrorKind::FailedPrecondition,
                 Self::Protected | Self::InvalidIdOptions => EngineErrorKind::InvalidArgument,
             },
             self.to_string(),
@@ -74,6 +77,7 @@ impl DocumentIndexError {
 impl fmt::Display for DocumentIndexError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::CollectionNotFound => "document collection does not exist",
             Self::NotFound => "document index not found",
             Self::Protected => "the built-in document ID index cannot be dropped",
             Self::OptionsConflict => "an equivalent document index already has another name",
@@ -94,6 +98,11 @@ mod index_tests {
     #[test]
     fn index_lifecycle_errors_retain_typed_payload_free_causes() {
         for (cause, kind, code) in [
+            (
+                DocumentIndexError::CollectionNotFound,
+                EngineErrorKind::FailedPrecondition,
+                26,
+            ),
             (
                 DocumentIndexError::NotFound,
                 EngineErrorKind::FailedPrecondition,

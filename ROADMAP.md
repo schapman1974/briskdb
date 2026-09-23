@@ -647,7 +647,7 @@ requires an earlier dependency:
       Rust and native sync/async Python can now drop one pending declaration by
       exact name. Built-in protection, pre-commit controls/budgets, concurrent
       drops, crash recovery and ID non-reuse are covered. Built-index drops use
-      the recoverable path below; wire commands and wildcard/field-alias removal remain open.
+      the recoverable path below; wire selectors use the separate exclusive path below.
       Native Rust and sync/async Python declarations now accept sparse/partial
       options through the shared eager predicate validator. Exact membership
       metadata uses the existing import envelope, preserves IDs across restart,
@@ -677,8 +677,8 @@ requires an earlier dependency:
       exact records and startup verifies full coverage without silent repair.
       Process-exit tests cover build/abort commit boundaries. Interrupted builds
       reopen as pending with only their derived entries removed. Opaque/unique
-      pending declarations stay non-enforcing; reads still scan. Global uniqueness,
-      planner use and wire index removal remain open.
+      pending declarations stay non-enforcing; reads still scan. Global uniqueness
+      and planner use remain open.
       Exact native `DropIndex`/sync/async `drop_index` now removes built indexes
       with version-19 Drop intent, sealed per-shard cleanup and restart completion.
       BSON, surviving Ready entries and permanent allocation history are preserved;
@@ -706,8 +706,16 @@ requires an earlier dependency:
       prefixes survive runtime failures; unfinished new entries are removed on
       reopen without changing earlier indexes or records. Real-driver restart,
       raw malformed-batch, source-locked metadata and crash-boundary tests cover
-      this path. Wire removal, unique enforcement, planner acceleration and
+      this path. Unique enforcement, planner acceleration and
       broader IndexModel warning/degradation compatibility remain open.
+      Native `DropIndexes` now powers Mongo/PyMongo named, unambiguous legacy-field
+      and wildcard removal under one sole-process/exclusive admission. It resolves
+      selection/counts before mutation, protects the built-in ID index, removes
+      both Ready entries and Pending definitions, and preserves BSON/allocator
+      history. Completed prefixes survive interruption; only the admitted drop is
+      finished on reopen, not later unstarted indexes. Raw-wire, sync/async driver,
+      locked metadata/alias, cancellation and per-index crash tests cover this path.
+      Name arrays/key-pattern selectors and ambiguous-alias parity remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

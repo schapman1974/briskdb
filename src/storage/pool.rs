@@ -1272,10 +1272,33 @@ pub(super) fn run_dedicated_connection_controlled<T>(
             Err(error.context("failed to restore the dedicated SQLite busy timeout"))
         }
         (Ok(value), Ok(()), Ok(()), _) => Ok(value),
+        (Err(error), _, _, Some(reason))
+            if error.kind() == EngineErrorKind::DataCorruption
+                && has_generic_sqlite_failure(&error) =>
+        {
+            // SQLite's PRAGMA virtual tables can surface an interrupted inner
+            // statement as generic SQLITE_ERROR. A storage validator may have
+            // wrapped that ambiguous read failure as corruption. An accepted
+            // cancellation is authoritative here; do not persist a false
+            // degraded state. No diagnostic text is parsed, and concrete
+            // SQLITE_CORRUPT/NOTADB or semantic integrity failures still win.
+            Err(reason.error())
+        }
         (Err(error), _, _, _) if error.kind() == EngineErrorKind::DataCorruption => Err(error),
         (Err(_), _, _, Some(reason)) => Err(reason.error()),
         (Err(error), _, _, None) => Err(error),
     }
+}
+
+fn has_generic_sqlite_failure(error: &EngineError) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(cause) = source {
+        if let Some(rusqlite::Error::SqliteFailure(code, _)) = cause.downcast_ref() {
+            return code.extended_code == rusqlite::ffi::SQLITE_ERROR;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 impl Deref for PooledConnection {
@@ -1343,6 +1366,64 @@ mod tests {
 
     use super::*;
     use crate::storage::{action_taints_connection, action_writes_connection};
+
+    #[test]
+    fn dedicated_cancellation_resolves_ambiguous_reads_but_preserves_proven_corruption() {
+        use crate::core::CancellationReason;
+
+        for reason in [
+            None,
+            Some(CancellationReason::Cancelled),
+            Some(CancellationReason::DeadlineExceeded),
+        ] {
+            for code in [
+                rusqlite::ffi::SQLITE_ERROR,
+                rusqlite::ffi::SQLITE_CORRUPT,
+                rusqlite::ffi::SQLITE_NOTADB,
+            ] {
+                for message in ["interrupted", "unrelated localized diagnostic"] {
+                    let mut connection = Connection::open_in_memory().unwrap();
+                    let control = OperationControl::new(None);
+                    let result: EngineResult<()> = run_dedicated_connection_controlled(
+                        &mut connection,
+                        Arc::clone(&control),
+                        |_| {
+                            if let Some(reason) = reason {
+                                assert!(control.request_cancel(reason));
+                            }
+                            Err(EngineError::from_source(
+                                EngineErrorKind::DataCorruption,
+                                "schema validation read failed",
+                                sqlite_error::storage(rusqlite::Error::SqliteFailure(
+                                    rusqlite::ffi::Error::new(code),
+                                    Some(message.into()),
+                                )),
+                            ))
+                        },
+                    );
+                    let expected = if code == rusqlite::ffi::SQLITE_ERROR {
+                        reason
+                            .map(|reason| reason.error().kind())
+                            .unwrap_or(EngineErrorKind::DataCorruption)
+                    } else {
+                        EngineErrorKind::DataCorruption
+                    };
+                    assert_eq!(result.unwrap_err().kind(), expected);
+                }
+            }
+        }
+        let mut connection = Connection::open_in_memory().unwrap();
+        let control = OperationControl::new(None);
+        let result: EngineResult<()> =
+            run_dedicated_connection_controlled(&mut connection, Arc::clone(&control), |_| {
+                assert!(control.request_cancel(CancellationReason::Cancelled));
+                Err(EngineError::new(
+                    EngineErrorKind::DataCorruption,
+                    "confirmed checksum mismatch",
+                ))
+            });
+        assert_eq!(result.unwrap_err().kind(), EngineErrorKind::DataCorruption);
+    }
 
     fn pools(pool_size: usize, queue_capacity: usize) -> (tempfile::TempDir, ConnectionPools) {
         let temp = tempfile::tempdir().unwrap();

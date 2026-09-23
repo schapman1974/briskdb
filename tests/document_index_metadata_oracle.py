@@ -15,6 +15,7 @@ from tinymongo.storage_backends import clear_memory_namespace
 
 
 def main():
+    assert sys.argv[1:] in ([], ["--drop-alias"])
     for module, digest in [
         (reference, "d372699407b46a7abefb5bb132d99d4645f3e7bfddc73213c1fe3fccbac476e0"),
         (indexes, "91001ac8d89a89eed65555ebe8196de8345735b15aeefeaa18851619e3519ca6"),
@@ -34,7 +35,9 @@ def main():
         ]
         for event in events:
             if event["action"] == "drop":
-                collection.drop_index(event["name"])
+                if "--drop-alias" in sys.argv:
+                    event["selector"] = "value"
+                collection.drop_index(event.get("selector", event["name"]))
             else:
                 options = {"name": event["name"]}
                 if event.get("sparse"):

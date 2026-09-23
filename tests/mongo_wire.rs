@@ -825,6 +825,130 @@ async fn index_creation_rejects_duplicate_options_and_malformed_batches_before_n
 }
 
 #[tokio::test]
+async fn index_removal_validates_selection_options_and_counts_without_record_loss() {
+    fn doc<const N: usize>(entries: [(&str, BsonValue); N]) -> BsonDocument {
+        BsonDocument::from_entries(entries).unwrap()
+    }
+    let (_root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let create = doc([
+        ("createIndexes", BsonValue::from("items")),
+        (
+            "indexes",
+            BsonValue::Array(
+                ["value", "tail"]
+                    .map(|field| {
+                        BsonValue::Document(doc([(
+                            "key",
+                            BsonValue::Document(doc([(field, BsonValue::Int32(1))])),
+                        )]))
+                    })
+                    .to_vec(),
+            ),
+        ),
+        ("$db", BsonValue::from("wire")),
+    ]);
+    assert_eq!(
+        send_command(&mut stream, &create).await.get_first("ok"),
+        Some(&BsonValue::Double(1.0))
+    );
+    let listing = doc([
+        ("listIndexes", BsonValue::from("items")),
+        ("$db", BsonValue::from("wire")),
+    ]);
+    let base = doc([
+        ("dropIndexes", BsonValue::from("items")),
+        ("$db", BsonValue::from("wire")),
+    ]);
+    for (selection, code) in [
+        (BsonValue::Int32(1), 14),
+        (BsonValue::Array(vec![BsonValue::from("value_1")]), 14),
+        (
+            BsonValue::Document(doc([("value", BsonValue::Int32(1))])),
+            14,
+        ),
+        (BsonValue::from(""), 2),
+        (BsonValue::from("_id"), 72),
+        (BsonValue::from("_id_"), 72),
+        (BsonValue::from("missing"), 27),
+    ] {
+        let mut invalid = base.clone();
+        invalid.push("index", selection).unwrap();
+        assert_eq!(
+            send_command(&mut stream, &invalid).await.get_first("code"),
+            Some(&BsonValue::Int32(code))
+        );
+        assert_eq!(
+            first_batch(&send_command(&mut stream, &listing).await).len(),
+            3
+        );
+    }
+    assert_eq!(
+        send_command(&mut stream, &base).await.get_first("code"),
+        Some(&BsonValue::Int32(2))
+    );
+    let mut all = base.clone();
+    all.push("index", BsonValue::from("*")).unwrap();
+    for (field, value) in [
+        (
+            "writeConcern",
+            BsonValue::Document(doc([("w", BsonValue::Int32(0))])),
+        ),
+        ("unknown", BsonValue::Boolean(true)),
+        ("maxTimeMS", BsonValue::Int32(-1)),
+    ] {
+        let mut invalid = all.clone();
+        invalid.push(field, value).unwrap();
+        assert_eq!(
+            send_command(&mut stream, &invalid).await.get_first("ok"),
+            Some(&BsonValue::Double(0.0))
+        );
+        assert_eq!(
+            first_batch(&send_command(&mut stream, &listing).await).len(),
+            3
+        );
+    }
+    let mut bytes = packet(&all, 77, 0);
+    let raw = encode_document(&BsonDocument::new()).unwrap();
+    bytes.put_u8(1);
+    bytes.put_i32_le((4 + 10 + raw.len()) as i32);
+    bytes.extend_from_slice(b"documents\0");
+    bytes.extend_from_slice(&raw);
+    let length = bytes.len() as i32;
+    bytes[..4].copy_from_slice(&length.to_le_bytes());
+    stream.write_all(&bytes).await.unwrap();
+    assert_eq!(
+        response(&mut stream).await.1.get_first("code"),
+        Some(&BsonValue::Int32(72))
+    );
+    let record = doc([("_id", BsonValue::Int32(1)), ("value", BsonValue::Int32(2))]);
+    assert_eq!(
+        send_command(&mut stream, &insert_command("items", record.clone()))
+            .await
+            .get_first("ok"),
+        Some(&BsonValue::Double(1.0))
+    );
+    let reply = send_command(&mut stream, &all).await;
+    assert_eq!(reply.get_first("nIndexesWas"), Some(&BsonValue::Int64(3)));
+    assert_eq!(
+        first_batch(&send_command(&mut stream, &listing).await).len(),
+        1
+    );
+    assert_eq!(
+        first_batch(&send_command(&mut stream, &find_command("items", BsonValue::Int32(1))).await),
+        &[BsonValue::Document(record)]
+    );
+    assert_eq!(
+        send_command(&mut stream, &all)
+            .await
+            .get_first("nIndexesWas"),
+        Some(&BsonValue::Int64(1))
+    );
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn multi_update_errors_distinguish_confirmed_rollback_from_prior_commits() {
     fn doc<const N: usize>(fields: [(&str, BsonValue); N]) -> BsonDocument {
         BsonDocument::from_entries(fields).unwrap()

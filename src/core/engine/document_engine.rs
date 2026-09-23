@@ -65,6 +65,7 @@ enum DocumentIndexOperation {
     Drop(String),
     Create(crate::document::DocumentIndexRequest),
     CreateBatch(Box<[crate::document::DocumentIndexRequest]>),
+    DropBatch(Option<String>),
 }
 
 impl Engine {
@@ -111,6 +112,21 @@ impl Engine {
                         request_id,
                         namespace,
                         DocumentIndexOperation::Create(index),
+                    )
+                    .await
+                }
+            }
+            DocumentCommand::DropIndexes(request) => {
+                let (namespace, name, options) = request.into_parts();
+                if let Err(error) = require_catalog_write_options(options) {
+                    Err(error)
+                } else {
+                    self.run_document_index_operation(
+                        &mut operation,
+                        session,
+                        request_id,
+                        namespace,
+                        DocumentIndexOperation::DropBatch(name),
                     )
                     .await
                 }
@@ -1130,6 +1146,7 @@ impl Engine {
             DocumentCommand::CreateCollection(_)
             | DocumentCommand::CreateBuiltIndex(_)
             | DocumentCommand::CreateIndexes(_)
+            | DocumentCommand::DropIndexes(_)
             | DocumentCommand::BuildIndex(_)
             | DocumentCommand::DropCollection(_)
             | DocumentCommand::DropDatabase(_) => Err(EngineError::new(
@@ -1201,6 +1218,29 @@ impl Engine {
             let _lease = lease;
             let _session = session;
             let result: EngineResult<DocumentExecution> = (|| {
+                if let DocumentIndexOperation::DropBatch(name) = action {
+                    let execution = DocumentExecution::new(
+                        request_id,
+                        None,
+                        DocumentResult::IndexesDropped {
+                            before: 0,
+                            after: 0,
+                        },
+                    );
+                    enforce_execution_result_limits(&execution, result_limits)?;
+                    connections.retire_idle_for_schema_migration()?;
+                    let (before, after) = storage.drop_document_indexes_controlled(
+                        &namespace,
+                        name.as_deref(),
+                        migration,
+                        Arc::clone(&worker_control),
+                    )?;
+                    return Ok(DocumentExecution::new(
+                        request_id,
+                        None,
+                        DocumentResult::IndexesDropped { before, after },
+                    ));
+                }
                 if let DocumentIndexOperation::CreateBatch(indexes) = action {
                     let definitions = crate::document::normalize_index_batch(indexes, &mut || {
                         ensure_document_cpu_active(&cancellation, &worker_control)
@@ -1228,7 +1268,8 @@ impl Engine {
                     ));
                 }
                 let (name, declaration, response) = match action {
-                    DocumentIndexOperation::CreateBatch(_) => unreachable!("batch handled above"),
+                    DocumentIndexOperation::CreateBatch(_)
+                    | DocumentIndexOperation::DropBatch(_) => unreachable!("batch handled above"),
                     DocumentIndexOperation::Create(index) => {
                         let (specification, name, unique) =
                             crate::document::normalize_index_request(index, &mut || {
@@ -2636,7 +2677,7 @@ fn enforce_execution_result_limits_with_check(
             budget.add_bytes(DOCUMENT_RESULT_ROW_BYTES + DOCUMENT_RESULT_VALUE_BYTES + 16)?;
             budget.add_bytes(u64::try_from(name.len()).unwrap_or(u64::MAX))?;
         }
-        DocumentResult::IndexesBuilt { .. } => {
+        DocumentResult::IndexesBuilt { .. } | DocumentResult::IndexesDropped { .. } => {
             budget.add_rows(1)?;
             budget.add_bytes(DOCUMENT_RESULT_ROW_BYTES + DOCUMENT_RESULT_VALUE_BYTES + 16)?;
         }
@@ -2773,6 +2814,7 @@ fn execution_result_is_mutation(result: &DocumentResult) -> bool {
             | DocumentResult::IndexReady(_)
             | DocumentResult::IndexBuilt { .. }
             | DocumentResult::IndexesBuilt { .. }
+            | DocumentResult::IndexesDropped { .. }
             | DocumentResult::CursorKilled(_)
     )
 }
@@ -3405,6 +3447,11 @@ mod tests {
         lifecycle_rejects_its_own_transaction_before_schema_quiescence(2).await;
     }
 
+    #[tokio::test]
+    async fn index_removal_rejects_its_own_transaction_before_schema_quiescence() {
+        lifecycle_rejects_its_own_transaction_before_schema_quiescence(3).await;
+    }
+
     async fn lifecycle_rejects_its_own_transaction_before_schema_quiescence(mode: u8) {
         let temp = tempfile::tempdir().unwrap();
         let engine = Engine::open(temp.path(), 2).await.unwrap();
@@ -3432,6 +3479,11 @@ mod tests {
                 )
                 .unwrap(),
             )
+        } else if mode == 3 {
+            DocumentCommand::DropIndexes(crate::document::DocumentDropIndexesRequest::all(
+                DocumentNamespace::new("app", "events").unwrap(),
+                DocumentWriteOptions::new(),
+            ))
         } else if mode == 2 {
             DocumentCommand::CreateIndexes(
                 crate::document::DocumentCreateIndexesRequest::new(

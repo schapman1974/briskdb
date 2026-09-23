@@ -27,6 +27,314 @@ fn batch(indexes: Vec<DocumentIndexRequest>) -> DocumentCommand {
             .unwrap(),
     )
 }
+
+fn drop_indexes(name: Option<&str>) -> DocumentCommand {
+    DocumentCommand::DropIndexes(match name {
+        Some(name) => {
+            DocumentDropIndexesRequest::new(namespace(), name, DocumentWriteOptions::new()).unwrap()
+        }
+        None => DocumentDropIndexesRequest::all(namespace(), DocumentWriteOptions::new()),
+    })
+}
+
+#[tokio::test]
+async fn index_drop_selection_counts_controls_and_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    let missing = engine
+        .execute_document(&session, request(drop_indexes(None), RequestContext::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(index_code(&missing), 26);
+    engine
+        .execute_document(
+            &session,
+            request(
+                DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                    namespace(),
+                    DocumentCollectionOptions::empty(),
+                    DocumentWriteOptions::new(),
+                )),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    engine
+        .execute_document(
+            &session,
+            request(
+                batch(vec![
+                    index("value", "first"),
+                    index("value", "second").with_sparse(true),
+                ]),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    for name in ["_id", "_id_"] {
+        let error = engine
+            .execute_document(
+                &session,
+                request(drop_indexes(Some(name)), RequestContext::new()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(index_code(&error), 72);
+    }
+    let ambiguous = engine
+        .execute_document(
+            &session,
+            request(drop_indexes(Some("value")), RequestContext::new()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(ambiguous.kind(), EngineErrorKind::Unsupported);
+    let token = CancellationToken::new();
+    token.cancel();
+    for (context, kind) in [
+        (
+            RequestContext::new().with_result_limits(ResultLimits::new(1, 48).unwrap()),
+            EngineErrorKind::LimitExceeded,
+        ),
+        (
+            RequestContext::new().with_cancellation_token(token),
+            EngineErrorKind::Cancelled,
+        ),
+        (
+            RequestContext::new().with_deadline(Instant::now() - Duration::from_secs(1)),
+            EngineErrorKind::DeadlineExceeded,
+        ),
+    ] {
+        assert_eq!(
+            engine
+                .execute_document(&session, request(drop_indexes(None), context))
+                .await
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+    }
+    for (name, before, after) in [("first", 3, 2), ("value", 2, 1)] {
+        let execution = engine
+            .execute_document(
+                &session,
+                request(
+                    drop_indexes(Some(name)),
+                    RequestContext::new().with_result_limits(ResultLimits::new(1, 49).unwrap()),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            execution.result(),
+            &DocumentResult::IndexesDropped { before, after }
+        );
+    }
+    let missing = engine
+        .execute_document(
+            &session,
+            request(drop_indexes(Some("value")), RequestContext::new()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(index_code(&missing), 27);
+    // An explicit name wins over another index's legacy field alias.
+    engine
+        .execute_document(
+            &session,
+            request(
+                batch(vec![index("other", "value"), index("value", "shadow")]),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    let execution = engine
+        .execute_document(
+            &session,
+            request(drop_indexes(Some("value")), RequestContext::new()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        execution.result(),
+        &DocumentResult::IndexesDropped {
+            before: 3,
+            after: 2
+        }
+    );
+    let execution = engine
+        .execute_document(
+            &session,
+            request(
+                DocumentCommand::ListIndexes(DocumentListIndexesRequest::new(
+                    namespace(),
+                    DocumentReadOptions::new(),
+                )),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    let DocumentResult::Indexes(indexes) = execution.result() else {
+        panic!("catalog")
+    };
+    assert!(indexes.iter().any(|index| index.name() == "shadow"));
+    engine
+        .execute_document(
+            &session,
+            request(drop_indexes(Some("shadow")), RequestContext::new()),
+        )
+        .await
+        .unwrap();
+    engine.shutdown().await.unwrap();
+    drop(session);
+    drop(engine);
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    let execution = engine
+        .execute_document(&session, request(drop_indexes(None), RequestContext::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        execution.result(),
+        &DocumentResult::IndexesDropped {
+            before: 1,
+            after: 1
+        }
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn index_drop_all_removes_ready_and_pending_definitions_without_touching_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    engine
+        .execute_document(
+            &session,
+            request(
+                DocumentCommand::CreateCollection(DocumentCreateCollectionRequest::new(
+                    namespace(),
+                    DocumentCollectionOptions::empty(),
+                    DocumentWriteOptions::new(),
+                )),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    engine
+        .execute_document(
+            &session,
+            request(
+                batch(vec![index("value", "value"), index("tail", "tail")]),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    engine
+        .execute_document(
+            &session,
+            request(
+                DocumentCommand::CreateIndex(DocumentCreateIndexRequest::new(
+                    namespace(),
+                    index("unique", "pending").with_unique(true),
+                    DocumentWriteOptions::new(),
+                )),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    engine
+        .execute_document(
+            &session,
+            request(
+                DocumentCommand::Insert(
+                    DocumentInsertRequest::new(
+                        namespace(),
+                        vec![
+                            BsonDocument::from_entries([
+                                ("_id", BsonValue::Int32(1)),
+                                ("value", BsonValue::Int32(2)),
+                                ("tail", BsonValue::Int32(3)),
+                            ])
+                            .unwrap(),
+                        ],
+                        DocumentWriteOptions::new(),
+                    )
+                    .unwrap(),
+                ),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    let execution = engine
+        .execute_document(&session, request(drop_indexes(None), RequestContext::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        execution.result(),
+        &DocumentResult::IndexesDropped {
+            before: 3,
+            after: 1
+        }
+    );
+    engine.shutdown().await.unwrap();
+    drop(session);
+    drop(engine);
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    let execution = engine
+        .execute_document(
+            &session,
+            request(
+                DocumentCommand::ListIndexes(DocumentListIndexesRequest::new(
+                    namespace(),
+                    DocumentReadOptions::new(),
+                )),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    let DocumentResult::Indexes(indexes) = execution.result() else {
+        panic!("catalog")
+    };
+    assert_eq!(indexes.len(), 1);
+    assert!(indexes[0].is_built_in());
+    let execution = engine
+        .execute_document(
+            &session,
+            request(
+                DocumentCommand::Count(DocumentCountRequest::new(
+                    namespace(),
+                    DocumentFilter::empty(),
+                    DocumentReadOptions::new(),
+                )),
+                RequestContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(execution.result(), &DocumentResult::Count(1));
+    // A subsequent build validates zero stale entries and current record coverage.
+    engine
+        .execute_document(
+            &session,
+            request(batch(vec![index("value", "value")]), RequestContext::new()),
+        )
+        .await
+        .unwrap();
+    engine.shutdown().await.unwrap();
+}
 fn index_code(error: &EngineError) -> i32 {
     let mut source = error.source();
     while let Some(cause) = source {

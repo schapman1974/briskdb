@@ -54,6 +54,120 @@ fn high_water(root: &Path) -> i64 {
         .unwrap()
 }
 
+fn drop_selected(storage: &Storage, name: Option<&str>) -> EngineResult<(u64, u64)> {
+    let migration = storage.begin_schema_migration()?;
+    migration.wait_for_quiescence_blocking();
+    storage.drop_document_indexes_controlled(
+        &DocumentNamespace::new("app", "items").unwrap(),
+        name,
+        migration,
+        OperationControl::new(None),
+    )
+}
+
+#[test]
+fn every_drop_batch_boundary_preserves_completed_prefix_and_unstarted_indexes() {
+    for count in [2, 4] {
+        let mut points = vec![
+            "drop-before-intent:0".to_owned(),
+            "drop-after-intent:0".to_owned(),
+            "cleanup-before-completion:0".to_owned(),
+            "cleanup-after-completion:0".to_owned(),
+        ];
+        for shard in 0..count {
+            for point in [
+                "cleanup-before-shard",
+                "cleanup-after-shard",
+                "before-cursor",
+                "after-cursor",
+            ] {
+                points.push(format!("{point}:{shard}"));
+            }
+        }
+        for point in points {
+            let temp = tempfile::tempdir().unwrap();
+            let (storage, collection) = setup(temp.path(), count);
+            let target = build(&storage, "value").unwrap();
+            create_built(&storage, "a", "a").unwrap();
+            create_built(&storage, "z", "z").unwrap();
+            storage
+                .declare_document_index(
+                    collection,
+                    "!pending",
+                    &BsonDocument::from_entries([("pending", BsonValue::Int32(1))]).unwrap(),
+                    true,
+                )
+                .unwrap();
+            let catalog = storage.document_catalog().unwrap();
+            let first = catalog
+                .collection("app", "items")
+                .unwrap()
+                .indexes()
+                .iter()
+                .find(|i| i.name() == "a")
+                .unwrap()
+                .id();
+            let high = high_water(temp.path());
+            let records = snapshot(temp.path(), count, "briskdb_documents_v1");
+            let mut expected_entries =
+                snapshot(temp.path(), count, "briskdb_document_index_entries_v1");
+            let admitted = point != "drop-before-intent:0";
+            for shard in &mut expected_entries {
+                shard.retain(|row| {
+                    row[1] != Value::Integer(first.get() as i64)
+                        && (!admitted || row[1] != Value::Integer(target.id().get() as i64))
+                });
+            }
+            drop(storage);
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "storage::document::enabled::index_operations::tests::index_operation_crash_child", "--nocapture"])
+                .env("BRISKDB_TEST_INDEX_OPERATION_ROOT", temp.path())
+                .env("BRISKDB_TEST_INDEX_OPERATION_SHARDS", count.to_string())
+                .env("BRISKDB_TEST_INDEX_OPERATION_DROP_BATCH", "1")
+                .env("BRISKDB_TEST_DOCUMENT_INDEX_OPERATION_ID", target.id().get().to_string())
+                .env("BRISKDB_TEST_DOCUMENT_INDEX_OPERATION_CRASH", &point)
+                .output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(75),
+                "{point}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let storage = Storage::open(temp.path(), count).unwrap();
+            assert_eq!(high_water(temp.path()), high);
+            assert_eq!(
+                snapshot(temp.path(), count, "briskdb_documents_v1"),
+                records
+            );
+            assert_eq!(
+                snapshot(temp.path(), count, "briskdb_document_index_entries_v1"),
+                expected_entries,
+                "{point}"
+            );
+            let catalog = storage.document_catalog().unwrap();
+            let indexes = catalog.collection("app", "items").unwrap().indexes();
+            assert!(!indexes.iter().any(|i| matches!(i.name(), "a" | "!pending")));
+            assert!(
+                indexes
+                    .iter()
+                    .any(|i| i.name() == "z" && i.lifecycle() == DocumentIndexLifecycle::Ready)
+            );
+            assert_eq!(indexes.iter().any(|i| i.name() == "value"), !admitted);
+            assert_eq!(
+                drop_selected(&storage, None).unwrap(),
+                (if admitted { 2 } else { 3 }, 1)
+            );
+            assert!(
+                snapshot(temp.path(), count, "briskdb_document_index_entries_v1")
+                    .iter()
+                    .all(Vec::is_empty)
+            );
+            assert_eq!(high_water(temp.path()), high);
+        }
+    }
+}
+
 fn create_batch(
     storage: &Storage,
     indexes: Vec<crate::document::DocumentIndexRequest>,
@@ -765,7 +879,9 @@ fn index_operation_crash_child() {
         .parse()
         .unwrap();
     let storage = Storage::open(root, count).unwrap();
-    if std::env::var("BRISKDB_TEST_INDEX_OPERATION_BATCH").as_deref() == Ok("1") {
+    if std::env::var("BRISKDB_TEST_INDEX_OPERATION_DROP_BATCH").as_deref() == Ok("1") {
+        drop_selected(&storage, None).unwrap();
+    } else if std::env::var("BRISKDB_TEST_INDEX_OPERATION_BATCH").as_deref() == Ok("1") {
         create_batch(
             &storage,
             vec![batch_index("value", "value"), batch_index("other", "other")],
@@ -1043,6 +1159,96 @@ fn every_built_drop_boundary_recovers_without_rewriting_surviving_authority() {
 }
 
 #[test]
+fn cancellation_during_cleanup_validation_is_not_corruption() {
+    use crate::core::CancellationReason;
+    use std::sync::Barrier;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    let blocker = storage.open_unconfigured_shard(0).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    for attempt in 0..512 {
+        let mut connection = storage.open_unconfigured_shard(0).unwrap();
+        let control = OperationControl::new(None);
+        let observer_control = Arc::clone(&control);
+        let ready = Arc::new(Barrier::new(2));
+        let observer_ready = Arc::clone(&ready);
+        let observer = std::thread::spawn(move || {
+            observer_ready.wait();
+            std::thread::sleep(std::time::Duration::from_micros((attempt % 256) * 10));
+            observer_control.request_cancel(CancellationReason::Cancelled);
+        });
+        let result: EngineResult<()> =
+            run_provisioning_step(&mut connection, Some(&control), |connection| {
+                ready.wait();
+                storage.validate_unconfigured_shard_nonterminal(connection, 0)?;
+                require_schema(connection)?;
+                // Keep the operation interruptible even when validation finishes
+                // before the observer. No mutation is performed.
+                connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sqlite_error::storage)?;
+                panic!("the blocker must prevent write admission");
+            });
+        observer.join().unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.kind(),
+            EngineErrorKind::Cancelled,
+            "attempt {attempt}: {error:?}"
+        );
+    }
+    blocker.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn cancellation_at_each_cleanup_validation_checkpoint_is_not_corruption() {
+    use crate::core::CancellationReason;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    for checkpoint in 1..=10_000 {
+        let mut connection = storage.open_unconfigured_shard(0).unwrap();
+        let control = OperationControl::new(None);
+        let progress_control = Arc::clone(&control);
+        let result = run_provisioning_step(&mut connection, Some(&control), |connection| {
+            let steps = AtomicUsize::new(0);
+            connection
+                .progress_handler(
+                    1,
+                    Some(move || {
+                        if steps.fetch_add(1, Ordering::Relaxed) + 1 == checkpoint {
+                            progress_control.request_cancel(CancellationReason::Cancelled);
+                        }
+                        // Exercise the interrupt callback itself. Returning true
+                        // would also force SQLITE_INTERRUPT from the outer VM.
+                        false
+                    }),
+                )
+                .unwrap();
+            storage.validate_unconfigured_shard_nonterminal(connection, 0)?;
+            require_schema(connection)
+        });
+        if control.reason().is_none() {
+            result.unwrap();
+            assert!(checkpoint > 100, "must cover the complete validation");
+            return;
+        }
+        if let Err(error) = result {
+            assert_eq!(
+                error.kind(),
+                EngineErrorKind::Cancelled,
+                "checkpoint {checkpoint}: {error:?}"
+            );
+        }
+    }
+    panic!("validation exceeded the bounded checkpoint sweep");
+}
+
+#[test]
 fn cancelled_admitted_drop_stays_fenced_until_reopen_finishes_cleanup() {
     use crate::core::CancellationReason;
     let temp = tempfile::tempdir().unwrap();
@@ -1076,6 +1282,84 @@ fn cancelled_admitted_drop_stays_fenced_until_reopen_finishes_cleanup() {
         .drop_built_document_index_controlled("app", "items", "value", migration, control)
         .unwrap_err();
     observer.join().unwrap();
+    assert_eq!(error.kind(), EngineErrorKind::Cancelled, "{error:?}");
+    assert!(storage.enter_schema_operation().is_err());
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    drop(storage);
+    let storage = Storage::open(temp.path(), 2).unwrap();
+    assert_eq!(
+        storage
+            .document_catalog()
+            .unwrap()
+            .collection("app", "items")
+            .unwrap()
+            .indexes()
+            .len(),
+        1
+    );
+    assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+    assert!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1")
+            .iter()
+            .all(Vec::is_empty)
+    );
+}
+
+#[test]
+fn cancelled_drop_batch_keeps_completed_prefix_and_fences_current_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    storage
+        .declare_document_index(
+            collection,
+            "!pending",
+            &BsonDocument::from_entries([("pending", BsonValue::Int32(1))]).unwrap(),
+            false,
+        )
+        .unwrap();
+    let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+    let high = high_water(temp.path());
+    let blocker = storage.open_unconfigured_shard(0).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let control = OperationControl::new(None);
+    let observer_control = Arc::clone(&control);
+    let manifest = temp.path().join("manifest.sqlite");
+    let observer = std::thread::spawn(move || {
+        let connection = Connection::open(manifest).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let admitted: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM briskdb_document_index_operation WHERE operation_kind=2)", [], |row| row.get(0)).unwrap();
+            if admitted {
+                let pending_exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM briskdb_document_indexes WHERE index_name='!pending')", [], |row| row.get(0)).unwrap();
+                assert!(
+                    !pending_exists,
+                    "completed prefix must already be committed"
+                );
+                assert!(
+                    observer_control.request_cancel(crate::core::CancellationReason::Cancelled)
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "batch drop intent was not admitted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let migration = storage.begin_schema_migration().unwrap();
+    migration.wait_for_quiescence_blocking();
+    let error = storage
+        .drop_document_indexes_controlled(
+            &DocumentNamespace::new("app", "items").unwrap(),
+            None,
+            migration,
+            control,
+        )
+        .unwrap_err();
+    observer.join().unwrap();
     assert_eq!(error.kind(), EngineErrorKind::Cancelled);
     assert!(storage.enter_schema_operation().is_err());
     blocker.execute_batch("ROLLBACK").unwrap();
@@ -1098,6 +1382,7 @@ fn cancelled_admitted_drop_stays_fenced_until_reopen_finishes_cleanup() {
             .iter()
             .all(Vec::is_empty)
     );
+    assert_eq!(high_water(temp.path()), high);
 }
 
 #[test]

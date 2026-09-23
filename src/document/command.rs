@@ -1369,6 +1369,54 @@ impl DocumentDropIndexRequest {
     }
 }
 
+/// Drop an exact index name, an unambiguous single-field alias, or all secondary
+/// indexes under one exclusive admission. The built-in ID index is protected.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentDropIndexesRequest {
+    namespace: DocumentNamespace,
+    name_or_field: Option<String>,
+    write_options: DocumentWriteOptions,
+}
+
+impl DocumentDropIndexesRequest {
+    pub fn new(
+        namespace: DocumentNamespace,
+        name_or_field: impl Into<String>,
+        write_options: DocumentWriteOptions,
+    ) -> EngineResult<Self> {
+        let name_or_field = name_or_field.into();
+        validate_index_name(&name_or_field)?;
+        Ok(Self {
+            namespace,
+            name_or_field: Some(name_or_field),
+            write_options,
+        })
+    }
+
+    /// Select every secondary definition, including native Pending declarations.
+    pub fn all(namespace: DocumentNamespace, write_options: DocumentWriteOptions) -> Self {
+        Self {
+            namespace,
+            name_or_field: None,
+            write_options,
+        }
+    }
+
+    pub const fn namespace(&self) -> &DocumentNamespace {
+        &self.namespace
+    }
+    pub fn name_or_field(&self) -> Option<&str> {
+        self.name_or_field.as_deref()
+    }
+    pub const fn write_options(&self) -> DocumentWriteOptions {
+        self.write_options
+    }
+    pub fn into_parts(self) -> (DocumentNamespace, Option<String>, DocumentWriteOptions) {
+        (self.namespace, self.name_or_field, self.write_options)
+    }
+}
+
 /// Request the next batch from one cursor.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1474,6 +1522,7 @@ pub enum DocumentCommandKind {
     CreateIndexes,
     BuildIndex,
     DropIndex,
+    DropIndexes,
     ListIndexes,
     ListIndexMetadata,
     ContinueCursor,
@@ -1509,6 +1558,7 @@ pub enum DocumentCommand {
     CreateIndexes(DocumentCreateIndexesRequest),
     BuildIndex(DocumentBuildIndexRequest),
     DropIndex(DocumentDropIndexRequest),
+    DropIndexes(DocumentDropIndexesRequest),
     ListIndexes(DocumentListIndexesRequest),
     ListIndexMetadata(DocumentListIndexMetadataRequest),
     ContinueCursor(DocumentContinueCursorRequest),
@@ -1541,6 +1591,7 @@ impl DocumentCommand {
             Self::CreateIndexes(_) => DocumentCommandKind::CreateIndexes,
             Self::BuildIndex(_) => DocumentCommandKind::BuildIndex,
             Self::DropIndex(_) => DocumentCommandKind::DropIndex,
+            Self::DropIndexes(_) => DocumentCommandKind::DropIndexes,
             Self::ListIndexes(_) => DocumentCommandKind::ListIndexes,
             Self::ListIndexMetadata(_) => DocumentCommandKind::ListIndexMetadata,
             Self::ContinueCursor(_) => DocumentCommandKind::ContinueCursor,

@@ -42,16 +42,21 @@ fn equivalent_definition(left: &DocumentIndexMetadata, right: &DocumentIndexMeta
 }
 
 #[cfg(test)]
-fn build_checkpoint(created: bool, point: &str, shard: u16) {
+fn build_checkpoint(created: bool, point: &str, shard: u16, index: DocumentIndexId) {
     if created {
-        checkpoint(&format!("create-{point}"), shard);
+        checkpoint(&format!("create-{point}"), shard, index);
     } else {
-        checkpoint(point, shard);
+        checkpoint(point, shard, index);
     }
 }
 
 #[cfg(test)]
-fn checkpoint(point: &str, shard: u16) {
+fn checkpoint(point: &str, shard: u16, index: DocumentIndexId) {
+    if let Ok(selected) = std::env::var("BRISKDB_TEST_DOCUMENT_INDEX_OPERATION_ID") {
+        if selected.parse::<u64>().expect("test index identity") != index.get() {
+            return;
+        }
+    }
     if std::env::var("BRISKDB_TEST_DOCUMENT_INDEX_OPERATION_CRASH")
         .ok()
         .as_deref()
@@ -97,10 +102,10 @@ fn advance(
             ensure_control_active(control, "before committing document index progress")?;
         }
         #[cfg(test)]
-        checkpoint("before-cursor", journal.next);
+        checkpoint("before-cursor", journal.next, journal.index);
         transaction.commit().map_err(sqlite_error::storage)?;
         #[cfg(test)]
-        checkpoint("after-cursor", journal.next);
+        checkpoint("after-cursor", journal.next, journal.index);
         Ok(())
     })
 }
@@ -164,10 +169,10 @@ fn cleanup(
                 ensure_control_active(control, "before committing document index cleanup")?;
             }
             #[cfg(test)]
-            checkpoint("cleanup-before-shard", shard);
+            checkpoint("cleanup-before-shard", shard, journal.index);
             transaction.commit().map_err(sqlite_error::storage)?;
             #[cfg(test)]
-            checkpoint("cleanup-after-shard", shard);
+            checkpoint("cleanup-after-shard", shard, journal.index);
             Ok(())
         })?;
         advance(storage, connection, &journal, shard + 1, control)?;
@@ -208,10 +213,10 @@ fn cleanup(
             ensure_control_active(control, "before completing document index cleanup")?;
         }
         #[cfg(test)]
-        checkpoint("cleanup-before-completion", 0);
+        checkpoint("cleanup-before-completion", 0, journal.index);
         transaction.commit().map_err(sqlite_error::storage)?;
         #[cfg(test)]
-        checkpoint("cleanup-after-completion", 0);
+        checkpoint("cleanup-after-completion", 0, journal.index);
         Ok(())
     })
 }
@@ -266,6 +271,132 @@ impl Storage {
         mut migration: SchemaMigrationGuard,
         control: Arc<OperationControl>,
     ) -> EngineResult<()> {
+        self.drop_document_index_under_guard(
+            database,
+            collection_name,
+            name,
+            &mut migration,
+            control,
+        )?;
+        migration.publish_ready()
+    }
+
+    /// Resolve the complete selection and its counts under the same admission
+    /// that owns every cleanup. No adapter-side list/drop race is possible.
+    pub(crate) fn drop_document_indexes_controlled(
+        &self,
+        namespace: &DocumentNamespace,
+        name_or_field: Option<&str>,
+        mut migration: SchemaMigrationGuard,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<(u64, u64)> {
+        let result = (|| {
+            ensure_control_active(&control, "before selecting document indexes for removal")?;
+            if matches!(name_or_field, Some("_id" | "_id_")) {
+                return Err(DocumentIndexError::Protected.into_engine_error());
+            }
+            migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
+            let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+            let (names, before, after) = run_manifest_controlled(
+                &mut connection,
+                Arc::clone(&control),
+                |connection| {
+                    configure_journal_mode(connection)?;
+                    require_ready_manifest(connection, self.shard_count())?;
+                    let catalog = load_catalog_rows(connection)?;
+                    let collection = catalog
+                        .collection(namespace.database(), namespace.collection())
+                        .ok_or_else(|| {
+                            DocumentIndexError::CollectionNotFound.into_engine_error()
+                        })?;
+                    let exact = name_or_field.and_then(|name| {
+                        collection
+                            .indexes()
+                            .iter()
+                            .find(|index| index.name() == name)
+                    });
+                    let mut names = Vec::new();
+                    names
+                        .try_reserve_exact(if name_or_field.is_some() {
+                            1
+                        } else {
+                            collection.indexes().len()
+                        })
+                        .map_err(|_| {
+                            EngineError::new(
+                                EngineErrorKind::LimitExceeded,
+                                "unable to allocate document index removal selection",
+                            )
+                        })?;
+                    let mut before = 0;
+                    let mut removed_ready = 0;
+                    for index in collection.indexes() {
+                        ensure_control_active(
+                            &control,
+                            "while selecting document indexes for removal",
+                        )?;
+                        let ready = index.lifecycle() == DocumentIndexLifecycle::Ready;
+                        before += u64::from(ready);
+                        if index.is_built_in() {
+                            continue;
+                        }
+                        let selected = match name_or_field {
+                            None => true,
+                            Some(_) if exact.is_some() => {
+                                exact.is_some_and(|target| target.id() == index.id())
+                            }
+                            Some(field) => index.definition().is_some_and(|definition| {
+                                definition.keys().len() == 1
+                                    && definition
+                                        .keys()
+                                        .iter()
+                                        .next()
+                                        .is_some_and(|(name, _)| name == field)
+                            }),
+                        };
+                        if selected {
+                            if name_or_field.is_some() && !names.is_empty() {
+                                // Source backends disagree on ambiguous alias order.
+                                // Require an exact name instead of deleting arbitrarily.
+                                return Err(EngineError::new(
+                                    EngineErrorKind::Unsupported,
+                                    "document index field alias is ambiguous; use an exact index name",
+                                ));
+                            }
+                            names.push(index.name().to_owned());
+                            removed_ready += u64::from(ready);
+                        }
+                    }
+                    if name_or_field.is_some() && names.is_empty() {
+                        return Err(DocumentIndexError::NotFound.into_engine_error());
+                    }
+                    Ok((names, before, before - removed_ready))
+                },
+            )?;
+            for name in names {
+                ensure_control_active(&control, "between document index removals")?;
+                self.drop_document_index_under_guard(
+                    namespace.database(),
+                    namespace.collection(),
+                    &name,
+                    &mut migration,
+                    Arc::clone(&control),
+                )?;
+            }
+            migration.publish_ready()?;
+            Ok((before, after))
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    fn drop_document_index_under_guard(
+        &self,
+        database: &str,
+        collection_name: &str,
+        name: &str,
+        migration: &mut SchemaMigrationGuard,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<()> {
         let result = (|| {
             ensure_control_active(&control, "before dropping built document index")?;
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
@@ -301,7 +432,7 @@ impl Storage {
                     name,
                     Arc::clone(&control),
                 )?;
-                migration.publish_ready()?;
+                migration.mark_ready_on_drop();
                 return Ok(());
             }
             let future =
@@ -338,10 +469,10 @@ impl Storage {
                 ensure_control_active(&control, "before committing document index drop intent")?;
                 migration.mark_pending_on_drop();
                 #[cfg(test)]
-                checkpoint("drop-before-intent", 0);
+                checkpoint("drop-before-intent", 0, target.id());
                 transaction.commit().map_err(sqlite_error::storage)?;
                 #[cfg(test)]
-                checkpoint("drop-after-intent", 0);
+                checkpoint("drop-after-intent", 0, target.id());
                 Ok(())
             })?;
             cleanup(
@@ -356,7 +487,8 @@ impl Storage {
                 Some(&control),
             )?;
             self.publish_document_indexes(future)?;
-            migration.publish_ready()
+            migration.mark_ready_on_drop();
+            Ok(())
         })();
         self.fail_closed_on_corruption(result)
     }
@@ -748,10 +880,10 @@ impl Storage {
                 ensure_control_active(&control, "before committing document index build intent")?;
                 migration.mark_pending_on_drop();
                 #[cfg(test)]
-                build_checkpoint(created, "before-intent", 0);
+                build_checkpoint(created, "before-intent", 0, target.id());
                 transaction.commit().map_err(sqlite_error::storage)?;
                 #[cfg(test)]
-                build_checkpoint(created, "after-intent", 0);
+                build_checkpoint(created, "after-intent", 0, target.id());
                 Ok(())
             })?;
             let mut journal = Journal {
@@ -820,10 +952,10 @@ impl Storage {
                     )?;
                     ensure_control_active(&control, "before committing document index shard")?;
                     #[cfg(test)]
-                    build_checkpoint(created, "before-shard", shard);
+                    build_checkpoint(created, "before-shard", shard, target.id());
                     transaction.commit().map_err(sqlite_error::storage)?;
                     #[cfg(test)]
-                    build_checkpoint(created, "after-shard", shard);
+                    build_checkpoint(created, "after-shard", shard, target.id());
                     Ok(())
                 })?;
                 if !created {
@@ -861,10 +993,10 @@ impl Storage {
                         .ok_or_else(|| corrupt("activated document index disappeared"))?;
                     ensure_control_active(&control, "before publishing document index authority")?;
                     #[cfg(test)]
-                    build_checkpoint(created, "before-activation", 0);
+                    build_checkpoint(created, "before-activation", 0, target.id());
                     transaction.commit().map_err(sqlite_error::storage)?;
                     #[cfg(test)]
-                    build_checkpoint(created, "after-activation", 0);
+                    build_checkpoint(created, "after-activation", 0, target.id());
                     Ok(metadata)
                 },
             )?;
