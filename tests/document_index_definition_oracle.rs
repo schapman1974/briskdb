@@ -38,19 +38,27 @@ async fn batch_index_creation_matches_locked_client_metadata_and_reopen() {
     assert_built_index_metadata(2).await;
 }
 
+#[tokio::test]
+#[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
+async fn index_removal_alias_matches_locked_client_metadata_and_reopen() {
+    assert_built_index_metadata(3).await;
+}
+
 async fn assert_built_index_metadata(mode: u8) {
     use briskdb::document::{
         DocumentBuildIndexRequest, DocumentContinueCursorRequest, DocumentDropIndexRequest,
         DocumentFilter, DocumentListIndexMetadataRequest,
     };
     let python = std::env::var("BRISKDB_MONGO_ORACLE_PYTHON").unwrap_or_else(|_| "python3".into());
-    let output = Command::new(python)
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/document_index_metadata_oracle.py"
-        ))
-        .output()
-        .unwrap();
+    let mut oracle = Command::new(python);
+    oracle.arg(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/document_index_metadata_oracle.py"
+    ));
+    if mode == 3 {
+        oracle.arg("--drop-alias");
+    }
+    let output = oracle.output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -85,20 +93,47 @@ async fn assert_built_index_metadata(mode: u8) {
             panic!("name")
         };
         if event.get_first("action") == Some(&BsonValue::from("drop")) {
-            engine
-                .execute_document(
-                    &session,
-                    request(DocumentCommand::DropIndex(
-                        DocumentDropIndexRequest::new(
-                            namespace.clone(),
-                            name,
-                            DocumentWriteOptions::new(),
-                        )
-                        .unwrap(),
-                    )),
-                )
-                .await
-                .unwrap();
+            if mode == 3 {
+                let Some(BsonValue::String(selector)) = event.get_first("selector") else {
+                    panic!("drop selector")
+                };
+                let execution = engine
+                    .execute_document(
+                        &session,
+                        request(DocumentCommand::DropIndexes(
+                            briskdb::document::DocumentDropIndexesRequest::new(
+                                namespace.clone(),
+                                selector,
+                                DocumentWriteOptions::new(),
+                            )
+                            .unwrap(),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    execution.result(),
+                    &DocumentResult::IndexesDropped {
+                        before: expected.len() as u64,
+                        after: expected.len() as u64 - 1
+                    }
+                );
+            } else {
+                engine
+                    .execute_document(
+                        &session,
+                        request(DocumentCommand::DropIndex(
+                            DocumentDropIndexRequest::new(
+                                namespace.clone(),
+                                name,
+                                DocumentWriteOptions::new(),
+                            )
+                            .unwrap(),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+            }
         } else {
             let Some(BsonValue::Document(keys)) = event.get_first("keys") else {
                 panic!("keys")
@@ -120,7 +155,7 @@ async fn assert_built_index_metadata(mode: u8) {
             let execution = engine
                 .execute_document(
                     &session,
-                    request(if mode == 2 {
+                    request(if mode >= 2 {
                         DocumentCommand::CreateIndexes(
                             briskdb::document::DocumentCreateIndexesRequest::new(
                                 namespace.clone(),
@@ -137,7 +172,7 @@ async fn assert_built_index_metadata(mode: u8) {
                 )
                 .await
                 .unwrap();
-            if mode == 2 {
+            if mode >= 2 {
                 let before = expected.len().max(1) as u64;
                 assert_eq!(
                     execution.result(),

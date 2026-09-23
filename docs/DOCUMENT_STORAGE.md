@@ -142,11 +142,15 @@ unindexed-field changes), and deletes maintain entries in the document's own
 transaction. A schema-fenced root-shared compiled cache selects only Ready
 indexes; opaque or unique pending declarations remain non-enforcing. Startup
 rejects missing, extra, stale or orphan entries without repair unless an explicit
-journal owns their cleanup. Global uniqueness, planner use and Mongo wire index
-removal remain work under #174. Native/wire batch creation retains one admission
+journal owns their cleanup. Global uniqueness and planner use remain work under
+#174. Native/wire batch creation and removal retain one admission
 guard across entries; completed entries survive a later failure, and only an
 unfinished entry's journal fences the root until reopen. Built-index drops use journal-owned cleanup
 without removing records; namespace deletion can remove both indexes and records.
+Bulk removal resolves all names before its first mutation. Completed removals
+stay committed; only the currently admitted index has a restart obligation,
+and unstarted indexes survive an interrupted batch. Pending definitions use their
+existing single-manifest deletion within the same admission. No format bump.
 
 ## Provisioning and restart
 

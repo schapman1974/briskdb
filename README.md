@@ -458,7 +458,8 @@ more valuable than a star. Start with the
   remain planned. Explicit non-unique `build_index` now builds maintained entries;
   PyMongo `create_index` / `create_indexes` also build ordinary, compound, sparse
   and partial non-unique indexes. Builds require sole-process ownership and queries
-  still scan; wire index removal remains open. Multi-document writes commit per shard,
+  still scan. PyMongo `drop_index` / `drop_indexes` remove secondary indexes
+  without deleting documents; `_id_` remains protected. Multi-document writes commit per shard,
   without global atomicity or MongoDB per-document failure-boundary guarantees.
 - Ubuntu 24.04 x86-64 receives the full required Rust CI suite. Python wheels
   receive native build, audit, install, restart, corruption, and concurrency

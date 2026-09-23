@@ -21,9 +21,9 @@ use crate::{
         DocumentContinueCursorRequest, DocumentCountRequest, DocumentCreateCollectionRequest,
         DocumentCreateIndexesRequest, DocumentCursorError, DocumentCursorId, DocumentDeleteRequest,
         DocumentDistinctRequest, DocumentDropCollectionRequest, DocumentDropDatabaseRequest,
-        DocumentFilter, DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
-        DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentInsertRequest,
-        DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
+        DocumentDropIndexesRequest, DocumentFilter, DocumentFindOneAndDeleteRequest,
+        DocumentFindOneAndReplaceRequest, DocumentFindOneAndUpdateRequest, DocumentFindRequest,
+        DocumentInsertRequest, DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
         DocumentListDatabaseNamesRequest, DocumentListIndexMetadataRequest, DocumentMatcher,
         DocumentMutationError, DocumentMutationScope, DocumentNamespace, DocumentPipeline,
         DocumentProjection, DocumentProjector, DocumentQueryError, DocumentReadOptions,
@@ -145,6 +145,9 @@ impl CommandError {
                 return Self::new(
                     index.mongo_code(),
                     match index {
+                        crate::document::DocumentIndexError::CollectionNotFound => {
+                            "NamespaceNotFound"
+                        }
                         crate::document::DocumentIndexError::NotFound => "IndexNotFound",
                         crate::document::DocumentIndexError::Protected => "InvalidOptions",
                         crate::document::DocumentIndexError::OptionsConflict => {
@@ -236,6 +239,7 @@ pub(super) enum Command {
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
     ListIndexes(DocumentListIndexMetadataRequest, Option<Duration>),
     CreateIndexes(DocumentCreateIndexesRequest),
+    DropIndexes(DocumentDropIndexesRequest),
     DropCollection(DocumentDropCollectionRequest),
     DropDatabase(DocumentDropDatabaseRequest),
     Insert(DocumentInsertRequest),
@@ -277,6 +281,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             | "listCollections"
             | "listIndexes"
             | "createIndexes"
+            | "dropIndexes"
             | "listDatabases"
     ) {
         return None;
@@ -350,6 +355,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 "deletes" if name == "delete" => matches!(value, BsonValue::Array(_)),
                 "updates" if name == "update" => matches!(value, BsonValue::Array(_)),
                 "indexes" if name == "createIndexes" => matches!(value, BsonValue::Array(_)),
+                "index" if name == "dropIndexes" => true,
                 "ordered" if matches!(name, "insert" | "delete" | "update") => {
                     matches!(value, BsonValue::Boolean(_))
                 }
@@ -362,7 +368,12 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 "writeConcern"
                     if matches!(
                         name,
-                        "drop" | "dropDatabase" | "create" | "findAndModify" | "createIndexes"
+                        "drop"
+                            | "dropDatabase"
+                            | "create"
+                            | "findAndModify"
+                            | "createIndexes"
+                            | "dropIndexes"
                     ) =>
                 {
                     valid_write_concern(value)
@@ -379,6 +390,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                             | "listCollections"
                             | "listIndexes"
                             | "createIndexes"
+                            | "dropIndexes"
                             | "listDatabases"
                             | "delete"
                             | "update"
@@ -494,6 +506,8 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             Command::ListDatabaseNames(DocumentListDatabaseNamesRequest::new(DocumentFilter::new(
                 filter,
             )?))
+        } else if name == "dropIndexes" {
+            Command::DropIndexes(indexes::prepare_drop(request, namespace)?)
         } else if name == "createIndexes" {
             Command::CreateIndexes(indexes::prepare(request, namespace, started, timeout)?)
         } else if name == "listIndexes" {
@@ -1301,6 +1315,27 @@ impl Executor {
             ));
         }
         match command {
+            Command::DropIndexes(request) => {
+                match self
+                    .call(
+                        session,
+                        identity,
+                        &context,
+                        DocumentCommand::DropIndexes(request),
+                    )
+                    .await?
+                {
+                    DocumentResult::IndexesDropped { before, .. } => Ok(fields([
+                        ("ok", BsonValue::Double(1.0)),
+                        ("nIndexesWas", BsonValue::Int64(before as i64)),
+                    ])),
+                    _ => Err(CommandError::new(
+                        1,
+                        "InternalError",
+                        "unexpected engine result",
+                    )),
+                }
+            }
             Command::CreateIndexes(request) => {
                 self.ensure_collection(session, identity, &context, request.namespace())
                     .await?;

@@ -3,6 +3,39 @@
 use super::*;
 use crate::document::{DocumentIndexError, DocumentIndexRequest, normalize_index_batch};
 
+pub(super) fn prepare_drop(
+    request: &Request,
+    namespace: DocumentNamespace,
+) -> Result<DocumentDropIndexesRequest> {
+    if !request.sequences.is_empty() {
+        return Err(CommandError::options());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    if request.body.iter().any(|(name, _)| !seen.insert(name)) {
+        return Err(CommandError::invalid());
+    }
+    let index = request
+        .body
+        .get_first("index")
+        .ok_or_else(CommandError::invalid)?;
+    let BsonValue::String(name) = index else {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "index selection must be a string",
+        ));
+    };
+    if name == "*" {
+        Ok(DocumentDropIndexesRequest::all(
+            namespace,
+            DocumentWriteOptions::new(),
+        ))
+    } else {
+        DocumentDropIndexesRequest::new(namespace, name, DocumentWriteOptions::new())
+            .map_err(Into::into)
+    }
+}
+
 pub(super) fn prepare(
     request: &Request,
     namespace: DocumentNamespace,

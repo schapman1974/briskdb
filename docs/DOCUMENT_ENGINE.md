@@ -68,6 +68,7 @@ The current engine executes:
 | `CreateBuiltIndex` | Creates and builds one non-unique index on an existing collection; returns `IndexBuilt { name, before, after }` with Ready counts under the same exclusive admission |
 | `CreateIndexes` | Eagerly validates up to 1,000 definitions, then creates them in order under one exclusive admission; logical-definition conflicts, built-in ID no-ops, and `IndexesBuilt { before, after }` counts |
 | `DropIndex` | Removes an exact pending declaration or recoverably removes a built non-unique index and its derived entries; never removes BSON records |
+| `DropIndexes` | Removes an exact name, an unambiguous single-field alias, or every secondary definition under one exclusive admission; returns Ready `before` / `after` counts and protects the built-in ID index |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `ListIndexMetadata` | Pages BSON metadata for built indexes only, built-in first then by name; shares cursor controls and excludes pending declarations |
 | `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
@@ -135,8 +136,8 @@ membership validator or authority: consumers must compile it before execution.
 New secondary declarations start `PendingBuild`, including `unique` ones:
 they are not query authorities or uniqueness constraints. Declarations do not
 scan or validate existing records. Explicit non-unique builds and transactional
-maintenance and wire creation/discovery are implemented separately below; wire
-removal and planner use remain future work. Required CI compares 64 valid ascending integer-key definitions
+maintenance and wire creation/discovery/removal are implemented separately below;
+planner use remains future work. Required CI compares 64 valid ascending integer-key definitions
 against unchanged TinyMongo index source, including names, key order, flags and
 restart metadata. Descending/numeric-alias normalization, invalid inputs,
 resource limits and legacy metadata preservation are independently tested; no
@@ -162,7 +163,20 @@ admission fenced until reopening completes the drop; it is not a rollback promis
 Process-exit tests cover both sides of intent, shard, cursor and completion commits.
 Other Ready indexes and exact BSON remain unchanged. A schema-guarded, bounded
 Ready-name cache selects this path without adding I/O to pending drops, preserving
-their concurrent behavior. Mongo wire `dropIndexes` remains future work.
+their concurrent behavior.
+
+`DropIndexes(DocumentDropIndexesRequest)` is the separate exclusive selection
+path used by Mongo `dropIndexes`. An exact name takes priority over field aliases;
+without an exact name, only one recognized single-field match is accepted.
+Ambiguous aliases fail before any removal (use an exact name); selectors are
+bounded to 255 UTF-8 bytes. `DocumentDropIndexesRequest::all` selects every
+secondary definition, including non-enforcing Pending declarations, never `_id_`.
+The complete selection and Ready counts are resolved under one schema/process
+guard, and fixed-size result limits precede mutation. Completed removals survive
+an error; an admitted unfinished drop completes on reopen, while later unstarted
+indexes remain. This is not batch rollback or a durable all-index transaction.
+The permanent allocator and document rows are unchanged. Named `*` remains a
+literal in the native constructor; only the wire adapter translates `*` to `all`.
 
 `DocumentIndexKeyGenerator` is the shared, immutable secondary-key foundation,
 not a physical index. It validates key definitions and compiles optional partial
@@ -223,8 +237,8 @@ Pending declarations participate in conflict checks and matching ones are built.
 The ascending built-in ID request is a no-op with actual Ready counts; descending
 ID creation is unsupported. The older singleton declaration/build APIs retain
 their existing permissive naming behavior.
-Cross-shard uniqueness, safe planner candidates and
-wire index removal remain open under #174. Ready-index discovery is
+Cross-shard uniqueness, safe planner candidates and broader selector compatibility
+remain open under #174. Ready-index discovery is
 implemented through `ListIndexMetadata` and Mongo `listIndexes`.
 
 It generates ordered compound tuples with at most one final array field, removes

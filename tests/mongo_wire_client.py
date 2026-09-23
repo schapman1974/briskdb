@@ -1651,6 +1651,65 @@ def lifecycle_smoke(uri):
         assert client.wire_lifecycle_keep.one.count_documents({}) == 1
 
 
+def index_removal_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        database = client.wire_index_drop
+        collection = database.items
+        collection.insert_many([{"_id": n, "value": n, "tail": n} for n in range(8)])
+        collection.create_index("value", name="value_lookup")
+        collection.create_index("tail", name="tail_lookup", sparse=True)
+        database.keep.create_index("value")
+        for name in ("_id", "_id_"):
+            try:
+                collection.drop_index(name)
+            except OperationFailure as error:
+                assert error.code == 72
+            else:
+                raise AssertionError("built-in ID index was dropped")
+        for selector, code in [("missing", 27), (1, 14), (["value_lookup"], 14), ({"value": 1}, 14)]:
+            try:
+                database.command("dropIndexes", "items", index=selector)
+            except OperationFailure as error:
+                assert error.code == code
+            else:
+                raise AssertionError("invalid index removal was accepted")
+        result = database.command("dropIndexes", "items", index="value_lookup")
+        assert result["nIndexesWas"] == 3
+        # Source-compatible unambiguous legacy field alias.
+        assert collection.drop_index("tail") is None
+        assert set(collection.index_information()) == {"_id_"}
+        assert set(database.keep.index_information()) == {"_id_", "value_1"}
+        collection.create_indexes([pymongo.IndexModel("value"), pymongo.IndexModel("tail")])
+        cursor = database.command("listIndexes", "items", cursor={"batchSize": 1})["cursor"]
+        assert cursor["id"]
+        result = database.command("dropIndexes", "items", index="*")
+        assert result["nIndexesWas"] == 3
+        more = database.command("getMore", cursor["id"], collection="items")["cursor"]
+        assert more["id"] == 0 and more["nextBatch"] == []
+        assert collection.drop_indexes() is None
+        assert collection.count_documents({}) == 8
+        collection.insert_one({"_id": 8, "value": 8, "tail": 8})
+        assert set(collection.index_information()) == {"_id_"}
+        try:
+            database.command("dropIndexes", "absent", index="*")
+        except OperationFailure as error:
+            assert error.code == 26
+        else:
+            raise AssertionError("missing namespace removal succeeded")
+        assert "absent" not in database.list_collection_names()
+
+
+async def async_index_removal_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.wire_index_drop.async_items
+        await collection.create_indexes([pymongo.IndexModel("value"), pymongo.IndexModel("tail")])
+        await collection.insert_one({"_id": 1, "value": 2, "tail": 3})
+        assert await collection.drop_index("value_1") is None
+        assert await collection.drop_indexes() is None
+        assert set(await collection.index_information()) == {"_id_"}
+        assert await collection.count_documents({}) == 1
+
+
 def index_creation_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         database = client.wire_index_create
@@ -1770,6 +1829,11 @@ async def async_index_metadata_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert set(client.wire_index_drop.items.index_information()) == {"_id_"}
+        assert client.wire_index_drop.items.count_documents({}) == 9
+        assert set(client.wire_index_drop.keep.index_information()) == {"_id_", "value_1"}
+        assert set(client.wire_index_drop.async_items.index_information()) == {"_id_"}
+        assert client.wire_index_drop.async_items.count_documents({}) == 1
         assert set(client.wire_index_create.items.index_information()) == {"_id_", "value_1", "compound", "partial", "active"}
         assert client.wire_index_create.items.count_documents({}) == 12
         assert client.wire_index_create.items.find_one({"_id": 1})["value"] == 100
@@ -2208,6 +2272,8 @@ if __name__ == "__main__":
     else:
         index_creation_smoke(sys.argv[1])
         asyncio.run(async_index_creation_smoke(sys.argv[1]))
+        index_removal_smoke(sys.argv[1])
+        asyncio.run(async_index_removal_smoke(sys.argv[1]))
         sync_smoke(sys.argv[1])
         document_smoke(sys.argv[1])
         batch_smoke(sys.argv[1])
