@@ -126,7 +126,28 @@ and position state. An opening allocation ceiling excludes later creations;
 deleted rows can disappear, and a dropped/recreated database invalidates the
 cursor. There is no cross-batch snapshot promise. Collection UUIDv8 identity
 survives reopen and backup, changes on drop/recreate, and differs for independent
-roots. Index metadata cursors remain open.
+roots.
+
+`listIndexes` and sync/async PyMongo `list_indexes()` / `index_information()`
+expose the built-in `_id_` followed by Ready secondary indexes in name order.
+Rows contain ordered `key` and `name`, plus applicable `sparse` and
+`partialFilterExpression` options. Pending native declarations are omitted:
+they are not built indexes, including declarations marked unique. No internal
+identity, lifecycle, or fictitious Mongo index version is exposed. Raw missing
+collections return code 26; PyMongo returns empty discovery without creating them.
+The `cursor` option accepts `batchSize` 0–1000; `maxTimeMS`, byte caps, cursor
+ownership, pooled-socket continuation and cleanup use the shared engine path.
+`includeBuildUUIDs` / `includeIndexBuildInfo` and other unsupported options are
+rejected rather than fabricated. The cursor namespace is `database.collection`,
+as defined by the [Mongo command](https://www.mongodb.com/docs/manual/reference/command/listIndexes/).
+
+Index cursors retain only a collection identity, opening index-ID ceiling and
+bounded name position, never definitions or SQLite handles. New/recreated index
+identities are excluded, drops may disappear, and collection drop/recreation
+invalidates continuation. Pages are not a snapshot: an existing pending declaration
+built between pages may become visible if its name is still ahead of the cursor.
+Native Rust `ListIndexMetadata` and Python `list_index_metadata` share this path;
+the older native `ListIndexes` / `list_indexes` still include pending metadata.
 
 The shared Rust index catalog now assigns stable, root-wide IDs to built-in and
 pending secondary indexes. The version-17 manifest upgrade preserves existing
@@ -145,7 +166,7 @@ activation by itself. Version 19 adds explicit native Rust/Python non-unique
 builds with journaled shard progress, atomic Ready publication, transactional
 entry maintenance and restart coverage/checksum validation. Unpublished builds
 are discarded on reopen without changing BSON or declaration IDs. Global
-uniqueness, planner use and Mongo wire index commands remain
+uniqueness, planner use and Mongo wire index creation/removal remain
 open under #174; these native additions do not expand the wire contract. Native
 Rust and sync/async Python can also drop built indexes through the existing exact
 name API. A journaled, sole-process cleanup removes derived entries and metadata,
@@ -177,7 +198,7 @@ before storage admission. The current option contract is:
 
 | Option | Accepted behavior |
 | --- | --- |
-| `maxTimeMS` | Nonnegative integer; a positive value narrows the 15-second command deadline. Find, aggregate, and collection metadata retain the remaining execution budget across batches; client idle time is not charged. Positive getMore values require unsupported tailable/awaitData semantics and are rejected. |
+| `maxTimeMS` | Nonnegative integer; a positive value narrows the 15-second command deadline. Find, aggregate, and collection/index metadata retain the remaining execution budget across batches; client idle time is not charged. Positive getMore values require unsupported tailable/awaitData semantics and are rejected. |
 | `$readPreference` | A document containing only a recognized `mode`; the standalone engine serves the request |
 | `ordered` | Boolean; defaults to `true`, with ordered/unordered partial-failure behavior |
 | Insert `writeConcern` | Omitted/empty, or `w` equal to 0 or 1, `j: false`, and `wtimeout: 0`; no replication or stronger durability is promised |
@@ -438,7 +459,7 @@ push/pull subsets cover non-ID object/array paths and embedded-ID queries. These
 legacy reference helpers restore IDs (and add-to-set overwrites scalar parents) instead of
 enforcing BriskDB's stricter safety rules. These boundaries have independent
 tests, not frozen allowances or rewritten expected results. Independent
-tests check resource and commit limits. Additional update operators and index metadata cursors remain
+tests check resource and commit limits. Additional update operators remain
 unimplemented.
 
 The native index-definition foundation now validates ordered keys, normalizes
@@ -447,7 +468,10 @@ Required CI compares 64 valid ascending integer-key definitions with the unchang
 frozen index model, including pending metadata after restart. Descending/numeric
 aliases and invalid/resource-limited definitions have independent tests. This is
 not itself physical index support: secondary declarations still enforce no uniqueness,
-and wire index commands and metadata cursors remain unimplemented. The full frozen
+and wire index creation/removal remain unimplemented. Required CI also compares
+six build/drop/recreation discovery states and the reopened result with the
+source-locked TinyMongo client, including built-in/name order and exact options.
+Only ordered key pairs are represented as BSON documents for transport. The full frozen
 index suites remain open; no frozen expected result or allowance is changed.
 
 The shared index-key foundation now checks 7,201 additional source-locked cases
@@ -466,7 +490,7 @@ partial options after shared eager validation. The complete retained envelope is
 bounded; exact filter BSON, IDs and membership options survive restart. Existing
 flat declarations remain byte-compatible, and unknown legacy envelopes remain
 opaque/readable. These options are metadata-only until physical activation;
-native validation does not scan records and wire index commands remain open.
+native validation does not scan records and wire index creation/removal remain open.
 
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required

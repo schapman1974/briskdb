@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 mod aggregation;
 mod deletion;
 mod distinct;
+mod index_metadata;
 mod metadata;
 mod single_mutation;
 mod sorting;
@@ -26,7 +27,7 @@ use write_transaction::write_transaction;
 
 use super::document_cursor::{
     AggregateCursor, AggregateRow, CursorSource as PreparedFilterRoute, CursorState,
-    MetadataCursorState, RetainedCursorState,
+    IndexMetadataCursorState, MetadataCursorState, RetainedCursorState,
 };
 use super::{Engine, Operation, flatten_join, pending_cancellation_reason, retire_if_broken};
 use crate::{
@@ -298,6 +299,18 @@ impl Engine {
             }
             DocumentCommand::ListCollectionMetadata(request) => {
                 self.start_collection_metadata_cursor(
+                    owner,
+                    session,
+                    request_id,
+                    request,
+                    cancellation,
+                    deadline,
+                    result_limits,
+                )
+                .await
+            }
+            DocumentCommand::ListIndexMetadata(request) => {
+                self.start_index_metadata_cursor(
                     owner,
                     session,
                     request_id,
@@ -744,6 +757,32 @@ impl Engine {
                         let cursor_id = lease.complete(
                             has_more.then_some(RetainedCursorState::Collections(state)),
                         )?;
+                        Ok(DocumentExecution::new(
+                            request_id,
+                            None,
+                            DocumentResult::Cursor(
+                                crate::document::DocumentCursorBatch::from_validated(
+                                    namespace, cursor_id, documents,
+                                ),
+                            ),
+                        ))
+                    }
+                    RetainedCursorState::Indexes(mut state) => {
+                        if let Some(bytes) = options.batch_byte_limit() {
+                            state.batch_byte_limit =
+                                Some(state.batch_byte_limit.unwrap_or(u64::MAX).min(bytes));
+                        }
+                        let (documents, has_more) = self
+                            .read_index_metadata_page(
+                                &mut state,
+                                cancellation,
+                                deadline,
+                                options.batch_size(),
+                                result_limits,
+                            )
+                            .await?;
+                        let cursor_id = lease
+                            .complete(has_more.then_some(RetainedCursorState::Indexes(state)))?;
                         Ok(DocumentExecution::new(
                             request_id,
                             None,

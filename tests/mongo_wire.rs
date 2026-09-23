@@ -450,6 +450,7 @@ async fn finite_connection_cap_rejects_overflow() {
 #[ignore = "requires pinned PyMongo; CI runs this explicitly with BRISKDB_MONGO_WIRE_PYTHON"]
 async fn real_pymongo_sync_async_discovery() {
     let (root, database, mut server) = setup().await;
+    seed_index_metadata(&database).await;
     let output = run_driver(server.address(), "initial").await;
     server.close().await.unwrap();
     database.close().await.unwrap();
@@ -467,6 +468,161 @@ async fn real_pymongo_sync_async_discovery() {
     server.close().await.unwrap();
     database.close().await.unwrap();
     assert_driver(output);
+}
+
+async fn seed_index_metadata(database: &BriskDb) {
+    use briskdb::document::{
+        DocumentBuildIndexRequest, DocumentCollectionOptions, DocumentCommand,
+        DocumentCreateCollectionRequest, DocumentCreateIndexRequest, DocumentFilter,
+        DocumentIndexRequest, DocumentNamespace, DocumentWriteOptions,
+    };
+    let namespace = DocumentNamespace::new("wire_indexes", "items").unwrap();
+    let session = database.session();
+    database
+        .execute_document(
+            &session,
+            engine_request(DocumentCommand::CreateCollection(
+                DocumentCreateCollectionRequest::new(
+                    namespace.clone(),
+                    DocumentCollectionOptions::empty(),
+                    DocumentWriteOptions::new(),
+                ),
+            )),
+        )
+        .await
+        .unwrap();
+    for (name, sparse, partial, unique, build) in [
+        ("z", false, false, false, true),
+        ("!before_id", true, false, false, true),
+        ("partial", false, true, false, true),
+        ("pending", false, false, false, false),
+        ("pending_unique", false, false, true, false),
+    ] {
+        let mut definition = DocumentIndexRequest::new(
+            BsonDocument::from_entries([
+                ("value", BsonValue::Int32(1)),
+                ("tail", BsonValue::Int32(-1)),
+            ])
+            .unwrap(),
+        )
+        .unwrap()
+        .with_name(name)
+        .unwrap()
+        .with_sparse(sparse)
+        .with_unique(unique);
+        if partial {
+            definition = definition.with_partial_filter(
+                DocumentFilter::new(
+                    BsonDocument::from_entries([("active", BsonValue::Boolean(true))]).unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        database
+            .execute_document(
+                &session,
+                engine_request(DocumentCommand::CreateIndex(
+                    DocumentCreateIndexRequest::new(
+                        namespace.clone(),
+                        definition,
+                        DocumentWriteOptions::new(),
+                    ),
+                )),
+            )
+            .await
+            .unwrap();
+        if build {
+            database
+                .execute_document(
+                    &session,
+                    engine_request(DocumentCommand::BuildIndex(
+                        DocumentBuildIndexRequest::new(
+                            namespace.clone(),
+                            name,
+                            DocumentWriteOptions::new(),
+                        )
+                        .unwrap(),
+                    )),
+                )
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn wire_index_metadata_lists_only_ready_definitions_and_validates_options() {
+    let (_root, database, mut server) = setup().await;
+    seed_index_metadata(&database).await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let listing = BsonDocument::from_entries([
+        ("listIndexes", BsonValue::from("items")),
+        ("$db", BsonValue::from("wire_indexes")),
+    ])
+    .unwrap();
+    let reply = send_command(&mut stream, &listing).await;
+    let names = first_batch(&reply)
+        .iter()
+        .map(|value| {
+            let BsonValue::Document(row) = value else {
+                panic!("metadata")
+            };
+            assert!(row.get_first("v").is_none() && row.get_first("unique").is_none());
+            row.get_first("name").unwrap().clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        ["_id_", "!before_id", "partial", "z"].map(BsonValue::from)
+    );
+    for (field, value, code) in [
+        ("cursor", BsonValue::Boolean(true), 14),
+        (
+            "cursor",
+            BsonValue::Document(
+                BsonDocument::from_entries([("batchSize", BsonValue::Int32(-1))]).unwrap(),
+            ),
+            2,
+        ),
+        (
+            "cursor",
+            BsonValue::Document(
+                BsonDocument::from_entries([("batchSize", BsonValue::Int32(1001))]).unwrap(),
+            ),
+            115,
+        ),
+        (
+            "cursor",
+            BsonValue::Document(
+                BsonDocument::from_entries([("unknown", BsonValue::Int32(1))]).unwrap(),
+            ),
+            72,
+        ),
+        ("includeBuildUUIDs", BsonValue::Boolean(true), 72),
+        ("includeIndexBuildInfo", BsonValue::Boolean(true), 72),
+        ("filter", BsonValue::Document(BsonDocument::new()), 72),
+        ("writeConcern", BsonValue::Document(BsonDocument::new()), 72),
+    ] {
+        let mut invalid = listing.clone();
+        invalid.push(field, value).unwrap();
+        let reply = send_command(&mut stream, &invalid).await;
+        assert_eq!(
+            reply.get_first("code"),
+            Some(&BsonValue::Int32(code)),
+            "{reply:?}"
+        );
+    }
+    let absent = BsonDocument::from_entries([
+        ("listIndexes", BsonValue::from("missing")),
+        ("$db", BsonValue::from("wire_indexes")),
+    ])
+    .unwrap();
+    assert_eq!(
+        send_command(&mut stream, &absent).await.get_first("code"),
+        Some(&BsonValue::Int32(26))
+    );
+    server.close().await.unwrap();
+    database.close().await.unwrap();
 }
 
 async fn run_driver(address: std::net::SocketAddr, phase: &'static str) -> std::process::Output {

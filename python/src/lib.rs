@@ -20,10 +20,11 @@ use briskdb::document::{
     DocumentFilter, DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
     DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentIndexRequest,
     DocumentInsertRequest, DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
-    DocumentListCollectionsRequest, DocumentListDatabaseNamesRequest, DocumentListIndexesRequest,
-    DocumentMutationScope, DocumentNamespace, DocumentPipeline, DocumentProjection,
-    DocumentReadOptions, DocumentReplaceRequest, DocumentRequest, DocumentRequestId, DocumentSort,
-    DocumentUpdate, DocumentUpdateRequest, DocumentWriteOptions,
+    DocumentListCollectionsRequest, DocumentListDatabaseNamesRequest,
+    DocumentListIndexMetadataRequest, DocumentListIndexesRequest, DocumentMutationScope,
+    DocumentNamespace, DocumentPipeline, DocumentProjection, DocumentReadOptions,
+    DocumentReplaceRequest, DocumentRequest, DocumentRequestId, DocumentSort, DocumentUpdate,
+    DocumentUpdateRequest, DocumentWriteOptions,
 };
 use briskdb::{
     BriskCursor, BriskDb, BriskSession, BriskTransaction,
@@ -1513,6 +1514,40 @@ impl Session {
         self.execute_document_command(
             py,
             DocumentCommand::ListCollectionMetadata(request),
+            request_id,
+            timeout_ms,
+            cancellation.as_deref(),
+            max_result_rows,
+            max_result_bytes,
+        )
+    }
+
+    #[pyo3(signature = (database, collection, *, batch_size = 101, batch_byte_limit = None, request_id = None, timeout_ms = None, cancellation = None, max_result_rows = None, max_result_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn list_index_metadata(
+        &self,
+        py: Python<'_>,
+        database: String,
+        collection: String,
+        batch_size: u64,
+        batch_byte_limit: Option<u64>,
+        request_id: Option<Py<PyAny>>,
+        timeout_ms: Option<u64>,
+        cancellation: Option<PyRef<'_, CancellationToken>>,
+        max_result_rows: Option<u64>,
+        max_result_bytes: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.require_document_support()?;
+        let namespace = python_engine_result(DocumentNamespace::new(database, collection))?;
+        let mut options = document_read_options(0, None, batch_size)?;
+        if let Some(bytes) = batch_byte_limit {
+            options = python_engine_result(options.with_batch_byte_limit(bytes))?;
+        }
+        self.execute_document_command(
+            py,
+            DocumentCommand::ListIndexMetadata(DocumentListIndexMetadataRequest::new(
+                namespace, options,
+            )),
             request_id,
             timeout_ms,
             cancellation.as_deref(),

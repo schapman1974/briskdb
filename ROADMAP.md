@@ -518,7 +518,7 @@ requires an earlier dependency:
       engine-owned cursors. Tests cover BSON fidelity, numeric-equivalent IDs,
       cross-interface access, restart, host enablement, one-way writes, and
       response limits. Missing collections read empty without creating metadata.
-      Additional update operators, index metadata cursors,
+      Additional update operators,
       and broader database options remain open.
     - [x] [#173](https://github.com/schapman1974/briskdb/issues/173) — ordered and
       unordered insert batches use canonical-ID routing and contiguous
@@ -678,13 +678,20 @@ requires an earlier dependency:
       Process-exit tests cover build/abort commit boundaries. Interrupted builds
       reopen as pending with only their derived entries removed. Opaque/unique
       pending declarations stay non-enforcing; reads still scan. Global uniqueness,
-      planner use, wire commands and metadata cursors remain open.
+      planner use and wire index creation/removal remain open.
       Exact native `DropIndex`/sync/async `drop_index` now removes built indexes
       with version-19 Drop intent, sealed per-shard cleanup and restart completion.
       BSON, surviving Ready entries and permanent allocation history are preserved;
       the compiled/name cache is published under exclusive schema admission.
       Pending drops keep their concurrent metadata-only path. Commit-boundary
       crashes and cancellation after intent verify recovery without rollback claims.
+      Ready-index metadata now pages through native Rust/sync/async Python and
+      Mongo `listIndexes` / PyMongo `list_indexes` / `index_information`.
+      Built-in-first/name ordering and exact sparse/partial options match the
+      source-locked client; pending declarations remain visible only through the
+      existing native catalog API. Cursors retain bounded identity/name state,
+      exclude newly allocated IDs, invalidate on collection recreation and share
+      byte/row/time/ownership limits. Reopen and real-driver tests cover both APIs.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
@@ -704,7 +711,8 @@ requires an earlier dependency:
       restart, ownership, byte limits, and exhaustion. Aggregate cursors now
       share the same ownership/cleanup/quotas, retaining streaming stage counters
       or bounded blocking-stage results. Collection metadata now shares these
-      limits with filtered, byte-bounded pages; index metadata cursors remain open;
+      limits with filtered, byte-bounded pages; Ready-index metadata shares the
+      registry with bounded name/identity positions;
       no cross-shard or cross-batch snapshot is promised.
     - [ ] [#172](https://github.com/schapman1974/briskdb/issues/172) — basic find
       projection now shares one Rust transform across embedded and wire APIs.

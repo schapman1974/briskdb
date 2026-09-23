@@ -22,6 +22,180 @@ fn request(command: DocumentCommand) -> DocumentRequest {
 
 #[tokio::test]
 #[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
+async fn built_index_metadata_matches_locked_client_after_build_drop_and_reopen() {
+    use briskdb::document::{
+        DocumentBuildIndexRequest, DocumentContinueCursorRequest, DocumentDropIndexRequest,
+        DocumentFilter, DocumentListIndexMetadataRequest,
+    };
+    let python = std::env::var("BRISKDB_MONGO_ORACLE_PYTHON").unwrap_or_else(|_| "python3".into());
+    let output = Command::new(python)
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/document_index_metadata_oracle.py"
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.len() < 64 * 1024);
+    let root = tempfile::tempdir().unwrap();
+    let namespace = DocumentNamespace::new("oracle", "indexes").unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    engine
+        .execute_document(
+            &session,
+            request(DocumentCommand::CreateCollection(
+                DocumentCreateCollectionRequest::new(
+                    namespace.clone(),
+                    DocumentCollectionOptions::empty(),
+                    DocumentWriteOptions::new(),
+                ),
+            )),
+        )
+        .await
+        .unwrap();
+    let mut bytes = output.stdout.as_slice();
+    let mut expected = Vec::new();
+    let mut cases = 0;
+    while !bytes.is_empty() {
+        let length = i32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let event = decode_document(&bytes[..length]).unwrap();
+        bytes = &bytes[length..];
+        let Some(BsonValue::String(name)) = event.get_first("name") else {
+            panic!("name")
+        };
+        if event.get_first("action") == Some(&BsonValue::from("drop")) {
+            engine
+                .execute_document(
+                    &session,
+                    request(DocumentCommand::DropIndex(
+                        DocumentDropIndexRequest::new(
+                            namespace.clone(),
+                            name,
+                            DocumentWriteOptions::new(),
+                        )
+                        .unwrap(),
+                    )),
+                )
+                .await
+                .unwrap();
+        } else {
+            let Some(BsonValue::Document(keys)) = event.get_first("keys") else {
+                panic!("keys")
+            };
+            let mut definition = DocumentIndexRequest::new(keys.clone())
+                .unwrap()
+                .with_name(name)
+                .unwrap()
+                .with_sparse(event.get_first("sparse") == Some(&BsonValue::Boolean(true)));
+            if let Some(BsonValue::Document(partial)) = event.get_first("partial") {
+                definition =
+                    definition.with_partial_filter(DocumentFilter::new(partial.clone()).unwrap());
+            }
+            engine
+                .execute_document(
+                    &session,
+                    request(DocumentCommand::CreateIndex(
+                        DocumentCreateIndexRequest::new(
+                            namespace.clone(),
+                            definition,
+                            DocumentWriteOptions::new(),
+                        ),
+                    )),
+                )
+                .await
+                .unwrap();
+            engine
+                .execute_document(
+                    &session,
+                    request(DocumentCommand::BuildIndex(
+                        DocumentBuildIndexRequest::new(
+                            namespace.clone(),
+                            name,
+                            DocumentWriteOptions::new(),
+                        )
+                        .unwrap(),
+                    )),
+                )
+                .await
+                .unwrap();
+        }
+        let Some(BsonValue::Array(rows)) = event.get_first("expected") else {
+            panic!("expected")
+        };
+        expected = rows
+            .iter()
+            .map(|row| {
+                let BsonValue::Document(row) = row else {
+                    panic!("metadata")
+                };
+                encode_document(row).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut command =
+            DocumentCommand::ListIndexMetadata(DocumentListIndexMetadataRequest::new(
+                namespace.clone(),
+                DocumentReadOptions::new().with_batch_size(1).unwrap(),
+            ));
+        let mut actual = Vec::new();
+        loop {
+            let execution = engine
+                .execute_document(&session, request(command))
+                .await
+                .unwrap();
+            let DocumentResult::Cursor(batch) = execution.into_parts().2 else {
+                panic!("cursor")
+            };
+            actual.extend(
+                batch
+                    .documents()
+                    .iter()
+                    .map(|row| encode_document(row).unwrap()),
+            );
+            let Some(id) = batch.cursor_id() else { break };
+            command = DocumentCommand::ContinueCursor(DocumentContinueCursorRequest::new(
+                namespace.clone(),
+                id,
+                DocumentReadOptions::new().with_batch_size(1).unwrap(),
+            ));
+        }
+        assert_eq!(actual, expected);
+        cases += 1;
+    }
+    assert_eq!(cases, 6);
+    engine.shutdown().await.unwrap();
+    drop(session);
+    drop(engine);
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let execution = engine
+        .execute_document(
+            &engine.session(),
+            request(DocumentCommand::ListIndexMetadata(
+                DocumentListIndexMetadataRequest::new(namespace, DocumentReadOptions::new()),
+            )),
+        )
+        .await
+        .unwrap();
+    let DocumentResult::Cursor(batch) = execution.result() else {
+        panic!("cursor")
+    };
+    assert_eq!(
+        batch
+            .documents()
+            .iter()
+            .map(|row| encode_document(row).unwrap())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
 async fn index_definitions_match_locked_names_and_keys_without_claiming_physical_indexes() {
     let python = std::env::var("BRISKDB_MONGO_ORACLE_PYTHON").unwrap_or_else(|_| "python3".into());
     let output = Command::new(python)

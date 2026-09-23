@@ -1651,6 +1651,49 @@ def lifecycle_smoke(uri):
         assert client.wire_lifecycle_keep.one.count_documents({}) == 1
 
 
+def index_metadata_smoke(uri):
+    expected = [
+        {"name": "_id_", "key": {"_id": 1}},
+        {"name": "!before_id", "key": {"value": 1, "tail": -1}, "sparse": True},
+        {"name": "partial", "key": {"value": 1, "tail": -1}, "partialFilterExpression": {"active": True}},
+        {"name": "z", "key": {"value": 1, "tail": -1}},
+    ]
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        database = client.wire_indexes
+        assert list(database.items.list_indexes()) == expected
+        information = database.items.index_information()
+        assert information == {row["name"]: {**{key: value for key, value in row.items() if key not in ("name", "key")}, "key": list(row["key"].items())} for row in expected}
+        before = database.list_collection_names()
+        assert list(database.missing.list_indexes()) == []
+        assert database.missing.index_information() == {}
+        assert database.list_collection_names() == before
+        cursor = database.command("listIndexes", "items", cursor={"batchSize": 0}, maxTimeMS=10000)["cursor"]
+        assert cursor["id"] and cursor["ns"] == "wire_indexes.items" and cursor["firstBatch"] == []
+        rows = []
+        with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as peer:
+            while cursor["id"]:
+                cursor = peer.wire_indexes.command("getMore", cursor["id"], collection="items", batchSize=1)["cursor"]
+                rows.extend(cursor["nextBatch"])
+        assert rows == expected
+        cursor = database.command("listIndexes", "items", cursor={"batchSize": 1})["cursor"]
+        assert cursor["firstBatch"] == expected[:1]
+        assert database.command("killCursors", "items", cursors=[cursor["id"]])["cursorsKilled"] == [cursor["id"]]
+        try:
+            database.command("getMore", cursor["id"], collection="items")
+        except OperationFailure as error:
+            assert error.code == 43
+        else:
+            raise AssertionError("killed index metadata cursor remained usable")
+
+
+async def async_index_metadata_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        rows = [row async for row in await client.wire_indexes.items.list_indexes()]
+        assert [row["name"] for row in rows] == ["_id_", "!before_id", "partial", "z"]
+        assert (await client.wire_indexes.items.index_information())["partial"] == {"key": [("value", 1), ("tail", -1)], "partialFilterExpression": {"active": True}}
+        assert [row async for row in await client.wire_indexes.missing.list_indexes()] == []
+
+
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         assert client.wire_operator_upsert.items.count_documents({}) == 4
@@ -2079,6 +2122,8 @@ async def async_smoke(uri):
 
 if __name__ == "__main__":
     assert pymongo.version == "4.17.0", "use the pinned real-driver version"
+    index_metadata_smoke(sys.argv[1])
+    asyncio.run(async_index_metadata_smoke(sys.argv[1]))
     if len(sys.argv) > 2 and sys.argv[2] == "reopened":
         persisted_smoke(sys.argv[1])
     else:

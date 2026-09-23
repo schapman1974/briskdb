@@ -515,6 +515,14 @@ namespace_options_request!(
     read_options,
     read_options
 );
+namespace_options_request!(
+    /// Page BSON metadata for built indexes only, in built-in/name order.
+    /// Unlike `DocumentListIndexesRequest`, pending declarations are excluded.
+    DocumentListIndexMetadataRequest,
+    DocumentReadOptions,
+    read_options,
+    read_options
+);
 
 macro_rules! filter_read_request {
     ($(#[$meta:meta])* $name:ident) => {
@@ -1409,6 +1417,7 @@ pub enum DocumentCommandKind {
     BuildIndex,
     DropIndex,
     ListIndexes,
+    ListIndexMetadata,
     ContinueCursor,
     KillCursor,
 }
@@ -1439,6 +1448,7 @@ pub enum DocumentCommand {
     BuildIndex(DocumentBuildIndexRequest),
     DropIndex(DocumentDropIndexRequest),
     ListIndexes(DocumentListIndexesRequest),
+    ListIndexMetadata(DocumentListIndexMetadataRequest),
     ContinueCursor(DocumentContinueCursorRequest),
     KillCursor(DocumentKillCursorRequest),
 }
@@ -1468,6 +1478,7 @@ impl DocumentCommand {
             Self::BuildIndex(_) => DocumentCommandKind::BuildIndex,
             Self::DropIndex(_) => DocumentCommandKind::DropIndex,
             Self::ListIndexes(_) => DocumentCommandKind::ListIndexes,
+            Self::ListIndexMetadata(_) => DocumentCommandKind::ListIndexMetadata,
             Self::ContinueCursor(_) => DocumentCommandKind::ContinueCursor,
             Self::KillCursor(_) => DocumentCommandKind::KillCursor,
         }
