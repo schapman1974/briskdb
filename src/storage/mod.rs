@@ -947,7 +947,8 @@ impl Storage {
         )?;
         let document_provisioning = manifest
             .query_row(
-                "SELECT EXISTS (SELECT 1 FROM briskdb_document_provisioning)",
+                "SELECT EXISTS (SELECT 1 FROM briskdb_document_provisioning)
+                 OR EXISTS (SELECT 1 FROM briskdb_document_index_storage WHERE lifecycle_state = 2)",
                 [],
                 |row| row.get::<_, bool>(0),
             )
@@ -2749,6 +2750,8 @@ impl Storage {
                        AND tbl_name <> 'briskdb_shard_metadata'
                        AND name <> 'briskdb_documents_v1'
                        AND tbl_name <> 'briskdb_documents_v1'
+                       AND name <> 'briskdb_document_index_entries_v1'
+                       AND tbl_name <> 'briskdb_document_index_entries_v1'
                      ORDER BY name COLLATE BINARY
                      LIMIT 1",
                     [],
@@ -3391,10 +3394,10 @@ fn document_pool_action_is_allowed(action: AuthAction<'_>) -> bool {
     }
     match action {
         AuthAction::Insert { table_name } | AuthAction::Delete { table_name } => {
-            table_name == document::RECORDS_TABLE
+            document::is_storage_table(table_name)
         }
         AuthAction::Update { table_name, .. } | AuthAction::Read { table_name, .. } => {
-            table_name == document::RECORDS_TABLE
+            document::is_storage_table(table_name)
         }
         _ => false,
     }
@@ -3585,6 +3588,7 @@ fn application_table_names(connection: &Connection) -> EngineResult<BTreeSet<Str
                AND name NOT GLOB 'sqlite_*'
                AND name <> 'briskdb_shard_metadata'
                AND name <> 'briskdb_documents_v1'
+               AND name <> 'briskdb_document_index_entries_v1'
              ORDER BY name COLLATE BINARY",
         )
         .map_err(sqlite_error::storage)?;
@@ -4645,6 +4649,7 @@ mod tests {
             manifest
                 .execute_batch(
                     "BEGIN IMMEDIATE;
+                     DROP TABLE briskdb_document_index_storage;
                      DROP TABLE briskdb_document_index_identities;
                      DROP TABLE briskdb_document_index_allocator;
                      DROP TABLE briskdb_document_deletion;
@@ -4759,6 +4764,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_document_index_storage;
                  DROP TABLE briskdb_document_index_identities;
                  DROP TABLE briskdb_document_index_allocator;
                  DROP TABLE briskdb_document_deletion;
@@ -4867,6 +4873,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_document_index_storage;
                  DROP TABLE briskdb_document_index_identities;
                  DROP TABLE briskdb_document_index_allocator;
                  DROP TABLE briskdb_document_deletion;
@@ -8126,6 +8133,40 @@ mod tests {
             assert_eq!(retry.candidate_count(), 0);
             assert_eq!(retry.stale_candidate_count(), 0);
             assert_eq!(retry.repairs_queued(), 0);
+        }
+    }
+
+    #[test]
+    fn document_index_storage_upgrade_requires_sole_process_ownership() {
+        for legacy in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            drop(Storage::open(temp.path(), 2).unwrap());
+            let (peer, release) = spawn_shared_root_peer(temp.path(), "document-index-upgrade");
+            let connection = Connection::open(temp.path().join("manifest.sqlite")).unwrap();
+            if legacy {
+                manifest::downgrade_v18_manifest_to_v17_for_test(&connection, 2).unwrap();
+            } else {
+                connection.execute_batch("UPDATE briskdb_document_index_storage SET lifecycle_state = 2, next_shard = 0").unwrap();
+                manifest::refresh_manifest_digest(&connection).unwrap();
+            }
+            let before: Vec<u8> = connection
+                .query_row("SELECT manifest_digest FROM briskdb_integrity", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                Storage::open(temp.path(), 2).unwrap_err().kind(),
+                EngineErrorKind::Busy
+            );
+            let after: Vec<u8> = connection
+                .query_row("SELECT manifest_digest FROM briskdb_integrity", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(before, after);
+            release_shared_root_peer(peer, &release);
+            drop(Storage::open(temp.path(), 2).unwrap());
+            assert!(!manifest::startup_requires_exclusive_ownership(&connection, 2).unwrap());
         }
     }
 

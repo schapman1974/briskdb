@@ -137,6 +137,13 @@ Native Rust/Python can remove a pending declaration by exact name, with built-in
 ID protection, transactional identity cleanup and non-reuse on recreation. This
 does not add the Mongo wire `dropIndexes` command or wildcard/field-alias removal.
 
+The version-18 upgrade adds empty physical secondary-index storage with a
+checksummed, restartable per-shard layout upgrade and an older-binary fence.
+Namespace creation/deletion owns the reserved tables; existing records, index
+specifications and IDs are preserved. This is storage groundwork, not index
+activation: transactional maintenance, builds, global uniqueness, planner use
+and Mongo wire index commands remain open under #174.
+
 `listDatabases` on `admin` supports `nameOnly: true`, including ordinary
 sync/async PyMongo `list_database_names()` and
 `list_databases(nameOnly=True, filter={"name": ...})`. It returns only

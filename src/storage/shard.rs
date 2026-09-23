@@ -2128,6 +2128,7 @@ fn application_table_names(connection: &Connection) -> EngineResult<BTreeSet<Str
                AND name NOT GLOB 'briskdb_global_index_outbox_*'
                AND name <> 'briskdb_global_index_shard_summaries'
                AND name <> 'briskdb_documents_v1'
+               AND name <> 'briskdb_document_index_entries_v1'
                AND name <> 'briskdb_idempotency_receipts_v1'
              ORDER BY name COLLATE BINARY",
         )
@@ -3698,7 +3699,7 @@ fn is_metadata_table(name: &str) -> bool {
 
 fn is_storage_owned_table(name: &str) -> bool {
     is_metadata_table(name)
-        || name.eq_ignore_ascii_case(super::document::RECORDS_TABLE)
+        || super::document::is_storage_table(name)
         || name.eq_ignore_ascii_case(super::idempotency::RECEIPTS_TABLE)
         || name
             .as_bytes()

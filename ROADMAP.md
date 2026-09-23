@@ -664,7 +664,13 @@ requires an earlier dependency:
       the whole result; input and catalog bytes remain unchanged. Reopen tests
       preserve IDs/options, and pending uniqueness still does not constrain writes.
       This is preflight only, not physical authority or a freshness guarantee.
-      Physical build/recovery, write-time
+      The version-18 storage upgrade now installs exact empty entry tables and
+      by-record indexes under a downgrade fence and checksummed per-shard journal.
+      Crash/reopen coverage preserves record bytes, declarations and permanent IDs;
+      Ready roots reject missing/malformed schemas or unexpected entries. Namespace
+      provisioning/deletion owns these tables; ordinary SQL cannot access them.
+      This prepares physical storage without activating or populating an index.
+      Physical builds/activation, write-time
       maintenance, wire index commands and metadata cursors remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted

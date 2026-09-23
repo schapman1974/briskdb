@@ -36,8 +36,8 @@ It may update `manifest.sqlite`, shard metadata, schema generations, or other
 files in the data directory. Treat startup of a newer binary as a storage
 mutation even when application rows do not change.
 
-The current version-17 migration accepts every exact historical version 1
-through 16. The v14-to-v15 transaction installs the idempotency-receipt
+The current version-18 migration accepts every exact historical version 1
+through 17. The v14-to-v15 transaction installs the idempotency-receipt
 downgrade fence; later eligible keyed writes may lazily create the optional
 shard-local receipt table. The v15-to-v16 transaction adds document identity
 high-water marks initialized from existing IDs, an empty deletion journal,
@@ -50,6 +50,13 @@ The v16-to-v17 transaction adds permanent document-index IDs and an allocation
 high-water mark, preserving existing index specifications byte-for-byte. It
 installs digest version 9 and the version-17 fence without changing shards or
 activating indexes. Version-16 and older binaries refuse an upgraded root.
+The v17-to-v18 transaction adds the document-index storage journal, digest
+version 10 and version-18 fence. Sole-process startup then creates empty physical
+entry tables and by-record indexes on document shards, with checksummed progress
+and crash recovery. BSON records and existing index definitions/IDs are unchanged;
+secondary indexes remain pending and non-enforcing. Empty roots acquire no new
+shard tables until collection creation. Version-17 and older binaries refuse
+the upgraded root, including an interrupted physical upgrade.
 
 ## Required upgrade procedure
 

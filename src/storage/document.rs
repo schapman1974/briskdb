@@ -11,6 +11,8 @@ use crate::{
 
 use super::Storage;
 
+mod index_storage;
+
 pub(super) const RECORDS_TABLE: &str = "briskdb_documents_v1";
 const RECORDS_SCHEMA_SQL: &str = "CREATE TABLE briskdb_documents_v1 (
     collection_id INTEGER NOT NULL CHECK (collection_id > 0),
@@ -35,12 +37,18 @@ pub(super) fn is_exact_schema_object(
     table_name: &str,
     sql: Option<&str>,
 ) -> bool {
-    object_type == "table"
+    (object_type == "table"
         && name == RECORDS_TABLE
         && table_name == RECORDS_TABLE
         && sql.is_some_and(|sql| {
             normalize_schema_sql(sql) == normalize_schema_sql(RECORDS_SCHEMA_SQL)
-        })
+        }))
+        || index_storage::is_exact_schema_object(object_type, name, table_name, sql)
+}
+
+pub(super) fn is_storage_table(name: &str) -> bool {
+    name.eq_ignore_ascii_case(RECORDS_TABLE)
+        || name.eq_ignore_ascii_case(index_storage::ENTRIES_TABLE)
 }
 
 pub(super) fn validate_optional_schema(connection: &Connection) -> EngineResult<bool> {
@@ -64,6 +72,11 @@ pub(super) fn validate_optional_schema(connection: &Connection) -> EngineResult<
         })
         .map_err(|error| shard_read_error(error, "failed to inspect document storage schema"))?;
     if objects.is_empty() {
+        if index_storage::validate_optional_schema(connection)? {
+            return Err(corrupt(
+                "document index storage exists without document records",
+            ));
+        }
         return Ok(false);
     }
     if objects.len() != 1
@@ -78,12 +91,14 @@ pub(super) fn validate_optional_schema(connection: &Connection) -> EngineResult<
             "shard document storage table has an incompatible schema",
         ));
     }
+    index_storage::validate_optional_schema(connection)?;
     Ok(true)
 }
 
 #[cfg(feature = "documents")]
 fn ensure_schema(connection: &mut Connection) -> EngineResult<()> {
-    if validate_optional_schema(connection)? {
+    if validate_optional_schema(connection)? && index_storage::validate_optional_schema(connection)?
+    {
         return Ok(());
     }
     let transaction = connection
@@ -94,6 +109,7 @@ fn ensure_schema(connection: &mut Connection) -> EngineResult<()> {
             .execute_batch(RECORDS_SCHEMA_SQL)
             .map_err(sqlite_error::storage)?;
     }
+    index_storage::ensure_schema(&transaction)?;
     if !validate_optional_schema(&transaction)? {
         return Err(corrupt(
             "document storage table creation did not produce its exact schema",
@@ -104,7 +120,8 @@ fn ensure_schema(connection: &mut Connection) -> EngineResult<()> {
 
 #[cfg(feature = "documents")]
 fn require_schema(connection: &Connection) -> EngineResult<()> {
-    if validate_optional_schema(connection)? {
+    if validate_optional_schema(connection)? && index_storage::validate_optional_schema(connection)?
+    {
         Ok(())
     } else {
         Err(corrupt(
@@ -244,6 +261,16 @@ mod enabled {
             return Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
                 "document deletion is incomplete; reopen the database to recover it",
+            ));
+        }
+        let pending: bool = connection.query_row(
+            "SELECT lifecycle_state = 2 FROM briskdb_document_index_storage WHERE singleton = 1",
+            [], |row| row.get(0),
+        ).map_err(sqlite_error::storage)?;
+        if pending {
+            return Err(EngineError::new(
+                EngineErrorKind::FailedPrecondition,
+                "document index storage upgrade is incomplete; reopen the database to recover it",
             ));
         }
         match integrity.state() {
@@ -1917,6 +1944,7 @@ mod enabled {
         if let Some(provisioning) = load_provisioning(manifest_connection)? {
             recover_provisioning(storage, manifest_connection, provisioning)?;
         }
+        super::index_storage::recover_layout(storage, manifest_connection)?;
         let catalog = load_catalog_rows(manifest_connection)?;
         if !catalog.collections().is_empty() {
             validate_stored_records(storage, manifest_connection, &catalog)?;
@@ -1991,12 +2019,17 @@ mod enabled {
                     // This shard may have committed before its journal cursor.
                     // The absence of the exact optional table is then success.
                     if present {
+                        super::index_storage::drop_schema(&transaction)?;
                         transaction
                             .execute_batch("DROP TABLE briskdb_documents_v1")
                             .map_err(sqlite_error::storage)?;
                     }
                 } else {
-                    require_schema(&transaction)?;
+                    // A v17 deletion journal can precede the v18 storage
+                    // upgrade. Its old record table is sufficient for cleanup.
+                    if !present {
+                        return Err(corrupt("document deletion is missing shard records"));
+                    }
                     for id in &collections {
                         if let Some(control) = control {
                             ensure_control_active(control, "during document shard cleanup")?;
@@ -2271,6 +2304,9 @@ mod enabled {
             let connection = storage.open_unconfigured_shard(shard)?;
             storage.validate_unconfigured_shard(&connection, shard)?;
             require_schema(&connection)?;
+            // No secondary index is activated yet. Unexpected entry rows are
+            // corruption, never disposable caches to erase during recovery.
+            super::index_storage::require_empty(&connection)?;
             let mut statement = connection
                 .prepare(
                     "SELECT collection_id, natural_order, id_key, document_bson,
@@ -5200,100 +5236,112 @@ mod enabled {
 
         #[test]
         fn startup_resumes_document_collection_provisioning_from_durable_cursor() {
-            let temp = tempfile::tempdir().unwrap();
-            drop(Storage::open(temp.path(), 4).unwrap());
+            for legacy in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                drop(Storage::open(temp.path(), 4).unwrap());
 
-            let options_bson =
-                encode_document(DocumentCollectionOptions::empty().document()).unwrap();
-            let id_specification_bson =
-                encode_document(&builtin_id_specification().unwrap()).unwrap();
-            let operation_id = provisioning_id("recovery_db", "events", &options_bson);
-            let manifest_path = temp.path().join("manifest.sqlite");
-            let mut manifest_connection = open_existing_manifest(&manifest_path).unwrap();
-            configure_manifest_connection(&manifest_connection).unwrap();
-            configure_journal_mode(&manifest_connection).unwrap();
-            let transaction = manifest_connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .unwrap();
-            transaction
-                .execute(
-                    "INSERT INTO briskdb_document_databases (
+                let options_bson =
+                    encode_document(DocumentCollectionOptions::empty().document()).unwrap();
+                let id_specification_bson =
+                    encode_document(&builtin_id_specification().unwrap()).unwrap();
+                let operation_id = provisioning_id("recovery_db", "events", &options_bson);
+                let manifest_path = temp.path().join("manifest.sqlite");
+                let mut manifest_connection = open_existing_manifest(&manifest_path).unwrap();
+                configure_manifest_connection(&manifest_connection).unwrap();
+                configure_journal_mode(&manifest_connection).unwrap();
+                let transaction = manifest_connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO briskdb_document_databases (
                         database_id, database_name, catalog_version
                      ) VALUES (1, 'recovery_db', 1)",
-                    [],
-                )
-                .unwrap();
-            transaction
-                .execute(
-                    "INSERT INTO briskdb_document_collections (
+                        [],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO briskdb_document_collections (
                         collection_id, database_id, collection_name, options_bson,
                         bson_schema_version, storage_format_version,
                         placement_policy, placement_version, next_natural_order,
                         lifecycle_state
                      ) VALUES (1, 1, 'events', ?1, 1, 1, 1, 1, 1, 1)",
-                    [options_bson],
-                )
-                .unwrap();
-            transaction
-                .execute(
-                    "INSERT INTO briskdb_document_indexes (
+                        [options_bson],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO briskdb_document_indexes (
                         collection_id, index_name, spec_bson, is_unique, is_builtin,
                         index_format_version, lifecycle_state
                      ) VALUES (1, '_id_', ?1, 1, 1, 1, ?2)",
-                    rusqlite::params![id_specification_bson, INDEX_PENDING_BUILD],
-                )
-                .unwrap();
-            allocate_index_identity(&transaction, 1, "_id_").unwrap();
-            transaction
-                .execute(
-                    "INSERT INTO briskdb_document_provisioning (
+                        rusqlite::params![id_specification_bson, INDEX_PENDING_BUILD],
+                    )
+                    .unwrap();
+                allocate_index_identity(&transaction, 1, "_id_").unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO briskdb_document_provisioning (
                         singleton, collection_id, operation_id, shard_count, next_shard
                      ) VALUES (1, 1, ?1, 4, 1)",
-                    [operation_id.as_slice()],
-                )
-                .unwrap();
-            transaction.execute("UPDATE briskdb_document_identities SET database_high_water = 1, collection_high_water = 1 WHERE singleton = 1", []).unwrap();
-            manifest::validate_document_catalog(&transaction, 4).unwrap();
-            manifest::refresh_manifest_digest(&transaction).unwrap();
-            transaction.commit().unwrap();
-            drop(manifest_connection);
-
-            let mut first_shard = Connection::open(shard_path(temp.path(), 0)).unwrap();
-            ensure_schema(&mut first_shard).unwrap();
-            drop(first_shard);
-
-            let storage = Storage::open(temp.path(), 4).unwrap();
-            let catalog = storage.document_catalog().unwrap();
-            let collection = catalog.collection("recovery_db", "events").unwrap();
-            assert_eq!(collection.id().get(), 1);
-            assert_eq!(collection.indexes().len(), 1);
-            assert_eq!(collection.indexes()[0].name(), "_id_");
-            for shard in 0..4 {
-                let connection = Connection::open(shard_path(temp.path(), shard)).unwrap();
-                assert!(super::super::validate_optional_schema(&connection).unwrap());
-            }
-            let manifest_connection = Connection::open(manifest_path).unwrap();
-            assert_eq!(
-                manifest_connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM briskdb_document_provisioning",
-                        [],
-                        |row| row.get::<_, i64>(0),
+                        [operation_id.as_slice()],
                     )
-                    .unwrap(),
-                0
-            );
-            assert_eq!(
-                manifest_connection
-                    .query_row(
-                        "SELECT lifecycle_state FROM briskdb_document_collections
+                    .unwrap();
+                transaction.execute("UPDATE briskdb_document_identities SET database_high_water = 1, collection_high_water = 1 WHERE singleton = 1", []).unwrap();
+                manifest::validate_document_catalog(&transaction, 4).unwrap();
+                manifest::refresh_manifest_digest(&transaction).unwrap();
+                transaction.commit().unwrap();
+                drop(manifest_connection);
+
+                let mut first_shard = Connection::open(shard_path(temp.path(), 0)).unwrap();
+                ensure_schema(&mut first_shard).unwrap();
+                if legacy {
+                    first_shard
+                        .execute_batch("DROP TABLE briskdb_document_index_entries_v1")
+                        .unwrap();
+                    manifest::downgrade_v18_manifest_to_v17_for_test(
+                        &Connection::open(&manifest_path).unwrap(),
+                        4,
+                    )
+                    .unwrap();
+                }
+                drop(first_shard);
+
+                let storage = Storage::open(temp.path(), 4).unwrap();
+                let catalog = storage.document_catalog().unwrap();
+                let collection = catalog.collection("recovery_db", "events").unwrap();
+                assert_eq!(collection.id().get(), 1);
+                assert_eq!(collection.indexes().len(), 1);
+                assert_eq!(collection.indexes()[0].name(), "_id_");
+                for shard in 0..4 {
+                    let connection = Connection::open(shard_path(temp.path(), shard)).unwrap();
+                    require_schema(&connection).unwrap();
+                }
+                let manifest_connection = Connection::open(manifest_path).unwrap();
+                assert_eq!(
+                    manifest_connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM briskdb_document_provisioning",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    manifest_connection
+                        .query_row(
+                            "SELECT lifecycle_state FROM briskdb_document_collections
                          WHERE collection_id = 1",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap(),
-                COLLECTION_ACTIVE
-            );
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    COLLECTION_ACTIVE
+                );
+            }
         }
     }
 }
@@ -5314,7 +5362,8 @@ pub(super) fn recover_or_validate(
     let has_catalog = manifest_connection
         .query_row(
             "SELECT EXISTS (SELECT 1 FROM briskdb_document_collections)
-                OR EXISTS (SELECT 1 FROM briskdb_document_deletion)",
+                OR EXISTS (SELECT 1 FROM briskdb_document_deletion)
+                OR EXISTS (SELECT 1 FROM briskdb_document_index_storage WHERE lifecycle_state = 2)",
             [],
             |row| row.get::<_, bool>(0),
         )
