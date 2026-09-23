@@ -23,21 +23,21 @@ used, while idempotency stripes are retained after first use so unlink cannot
 create competing inodes. None may be replaced while a process is live. See the
 [multi-process contract](MULTIPROCESS.md).
 
-## Current format: version 17
+## Current format: version 18
 
 SQLite header fields identify the file and its format:
 
 | Header field | Value | Meaning |
 | --- | --- | --- |
 | `PRAGMA application_id` | `0x42524442` (`BRDB`) | Permanent BriskDB manifest-family marker |
-| `PRAGMA user_version` | `17` | Authoritative manifest schema version |
+| `PRAGMA user_version` | `18` | Authoritative manifest schema version |
 
 The application ID prevents an accidental foreign SQLite file from being
 adopted as a manifest. It is not authentication or tamper protection: a process
 that can write the data directory can forge it and the unkeyed checksums
 described below.
 
-Version 17 has twenty-seven strict manifest tables and the partial unique
+Version 18 has twenty-eight strict manifest tables and the partial unique
 allocation-owner index. It retains the routing, authoritative
 logical and document catalogs, physical layout, application-schema migration,
 integrity, generated-ID activation, allocation-owner lifecycle, recoverable
@@ -48,6 +48,10 @@ High-water marks begin at the existing maximum database and collection IDs
 (zero for empty catalogs). The upgrade changes no shard file or application row.
 The v16-to-v17 step adds stable index identities and a permanent allocation head,
 installs the version-17 fence, and advances the semantic digest to version 9.
+The v17-to-v18 step adds a checksummed physical document-index layout journal,
+installs the version-18 fence, and advances the semantic digest to version 10.
+Sole-process startup then provisions empty entry tables on document shards;
+existing BSON and index declarations/IDs are unchanged, with no index activation.
 
 ```sql
 CREATE TABLE briskdb_manifest (
@@ -57,7 +61,7 @@ CREATE TABLE briskdb_manifest (
 
 CREATE TABLE briskdb_metadata (
     requires_manifest_version INTEGER NOT NULL
-        CHECK (requires_manifest_version >= 17)
+        CHECK (requires_manifest_version >= 18)
 ) STRICT;
 
 CREATE TABLE briskdb_routing (
@@ -569,6 +573,15 @@ CREATE TABLE briskdb_table_provisioning_declarations (
     )
 ) STRICT;
 
+CREATE TABLE briskdb_document_index_storage (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    entry_format_version INTEGER NOT NULL CHECK (entry_format_version = 1),
+    lifecycle_state INTEGER NOT NULL CHECK (lifecycle_state IN (1, 2)),
+    shard_count INTEGER NOT NULL CHECK (shard_count BETWEEN 2 AND 64),
+    next_shard INTEGER NOT NULL CHECK (next_shard BETWEEN 0 AND shard_count),
+    CHECK (lifecycle_state <> 1 OR next_shard = shard_count)
+) STRICT;
+
 CREATE TABLE briskdb_shard_layout (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     layout_id BLOB NOT NULL
@@ -640,8 +653,9 @@ CREATE TABLE briskdb_integrity (
 
 The manifest, metadata, routing, schema-catalog, shard-layout, and integrity
 tables each contain exactly one row, as does `briskdb_document_identities`.
-The version-17 downgrade-fence row is exactly `17`. The
-`briskdb_document_index_allocator` also contains exactly one row.
+The version-18 downgrade-fence row is exactly `18`. The
+`briskdb_document_index_allocator` and `briskdb_document_index_storage` also
+contain exactly one row each.
 `briskdb_generated_table_ddl`, `briskdb_table_provisioning`,
 `briskdb_document_provisioning`, and `briskdb_document_deletion` each
 contain zero or one row. A completed generated-table bridge is retained;
@@ -649,25 +663,25 @@ table-provisioning declaration rows exist only while their transient parent row
 exists.
 The two integrity-version columns deliberately accept any positive integer so
 a future digest encoding can remain structurally readable long enough for an
-older binary to reject it as `FailedPrecondition`; v17 writers emit manifest
-digest version `9` and schema digest version `1`.
+older binary to reject it as `FailedPrecondition`; v18 writers emit manifest
+digest version `10` and schema digest version `1`.
 Zero or negative versions are malformed and are `DataCorruption`.
 `briskdb_manifest.shard_count` is immutable and is the initial routing modulus;
 it is also the live physical-shard count. Physical IDs are exactly
 `0..shard_count - 1`. Filenames remain derived by trusted code as
 `shards/{shard_id:04}.sqlite` and are never read from catalog-controlled paths.
-Version 17 supports only the `active` physical-shard lifecycle state. Adding
+Version 18 supports only the `active` physical-shard lifecycle state. Adding
 provisioning, draining, or retirement states to the routing catalog requires a
 later format and state-machine change. The separate shard-layout state governs
 only startup identity reconciliation.
 
 ### Logical catalog
 
-Every fresh or upgraded v17 manifest contains SQL logical database ID `1` named
+Every fresh or upgraded v18 manifest contains SQL logical database ID `1` named
 `default`. A fresh or pre-v6 upgrade begins at application-schema
 generation `0`; each completed journal row advances it by exactly one, through
 a maximum of `2,147,483,647`. The schema-catalog singleton also contains
-identifier encoding version `1` and default database ID `1`. Version 17 permits
+identifier encoding version `1` and default database ID `1`. Version 18 permits
 at most 64 logical databases and 4,096 table rows. Database and table IDs are
 positive; table names are unique within their owning database, and every table
 references an existing database.
@@ -819,7 +833,7 @@ continue allocating values in a retired owner's encoded range.
 Fresh version 17 storage seeds active `owner_slot = physical_shard_id`, so the
 initial slots are the contiguous range `0..shard_count - 1`. A slot is an
 immutable ID namespace, not a value that may be recomputed from a later shard
-count or bucket map. Version 17 has no public owner-map mutation operation, but
+count or bucket map. Version 18 has no public owner-map mutation operation, but
 its format preserves the state required by a later resharding workflow: retire
 the old slot without deleting it and explicitly add a never-used replacement
 whose slot is greater than every prior owner of that physical shard.
@@ -951,7 +965,7 @@ the data root. An exact complete repeat is a read-only idempotent success;
 empty, partial, different, duplicate, nonempty, or physically mismatched
 declarations fail without replacing the catalog. Once populated, the catalog
 cannot be edited in place. The one exception is an exact declaration repeat for
-a v9 catalog migrated with an inactive native policy: v17 may provision that
+a v9 catalog migrated with an inactive native policy: v18 may provision that
 unchanged policy if all declared physical tables are still empty, but it may
 not alter a declaration or catalog ID. A later journaled schema migration must preserve the
 exact registered physical table set on every shard and retain every sharded
@@ -1122,7 +1136,7 @@ acknowledged or replayed shard, resumes in ascending order, and publishes
 digests, owner ranges, or nonempty tables fail closed; BriskDB never infers a
 different request from partial shard state.
 
-Fresh v17 initialization leaves the SQL table, generated-ID, hi/lo,
+Fresh v18 initialization leaves the SQL table, generated-ID, hi/lo,
 generated-table DDL, global-index, document, and provisioning catalogs empty.
 The document identity singleton starts with both high-water marks at zero.
 The v7-to-v8 migration
@@ -1170,7 +1184,7 @@ additional `Applying` row may exist, and it must target
 `schema_generation + 1`. Its stored source generation, shard count, SQL text,
 digest, state, and progress are validated on every manifest open. Any journal
 history requires the physical layout to be `Ready`; `Creating` and `Adopting`
-manifests have an empty journal. Fresh v17 initialization and pre-v6 upgrades
+manifests have an empty journal. Fresh v18 initialization and pre-v6 upgrades
 begin with an empty journal at generation 0.
 
 The retained journal proves which exact batches BriskDB coordinated; it does
@@ -1216,8 +1230,8 @@ restart as repair after any reported `DataCorruption`; whole-shard corruption
 drills and failure handling remain issue #68. Those storage failures retain
 their own error kinds and do not themselves justify rebaselining data.
 
-Manifest digest version 9 is a full 32-byte, unkeyed BLAKE3 digest. The stream
-begins with `briskdb.manifest.semantic-root.v9` plus its terminating NUL. It
+Manifest digest version 10 is a full 32-byte, unkeyed BLAKE3 digest. The stream
+begins with `briskdb.manifest.semantic-root.v10` plus its terminating NUL. It
 then encodes the length-prefixed name `application_id` and its tagged integer,
 followed by the length-prefixed name `user_version` and its tagged integer.
 These tables and columns follow in fixed order:
@@ -1239,6 +1253,7 @@ These tables and columns follow in fixed order:
 | `briskdb_document_deletion` | `singleton`, `database_id`, `collection_id`, `operation_id`, `shard_count`, `next_shard` |
 | `briskdb_document_index_identities` | `index_id`, `collection_id`, `index_name` |
 | `briskdb_document_index_allocator` | `singleton`, `index_high_water` |
+| `briskdb_document_index_storage` | `singleton`, `entry_format_version`, `lifecycle_state`, `shard_count`, `next_shard` |
 | `briskdb_schema_catalog` | `singleton`, `identifier_encoding_version`, `schema_generation`, `default_database_id` |
 | `briskdb_tables` | `table_id`, `database_id`, `table_name`, `placement`, `shard_key_column`, `shard_key_type` |
 | `briskdb_generated_ids` | `table_id`, `policy`, `generated_column`, `encoding_version`, `activation_state` |
@@ -1265,7 +1280,7 @@ self-reference; its version, database state, and schema digest fields are
 covered. Frozen SQL definitions, STRICT flags, indexes, and foreign keys are
 validated separately rather than encoded as semantic rows.
 
-Every BriskDB-owned v17 manifest mutation recalculates the root after its row
+Every BriskDB-owned v18 manifest mutation recalculates the root after its row
 changes and before the same transaction commits. Progress acknowledgement,
 migration publication/finalization, provisioning intent/progress/finalization,
 generated-table bridge transitions, layout publication, owner/activation state
@@ -1275,7 +1290,9 @@ semantic values instead of the raw SQLite file makes the root stable across WAL
 checkpoints, page relocation, and `VACUUM`; it deliberately does not cover
 SQLite page bytes, rollback journals, WAL, or shared memory.
 
-Digest version 8 remains frozen solely to verify and migrate version-16
+Digest version 9 remains frozen solely to verify and migrate version-17
+manifests. Its `briskdb.manifest.semantic-root.v9` domain and stream omit the
+index-storage layout journal. Digest version 8 remains frozen solely to verify and migrate version-16
 manifests. Its `briskdb.manifest.semantic-root.v8` domain and stream omit the
 two index identity tables. Digest version 7 remains frozen solely to verify and migrate version-14 and
 version-15 manifests. It uses the `briskdb.manifest.semantic-root.v7` domain and
@@ -1300,8 +1317,8 @@ encoding, covers generated-ID policy and the owner-to-shard mapping, but omits
 activation, owner lifecycle, and both provisioning tables. Digest version 1
 remains frozen for version-7 and version-8 manifests. It uses the
 `briskdb.manifest.semantic-root.v1` domain and the same encoding, but omits the
-two version-9 tables. A v17 manifest must store version 9; storing an older
-digest in an otherwise v17 shape is corruption, and an unsupported future
+two version-9 tables. A v18 manifest must store version 10; storing an older
+digest in an otherwise v18 shape is corruption, and an unsupported future
 positive digest version is a failed precondition.
 
 The frozen four-shard v8/version-1 fixture with layout ID
@@ -1439,7 +1456,7 @@ The routing singleton contains exactly these generation-1 values:
 | `key_encoding_version` | `1` | Canonical bytes defined below for raw, explicit, and typed inferred routing keys |
 | `bucket_algorithm_version` | `1` | Compatibility-preserving range algorithm below |
 | `virtual_bucket_count` | `4096` | Fixed virtual bucket space `0..4095` |
-| `map_generation` | `1` | Initial committed bucket map and the only generation version 17 can interpret |
+| `map_generation` | `1` | Initial committed bucket map and the only generation version 18 can interpret |
 
 Every bucket ID exists exactly once and references an active physical shard.
 Every physical shard owns at least one bucket. The generation-1 map partitions
@@ -1462,7 +1479,7 @@ planning and policy contract is in [bound statement
 planning](SQL_PLANNING.md).
 
 This routing format is intentionally distinct from the tagged, order-preserving
-[canonical global-index key format](INDEX_KEY_ENCODING.md). Version 17 records
+[canonical global-index key format](INDEX_KEY_ENCODING.md). Version 18 records
 the codec version in every global-index definition but does not persist physical
 index entries or change shard placement. Physical entries live in the separate
 storage-version-4 `global-indexes/global.sqlite` authority, never in a shard.
@@ -1709,7 +1726,7 @@ vectors freeze the exact key bytes, BLAKE3 prefix, little-endian hash integer,
 bucket ID, and persisted physical shard.
 
 `map_generation` is separate from manifest `user_version` and from
-`schema_generation`. Version 17 accepts only routing generation 1 and validates
+`schema_generation`. Version 18 accepts only routing generation 1 and validates
 its exact deterministic assignment; no public map-mutation operation exists
 yet. A future format that can commit a changed map must bump `user_version` and
 its downgrade fence as well as `map_generation`. That requirement makes this
@@ -1720,12 +1737,56 @@ At each open, BriskDB validates the exact objects, columns, strict flags, frozen
 schema SQL, singleton rows, logical identifiers and limits, metadata codes,
 supported algorithm values, contiguous physical and bucket IDs, active
 lifecycle states, assignments, coverage, and foreign keys. A recognized
-version-17 manifest that violates any invariant is `DataCorruption` and is
+version-18 manifest that violates any invariant is `DataCorruption` and is
 rejected before shard connections are opened. The same locked transaction
 returns routing and logical rows as one coherent shared snapshot. Request
 routing performs no manifest query and cannot fall back to modulo after a failed
 validation; only successful migration finalization publishes a newer logical
 schema generation into the snapshot.
+
+## Previous version 17
+
+Version 17 has twenty-seven strict manifest tables and semantic digest version 9.
+The atomic v17-to-v18 manifest transaction adds `briskdb_document_index_storage`,
+installs the version-18 fence/header, and reseals with digest version 10. The
+singleton uses entry format 1 and the exact root shard count. A root with any
+collection starts in `Upgrading` (2), cursor 0; an empty root starts `Ready` (1),
+cursor equal to shard count. It preserves all existing semantic rows and BSON.
+
+The pending layout requires sole-process startup ownership. Namespace deletion
+or provisioning recovery runs first. Each remaining document shard then creates
+the following exact schema in one transaction, followed by a separate sealed
+manifest cursor commit. A crash between commits safely retries the shard.
+Only after the complete shard prefix is durable does a final manifest transaction
+mark the layout Ready. The format version itself identifies this one-time layout
+upgrade; the journal is retained after completion. Empty catalogs create no
+physical tables. Collection provisioning subsequently creates both record and
+entry schemas together; dropping the last namespace removes both.
+
+```sql
+CREATE TABLE briskdb_document_index_entries_v1 (
+    collection_id INTEGER NOT NULL CHECK (collection_id > 0),
+    index_id INTEGER NOT NULL CHECK (index_id > 0),
+    id_key BLOB NOT NULL CHECK (typeof(id_key) = 'blob' AND length(id_key) BETWEEN 9 AND 16777216),
+    index_key BLOB NOT NULL CHECK (typeof(index_key) = 'blob' AND length(index_key) BETWEEN 13 AND 67108864),
+    entry_checksum BLOB NOT NULL CHECK (typeof(entry_checksum) = 'blob' AND length(entry_checksum) = 32),
+    entry_format_version INTEGER NOT NULL CHECK (entry_format_version = 1),
+    PRIMARY KEY (collection_id, index_id, index_key, id_key),
+    FOREIGN KEY (collection_id, id_key) REFERENCES briskdb_documents_v1 (collection_id, id_key) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX briskdb_document_index_entries_by_record_v1
+    ON briskdb_document_index_entries_v1 (collection_id, id_key, index_id);
+```
+
+These reserved objects are excluded from application-schema hashes and ordinary
+SQL access. They have no physical index authority yet: startup requires them to
+be empty and rejects nonempty, orphaned or malformed storage. Missing entry
+schema in a Ready root is corruption, not an automatic rebuild. Secondary
+declarations stay PendingBuild; no existing index is populated, enforced or used
+by the planner. Entry checksum encoding, transactional maintenance and build
+activation remain subsequent work under #174. Downgrading is unsupported;
+version-17 and older readers reject the fence without modifying the root.
 
 ## Previous version 16
 
@@ -2036,7 +2097,7 @@ CREATE TABLE briskdb_metadata (
 The fence contains exactly `2`. A current opener validates this complete format
 before applying the numbered v2-to-v3, v3-to-v4, v4-to-v5, v5-to-v6,
 v6-to-v7, v7-to-v8, v8-to-v9, v9-to-v10, v10-to-v11, v11-to-v12,
-v12-to-v13, v13-to-v14, v14-to-v15, v15-to-v16, and v16-to-v17 transactions.
+v12-to-v13, v13-to-v14, v14-to-v15, v15-to-v16, v16-to-v17, and v17-to-v18 transactions.
 
 ## Legacy version 1
 
@@ -2102,11 +2163,12 @@ returning:
    the digest version or manifest object set; and v15-to-v16 adds permanent
    document identities, the deletion journal, and semantic digest version 8.
    The v16-to-v17 step adds permanent index identities and semantic digest version 9.
+   The v17-to-v18 step adds the physical index-layout journal and digest version 10.
    Older formats therefore cannot be mistaken for checksummed,
    authoritative-catalog, allocator-authority, recoverable provisioning, or
    durable logical-to-physical DDL identity.
 6. Fresh initialization is allowed only beside an otherwise empty physical
-   layout and commits v17 physical state `Creating`, integrity state
+   layout and commits v18 physical state `Creating`, integrity state
    `Verifying`, generation 0, and empty application-schema and provisioning
    journals. An existing
    v1/v2/v3 manifest first advances through v4; the v4-to-v5 transaction commits
@@ -2121,8 +2183,9 @@ returning:
    catalog; v14-to-v15 installs the receipt-format fence; and v15-to-v16 adds
    identity high-water marks and an empty deletion journal.
    The v16-to-v17 step adds index identities and their permanent allocation head.
+   The v17-to-v18 step adds an empty Ready index-layout journal.
 7. If the validated integrity state is `Degraded`, fail startup without
-   changing it. Otherwise, if a validated v17 manifest contains one `Applying`
+   changing it. Otherwise, if a validated v18 manifest contains one `Applying`
    migration, require state `Migrating`, validate every shard against the
    trusted source/target fingerprint for its exact journal-prefix position,
    and resume it in ascending order. The final transaction publishes the
@@ -2166,7 +2229,7 @@ returning:
     `Database`, or `Engine`.
 
 SQLite transactional DDL keeps each numbered manifest step atomic within
-`manifest.sqlite`. A version-1 upgrade commits versions 2 through 17; a
+`manifest.sqlite`. A version-1 upgrade commits versions 2 through 18; a
 version-2 upgrade begins at 3, and so on. The v3-to-v4 step
 still creates the
 logical catalog, inserts database ID 1 named `default` plus the
@@ -2354,7 +2417,7 @@ header value, format version, digest input, routing metadata, schema
 fingerprint, journal record, or recovery step. Listener settings are not
 persisted. Because engine open and its existing recovery precede listener
 binding, a later bind failure does not undo a migration or recovery transaction
-that already committed; a subsequent startup revalidates the same version-17
+that already committed; a subsequent startup revalidates the same version-18
 layout normally.
 
 Issue #52's separate data/admin HTTP routers and optional administration socket
@@ -2414,7 +2477,7 @@ requires a backup from before the unsupported format.
 ## Verification contract
 
 Tests cover fresh creation and every
-v1/v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16 upgrade path to v17, every
+v1/v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17 upgrade path to v18, every
 manifest layout and integrity state, the exact shard header and metadata row,
 dynamic schema generations, retained migration history, checksum golden
 vectors, and no-op ready reopen. Failure

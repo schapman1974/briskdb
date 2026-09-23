@@ -11,7 +11,7 @@ listener or a high-level embedded collection API.
 ## Logical catalog
 
 Manifest format 14 introduced document namespaces separate from the SQL table
-catalog, and the current format 17 retains that separation. A SQL table can
+catalog, and the current format 18 retains that separation. A SQL table can
 never become a collection through schema discovery. The manifest stores:
 
 - exact, case-sensitive database and collection names;
@@ -29,8 +29,8 @@ Database names contain 1 to 63 UTF-8 bytes. A complete
 compared byte-for-byte and may not contain NUL. Mongo names are not normalized
 through BriskDB's lowercase SQL identifier rules.
 
-All eight document catalog tables participate in semantic manifest digest
-version 9. Every supported mutation uses an immediate SQLite transaction,
+All eight document catalog tables and the index-storage layout journal participate
+in semantic manifest digest version 10. Every supported mutation uses an immediate SQLite transaction,
 validates the complete catalog, refreshes the digest, and commits the metadata
 as one unit. Startup validates exact table definitions, foreign keys, row and
 byte bounds, supported versions, namespace limits, built-in index state, and
@@ -48,8 +48,8 @@ format claim.
 
 ## Shard records and placement
 
-Every shard that serves an active collection has one storage-owned table. Its
-abridged shape is:
+Every shard that serves an active collection has a storage-owned record table
+and an empty secondary-index entry table. The record table's abridged shape is:
 
 ```sql
 CREATE TABLE briskdb_documents_v1 (
@@ -109,12 +109,30 @@ catalog authority; the future physical path must fence the snapshot and commit
 entries with the document. Pending declarations remain non-enforcing. See the
 [shared-engine preparation contract](DOCUMENT_ENGINE.md#implemented-commands).
 
+Manifest format 18 adds `briskdb_document_index_entries_v1`, keyed by
+`(collection_id, index_id, index_key, id_key)`, and a by-record index for future
+write maintenance. A foreign key ties entries to their owning records with
+delete cascading. The exact schema is excluded from application-schema hashes
+and SQL catalog discovery, and ordinary SQL cannot access it. Entry rows are
+not written or used yet: nonempty storage fails closed on reopen. Pending
+declarations still do not enforce uniqueness or accelerate reads.
+
+The version-18 upgrade installs a checksummed layout journal and version fence
+before changing shards. Startup, under sole-process ownership, finishes any
+namespace recovery, creates the empty entry schema on each populated shard,
+and commits a per-shard cursor before marking the layout Ready. Reopening after
+a process exit resumes idempotently; existing BSON, declaration bytes and IDs
+are unchanged. Empty roots stay physically empty until collection creation.
+Missing or malformed entry schema in an already-Ready root is corruption,
+not an invitation to rebuild. Entry maintenance, build coverage/activation,
+global uniqueness and planner use remain separate work under #174.
+
 ## Provisioning and restart
 
 Collection creation first commits the database, provisioning collection,
 pending built-in `_id_` index, operation identity, target shard count, and
 `next_shard = 0` under the manifest checksum. It then creates or verifies the
-fixed table on each shard and advances the checksummed cursor. Only after every
+record and entry tables on each shard and advances the checksummed cursor. Only after every
 shard is durable does one final transaction mark the collection and built-in
 index Ready and remove the cursor.
 
@@ -122,7 +140,7 @@ A retained cursor forces sole-process startup ownership. Restart resumes the
 exact remaining shard prefix idempotently. An active collection with a missing
 or incompatible table is corruption. An exact document table without catalog
 authority is also rejected. Builds without the `documents` feature still
-understand current manifest format 17 and validate its physical schema, but
+understand current manifest format 18 and validate its physical schema, but
 refuse to open a root containing collections or a pending deletion.
 
 Every built-in and declared index also has a durable root-wide `DocumentIndexId`.
