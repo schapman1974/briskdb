@@ -52,6 +52,40 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_nonunique_index_build_maintenance_and_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    session.insert_one(DATABASE, COLLECTION, {"_id": 1, "value": [1, 2, 2]})
+                    session.create_index(DATABASE, COLLECTION, {"value": 1})
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.build_index(DATABASE, COLLECTION, "value_1", max_result_bytes=1)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.build_index(DATABASE, COLLECTION, "value_1", cancellation=token)
+                    self.assertEqual(session.list_indexes(DATABASE, COLLECTION)["indexes"][1]["lifecycle"], "pending_build")
+                    identity = uuid.uuid4()
+                    result = session.build_index(DATABASE, COLLECTION, "value_1", request_id=identity)
+                    self.assertEqual((result["request_id"], result["index_name"], result["lifecycle"]), (identity, "value_1", "ready"))
+                    self.assertEqual(session.build_index(DATABASE, COLLECTION, "value_1")["lifecycle"], "ready")
+                    self.assertEqual(session.create_index(DATABASE, COLLECTION, {"value": 1})["lifecycle"], "ready")
+                    session.insert_one(DATABASE, COLLECTION, {"_id": 2, "value": [1, 2]})
+                    session.update_one(DATABASE, COLLECTION, {"_id": 1}, {"$set": {"value": [3, 4], "extra": True}})
+                    session.delete_one(DATABASE, COLLECTION, {"_id": 2})
+                    session.create_index(DATABASE, COLLECTION, {"value": 1}, name="unique", unique=True)
+                    with self.assertRaises(briskdb.UnsupportedError):
+                        session.build_index(DATABASE, COLLECTION, "unique")
+                    with self.assertRaises(briskdb.UnsupportedError):
+                        session.drop_index(DATABASE, COLLECTION, "value_1")
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    indexes = {item["name"]: item for item in session.list_indexes(DATABASE, COLLECTION)["indexes"]}
+                    self.assertEqual(indexes["value_1"]["lifecycle"], "ready")
+                    self.assertEqual(indexes["unique"]["lifecycle"], "pending_build")
+                    self.assertEqual(session.count_documents(DATABASE, COLLECTION, {"value": 4})["count"], 1)
+
     def test_sparse_partial_declarations_validate_preserve_options_and_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=2, documents=True) as database:
@@ -1872,6 +1906,22 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_nonunique_index_build_forwards_controls_and_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    await session.create_index(DATABASE, COLLECTION, {"value": 1})
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.build_index(DATABASE, COLLECTION, "value_1", max_result_bytes=1)
+                    identity = uuid.uuid4()
+                    result = await session.build_index(DATABASE, COLLECTION, "value_1", request_id=identity, timeout_ms=5000)
+                    self.assertEqual((result["request_id"], result["lifecycle"]), (identity, "ready"))
+                    await session.insert_one(DATABASE, COLLECTION, {"_id": 1, "value": "maintained"})
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    self.assertEqual((await session.list_indexes(DATABASE, COLLECTION))["indexes"][1]["lifecycle"], "ready")
+
     async def test_async_sparse_partial_declarations_forward_options_and_controls(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

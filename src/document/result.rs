@@ -386,6 +386,8 @@ pub enum DocumentResult {
     Update(DocumentUpdateResult),
     Delete(DocumentDeleteResult),
     IndexName(String),
+    /// A built non-unique index with complete, maintained physical entries.
+    IndexReady(String),
     Indexes(Box<[DocumentIndexMetadata]>),
     CursorKilled(bool),
 }
@@ -407,7 +409,7 @@ impl DocumentResult {
             Self::Insert(_) => DocumentResultKind::Insert,
             Self::Update(_) => DocumentResultKind::Update,
             Self::Delete(_) => DocumentResultKind::Delete,
-            Self::IndexName(_) => DocumentResultKind::IndexName,
+            Self::IndexName(_) | Self::IndexReady(_) => DocumentResultKind::IndexName,
             Self::Indexes(_) => DocumentResultKind::Indexes,
             Self::CursorKilled(_) => DocumentResultKind::CursorKilled,
         }
@@ -460,7 +462,7 @@ impl fmt::Debug for DocumentResult {
             Self::Indexes(values) => {
                 debug.field("index_count", &values.len());
             }
-            Self::Collection(_) | Self::IndexName(_) => {
+            Self::Collection(_) | Self::IndexName(_) | Self::IndexReady(_) => {
                 debug.field("payload", &"<redacted>");
             }
         }

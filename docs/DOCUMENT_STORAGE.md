@@ -11,7 +11,7 @@ listener or a high-level embedded collection API.
 ## Logical catalog
 
 Manifest format 14 introduced document namespaces separate from the SQL table
-catalog, and the current format 18 retains that separation. A SQL table can
+catalog, and the current format 19 retains that separation. A SQL table can
 never become a collection through schema discovery. The manifest stores:
 
 - exact, case-sensitive database and collection names;
@@ -29,8 +29,8 @@ Database names contain 1 to 63 UTF-8 bytes. A complete
 compared byte-for-byte and may not contain NUL. Mongo names are not normalized
 through BriskDB's lowercase SQL identifier rules.
 
-All eight document catalog tables and the index-storage layout journal participate
-in semantic manifest digest version 10. Every supported mutation uses an immediate SQLite transaction,
+All eight document catalog tables and the index-storage layout and operation journals participate
+in semantic manifest digest version 11. Every supported mutation uses an immediate SQLite transaction,
 validates the complete catalog, refreshes the digest, and commits the metadata
 as one unit. Startup validates exact table definitions, foreign keys, row and
 byte bounds, supported versions, namespace limits, built-in index state, and
@@ -88,15 +88,16 @@ and binary subtype 4 containing the same 16 bytes.
 The fixed table and exact canonical-ID key provide safe `_id` candidate
 filtering today. Later query and index work may add conservative candidate
 structures, but BSON matching remains authoritative; SQLite candidates may
-never exclude a true Mongo match. Secondary index declarations remain
-`PendingBuild` until issue #174 installs and verifies their physical authority.
+never exclude a true Mongo match. Secondary declarations start `PendingBuild`;
+an explicit non-unique build can publish maintained physical entries as `Ready`.
+Secondary entries are not yet used by the query planner.
 
 All shard-local insert, replace and delete storage primitives require a
 caller-owned Rust transaction and reject handles whose SQLite transaction has
 already rolled back. Ordinary inserts commit one immediate transaction per
 input; exact-ID deletes also use an explicit immediate transaction. This closes
-the autocommit paths before future index-entry maintenance adds more statements
-to each mutation. It does not create physical entries or activate indexes.
+the autocommit paths; Ready index entries now commit in that same transaction.
+Pending declarations do not constrain document writes.
 Cancellation before commit rolls back the current input; earlier batch commits
 remain. Subprocess tests cover process death after the write, before commit and
 after commit, including the durable prefix of an interrupted insert batch.
@@ -105,7 +106,7 @@ The pure `DocumentIndexPreparation` helper now prepares all secondary definition
 from a collection snapshot under one bounded budget, returning scoped encoded
 keys only if every index succeeds. It preserves empty sparse/partial membership
 and excludes the built-in ID index. It does not access storage or certify current
-catalog authority; the future physical path must fence the snapshot and commit
+catalog authority; the physical path fences its selected Ready snapshot and commits
 entries with the document. Pending declarations remain non-enforcing. See the
 [shared-engine preparation contract](DOCUMENT_ENGINE.md#implemented-commands).
 
@@ -113,9 +114,9 @@ Manifest format 18 adds `briskdb_document_index_entries_v1`, keyed by
 `(collection_id, index_id, index_key, id_key)`, and a by-record index for future
 write maintenance. A foreign key ties entries to their owning records with
 delete cascading. The exact schema is excluded from application-schema hashes
-and SQL catalog discovery, and ordinary SQL cannot access it. Entry rows are
-not written or used yet: nonempty storage fails closed on reopen. Pending
-declarations still do not enforce uniqueness or accelerate reads.
+and SQL catalog discovery, and ordinary SQL cannot access it. Version 19 permits
+entries owned by built non-unique indexes and verifies exact coverage on reopen.
+Pending declarations still do not enforce uniqueness or accelerate reads.
 
 The version-18 upgrade installs a checksummed layout journal and version fence
 before changing shards. Startup, under sole-process ownership, finishes any
@@ -124,8 +125,26 @@ and commits a per-shard cursor before marking the layout Ready. Reopening after
 a process exit resumes idempotently; existing BSON, declaration bytes and IDs
 are unchanged. Empty roots stay physically empty until collection creation.
 Missing or malformed entry schema in an already-Ready root is corruption,
-not an invitation to rebuild. Entry maintenance, build coverage/activation,
-global uniqueness and planner use remain separate work under #174.
+not an invitation to rebuild.
+
+Version 19 adds a checksummed build/cleanup journal and a version-19 reader fence.
+`BuildIndex` (Python `session.build_index`) requires sole-process ownership and
+exclusive schema admission. It validates the complete existing and prospective
+index set before durable intent, builds each shard transactionally, and publishes
+Ready only after all shard commits. A crash before publication causes startup to
+discard only the journal-owned derived entries and retain the PendingBuild
+declaration; it never activates a partial build. An interrupted admitted build
+leaves schema operations fenced until the root is reopened for recovery.
+
+Each entry checksum binds collection, index, shard, canonical record ID, BDIK
+frame and the exact current record checksum. Inserts, replacements (including
+unindexed-field changes), and deletes maintain entries in the document's own
+transaction. A schema-fenced root-shared compiled cache selects only Ready
+indexes; opaque or unique pending declarations remain non-enforcing. Startup
+rejects missing, extra, stale or orphan entries without repair unless an explicit
+journal owns their cleanup. Global uniqueness, physical index drop, planner use
+and Mongo wire index commands remain work under #174. Dropping a built index
+currently returns Unsupported; namespace deletion can remove it with its records.
 
 ## Provisioning and restart
 

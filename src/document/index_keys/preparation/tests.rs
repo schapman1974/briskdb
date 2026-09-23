@@ -77,6 +77,40 @@ fn frames(result: &PreparedDocumentIndexEntries) -> Vec<(u64, bool, Vec<Vec<u8>>
 }
 
 #[test]
+fn storage_selection_never_interprets_or_enforces_unselected_pending_definitions() {
+    let ready = DocumentIndexMetadata::from_validated_parts(
+        DocumentIndexId::from_validated(7),
+        "ready".into(),
+        keys(),
+        false,
+        false,
+        DocumentIndexLifecycle::Ready,
+    );
+    let opaque = secondary(9, doc([("opaque", BsonValue::from("unknown"))]));
+    let metadata = collection([opaque, ready]);
+    assert!(DocumentIndexPreparation::compile(&metadata).is_err());
+    let active = DocumentIndexPreparation::compile_selected_with_check(
+        metadata.id(),
+        metadata.indexes(),
+        |index| index.lifecycle() == DocumentIndexLifecycle::Ready,
+        &mut || Ok(()),
+    )
+    .unwrap();
+    let prepared = active.prepare(&doc([("v", BsonValue::Int32(5))])).unwrap();
+    assert_eq!(prepared.indexes().len(), 1);
+    assert_eq!(prepared.indexes()[0].index_id().get(), 7);
+    assert!(!active.is_empty());
+    let empty = DocumentIndexPreparation::compile_selected_with_check(
+        metadata.id(),
+        metadata.indexes(),
+        |_| false,
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert!(empty.is_empty());
+}
+
+#[test]
 fn preparation_preserves_scoped_encoded_keys_membership_and_input() {
     let metadata = collection([
         secondary(7, keys()),

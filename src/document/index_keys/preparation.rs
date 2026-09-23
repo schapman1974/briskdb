@@ -5,7 +5,7 @@ use crate::{
     core::{EngineError, EngineErrorKind, EngineResult},
     document::{
         BsonDocument, BsonErrorContext, DocumentCollectionId, DocumentCollectionMetadata,
-        DocumentIndexId, encode_document, memory,
+        DocumentIndexId, DocumentIndexMetadata, encode_document, memory,
     },
 };
 
@@ -17,7 +17,7 @@ pub const MAX_DOCUMENT_PREPARED_INDEXES: usize = 64;
 ///
 /// Includes pending declarations, for future build validation. This is a pure
 /// preflight helper: it neither activates indexes nor enforces uniqueness nor
-/// certifies that metadata is current. A future storage caller must fence the
+/// certifies that metadata is current. A storage caller must fence the
 /// catalog and maintain entries in the same transaction as the document.
 /// Ordinary writes do not call this for today's non-enforcing pending indexes.
 ///
@@ -69,13 +69,26 @@ impl DocumentIndexPreparation {
         if collection.indexes().len() > MAX_DOCUMENT_PREPARED_INDEXES + 1 {
             return Err(limit());
         }
+        Self::compile_selected_with_check(collection.id(), collection.indexes(), |_| true, check)
+    }
+
+    /// Storage selects only authoritative Ready indexes for maintenance, or
+    /// one explicitly journaled index for a build. Selection itself is not a
+    /// freshness proof: its caller must retain schema admission/ownership.
+    pub(crate) fn compile_selected_with_check(
+        collection_id: DocumentCollectionId,
+        metadata: &[DocumentIndexMetadata],
+        include: impl Fn(&DocumentIndexMetadata) -> bool,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<Self> {
+        check()?;
         let mut budget = Budget::new(check);
         let mut indexes: Vec<CompiledIndex> = Vec::new();
         let mut retained_bytes = 256_usize;
         budget.charge(retained_bytes)?;
-        for metadata in collection.indexes() {
+        for metadata in metadata {
             budget.step()?;
-            if metadata.is_built_in() {
+            if metadata.is_built_in() || !include(metadata) {
                 continue;
             }
             if indexes.len() >= MAX_DOCUMENT_PREPARED_INDEXES {
@@ -115,7 +128,7 @@ impl DocumentIndexPreparation {
         }
         budget.step()?;
         Ok(Self {
-            collection_id: collection.id(),
+            collection_id,
             indexes,
             retained_bytes,
         })
@@ -123,6 +136,10 @@ impl DocumentIndexPreparation {
 
     pub const fn collection_id(&self) -> DocumentCollectionId {
         self.collection_id
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.indexes.is_empty()
     }
 
     /// Conservative owned-heap charge for retained compiled definitions.

@@ -165,6 +165,11 @@ pub(crate) fn execution_to_python(
             output.set_item("index_name", name)?;
             output.set_item("lifecycle", "pending_build")?;
         }
+        DocumentResult::IndexReady(name) => {
+            output.set_item("kind", "index_name")?;
+            output.set_item("index_name", name)?;
+            output.set_item("lifecycle", "ready")?;
+        }
         DocumentResult::Indexes(indexes) => {
             output.set_item("kind", "indexes")?;
             let values = PyList::empty(py);

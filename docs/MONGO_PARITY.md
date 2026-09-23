@@ -141,8 +141,12 @@ The version-18 upgrade adds empty physical secondary-index storage with a
 checksummed, restartable per-shard layout upgrade and an older-binary fence.
 Namespace creation/deletion owns the reserved tables; existing records, index
 specifications and IDs are preserved. This is storage groundwork, not index
-activation: transactional maintenance, builds, global uniqueness, planner use
-and Mongo wire index commands remain open under #174.
+activation by itself. Version 19 adds explicit native Rust/Python non-unique
+builds with journaled shard progress, atomic Ready publication, transactional
+entry maintenance and restart coverage/checksum validation. Unpublished builds
+are discarded on reopen without changing BSON or declaration IDs. Global
+uniqueness, physical index drop, planner use and Mongo wire index commands remain
+open under #174; these native additions do not expand the wire contract.
 
 `listDatabases` on `admin` supports `nameOnly: true`, including ordinary
 sync/async PyMongo `list_database_names()` and
@@ -438,7 +442,7 @@ numeric directions and generates bounded default names before catalog mutation.
 Required CI compares 64 valid ascending integer-key definitions with the unchanged
 frozen index model, including pending metadata after restart. Descending/numeric
 aliases and invalid/resource-limited definitions have independent tests. This is
-not physical index support: secondary declarations still enforce no uniqueness,
+not itself physical index support: secondary declarations still enforce no uniqueness,
 and wire index commands and metadata cursors remain unimplemented. The full frozen
 index suites remain open; no frozen expected result or allowance is changed.
 
@@ -450,7 +454,7 @@ BSON identities and the shared matcher. Every generated key is also serialized
 and restored through the versioned tuple codec before oracle comparison; opaque
 reference tokens and the frozen generator remain unchanged. Independent tests cover bounded work,
 eager validation, input immutability and interruption without partial results.
-This is not physical index activation, wire support or uniqueness enforcement.
+This pure helper is not physical index activation, wire support or uniqueness enforcement.
 The frozen helper subset rejects intermediate/parallel arrays, object/nested-array
 keys, ObjectId/date keys and nonfinite numeric keys; broader MongoDB index values
 remain open. Native Rust and sync/async Python declarations now accept sparse or

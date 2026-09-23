@@ -5,16 +5,16 @@ use std::time::{Duration, Instant};
 use briskdb::{
     core::{CancellationToken, Engine, EngineErrorKind, RequestContext, ResultLimits, Session},
     document::{
-        BsonDocument, BsonValue, DocumentAggregateRequest, DocumentCollectionExistsRequest,
-        DocumentCollectionMetadata, DocumentCollectionOptions, DocumentCommand,
-        DocumentCountRequest, DocumentCreateCollectionRequest, DocumentCreateIndexRequest,
-        DocumentDeleteRequest, DocumentDropIndexRequest, DocumentExecution, DocumentFilter,
-        DocumentFindRequest, DocumentIndexError, DocumentIndexKeyGenerator, DocumentIndexLifecycle,
-        DocumentIndexMetadata, DocumentIndexPreparation, DocumentIndexRequest,
-        DocumentInsertRequest, DocumentListCollectionsRequest, DocumentListIndexesRequest,
-        DocumentMutationScope, DocumentNamespace, DocumentPipeline, DocumentPlan,
-        DocumentProjection, DocumentReadOptions, DocumentRequest, DocumentRequestId,
-        DocumentResult, DocumentWriteOptions, encode_document,
+        BsonDocument, BsonValue, DocumentAggregateRequest, DocumentBuildIndexRequest,
+        DocumentCollectionExistsRequest, DocumentCollectionMetadata, DocumentCollectionOptions,
+        DocumentCommand, DocumentCountRequest, DocumentCreateCollectionRequest,
+        DocumentCreateIndexRequest, DocumentDeleteRequest, DocumentDropIndexRequest,
+        DocumentExecution, DocumentFilter, DocumentFindRequest, DocumentIndexError,
+        DocumentIndexKeyGenerator, DocumentIndexLifecycle, DocumentIndexMetadata,
+        DocumentIndexPreparation, DocumentIndexRequest, DocumentInsertRequest,
+        DocumentListCollectionsRequest, DocumentListIndexesRequest, DocumentMutationScope,
+        DocumentNamespace, DocumentPipeline, DocumentPlan, DocumentProjection, DocumentReadOptions,
+        DocumentRequest, DocumentRequestId, DocumentResult, DocumentWriteOptions, encode_document,
     },
 };
 use rusqlite::Connection;
@@ -142,6 +142,113 @@ fn create_index_command(index: DocumentIndexRequest) -> DocumentCommand {
         index,
         DocumentWriteOptions::new(),
     ))
+}
+
+fn build_index(name: &str) -> DocumentCommand {
+    DocumentCommand::BuildIndex(
+        DocumentBuildIndexRequest::new(namespace(), name, DocumentWriteOptions::new()).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn nonunique_index_build_controls_maintenance_and_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    create_collection(&engine, &session, 1).await;
+    insert(
+        &engine,
+        &session,
+        2,
+        vec![document(BsonValue::Int32(1), "same")],
+    )
+    .await;
+    declare_pending_index(&engine, &session, "label").await;
+    let token = CancellationToken::new();
+    token.cancel();
+    for (context, kind) in [
+        (
+            RequestContext::new().with_cancellation_token(token),
+            EngineErrorKind::Cancelled,
+        ),
+        (
+            RequestContext::new().with_result_limits(ResultLimits::new(1, 1).unwrap()),
+            EngineErrorKind::LimitExceeded,
+        ),
+    ] {
+        assert_eq!(
+            engine
+                .execute_document(&session, request(3, context, build_index("label")))
+                .await
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+        assert_eq!(
+            pending_indexes(&engine, &session).await[1].lifecycle(),
+            DocumentIndexLifecycle::PendingBuild
+        );
+    }
+    for _ in 0..2 {
+        let result = engine
+            .execute_document(
+                &session,
+                request(4, RequestContext::new(), build_index("label")),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result.result(), DocumentResult::IndexReady(name) if name == "label"));
+    }
+    declare_pending_index(&engine, &session, "label").await;
+    assert_eq!(
+        pending_indexes(&engine, &session).await[1].lifecycle(),
+        DocumentIndexLifecycle::Ready
+    );
+    insert(
+        &engine,
+        &session,
+        5,
+        vec![document(BsonValue::Int32(2), "same")],
+    )
+    .await;
+    assert_eq!(
+        engine
+            .execute_document(
+                &session,
+                request(6, RequestContext::new(), drop_index("label"))
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        EngineErrorKind::Unsupported
+    );
+    let count: i64 = (0..2)
+        .map(|shard| {
+            Connection::open(
+                temp.path()
+                    .join("shards")
+                    .join(format!("{shard:04}.sqlite")),
+            )
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM briskdb_document_index_entries_v1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        })
+        .sum();
+    assert_eq!(count, 2);
+    engine.shutdown().await.unwrap();
+    drop(session);
+    drop(engine);
+    let engine = Engine::open(temp.path(), 2).await.unwrap();
+    let session = engine.session();
+    assert_eq!(
+        pending_indexes(&engine, &session).await[1].lifecycle(),
+        DocumentIndexLifecycle::Ready
+    );
+    engine.shutdown().await.unwrap();
 }
 
 fn partial_index_filter() -> BsonDocument {

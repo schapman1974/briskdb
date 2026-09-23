@@ -77,6 +77,21 @@ impl Engine {
             )));
         }
         let result = match command {
+            DocumentCommand::BuildIndex(request) => {
+                let (namespace, name, options) = request.into_parts();
+                if let Err(error) = require_catalog_write_options(options) {
+                    Err(error)
+                } else {
+                    self.run_document_build_index(
+                        &mut operation,
+                        session,
+                        request_id,
+                        namespace,
+                        name,
+                    )
+                    .await
+                }
+            }
             DocumentCommand::CreateCollection(request) => {
                 let (namespace, options, write_options) = request.into_parts();
                 if let Err(error) = require_catalog_write_options(write_options) {
@@ -345,24 +360,29 @@ impl Engine {
                     .await?;
                 let metadata_storage = storage.clone();
                 let metadata_name = name.clone();
-                self.run_document_storage_task(
-                    cancellation,
-                    deadline,
-                    move |_cancellation, control| {
-                        metadata_storage.declare_document_index_controlled(
-                            collection_id,
-                            &metadata_name,
-                            &specification,
-                            unique,
-                            control,
-                        )
-                    },
-                )
-                .await?;
+                let metadata = self
+                    .run_document_storage_task(
+                        cancellation,
+                        deadline,
+                        move |_cancellation, control| {
+                            metadata_storage.declare_document_index_controlled(
+                                collection_id,
+                                &metadata_name,
+                                &specification,
+                                unique,
+                                control,
+                            )
+                        },
+                    )
+                    .await?;
                 Ok(DocumentExecution::new(
                     request_id,
                     None,
-                    DocumentResult::IndexName(name),
+                    if metadata.lifecycle() == crate::document::DocumentIndexLifecycle::Ready {
+                        DocumentResult::IndexReady(name)
+                    } else {
+                        DocumentResult::IndexName(name)
+                    },
                 ))
             }
             DocumentCommand::ListIndexes(request) => {
@@ -999,6 +1019,7 @@ impl Engine {
                 ))
             }
             DocumentCommand::CreateCollection(_)
+            | DocumentCommand::BuildIndex(_)
             | DocumentCommand::DropCollection(_)
             | DocumentCommand::DropDatabase(_) => Err(EngineError::new(
                 EngineErrorKind::Internal,
@@ -1035,6 +1056,62 @@ impl Engine {
             }
             result
         }
+    }
+
+    async fn run_document_build_index(
+        &self,
+        operation: &mut Operation,
+        session: &Session,
+        request_id: crate::document::DocumentRequestId,
+        namespace: DocumentNamespace,
+        name: String,
+    ) -> EngineResult<DocumentExecution> {
+        let migration = self.inner.database.storage.begin_schema_migration()?;
+        let session_preflight = operation.wait_pending(self.ready_session(session)).await?;
+        require_document_session_ready(&session_preflight)?;
+        drop(session_preflight);
+        operation
+            .wait_pending(async {
+                migration.wait_for_quiescence().await;
+                Ok(())
+            })
+            .await?;
+        let session = operation.wait_pending(self.ready_session(session)).await?;
+        require_document_session_ready(&session)?;
+        let worker = operation.wait_pending(self.inner.workers.acquire()).await?;
+        operation.check_before_start()?;
+        let lease = operation.take_lease();
+        let worker_control = Arc::clone(&operation.control);
+        let result_limits = operation.result_limits;
+        let storage = self.inner.database.storage.clone();
+        let connections = self.inner.connections.clone();
+        let join = worker.spawn(move || {
+            let _lease = lease;
+            let _session = session;
+            // Allocate and validate the response before durable build intent.
+            let execution =
+                DocumentExecution::new(request_id, None, DocumentResult::IndexReady(name.clone()));
+            let result = enforce_execution_result_limits(&execution, result_limits)
+                .and_then(|_| connections.retire_idle_for_schema_migration())
+                .and_then(|_| {
+                    storage.build_document_index_controlled(
+                        namespace.database(),
+                        namespace.collection(),
+                        &name,
+                        migration,
+                        Arc::clone(&worker_control),
+                    )
+                })
+                .map(|_| execution);
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == EngineErrorKind::DataCorruption)
+            {
+                storage.record_schema_degraded();
+            }
+            worker_control.complete(result)
+        });
+        operation.wait_started(join).await
     }
 
     async fn run_document_create_collection(
@@ -2363,7 +2440,7 @@ fn enforce_execution_result_limits_with_check(
                 budget.add_value(id, check)?;
             }
         }
-        DocumentResult::IndexName(name) => {
+        DocumentResult::IndexName(name) | DocumentResult::IndexReady(name) => {
             budget.add_rows(1)?;
             budget.add_bytes(DOCUMENT_RESULT_ROW_BYTES + DOCUMENT_RESULT_VALUE_BYTES)?;
             budget.add_bytes(u64::try_from(name.len()).unwrap_or(u64::MAX))?;
@@ -2498,6 +2575,7 @@ fn execution_result_is_mutation(result: &DocumentResult) -> bool {
             | DocumentResult::Update(_)
             | DocumentResult::Delete(_)
             | DocumentResult::IndexName(_)
+            | DocumentResult::IndexReady(_)
             | DocumentResult::CursorKilled(_)
     )
 }
