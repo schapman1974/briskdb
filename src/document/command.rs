@@ -12,6 +12,8 @@ use super::{
 
 /// Maximum UTF-8 byte length of a user-defined document index name.
 pub const MAX_DOCUMENT_INDEX_NAME_BYTES: usize = 255;
+/// Maximum number of definitions in one foreground index-creation batch.
+pub const MAX_DOCUMENT_INDEX_BATCH_SIZE: usize = 1000;
 
 fn invalid_argument(message: impl Into<String>) -> EngineError {
     EngineError::new(EngineErrorKind::InvalidArgument, message)
@@ -1233,6 +1235,60 @@ impl fmt::Debug for DocumentCreateIndexRequest {
     }
 }
 
+/// Create a bounded, ordered batch under one exclusive schema admission.
+/// Shape validation is eager; a runtime failure can retain a completed prefix.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentCreateIndexesRequest {
+    namespace: DocumentNamespace,
+    indexes: Box<[DocumentIndexRequest]>,
+    write_options: DocumentWriteOptions,
+}
+
+impl DocumentCreateIndexesRequest {
+    pub fn new(
+        namespace: DocumentNamespace,
+        indexes: Vec<DocumentIndexRequest>,
+        write_options: DocumentWriteOptions,
+    ) -> EngineResult<Self> {
+        if indexes.is_empty() || indexes.len() > MAX_DOCUMENT_INDEX_BATCH_SIZE {
+            return Err(invalid_argument("invalid document index batch size"));
+        }
+        let mut bytes = 0;
+        for index in &indexes {
+            add_request_payload_bytes(&mut bytes, index.keys())?;
+            add_request_payload_len(&mut bytes, index.name().map_or(0, str::len))?;
+            if let Some(filter) = index.partial_filter() {
+                add_request_payload_bytes(&mut bytes, filter.document())?;
+            }
+        }
+        Ok(Self {
+            namespace,
+            indexes: indexes.into_boxed_slice(),
+            write_options,
+        })
+    }
+
+    pub const fn namespace(&self) -> &DocumentNamespace {
+        &self.namespace
+    }
+    pub fn indexes(&self) -> &[DocumentIndexRequest] {
+        &self.indexes
+    }
+    pub const fn write_options(&self) -> DocumentWriteOptions {
+        self.write_options
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        DocumentNamespace,
+        Box<[DocumentIndexRequest]>,
+        DocumentWriteOptions,
+    ) {
+        (self.namespace, self.indexes, self.write_options)
+    }
+}
+
 /// Build a declared non-unique index under exclusive schema admission.
 /// Queries continue to use the existing scan planner after the build.
 #[non_exhaustive]
@@ -1415,6 +1471,7 @@ pub enum DocumentCommandKind {
     Delete,
     CreateIndex,
     CreateBuiltIndex,
+    CreateIndexes,
     BuildIndex,
     DropIndex,
     ListIndexes,
@@ -1448,6 +1505,8 @@ pub enum DocumentCommand {
     CreateIndex(DocumentCreateIndexRequest),
     /// Create and build a non-unique secondary index in one exclusive operation.
     CreateBuiltIndex(DocumentCreateIndexRequest),
+    /// Create indexes with logical-definition name conflict checks.
+    CreateIndexes(DocumentCreateIndexesRequest),
     BuildIndex(DocumentBuildIndexRequest),
     DropIndex(DocumentDropIndexRequest),
     ListIndexes(DocumentListIndexesRequest),
@@ -1479,6 +1538,7 @@ impl DocumentCommand {
             Self::Delete(_) => DocumentCommandKind::Delete,
             Self::CreateIndex(_) => DocumentCommandKind::CreateIndex,
             Self::CreateBuiltIndex(_) => DocumentCommandKind::CreateBuiltIndex,
+            Self::CreateIndexes(_) => DocumentCommandKind::CreateIndexes,
             Self::BuildIndex(_) => DocumentCommandKind::BuildIndex,
             Self::DropIndex(_) => DocumentCommandKind::DropIndex,
             Self::ListIndexes(_) => DocumentCommandKind::ListIndexes,

@@ -678,7 +678,7 @@ requires an earlier dependency:
       Process-exit tests cover build/abort commit boundaries. Interrupted builds
       reopen as pending with only their derived entries removed. Opaque/unique
       pending declarations stay non-enforcing; reads still scan. Global uniqueness,
-      planner use and wire index creation/removal remain open.
+      planner use and wire index removal remain open.
       Exact native `DropIndex`/sync/async `drop_index` now removes built indexes
       with version-19 Drop intent, sealed per-shard cleanup and restart completion.
       BSON, surviving Ready entries and permanent allocation history are preserved;
@@ -699,7 +699,15 @@ requires an earlier dependency:
       removes that declaration on reopen, while preexisting Pending declarations
       survive aborted builds. Crash/recovery and admitted-cancellation tests
       preserve records, surviving entries and nonreused index identities.
-      This is the creation prerequisite, not yet wire `createIndexes`.
+      Native `CreateIndexes` now powers Mongo `createIndexes` and sync/async
+      PyMongo `create_index` / `create_indexes`: bounded eager batch validation,
+      sole-process admission retained across entries, actual Ready counts,
+      built-in ID no-ops and source-compatible 85/86 name conflicts. Completed
+      prefixes survive runtime failures; unfinished new entries are removed on
+      reopen without changing earlier indexes or records. Real-driver restart,
+      raw malformed-batch, source-locked metadata and crash-boundary tests cover
+      this path. Wire removal, unique enforcement, planner acceleration and
+      broader IndexModel warning/degradation compatibility remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

@@ -684,6 +684,147 @@ async fn send_command(stream: &mut TcpStream, body: &BsonDocument) -> BsonDocume
 }
 
 #[tokio::test]
+async fn index_creation_rejects_duplicate_options_and_malformed_batches_before_namespace_creation()
+{
+    fn doc(entries: Vec<(&str, BsonValue)>) -> BsonDocument {
+        BsonDocument::from_entries(entries).unwrap()
+    }
+    async fn reject_duplicate(address: std::net::SocketAddr, body: &BsonDocument) {
+        use briskdb::document::{
+            BsonCodecOptions, DuplicateFieldPolicy, encode_document_with_options,
+        };
+        let raw = encode_document_with_options(
+            body,
+            &BsonCodecOptions::new().with_duplicate_field_policy(DuplicateFieldPolicy::Preserve),
+        )
+        .unwrap();
+        let mut payload = BytesMut::new();
+        payload.put_u32_le(0);
+        payload.put_u8(0);
+        payload.extend_from_slice(&raw);
+        let mut bytes = BytesMut::new();
+        FrameCodec::default()
+            .encode(
+                Frame {
+                    request_id: 77,
+                    response_to: 0,
+                    opcode: Opcode::Message,
+                    payload: payload.freeze(),
+                },
+                &mut bytes,
+            )
+            .unwrap();
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        // Duplicate BSON fields are fatal at the decoder, before command parsing.
+        disconnected(&mut stream).await;
+    }
+    let (root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let keys = || BsonValue::Document(doc(vec![("value", BsonValue::Int32(1))]));
+    let good = || BsonValue::Document(doc(vec![("key", keys())]));
+    let bad_entries = vec![
+        BsonValue::Document(doc(vec![
+            ("key", keys()),
+            ("name", BsonValue::from("a")),
+            ("name", BsonValue::from("b")),
+        ])),
+        BsonValue::Document(doc(vec![(
+            "key",
+            BsonValue::Document(doc(vec![
+                ("value", BsonValue::Int32(1)),
+                ("value", BsonValue::Int32(-1)),
+            ])),
+        )])),
+        BsonValue::Document(doc(vec![
+            ("key", keys()),
+            ("sparse", BsonValue::Boolean(true)),
+            ("sparse", BsonValue::Boolean(false)),
+        ])),
+    ];
+    for bad in bad_entries {
+        let body = doc(vec![
+            ("createIndexes", BsonValue::from("absent")),
+            ("indexes", BsonValue::Array(vec![good(), bad])),
+            ("$db", BsonValue::from("wire")),
+        ]);
+        reject_duplicate(server.address(), &body).await;
+    }
+    let duplicate_body = doc(vec![
+        ("createIndexes", BsonValue::from("absent")),
+        ("indexes", BsonValue::Array(vec![good()])),
+        ("indexes", BsonValue::Array(vec![good()])),
+        ("$db", BsonValue::from("wire")),
+    ]);
+    reject_duplicate(server.address(), &duplicate_body).await;
+    for indexes in [
+        vec![],
+        vec![good(); 1001],
+        vec![good(), BsonValue::Int32(1)],
+    ] {
+        let body = doc(vec![
+            ("createIndexes", BsonValue::from("absent")),
+            ("indexes", BsonValue::Array(indexes)),
+            ("$db", BsonValue::from("wire")),
+        ]);
+        assert_eq!(
+            send_command(&mut stream, &body).await.get_first("ok"),
+            Some(&BsonValue::Double(0.0))
+        );
+    }
+    for extra in [
+        (
+            "writeConcern",
+            BsonValue::Document(doc(vec![("w", BsonValue::Int32(0))])),
+        ),
+        ("commitQuorum", BsonValue::Int32(1)),
+        ("maxTimeMS", BsonValue::Int32(-1)),
+    ] {
+        let body = doc(vec![
+            ("createIndexes", BsonValue::from("absent")),
+            ("indexes", BsonValue::Array(vec![good()])),
+            ("$db", BsonValue::from("wire")),
+            extra,
+        ]);
+        assert_eq!(
+            send_command(&mut stream, &body).await.get_first("ok"),
+            Some(&BsonValue::Double(0.0))
+        );
+    }
+    // Index DDL rejects document sequences rather than treating them as writes.
+    let body = doc(vec![
+        ("createIndexes", BsonValue::from("absent")),
+        ("indexes", BsonValue::Array(vec![good()])),
+        ("$db", BsonValue::from("wire")),
+    ]);
+    let mut bytes = packet(&body, 77, 0);
+    let raw = encode_document(&BsonDocument::new()).unwrap();
+    bytes.put_u8(1);
+    bytes.put_i32_le((4 + 10 + raw.len()) as i32);
+    bytes.extend_from_slice(b"documents\0");
+    bytes.extend_from_slice(&raw);
+    let length = bytes.len() as i32;
+    bytes[..4].copy_from_slice(&length.to_le_bytes());
+    stream.write_all(&bytes).await.unwrap();
+    assert_eq!(
+        response(&mut stream).await.1.get_first("code"),
+        Some(&BsonValue::Int32(72))
+    );
+    drop(stream);
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+    let manifest = rusqlite::Connection::open(root.path().join("manifest.sqlite")).unwrap();
+    let count: i64 = manifest
+        .query_row(
+            "SELECT count(*) FROM briskdb_document_collections",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn multi_update_errors_distinguish_confirmed_rollback_from_prior_commits() {
     fn doc<const N: usize>(fields: [(&str, BsonValue); N]) -> BsonDocument {
         BsonDocument::from_entries(fields).unwrap()

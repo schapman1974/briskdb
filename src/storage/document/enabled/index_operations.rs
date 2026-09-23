@@ -23,6 +23,24 @@ struct BuildOutcome {
     after: u64,
 }
 
+fn equivalent_definition(left: &DocumentIndexMetadata, right: &DocumentIndexMetadata) -> bool {
+    let (Some(left_definition), Some(right_definition)) = (left.definition(), right.definition())
+    else {
+        return false;
+    };
+    left.is_unique() == right.is_unique()
+        && left_definition.keys() == right_definition.keys()
+        && left_definition.sparse() == right_definition.sparse()
+        && match (
+            left_definition.partial_filter(),
+            right_definition.partial_filter(),
+        ) {
+            (None, None) => true,
+            (Some(left), Some(right)) => left.representation_eq(right),
+            _ => false,
+        }
+}
+
 #[cfg(test)]
 fn build_checkpoint(created: bool, point: &str, shard: u16) {
     if created {
@@ -393,6 +411,88 @@ impl Storage {
         mut migration: SchemaMigrationGuard,
         control: Arc<OperationControl>,
     ) -> EngineResult<BuildOutcome> {
+        let outcome = self.build_or_create_document_index_under_guard(
+            database,
+            collection_name,
+            name,
+            declaration,
+            &mut migration,
+            control,
+            false,
+        )?;
+        migration.publish_ready()?;
+        Ok(outcome)
+    }
+
+    pub(crate) fn create_document_indexes_controlled(
+        &self,
+        namespace: &DocumentNamespace,
+        indexes: Vec<crate::document::DocumentIndexBuildDefinition>,
+        mut migration: SchemaMigrationGuard,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<(u64, u64)> {
+        let result = (|| {
+            ensure_control_active(&control, "before creating document indexes")?;
+            migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
+            let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+            let before =
+                run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
+                    configure_journal_mode(connection)?;
+                    require_ready_manifest(connection, self.shard_count())?;
+                    let catalog = load_catalog_rows(connection)?;
+                    let collection = catalog
+                        .collection(namespace.database(), namespace.collection())
+                        .ok_or_else(|| {
+                            EngineError::new(
+                                EngineErrorKind::InvalidArgument,
+                                "document collection does not exist",
+                            )
+                        })?;
+                    Ok(collection
+                        .indexes()
+                        .iter()
+                        .filter(|index| index.lifecycle() == DocumentIndexLifecycle::Ready)
+                        .count() as u64)
+                })?;
+            let mut after = before;
+            for index in indexes {
+                ensure_control_active(&control, "between document index builds")?;
+                if let crate::document::DocumentIndexBuildDefinition::Secondary {
+                    specification,
+                    name,
+                    unique,
+                } = index
+                {
+                    after = self
+                        .build_or_create_document_index_under_guard(
+                            namespace.database(),
+                            namespace.collection(),
+                            &name,
+                            Some((&specification, unique)),
+                            &mut migration,
+                            Arc::clone(&control),
+                            true,
+                        )?
+                        .after;
+                }
+            }
+            migration.publish_ready()?;
+            Ok((before, after))
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_or_create_document_index_under_guard(
+        &self,
+        database: &str,
+        collection_name: &str,
+        name: &str,
+        declaration: Option<(&BsonDocument, bool)>,
+        migration: &mut SchemaMigrationGuard,
+        control: Arc<OperationControl>,
+        strict_compatibility: bool,
+    ) -> EngineResult<BuildOutcome> {
         let result = (|| {
             ensure_control_active(&control, "before building document index")?;
             migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
@@ -416,13 +516,38 @@ impl Storage {
                 .iter()
                 .find(|index| index.name() == name);
             if let Some((specification, unique)) = declaration {
+                if strict_compatibility {
+                    let proposed = DocumentIndexMetadata::from_validated_parts(
+                        DocumentIndexId::from_validated(1),
+                        name.to_owned(),
+                        specification.clone(),
+                        unique,
+                        false,
+                        DocumentIndexLifecycle::PendingBuild,
+                    );
+                    if let Some(existing) = existing {
+                        if !equivalent_definition(existing, &proposed) {
+                            return Err(DocumentIndexError::KeySpecsConflict.into_engine_error());
+                        }
+                    } else {
+                        for index in collection.indexes() {
+                            ensure_control_active(
+                                &control,
+                                "while checking document index conflicts",
+                            )?;
+                            if equivalent_definition(index, &proposed) {
+                                return Err(DocumentIndexError::OptionsConflict.into_engine_error());
+                            }
+                        }
+                    }
+                }
                 if unique {
                     return Err(EngineError::new(
                         EngineErrorKind::Unsupported,
                         "physical unique document indexes require global uniqueness authority",
                     ));
                 }
-                if let Some(existing) = existing {
+                if let Some(existing) = existing.filter(|_| !strict_compatibility) {
                     let canonical_keys = !specification.is_empty()
                         && specification
                             .iter()
@@ -570,7 +695,7 @@ impl Storage {
                 })?;
             }
             if target.lifecycle() == DocumentIndexLifecycle::Ready {
-                migration.publish_ready()?;
+                migration.mark_ready_on_drop();
                 return Ok(BuildOutcome {
                     metadata: target.clone(),
                     before,
@@ -744,7 +869,7 @@ impl Storage {
                 },
             )?;
             self.publish_document_indexes(future)?;
-            migration.publish_ready()?;
+            migration.mark_ready_on_drop();
             Ok(BuildOutcome {
                 metadata,
                 before,

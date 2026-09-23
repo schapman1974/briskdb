@@ -1651,6 +1651,80 @@ def lifecycle_smoke(uri):
         assert client.wire_lifecycle_keep.one.count_documents({}) == 1
 
 
+def index_creation_smoke(uri):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        database = client.wire_index_create
+        collection = database.items
+        collection.insert_many([{"_id": n, "value": n, "tail": 12 - n, "active": n % 2 == 0} for n in range(12)])
+        assert collection.create_index("value") == "value_1"
+        models = [
+            pymongo.IndexModel([("value", 1), ("tail", -1)], name="compound", sparse=True),
+            pymongo.IndexModel("tail", name="partial", partialFilterExpression={"active": True}),
+            pymongo.IndexModel("_id"),
+        ]
+        assert collection.create_indexes(models) == ["compound", "partial", "_id_1"]
+        for definitions, before, after in [
+            ([{"key": {"value": 1}, "name": "value_1"}], 4, 4),
+            ([{"key": {"_id": 1}, "name": "ignored"}], 4, 4),
+            ([{"key": {"active": 1}, "name": "active"}, {"key": {"active": 1}, "name": "active"}], 4, 5),
+        ]:
+            result = database.command("createIndexes", "items", indexes=definitions)
+            assert (result["numIndexesBefore"], result["numIndexesAfter"]) == (before, after)
+        for definitions, code in [
+            ([{"key": {"value": 1}, "name": "value_1", "unique": True}], 86),
+            ([{"key": {"tail": 1}, "name": "value_1"}], 86),
+            ([{"key": {"value": 1}, "name": "another"}], 85),
+            ([{"key": {"_id": 1}, "unique": False}], 197),
+            ([{"key": {"_id": 1}, "unique": True}], 197),
+            ([{"key": {"new": 1}, "unique": True}], 115),
+        ]:
+            try:
+                database.command("createIndexes", "items", indexes=definitions)
+            except OperationFailure as error:
+                assert error.code == code, (error.code, code)
+            else:
+                raise AssertionError("index conflict/options must fail")
+        # Invalid late shapes are rejected before an implicit collection exists.
+        for bad in [
+            {"key": {"bad": "hashed"}}, {"key": {"bad": True}},
+            {"key": {"bad": 1}, "expireAfterSeconds": 60},
+            {"key": {"bad": 1}, "unique": 1},
+            {"key": {"bad": 1}, "partialFilterExpression": {"bad": {"$unknown": 1}}},
+            {"key": {"bad": 1}, "sparse": True, "partialFilterExpression": {"bad": 1}},
+        ]:
+            try:
+                database.command("createIndexes", "absent", indexes=[{"key": {"good": 1}}, bad])
+            except OperationFailure:
+                pass
+            else:
+                raise AssertionError("invalid index batch was accepted")
+            assert "absent" not in database.list_collection_names()
+        # Runtime failure retains the completed prefix and leaves the root usable.
+        try:
+            database.command("createIndexes", "prefix", indexes=[
+                {"key": {"value": 1}, "name": "first"},
+                {"key": {"second": 1}, "unique": True},
+            ])
+        except OperationFailure as error:
+            assert error.code == 115
+        else:
+            raise AssertionError("unsupported unique build succeeded")
+        assert set(database.prefix.index_information()) == {"_id_", "first"}
+        collection.update_one({"_id": 1}, {"$set": {"active": True, "value": 100}})
+        collection.delete_one({"_id": 2})
+        collection.insert_one({"_id": 12, "value": 12, "tail": 0, "active": True})
+        assert collection.count_documents({}) == 12
+
+
+async def async_index_creation_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        collection = client.wire_index_create.async_items
+        assert await collection.create_index("value") == "value_1"
+        assert await collection.create_indexes([pymongo.IndexModel("tail"), pymongo.IndexModel("_id")]) == ["tail_1", "_id_1"]
+        assert set(await collection.index_information()) == {"_id_", "tail_1", "value_1"}
+        await collection.insert_one({"_id": 1, "value": 2, "tail": 3})
+
+
 def index_metadata_smoke(uri):
     expected = [
         {"name": "_id_", "key": {"_id": 1}},
@@ -1696,6 +1770,11 @@ async def async_index_metadata_smoke(uri):
 
 def persisted_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
+        assert set(client.wire_index_create.items.index_information()) == {"_id_", "value_1", "compound", "partial", "active"}
+        assert client.wire_index_create.items.count_documents({}) == 12
+        assert client.wire_index_create.items.find_one({"_id": 1})["value"] == 100
+        assert set(client.wire_index_create.prefix.index_information()) == {"_id_", "first"}
+        assert set(client.wire_index_create.async_items.index_information()) == {"_id_", "tail_1", "value_1"}
         assert client.wire_operator_upsert.items.count_documents({}) == 4
         assert client.wire_operator_upsert.items.find_one({"_id": None}) == {"_id": None, "counter": 7, "stamp": Timestamp(0, 0)}
         assert client.wire_operator_upsert.concurrent.find_one() == {"_id": 999, "counter": 32}
@@ -2127,6 +2206,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[2] == "reopened":
         persisted_smoke(sys.argv[1])
     else:
+        index_creation_smoke(sys.argv[1])
+        asyncio.run(async_index_creation_smoke(sys.argv[1]))
         sync_smoke(sys.argv[1])
         document_smoke(sys.argv[1])
         batch_smoke(sys.argv[1])

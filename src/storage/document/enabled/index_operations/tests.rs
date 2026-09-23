@@ -54,6 +54,135 @@ fn high_water(root: &Path) -> i64 {
         .unwrap()
 }
 
+fn create_batch(
+    storage: &Storage,
+    indexes: Vec<crate::document::DocumentIndexRequest>,
+) -> EngineResult<(u64, u64)> {
+    let definitions =
+        crate::document::normalize_index_batch(indexes.into_boxed_slice(), &mut || Ok(()))?;
+    let migration = storage.begin_schema_migration()?;
+    migration.wait_for_quiescence_blocking();
+    storage.create_document_indexes_controlled(
+        &DocumentNamespace::new("app", "items").unwrap(),
+        definitions,
+        migration,
+        OperationControl::new(None),
+    )
+}
+
+fn batch_index(field: &str, name: &str) -> crate::document::DocumentIndexRequest {
+    crate::document::DocumentIndexRequest::new(
+        BsonDocument::from_entries([(field, BsonValue::Int32(1))]).unwrap(),
+    )
+    .unwrap()
+    .with_name(name)
+    .unwrap()
+}
+
+#[test]
+fn strict_batch_matches_legacy_envelope_without_rewriting_identity_or_definition() {
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    let specification = BsonDocument::from_entries([
+        ("v", BsonValue::Int32(2)),
+        ("name", BsonValue::from("legacy")),
+        (
+            "key",
+            BsonValue::Document(
+                BsonDocument::from_entries([("other", BsonValue::Int64(1))]).unwrap(),
+            ),
+        ),
+        ("unique", BsonValue::Boolean(false)),
+        ("sparse", BsonValue::Boolean(false)),
+        ("partialFilterExpression", BsonValue::Null),
+    ])
+    .unwrap();
+    let original = storage
+        .declare_document_index(collection, "legacy", &specification, false)
+        .unwrap();
+    assert_eq!(
+        create_batch(&storage, vec![batch_index("other", "legacy")]).unwrap(),
+        (1, 2)
+    );
+    // Matching name wins even if a permissive legacy API declared a duplicate.
+    storage
+        .declare_document_index(
+            collection,
+            "duplicate",
+            &BsonDocument::from_entries([("other", BsonValue::Int32(1))]).unwrap(),
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        create_batch(&storage, vec![batch_index("other", "legacy")]).unwrap(),
+        (2, 2)
+    );
+    let catalog = storage.document_catalog().unwrap();
+    let actual = catalog
+        .collection("app", "items")
+        .unwrap()
+        .indexes()
+        .iter()
+        .find(|i| i.name() == "legacy")
+        .unwrap();
+    assert_eq!(actual.id(), original.id());
+    assert!(actual.specification().representation_eq(&specification));
+    let error = create_batch(&storage, vec![batch_index("other", "new")]).unwrap_err();
+    assert_eq!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<DocumentIndexError>(),
+        Some(&DocumentIndexError::OptionsConflict)
+    );
+}
+
+#[test]
+fn batch_crash_preserves_completed_prefix_and_cleans_only_unfinished_entry() {
+    for count in [2, 4] {
+        let mut points = vec![
+            "create-before-intent:0".to_owned(),
+            "create-after-intent:0".to_owned(),
+            "create-before-activation:0".to_owned(),
+            "create-after-activation:0".to_owned(),
+        ];
+        for shard in 0..count {
+            points.push(format!("create-before-shard:{shard}"));
+            points.push(format!("create-after-shard:{shard}"));
+        }
+        for point in points {
+            let temp = tempfile::tempdir().unwrap();
+            let (storage, _) = setup(temp.path(), count);
+            let records = snapshot(temp.path(), count, "briskdb_documents_v1");
+            drop(storage);
+            crash_operation_mode(temp.path(), count, &point, false, None, true);
+            let storage = Storage::open(temp.path(), count).unwrap();
+            let catalog = storage.document_catalog().unwrap();
+            let indexes = catalog.collection("app", "items").unwrap().indexes();
+            assert!(
+                indexes
+                    .iter()
+                    .any(|i| i.name() == "value" && i.lifecycle() == DocumentIndexLifecycle::Ready)
+            );
+            let finished = point == "create-after-activation:0";
+            assert_eq!(indexes.len(), if finished { 3 } else { 2 });
+            assert_eq!(indexes.iter().any(|i| i.name() == "other"), finished);
+            assert_eq!(
+                snapshot(temp.path(), count, "briskdb_documents_v1"),
+                records
+            );
+            let before = if finished { 3 } else { 2 };
+            assert_eq!(
+                create_batch(
+                    &storage,
+                    vec![batch_index("value", "value"), batch_index("other", "other")]
+                )
+                .unwrap(),
+                (before, 3)
+            );
+        }
+    }
+}
+
 #[test]
 fn combined_creation_publishes_entries_counts_and_shared_cache_without_record_rewrites() {
     let temp = tempfile::tempdir().unwrap();
@@ -636,7 +765,13 @@ fn index_operation_crash_child() {
         .parse()
         .unwrap();
     let storage = Storage::open(root, count).unwrap();
-    if let Ok(name) = std::env::var("BRISKDB_TEST_INDEX_OPERATION_CREATE") {
+    if std::env::var("BRISKDB_TEST_INDEX_OPERATION_BATCH").as_deref() == Ok("1") {
+        create_batch(
+            &storage,
+            vec![batch_index("value", "value"), batch_index("other", "other")],
+        )
+        .unwrap();
+    } else if let Ok(name) = std::env::var("BRISKDB_TEST_INDEX_OPERATION_CREATE") {
         create_built(&storage, &name, "value").unwrap();
     } else if std::env::var("BRISKDB_TEST_INDEX_OPERATION_DROP").as_deref() == Ok("1") {
         drop_built(&storage, "value").unwrap();
@@ -655,6 +790,17 @@ fn crash_mode(root: &Path, count: u16, point: &str, dropping: bool) {
 }
 
 fn crash_operation(root: &Path, count: u16, point: &str, dropping: bool, creating: Option<&str>) {
+    crash_operation_mode(root, count, point, dropping, creating, false);
+}
+
+fn crash_operation_mode(
+    root: &Path,
+    count: u16,
+    point: &str,
+    dropping: bool,
+    creating: Option<&str>,
+    batch: bool,
+) {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap());
     child
         .args([
@@ -664,6 +810,10 @@ fn crash_operation(root: &Path, count: u16, point: &str, dropping: bool, creatin
         ])
         .env("BRISKDB_TEST_INDEX_OPERATION_ROOT", root)
         .env("BRISKDB_TEST_INDEX_OPERATION_SHARDS", count.to_string())
+        .env(
+            "BRISKDB_TEST_INDEX_OPERATION_BATCH",
+            if batch { "1" } else { "0" },
+        )
         .env("BRISKDB_TEST_DOCUMENT_INDEX_OPERATION_CRASH", point)
         .env(
             "BRISKDB_TEST_INDEX_OPERATION_DROP",

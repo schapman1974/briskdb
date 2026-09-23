@@ -435,6 +435,10 @@ impl SchemaMigrationGuard {
         self.local.mark_pending_on_drop();
     }
 
+    pub(crate) fn mark_ready_on_drop(&mut self) {
+        self.local.mark_ready_on_drop();
+    }
+
     fn acquire_process_ownership(
         &mut self,
         lease: &process_lock::RootProcessLease,

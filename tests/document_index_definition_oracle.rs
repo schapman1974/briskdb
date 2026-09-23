@@ -23,16 +23,22 @@ fn request(command: DocumentCommand) -> DocumentRequest {
 #[tokio::test]
 #[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
 async fn built_index_metadata_matches_locked_client_after_build_drop_and_reopen() {
-    assert_built_index_metadata(false).await;
+    assert_built_index_metadata(0).await;
 }
 
 #[tokio::test]
 #[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
 async fn combined_index_creation_matches_locked_client_metadata_and_reopen() {
-    assert_built_index_metadata(true).await;
+    assert_built_index_metadata(1).await;
 }
 
-async fn assert_built_index_metadata(combined: bool) {
+#[tokio::test]
+#[ignore = "requires source-locked test-only TinyMongo; CI runs this explicitly"]
+async fn batch_index_creation_matches_locked_client_metadata_and_reopen() {
+    assert_built_index_metadata(2).await;
+}
+
+async fn assert_built_index_metadata(mode: u8) {
     use briskdb::document::{
         DocumentBuildIndexRequest, DocumentContinueCursorRequest, DocumentDropIndexRequest,
         DocumentFilter, DocumentListIndexMetadataRequest,
@@ -114,7 +120,16 @@ async fn assert_built_index_metadata(combined: bool) {
             let execution = engine
                 .execute_document(
                     &session,
-                    request(if combined {
+                    request(if mode == 2 {
+                        DocumentCommand::CreateIndexes(
+                            briskdb::document::DocumentCreateIndexesRequest::new(
+                                namespace.clone(),
+                                vec![definition.index().clone()],
+                                DocumentWriteOptions::new(),
+                            )
+                            .unwrap(),
+                        )
+                    } else if mode == 1 {
                         DocumentCommand::CreateBuiltIndex(definition.clone())
                     } else {
                         DocumentCommand::CreateIndex(definition.clone())
@@ -122,7 +137,16 @@ async fn assert_built_index_metadata(combined: bool) {
                 )
                 .await
                 .unwrap();
-            if combined {
+            if mode == 2 {
+                let before = expected.len().max(1) as u64;
+                assert_eq!(
+                    execution.result(),
+                    &DocumentResult::IndexesBuilt {
+                        before,
+                        after: before + 1
+                    }
+                );
+            } else if mode == 1 {
                 let before = expected.len().max(1) as u64;
                 assert_eq!(
                     execution.result(),

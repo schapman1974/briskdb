@@ -45,15 +45,16 @@ pub use codec::{
 pub use command::{
     DocumentAggregateRequest, DocumentBuildIndexRequest, DocumentCollectionExistsRequest,
     DocumentCommand, DocumentCommandKind, DocumentContinueCursorRequest, DocumentCountRequest,
-    DocumentCreateCollectionRequest, DocumentCreateIndexRequest, DocumentCursorId,
-    DocumentDeleteRequest, DocumentDistinctRequest, DocumentDropCollectionRequest,
-    DocumentDropDatabaseRequest, DocumentDropIndexRequest, DocumentFindOneAndDeleteRequest,
-    DocumentFindOneAndReplaceRequest, DocumentFindOneAndUpdateRequest, DocumentFindRequest,
-    DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
-    DocumentListCollectionMetadataRequest, DocumentListCollectionsRequest,
-    DocumentListDatabaseNamesRequest, DocumentListIndexMetadataRequest, DocumentListIndexesRequest,
-    DocumentMutationScope, DocumentNamespace, DocumentReplaceRequest, DocumentRequest,
-    DocumentRequestId, DocumentUpdateRequest, MAX_DOCUMENT_INDEX_NAME_BYTES,
+    DocumentCreateCollectionRequest, DocumentCreateIndexRequest, DocumentCreateIndexesRequest,
+    DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
+    DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentDropIndexRequest,
+    DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
+    DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentIndexRequest,
+    DocumentInsertRequest, DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
+    DocumentListCollectionsRequest, DocumentListDatabaseNamesRequest,
+    DocumentListIndexMetadataRequest, DocumentListIndexesRequest, DocumentMutationScope,
+    DocumentNamespace, DocumentReplaceRequest, DocumentRequest, DocumentRequestId,
+    DocumentUpdateRequest, MAX_DOCUMENT_INDEX_BATCH_SIZE, MAX_DOCUMENT_INDEX_NAME_BYTES,
 };
 pub use distinct::DocumentDistinct;
 pub(crate) use error::DocumentWriteRollback;
@@ -62,7 +63,10 @@ pub use error::{
     DocumentIndexError, DocumentMutationError,
 };
 pub use index_definition::DocumentIndexDefinition;
-pub(crate) use index_definition::{normalize_index_definition, normalize_index_request};
+pub(crate) use index_definition::{
+    DocumentIndexBuildDefinition, normalize_index_batch, normalize_index_definition,
+    normalize_index_request,
+};
 pub use index_keys::{
     DOCUMENT_INDEX_KEY_ENCODING_VERSION, DocumentIndexKey, DocumentIndexKeyGenerator,
     DocumentIndexPreparation, MAX_DOCUMENT_INDEX_KEY_BYTES, MAX_DOCUMENT_PREPARED_INDEXES,
