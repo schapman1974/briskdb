@@ -7,3 +7,5 @@ pub mod http;
 pub mod mongo;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "http")]
+pub mod sqlite_remote;

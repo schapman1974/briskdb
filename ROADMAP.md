@@ -17,6 +17,25 @@ This roadmap is ordered by dependency and risk rather than by calendar date.
 
 ## Product contract
 
+### Remote SQLite addon
+
+Tracked in [#349](https://github.com/schapman1974/briskdb/issues/349).
+The read-only preview ships an original native virtual-table module and remote
+client in the Python wheel. Standard `sqlite3.Connection` queries allowlisted
+BriskDB tables through a dedicated authenticated connector over the same Engine.
+Registered tables use logical placement; legacy databases require an explicit
+single-shard routing scope. HTTPS deployment currently uses a trusted reverse
+proxy in front of the loopback-only dedicated listener.
+
+The first checkpoint covers bounded full scans, schema/server fencing, typed
+values, local joins and real wheel-loading tests. It deliberately does not claim
+writable transactions, stable remote rowids, shared snapshots, paged cursors or
+query pushdown. Next checkpoints add retained read sessions/cursors and safe
+pushdown, then mutation/transaction mapping with rollback, disconnect and
+unknown-commit-outcome tests. No write capability will be enabled solely because
+SQLite exposes an `xUpdate` callback. The [Python API](python/API.md#remote-sqlite-addon)
+states the current bounds and unsupported behavior.
+
 ### What compatibility means
 
 PostgreSQL and MySQL support has three distinct layers:

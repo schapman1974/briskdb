@@ -13,6 +13,27 @@ One `cp39-abi3` wheel per platform supports the stated CPython range. A local
 Rust compiler is not used when installing those wheels. The sdist is tested
 separately and requires Rust 1.85 or newer.
 
+## Remote SQLite host requirements
+
+`attach_remote` additionally requires the Python interpreter's own SQLite
+library to be **3.31 or newer** and built with loadable-extension support.
+Some system Python builds (notably macOS builds without extension loading)
+cannot use this addon; use a compatible interpreter. Embedded BriskDB still
+works independently of this host capability.
+
+The native bridge dispatches exclusively through the host's extension API.
+It never passes a host connection to BriskDB's bundled SQLite library. Multiple
+connections to the same host library are supported; mixing different host
+SQLite API tables in one process is rejected. The wheel is a Python addon,
+not a standalone SQLite CLI extension. Wheel CI exercises actual stdlib
+`sqlite3` loading and network reads on Linux Python 3.9 and 3.14, and on
+extension-enabled Homebrew Python 3.14 for both macOS architectures. These jobs
+require addon execution; they cannot pass by skipping it. The python.org macOS
+interpreters still run the embedded suite and verify explicit addon capability
+rejection when their SQLite loader is absent. The Linux source-distribution
+tests also exercise the addon. A wheel tag alone does not guarantee that a
+particular interpreter's host SQLite supports extension loading.
+
 ## Optional BSON dependency
 
 SQL-only applications need no BSON package. The wheel does not declare a

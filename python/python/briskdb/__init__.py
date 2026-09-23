@@ -51,8 +51,11 @@ from .api import (
     connect_async,
     open_async,
 )
+from .remote import RemoteAttachment, attach_remote
 
 __all__ = [
+    "RemoteAttachment",
+    "attach_remote",
     "BriskDBError",
     "BusyError",
     "CancelledError",

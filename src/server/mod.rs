@@ -298,7 +298,7 @@ pub struct AttachedServer {
 impl AttachedServer {
     /// Bind and start listeners against the exact engine behind `database`.
     pub async fn start(database: &BriskDb, config: ListenerConfig) -> anyhow::Result<Self> {
-        Self::start_with_security(database, config, None).await
+        Self::start_with_security(database, config, None, None).await
     }
 
     /// Bind listeners with TLS and SCRAM enabled for PostgreSQL.
@@ -311,13 +311,27 @@ impl AttachedServer {
         let security = security
             .load()
             .context("failed to prepare PostgreSQL TLS and SCRAM configuration")?;
-        Self::start_with_security(database, config, Some(security)).await
+        Self::start_with_security(database, config, Some(security), None).await
+    }
+
+    /// Start a dedicated authenticated SQLite remote data plane instead of
+    /// the ordinary SQL HTTP API. HTTP remains loopback-only (HTTPS proxy for
+    /// network access). The separate admin plane must not be published.
+    pub async fn start_sqlite_remote(
+        database: &BriskDb,
+        config: ListenerConfig,
+        remote: crate::protocol::sqlite_remote::Config,
+    ) -> anyhow::Result<Self> {
+        let router = crate::protocol::sqlite_remote::router(database.engine().clone(), remote)
+            .map_err(anyhow::Error::msg)?;
+        Self::start_with_security(database, config, None, Some(router)).await
     }
 
     async fn start_with_security(
         database: &BriskDb,
         config: ListenerConfig,
         security: Option<postgres::LoadedSecurity>,
+        data_router: Option<axum::Router>,
     ) -> anyhow::Result<Self> {
         validate_listener_addresses(&config, security.is_some())?;
         let listeners = BoundListeners::bind(&config).await?;
@@ -334,6 +348,7 @@ impl AttachedServer {
                 None,
                 EngineShutdown::Borrowed,
                 security,
+                data_router,
             )
             .await
         });
@@ -398,6 +413,7 @@ where
         None,
         EngineShutdown::Owned,
         postgres_security,
+        None,
     )
     .await
 }
@@ -418,6 +434,7 @@ where
         signal,
         accepted,
         EngineShutdown::Owned,
+        None,
         None,
     )
     .await
@@ -440,6 +457,7 @@ where
         accepted,
         EngineShutdown::Owned,
         None,
+        None,
     )
     .await
 }
@@ -457,13 +475,14 @@ async fn serve_listeners_with_shutdown_mode<F>(
     accepted: Option<Arc<Notify>>,
     engine_shutdown: EngineShutdown,
     postgres_security: Option<postgres::LoadedSecurity>,
+    data_router: Option<axum::Router>,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send,
 {
     let mut shutdown_guard =
         (engine_shutdown == EngineShutdown::Owned).then(|| ShutdownOnDrop::new(engine.clone()));
-    let data_router = http::data_router_with_engine(engine.clone());
+    let data_router = data_router.unwrap_or_else(|| http::data_router_with_engine(engine.clone()));
     let admin_router = listeners
         .admin
         .as_ref()

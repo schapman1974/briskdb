@@ -1,6 +1,7 @@
 mod bson;
 mod document_api;
 mod error;
+mod remote_sqlite;
 mod value;
 
 use std::{
@@ -871,6 +872,9 @@ impl Database {
         postgres_tls_key = None,
         postgres_user = "briskdb",
         postgres_password_file = None,
+        sqlite_remote_token = None,
+        sqlite_remote_tables = None,
+        sqlite_remote_routing_key = None,
     ))]
     // These are separate keyword-only arguments in the stable Python API.
     #[allow(clippy::too_many_arguments)]
@@ -884,7 +888,44 @@ impl Database {
         postgres_tls_key: Option<PathBuf>,
         postgres_user: &str,
         postgres_password_file: Option<PathBuf>,
+        sqlite_remote_token: Option<&str>,
+        sqlite_remote_tables: Option<Vec<String>>,
+        sqlite_remote_routing_key: Option<String>,
     ) -> PyResult<Server> {
+        let mut remote = match (sqlite_remote_token, sqlite_remote_tables) {
+            (None, None) => None,
+            (Some(token), Some(tables)) => Some(
+                briskdb::protocol::sqlite_remote::Config::new(token, tables)
+                    .map_err(crate::error::invalid_value)?,
+            ),
+            _ => {
+                return Err(crate::error::invalid_value(
+                    "sqlite_remote_token and sqlite_remote_tables must be set together",
+                ));
+            }
+        };
+        if let Some(key) = sqlite_remote_routing_key {
+            remote = Some(
+                remote
+                    .ok_or_else(|| {
+                        crate::error::invalid_value(
+                            "sqlite_remote_routing_key requires SQLite remote configuration",
+                        )
+                    })?
+                    .with_legacy_routing_key(key)
+                    .map_err(crate::error::invalid_value)?,
+            );
+        }
+        if remote.is_some()
+            && (postgres.is_some()
+                || postgres_tls_cert.is_some()
+                || postgres_tls_key.is_some()
+                || postgres_password_file.is_some())
+        {
+            return Err(crate::error::invalid_value(
+                "use a separate serve() handle for PostgreSQL and SQLite remote listeners",
+            ));
+        }
         let http_listen = parse_listener_address(http, "HTTP")?;
         let admin_listen = admin
             .map(|address| parse_listener_address(address, "admin HTTP"))
@@ -933,16 +974,28 @@ impl Database {
                 admin_listen,
                 postgres_listen,
             };
-            let attached = match postgres_security {
-                Some(security) => shared
-                    .runtime
-                    .runtime
-                    .block_on(AttachedServer::start_secure(
-                        &database,
-                        listener_config,
-                        security,
-                    )),
-                None => shared
+            let attached = match (remote, postgres_security) {
+                (Some(remote), _) => {
+                    shared
+                        .runtime
+                        .runtime
+                        .block_on(AttachedServer::start_sqlite_remote(
+                            &database,
+                            listener_config,
+                            remote,
+                        ))
+                }
+                (None, Some(security)) => {
+                    shared
+                        .runtime
+                        .runtime
+                        .block_on(AttachedServer::start_secure(
+                            &database,
+                            listener_config,
+                            security,
+                        ))
+                }
+                (None, None) => shared
                     .runtime
                     .runtime
                     .block_on(AttachedServer::start(&database, listener_config)),

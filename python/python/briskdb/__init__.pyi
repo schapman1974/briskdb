@@ -39,6 +39,7 @@ from ._briskdb import (
     __version__ as __version__,
     open as open,
 )
+from .remote import RemoteAttachment as RemoteAttachment, attach_remote as attach_remote
 from .api import (
     AsyncCursor as AsyncCursor,
     AsyncDatabase as AsyncDatabase,
