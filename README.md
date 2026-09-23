@@ -11,6 +11,8 @@ BriskDB turns ordinary SQLite files into one database with **parallel writes,
 PostgreSQL compatibility, HTTP access, and embedded Rust/Python APIs**. It keeps
 SQLite's proven storage engine and tooling; BriskDB adds the routing layer,
 shard-safe IDs, cross-shard indexes, protocols, and operational guardrails.
+An optional read-only addon also lets Python's standard `sqlite3` query BriskDB
+tables through a local or remote server, using the same Python wheel.
 
 <p align="center">
   <img src="docs/assets/briskdb-demo.gif" alt="BriskDB demo: four Python writer threads writing through one engine into four ordinary SQLite WAL shards, with HTTP and PostgreSQL listeners" width="900">
@@ -24,6 +26,7 @@ shard-safe IDs, cross-shard indexes, protocols, and operational guardrails.
 | **Keep inspectable files** | Every data shard remains a normal SQLite database—no SQLite fork. |
 
 [Try it without a compiler](#try-it-in-30-seconds) ·
+[Use Python sqlite3](#use-python-sqlite3-with-briskdb) ·
 [Download an alpha](https://github.com/schapman1974/briskdb/releases) ·
 [Open the data browser](#browse-the-whole-logical-database) ·
 [Follow MongoDB and MySQL](#follow-the-build)
@@ -81,6 +84,103 @@ The protocol adapters do not own database semantics. Routing, limits,
 cancellation, values, sessions, and execution live in the shared Rust engine,
 leaving room for more protocols and storage adapters later.
 
+## Use Python sqlite3 with BriskDB
+
+Use a real `sqlite3.Connection` and ordinary SQL to read tables on a BriskDB
+server. `briskdb.attach_remote()` exposes them as SQLite virtual tables in the
+`remote` schema; it does not replace Python's `sqlite3` driver or copy the
+server's database files. SQLite runs joins, filters, and aggregates locally.
+
+This addon is a **read-only preview on `main`**, not yet published to PyPI.
+From a checkout of this repository, install it with Python 3.9+ and Rust 1.85+:
+
+```bash
+python -m pip install ./python
+```
+
+Your Python interpreter must have SQLite 3.31+ with extension-loading support.
+Some macOS Python builds disable it; extension-enabled Homebrew Python 3.14 is
+tested. See the [host requirements](python/COMPATIBILITY.md#remote-sqlite-host-requirements).
+
+### Connect to an existing server
+
+Use the server's HTTPS origin and bearer token. The server must explicitly
+enable the SQLite remote connector and allow access to `users`:
+
+```python
+import os
+import sqlite3
+from contextlib import closing
+
+import briskdb
+
+with closing(sqlite3.connect(":memory:")) as conn:
+    with briskdb.attach_remote(
+        conn, "https://db.example.com", token=os.environ["BRISKDB_TOKEN"]
+    ):
+        rows = conn.execute(
+            "SELECT id, name FROM remote.users WHERE id = ?", (123,)
+        ).fetchall()
+        print(rows)
+```
+
+### Try the complete round trip locally
+
+This self-contained example creates temporary data, starts an authenticated
+BriskDB listener, queries it through `sqlite3`, and closes everything afterward:
+
+```python
+import secrets
+import sqlite3
+import tempfile
+from contextlib import closing
+
+import briskdb
+
+token = secrets.token_urlsafe(32)
+
+with tempfile.TemporaryDirectory(prefix="briskdb-sqlite3-") as data_dir:
+    with briskdb.open(data_dir, shards=2) as db:
+        with db.session(routing_key="demo") as session:
+            session.migrate("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            session.execute(
+                "INSERT INTO users (id, name) VALUES (?1, ?2)", [123, "Ada"]
+            )
+
+        with db.serve(
+            admin=None,
+            sqlite_remote_token=token,
+            sqlite_remote_tables=["users"],
+            sqlite_remote_routing_key="demo",
+        ) as server:
+            with closing(sqlite3.connect(":memory:")) as conn:
+                with briskdb.attach_remote(
+                    conn, f"http://{server.http_address}", token=token
+                ):
+                    print(conn.execute(
+                        "SELECT id, name FROM remote.users WHERE id = ?", (123,)
+                    ).fetchall())  # [(123, 'Ada')]
+```
+
+The setup writes through BriskDB; the `sqlite3` connection only reads. This
+fresh, uncataloged demo uses `sqlite_remote_routing_key="demo"` to expose one
+routed shard—not the whole database and not a row-level permission filter.
+For **registered logical tables**, omit that argument: BriskDB uses their
+normal shard placement across the database.
+
+For access from another machine, keep the connector bound to loopback and
+publish **only its dedicated data listener** through a trusted HTTPS reverse
+proxy. Plain HTTP is accepted only for literal loopback IPs. Keep the token
+secret; do not publish the separate admin or ordinary SQL HTTP listeners.
+
+Current limits: read-only full scans of at most 4,096 rows, 1 MiB of engine
+results, and an 8 MiB response (or stricter engine settings). `WHERE` and
+`LIMIT` run locally and do not bypass those scan limits. There are no remote
+writes, paged cursors, shared transaction snapshots, or hidden rowids yet.
+See the [SQLite addon API](python/API.md#remote-sqlite-addon) for the full
+contract and [#349](https://github.com/schapman1974/briskdb/issues/349) for the
+remaining work.
+
 ## Browse the whole logical database
 
 ![BriskDB data browser showing one logical table across four SQLite shards](docs/assets/admin-browser.svg)
@@ -135,6 +235,7 @@ experimental and opt-in; the exact contract lives in
 | Native MongoDB wire protocol with TinyMongo parity | Opt-in loopback discovery, queries/cursors, basic aggregation, metadata, deletes, replacement/operator upserts (including find-and-modify), and field/array updates share the [document engine](docs/DOCUMENT_ENGINE.md); full [Mongo parity](docs/MONGO_PARITY.md), remaining operators, and secondary indexes remain [in progress](https://github.com/schapman1974/briskdb/issues/160) |
 | MySQL wire protocol | [Planned](https://github.com/schapman1974/briskdb/issues/40) |
 | Native Python extension | Typed sync/async SQL and opt-in BSON document commands; tagged releases build audited macOS/Linux ARM/x86 wheels |
+| Python's standard `sqlite3` | [Read-only remote addon](#use-python-sqlite3-with-briskdb) on `main`; authenticated table access, parameters and local joins; not yet published to PyPI |
 | Serverless lifecycle | [Planned](https://github.com/schapman1974/briskdb/issues/194) |
 
 ## Where BriskDB fits
@@ -372,6 +473,8 @@ more valuable than a star. Start with the
 - [Global-index production gate](docs/GLOBAL_INDEX_RELEASE_GATE.md)
 - [Embedded Rust](docs/EMBEDDED_RUST.md)
 - [Embedded SQL](docs/EMBEDDED_SQL.md)
+- [Python sqlite3 quickstart](#use-python-sqlite3-with-briskdb)
+- [Remote SQLite addon API](python/API.md#remote-sqlite-addon)
 - [Crate features and support tiers](docs/CRATE_FEATURES.md)
 - [PostgreSQL quickstart](docs/POSTGRES_QUICKSTART.md)
 - [Tested PostgreSQL clients](docs/POSTGRES_CLIENTS.md)
