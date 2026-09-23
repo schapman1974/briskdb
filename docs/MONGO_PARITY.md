@@ -149,6 +149,20 @@ built between pages may become visible if its name is still ahead of the cursor.
 Native Rust `ListIndexMetadata` and Python `list_index_metadata` share this path;
 the older native `ListIndexes` / `list_indexes` still include pending metadata.
 
+Mongo `createIndexes` and sync/async PyMongo `create_index` / `create_indexes`
+now build non-unique ordinary, compound, sparse and partial indexes through native
+`CreateIndexes`. Batches are limited to 1,000 entries and existing BSON/request
+budgets. Every shape is validated before implicit collection creation; builds then
+run in order under one exclusive schema/sole-process admission. A runtime failure
+can retain a completed prefix. Actual Ready counts include `_id_` and exclude
+Pending declarations. Matching retries keep identities and metadata; same-name
+definition conflicts return 86, equivalent definitions with another name return
+85, and explicit uniqueness options on ascending `_id` return 197. Valid ascending
+`_id` requests are no-ops even when PyMongo supplies its default `_id_1` name.
+New unique secondary builds return 115; unknown options (including TTL, background,
+collation and commit quorum), descending `_id` creation and document sequences are
+not supported. These builds maintain entries but do not accelerate reads yet.
+
 The shared Rust index catalog now assigns stable, root-wide IDs to built-in and
 pending secondary indexes. The version-17 manifest upgrade preserves existing
 specification bytes; declarations and allocation commit together, and committed
@@ -166,8 +180,8 @@ activation by itself. Version 19 adds explicit native Rust/Python non-unique
 builds with journaled shard progress, atomic Ready publication, transactional
 entry maintenance and restart coverage/checksum validation. Unpublished builds
 are discarded on reopen without changing BSON or declaration IDs. Global
-uniqueness, planner use and Mongo wire index creation/removal remain
-open under #174; these native additions do not expand the wire contract. Native
+uniqueness, planner use and Mongo wire index removal remain
+open under #174. Native
 Rust and sync/async Python can also drop built indexes through the existing exact
 name API. A journaled, sole-process cleanup removes derived entries and metadata,
 preserves BSON/other Ready indexes/allocator history, and finishes on reopen after
@@ -468,7 +482,7 @@ Required CI compares 64 valid ascending integer-key definitions with the unchang
 frozen index model, including pending metadata after restart. Descending/numeric
 aliases and invalid/resource-limited definitions have independent tests. This is
 not itself physical index support: secondary declarations still enforce no uniqueness,
-and wire index creation/removal remain unimplemented. Required CI also compares
+and wire index removal remains unimplemented. Required CI also compares
 six build/drop/recreation discovery states and the reopened result with the
 source-locked TinyMongo client, including built-in/name order and exact options.
 Only ordered key pairs are represented as BSON documents for transport. The full frozen
@@ -490,14 +504,17 @@ partial options after shared eager validation. The complete retained envelope is
 bounded; exact filter BSON, IDs and membership options survive restart. Existing
 flat declarations remain byte-compatible, and unknown legacy envelopes remain
 opaque/readable. These options are metadata-only until physical activation;
-native declaration validation does not scan records and wire index creation/removal remain open.
+native declaration validation does not scan records and wire index removal remains open.
 The separate native `CreateBuiltIndex` / sync/async `create_built_index` helper
 now combines declaration and physical non-unique build on an existing collection,
 with exclusive before/after Ready counts. Preflight rejects unsupported data and
 combined budgets without publishing metadata. Restart removes newly created
 unfinished declarations and entries, but preserves preexisting Pending ones.
 It reuses the v19 cleanup journal and does not change the frozen contract or
-claim wire creation, secondary uniqueness, or planner acceleration.
+claim secondary uniqueness or planner acceleration. Native batch and wire creation
+now reuse that lifecycle, with completed-prefix recovery tests at every new-entry
+commit boundary on two- and four-shard roots. TinyMongo's broader IndexModel
+warning/degradation behavior and the full frozen index suites remain open.
 
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required

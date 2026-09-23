@@ -41,6 +41,9 @@ impl Error for DocumentCursorError {}
 pub enum DocumentIndexError {
     NotFound,
     Protected,
+    OptionsConflict,
+    KeySpecsConflict,
+    InvalidIdOptions,
 }
 
 impl DocumentIndexError {
@@ -48,14 +51,19 @@ impl DocumentIndexError {
         match self {
             Self::NotFound => 27,
             Self::Protected => 72,
+            Self::OptionsConflict => 85,
+            Self::KeySpecsConflict => 86,
+            Self::InvalidIdOptions => 197,
         }
     }
 
     pub(crate) fn into_engine_error(self) -> EngineError {
         EngineError::from_source(
             match self {
-                Self::NotFound => EngineErrorKind::FailedPrecondition,
-                Self::Protected => EngineErrorKind::InvalidArgument,
+                Self::NotFound | Self::OptionsConflict | Self::KeySpecsConflict => {
+                    EngineErrorKind::FailedPrecondition
+                }
+                Self::Protected | Self::InvalidIdOptions => EngineErrorKind::InvalidArgument,
             },
             self.to_string(),
             self,
@@ -68,6 +76,11 @@ impl fmt::Display for DocumentIndexError {
         formatter.write_str(match self {
             Self::NotFound => "document index not found",
             Self::Protected => "the built-in document ID index cannot be dropped",
+            Self::OptionsConflict => "an equivalent document index already has another name",
+            Self::KeySpecsConflict => "document index name already has a different definition",
+            Self::InvalidIdOptions => {
+                "the built-in document ID index does not accept uniqueness options"
+            }
         })
     }
 }

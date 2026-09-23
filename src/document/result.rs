@@ -303,6 +303,7 @@ impl DocumentDeleteResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DocumentResultKind {
     IndexBuilt,
+    IndexesBuilt,
     Acknowledged,
     CollectionExists,
     NamespaceDropped,
@@ -395,6 +396,10 @@ pub enum DocumentResult {
         before: u64,
         after: u64,
     },
+    IndexesBuilt {
+        before: u64,
+        after: u64,
+    },
     Indexes(Box<[DocumentIndexMetadata]>),
     CursorKilled(bool),
 }
@@ -418,6 +423,7 @@ impl DocumentResult {
             Self::Delete(_) => DocumentResultKind::Delete,
             Self::IndexName(_) | Self::IndexReady(_) => DocumentResultKind::IndexName,
             Self::IndexBuilt { .. } => DocumentResultKind::IndexBuilt,
+            Self::IndexesBuilt { .. } => DocumentResultKind::IndexesBuilt,
             Self::Indexes(_) => DocumentResultKind::Indexes,
             Self::CursorKilled(_) => DocumentResultKind::CursorKilled,
         }
@@ -473,7 +479,8 @@ impl fmt::Debug for DocumentResult {
             Self::Collection(_)
             | Self::IndexName(_)
             | Self::IndexReady(_)
-            | Self::IndexBuilt { .. } => {
+            | Self::IndexBuilt { .. }
+            | Self::IndexesBuilt { .. } => {
                 debug.field("payload", &"<redacted>");
             }
         }

@@ -7,6 +7,7 @@ use std::{
 };
 
 mod cursors;
+mod indexes;
 
 use tokio::sync::Mutex;
 
@@ -18,9 +19,9 @@ use crate::{
         BsonCodecOptions, BsonDocument, BsonValue, DocumentAggregateRequest, DocumentAggregator,
         DocumentCollectionExistsRequest, DocumentCollectionOptions, DocumentCommand,
         DocumentContinueCursorRequest, DocumentCountRequest, DocumentCreateCollectionRequest,
-        DocumentCursorError, DocumentCursorId, DocumentDeleteRequest, DocumentDistinctRequest,
-        DocumentDropCollectionRequest, DocumentDropDatabaseRequest, DocumentFilter,
-        DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
+        DocumentCreateIndexesRequest, DocumentCursorError, DocumentCursorId, DocumentDeleteRequest,
+        DocumentDistinctRequest, DocumentDropCollectionRequest, DocumentDropDatabaseRequest,
+        DocumentFilter, DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
         DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentInsertRequest,
         DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
         DocumentListDatabaseNamesRequest, DocumentListIndexMetadataRequest, DocumentMatcher,
@@ -140,6 +141,25 @@ impl CommandError {
                     "cursor is unavailable",
                 );
             }
+            if let Some(index) = cause.downcast_ref::<crate::document::DocumentIndexError>() {
+                return Self::new(
+                    index.mongo_code(),
+                    match index {
+                        crate::document::DocumentIndexError::NotFound => "IndexNotFound",
+                        crate::document::DocumentIndexError::Protected => "InvalidOptions",
+                        crate::document::DocumentIndexError::OptionsConflict => {
+                            "IndexOptionsConflict"
+                        }
+                        crate::document::DocumentIndexError::KeySpecsConflict => {
+                            "IndexKeySpecsConflict"
+                        }
+                        crate::document::DocumentIndexError::InvalidIdOptions => {
+                            "InvalidIndexSpecificationOption"
+                        }
+                    },
+                    "invalid document index operation",
+                );
+            }
             if let Some(query) = cause.downcast_ref::<DocumentQueryError>() {
                 let code = query.mongo_code();
                 let name = match code {
@@ -215,6 +235,7 @@ pub(super) enum Command {
     CreateCollection(DocumentCreateCollectionRequest),
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
     ListIndexes(DocumentListIndexMetadataRequest, Option<Duration>),
+    CreateIndexes(DocumentCreateIndexesRequest),
     DropCollection(DocumentDropCollectionRequest),
     DropDatabase(DocumentDropDatabaseRequest),
     Insert(DocumentInsertRequest),
@@ -255,6 +276,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             | "create"
             | "listCollections"
             | "listIndexes"
+            | "createIndexes"
             | "listDatabases"
     ) {
         return None;
@@ -327,6 +349,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                 "documents" if name == "insert" => matches!(value, BsonValue::Array(_)),
                 "deletes" if name == "delete" => matches!(value, BsonValue::Array(_)),
                 "updates" if name == "update" => matches!(value, BsonValue::Array(_)),
+                "indexes" if name == "createIndexes" => matches!(value, BsonValue::Array(_)),
                 "ordered" if matches!(name, "insert" | "delete" | "update") => {
                     matches!(value, BsonValue::Boolean(_))
                 }
@@ -337,7 +360,10 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     valid_write_concern(value)
                 }
                 "writeConcern"
-                    if matches!(name, "drop" | "dropDatabase" | "create" | "findAndModify") =>
+                    if matches!(
+                        name,
+                        "drop" | "dropDatabase" | "create" | "findAndModify" | "createIndexes"
+                    ) =>
                 {
                     valid_write_concern(value)
                         && matches!(value, BsonValue::Document(doc)
@@ -352,6 +378,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                             | "create"
                             | "listCollections"
                             | "listIndexes"
+                            | "createIndexes"
                             | "listDatabases"
                             | "delete"
                             | "update"
@@ -467,6 +494,8 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             Command::ListDatabaseNames(DocumentListDatabaseNamesRequest::new(DocumentFilter::new(
                 filter,
             )?))
+        } else if name == "createIndexes" {
+            Command::CreateIndexes(indexes::prepare(request, namespace, started, timeout)?)
         } else if name == "listIndexes" {
             if !request.sequences.is_empty() {
                 return Err(CommandError::options());
@@ -1272,6 +1301,30 @@ impl Executor {
             ));
         }
         match command {
+            Command::CreateIndexes(request) => {
+                self.ensure_collection(session, identity, &context, request.namespace())
+                    .await?;
+                match self
+                    .call(
+                        session,
+                        identity,
+                        &context,
+                        DocumentCommand::CreateIndexes(request),
+                    )
+                    .await?
+                {
+                    DocumentResult::IndexesBuilt { before, after } => Ok(fields([
+                        ("ok", BsonValue::Double(1.0)),
+                        ("numIndexesBefore", BsonValue::Int64(before as i64)),
+                        ("numIndexesAfter", BsonValue::Int64(after as i64)),
+                    ])),
+                    _ => Err(CommandError::new(
+                        1,
+                        "InternalError",
+                        "unexpected engine result",
+                    )),
+                }
+            }
             Command::ListDatabaseNames(request) => {
                 match self
                     .call(

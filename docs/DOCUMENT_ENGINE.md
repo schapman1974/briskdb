@@ -66,6 +66,7 @@ The current engine executes:
 | `CreateIndex` | Validates and normalizes ordered keys, resolves a bounded default/explicit name, and declares pending index metadata; it does not build or enforce a secondary index |
 | `BuildIndex` | Explicitly builds a declared non-unique index under sole-process/exclusive schema admission; returns `IndexReady(name)` after complete publication; queries still scan |
 | `CreateBuiltIndex` | Creates and builds one non-unique index on an existing collection; returns `IndexBuilt { name, before, after }` with Ready counts under the same exclusive admission |
+| `CreateIndexes` | Eagerly validates up to 1,000 definitions, then creates them in order under one exclusive admission; logical-definition conflicts, built-in ID no-ops, and `IndexesBuilt { before, after }` counts |
 | `DropIndex` | Removes an exact pending declaration or recoverably removes a built non-unique index and its derived entries; never removes BSON records |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `ListIndexMetadata` | Pages BSON metadata for built indexes only, built-in first then by name; shares cursor controls and excludes pending declarations |
@@ -134,8 +135,8 @@ membership validator or authority: consumers must compile it before execution.
 New secondary declarations start `PendingBuild`, including `unique` ones:
 they are not query authorities or uniqueness constraints. Declarations do not
 scan or validate existing records. Explicit non-unique builds and transactional
-maintenance are implemented separately below; wire index commands and index
-cursors remain future work. Required CI compares 64 valid ascending integer-key definitions
+maintenance and wire creation/discovery are implemented separately below; wire
+removal and planner use remain future work. Required CI compares 64 valid ascending integer-key definitions
 against unchanged TinyMongo index source, including names, key order, flags and
 restart metadata. Descending/numeric-alias normalization, invalid inputs,
 resource limits and legacy metadata preservation are independently tested; no
@@ -209,8 +210,21 @@ interrupted operation removes both the new declaration and its derived entries,
 without reusing its committed identity. No format version changes. `before` and
 `after` count Ready indexes (including `_id_`, excluding unrelated Pending
 declarations); result limits are checked before durable intent.
+`CreateIndexes(DocumentCreateIndexesRequest)` adds bounded ordered batches and
+logical-definition conflict checks for Mongo `createIndexes`. It validates every
+shape before mutation, retains one schema/process guard across the entire batch,
+and checks the fixed-size response budget before any durable intent. A runtime
+failure can retain a completed prefix; this is not atomic batch rollback.
+Matching names take precedence over legacy equivalent duplicates; a changed
+definition under the same name is code 86, an equivalent definition under another
+name is code 85. Recognized flat/v2 encodings compare keys and membership options
+without rewriting stored BSON or IDs; partial filters retain exact BSON comparison.
+Pending declarations participate in conflict checks and matching ones are built.
+The ascending built-in ID request is a no-op with actual Ready counts; descending
+ID creation is unsupported. The older singleton declaration/build APIs retain
+their existing permissive naming behavior.
 Cross-shard uniqueness, safe planner candidates and
-wire index creation/removal remain open under #174. Ready-index discovery is
+wire index removal remain open under #174. Ready-index discovery is
 implemented through `ListIndexMetadata` and Mongo `listIndexes`.
 
 It generates ordered compound tuples with at most one final array field, removes

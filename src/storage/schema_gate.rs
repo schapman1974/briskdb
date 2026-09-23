@@ -260,6 +260,12 @@ impl SchemaMigrationGuard {
         self.restore_state = SchemaGateState::Pending;
     }
 
+    /// A completed batch entry has no outstanding journal. Keep admission closed
+    /// for the next entry, but restore Ready if its preflight fails.
+    pub(crate) fn mark_ready_on_drop(&mut self) {
+        self.restore_state = SchemaGateState::Ready;
+    }
+
     /// Publish a successfully completed migration and admit ordinary work again.
     pub(crate) fn publish_ready(mut self) -> EngineResult<()> {
         self.publish(SchemaGateState::Ready)
@@ -452,6 +458,29 @@ mod tests {
             pending_publish_gate.snapshot().state,
             SchemaGateState::Degraded
         );
+    }
+
+    #[test]
+    fn completed_batch_entry_restores_ready_without_reopening_admission() {
+        let gate = SchemaGate::new();
+        let mut migration = gate.begin_migration().unwrap();
+        migration.mark_pending_on_drop();
+        migration.mark_ready_on_drop();
+        assert_eq!(gate.snapshot().state, SchemaGateState::Migrating);
+        assert!(gate.try_acquire_operation().is_err());
+        drop(migration);
+        assert_eq!(gate.snapshot().state, SchemaGateState::Ready);
+
+        let mut migration = gate.begin_migration().unwrap();
+        migration.mark_ready_on_drop();
+        migration.mark_pending_on_drop();
+        drop(migration);
+        assert_eq!(gate.snapshot().state, SchemaGateState::Pending);
+        let mut migration = gate.begin_migration().unwrap();
+        migration.mark_ready_on_drop();
+        gate.mark_degraded();
+        drop(migration);
+        assert_eq!(gate.snapshot().state, SchemaGateState::Degraded);
     }
 
     #[test]

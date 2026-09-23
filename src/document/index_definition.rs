@@ -16,6 +16,82 @@ const MAX_INDEX_FIELDS: usize = 32;
 const MAX_PATH_COMPONENTS: usize = 100;
 const MAX_SPEC_BYTES: usize = 1024 * 1024;
 
+pub(crate) enum DocumentIndexBuildDefinition {
+    BuiltIn,
+    Secondary {
+        specification: BsonDocument,
+        name: String,
+        unique: bool,
+    },
+}
+
+/// Eagerly normalize every entry before allowing any namespace/index mutation.
+pub(crate) fn normalize_index_batch(
+    indexes: Box<[DocumentIndexRequest]>,
+    check: &mut dyn FnMut() -> EngineResult<()>,
+) -> EngineResult<Vec<DocumentIndexBuildDefinition>> {
+    let mut normalized = Vec::new();
+    normalized.try_reserve_exact(indexes.len()).map_err(|_| {
+        EngineError::new(
+            EngineErrorKind::LimitExceeded,
+            "unable to allocate document index batch",
+        )
+    })?;
+    let mut retained = 0usize;
+    for index in indexes {
+        check()?;
+        if index.keys().len() == 1
+            && index
+                .keys()
+                .get_first("_id")
+                .is_some_and(|value| value == &BsonValue::Int32(-1))
+        {
+            return Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "descending built-in document ID index creation is not supported",
+            ));
+        }
+        let builtin = index.keys().len() == 1
+            && index
+                .keys()
+                .get_first("_id")
+                .is_some_and(|value| value == &BsonValue::Int32(1));
+        if builtin && index.unique() {
+            return Err(super::DocumentIndexError::InvalidIdOptions.into_engine_error());
+        }
+        // The built-in name is not a user declaration. Still validate all keys
+        // and membership predicates, even though a valid _id request is a no-op.
+        let index = if builtin {
+            index.with_name("_id_1")?
+        } else {
+            index
+        };
+        let (specification, name, unique) = normalize_index_request(index, check)?;
+        let bytes = super::encode_document(&specification)
+            .map_err(|error| error.into_engine_error(BsonErrorContext::ClientInput))?;
+        retained = retained
+            .checked_add(bytes.len() + name.len())
+            .filter(|bytes| *bytes <= super::MAX_DOCUMENT_REQUEST_BYTES)
+            .ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::LimitExceeded,
+                    "normalized document index batch exceeds capacity",
+                )
+            })?;
+        normalized.push(if builtin {
+            DocumentIndexBuildDefinition::BuiltIn
+        } else {
+            DocumentIndexBuildDefinition::Secondary {
+                specification,
+                name,
+                unique,
+            }
+        });
+    }
+    check()?;
+    Ok(normalized)
+}
+
 /// Borrowed keys and membership options from an understood catalog encoding.
 ///
 /// This view does not normalize or rewrite stored BSON, validate documents,
