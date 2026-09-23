@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import os
 import secrets
 import sqlite3
 import struct
@@ -19,6 +19,17 @@ from briskdb import remote
 
 
 class RemoteSqliteTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        available = (sqlite3.sqlite_version_info >= (3, 31, 0)
+                     and hasattr(sqlite3.Connection, "enable_load_extension")
+                     and hasattr(sqlite3.Connection, "load_extension"))
+        if not available:
+            message = "host SQLite lacks addon support; capability rejection is tested separately"
+            if os.environ.get("BRISKDB_REQUIRE_REMOTE_SQLITE") == "1":
+                raise AssertionError(message)
+            raise unittest.SkipTest(message)
+
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -265,6 +276,38 @@ class RemoteSqliteTests(unittest.TestCase):
             proxy.shutdown()
             proxy.server_close()
             worker.join(timeout=5)
+
+
+class RemoteSqliteCapabilityTests(unittest.TestCase):
+    def test_missing_loader_is_rejected_before_network_or_connection_changes(self) -> None:
+        class WithoutLoader(sqlite3.Connection):
+            def __getattribute__(self, name: str) -> object:
+                if name in ("enable_load_extension", "load_extension"):
+                    raise AttributeError(name)
+                return super().__getattribute__(name)
+
+        for factory in (sqlite3.Connection, WithoutLoader):
+            connection = sqlite3.connect(":memory:", factory=factory)
+            try:
+                if hasattr(connection, "enable_load_extension") and hasattr(connection, "load_extension"):
+                    continue
+                with mock.patch.object(remote._Client, "request", side_effect=AssertionError("network must not run")):
+                    with self.assertRaisesRegex(sqlite3.NotSupportedError, "loadable extensions"):
+                        briskdb.attach_remote(connection, "https://example.invalid", token="x" * 32)
+                self.assertEqual(connection.execute("SELECT 1").fetchone(), (1,))
+                self.assertEqual([row[1] for row in connection.execute("PRAGMA database_list")], ["main"])
+            finally:
+                connection.close()
+
+    def test_old_host_sqlite_is_rejected_without_sending_credentials(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            with mock.patch.object(sqlite3, "sqlite_version_info", (3, 30, 0)):
+                with mock.patch.object(remote._Client, "request", side_effect=AssertionError("network must not run")):
+                    with self.assertRaisesRegex(sqlite3.NotSupportedError, "3.31"):
+                        briskdb.attach_remote(connection, "https://example.invalid", token="x" * 32)
+        finally:
+            connection.close()
 
 
 if __name__ == "__main__":

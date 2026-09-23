@@ -76,6 +76,8 @@ jobs:
 
       - name: Install the sdist and run the Python suite
         shell: bash
+        env:
+          BRISKDB_REQUIRE_REMOTE_SQLITE: "1"
         run: |
           set -euo pipefail
           python -m venv "$RUNNER_TEMP/briskdb-sdist"
@@ -200,6 +202,8 @@ jobs:
           python-version: "3.9"
 
       - name: Run minimum-version wheel tests without a source build
+        env:
+          BRISKDB_REQUIRE_REMOTE_SQLITE: ${{ runner.os == 'Linux' && '1' || '0' }}
         run: |
           python -m pip install --no-index --only-binary=:all: --force-reinstall dist/*.whl
           python - <<'PY'
@@ -233,6 +237,8 @@ jobs:
           python-version: "3.14"
 
       - name: Run maximum-version wheel tests without a source build
+        env:
+          BRISKDB_REQUIRE_REMOTE_SQLITE: ${{ runner.os == 'Linux' && '1' || '0' }}
         run: |
           python -m pip install --no-index --only-binary=:all: --force-reinstall dist/*.whl
           python - <<'PY'
@@ -261,6 +267,22 @@ jobs:
           python -m unittest discover -s python/tests -v
           python -m pip install mypy==1.19.1
           python -m mypy --strict --python-version 3.9 python/tests/typing_contract.py
+
+      # python.org macOS interpreters may omit SQLite extension loading. Keep
+      # their embedded/capability tests above AND require actual native addon
+      # execution using Homebrew's extension-enabled host SQLite on both Macs.
+      - name: Require remote SQLite wheel tests on extension-enabled macOS Python
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          BRISKDB_REQUIRE_REMOTE_SQLITE: "1"
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          brew list --versions python@3.14 >/dev/null || brew install python@3.14
+          "$(brew --prefix python@3.14)/bin/python3.14" -m venv "$RUNNER_TEMP/briskdb-remote-host"
+          "$RUNNER_TEMP/briskdb-remote-host/bin/python" -m pip install --no-index --only-binary=:all: dist/*.whl
+          "$RUNNER_TEMP/briskdb-remote-host/bin/python" -m unittest discover -s python/tests -p test_remote_sqlite.py -v
 
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -26,8 +26,13 @@ It never passes a host connection to BriskDB's bundled SQLite library. Multiple
 connections to the same host library are supported; mixing different host
 SQLite API tables in one process is rejected. The wheel is a Python addon,
 not a standalone SQLite CLI extension. Wheel CI exercises actual stdlib
-`sqlite3` loading and network reads on Python 3.9 and 3.14 for every supported
-native wheel platform; source-distribution tests exercise the same addon.
+`sqlite3` loading and network reads on Linux Python 3.9 and 3.14, and on
+extension-enabled Homebrew Python 3.14 for both macOS architectures. These jobs
+require addon execution; they cannot pass by skipping it. The python.org macOS
+interpreters still run the embedded suite and verify explicit addon capability
+rejection when their SQLite loader is absent. The Linux source-distribution
+tests also exercise the addon. A wheel tag alone does not guarantee that a
+particular interpreter's host SQLite supports extension loading.
 
 ## Optional BSON dependency
 
