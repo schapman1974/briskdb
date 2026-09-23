@@ -2045,15 +2045,20 @@ fn next_matching_document(
         }
         Ok(())
     };
+    let probe = matcher
+        .map(|matcher| storage.document_equality_probe(collection_id, matcher, &mut check))
+        .transpose()?
+        .flatten();
     loop {
         check()?;
         let record = storage
-            .scan_document_shard_on_connection(
+            .scan_document_candidates_on_connection(
                 connection,
                 collection_id,
                 shard,
                 after,
                 DOCUMENT_MERGE_PAGE_SIZE,
+                probe.as_ref(),
                 cancellation,
             )?
             .into_iter()

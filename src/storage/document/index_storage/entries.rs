@@ -57,6 +57,27 @@ fn checksum(
     *hash.finalize().as_bytes()
 }
 
+/// Validate the returned candidate's entry against the same SQLite snapshot's
+/// exact record. An equality index narrows candidates, never trusts stale keys.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::storage::document) fn validate_probe_entry(
+    collection: DocumentCollectionId,
+    index: DocumentIndexId,
+    shard: u16,
+    id_key: &[u8],
+    index_key: &[u8],
+    record_checksum: &[u8; 32],
+    stored_checksum: &[u8],
+    version: i64,
+) -> EngineResult<()> {
+    if version != 1
+        || stored_checksum != checksum(collection, index, shard, id_key, index_key, record_checksum)
+    {
+        return Err(corrupt("document index candidate is stale or damaged"));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::storage::document) fn insert_entries(
     transaction: &Transaction<'_>,

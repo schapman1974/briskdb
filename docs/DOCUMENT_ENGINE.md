@@ -136,8 +136,8 @@ membership validator or authority: consumers must compile it before execution.
 New secondary declarations start `PendingBuild`, including `unique` ones:
 they are not query authorities or uniqueness constraints. Declarations do not
 scan or validate existing records. Explicit non-unique builds and transactional
-maintenance and wire creation/discovery/removal are implemented separately below;
-planner use remains future work. Required CI compares 64 valid ascending integer-key definitions
+maintenance and wire creation/discovery/removal are implemented separately below,
+along with conservative equality candidates. Required CI compares 64 valid ascending integer-key definitions
 against unchanged TinyMongo index source, including names, key order, flags and
 restart metadata. Descending/numeric-alias normalization, invalid inputs,
 resource limits and legacy metadata preservation are independently tested; no
@@ -237,9 +237,44 @@ Pending declarations participate in conflict checks and matching ones are built.
 The ascending built-in ID request is a no-op with actual Ready counts; descending
 ID creation is unsupported. The older singleton declaration/build APIs retain
 their existing permissive naming behavior.
-Cross-shard uniqueness, safe planner candidates and broader selector compatibility
+Cross-shard uniqueness, broader planner candidates and selector compatibility
 remain open under #174. Ready-index discovery is
 implemented through `ListIndexMetadata` and Mongo `listIndexes`.
+
+### Equality index candidates
+
+Find (including sorted/paged reads) and filtered count/distinct can use a current
+Ready non-unique index when every indexed
+path has a necessary supported scalar equality. Direct equality, `$eq` and
+positive `$and` clauses are recognized; the entire BSON matcher still verifies
+each candidate. Compound paths and scalar membership in final arrays reuse the
+same canonical BDIK keys as transactional write maintenance. Missing/null and
+numeric cohorts keep their BSON semantics; booleans remain distinct from numbers.
+
+Partial indexes are not selected. Sparse all-null tuples, incomplete compound
+equalities, array/object operands, ObjectId/date/nonfinite operands and queries
+with only alternatives, negations, ranges or membership tests fall back to scans.
+A sparse compound tuple is eligible when at least one necessary equality is
+nonnull. Optional probe preparation exceeding its work budget also falls back;
+cancellation and integrity errors are not swallowed. There is no index hint API.
+
+Storage selects from the root-shared Ready cache under the request's schema
+admission and binds collection/index/key values in SQLite. Candidates preserve
+shard-local natural order, validate the entry-to-record checksum binding and then
+pass the full matcher. A cursor does not retain index authority between requests:
+drop/recreation selects current authority or resumes scanning from the existing
+natural-order frontier. This does not add a cross-request snapshot. Shard routing
+and the public `Point`/`Scatter` plan remain unchanged; access-method reasons and
+row counters, index-only reads, ordering/range pushdown, mutation selection and aggregation pushdown
+remain work under #178. No format migration is needed.
+
+Required CI checks 1,087 source-locked probe groups (201,349 matcher evaluations,
+9,541 eligible matching candidates) without false negatives, plus native and
+real-driver scan differentials, residual filters, paging, index churn, write
+maintenance, restart and damaged candidate checks. The manual same-root benchmark
+is `cargo test --locked --features documents --test document_index_reads
+equality_candidate_benchmark -- --ignored --exact --nocapture`; timings are local
+measurements, not CI performance assertions.
 
 It generates ordered compound tuples with at most one final array field, removes
 duplicate array entries in encounter order, equates missing with null, and gives
@@ -1044,7 +1079,7 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 Other update operators,
 additional aggregation expressions/group-key forms,
 database statistics, unique secondary-index builds and
-index-backed query plans
+broader index-backed query plans
 remain later roadmap work. Collection and Ready-index metadata cursors are implemented.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
 category.

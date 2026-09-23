@@ -67,6 +67,7 @@ pub(crate) use index_definition::{
     DocumentIndexBuildDefinition, normalize_index_batch, normalize_index_definition,
     normalize_index_request,
 };
+pub(crate) use index_keys::DocumentIndexProbe;
 pub use index_keys::{
     DOCUMENT_INDEX_KEY_ENCODING_VERSION, DocumentIndexKey, DocumentIndexKeyGenerator,
     DocumentIndexPreparation, MAX_DOCUMENT_INDEX_KEY_BYTES, MAX_DOCUMENT_PREPARED_INDEXES,

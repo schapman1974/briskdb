@@ -197,7 +197,7 @@ activation by itself. Version 19 adds explicit native Rust/Python non-unique
 builds with journaled shard progress, atomic Ready publication, transactional
 entry maintenance and restart coverage/checksum validation. Unpublished builds
 are discarded on reopen without changing BSON or declaration IDs. Global
-uniqueness, planner use and broader selector compatibility remain
+uniqueness, broader planner use and selector compatibility remain
 open under #174. Native
 Rust and sync/async Python can also drop built indexes through the existing exact
 name API. A journaled, sole-process cleanup removes derived entries and metadata,
@@ -498,8 +498,9 @@ numeric directions and generates bounded default names before catalog mutation.
 Required CI compares 64 valid ascending integer-key definitions with the unchanged
 frozen index model, including pending metadata after restart. Descending/numeric
 aliases and invalid/resource-limited definitions have independent tests. This is
-not itself physical index support: secondary declarations still enforce no uniqueness,
-and planner acceleration remains unimplemented. Required CI also compares
+not itself physical index support: secondary declarations still enforce no uniqueness.
+Ready non-unique indexes separately support conservative equality candidates.
+Required CI also compares
 six build/drop/recreation discovery states and the reopened result with the
 source-locked TinyMongo client, including built-in/name order and exact options.
 Only ordered key pairs are represented as BSON documents for transport. The full frozen
@@ -529,10 +530,20 @@ with exclusive before/after Ready counts. Preflight rejects unsupported data and
 combined budgets without publishing metadata. Restart removes newly created
 unfinished declarations and entries, but preserves preexisting Pending ones.
 It reuses the v19 cleanup journal and does not change the frozen contract or
-claim secondary uniqueness or planner acceleration. Native batch and wire creation
+claim secondary uniqueness. Equality candidates use the separately validated
+Ready-cache read path. Native batch and wire creation
 now reuse that lifecycle, with completed-prefix recovery tests at every new-entry
 commit boundary on two- and four-shard roots. TinyMongo's broader IndexModel
 warning/degradation behavior and the full frozen index suites remain open.
+
+Ready-index equality reads now have 1,087 additional source-locked probe groups:
+201,349 matcher evaluations and 9,541 eligible matching candidates without false
+negatives. Direct/positive-conjunctive complete scalar tuples use bound BDIK
+probes, preserve natural paging and still run the full matcher. Partial indexes,
+sparse all-null tuples and unsupported/incomplete shapes scan. Native/real-driver
+tests compare filters, sorting, count/distinct, index drop/recreation between
+batches, write maintenance and reopened results. This does not close #174 or
+#178: uniqueness, broader candidate forms and plan diagnostics remain open.
 
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required
