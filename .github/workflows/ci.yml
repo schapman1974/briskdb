@@ -277,7 +277,9 @@ jobs:
   test:
     name: Tests (${{ matrix.rust }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Full target tests plus the recovery/benchmark smoke matrix now exceed
+    # twenty minutes on hosted runners. Keep all coverage and allow completion.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
