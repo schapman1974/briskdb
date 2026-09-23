@@ -225,6 +225,109 @@ fn visit_records(
 }
 
 impl Storage {
+    pub(crate) fn drop_built_document_index_controlled(
+        &self,
+        database: &str,
+        collection_name: &str,
+        name: &str,
+        mut migration: SchemaMigrationGuard,
+        control: Arc<OperationControl>,
+    ) -> EngineResult<()> {
+        let result = (|| {
+            ensure_control_active(&control, "before dropping built document index")?;
+            migration.acquire_process_ownership(&self.schema_coordination.process_lease)?;
+            let mut connection = open_existing_manifest(&self.root.join("manifest.sqlite"))?;
+            let catalog =
+                run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
+                    configure_journal_mode(connection)?;
+                    require_ready_manifest(connection, self.shard_count())?;
+                    load_catalog_rows(connection)
+                })?;
+            let collection = catalog
+                .collection(database, collection_name)
+                .ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::InvalidArgument,
+                        "document collection does not exist",
+                    )
+                })?;
+            let target = collection
+                .indexes()
+                .iter()
+                .find(|index| index.name() == name)
+                .ok_or_else(|| DocumentIndexError::NotFound.into_engine_error())?;
+            if target.is_built_in() || matches!(name, "_id" | "_id_") {
+                return Err(DocumentIndexError::Protected.into_engine_error());
+            }
+            // Resolve afresh under exclusive admission. The initial cached
+            // dispatch decision was protected, but another DDL operation may
+            // have completed between releasing shared and acquiring exclusive.
+            if target.lifecycle() == DocumentIndexLifecycle::PendingBuild {
+                self.drop_pending_document_index_controlled(
+                    collection.id(),
+                    name,
+                    Arc::clone(&control),
+                )?;
+                migration.publish_ready()?;
+                return Ok(());
+            }
+            let future =
+                compile_indexes_with_candidate(&catalog, None, Some(target.id()), &mut || {
+                    ensure_control_active(&control, "while preparing surviving document indexes")
+                })
+                .map_err(stored_index_error)?;
+            let mut operation = vec![0_u8; 32];
+            getrandom::fill(&mut operation).map_err(|error| {
+                EngineError::new(
+                    EngineErrorKind::Internal,
+                    format!("unable to allocate document index operation identity: {error}"),
+                )
+            })?;
+            run_manifest_controlled(&mut connection, Arc::clone(&control), |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sqlite_error::storage)?;
+                require_ready_manifest(&transaction, self.shard_count())?;
+                let changed = transaction.execute("UPDATE briskdb_document_indexes SET lifecycle_state = 2
+                    WHERE collection_id = ?1 AND index_name = ?2 AND is_builtin = 0 AND is_unique = 0 AND lifecycle_state = 1",
+                    params![to_sqlite_id(collection.id())?, name]).map_err(sqlite_error::storage)?;
+                if changed != 1 {
+                    return Err(corrupt("document index drop lost its Ready declaration"));
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO briskdb_document_index_operation VALUES (1, ?1, 2, ?2, ?3, 0)",
+                        params![target.id().get() as i64, operation, self.shard_count()],
+                    )
+                    .map_err(sqlite_error::storage)?;
+                manifest::refresh_manifest_digest(&transaction)?;
+                manifest::current_integrity(&transaction, self.shard_count())?;
+                ensure_control_active(&control, "before committing document index drop intent")?;
+                migration.mark_pending_on_drop();
+                #[cfg(test)]
+                checkpoint("drop-before-intent", 0);
+                transaction.commit().map_err(sqlite_error::storage)?;
+                #[cfg(test)]
+                checkpoint("drop-after-intent", 0);
+                Ok(())
+            })?;
+            cleanup(
+                self,
+                &mut connection,
+                Journal {
+                    index: target.id(),
+                    kind: DROP,
+                    operation,
+                    next: 0,
+                },
+                Some(&control),
+            )?;
+            self.publish_document_indexes(future)?;
+            migration.publish_ready()
+        })();
+        self.fail_closed_on_corruption(result)
+    }
+
     pub(crate) fn build_document_index_controlled(
         &self,
         database: &str,
@@ -268,9 +371,10 @@ impl Storage {
             let current = compile_ready_indexes(&catalog, &mut || {
                 ensure_control_active(&control, "while preparing document index authority")
             })?;
-            let future = compile_indexes_with_candidate(&catalog, Some(target.id()), &mut || {
-                ensure_control_active(&control, "while preparing document index build")
-            })?;
+            let future =
+                compile_indexes_with_candidate(&catalog, Some(target.id()), None, &mut || {
+                    ensure_control_active(&control, "while preparing document index build")
+                })?;
             let prepared = future
                 .get(&collection.id())
                 .ok_or_else(|| corrupt("document index build omitted its collection"))?;

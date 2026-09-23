@@ -1776,8 +1776,7 @@ CREATE TABLE briskdb_document_index_operation (
 ) STRICT;
 ```
 
-Kinds are Build (1), Drop cleanup (2), and Abort cleanup (3). This checkpoint
-exposes builds, not foreground physical drops. A journal targets exactly one
+Kinds are Build (1), Drop cleanup (2), and Abort cleanup (3). A journal targets exactly one
 PendingBuild secondary index in an active collection. Build/Abort targets must
 be non-unique; Ready secondary unique indexes are invalid. The exact root shard
 count and progress are sealed; operations cannot overlap namespace provisioning,
@@ -1791,6 +1790,16 @@ finds Build intent, it seals Abort with cursor zero, removes only that index ID'
 derived entries shard-by-shard, and clears intent while retaining PendingBuild.
 Cleanup is idempotent across either side of each commit. No implicit rebuild,
 activation, allocator reset or BSON rewrite occurs during recovery.
+
+Foreground built-index removal uses the same version-19 Drop kind. Under
+sole-process/exclusive schema ownership it atomically marks the Ready target
+PendingBuild and seals intent, then deletes only its globally unique index ID's
+entries before advancing each shard cursor. Finalization deletes the journal and
+the pending declaration/identity mapping together; the allocation high-water mark
+remains. Restart completes an admitted Drop, even if cancellation interrupted the
+caller. Surviving definitions/names are published to the shared cache before schema
+admission resumes. Pending declaration drops still need no physical journal.
+No format bump is required: version-19 readers already understand this cleanup kind.
 
 Ready entries are maintained atomically with records. Entry format 1 checksums
 are full BLAKE3 over `briskdb.document-index-entry.v1` plus NUL, format as u32 LE,

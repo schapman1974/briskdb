@@ -59,6 +59,11 @@ const DOCUMENT_WRITE_ERROR_BYTES: u64 = 64;
 static SERVER_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 const _: () = assert!(DOCUMENT_MERGE_PAGE_SIZE <= MAX_DOCUMENT_SHARD_SCAN_RECORDS);
 
+enum DocumentIndexOperation {
+    Build,
+    Drop,
+}
+
 impl Engine {
     /// Execute one owned document command through the same lifecycle, session,
     /// cancellation, deadline, worker, connection-pool, and result-limit
@@ -82,12 +87,13 @@ impl Engine {
                 if let Err(error) = require_catalog_write_options(options) {
                     Err(error)
                 } else {
-                    self.run_document_build_index(
+                    self.run_document_index_operation(
                         &mut operation,
                         session,
                         request_id,
                         namespace,
                         name,
+                        DocumentIndexOperation::Build,
                     )
                     .await
                 }
@@ -142,24 +148,58 @@ impl Engine {
                     Ok(guard) => guard,
                     Err(error) => return operation.finish(Err(error)),
                 };
-                let session_guard = match operation.wait_pending(self.ready_session(session)).await
-                {
-                    Ok(guard) => guard,
-                    Err(error) => return operation.finish(Err(error)),
+                let ready_drop = if let DocumentCommand::DropIndex(request) = &command {
+                    match self
+                        .inner
+                        .database
+                        .storage
+                        .document_index_is_ready(request.namespace(), request.name())
+                    {
+                        Ok(ready) => ready,
+                        Err(error) => return operation.finish(Err(error)),
+                    }
+                } else {
+                    false
                 };
-                if let Err(error) = require_document_session_ready(&session_guard) {
-                    return operation.finish(Err(error));
+                if ready_drop {
+                    drop(schema_operation);
+                    let DocumentCommand::DropIndex(request) = command else {
+                        unreachable!("only index drops select physical cleanup");
+                    };
+                    let (namespace, name, options) = request.into_parts();
+                    if let Err(error) = require_catalog_write_options(options) {
+                        Err(error)
+                    } else {
+                        self.run_document_index_operation(
+                            &mut operation,
+                            session,
+                            request_id,
+                            namespace,
+                            name,
+                            DocumentIndexOperation::Drop,
+                        )
+                        .await
+                    }
+                } else {
+                    let session_guard =
+                        match operation.wait_pending(self.ready_session(session)).await {
+                            Ok(guard) => guard,
+                            Err(error) => return operation.finish(Err(error)),
+                        };
+                    if let Err(error) = require_document_session_ready(&session_guard) {
+                        return operation.finish(Err(error));
+                    }
+                    let owner = ConnectionOwner::new(session.id().get());
+                    self.run_document_command(
+                        &mut operation,
+                        owner,
+                        session_guard,
+                        schema_operation,
+                        request_id,
+                        command,
+                    )
+                    .await
                 }
-                let owner = ConnectionOwner::new(session.id().get());
-                self.run_document_command(
-                    &mut operation,
-                    owner,
-                    session_guard,
-                    schema_operation,
-                    request_id,
-                    command,
-                )
-                .await
             }
         };
         if operation.lease.is_some() {
@@ -1058,13 +1098,14 @@ impl Engine {
         }
     }
 
-    async fn run_document_build_index(
+    async fn run_document_index_operation(
         &self,
         operation: &mut Operation,
         session: &Session,
         request_id: crate::document::DocumentRequestId,
         namespace: DocumentNamespace,
         name: String,
+        action: DocumentIndexOperation,
     ) -> EngineResult<DocumentExecution> {
         let migration = self.inner.database.storage.begin_schema_migration()?;
         let session_preflight = operation.wait_pending(self.ready_session(session)).await?;
@@ -1088,19 +1129,34 @@ impl Engine {
         let join = worker.spawn(move || {
             let _lease = lease;
             let _session = session;
-            // Allocate and validate the response before durable build intent.
-            let execution =
-                DocumentExecution::new(request_id, None, DocumentResult::IndexReady(name.clone()));
+            // Allocate and validate the response before durable build/drop intent.
+            let execution = DocumentExecution::new(
+                request_id,
+                None,
+                match action {
+                    DocumentIndexOperation::Build => DocumentResult::IndexReady(name.clone()),
+                    DocumentIndexOperation::Drop => DocumentResult::Acknowledged(true),
+                },
+            );
             let result = enforce_execution_result_limits(&execution, result_limits)
                 .and_then(|_| connections.retire_idle_for_schema_migration())
-                .and_then(|_| {
-                    storage.build_document_index_controlled(
+                .and_then(|_| match action {
+                    DocumentIndexOperation::Build => storage
+                        .build_document_index_controlled(
+                            namespace.database(),
+                            namespace.collection(),
+                            &name,
+                            migration,
+                            Arc::clone(&worker_control),
+                        )
+                        .map(|_| ()),
+                    DocumentIndexOperation::Drop => storage.drop_built_document_index_controlled(
                         namespace.database(),
                         namespace.collection(),
                         &name,
                         migration,
                         Arc::clone(&worker_control),
-                    )
+                    ),
                 })
                 .map(|_| execution);
             if result

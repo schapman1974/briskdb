@@ -77,8 +77,11 @@ class PythonDocumentApiTests(unittest.TestCase):
                     session.create_index(DATABASE, COLLECTION, {"value": 1}, name="unique", unique=True)
                     with self.assertRaises(briskdb.UnsupportedError):
                         session.build_index(DATABASE, COLLECTION, "unique")
-                    with self.assertRaises(briskdb.UnsupportedError):
-                        session.drop_index(DATABASE, COLLECTION, "value_1")
+                    session.create_index(DATABASE, COLLECTION, {"value": 1}, name="to_drop")
+                    session.build_index(DATABASE, COLLECTION, "to_drop")
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.drop_index(DATABASE, COLLECTION, "to_drop", max_result_bytes=33)
+                    self.assertTrue(session.drop_index(DATABASE, COLLECTION, "to_drop")["acknowledged"])
             with briskdb.open(root, shards=2, documents=True) as database:
                 with database.session() as session:
                     indexes = {item["name"]: item for item in session.list_indexes(DATABASE, COLLECTION)["indexes"]}
@@ -1918,6 +1921,9 @@ class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
                     result = await session.build_index(DATABASE, COLLECTION, "value_1", request_id=identity, timeout_ms=5000)
                     self.assertEqual((result["request_id"], result["lifecycle"]), (identity, "ready"))
                     await session.insert_one(DATABASE, COLLECTION, {"_id": 1, "value": "maintained"})
+                    await session.create_index(DATABASE, COLLECTION, {"value": 1}, name="to_drop")
+                    await session.build_index(DATABASE, COLLECTION, "to_drop")
+                    self.assertTrue((await session.drop_index(DATABASE, COLLECTION, "to_drop"))["acknowledged"])
             async with await briskdb.open_async(root, shards=2, documents=True) as database:
                 async with await database.session() as session:
                     self.assertEqual((await session.list_indexes(DATABASE, COLLECTION))["indexes"][1]["lifecycle"], "ready")

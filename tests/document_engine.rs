@@ -211,17 +211,40 @@ async fn nonunique_index_build_controls_maintenance_and_reopen() {
         vec![document(BsonValue::Int32(2), "same")],
     )
     .await;
+    declare_pending_index(&engine, &session, "to_drop").await;
+    engine
+        .execute_document(
+            &session,
+            request(6, RequestContext::new(), build_index("to_drop")),
+        )
+        .await
+        .unwrap();
     assert_eq!(
         engine
             .execute_document(
                 &session,
-                request(6, RequestContext::new(), drop_index("label"))
+                request(
+                    7,
+                    RequestContext::new().with_result_limits(ResultLimits::new(1, 33).unwrap()),
+                    drop_index("to_drop")
+                )
             )
             .await
             .unwrap_err()
             .kind(),
-        EngineErrorKind::Unsupported
+        EngineErrorKind::LimitExceeded
     );
+    assert!(matches!(
+        engine
+            .execute_document(
+                &session,
+                request(8, RequestContext::new(), drop_index("to_drop"))
+            )
+            .await
+            .unwrap()
+            .result(),
+        DocumentResult::Acknowledged(true)
+    ));
     let count: i64 = (0..2)
         .map(|shard| {
             Connection::open(

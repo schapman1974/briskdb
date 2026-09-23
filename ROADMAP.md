@@ -646,8 +646,8 @@ requires an earlier dependency:
       rollback are tested. IDs do not change Python/wire metadata shapes.
       Rust and native sync/async Python can now drop one pending declaration by
       exact name. Built-in protection, pre-commit controls/budgets, concurrent
-      drops, crash recovery and ID non-reuse are covered. Physical-index drops,
-      wire commands and wildcard/field-alias removal remain open.
+      drops, crash recovery and ID non-reuse are covered. Built-index drops use
+      the recoverable path below; wire commands and wildcard/field-alias removal remain open.
       Native Rust and sync/async Python declarations now accept sparse/partial
       options through the shared eager predicate validator. Exact membership
       metadata uses the existing import envelope, preserves IDs across restart,
@@ -678,7 +678,13 @@ requires an earlier dependency:
       Process-exit tests cover build/abort commit boundaries. Interrupted builds
       reopen as pending with only their derived entries removed. Opaque/unique
       pending declarations stay non-enforcing; reads still scan. Global uniqueness,
-      physical-index drops, planner use, wire commands and metadata cursors remain open.
+      planner use, wire commands and metadata cursors remain open.
+      Exact native `DropIndex`/sync/async `drop_index` now removes built indexes
+      with version-19 Drop intent, sealed per-shard cleanup and restart completion.
+      BSON, surviving Ready entries and permanent allocation history are preserved;
+      the compiled/name cache is published under exclusive schema admission.
+      Pending drops keep their concurrent metadata-only path. Commit-boundary
+      crashes and cancellation after intent verify recovery without rollback claims.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
