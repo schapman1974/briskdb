@@ -158,6 +158,7 @@ fn shard_read_error(error: rusqlite::Error, diagnostic: &'static str) -> EngineE
 
 #[cfg(feature = "documents")]
 mod enabled {
+    mod index_metadata;
     mod index_operations;
     use std::{
         collections::{HashMap, HashSet},

@@ -51,9 +51,9 @@ pub use command::{
     DocumentFindOneAndReplaceRequest, DocumentFindOneAndUpdateRequest, DocumentFindRequest,
     DocumentIndexRequest, DocumentInsertRequest, DocumentKillCursorRequest,
     DocumentListCollectionMetadataRequest, DocumentListCollectionsRequest,
-    DocumentListDatabaseNamesRequest, DocumentListIndexesRequest, DocumentMutationScope,
-    DocumentNamespace, DocumentReplaceRequest, DocumentRequest, DocumentRequestId,
-    DocumentUpdateRequest, MAX_DOCUMENT_INDEX_NAME_BYTES,
+    DocumentListDatabaseNamesRequest, DocumentListIndexMetadataRequest, DocumentListIndexesRequest,
+    DocumentMutationScope, DocumentNamespace, DocumentReplaceRequest, DocumentRequest,
+    DocumentRequestId, DocumentUpdateRequest, MAX_DOCUMENT_INDEX_NAME_BYTES,
 };
 pub use distinct::DocumentDistinct;
 pub(crate) use error::DocumentWriteRollback;

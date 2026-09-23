@@ -448,6 +448,12 @@ class Session:
         cancellation: Optional[CancellationToken] = None,
         max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
     ) -> FindResult: ...
+    def list_index_metadata(
+        self, database: str, collection: str, *, batch_size: int = 101,
+        batch_byte_limit: Optional[int] = None, request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> FindResult: ...
     def create_index(
         self,
         database: str,

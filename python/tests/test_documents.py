@@ -52,6 +52,39 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_paged_built_index_metadata_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(session.list_index_metadata(DATABASE, COLLECTION)["documents"], [])
+                    session.create_collection(DATABASE, COLLECTION)
+                    session.create_index(DATABASE, COLLECTION, {"value": 1}, name="pending", unique=True)
+                    session.create_index(DATABASE, COLLECTION, {"value": 1, "tail": -1}, name="!ready", partial_filter={"active": True})
+                    session.build_index(DATABASE, COLLECTION, "!ready")
+                    expected = [{"name": "_id_", "key": {"_id": 1}}, {"name": "!ready", "key": {"value": 1, "tail": -1}, "partialFilterExpression": {"active": True}}]
+                    identity = uuid.uuid4()
+                    page = session.list_index_metadata(DATABASE, COLLECTION, batch_size=0, batch_byte_limit=1024, request_id=identity)
+                    self.assertEqual(page["request_id"], identity)
+                    self.assertEqual(page["documents"], [])
+                    rows = []
+                    while page["cursor_id"] is not None:
+                        page = session.get_more(DATABASE, COLLECTION, page["cursor_id"], batch_size=1)
+                        rows.extend(page["documents"])
+                    self.assertEqual(rows, expected)
+                    for control in [{"max_result_rows": 1}, {"max_result_bytes": 1}, {"batch_byte_limit": 1}]:
+                        with self.assertRaises(briskdb.LimitExceededError):
+                            session.list_index_metadata(DATABASE, COLLECTION, **control)
+                    token = briskdb.CancellationToken()
+                    token.cancel()
+                    with self.assertRaises(briskdb.CancelledError):
+                        session.list_index_metadata(DATABASE, COLLECTION, cancellation=token)
+                    page = session.list_index_metadata(DATABASE, COLLECTION, batch_size=0)
+                    self.assertTrue(session.kill_cursor(DATABASE, COLLECTION, page["cursor_id"])["killed"])
+                    self.assertEqual(len(session.list_indexes(DATABASE, COLLECTION)["indexes"]), 3)
+            with briskdb.open(root, shards=2, documents=True) as database:
+                with database.session() as session:
+                    self.assertEqual(session.list_index_metadata(DATABASE, COLLECTION)["documents"], expected)
+
     def test_nonunique_index_build_maintenance_and_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=2, documents=True) as database:
@@ -1909,6 +1942,23 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_paged_built_index_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    await session.create_index(DATABASE, COLLECTION, {"value": 1}, sparse=True)
+                    await session.build_index(DATABASE, COLLECTION, "value_1")
+                    identity = uuid.uuid4()
+                    page = await session.list_index_metadata(DATABASE, COLLECTION, batch_size=1, batch_byte_limit=1024, request_id=identity)
+                    self.assertEqual(page["request_id"], identity)
+                    self.assertEqual(page["documents"], [{"name": "_id_", "key": {"_id": 1}}])
+                    page = await session.get_more(DATABASE, COLLECTION, page["cursor_id"], batch_size=1)
+                    self.assertEqual(page["documents"], [{"name": "value_1", "key": {"value": 1}, "sparse": True}])
+                    self.assertIsNone(page["cursor_id"])
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        await session.list_index_metadata(DATABASE, COLLECTION, max_result_bytes=1)
+
     async def test_async_nonunique_index_build_forwards_controls_and_ready(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=2, documents=True) as database:

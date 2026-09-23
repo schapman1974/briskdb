@@ -23,12 +23,13 @@ use crate::{
         DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
         DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentInsertRequest,
         DocumentKillCursorRequest, DocumentListCollectionMetadataRequest,
-        DocumentListDatabaseNamesRequest, DocumentMatcher, DocumentMutationError,
-        DocumentMutationScope, DocumentNamespace, DocumentPipeline, DocumentProjection,
-        DocumentProjector, DocumentQueryError, DocumentReadOptions, DocumentReplaceRequest,
-        DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort, DocumentSorter,
-        DocumentUpdate, DocumentUpdateError, DocumentUpdateRequest, DocumentUpdater,
-        DocumentWriteOptions, decode_document_batch_with_options, encode_document_with_options,
+        DocumentListDatabaseNamesRequest, DocumentListIndexMetadataRequest, DocumentMatcher,
+        DocumentMutationError, DocumentMutationScope, DocumentNamespace, DocumentPipeline,
+        DocumentProjection, DocumentProjector, DocumentQueryError, DocumentReadOptions,
+        DocumentReplaceRequest, DocumentRequest, DocumentRequestId, DocumentResult, DocumentSort,
+        DocumentSorter, DocumentUpdate, DocumentUpdateError, DocumentUpdateRequest,
+        DocumentUpdater, DocumentWriteOptions, decode_document_batch_with_options,
+        encode_document_with_options,
     },
 };
 
@@ -192,10 +193,28 @@ fn fields<const N: usize>(entries: [(&str, BsonValue); N]) -> BsonDocument {
     BsonDocument::from_entries(entries).expect("static Mongo result field names")
 }
 
+fn metadata_read_options(body: &BsonDocument) -> Result<DocumentReadOptions> {
+    let mut options = DocumentReadOptions::new();
+    if let Some(BsonValue::Document(cursor)) = body.get_first("cursor") {
+        for (field, value) in cursor.iter() {
+            if field != "batchSize" {
+                return Err(CommandError::options());
+            }
+            let size = unsigned(value)?;
+            if size > 1000 {
+                return Err(CommandError::unsupported());
+            }
+            options = options.with_batch_size(size)?;
+        }
+    }
+    Ok(options.with_batch_byte_limit((wire::MAX_BOOTSTRAP_MESSAGE_BYTES - 8192) as u64)?)
+}
+
 pub(super) enum Command {
     ListDatabaseNames(DocumentListDatabaseNamesRequest),
     CreateCollection(DocumentCreateCollectionRequest),
     ListCollections(DocumentListCollectionMetadataRequest, Option<Duration>),
+    ListIndexes(DocumentListIndexMetadataRequest, Option<Duration>),
     DropCollection(DocumentDropCollectionRequest),
     DropDatabase(DocumentDropDatabaseRequest),
     Insert(DocumentInsertRequest),
@@ -235,6 +254,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             | "dropDatabase"
             | "create"
             | "listCollections"
+            | "listIndexes"
             | "listDatabases"
     ) {
         return None;
@@ -295,7 +315,10 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                             return Err(CommandError::options());
                         }
                         timeout = timeout.min(Duration::from_millis(millis));
-                        if matches!(name, "find" | "aggregate" | "listCollections") {
+                        if matches!(
+                            name,
+                            "find" | "aggregate" | "listCollections" | "listIndexes"
+                        ) {
                             cursor_budget = Some(Duration::from_millis(millis));
                         }
                     }
@@ -328,6 +351,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                             | "dropDatabase"
                             | "create"
                             | "listCollections"
+                            | "listIndexes"
                             | "listDatabases"
                             | "delete"
                             | "update"
@@ -367,7 +391,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     }
                     true
                 }
-                "cursor" if matches!(name, "aggregate" | "listCollections") => {
+                "cursor" if matches!(name, "aggregate" | "listCollections" | "listIndexes") => {
                     if !matches!(value, BsonValue::Document(_)) {
                         return Err(CommandError::new(
                             14,
@@ -443,6 +467,17 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
             Command::ListDatabaseNames(DocumentListDatabaseNamesRequest::new(DocumentFilter::new(
                 filter,
             )?))
+        } else if name == "listIndexes" {
+            if !request.sequences.is_empty() {
+                return Err(CommandError::options());
+            }
+            Command::ListIndexes(
+                DocumentListIndexMetadataRequest::new(
+                    namespace,
+                    metadata_read_options(&request.body)?,
+                ),
+                cursor_budget,
+            )
         } else if name == "listCollections" {
             if !request.sequences.is_empty() {
                 return Err(CommandError::options());
@@ -461,21 +496,7 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
                     Ok(())
                 }
             })?;
-            let mut options = DocumentReadOptions::new();
-            if let Some(BsonValue::Document(cursor)) = request.body.get_first("cursor") {
-                for (field, value) in cursor.iter() {
-                    if field != "batchSize" {
-                        return Err(CommandError::options());
-                    }
-                    let size = unsigned(value)?;
-                    if size > 1000 {
-                        return Err(CommandError::unsupported());
-                    }
-                    options = options.with_batch_size(size)?;
-                }
-            }
-            options =
-                options.with_batch_byte_limit((wire::MAX_BOOTSTRAP_MESSAGE_BYTES - 8192) as u64)?;
+            let options = metadata_read_options(&request.body)?;
             Command::ListCollections(
                 DocumentListCollectionMetadataRequest::new(
                     &request.database,
@@ -985,7 +1006,8 @@ pub(super) fn prepare(request: &Request) -> Option<Result<Prepared>> {
         }
         if let Command::Find(_, _, budget)
         | Command::Aggregate(_, budget)
-        | Command::ListCollections(_, budget) = &mut command
+        | Command::ListCollections(_, budget)
+        | Command::ListIndexes(_, budget) = &mut command
         {
             *budget = budget.map(|budget| budget.saturating_sub(elapsed));
         }
@@ -1710,9 +1732,25 @@ impl Executor {
             }
             command @ (Command::Find(..)
             | Command::Aggregate(..)
-            | Command::ListCollections(..)) => {
+            | Command::ListCollections(..)
+            | Command::ListIndexes(..)) => {
                 let started = Instant::now();
-                let metadata = matches!(&command, Command::ListCollections(..));
+                let metadata = matches!(
+                    &command,
+                    Command::ListCollections(..) | Command::ListIndexes(..)
+                );
+                if let Command::ListIndexes(request, _) = &command {
+                    if !self
+                        .exists(session, identity, &context, request.namespace())
+                        .await?
+                    {
+                        return Err(CommandError::new(
+                            26,
+                            "NamespaceNotFound",
+                            "collection does not exist",
+                        ));
+                    }
+                }
                 let (namespace, command, single_batch, empty_single_batch, budget) = match command {
                     Command::Find(find, single_batch, budget) => {
                         let namespace = find.namespace().clone();
@@ -1735,6 +1773,13 @@ impl Executor {
                     Command::ListCollections(request, budget) => (
                         request.namespace().clone(),
                         DocumentCommand::ListCollectionMetadata(request),
+                        false,
+                        false,
+                        budget,
+                    ),
+                    Command::ListIndexes(request, budget) => (
+                        request.namespace().clone(),
+                        DocumentCommand::ListIndexMetadata(request),
                         false,
                         false,
                         budget,

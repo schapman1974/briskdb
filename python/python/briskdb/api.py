@@ -359,6 +359,19 @@ class AsyncSession:
             max_result_rows=max_result_rows, max_result_bytes=max_result_bytes,
         )
 
+    async def list_index_metadata(
+        self, database: str, collection: str, *, batch_size: int = 101,
+        batch_byte_limit: Optional[int] = None, request_id: Optional[UUID] = None,
+        timeout_ms: Optional[int] = None, cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        return await _cancelable_call(
+            self._session.list_index_metadata, database, collection,
+            batch_size=batch_size, batch_byte_limit=batch_byte_limit,
+            request_id=request_id, timeout_ms=timeout_ms, cancellation=cancellation,
+            max_result_rows=max_result_rows, max_result_bytes=max_result_bytes,
+        )
+
     async def create_index(
         self,
         database: str,

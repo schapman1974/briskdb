@@ -59,9 +59,21 @@ pub(super) struct MetadataCursorState {
     pub batch_byte_limit: Option<u64>,
 }
 
+/// Index discovery keeps a stable collection identity and allocation ceiling,
+/// not index definitions. None precedes the built-in; Some("") follows it.
+#[derive(Clone)]
+pub(super) struct IndexMetadataCursorState {
+    pub namespace: DocumentNamespace,
+    pub collection_id: DocumentCollectionId,
+    pub upper_id: u64,
+    pub after_name: Option<String>,
+    pub batch_byte_limit: Option<u64>,
+}
+
 pub(super) enum RetainedCursorState {
     Documents(Box<CursorState>),
     Collections(MetadataCursorState),
+    Indexes(IndexMetadataCursorState),
 }
 
 impl From<CursorState> for RetainedCursorState {
@@ -81,6 +93,7 @@ impl RetainedCursorState {
         match self {
             Self::Documents(state) => &state.namespace,
             Self::Collections(state) => &state.namespace,
+            Self::Indexes(state) => &state.namespace,
         }
     }
 
@@ -88,6 +101,7 @@ impl RetainedCursorState {
         match self {
             Self::Documents(state) => state.retained_bytes(),
             Self::Collections(state) => 4096usize.saturating_add(state.matcher.retained_bytes()),
+            Self::Indexes(_) => 4096,
         }
     }
 }

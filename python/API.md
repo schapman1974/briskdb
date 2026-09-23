@@ -58,6 +58,7 @@ optional `bson` package from PyMongo; SQL-only use has no PyMongo dependency.
 - `create_index(database, collection, keys, *, name=None, unique=False, sparse=False, partial_filter=None, ...)`
 - `drop_index(database, collection, name, ...)`
 - `list_indexes(database, collection, *, skip=0, limit=None, batch_size=101, ...)`
+- `list_index_metadata(database, collection, *, batch_size=101, batch_byte_limit=None, ...)`
 - `insert_one(database, collection, document, ...)`
 - `find(database, collection, filter=None, *, projection=None, sort=None, skip=0, limit=None, batch_size=101, ...)`
 - `get_more(database, collection, cursor_id, *, batch_size=101, ...)`
@@ -178,6 +179,19 @@ rows may disappear; drop/recreate invalidates an old database cursor. No snapsho
 is promised. Soft byte limits carry across pages; hard result limits reject the
 whole request. The existing materialized `list_collections` result is unchanged.
 
+`list_index_metadata` returns a `cursor` with BSON metadata for built indexes:
+`_id_` first, then Ready secondary indexes by name. Rows contain `name`, ordered
+`key`, and applicable `sparse` / `partialFilterExpression` options, without an
+invented Mongo index version. Pending declarations are excluded, even if marked
+unique. The existing `list_indexes` method still returns all catalog declarations.
+Use the original collection name with `get_more` / `kill_cursor`. Missing
+collections return exhausted/empty without creation. Cursors retain only bounded
+identity/name positions: later index creations or recreations are excluded,
+drops may disappear, and dropping/recreating the collection invalidates the cursor.
+There is no cross-page snapshot; an already-declared index built between pages
+may appear if its name has not been passed. Zero-sized first batches and the same
+byte, result, deadline, cancellation and ownership controls apply in sync/async.
+
 Every method also accepts `request_id`, `timeout_ms`, `cancellation`,
 `max_result_rows`, and `max_result_bytes`. A request ID is a nonzero
 `uuid.UUID`; omitting it generates one. `AsyncSession` provides the same
@@ -196,7 +210,7 @@ plan. Payload keys are:
 | `collections` | ordered `collections` list |
 | `database_names` | `names` list of exact logical document database names |
 | `index_name` | `index_name` and `lifecycle="pending_build"` or `"ready"` |
-| `acknowledged` | `acknowledged` boolean (pending-index removal) |
+| `acknowledged` | `acknowledged` boolean (pending or built index removal) |
 | `indexes` | ordered `indexes` list |
 | `insert` | `acknowledged`, `inserted_count`, `inserted_ids` |
 | `cursor` | `namespace`, `cursor_id`, `exhausted`, `documents` |

@@ -67,6 +67,7 @@ The current engine executes:
 | `BuildIndex` | Explicitly builds a declared non-unique index under sole-process/exclusive schema admission; returns `IndexReady(name)` after complete publication; queries still scan |
 | `DropIndex` | Removes an exact pending declaration or recoverably removes a built non-unique index and its derived entries; never removes BSON records |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
+| `ListIndexMetadata` | Pages BSON metadata for built indexes only, built-in first then by name; shares cursor controls and excludes pending declarations |
 | `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
 | `Find` | Evaluates BSON match expressions and returns a bounded batch with a continuation ID when needed |
 | `Aggregate` | Executes shared basic/projection stages over global natural-order input and returns a retained cursor |
@@ -198,7 +199,8 @@ require reopening; startup discards the unpublished derived entries, leaving the
 declaration pending. Shared preparation bounds apply across all Ready indexes,
 not independently per index. Unique builds currently return Unsupported.
 Cross-shard uniqueness, safe planner candidates and
-wire index commands remain open under #174.
+wire index creation/removal remain open under #174. Ready-index discovery is
+implemented through `ListIndexMetadata` and Mongo `listIndexes`.
 
 It generates ordered compound tuples with at most one final array field, removes
 duplicate array entries in encounter order, equates missing with null, and gives
@@ -1002,9 +1004,9 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 
 Other update operators,
 additional aggregation expressions/group-key forms,
-database statistics, index metadata cursors, unique secondary-index builds and
+database statistics, unique secondary-index builds and
 index-backed query plans
-remain later roadmap work. Collection metadata cursors are implemented.
+remain later roadmap work. Collection and Ready-index metadata cursors are implemented.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
 category.
 
