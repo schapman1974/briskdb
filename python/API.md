@@ -195,7 +195,7 @@ plan. Payload keys are:
 | `collection_exists` | `exists` boolean |
 | `collections` | ordered `collections` list |
 | `database_names` | `names` list of exact logical document database names |
-| `index_name` | `index_name` and `lifecycle="pending_build"` |
+| `index_name` | `index_name` and `lifecycle="pending_build"` or `"ready"` |
 | `acknowledged` | `acknowledged` boolean (pending-index removal) |
 | `indexes` | ordered `indexes` list |
 | `insert` | `acknowledged`, `inserted_count`, `inserted_ids` |
@@ -213,8 +213,8 @@ null plan and scalar result accounting, even with large catalogs.
 Collection metadata contains `id`, `database_id`, `database`, `name`,
 `namespace`, exact BSON `options`, placement `code`/`version`, and index
 metadata. Each index contains `name`, exact ordered `keys`, `unique`,
-`built_in`, and `lifecycle`. Secondary index declarations currently remain
-`pending_build`; the ready built-in `_id_` index is authoritative.
+`built_in`, and `lifecycle`. New secondary declarations start `pending_build`;
+explicit non-unique builds become `ready`. The built-in `_id_` is always ready.
 
 Both sync and async `create_index` accept `sparse=True` or a `partial_filter`
 mapping, but not both. The shared index validator checks the supported predicate
@@ -222,7 +222,24 @@ subset eagerly, including branches that would otherwise short-circuit. Empty
 filters and unsupported operators (such as `$ne`) raise `UnsupportedError`.
 Keys, name and filter together have a 1 MiB stored-specification limit. This is a
 declaration only: it does not scan existing records, accelerate queries, or enforce
-uniqueness yet, and its result still says `lifecycle="pending_build"`.
+uniqueness yet. Redeclaring an identical built index preserves `lifecycle="ready"`.
+
+Sync and async `build_index(database, collection, name, ...)` build a declared
+non-unique index and return its name with `lifecycle="ready"`. They accept the
+usual request ID, timeout, cancellation and result limits. Builds require no
+other process to hold the database open and exclusively pause schema admission.
+All current records and the combined index-key budget are validated before
+durable intent. Publication happens only after all shards commit. Interruption
+after intent requires closing/reopening the root; recovery removes the unfinished
+build's derived entries and leaves its declaration pending for an explicit retry.
+Ready entries are maintained with inserts, replacements, updates and deletes.
+Queries still scan; this does not accelerate them or enforce secondary uniqueness.
+`unique=True` builds raise `UnsupportedError` until global uniqueness is implemented.
+
+```python
+session.create_index("app", "events", {"kind": 1}, name="by_kind")
+session.build_index("app", "events", "by_kind")  # lifecycle: ready
+```
 
 Recognized advanced index metadata reports normalized ordered `keys` plus optional
 `sparse=True` or `partial_filter` fields; absence means no such membership option.
@@ -240,8 +257,8 @@ ID index. `_id`/`_id_` raise `InvalidArgumentError`; missing indexes raise
 selectors and bulk removal are not supported: `*` is only an exact native name,
 not a wildcard. Cancellation/deadline or insufficient result limits before
 commit leave the declaration intact. Recreating a removed name gets a new durable
-internal ID. Physical index builds/maintenance and Mongo wire `dropIndexes` are
-still unfinished.
+internal ID. Built-index removal currently raises `UnsupportedError`; recoverable
+physical drops and Mongo wire `dropIndexes` remain unfinished.
 
 This API deliberately mirrors the document engine's implemented boundary:
 `insert_one` generates a missing ObjectId while preserving explicit null and

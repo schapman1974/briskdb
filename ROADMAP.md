@@ -632,7 +632,7 @@ requires an earlier dependency:
       direction bytes. 64 source-locked valid ascending definitions verify exact
       names, key order, flags and pending metadata after restart. Independent tests
       cover descending/numeric aliases, controls and rejection atomicity. All
-      secondary declarations remain pending and enforce no uniqueness yet.
+      new secondary declarations start pending and enforce no uniqueness yet.
       The shared index-key generator now supplies bounded BSON-aware equality
       tuples, one-level multikey deduplication, missing/null and empty-array
       identities, and sparse/partial membership. 7,201 source-locked cases check
@@ -670,8 +670,15 @@ requires an earlier dependency:
       Ready roots reject missing/malformed schemas or unexpected entries. Namespace
       provisioning/deletion owns these tables; ordinary SQL cannot access them.
       This prepares physical storage without activating or populating an index.
-      Physical builds/activation, write-time
-      maintenance, wire index commands and metadata cursors remain open.
+      Version 19 adds explicit native Rust/sync/async Python non-unique builds:
+      sole-process/exclusive schema admission, combined active-plus-candidate
+      preparation bounds, sealed per-shard progress and atomic Ready publication.
+      Every record write maintains entries in its own transaction; checksums bind
+      exact records and startup verifies full coverage without silent repair.
+      Process-exit tests cover build/abort commit boundaries. Interrupted builds
+      reopen as pending with only their derived entries removed. Opaque/unique
+      pending declarations stay non-enforcing; reads still scan. Global uniqueness,
+      physical-index drops, planner use, wire commands and metadata cursors remain open.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

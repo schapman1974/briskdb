@@ -43,8 +43,8 @@ pub use codec::{
     decode_document_with_options, encode_document, encode_document_with_options,
 };
 pub use command::{
-    DocumentAggregateRequest, DocumentCollectionExistsRequest, DocumentCommand,
-    DocumentCommandKind, DocumentContinueCursorRequest, DocumentCountRequest,
+    DocumentAggregateRequest, DocumentBuildIndexRequest, DocumentCollectionExistsRequest,
+    DocumentCommand, DocumentCommandKind, DocumentContinueCursorRequest, DocumentCountRequest,
     DocumentCreateCollectionRequest, DocumentCreateIndexRequest, DocumentCursorId,
     DocumentDeleteRequest, DocumentDistinctRequest, DocumentDropCollectionRequest,
     DocumentDropDatabaseRequest, DocumentDropIndexRequest, DocumentFindOneAndDeleteRequest,

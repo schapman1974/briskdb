@@ -1225,6 +1225,45 @@ impl fmt::Debug for DocumentCreateIndexRequest {
     }
 }
 
+/// Build a declared non-unique index under exclusive schema admission.
+/// Queries continue to use the existing scan planner after the build.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentBuildIndexRequest {
+    namespace: DocumentNamespace,
+    name: String,
+    write_options: DocumentWriteOptions,
+}
+
+impl DocumentBuildIndexRequest {
+    pub fn new(
+        namespace: DocumentNamespace,
+        name: impl Into<String>,
+        write_options: DocumentWriteOptions,
+    ) -> EngineResult<Self> {
+        let name = name.into();
+        validate_index_name(&name)?;
+        Ok(Self {
+            namespace,
+            name,
+            write_options,
+        })
+    }
+
+    pub const fn namespace(&self) -> &DocumentNamespace {
+        &self.namespace
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub const fn write_options(&self) -> DocumentWriteOptions {
+        self.write_options
+    }
+    pub fn into_parts(self) -> (DocumentNamespace, String, DocumentWriteOptions) {
+        (self.namespace, self.name, self.write_options)
+    }
+}
+
 /// Request to drop one named index.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1367,6 +1406,7 @@ pub enum DocumentCommandKind {
     Replace,
     Delete,
     CreateIndex,
+    BuildIndex,
     DropIndex,
     ListIndexes,
     ContinueCursor,
@@ -1396,6 +1436,7 @@ pub enum DocumentCommand {
     Replace(DocumentReplaceRequest),
     Delete(DocumentDeleteRequest),
     CreateIndex(DocumentCreateIndexRequest),
+    BuildIndex(DocumentBuildIndexRequest),
     DropIndex(DocumentDropIndexRequest),
     ListIndexes(DocumentListIndexesRequest),
     ContinueCursor(DocumentContinueCursorRequest),
@@ -1424,6 +1465,7 @@ impl DocumentCommand {
             Self::Replace(_) => DocumentCommandKind::Replace,
             Self::Delete(_) => DocumentCommandKind::Delete,
             Self::CreateIndex(_) => DocumentCommandKind::CreateIndex,
+            Self::BuildIndex(_) => DocumentCommandKind::BuildIndex,
             Self::DropIndex(_) => DocumentCommandKind::DropIndex,
             Self::ListIndexes(_) => DocumentCommandKind::ListIndexes,
             Self::ContinueCursor(_) => DocumentCommandKind::ContinueCursor,

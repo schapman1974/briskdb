@@ -142,8 +142,12 @@ exist; large skips may need repeated scans. `create_index(database, collection,
 both synchronous and asyncio APIs. Numeric direction aliases normalize to Int32,
 while malformed/duplicate paths, invalid directions, reserved names and oversized
 definitions fail before catalog changes. Explicit names remain supported.
-Secondary indexes remain `pending_build`, including `unique=True`: declarations
-do not yet accelerate queries or enforce uniqueness. The built-in `_id_` remains
+Secondary declarations start `pending_build`. `session.build_index(database,
+collection, name)` explicitly builds a non-unique index and marks it Ready after
+every shard commits; later document writes maintain its entries transactionally.
+It requires sole-process ownership; interrupted builds require reopening for
+cleanup and retry. Unique builds remain unsupported, and reads still scan—these
+indexes do not yet accelerate queries or enforce uniqueness. The built-in `_id_` remains
 ready and enforced, but its redeclaration is not part of this checkpoint;
 other update operators, additional aggregation expressions, and bulk-write
 Python helpers remain future work. Multi-delete/update commit one shard at a time;

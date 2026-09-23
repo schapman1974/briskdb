@@ -89,7 +89,7 @@ class NamespaceDroppedResult(DocumentExecution):
 class CreateIndexResult(DocumentExecution):
     kind: Literal["index_name"]
     index_name: str
-    lifecycle: Literal["pending_build"]
+    lifecycle: Literal["pending_build", "ready"]
 
 class DropIndexResult(DocumentExecution):
     kind: Literal["acknowledged"]
@@ -463,6 +463,12 @@ class Session:
         cancellation: Optional[CancellationToken] = None,
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
+    ) -> CreateIndexResult: ...
+    def build_index(
+        self, database: str, collection: str, name: str, *,
+        request_id: Optional[UUID] = None, timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
     ) -> CreateIndexResult: ...
     def drop_index(
         self, database: str, collection: str, name: str, *,

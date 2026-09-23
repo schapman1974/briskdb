@@ -89,6 +89,8 @@ struct RootSchemaCoordination {
     idempotency_stripes: Arc<[AtomicBool; IDEMPOTENCY_LOCK_STRIPES]>,
     catalogs: Mutex<Vec<Weak<CatalogSnapshot>>>,
     schema_digests: Mutex<RuntimeSchemaDigests>,
+    #[cfg(feature = "documents")]
+    document_indexes: Mutex<Option<Arc<document::DocumentIndexPreparations>>>,
     #[cfg_attr(not(feature = "experimental-vtab"), allow(dead_code))]
     hilo_allocator: hilo::HiloAllocator,
 }
@@ -133,6 +135,8 @@ impl RootSchemaCoordination {
             idempotency_stripes: Arc::new(std::array::from_fn(|_| AtomicBool::new(false))),
             catalogs: Mutex::new(Vec::new()),
             schema_digests: Mutex::new(RuntimeSchemaDigests::default()),
+            #[cfg(feature = "documents")]
+            document_indexes: Mutex::new(None),
             hilo_allocator: hilo::HiloAllocator::new()?,
         })
     }
@@ -948,7 +952,8 @@ impl Storage {
         let document_provisioning = manifest
             .query_row(
                 "SELECT EXISTS (SELECT 1 FROM briskdb_document_provisioning)
-                 OR EXISTS (SELECT 1 FROM briskdb_document_index_storage WHERE lifecycle_state = 2)",
+                 OR EXISTS (SELECT 1 FROM briskdb_document_index_storage WHERE lifecycle_state = 2)
+                 OR EXISTS (SELECT 1 FROM briskdb_document_index_operation)",
                 [],
                 |row| row.get::<_, bool>(0),
             )
@@ -4649,6 +4654,7 @@ mod tests {
             manifest
                 .execute_batch(
                     "BEGIN IMMEDIATE;
+                     DROP TABLE briskdb_document_index_operation;
                      DROP TABLE briskdb_document_index_storage;
                      DROP TABLE briskdb_document_index_identities;
                      DROP TABLE briskdb_document_index_allocator;
@@ -4764,6 +4770,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_document_index_operation;
                  DROP TABLE briskdb_document_index_storage;
                  DROP TABLE briskdb_document_index_identities;
                  DROP TABLE briskdb_document_index_allocator;
@@ -4873,6 +4880,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "BEGIN IMMEDIATE;
+                 DROP TABLE briskdb_document_index_operation;
                  DROP TABLE briskdb_document_index_storage;
                  DROP TABLE briskdb_document_index_identities;
                  DROP TABLE briskdb_document_index_allocator;

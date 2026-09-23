@@ -176,9 +176,17 @@ This pure helper does not touch storage, enforce declared uniqueness, change
 index lifecycles, or establish catalog freshness. A compiled snapshot may be
 stale after a drop; physical callers must fence metadata and maintain entries
 atomically with the document. Ordinary writes still ignore non-enforcing pending
-declarations. Physical schema/build/recovery, transactional maintenance,
-cross-shard uniqueness, safe planner candidates, and wire index commands remain
-open under #174; this helper alone does not make secondary indexes usable.
+declarations. `DocumentCommand::BuildIndex(DocumentBuildIndexRequest)` now builds
+one declared non-unique index offline under exclusive schema admission and
+sole-process ownership. It returns `DocumentResult::IndexReady(name)` after all
+shards commit and the checksummed manifest publishes Ready. Repeated builds and
+matching declarations preserve that Ready lifecycle. Ready entries are maintained
+transactionally by every record write and verified on reopen. Interrupted builds
+require reopening; startup discards the unpublished derived entries, leaving the
+declaration pending. Shared preparation bounds apply across all Ready indexes,
+not independently per index. Unique builds and built-index drops currently return
+Unsupported. Cross-shard uniqueness, safe planner candidates, physical drops and
+wire index commands remain open under #174.
 
 It generates ordered compound tuples with at most one final array field, removes
 duplicate array entries in encounter order, equates missing with null, and gives
@@ -981,7 +989,8 @@ restart, shared cursor quotas, byte paging, and deterministic admission interrup
 
 Other update operators,
 additional aggregation expressions/group-key forms,
-database statistics, index metadata cursors, and physical secondary-index builds
+database statistics, index metadata cursors, unique secondary-index builds and
+index-backed query plans
 remain later roadmap work. Collection metadata cursors are implemented.
 Unsupported command shapes return the stable `EngineErrorKind::Unsupported`
 category.

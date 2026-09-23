@@ -45,10 +45,12 @@ def sync_contract(path: str) -> None:
     collection_id: int = document_session.create_collection(
         "app", "notes", request_id=request_id
     )["collection"]["id"]
-    index_lifecycle: Literal["pending_build"] = document_session.create_index(
+    index_lifecycle: Literal["pending_build", "ready"] = document_session.create_index(
         "app", "notes", {"body": 1}, sparse=True
     )["lifecycle"]
     document_session.create_index("app", "notes", {"body": 1}, name="partial", partial_filter={"active": True})
+    built_lifecycle: Literal["pending_build", "ready"] = document_session.build_index("app", "notes", "partial")["lifecycle"]
+    print(built_lifecycle)
     index_metadata = document_session.list_indexes("app", "notes")["indexes"][0]
     sparse: bool = index_metadata.get("sparse", False)
     partial: Optional[dict[str, object]] = index_metadata.get("partial_filter")
@@ -129,6 +131,7 @@ async def async_contract(path: str) -> None:
     created = await session.create_collection("app", "typed")
     namespace: str = created["collection"]["namespace"]
     await session.create_index("app", "typed", {"body": 1}, sparse=True)
+    await session.build_index("app", "typed", "body_1")
     await session.create_index("app", "typed", {"body": 1}, name="partial", partial_filter={"active": True})
     index_metadata = (await session.list_indexes("app", "typed"))["indexes"][0]
     sparse: bool = index_metadata.get("sparse", False)

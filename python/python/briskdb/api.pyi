@@ -198,6 +198,12 @@ class AsyncSession:
         max_result_rows: Optional[int] = None,
         max_result_bytes: Optional[int] = None,
     ) -> CreateIndexResult: ...
+    async def build_index(
+        self, database: str, collection: str, name: str, *,
+        request_id: Optional[UUID] = None, timeout_ms: Optional[int] = None,
+        cancellation: Optional[CancellationToken] = None,
+        max_result_rows: Optional[int] = None, max_result_bytes: Optional[int] = None,
+    ) -> CreateIndexResult: ...
     async def drop_index(
         self, database: str, collection: str, name: str, *,
         request_id: Optional[UUID] = None, timeout_ms: Optional[int] = None,

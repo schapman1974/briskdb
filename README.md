@@ -454,8 +454,9 @@ more valuable than a star. Start with the
 - Python document commands support bounded BSON queries, basic aggregation,
   metadata/cursors, filtered deletes, replacements, and field/array updates.
   Replacement, update-one/many, and find-and-modify upserts are supported; other update operators,
-  native Python bulk-write helpers, and built
-  secondary indexes remain planned. Multi-document writes commit per shard,
+  native Python bulk-write helpers, secondary uniqueness and index-backed plans
+  remain planned. Explicit non-unique `build_index` now builds maintained entries;
+  it requires sole-process ownership and queries still scan. Multi-document writes commit per shard,
   without global atomicity or MongoDB per-document failure-boundary guarantees.
 - Ubuntu 24.04 x86-64 receives the full required Rust CI suite. Python wheels
   receive native build, audit, install, restart, corruption, and concurrency

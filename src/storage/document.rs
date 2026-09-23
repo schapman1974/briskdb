@@ -158,6 +158,7 @@ fn shard_read_error(error: rusqlite::Error, diagnostic: &'static str) -> EngineE
 
 #[cfg(feature = "documents")]
 mod enabled {
+    mod index_operations;
     use std::{
         collections::{HashMap, HashSet},
         sync::Arc,
@@ -171,7 +172,8 @@ mod enabled {
             BsonDocument, BsonErrorContext, BsonValue, CanonicalBsonKey, DocumentCatalog,
             DocumentCollectionId, DocumentCollectionMetadata, DocumentCollectionOptions,
             DocumentDatabaseId, DocumentIndexError, DocumentIndexId, DocumentIndexLifecycle,
-            DocumentIndexMetadata, DocumentPlacement, encode_document,
+            DocumentIndexMetadata, DocumentIndexPreparation, DocumentPlacement,
+            PreparedDocumentIndexEntries, encode_document,
         },
         sqlite_error,
     };
@@ -188,6 +190,177 @@ mod enabled {
     const INDEX_PENDING_BUILD: i64 = manifest::DOCUMENT_INDEX_PENDING_BUILD;
     const RECORD_CHECKSUM_DOMAIN: &[u8] = b"briskdb.document-record.v1\0";
     pub(crate) const MAX_DOCUMENT_SHARD_SCAN_RECORDS: usize = 4_096;
+
+    pub(in crate::storage) type DocumentIndexPreparations =
+        HashMap<DocumentCollectionId, Arc<DocumentIndexPreparation>>;
+
+    fn compile_ready_indexes(
+        catalog: &DocumentCatalog,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<DocumentIndexPreparations> {
+        compile_indexes_with_candidate(catalog, None, check).map_err(stored_index_error)
+    }
+
+    fn stored_index_error(error: EngineError) -> EngineError {
+        if matches!(
+            error.kind(),
+            EngineErrorKind::InvalidArgument
+                | EngineErrorKind::Unsupported
+                | EngineErrorKind::LimitExceeded
+                | EngineErrorKind::FailedPrecondition
+        ) {
+            EngineError::from_source(
+                EngineErrorKind::DataCorruption,
+                "stored document index authority cannot reproduce its bounded entries",
+                error,
+            )
+        } else {
+            error
+        }
+    }
+
+    fn compile_indexes_with_candidate(
+        catalog: &DocumentCatalog,
+        candidate: Option<DocumentIndexId>,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<DocumentIndexPreparations> {
+        let mut compiled = HashMap::new();
+        let mut retained = 0_usize;
+        for collection in catalog.collections() {
+            check()?;
+            let preparation = DocumentIndexPreparation::compile_selected_with_check(
+                collection.id(),
+                collection.indexes(),
+                |index| {
+                    index.lifecycle() == DocumentIndexLifecycle::Ready
+                        || Some(index.id()) == candidate
+                },
+                check,
+            )?;
+            if preparation.is_empty() {
+                continue;
+            }
+            retained = retained
+                .checked_add(preparation.retained_bytes())
+                .ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::LimitExceeded,
+                        "compiled document indexes exceed the root memory bound",
+                    )
+                })?;
+            if retained > 64 * 1024 * 1024 {
+                return Err(EngineError::new(
+                    EngineErrorKind::LimitExceeded,
+                    "compiled document indexes exceed the root memory bound",
+                ));
+            }
+            compiled.try_reserve(1).map_err(|error| {
+                EngineError::from_source(
+                    EngineErrorKind::OutOfMemory,
+                    "unable to retain compiled document indexes",
+                    error,
+                )
+            })?;
+            compiled.insert(collection.id(), Arc::new(preparation));
+        }
+        Ok(compiled)
+    }
+
+    impl Storage {
+        fn publish_document_indexes(&self, indexes: DocumentIndexPreparations) -> EngineResult<()> {
+            let mut current = self
+                .schema_coordination
+                .document_indexes
+                .lock()
+                .map_err(|_| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "document index coordination is poisoned",
+                    )
+                })?;
+            *current = Some(Arc::new(indexes));
+            Ok(())
+        }
+
+        /// The caller retains schema admission for the entire write. Build/drop
+        /// publication drains that admission before replacing this shared cache.
+        fn active_document_indexes(
+            &self,
+            collection: DocumentCollectionId,
+        ) -> EngineResult<Option<Arc<DocumentIndexPreparation>>> {
+            let current = self
+                .schema_coordination
+                .document_indexes
+                .lock()
+                .map_err(|_| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "document index coordination is poisoned",
+                    )
+                })?;
+            let current = current.as_ref().ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    "document index authority has not been validated",
+                )
+            })?;
+            Ok(current.get(&collection).cloned())
+        }
+    }
+
+    fn prepare_active_entries(
+        preparation: Option<&DocumentIndexPreparation>,
+        document: &BsonDocument,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<Option<PreparedDocumentIndexEntries>> {
+        preparation
+            .map(|preparation| {
+                preparation.prepare_with_check(document, &mut || {
+                    ensure_document_operation_not_cancelled(
+                        cancellation,
+                        "while preparing document index entries",
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    fn prepare_write_entries(
+        preparation: Option<&DocumentIndexPreparation>,
+        prepared: &PreparedDocumentWrite,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<Option<PreparedDocumentIndexEntries>> {
+        if preparation.is_none() {
+            return Ok(None);
+        }
+        let document = crate::document::decode_document(&prepared.document_bson)
+            .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?;
+        prepare_active_entries(preparation, &document, cancellation)
+    }
+
+    fn validate_record_index_coverage(
+        connection: &Connection,
+        preparation: Option<&DocumentIndexPreparation>,
+        record: &DocumentStorageRecord,
+        cancellation: &CancellationToken,
+    ) -> EngineResult<()> {
+        let expected = prepare_active_entries(preparation, &record.document, cancellation)
+            .map_err(stored_index_error)?;
+        super::index_storage::validate_record_entries(
+            connection,
+            record.collection_id,
+            record.shard,
+            record.id_key.as_bytes(),
+            &record.checksum,
+            expected.as_ref(),
+            &mut || {
+                ensure_document_operation_not_cancelled(
+                    cancellation,
+                    "while validating document index entries",
+                )
+            },
+        )
+    }
 
     /// Exact, validated bytes prepared for one shard-local document write.
     ///
@@ -223,6 +396,7 @@ mod enabled {
         id_key: CanonicalBsonKey,
         document: BsonDocument,
         encoded_len: usize,
+        checksum: [u8; 32],
     }
 
     impl DocumentStorageRecord {
@@ -264,13 +438,14 @@ mod enabled {
             ));
         }
         let pending: bool = connection.query_row(
-            "SELECT lifecycle_state = 2 FROM briskdb_document_index_storage WHERE singleton = 1",
+            "SELECT lifecycle_state = 2 OR EXISTS (SELECT 1 FROM briskdb_document_index_operation)
+             FROM briskdb_document_index_storage WHERE singleton = 1",
             [], |row| row.get(0),
         ).map_err(sqlite_error::storage)?;
         if pending {
             return Err(EngineError::new(
                 EngineErrorKind::FailedPrecondition,
-                "document index storage upgrade is incomplete; reopen the database to recover it",
+                "document index storage operation is incomplete; reopen the database to recover it",
             ));
         }
         match integrity.state() {
@@ -895,6 +1070,10 @@ mod enabled {
                 if let Some(deletion) = deletion {
                     recover_deletion(self, &mut connection, deletion, Some(&control))?;
                 }
+                let catalog = load_catalog_rows(&connection)?;
+                self.publish_document_indexes(compile_ready_indexes(&catalog, &mut || {
+                    ensure_control_active(&control, "before publishing document index catalog")
+                })?)?;
                 migration.publish_ready()?;
                 Ok(existed)
             })();
@@ -977,7 +1156,7 @@ mod enabled {
             debug_assert!(spec_bson.len() <= manifest::MAX_DOCUMENT_METADATA_BSON_BYTES);
             let manifest_path = self.root.join("manifest.sqlite");
             let mut connection = open_existing_manifest(&manifest_path)?;
-            let (stored_spec, index_id) =
+            let (stored_spec, index_id, stored_lifecycle) =
                 run_manifest_controlled(&mut connection, control.clone(), |connection| {
                     configure_journal_mode(connection)?;
                     let transaction = connection
@@ -1001,6 +1180,7 @@ mod enabled {
                         )
                         .optional()
                         .map_err(sqlite_error::storage)?;
+                    let mut stored_lifecycle = DocumentIndexLifecycle::PendingBuild;
                     let stored_spec = if let Some((existing_spec, existing_unique, lifecycle)) =
                         existing
                     {
@@ -1017,15 +1197,17 @@ mod enabled {
                                     &existing_spec,
                                     "document index specification",
                                 )? == *specification);
-                        if !same_spec
-                            || existing_unique != i64::from(unique)
-                            || lifecycle != INDEX_PENDING_BUILD
-                        {
+                        if !same_spec || existing_unique != i64::from(unique) {
                             return Err(EngineError::new(
                                 EngineErrorKind::FailedPrecondition,
                                 "document index name already has a different declaration",
                             ));
                         }
+                        stored_lifecycle = match lifecycle {
+                            INDEX_PENDING_BUILD => DocumentIndexLifecycle::PendingBuild,
+                            INDEX_READY => DocumentIndexLifecycle::Ready,
+                            _ => return Err(corrupt("invalid document index lifecycle")),
+                        };
                         existing_spec
                     } else {
                         transaction
@@ -1066,7 +1248,7 @@ mod enabled {
                         "before committing document index declaration",
                     )?;
                     transaction.commit().map_err(sqlite_error::storage)?;
-                    Ok((stored_spec, index_id))
+                    Ok((stored_spec, index_id, stored_lifecycle))
                 })?;
             let decoded = decode_metadata_document(&stored_spec, "document index specification")?;
             Ok(DocumentIndexMetadata::from_validated_parts(
@@ -1075,7 +1257,7 @@ mod enabled {
                 decoded,
                 unique,
                 false,
-                DocumentIndexLifecycle::PendingBuild,
+                stored_lifecycle,
             ))
         }
 
@@ -1124,8 +1306,9 @@ mod enabled {
                         return Err(DocumentIndexError::Protected.into_engine_error());
                     }
                     if lifecycle != INDEX_PENDING_BUILD {
-                        return Err(corrupt(
-                            "secondary document index is marked ready before physical index support",
+                        return Err(EngineError::new(
+                            EngineErrorKind::Unsupported,
+                            "dropping a built document index requires recoverable physical index removal",
                         ));
                     }
                     let changed = transaction
@@ -1468,6 +1651,8 @@ mod enabled {
             ensure_document_operation_not_cancelled(cancellation, "before inserting document")?;
             self.validate_prepared_document_route(shard, prepared)?;
             require_schema(connection)?;
+            let indexes = self.active_document_indexes(collection_id)?;
+            let entries = prepare_write_entries(indexes.as_deref(), prepared, cancellation)?;
             let natural_order = document_natural_order_to_sqlite(natural_order)?;
             let checksum = record_checksum(
                 collection_id,
@@ -1491,6 +1676,22 @@ mod enabled {
                     ],
                 )
                 .map_err(sqlite_error::statement)?;
+            if let Some(entries) = entries.as_ref() {
+                super::index_storage::insert_entries(
+                    connection,
+                    collection_id,
+                    shard,
+                    prepared.id_key.as_bytes(),
+                    &checksum,
+                    entries,
+                    &mut || {
+                        ensure_document_operation_not_cancelled(
+                            cancellation,
+                            "while inserting document index entries",
+                        )
+                    },
+                )?;
+            }
             Ok(())
         }
 
@@ -1520,6 +1721,22 @@ mod enabled {
             }
             self.validate_prepared_document_route(shard, replacement)?;
             require_schema(connection)?;
+            let Some(current) = self.get_document_on_connection(
+                connection,
+                collection_id,
+                shard,
+                id_key,
+                cancellation,
+            )?
+            else {
+                return Ok(false);
+            };
+            if current.natural_order != natural_order {
+                return Ok(false);
+            }
+            let indexes = self.active_document_indexes(collection_id)?;
+            validate_record_index_coverage(connection, indexes.as_deref(), &current, cancellation)?;
+            let entries = prepare_write_entries(indexes.as_deref(), replacement, cancellation)?;
             let natural_order = document_natural_order_to_sqlite(natural_order)?;
             let checksum = record_checksum(
                 collection_id,
@@ -1547,6 +1764,29 @@ mod enabled {
                     "exact document replacement changed more than one stored record",
                 ));
             }
+            if changed == 1 {
+                super::index_storage::remove_record_entries(
+                    connection,
+                    collection_id,
+                    id_key.as_bytes(),
+                )?;
+                if let Some(entries) = entries.as_ref() {
+                    super::index_storage::insert_entries(
+                        connection,
+                        collection_id,
+                        shard,
+                        id_key.as_bytes(),
+                        &checksum,
+                        entries,
+                        &mut || {
+                            ensure_document_operation_not_cancelled(
+                                cancellation,
+                                "while replacing document index entries",
+                            )
+                        },
+                    )?;
+                }
+            }
             Ok(changed == 1)
         }
 
@@ -1563,6 +1803,18 @@ mod enabled {
             ensure_document_operation_not_cancelled(cancellation, "before deleting document")?;
             self.validate_document_key_route(shard, id_key)?;
             require_schema(connection)?;
+            let Some(current) = self.get_document_on_connection(
+                connection,
+                collection_id,
+                shard,
+                id_key,
+                cancellation,
+            )?
+            else {
+                return Ok(false);
+            };
+            let indexes = self.active_document_indexes(collection_id)?;
+            validate_record_index_coverage(connection, indexes.as_deref(), &current, cancellation)?;
             let changed = connection
                 .execute(
                     "DELETE FROM briskdb_documents_v1
@@ -1574,6 +1826,13 @@ mod enabled {
                 return Err(corrupt(
                     "exact document deletion changed more than one stored record",
                 ));
+            }
+            if changed == 1 {
+                super::index_storage::remove_record_entries(
+                    connection,
+                    collection_id,
+                    id_key.as_bytes(),
+                )?;
             }
             Ok(changed == 1)
         }
@@ -1945,9 +2204,11 @@ mod enabled {
             recover_provisioning(storage, manifest_connection, provisioning)?;
         }
         super::index_storage::recover_layout(storage, manifest_connection)?;
+        index_operations::recover(storage, manifest_connection)?;
         let catalog = load_catalog_rows(manifest_connection)?;
+        let indexes = compile_ready_indexes(&catalog, &mut || Ok(()))?;
         if !catalog.collections().is_empty() {
-            validate_stored_records(storage, manifest_connection, &catalog)?;
+            validate_stored_records(storage, manifest_connection, &catalog, &indexes)?;
         } else {
             for shard in 0..storage.shard_count() {
                 let connection = storage.open_unconfigured_shard(shard)?;
@@ -1959,7 +2220,7 @@ mod enabled {
                 }
             }
         }
-        Ok(())
+        storage.publish_document_indexes(indexes)
     }
 
     fn load_deletion(connection: &Connection) -> EngineResult<Option<Deletion>> {
@@ -2291,6 +2552,7 @@ mod enabled {
         storage: &Storage,
         manifest_connection: &Connection,
         catalog: &DocumentCatalog,
+        indexes: &DocumentIndexPreparations,
     ) -> EngineResult<()> {
         manifest::current_integrity(manifest_connection, storage.shard_count())?;
         let active_collections = catalog
@@ -2304,9 +2566,7 @@ mod enabled {
             let connection = storage.open_unconfigured_shard(shard)?;
             storage.validate_unconfigured_shard(&connection, shard)?;
             require_schema(&connection)?;
-            // No secondary index is activated yet. Unexpected entry rows are
-            // corruption, never disposable caches to erase during recovery.
-            super::index_storage::require_empty(&connection)?;
+            super::index_storage::require_no_orphans(&connection)?;
             let mut statement = connection
                 .prepare(
                     "SELECT collection_id, natural_order, id_key, document_bson,
@@ -2362,7 +2622,11 @@ mod enabled {
                 let version = row.get::<_, i64>(5).map_err(|error| {
                     shard_read_error(error, "failed to decode stored BSON format version")
                 })?;
-                decode_record(
+                let record_checksum: [u8; 32] = checksum
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| corrupt("stored BSON checksum has an invalid length"))?;
+                let document = decode_record(
                     collection_id,
                     shard,
                     natural_order,
@@ -2370,6 +2634,19 @@ mod enabled {
                     bson,
                     checksum,
                     version,
+                )?;
+                let expected = indexes
+                    .get(&collection_id)
+                    .map(|preparation| preparation.prepare(&document).map_err(stored_index_error))
+                    .transpose()?;
+                super::index_storage::validate_record_entries(
+                    &connection,
+                    collection_id,
+                    shard,
+                    &id_key,
+                    &record_checksum,
+                    expected.as_ref(),
+                    &mut || Ok(()),
                 )?;
                 if !natural_orders.insert((collection_id, natural_order)) {
                     return Err(corrupt(
@@ -2782,9 +3059,9 @@ mod enabled {
             {
                 return Err(corrupt("built-in document _id index metadata is invalid"));
             }
-            if !built_in && lifecycle == DocumentIndexLifecycle::Ready {
+            if !built_in && unique && lifecycle == DocumentIndexLifecycle::Ready {
                 return Err(corrupt(
-                    "secondary document index is marked ready before physical index support",
+                    "unique document index is ready without global uniqueness authority",
                 ));
             }
             indexes.push(DocumentIndexMetadata::from_validated_parts(
@@ -3144,6 +3421,10 @@ mod enabled {
         let canonical_id = CanonicalBsonKey::from_bytes(&id_key)
             .map_err(|error| error.into_engine_error(BsonErrorContext::StoredData))?;
         let encoded_len = bson.len();
+        let record_checksum: [u8; 32] = checksum
+            .as_slice()
+            .try_into()
+            .map_err(|_| corrupt("stored BSON checksum has an invalid length"))?;
         let document = decode_record(
             collection_id,
             shard,
@@ -3160,6 +3441,7 @@ mod enabled {
             id_key: canonical_id,
             document,
             encoded_len,
+            checksum: record_checksum,
         })
     }
 
@@ -5347,6 +5629,8 @@ mod enabled {
 }
 
 #[cfg(feature = "documents")]
+pub(super) use enabled::DocumentIndexPreparations;
+#[cfg(feature = "documents")]
 pub(super) use enabled::recover_or_validate;
 #[cfg(feature = "documents")]
 pub(crate) use enabled::{
@@ -5363,7 +5647,8 @@ pub(super) fn recover_or_validate(
         .query_row(
             "SELECT EXISTS (SELECT 1 FROM briskdb_document_collections)
                 OR EXISTS (SELECT 1 FROM briskdb_document_deletion)
-                OR EXISTS (SELECT 1 FROM briskdb_document_index_storage WHERE lifecycle_state = 2)",
+                OR EXISTS (SELECT 1 FROM briskdb_document_index_storage WHERE lifecycle_state = 2)
+                OR EXISTS (SELECT 1 FROM briskdb_document_index_operation)",
             [],
             |row| row.get::<_, bool>(0),
         )
