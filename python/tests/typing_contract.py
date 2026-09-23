@@ -1,7 +1,22 @@
 from typing import List, Literal, Optional, Tuple
 from uuid import UUID
+import sqlite3
 
 import briskdb
+
+
+def remote_contract(database: briskdb.Database, token: str) -> None:
+    server: briskdb.Server = database.serve(
+        admin=None, sqlite_remote_token=token, sqlite_remote_tables=["notes"],
+        sqlite_remote_routing_key="typed",
+    )
+    connection = sqlite3.connect(":memory:")
+    with briskdb.attach_remote(connection, "http://" + server.http_address, token=token) as remote:
+        scope: str = remote.scope
+        tables: Tuple[str, ...] = remote.tables
+        print(scope, tables, connection.execute("SELECT * FROM remote.notes").fetchall())
+    connection.close()
+    server.close()
 
 
 def sync_contract(path: str) -> None:

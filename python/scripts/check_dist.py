@@ -21,10 +21,15 @@ PACKAGE_FILES = {
     "briskdb/_briskdb.pyi",
     "briskdb/api.py",
     "briskdb/api.pyi",
+    "briskdb/remote.py",
     "briskdb/NATIVE_NOTICES.txt",
     "briskdb/py.typed",
 }
 SDIST_FILES = {
+    "python/build.rs",
+    "python/src/remote_sqlite.c",
+    "python/src/remote_sqlite.rs",
+    "python/briskdb/remote.py",
     "API.md",
     "ASYNC_API.md",
     "CHANGELOG.md",

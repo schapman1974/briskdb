@@ -479,6 +479,9 @@ class AsyncDatabase:
         postgres_tls_key: Optional[Union[str, PathLike[str]]] = None,
         postgres_user: str = "briskdb",
         postgres_password_file: Optional[Union[str, PathLike[str]]] = None,
+        sqlite_remote_token: Optional[str] = None,
+        sqlite_remote_tables: Optional[list[str]] = None,
+        sqlite_remote_routing_key: Optional[str] = None,
     ) -> AsyncServer: ...
     async def close(self) -> CloseReport: ...
     async def __aenter__(self) -> AsyncDatabase: ...

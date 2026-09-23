@@ -39,6 +39,45 @@ session.close()
 db.close()
 ```
 
+## Query a remote BriskDB server through standard `sqlite3` (read-only preview)
+
+The same wheel includes an original native SQLite virtual-table addon and its
+remote client; this is not a VFS or a replacement for Python's `sqlite3` driver.
+Against an explicitly enabled BriskDB remote listener:
+
+```python
+import os
+import sqlite3
+import briskdb
+
+conn = sqlite3.connect(":memory:")
+with briskdb.attach_remote(conn, "https://db.example.com", token=os.environ["BRISKDB_TOKEN"]):
+    print(conn.execute("SELECT * FROM remote.users WHERE id = ?", (123,)).fetchall())
+conn.close()
+```
+
+Start the dedicated, authenticated listener against an existing engine with
+`db.serve(admin=None, sqlite_remote_token=token, sqlite_remote_tables=["users"])`.
+It serves only allowlisted tables; the normal `/v1/query` and `/v1/execute`
+routes are absent. Publish its loopback address through a trusted HTTPS reverse
+proxy for network access. Do not publish a separate admin/ordinary HTTP listener.
+Tokens should be generated with `secrets.token_urlsafe(32)` and kept out of source.
+
+Registered logical tables use BriskDB's normal shard placement. Uncataloged
+legacy databases require an explicit server-side `sqlite_remote_routing_key=`
+and expose **only that routed shard**, reported as `attachment.scope ==
+"legacy-shard"`; registered tables report `"logical"`. A routing key is not a
+row-level authorization filter: every allowlisted table row on that shard is readable.
+
+This preview supports bounded reads, parameters, aggregates, local SQL functions,
+and joins with local tables. Each scan is limited to 4,096 rows, 1 MiB of engine
+results and an 8 MiB encoded response (or stricter engine settings). No predicate,
+projection, or LIMIT pushdown yet: even `LIMIT 1` must fit the full table scan.
+Oversized results fail, never truncate. Reads across tables/shards are not a
+transaction snapshot. Writes, hidden rowids, remote DDL and transaction mapping
+are not implemented. See [the API contract](API.md#remote-sqlite-addon) and
+[host SQLite requirements](COMPATIBILITY.md#remote-sqlite-host-requirements).
+
 Enable native BSON commands per database handle. The default `standard` UUID
 representation uses subtype 4; legacy and `unspecified` modes are documented
 in the [value conversion contract](VALUE_CONVERSIONS.md).

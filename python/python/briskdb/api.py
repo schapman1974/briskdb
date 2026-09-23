@@ -941,6 +941,9 @@ class AsyncDatabase:
         postgres_tls_key: Optional[Union[str, PathLike[str]]] = None,
         postgres_user: str = "briskdb",
         postgres_password_file: Optional[Union[str, PathLike[str]]] = None,
+        sqlite_remote_token: Optional[str] = None,
+        sqlite_remote_tables: Optional[list[str]] = None,
+        sqlite_remote_routing_key: Optional[str] = None,
     ) -> AsyncServer:
         """Start listeners against this database's existing engine."""
 
@@ -953,6 +956,9 @@ class AsyncDatabase:
             postgres_tls_key=postgres_tls_key,
             postgres_user=postgres_user,
             postgres_password_file=postgres_password_file,
+            sqlite_remote_token=sqlite_remote_token,
+            sqlite_remote_tables=sqlite_remote_tables,
+            sqlite_remote_routing_key=sqlite_remote_routing_key,
         )
         return AsyncServer(server)
 

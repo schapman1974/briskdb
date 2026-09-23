@@ -6,6 +6,8 @@ files; the signatures below are the compact API map.
 
 ## Open and configure
 
+For networked use of Python's real `sqlite3`, see [remote SQLite](#remote-sqlite-addon).
+
 - `open(path, *, shards=None, documents=False, uuid_representation=None, config=None) -> Database`
 - `connect(...) -> Database` is the synchronous ergonomic alias.
 - `await open_async(...) -> AsyncDatabase` and `connect_async(...)` open
@@ -323,3 +325,67 @@ All native failures derive from `BriskDBError`; each has stable `code` and
 to the non-retryable `IdempotencyConflictError`, which derives from
 `IntegrityError`. See [value and error conversions](VALUE_CONVERSIONS.md) and
 [sync/async lifecycle details](ASYNC_API.md).
+
+## Remote SQLite addon
+
+`attach_remote(connection, url, *, token, schema="remote", tables=None,
+timeout=15.0) -> RemoteAttachment` accepts a standard `sqlite3.Connection`.
+It loads the native module from the installed BriskDB wheel and creates proxy
+virtual tables in a new, in-memory attached database. Query `remote.users`, or
+use an unqualified name when it does not collide with a local table. SQLite
+executes joins, expressions, aggregates, sorting, and predicates locally.
+
+`RemoteAttachment.schema`, `.tables`, `.scope` (`"logical"` or `"legacy-shard"`),
+and `.closed` describe the attachment. `.close()` and context-manager exit
+detach it without changing any remote table. Finish active cursors/transactions
+before closing; a busy detach raises and can be retried. Dropping a local proxy
+table never drops remote data. Neither attachment nor detachment commits or
+rolls back caller-owned work. Attachment rejects an active local transaction.
+The connection's ordinary thread-ownership rules still apply. This is a
+synchronous client; no async `sqlite3` API is implied.
+
+Server: `db.serve(..., sqlite_remote_token=token,
+sqlite_remote_tables=["users"], sqlite_remote_routing_key=None)` replaces the
+data listener's normal SQL endpoints with `GET /sqlite/v1/catalog` and
+`POST /sqlite/v1/scan`. Both require the bearer credential, with a 1..256-table
+allowlist in the default logical database. Each table has at most 256 columns.
+Use a separate `serve()` handle for PostgreSQL. The optional admin listener is
+unchanged; use `admin=None` unless needed, and never publish it through the proxy.
+The same options are forwarded by `AsyncDatabase.serve()`.
+
+Registered tables use engine placement and global/sharded reads. An uncataloged
+database is rejected unless the server explicitly supplies a legacy routing key;
+that mode exposes all rows on the selected physical shard, not all shards and
+not just rows belonging to that key. Internal tables and views are not exposed.
+Schema generation and a per-listener instance nonce fence stale attachments:
+after migration or restart, close and reattach. Metadata discovery checks every
+target shard's column shape. Declared affinities are retained; remote constraints,
+indexes, default collations, primary-key promises and hidden rowids are not copied.
+Use explicit key columns and explicit collations in local SQL where needed.
+
+Reads are capped at 4,096 rows and 1 MiB of engine result budget per scan, plus
+an 8 MiB binary frame/HTTP response cap. Smaller engine settings still apply.
+The server admits eight concurrent connector requests, bounds request bodies
+to 4 KiB, uses a ten-second engine deadline and a fifteen-second HTTP-handler
+deadline. Client timeout is configurable from >0 to 60 seconds; synchronous
+socket reads may finish one socket timeout after the overall read deadline.
+No automatic retries occur. There is no paging or pushdown in this preview:
+`WHERE`, projections and `LIMIT` do not make an oversized full-table scan valid.
+Remote cancellation on `Connection.interrupt()` is not yet provided during a
+blocking network callback; request deadlines bound that wait.
+
+NULL, signed int64, real, UTF-8 text (including embedded NUL), and blob values
+are transported without JSON number loss. Unrepresentable unsigned/decimal,
+invalid UTF-8 and NaN values fail rather than coerce silently. Reads from
+different cursors/tables/shards need not observe the same committed snapshot,
+even inside a local `BEGIN` or savepoint. Remote writes, DDL, transaction
+mapping, stable row locators and distributed atomicity are not implemented.
+
+Network access requires HTTPS with normal certificate verification. Literal
+loopback IPs may use HTTP for local development. Redirects and environment
+proxies are disabled; credentials are never embedded in SQLite schema SQL or
+returned error messages. The native module uses SQLite's `DIRECTONLY` safety
+flag (non-TEMP persistent views/triggers cannot activate it). It does not
+sandbox SQL executed directly by the connection's owner. After loading,
+extension loading is always disabled. Use only trusted SQL on this connection.
+Failures use standard `sqlite3` exceptions, not native `BriskDBError` subclasses.

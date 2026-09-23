@@ -356,6 +356,8 @@ name = "briskdb-python"
 version = "0.1.0-alpha.6"
 dependencies = [
  "briskdb",
+ "cc",
+ "libsqlite3-sys",
  "pyo3",
  "tempfile",
  "tokio",
