@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import http.client
+from email.message import Message
 import secrets
 import sqlite3
 import struct
@@ -279,6 +281,27 @@ class RemoteSqliteTests(unittest.TestCase):
 
 
 class RemoteSqliteCapabilityTests(unittest.TestCase):
+    def test_malformed_http_errors_and_truncated_bodies_fail_closed(self) -> None:
+        client = remote._Client("https://example.invalid", "x" * 32, 5)
+        for error in (http.client.BadStatusLine(client.token),
+                      http.client.IncompleteRead(client.token.encode(), 500)):
+            with mock.patch.object(client.opener, "open", side_effect=error):
+                with self.assertRaises(sqlite3.OperationalError) as observed:
+                    client.request("/sqlite/v1/catalog")
+                self.assertNotIn(client.token, str(observed.exception))
+        for length in ("100", "invalid", "8388609"):
+            headers = Message()
+            headers["Content-Type"] = "application/json"
+            headers["Content-Length"] = length
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.status = 200
+            response.headers = headers
+            response.read1.side_effect = [b"{}", b""]
+            with mock.patch.object(client.opener, "open", return_value=response):
+                with self.assertRaises(sqlite3.OperationalError):
+                    client.request("/sqlite/v1/catalog")
+
     def test_missing_loader_is_rejected_before_network_or_connection_changes(self) -> None:
         class WithoutLoader(sqlite3.Connection):
             def __getattribute__(self, name: str) -> object:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import http.client
 import json
 import math
 import secrets
@@ -75,6 +76,10 @@ class _Client:
                     raise sqlite3.OperationalError("invalid BriskDB remote response type")
                 if response.headers.get("Content-Encoding", "identity") != "identity":
                     raise sqlite3.OperationalError("compressed BriskDB remote responses are unsupported")
+                length = response.headers.get("Content-Length")
+                if length is not None and (not length.isascii() or not length.isdecimal()
+                                           or len(length) > 10 or int(length) > _MAX_BYTES):
+                    raise sqlite3.OperationalError("invalid BriskDB remote response length")
                 chunks = bytearray()
                 while True:
                     if time.monotonic() >= deadline:
@@ -84,6 +89,8 @@ class _Client:
                     if len(chunks) > _MAX_BYTES:
                         raise sqlite3.OperationalError("BriskDB remote response limit exceeded")
                     if not block:
+                        if length is not None and len(chunks) != int(length):
+                            raise sqlite3.OperationalError("truncated BriskDB remote response")
                         return bytes(chunks)
         except urllib.error.HTTPError as error:
             code = error.code
@@ -98,7 +105,7 @@ class _Client:
                 503: "BriskDB remote request capacity exceeded",
             }
             raise sqlite3.OperationalError(messages.get(code, "BriskDB remote request rejected")) from None
-        except (OSError, urllib.error.URLError):
+        except (OSError, urllib.error.URLError, http.client.HTTPException):
             # URL, proxy configuration, server bodies and credentials are not
             # safe exception messages. Reads are never retried automatically.
             raise sqlite3.OperationalError("BriskDB remote network request failed") from None

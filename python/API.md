@@ -367,8 +367,10 @@ Reads are capped at 4,096 rows and 1 MiB of engine result budget per scan, plus
 an 8 MiB binary frame/HTTP response cap. Smaller engine settings still apply.
 The server admits eight concurrent connector requests, bounds request bodies
 to 4 KiB, uses a ten-second engine deadline and a fifteen-second HTTP-handler
-deadline. Client timeout is configurable from >0 to 60 seconds; synchronous
-socket reads may finish one socket timeout after the overall read deadline.
+deadline. Client timeout is configurable from >0 to 60 seconds. It bounds idle
+socket operations and checks elapsed time between response-body reads; it is
+not a strict wall-clock bound on DNS resolution or slowly arriving HTTP headers.
+Use a trusted HTTPS endpoint/proxy with its own header/connection deadlines.
 No automatic retries occur. There is no paging or pushdown in this preview:
 `WHERE`, projections and `LIMIT` do not make an oversized full-table scan valid.
 Remote cancellation on `Connection.interrupt()` is not yet provided during a
