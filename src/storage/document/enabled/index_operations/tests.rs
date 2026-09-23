@@ -1159,6 +1159,96 @@ fn every_built_drop_boundary_recovers_without_rewriting_surviving_authority() {
 }
 
 #[test]
+fn cancellation_during_cleanup_validation_is_not_corruption() {
+    use crate::core::CancellationReason;
+    use std::sync::Barrier;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    let blocker = storage.open_unconfigured_shard(0).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    for attempt in 0..512 {
+        let mut connection = storage.open_unconfigured_shard(0).unwrap();
+        let control = OperationControl::new(None);
+        let observer_control = Arc::clone(&control);
+        let ready = Arc::new(Barrier::new(2));
+        let observer_ready = Arc::clone(&ready);
+        let observer = std::thread::spawn(move || {
+            observer_ready.wait();
+            std::thread::sleep(std::time::Duration::from_micros((attempt % 256) * 10));
+            observer_control.request_cancel(CancellationReason::Cancelled);
+        });
+        let result: EngineResult<()> =
+            run_provisioning_step(&mut connection, Some(&control), |connection| {
+                ready.wait();
+                storage.validate_unconfigured_shard_nonterminal(connection, 0)?;
+                require_schema(connection)?;
+                // Keep the operation interruptible even when validation finishes
+                // before the observer. No mutation is performed.
+                connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sqlite_error::storage)?;
+                panic!("the blocker must prevent write admission");
+            });
+        observer.join().unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.kind(),
+            EngineErrorKind::Cancelled,
+            "attempt {attempt}: {error:?}"
+        );
+    }
+    blocker.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn cancellation_at_each_cleanup_validation_checkpoint_is_not_corruption() {
+    use crate::core::CancellationReason;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    for checkpoint in 1..=10_000 {
+        let mut connection = storage.open_unconfigured_shard(0).unwrap();
+        let control = OperationControl::new(None);
+        let progress_control = Arc::clone(&control);
+        let result = run_provisioning_step(&mut connection, Some(&control), |connection| {
+            let steps = AtomicUsize::new(0);
+            connection
+                .progress_handler(
+                    1,
+                    Some(move || {
+                        if steps.fetch_add(1, Ordering::Relaxed) + 1 == checkpoint {
+                            progress_control.request_cancel(CancellationReason::Cancelled);
+                        }
+                        // Exercise the interrupt callback itself. Returning true
+                        // would also force SQLITE_INTERRUPT from the outer VM.
+                        false
+                    }),
+                )
+                .unwrap();
+            storage.validate_unconfigured_shard_nonterminal(connection, 0)?;
+            require_schema(connection)
+        });
+        if control.reason().is_none() {
+            result.unwrap();
+            assert!(checkpoint > 100, "must cover the complete validation");
+            return;
+        }
+        if let Err(error) = result {
+            assert_eq!(
+                error.kind(),
+                EngineErrorKind::Cancelled,
+                "checkpoint {checkpoint}: {error:?}"
+            );
+        }
+    }
+    panic!("validation exceeded the bounded checkpoint sweep");
+}
+
+#[test]
 fn cancelled_admitted_drop_stays_fenced_until_reopen_finishes_cleanup() {
     use crate::core::CancellationReason;
     let temp = tempfile::tempdir().unwrap();
@@ -1192,7 +1282,7 @@ fn cancelled_admitted_drop_stays_fenced_until_reopen_finishes_cleanup() {
         .drop_built_document_index_controlled("app", "items", "value", migration, control)
         .unwrap_err();
     observer.join().unwrap();
-    assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+    assert_eq!(error.kind(), EngineErrorKind::Cancelled, "{error:?}");
     assert!(storage.enter_schema_operation().is_err());
     blocker.execute_batch("ROLLBACK").unwrap();
     drop(blocker);
