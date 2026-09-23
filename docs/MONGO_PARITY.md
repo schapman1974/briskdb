@@ -145,8 +145,12 @@ activation by itself. Version 19 adds explicit native Rust/Python non-unique
 builds with journaled shard progress, atomic Ready publication, transactional
 entry maintenance and restart coverage/checksum validation. Unpublished builds
 are discarded on reopen without changing BSON or declaration IDs. Global
-uniqueness, physical index drop, planner use and Mongo wire index commands remain
-open under #174; these native additions do not expand the wire contract.
+uniqueness, planner use and Mongo wire index commands remain
+open under #174; these native additions do not expand the wire contract. Native
+Rust and sync/async Python can also drop built indexes through the existing exact
+name API. A journaled, sole-process cleanup removes derived entries and metadata,
+preserves BSON/other Ready indexes/allocator history, and finishes on reopen after
+an interruption. Pending drops retain their lightweight concurrent path.
 
 `listDatabases` on `admin` supports `nameOnly: true`, including ordinary
 sync/async PyMongo `list_database_names()` and

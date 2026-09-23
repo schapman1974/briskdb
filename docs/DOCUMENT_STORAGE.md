@@ -142,9 +142,9 @@ unindexed-field changes), and deletes maintain entries in the document's own
 transaction. A schema-fenced root-shared compiled cache selects only Ready
 indexes; opaque or unique pending declarations remain non-enforcing. Startup
 rejects missing, extra, stale or orphan entries without repair unless an explicit
-journal owns their cleanup. Global uniqueness, physical index drop, planner use
-and Mongo wire index commands remain work under #174. Dropping a built index
-currently returns Unsupported; namespace deletion can remove it with its records.
+journal owns their cleanup. Global uniqueness, planner use and Mongo wire index
+commands remain work under #174. Built-index drops use journal-owned cleanup
+without removing records; namespace deletion can remove both indexes and records.
 
 ## Provisioning and restart
 
@@ -209,8 +209,19 @@ The built-in index is protected. Declaration deletion, its identity-map cascade
 and semantic-root refresh commit atomically; the permanent allocation head does
 not decrease. No shard row or schema changes. A pre-commit process exit restores
 the declaration and ID on reopen; a post-commit exit preserves their absence.
-This metadata-only path rejects non-pending secondary lifecycles and does not
-stand in for a future recoverable physical-index drop.
+This metadata-only path rejects non-pending secondary lifecycles. The Engine
+selects it while holding shared schema admission; concurrent pending drops retain
+their existing behavior. Built indexes use a separate exclusive, sole-process path.
+It precompiles the survivor cache, seals Drop intent while marking the target
+PendingBuild, removes that index ID's entries shard-by-shard, and atomically
+deletes intent plus catalog/identity rows after the complete prefix commits.
+Startup finishes an interrupted Drop (rather than restoring its declaration).
+The caller must reopen after an admitted interruption. Cached names and compiled
+definitions are published together before admitting new writes, including through
+independent handles of the same root. The existing 64-MiB compiled-definition
+allowance is unchanged; dispatch names have a separate conservative 32-MiB ceiling
+large enough for every valid catalog, so existing version-19 roots retain their
+accepted definition budget. Debug output omits names and specifications.
 
 ## TinyMongo SQLite import
 

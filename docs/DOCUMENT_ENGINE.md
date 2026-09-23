@@ -65,6 +65,7 @@ The current engine executes:
 | `ListDatabaseNames` | Returns `DatabaseNames(Box<[String]>)` from a validated document catalog snapshot; shared filters on `name` and logical combinations, normal request controls, no disk statistics |
 | `CreateIndex` | Validates and normalizes ordered keys, resolves a bounded default/explicit name, and declares pending index metadata; it does not build or enforce a secondary index |
 | `BuildIndex` | Explicitly builds a declared non-unique index under sole-process/exclusive schema admission; returns `IndexReady(name)` after complete publication; queries still scan |
+| `DropIndex` | Removes an exact pending declaration or recoverably removes a built non-unique index and its derived entries; never removes BSON records |
 | `ListIndexes` | Returns the built-in `_id_` definition and declared secondary-index metadata |
 | `Insert` | Inserts ordered/unordered batches; generates missing ObjectIds, preserves explicit null IDs, and reports safe per-input duplicate failures |
 | `Find` | Evaluates BSON match expressions and returns a bounded batch with a continuation ID when needed |
@@ -138,18 +139,27 @@ restart metadata. Descending/numeric-alias normalization, invalid inputs,
 resource limits and legacy metadata preservation are independently tested; no
 frozen expectations or compatibility allowances are changed.
 
-`DropIndex` now removes one pending declaration by its exact, case-sensitive name.
+`DropIndex` removes one pending or built index by its exact, case-sensitive name.
 It protects both `_id` and `_id_`, reports a typed not-found error for an absent
 index, and never interprets field aliases, key patterns or `*` as bulk selectors
 (`*` can still be an exact native index name). It neither creates a missing
-collection nor touches document rows or SQL indexes. Deletion, identity-map
+collection nor touches document rows or SQL indexes. For pending declarations, deletion, identity-map
 cascade and checksum refresh share one manifest transaction; the allocation
 high-water mark is retained, so recreating the name gets a new index ID.
 Result-budget and request-control failures before commit leave the declaration
 unchanged. A successful commit returns `Acknowledged(true)` without a later
 cancellation check turning that committed removal into an apparent failure.
-Crash tests cover both sides of commit. Physical-index deletion and Mongo wire
-`dropIndexes` remain future work.
+Crash tests cover both sides of commit. Built non-unique indexes instead require
+sole-process ownership and exclusive schema admission: intent atomically changes
+the target to PendingBuild and installs the existing version-19 Drop journal.
+Cleanup removes only that globally unique index ID from each shard, then deletes
+its declaration/identity mapping and publishes the surviving compiled cache.
+The permanent allocator is never reset. Cancellation after intent leaves schema
+admission fenced until reopening completes the drop; it is not a rollback promise.
+Process-exit tests cover both sides of intent, shard, cursor and completion commits.
+Other Ready indexes and exact BSON remain unchanged. A schema-guarded, bounded
+Ready-name cache selects this path without adding I/O to pending drops, preserving
+their concurrent behavior. Mongo wire `dropIndexes` remains future work.
 
 `DocumentIndexKeyGenerator` is the shared, immutable secondary-key foundation,
 not a physical index. It validates key definitions and compiles optional partial
@@ -186,8 +196,8 @@ matching declarations preserve that Ready lifecycle. Ready entries are maintaine
 transactionally by every record write and verified on reopen. Interrupted builds
 require reopening; startup discards the unpublished derived entries, leaving the
 declaration pending. Shared preparation bounds apply across all Ready indexes,
-not independently per index. Unique builds and built-index drops currently return
-Unsupported. Cross-shard uniqueness, safe planner candidates, physical drops and
+not independently per index. Unique builds currently return Unsupported.
+Cross-shard uniqueness, safe planner candidates and
 wire index commands remain open under #174.
 
 It generates ordered compound tuples with at most one final array field, removes

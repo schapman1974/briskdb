@@ -18,6 +18,75 @@ fn build(storage: &Storage, name: &str) -> EngineResult<DocumentIndexMetadata> {
     )
 }
 
+fn drop_built(storage: &Storage, name: &str) -> EngineResult<()> {
+    let migration = storage.begin_schema_migration()?;
+    migration.wait_for_quiescence_blocking();
+    storage.drop_built_document_index_controlled(
+        "app",
+        "items",
+        name,
+        migration,
+        OperationControl::new(None),
+    )
+}
+
+#[test]
+fn built_drop_preserves_records_surviving_entries_and_allocator_without_stale_caches() {
+    use crate::document::BsonObjectId;
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, collection) = setup(temp.path(), 2);
+    let peer = Storage::open(temp.path(), 2).unwrap();
+    let removed = build(&storage, "value").unwrap();
+    storage
+        .declare_document_index(
+            collection,
+            "keep",
+            &BsonDocument::from_entries([("other", BsonValue::Int32(1))]).unwrap(),
+            false,
+        )
+        .unwrap();
+    build(&storage, "keep").unwrap();
+    let namespace = DocumentNamespace::new("app", "items").unwrap();
+    assert!(peer.document_index_is_ready(&namespace, "value").unwrap());
+    let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+    let mut surviving = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
+    for shard in &mut surviving {
+        shard.retain(|row| row[1] != Value::Integer(removed.id().get() as i64));
+    }
+    drop_built(&storage, "value").unwrap();
+    assert!(!peer.document_index_is_ready(&namespace, "value").unwrap());
+    assert!(peer.document_index_is_ready(&namespace, "keep").unwrap());
+    assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+    assert_eq!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1"),
+        surviving
+    );
+    // The removed index no longer rejects values outside its supported key subset.
+    peer.insert_document(
+        collection,
+        &document(50, BsonValue::ObjectId(BsonObjectId::from_bytes([7; 12]))),
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1")
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        13
+    );
+    let replacement = storage
+        .declare_document_index(collection, "value", removed.specification(), false)
+        .unwrap();
+    assert!(replacement.id().get() > removed.id().get());
+    assert_eq!(
+        replacement.lifecycle(),
+        DocumentIndexLifecycle::PendingBuild
+    );
+    drop(peer);
+    drop(storage);
+    drop(Storage::open(temp.path(), 2).unwrap());
+}
+
 fn setup(root: &Path, count: u16) -> (Storage, DocumentCollectionId) {
     let storage = Storage::open(root, count).unwrap();
     let collection = storage
@@ -438,11 +507,19 @@ fn index_operation_crash_child() {
         .parse()
         .unwrap();
     let storage = Storage::open(root, count).unwrap();
-    build(&storage, "value").unwrap();
+    if std::env::var("BRISKDB_TEST_INDEX_OPERATION_DROP").as_deref() == Ok("1") {
+        drop_built(&storage, "value").unwrap();
+    } else {
+        build(&storage, "value").unwrap();
+    }
     panic!("index operation crash boundary was not reached");
 }
 
 fn crash(root: &Path, count: u16, point: &str) {
+    crash_mode(root, count, point, false);
+}
+
+fn crash_mode(root: &Path, count: u16, point: &str, dropping: bool) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -452,6 +529,10 @@ fn crash(root: &Path, count: u16, point: &str) {
         .env("BRISKDB_TEST_INDEX_OPERATION_ROOT", root)
         .env("BRISKDB_TEST_INDEX_OPERATION_SHARDS", count.to_string())
         .env("BRISKDB_TEST_DOCUMENT_INDEX_OPERATION_CRASH", point)
+        .env(
+            "BRISKDB_TEST_INDEX_OPERATION_DROP",
+            if dropping { "1" } else { "0" },
+        )
         .output()
         .unwrap();
     assert_eq!(
@@ -460,6 +541,138 @@ fn crash(root: &Path, count: u16, point: &str) {
         "{point}: {} {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn every_built_drop_boundary_recovers_without_rewriting_surviving_authority() {
+    for count in [2, 4] {
+        let mut points = vec![
+            "drop-before-intent:0".to_owned(),
+            "drop-after-intent:0".to_owned(),
+            "cleanup-before-completion:0".to_owned(),
+            "cleanup-after-completion:0".to_owned(),
+        ];
+        for shard in 0..count {
+            for point in [
+                "cleanup-before-shard",
+                "cleanup-after-shard",
+                "before-cursor",
+                "after-cursor",
+            ] {
+                points.push(format!("{point}:{shard}"));
+            }
+        }
+        for point in points {
+            let temp = tempfile::tempdir().unwrap();
+            let (storage, collection) = setup(temp.path(), count);
+            let removed = build(&storage, "value").unwrap();
+            let keep = storage
+                .declare_document_index(
+                    collection,
+                    "keep",
+                    &BsonDocument::from_entries([("other", BsonValue::Int32(1))]).unwrap(),
+                    false,
+                )
+                .unwrap();
+            build(&storage, "keep").unwrap();
+            let records = snapshot(temp.path(), count, "briskdb_documents_v1");
+            let mut entries = snapshot(temp.path(), count, "briskdb_document_index_entries_v1");
+            if point != "drop-before-intent:0" {
+                for shard in &mut entries {
+                    shard.retain(|row| row[1] != Value::Integer(removed.id().get() as i64));
+                }
+            }
+            drop(storage);
+            crash_mode(temp.path(), count, &point, true);
+            let storage = Storage::open(temp.path(), count).unwrap();
+            assert_eq!(
+                snapshot(temp.path(), count, "briskdb_documents_v1"),
+                records,
+                "{point}"
+            );
+            assert_eq!(
+                snapshot(temp.path(), count, "briskdb_document_index_entries_v1"),
+                entries,
+                "{point}"
+            );
+            let catalog = storage.document_catalog().unwrap();
+            let indexes = catalog.collection("app", "items").unwrap().indexes();
+            assert_eq!(
+                indexes.iter().any(|index| index.id() == removed.id()),
+                point == "drop-before-intent:0"
+            );
+            assert!(indexes.iter().any(|index| index.id() == keep.id()
+                && index.lifecycle() == DocumentIndexLifecycle::Ready));
+            if point == "drop-before-intent:0" {
+                drop_built(&storage, "value").unwrap();
+            }
+            let next = storage
+                .declare_document_index(collection, "value", removed.specification(), false)
+                .unwrap();
+            assert!(next.id().get() > keep.id().get());
+            build(&storage, "value").unwrap();
+            drop(storage);
+            drop(Storage::open(temp.path(), count).unwrap());
+        }
+    }
+}
+
+#[test]
+fn cancelled_admitted_drop_stays_fenced_until_reopen_finishes_cleanup() {
+    use crate::core::CancellationReason;
+    let temp = tempfile::tempdir().unwrap();
+    let (storage, _) = setup(temp.path(), 2);
+    build(&storage, "value").unwrap();
+    let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
+    let blocker = storage.open_unconfigured_shard(0).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let control = OperationControl::new(None);
+    let observer_control = Arc::clone(&control);
+    let manifest_path = temp.path().join("manifest.sqlite");
+    let observer = std::thread::spawn(move || {
+        let connection = Connection::open(manifest_path).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let admitted: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM briskdb_document_index_operation WHERE operation_kind=2)", [], |row| row.get(0)).unwrap();
+            if admitted {
+                assert!(observer_control.request_cancel(CancellationReason::Cancelled));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drop intent was not admitted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let migration = storage.begin_schema_migration().unwrap();
+    migration.wait_for_quiescence_blocking();
+    let error = storage
+        .drop_built_document_index_controlled("app", "items", "value", migration, control)
+        .unwrap_err();
+    observer.join().unwrap();
+    assert_eq!(error.kind(), EngineErrorKind::Cancelled);
+    assert!(storage.enter_schema_operation().is_err());
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    drop(storage);
+    let storage = Storage::open(temp.path(), 2).unwrap();
+    assert_eq!(
+        storage
+            .document_catalog()
+            .unwrap()
+            .collection("app", "items")
+            .unwrap()
+            .indexes()
+            .len(),
+        1
+    );
+    assert_eq!(snapshot(temp.path(), 2, "briskdb_documents_v1"), records);
+    assert!(
+        snapshot(temp.path(), 2, "briskdb_document_index_entries_v1")
+            .iter()
+            .all(Vec::is_empty)
     );
 }
 

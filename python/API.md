@@ -250,15 +250,20 @@ same way; unknown legacy envelopes retain their previous opaque `keys` value and
 are not silently interpreted. Ordinary and built-in result shapes are unchanged.
 
 `drop_index` is available on both sync and async sessions. It removes one pending
-declaration by exact, case-sensitive name and returns `kind="acknowledged"`,
+declaration or built non-unique index by exact, case-sensitive name and returns `kind="acknowledged"`,
 `acknowledged=True`, and a null plan. It never removes documents or the built-in
 ID index. `_id`/`_id_` raise `InvalidArgumentError`; missing indexes raise
 `FailedPreconditionError`, including a repeated drop. Field aliases, key-pattern
 selectors and bulk removal are not supported: `*` is only an exact native name,
-not a wildcard. Cancellation/deadline or insufficient result limits before
-commit leave the declaration intact. Recreating a removed name gets a new durable
-internal ID. Built-index removal currently raises `UnsupportedError`; recoverable
-physical drops and Mongo wire `dropIndexes` remain unfinished.
+not a wildcard. For pending declarations, cancellation/deadline or insufficient
+result limits before the metadata commit leave the declaration intact. Built-index
+preflight failures before durable intent also leave it unchanged. Recreating a removed name gets a new durable
+internal ID. Built indexes require sole-process ownership and exclusive schema
+admission. Their entries are removed through the recovery journal without changing
+records or other Ready indexes. Cancellation after durable intent leaves the root
+fenced until closing/reopening finishes the admitted drop; it does not restore the
+index. The same options work through asyncio. Mongo wire `dropIndexes`, wildcard
+and field-alias removal remain unfinished.
 
 This API deliberately mirrors the document engine's implemented boundary:
 `insert_one` generates a missing ObjectId while preserving explicit null and

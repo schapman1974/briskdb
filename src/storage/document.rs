@@ -172,7 +172,7 @@ mod enabled {
             BsonDocument, BsonErrorContext, BsonValue, CanonicalBsonKey, DocumentCatalog,
             DocumentCollectionId, DocumentCollectionMetadata, DocumentCollectionOptions,
             DocumentDatabaseId, DocumentIndexError, DocumentIndexId, DocumentIndexLifecycle,
-            DocumentIndexMetadata, DocumentIndexPreparation, DocumentPlacement,
+            DocumentIndexMetadata, DocumentIndexPreparation, DocumentNamespace, DocumentPlacement,
             PreparedDocumentIndexEntries, encode_document,
         },
         sqlite_error,
@@ -190,15 +190,36 @@ mod enabled {
     const INDEX_PENDING_BUILD: i64 = manifest::DOCUMENT_INDEX_PENDING_BUILD;
     const RECORD_CHECKSUM_DOMAIN: &[u8] = b"briskdb.document-record.v1\0";
     pub(crate) const MAX_DOCUMENT_SHARD_SCAN_RECORDS: usize = 4_096;
+    const _: () = assert!(
+        manifest::MAX_DOCUMENT_INDEXES * (manifest::MAX_DOCUMENT_INDEX_NAME_BYTES + 128)
+            + manifest::MAX_DOCUMENT_COLLECTIONS * (255 + 256)
+            <= 32 * 1024 * 1024
+    );
 
-    pub(in crate::storage) type DocumentIndexPreparations =
-        HashMap<DocumentCollectionId, Arc<DocumentIndexPreparation>>;
+    pub(in crate::storage) struct DocumentIndexPreparations {
+        collections: HashMap<DocumentCollectionId, Arc<DocumentIndexPreparation>>,
+        ready_names: HashMap<DocumentNamespace, HashSet<String>>,
+    }
+
+    impl std::fmt::Debug for DocumentIndexPreparations {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("DocumentIndexPreparations")
+                .field("collection_count", &self.collections.len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl DocumentIndexPreparations {
+        fn get(&self, collection: &DocumentCollectionId) -> Option<&Arc<DocumentIndexPreparation>> {
+            self.collections.get(collection)
+        }
+    }
 
     fn compile_ready_indexes(
         catalog: &DocumentCatalog,
         check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<DocumentIndexPreparations> {
-        compile_indexes_with_candidate(catalog, None, check).map_err(stored_index_error)
+        compile_indexes_with_candidate(catalog, None, None, check).map_err(stored_index_error)
     }
 
     fn stored_index_error(error: EngineError) -> EngineError {
@@ -222,18 +243,24 @@ mod enabled {
     fn compile_indexes_with_candidate(
         catalog: &DocumentCatalog,
         candidate: Option<DocumentIndexId>,
+        excluded: Option<DocumentIndexId>,
         check: &mut dyn FnMut() -> EngineResult<()>,
     ) -> EngineResult<DocumentIndexPreparations> {
-        let mut compiled = HashMap::new();
+        let mut compiled = DocumentIndexPreparations {
+            collections: HashMap::new(),
+            ready_names: HashMap::new(),
+        };
         let mut retained = 0_usize;
+        let mut names_retained = 0_usize;
         for collection in catalog.collections() {
             check()?;
             let preparation = DocumentIndexPreparation::compile_selected_with_check(
                 collection.id(),
                 collection.indexes(),
                 |index| {
-                    index.lifecycle() == DocumentIndexLifecycle::Ready
-                        || Some(index.id()) == candidate
+                    Some(index.id()) != excluded
+                        && (index.lifecycle() == DocumentIndexLifecycle::Ready
+                            || Some(index.id()) == candidate)
                 },
                 check,
             )?;
@@ -248,25 +275,91 @@ mod enabled {
                         "compiled document indexes exceed the root memory bound",
                     )
                 })?;
-            if retained > 64 * 1024 * 1024 {
+            let selected = || {
+                collection.indexes().iter().filter(|index| {
+                    !index.is_built_in()
+                        && Some(index.id()) != excluded
+                        && (index.lifecycle() == DocumentIndexLifecycle::Ready
+                            || Some(index.id()) == candidate)
+                })
+            };
+            // Dispatch metadata has its own 32-MiB charge ceiling, sufficient
+            // for every valid catalog. Do not lower v19's existing 64-MiB
+            // definition allowance when opening previously built roots.
+            // Admitted lookups perform no I/O or allocation.
+            let name_bytes = selected()
+                .map(|index| index.name().len() + 128)
+                .sum::<usize>()
+                + collection.database_name().len()
+                + collection.name().len()
+                + 256;
+            names_retained = names_retained.checked_add(name_bytes).ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::LimitExceeded,
+                    "compiled document indexes exceed the root memory bound",
+                )
+            })?;
+            if retained > 64 * 1024 * 1024 || names_retained > 32 * 1024 * 1024 {
                 return Err(EngineError::new(
                     EngineErrorKind::LimitExceeded,
                     "compiled document indexes exceed the root memory bound",
                 ));
             }
-            compiled.try_reserve(1).map_err(|error| {
+            let allocation = |error| {
                 EngineError::from_source(
                     EngineErrorKind::OutOfMemory,
                     "unable to retain compiled document indexes",
                     error,
                 )
-            })?;
-            compiled.insert(collection.id(), Arc::new(preparation));
+            };
+            compiled.collections.try_reserve(1).map_err(allocation)?;
+            compiled.ready_names.try_reserve(1).map_err(allocation)?;
+            let mut names = HashSet::new();
+            names.try_reserve(selected().count()).map_err(allocation)?;
+            for index in selected() {
+                check()?;
+                names.insert(index.name().to_owned());
+            }
+            let namespace = DocumentNamespace::new(collection.database_name(), collection.name())?;
+            compiled.ready_names.insert(namespace, names);
+            compiled
+                .collections
+                .insert(collection.id(), Arc::new(preparation));
         }
         Ok(compiled)
     }
 
     impl Storage {
+        /// The caller holds shared schema admission while choosing whether a
+        /// drop needs exclusive physical cleanup. Pending drops retain that
+        /// shared guard, so a build cannot race this cached decision.
+        pub(crate) fn document_index_is_ready(
+            &self,
+            namespace: &DocumentNamespace,
+            name: &str,
+        ) -> EngineResult<bool> {
+            let current = self
+                .schema_coordination
+                .document_indexes
+                .lock()
+                .map_err(|_| {
+                    EngineError::new(
+                        EngineErrorKind::Internal,
+                        "document index coordination is poisoned",
+                    )
+                })?;
+            let current = current.as_ref().ok_or_else(|| {
+                EngineError::new(
+                    EngineErrorKind::FailedPrecondition,
+                    "document index authority has not been validated",
+                )
+            })?;
+            Ok(current
+                .ready_names
+                .get(namespace)
+                .is_some_and(|names| names.contains(name)))
+        }
+
         fn publish_document_indexes(&self, indexes: DocumentIndexPreparations) -> EngineResult<()> {
             let mut current = self
                 .schema_coordination
@@ -1262,7 +1355,7 @@ mod enabled {
         }
 
         /// Remove one pending declaration by exact name under Engine-held schema
-        /// admission. Physical indexes will require a separate recoverable drop.
+        /// admission. The Engine routes Ready indexes to exclusive journaled cleanup.
         pub(crate) fn drop_pending_document_index_controlled(
             &self,
             collection_id: DocumentCollectionId,
@@ -1308,7 +1401,7 @@ mod enabled {
                     if lifecycle != INDEX_PENDING_BUILD {
                         return Err(EngineError::new(
                             EngineErrorKind::Unsupported,
-                            "dropping a built document index requires recoverable physical index removal",
+                            "dropping a built document index requires exclusive schema admission",
                         ));
                     }
                     let changed = transaction
