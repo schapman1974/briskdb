@@ -99,6 +99,27 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
     assert_eq!(indexed.matcher_evaluations - point.matcher_evaluations, 2);
     assert_eq!(indexed.storage_reads - point.storage_reads, 4);
     assert_eq!(indexed.shard_visits - point.shard_visits, 2);
+    let mut sorted_find = find_by_a();
+    sorted_find
+        .push(
+            "sort",
+            BsonValue::Document(doc([("_id", BsonValue::Int32(1))])),
+        )
+        .unwrap();
+    assert!(
+        send_command(&mut stream, &sorted_find)
+            .await
+            .representation_eq(&plain)
+    );
+    let sorted = server.metrics().reads;
+    // The indexed key window reads two matches, then output fetches recheck both.
+    assert_eq!(
+        sorted.index_candidate_plans - indexed.index_candidate_plans,
+        1
+    );
+    assert_eq!(sorted.documents_examined - indexed.documents_examined, 4);
+    assert_eq!(sorted.matcher_evaluations - indexed.matcher_evaluations, 4);
+    assert_eq!(sorted.storage_reads - indexed.storage_reads, 6);
     // Catalog cursors and legacy count have no engine read-work snapshots.
     let listing = send_command(
         &mut stream,
@@ -134,16 +155,16 @@ async fn optional_read_metrics_preserve_replies_and_measure_scan_index_and_point
     )
     .await;
     assert_eq!(count.get_first("n"), Some(&BsonValue::Int64(12)));
-    assert_eq!(server.metrics().reads, indexed);
+    assert_eq!(server.metrics().reads, sorted);
     server.set_read_metrics_enabled(false);
     assert!(
         send_command(&mut stream, &find_by_a())
             .await
             .representation_eq(&plain)
     );
-    assert_eq!(server.metrics().reads, indexed);
+    assert_eq!(server.metrics().reads, sorted);
     server.close().await.unwrap();
-    assert_eq!(server.metrics().reads, indexed);
+    assert_eq!(server.metrics().reads, sorted);
     let mut restarted = MongoServer::start(&database, "127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();

@@ -528,6 +528,8 @@ before preparation; already prepared requests retain that choice when it changes
 The `reads` snapshot aggregates successful engine find/getMore/aggregate/distinct
 executions, record-read calls (including misses/lookahead/rescans), examined BSON
 documents, source matcher evaluations, and returned documents/distinct values.
+Sorted output refetches and source-matcher rechecks count again, independently
+of the preceding key-window scan; distinct also counts its internal lookahead.
 It excludes partial work from failed engine calls, legacy count, mutations and
 catalog reads. A successful engine result counts even if later reply encoding or
 socket delivery fails; these are not successful-client-operation counters.

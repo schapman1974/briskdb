@@ -242,8 +242,24 @@ async fn read_stats_are_per_request_and_count_lookahead_and_blocking_source_work
         ),
     )
     .await;
-    assert_eq!(stats(&sorted).documents_examined(), 7);
-    assert_eq!(stats(&sorted).storage_reads(), 9);
+    // Seven rows are scanned for sort keys, then fetched again for output.
+    assert_eq!(stats(&sorted).documents_examined(), 14);
+    assert_eq!(stats(&sorted).storage_reads(), 16);
+    assert_eq!(stats(&sorted).matcher_evaluations(), 0);
+    let filtered_sorted = call(
+        &engine,
+        &session,
+        command(
+            &namespace,
+            doc([("_id", obj([("$gte", BsonValue::Int32(0))]))]),
+            options().with_sort(DocumentSort::new(doc([("_id", BsonValue::Int32(-1))])).unwrap()),
+        ),
+    )
+    .await;
+    assert_eq!(stats(&filtered_sorted).documents_examined(), 14);
+    assert_eq!(stats(&filtered_sorted).storage_reads(), 16);
+    assert_eq!(stats(&filtered_sorted).matcher_evaluations(), 14);
+    assert_eq!(page(filtered_sorted).1, page(sorted).1);
     engine.shutdown().await.unwrap();
 }
 
