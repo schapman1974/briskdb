@@ -39,6 +39,102 @@ session.close()
 db.close()
 ```
 
+## Patch PyMongo for local testing
+
+The wheel from this checkout includes `briskdb.patch()`, a TinyMongo-style
+context manager/decorator. Install its optional pinned driver companion:
+
+```bash
+python -m pip install './python[pymongo]'
+# For a supplied test wheel (replacing any same-version older build):
+python -m pip install --force-reinstall './briskdb-...whl[pymongo]'
+```
+
+```python
+import briskdb
+import pymongo
+
+with briskdb.patch():  # isolated temporary SQLite files, not RAM-only
+    writer = pymongo.MongoClient("mongodb://ignored.example.com")
+    reader = pymongo.MongoClient()
+    writer.app.users.insert_one({"_id": 1, "name": "Ada", "score": 9})
+    assert reader.app.users.find_one({"_id": 1})["name"] == "Ada"
+# Clients close, PyMongo is restored, and the temporary files are removed.
+```
+
+Keep data with `briskdb.patch(folder="./test-data", shards=4)`, also usable as
+a synchronous test decorator. New roots default to four shards; reopening
+detects the stored layout unless an explicit count is supplied. Persistent
+folders are never deleted. Nested default scopes are isolated; managed clients
+and scopes using one canonical persistent path share one process-local engine
+until its last owner closes. Unrelated native `briskdb.open()` handles still
+obey the ordinary schema/multi-process ownership restrictions.
+
+```python
+import asyncio
+import briskdb
+import pymongo
+
+async def test_application():
+    async with briskdb.patch(folder="./async-test-data"):
+        async with pymongo.AsyncMongoClient() as client:
+            await client.app.users.update_one(
+                {"_id": 1}, {"$set": {"name": "Ada"}}, upsert=True
+            )
+            print(await client.app.users.find({}).sort("name", 1).to_list())
+
+asyncio.run(test_application())
+```
+
+Async clients require `async with briskdb.patch()` for awaited cleanup.
+Async scope startup/cleanup runs off the event loop and drains even on caller
+cancellation. Async decorators and async clients in synchronous scopes are
+rejected explicitly. Enter the patch before importing application/ODM modules
+that capture client aliases, and retain it for the full application lifetime.
+Only top-level `pymongo.MongoClient`/`AsyncMongoClient` are replaced. Existing
+clients, earlier constructor aliases and explicit PyMongo submodule imports
+are unchanged and may still contact their original server. Process-global
+scopes cannot overlap across threads/tasks; nesting must unwind in order.
+
+### Direct PyMongo-shaped clients
+
+```python
+from briskdb import MongoClient, DESCENDING
+
+with MongoClient(folder="./app-data", shards=4) as client:
+    print(list(client.app.users.find({"score": {"$gte": 5}}).sort("score", DESCENDING)))
+```
+
+`briskdb.AsyncMongoClient` provides `async with` and awaited operations/close.
+Direct async-client construction opens storage synchronously; an async patch
+scope offloads startup. A positional filesystem path, `briskdb_folder`, and
+migration aliases `tinymongo_folder`, `tinymongo_path`, `foldername`, and
+`sqlite_shards` are accepted. Direct clients default to `BRISKDB_HOME` or
+`./briskdb-data`; use explicit close or context managers. `client.briskdb_path`
+reports the root. `ASCENDING`, `DESCENDING`, `ReturnDocument`, `IndexModel`,
+and `briskdb.errors` support common client-side call sites.
+
+Both forms use real PyMongo 4.17.0 collections, cursors, results and exceptions
+with one private loopback Mongo listener over the bundled Rust engine. No
+HTTP/admin/SQL port or separate process starts. Supplied hosts/SRV destinations,
+credentials, TLS, proxy and replica-set settings are ignored for this explicit
+local replacement. URI database names and ordinary driver/codec settings are
+retained and validated by PyMongo; automatic encryption is rejected, not bypassed.
+There is no remote fallback. The unauthenticated loopback socket is **not a
+security boundary against other local users/processes**.
+
+Existing BriskDB Mongo query/resource limits still apply. This does not add
+transactions, change streams, TinyMongo-only metadata helpers or alternative
+memory/JSON/DuckDB/remote backends. `backend="sqlite"`/`"sqlite-sharded"` are
+accepted migration spellings; `backend="memory"` is rejected instead of calling
+temporary files RAM. Use fresh BriskDB roots, not TinyMongo database files, and
+spawned processes with newly constructed handles, never inherited clients after
+`fork()`. PyMongo remains optional for SQL-only use and unentered patch objects.
+
+After installing a test wheel, run `python python/examples/mongo/patch.py`
+from the repository (or copy that script elsewhere). It exercises sync queries,
+unique indexes, updates, async access and persisted reopen without a daemon.
+
 ## Query a remote BriskDB server through standard `sqlite3` (read-only preview)
 
 The same wheel includes an original native SQLite virtual-table addon and its

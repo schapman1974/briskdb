@@ -11,6 +11,7 @@ from email.parser import Parser
 from typing import Iterable, Set
 
 from packaging.utils import parse_wheel_filename
+from packaging.requirements import Requirement
 from packaging.version import Version
 
 
@@ -22,6 +23,11 @@ PACKAGE_FILES = {
     "briskdb/api.py",
     "briskdb/api.pyi",
     "briskdb/remote.py",
+    "briskdb/mongo.py",
+    "briskdb/mongo.pyi",
+    "briskdb/patching.py",
+    "briskdb/patching.pyi",
+    "briskdb/_mongo_runtime.py",
     "briskdb/NATIVE_NOTICES.txt",
     "briskdb/py.typed",
 }
@@ -29,7 +35,13 @@ SDIST_FILES = {
     "python/build.rs",
     "python/src/remote_sqlite.c",
     "python/src/remote_sqlite.rs",
+    "python/src/mongo_client.rs",
     "python/briskdb/remote.py",
+    "python/briskdb/mongo.py",
+    "python/briskdb/patching.py",
+    "python/briskdb/_mongo_runtime.py",
+    "python/briskdb/mongo.pyi",
+    "python/briskdb/patching.pyi",
     "API.md",
     "ASYNC_API.md",
     "CHANGELOG.md",
@@ -42,6 +54,7 @@ SDIST_FILES = {
     "examples/asyncio.py",
     "examples/serverless_handler.py",
     "examples/sync.py",
+    "examples/mongo/patch.py",
     "pyproject.toml",
 }
 
@@ -111,11 +124,21 @@ def check_wheel(path: pathlib.Path, platform: str) -> None:
         if metadata["License-Expression"] != "MIT":
             raise SystemExit("wheel has the wrong license expression")
         dependencies = metadata.get_all("Requires-Dist", [])
-        if any(
-            dependency.partition(";")[0].strip().lower().startswith(("bson", "pymongo"))
+        for dependency in dependencies:
+            requirement = Requirement(dependency)
+            if requirement.name.lower() in ("bson", "pymongo") and (
+                requirement.marker is None or requirement.marker.evaluate({"extra": ""})
+            ):
+                raise SystemExit("wheel must not require bson or PyMongo for SQL-only use")
+        extras = metadata.get_all("Provides-Extra", [])
+        if "pymongo" not in extras or not any(
+            Requirement(dependency).name.lower() == "pymongo"
+            and str(Requirement(dependency).specifier) == "==4.17.0"
+            and Requirement(dependency).marker is not None
+            and Requirement(dependency).marker.evaluate({"extra": "pymongo"})
             for dependency in dependencies
         ):
-            raise SystemExit("wheel must not require bson or PyMongo for SQL-only use")
+            raise SystemExit("wheel must include the pinned optional pymongo extra")
         if not any(
             name.endswith(".dist-info/licenses/BRISKDB_LICENSE.txt") for name in names
         ):

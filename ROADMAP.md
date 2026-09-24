@@ -523,6 +523,18 @@ requires an earlier dependency:
       Required CI smoke exercises
       real PyMongo 4.17.0 sync/async discovery, pooling, reconnect, and explicit
       unsupported-command errors (#184).
+    - [x] [#388](https://github.com/schapman1974/briskdb/issues/388) — Python
+      testing wheels now provide TinyMongo-style `briskdb.patch()` and direct
+      `MongoClient`/`AsyncMongoClient` imports backed by real pinned PyMongo and
+      the shared Rust engine. Scopes own temporary SQLite or persistent roots,
+      restore constructors in nested order, reject cross-task/thread overlap,
+      and drain startup/cleanup on cancellation. Same-path managed clients share
+      one engine. A private Mongo-only loopback listener opens no HTTP/admin
+      ports; supplied remote hosts/credentials are never connection targets.
+      Existing client aliases are outside the patch boundary. Async clients
+      require async scopes. Optional dependency, typing, installed-wheel tests
+      and README examples are part of this checkpoint, not new Mongo semantics
+      or alternative TinyMongo backend support.
     - [ ] [#181](https://github.com/schapman1974/briskdb/issues/181) — actual
       Beanie 2.1.0 and MongoEngine 0.29.3 CRUD application bodies now run unchanged
       from the locked TinyMongo source against stock PyMongo 4.17.0 and a real
