@@ -279,8 +279,9 @@ Preflight failures leave no new declaration. Interruption after durable intent
 requires closing/reopening the root; recovery removes a newly created unfinished
 declaration and its derived entries. If the declaration existed before this
 call, recovery preserves it as Pending, just like `build_index`. Committed index
-identities are never reused. This native helper does not yet enable Mongo wire
-`createIndexes`, query acceleration, or secondary uniqueness.
+identities are never reused. Mongo wire `createIndexes` uses this shared build
+lifecycle through the batch API. Ready indexes support the equality candidates
+and secondary uniqueness described above.
 
 Recognized advanced index metadata reports normalized ordered `keys` plus optional
 `sparse=True` or `partial_filter` fields; absence means no such membership option.
