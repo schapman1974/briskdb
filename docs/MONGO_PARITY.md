@@ -722,6 +722,16 @@ pagination, so reads and writes visit each logical record once. Independent
 candidate comparisons, scan differentials, physical-selection and checksum
 checks cover this extension without changing the frozen equality-probe oracle.
 
+Necessary positive `$exists: true` conditions can also select all entries of a
+current sparse index after finite key probes have been considered. Direct and
+positive-conjunction predicates on any indexed path qualify, including compound
+sparse indexes. Explicit null, empty arrays and conservative non-unique fallback
+entries remain candidates; the full matcher removes false positives. Negative,
+alternative, partial-index and unproven presence shapes retain scans. Multikey
+rows are grouped before pagination, current entry bindings are checked, and
+field-removing mutations keep record/index changes in the same transaction.
+This is not range pushdown, an ordering promise, or new aggregation filtering.
+
 The same candidates now narrow mutation selection for one/many updates and
 deletes, replacements and sorted find-and-modify, including upsert rechecks.
 Full predicate/identity rechecks and per-shard transactions remain authoritative.

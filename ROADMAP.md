@@ -776,6 +776,12 @@ requires an earlier dependency:
       regex/unsupported, empty/oversized and possible sparse all-null probes retain
       scans. Native scan differentials, typed candidate proofs, physical selection,
       checksum, index churn and restart checks cover the extension.
+      Necessary positive `$exists: true` clauses now select current non-partial
+      sparse entries after finite key probes. Any indexed path can prove compound
+      sparse membership; null/empty arrays and non-unique fallback entries stay
+      included. Grouped natural-order candidates retain full-matcher checks,
+      checksum validation and per-request authority. Negative/alternative and
+      unproven presence shapes keep scans; no format or aggregate-source change.
       Equality candidates now also narrow update/delete, replacement and
       find-and-modify selection, including sorted choices and upsert rechecks.
       Natural-order frontiers prevent duplicate processing when indexed keys

@@ -51,7 +51,12 @@ struct CompiledIndex {
 pub(crate) struct DocumentIndexProbe {
     collection_id: DocumentCollectionId,
     index_id: DocumentIndexId,
-    keys: Vec<Vec<u8>>,
+    selection: DocumentIndexSelection,
+}
+
+pub(crate) enum DocumentIndexSelection {
+    Keys(Vec<Vec<u8>>),
+    SparseEntries,
 }
 
 impl DocumentIndexProbe {
@@ -61,8 +66,8 @@ impl DocumentIndexProbe {
     pub(crate) const fn index_id(&self) -> DocumentIndexId {
         self.index_id
     }
-    pub(crate) fn keys(&self) -> &[Vec<u8>] {
-        &self.keys
+    pub(crate) fn selection(&self) -> &DocumentIndexSelection {
+        &self.selection
     }
 }
 
@@ -193,7 +198,9 @@ impl DocumentIndexPreparation {
                 return Ok(Some(DocumentIndexProbe {
                     collection_id: self.collection_id,
                     index_id: index.id,
-                    keys: vec![key.to_bytes_with_check(&mut || budget.step())?],
+                    selection: DocumentIndexSelection::Keys(vec![
+                        key.to_bytes_with_check(&mut || budget.step())?,
+                    ]),
                 }));
             }
         }
@@ -215,8 +222,23 @@ impl DocumentIndexPreparation {
             return Ok(Some(DocumentIndexProbe {
                 collection_id: self.collection_id,
                 index_id: index.id,
-                keys: encoded,
+                selection: DocumentIndexSelection::Keys(encoded),
             }));
+        }
+        // Exact equality and finite membership retain priority across indexes.
+        // A sparse presence proof scans every entry of the selected index, not
+        // an empty equality list or a retained cross-request catalog snapshot.
+        for index in &self.indexes {
+            if index
+                .generator
+                .sparse_presence_with_budget(matcher, &mut budget)?
+            {
+                return Ok(Some(DocumentIndexProbe {
+                    collection_id: self.collection_id,
+                    index_id: index.id,
+                    selection: DocumentIndexSelection::SparseEntries,
+                }));
+            }
         }
         budget.step()?;
         Ok(None)

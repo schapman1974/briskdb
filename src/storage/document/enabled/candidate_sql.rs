@@ -1,4 +1,4 @@
-//! Bounded, naturally ordered membership candidates for the shard merge frontier.
+//! Bounded, naturally ordered index candidates for the shard merge frontier.
 
 pub(super) fn membership(key_count: usize) -> String {
     // Only bounded placeholder numbers are generated, never BSON values. The
@@ -7,6 +7,14 @@ pub(super) fn membership(key_count: usize) -> String {
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(",");
+    grouped(&format!(" AND e.index_key IN ({placeholders})"))
+}
+
+pub(super) fn sparse() -> String {
+    grouped("")
+}
+
+fn grouped(key_filter: &str) -> String {
     // CROSS JOIN keeps the document natural-order range as the outer loop even
     // after ANALYZE. An index-first join can materialize every matching entry in
     // a temporary GROUP BY tree for each one-record merge frontier.
@@ -22,7 +30,7 @@ pub(super) fn membership(key_count: usize) -> String {
          CROSS JOIN briskdb_document_index_entries_v1 AS e
            ON e.collection_id = d.collection_id AND e.id_key = d.id_key
          WHERE d.collection_id = ?1 AND d.natural_order > ?2
-           AND e.index_id = ?4 AND e.index_key IN ({placeholders})
+           AND e.index_id = ?4{key_filter}
          GROUP BY d.natural_order ORDER BY d.natural_order LIMIT ?3"
     )
 }
@@ -36,7 +44,7 @@ mod tests {
     }
 
     #[test]
-    fn membership_pages_stream_without_temporary_grouping_before_and_after_analyze() {
+    fn grouped_index_pages_stream_without_temporary_grouping_before_and_after_analyze() {
         let mut connection = Connection::open_in_memory().unwrap();
         crate::storage::document::ensure_schema(&mut connection).unwrap();
         {
@@ -51,6 +59,10 @@ mod tests {
                         params![id, ordinal + 1, vec![0_u8; 5], vec![0_u8; 32]],
                     )
                     .unwrap();
+                // Some records are absent from this sparse-style index.
+                if ordinal % 5 == 0 {
+                    continue;
+                }
                 for value in [ordinal % 128, (ordinal + 1) % 128] {
                     transaction
                         .execute(
@@ -67,15 +79,18 @@ mod tests {
             if analyzed {
                 connection.execute_batch("ANALYZE").unwrap();
             }
-            for key_count in [2, 64, 128] {
-                let sql = super::membership(key_count);
+            for key_count in [Some(2), Some(64), Some(128), None] {
+                let sql = key_count.map_or_else(super::sparse, super::membership);
                 for (after, limit) in [(0, 1), (0, 3), (17, 7), (998, 3)] {
-                    let parameters: Vec<_> = [1, after, limit, 1]
+                    let mut parameters: Vec<_> = [1, after, limit, 1]
                         .into_iter()
                         .map(Value::Integer)
-                        .chain((0..key_count).map(|value| Value::Blob(key(value as u8))))
-                        .chain(std::iter::once(Value::Blob(key(255))))
                         .collect();
+                    if let Some(key_count) = key_count {
+                        parameters
+                            .extend((0..key_count).map(|value| Value::Blob(key(value as u8))));
+                        parameters.push(Value::Blob(key(255)));
+                    }
                     let plan: Vec<String> = connection
                         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
                         .unwrap()
@@ -87,11 +102,11 @@ mod tests {
                         plan.first().is_some_and(|step| {
                             step.starts_with("SEARCH d ") && step.contains("natural_order>?")
                         }),
-                        "document-first ordered range: analyzed={analyzed}, keys={key_count}: {plan:?}"
+                        "document-first ordered range: analyzed={analyzed}, keys={key_count:?}: {plan:?}"
                     );
                     assert!(
                         plan.iter().all(|step| !step.contains("TEMP B-TREE")),
-                        "no all-candidate sort/group: analyzed={analyzed}, keys={key_count}: {plan:?}"
+                        "no all-candidate sort/group: analyzed={analyzed}, keys={key_count:?}: {plan:?}"
                     );
                     let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = connection
                         .prepare(&sql)
@@ -105,15 +120,20 @@ mod tests {
                     let expected: Vec<_> = (0..1_000_i64)
                         .filter(|ordinal| {
                             ordinal + 1 > after
-                                && (ordinal % 128 < key_count as i64
-                                    || (ordinal + 1) % 128 < key_count as i64)
+                                && ordinal % 5 != 0
+                                && key_count.is_none_or(|key_count| {
+                                    ordinal % 128 < key_count as i64
+                                        || (ordinal + 1) % 128 < key_count as i64
+                                })
                         })
                         .take(limit as usize)
                         .map(|ordinal| ordinal + 1)
                         .collect();
                     assert_eq!(rows.iter().map(|row| row.0).collect::<Vec<_>>(), expected);
                     for (natural_order, index_key, checksum) in rows {
-                        assert!((index_key[0] as usize) < key_count);
+                        assert!(
+                            key_count.is_none_or(|key_count| (index_key[0] as usize) < key_count)
+                        );
                         assert!(
                             index_key[0] == ((natural_order - 1) % 128) as u8
                                 || index_key[0] == (natural_order % 128) as u8
