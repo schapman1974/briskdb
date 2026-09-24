@@ -52,6 +52,40 @@ def bson_bytes(
 
 
 class PythonDocumentApiTests(unittest.TestCase):
+    def test_opt_in_execution_stats_measure_reads_and_index_work(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with briskdb.open(root, shards=4, documents=True) as database:
+                with database.session() as session:
+                    session.create_collection(DATABASE, COLLECTION)
+                    for identity in range(12):
+                        session.insert_one(DATABASE, COLLECTION, {"_id": identity, "v": identity % 3})
+                    self.assertNotIn("read_stats", session.find(DATABASE, COLLECTION))
+                    result = session.find(DATABASE, COLLECTION, {"v": 1}, execution_stats=True)
+                    self.assertEqual(result["read_stats"], {"storage_reads": 16, "documents_examined": 12, "matcher_evaluations": 12, "shards_read": [0, 1, 2, 3]})
+                    self.assertNotIn("read_access", result["plan"])
+                    session.create_built_index(DATABASE, COLLECTION, {"v": 1})
+                    indexed = session.find(DATABASE, COLLECTION, {"v": 1}, execution_stats=True, plan_diagnostics=True)
+                    self.assertEqual(indexed["read_stats"]["documents_examined"], 4)
+                    self.assertEqual(indexed["documents"], result["documents"])
+                    point = session.find(DATABASE, COLLECTION, {"_id": 1}, execution_stats=True)
+                    self.assertEqual(point["read_stats"]["storage_reads"], 1)
+                    self.assertEqual(point["read_stats"]["matcher_evaluations"], 0)
+                    self.assertEqual(point["read_stats"]["shards_read"], point["plan"]["shards"])
+                    first = session.find(DATABASE, COLLECTION, batch_size=0, execution_stats=True)
+                    self.assertEqual(first["read_stats"]["storage_reads"], 0)
+                    next_page = session.get_more(DATABASE, COLLECTION, first["cursor_id"], batch_size=1, execution_stats=True)
+                    self.assertGreater(next_page["read_stats"]["storage_reads"], 0)
+                    last = session.get_more(DATABASE, COLLECTION, next_page["cursor_id"])
+                    self.assertNotIn("read_stats", last)
+                    distinct = session.distinct(DATABASE, COLLECTION, "v", execution_stats=True)
+                    self.assertGreaterEqual(distinct["read_stats"]["documents_examined"], 12)
+                    aggregate = session.aggregate(DATABASE, COLLECTION, [{"$count": "n"}], execution_stats=True)
+                    self.assertEqual(aggregate["documents"], [{"n": 12}])
+                    self.assertGreaterEqual(aggregate["read_stats"]["documents_examined"], 12)
+                    self.assertEqual(aggregate["read_stats"]["matcher_evaluations"], 0)
+                    with self.assertRaises(briskdb.LimitExceededError):
+                        session.find(DATABASE, COLLECTION, execution_stats=True, max_result_bytes=1)
+
     def test_opt_in_plan_diagnostics_and_cursor_index_churn(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with briskdb.open(root, shards=4, documents=True) as database:
@@ -2073,6 +2107,26 @@ assert attempts and attempts[0] == "bson", attempts
 
 
 class AsyncPythonDocumentApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_opt_in_execution_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            async with await briskdb.open_async(root, shards=2, documents=True) as database:
+                async with await database.session() as session:
+                    await session.create_collection(DATABASE, COLLECTION)
+                    for identity in range(3):
+                        await session.insert_one(DATABASE, COLLECTION, {"_id": identity, "v": 1})
+                    first = await session.find(DATABASE, COLLECTION, batch_size=1, execution_stats=True)
+                    self.assertIn(first["read_stats"]["documents_examined"], (2, 3))
+                    second = await session.get_more(DATABASE, COLLECTION, first["cursor_id"], batch_size=1, execution_stats=True)
+                    self.assertEqual(second["read_stats"]["documents_examined"], 2, "request-local, not cumulative")
+                    last = await session.get_more(DATABASE, COLLECTION, second["cursor_id"])
+                    self.assertNotIn("read_stats", last)
+                    distinct = await session.distinct(DATABASE, COLLECTION, "v", execution_stats=True)
+                    self.assertEqual(distinct["values"], [1])
+                    self.assertGreaterEqual(distinct["read_stats"]["documents_examined"], 3)
+                    aggregate = await session.aggregate(DATABASE, COLLECTION, [{"$count": "n"}], execution_stats=True)
+                    self.assertEqual(aggregate["documents"], [{"n": 3}])
+                    self.assertGreaterEqual(aggregate["read_stats"]["documents_examined"], 3)
+
     async def test_async_opt_in_plan_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             async with await briskdb.open_async(root, shards=4, documents=True) as database:

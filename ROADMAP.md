@@ -799,6 +799,13 @@ requires an earlier dependency:
       responses and point plans are unchanged; sorted/aggregate page budgets
       include the metadata. Planned shard owners are not measured visits;
       MongoDB explain, physical counters and broader benchmarks remain open.
+      Independent opt-in native execution statistics now measure record-read
+      calls, examined BSON documents, source-matcher evaluations and actual
+      read shards. Point/routed/scatter/sorted/distinct/aggregate reads share
+      request-local counters; lookahead/rescans count again, buffered output
+      can report zero source reads, and cursors retain no collector. Default
+      execution/output is unchanged. These are not SQLite page/byte counters
+      or MongoDB executionStats; final corpus and benchmark acceptance remains.
       Equality candidates now also narrow update/delete, replacement and
       find-and-modify selection, including sorted choices and upsert rechecks.
       Natural-order frontiers prevent duplicate processing when indexed keys

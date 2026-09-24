@@ -55,6 +55,7 @@ impl Engine {
             namespace: namespace.clone(),
             collection_id,
             source,
+            read_stats: ReadStats::for_options(&options),
             projection: None,
             sorter: None,
             sort_after: None,
@@ -75,6 +76,7 @@ impl Engine {
         let (documents, has_more) = self
             .read_document_page(owner, &mut state, cancellation, deadline, &options, limits)
             .await?;
+        let read_stats = state.finish_read_stats();
         let cursor_id = if has_more {
             session
                 .document_cursor_owner
@@ -89,7 +91,8 @@ impl Engine {
             DocumentResult::Cursor(crate::document::DocumentCursorBatch::from_validated(
                 namespace, cursor_id, documents,
             )),
-        ))
+        )
+        .with_read_stats(read_stats))
     }
 
     #[allow(clippy::too_many_arguments)]

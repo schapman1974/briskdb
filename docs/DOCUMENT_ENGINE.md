@@ -334,7 +334,22 @@ are exposed. These are planned access paths, not measured row/shard visits,
 SQLite I/O or index-only reads. Aggregation preserves its routed source scan
 and pipeline work accounting. Counts and find-and-modify reject this native
 option; catalog commands have no data access path. MongoDB `explain` and actual
-execution counters remain separate work under #178.
+SQLite-level execution counters remain separate work under #178.
+
+`DocumentReadOptions::with_execution_stats(true)` independently enables native
+per-request `DocumentExecution::read_stats()` (`execution_stats=True` /
+`result["read_stats"]` in sync/async Python). The payload-free snapshot contains
+point/candidate record-read call counts, BSON documents examined, source-matcher
+evaluations, and actual distinct read shards. Exact-ID, pruned-shard, natural,
+sorted, distinct and aggregation source reads share the collector. Lookahead
+and repeated sorting/source reads count again; buffered aggregation pages can
+correctly report zero source work. Pipeline predicates, catalog/index-entry
+work and physical SQLite rows/pages/bytes are excluded. Each requested page
+starts fresh, detaches the collector before cursor retention, and charges a
+fixed conservative 160 bytes in output limits/page packing. Unrequested reads
+allocate no collector or update counters. Failed/aborted requests return no
+snapshot; counters saturate rather than wrap. This does not change filtering,
+routing, transaction boundaries or MongoDB wire explain support.
 
 Singleton candidates also pin the document-first join, preventing stale SQLite
 statistics from sorting an entire large equality/null-key group for each one-row

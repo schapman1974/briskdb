@@ -263,6 +263,7 @@ async fn selected_shards_still_deliver_unmatched_input_to_the_original_runner() 
         remaining: None,
         batch_byte_limit: None,
         aggregation: None,
+        read_stats: None,
     };
     let (rows, more) = engine
         .read_document_source_page(

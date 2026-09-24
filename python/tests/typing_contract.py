@@ -89,6 +89,11 @@ def sync_contract(path: str) -> None:
     print(dropped_collection, dropped_database)
     distinct: List[object] = document_session.distinct("app", "notes", "body", plan_diagnostics=True)["values"]
     diagnostic_plan = document_session.find("app", "notes", plan_diagnostics=True)["plan"]
+    measured = document_session.find("app", "notes", execution_stats=True)
+    if "read_stats" in measured:
+        examined: int = measured["read_stats"]["documents_examined"]
+        read_shards: List[int] = measured["read_stats"]["shards_read"]
+        print(examined, read_shards)
     if diagnostic_plan is not None and "read_access" in diagnostic_plan:
         access = diagnostic_plan["read_access"]
         if access["kind"] == "index_candidates":
@@ -175,11 +180,11 @@ async def async_contract(path: str) -> None:
     dropped_collection: bool = (await session.drop_collection("app", "missing"))["existed"]
     dropped_database: bool = (await session.drop_database("missing"))["existed"]
     print(dropped_collection, dropped_database)
-    distinct: List[object] = (await session.distinct("app", "typed", "_id", plan_diagnostics=True))["values"]
-    aggregated: List[dict[str, object]] = (await session.aggregate("app", "typed", [{"$count": "n"}], batch_size=1, plan_diagnostics=True))["documents"]
+    distinct: List[object] = (await session.distinct("app", "typed", "_id", plan_diagnostics=True, execution_stats=True))["values"]
+    aggregated: List[dict[str, object]] = (await session.aggregate("app", "typed", [{"$count": "n"}], batch_size=1, plan_diagnostics=True, execution_stats=True))["documents"]
     print(aggregated)
-    projected: List[dict[str, object]] = (await session.find("app", "typed", projection={"_id": 1}, sort={"_id": -1}, plan_diagnostics=True))["documents"]
-    continued: List[dict[str, object]] = (await session.get_more("app", "typed", 1, plan_diagnostics=True))["documents"]
+    projected: List[dict[str, object]] = (await session.find("app", "typed", projection={"_id": 1}, sort={"_id": -1}, plan_diagnostics=True, execution_stats=True))["documents"]
+    continued: List[dict[str, object]] = (await session.get_more("app", "typed", 1, plan_diagnostics=True, execution_stats=True))["documents"]
     killed: bool = (await session.kill_cursor("app", "typed", 1))["killed"]
     deleted_many: int = (await session.delete_many("app", "typed", {}))["deleted_count"]
     removed: Optional[dict[str, object]] = (await session.find_one_and_delete("app", "typed", {}, projection={"_id": 1}, sort={"_id": -1}))["document"]

@@ -79,7 +79,16 @@ class DocumentCollectionInfo(TypedDict):
     placement: DocumentPlacementInfo
     indexes: List[DocumentIndexInfo]
 
-class DocumentExecution(TypedDict):
+class DocumentReadStats(TypedDict):
+    storage_reads: int
+    documents_examined: int
+    matcher_evaluations: int
+    shards_read: List[int]
+
+class DocumentExecutionDiagnostics(TypedDict, total=False):
+    read_stats: DocumentReadStats
+
+class DocumentExecution(DocumentExecutionDiagnostics):
     request_id: UUID
     plan: Optional[DocumentPlan]
 
@@ -550,6 +559,7 @@ class Session:
         limit: Optional[int] = None,
         batch_size: int = 101,
         plan_diagnostics: bool = False,
+        execution_stats: bool = False,
         request_id: Optional[UUID] = None,
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,
@@ -564,6 +574,7 @@ class Session:
         *,
         batch_size: int = 101,
         plan_diagnostics: bool = False,
+        execution_stats: bool = False,
         request_id: Optional[UUID] = None,
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,
@@ -578,6 +589,7 @@ class Session:
         *,
         batch_size: int = 101,
         plan_diagnostics: bool = False,
+        execution_stats: bool = False,
         request_id: Optional[UUID] = None,
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,
@@ -604,6 +616,7 @@ class Session:
         filter: Optional[BsonDocument] = None,
         *,
         plan_diagnostics: bool = False,
+        execution_stats: bool = False,
         request_id: Optional[UUID] = None,
         timeout_ms: Optional[int] = None,
         cancellation: Optional[CancellationToken] = None,

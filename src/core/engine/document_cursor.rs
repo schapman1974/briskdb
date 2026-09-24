@@ -4,7 +4,10 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -13,8 +16,8 @@ use crate::{
     document::{
         BsonDocument, CanonicalBsonKey, DocumentAggregationStream, DocumentCollectionId,
         DocumentCursorError, DocumentCursorId, DocumentDatabaseId, DocumentMatcher,
-        DocumentNamespace, DocumentPlan, DocumentPointPlan, DocumentProjector, DocumentScatterPlan,
-        DocumentSortKey, DocumentSorter,
+        DocumentNamespace, DocumentPlan, DocumentPointPlan, DocumentProjector, DocumentReadOptions,
+        DocumentReadStats, DocumentScatterPlan, DocumentSortKey, DocumentSorter,
     },
     storage::ConnectionOwner,
 };
@@ -91,6 +94,49 @@ pub(super) struct CursorState {
     pub remaining: Option<u64>,
     pub batch_byte_limit: Option<u64>,
     pub aggregation: Option<AggregateCursor>,
+    /// Present only while a request executes, never in a retained cursor.
+    pub read_stats: Option<Arc<ReadStats>>,
+}
+
+#[derive(Default)]
+pub(super) struct ReadStats {
+    storage_reads: AtomicU64,
+    documents_examined: AtomicU64,
+    matcher_evaluations: AtomicU64,
+    shard_mask: AtomicU64,
+}
+
+impl ReadStats {
+    pub fn for_options(options: &DocumentReadOptions) -> Option<Arc<Self>> {
+        options.execution_stats().then(|| Arc::new(Self::default()))
+    }
+
+    pub fn storage_read(&self, shard: u16) {
+        Self::add(&self.storage_reads, 1);
+        self.shard_mask.fetch_or(1_u64 << shard, Ordering::Relaxed);
+    }
+
+    pub fn examine(&self, documents: u64) {
+        Self::add(&self.documents_examined, documents);
+    }
+    pub fn match_document(&self) {
+        Self::add(&self.matcher_evaluations, 1);
+    }
+
+    fn add(counter: &AtomicU64, value: u64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_add(value))
+        });
+    }
+
+    fn snapshot(&self) -> DocumentReadStats {
+        DocumentReadStats::from_counters(
+            self.storage_reads.load(Ordering::Relaxed),
+            self.documents_examined.load(Ordering::Relaxed),
+            self.matcher_evaluations.load(Ordering::Relaxed),
+            self.shard_mask.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// Metadata cursors retain only bounded filter/position state, never catalog rows
@@ -191,6 +237,10 @@ pub(super) struct SortPosition {
 }
 
 impl CursorState {
+    pub fn finish_read_stats(&mut self) -> Option<DocumentReadStats> {
+        self.read_stats.take().map(|stats| stats.snapshot())
+    }
+
     fn retained_bytes(&self) -> usize {
         4096usize
             .saturating_add(
@@ -486,7 +536,30 @@ mod tests {
             skip: 0,
             remaining: None,
             batch_byte_limit: None,
+            read_stats: None,
         }
+    }
+
+    #[test]
+    fn read_stats_opt_in_snapshot_is_bounded_and_detaches_from_cursor() {
+        assert!(ReadStats::for_options(&DocumentReadOptions::new()).is_none());
+        let mut state = state();
+        state.read_stats =
+            ReadStats::for_options(&DocumentReadOptions::new().with_execution_stats(true));
+        let counters = state.read_stats.as_ref().unwrap();
+        counters.storage_read(0);
+        counters.storage_read(63);
+        counters.storage_read(63);
+        counters.examine(u64::MAX);
+        counters.examine(1);
+        counters.match_document();
+        let snapshot = state.finish_read_stats().unwrap();
+        assert!(state.read_stats.is_none());
+        assert_eq!(snapshot.storage_reads(), 3);
+        assert_eq!(snapshot.documents_examined(), u64::MAX);
+        assert_eq!(snapshot.matcher_evaluations(), 1);
+        assert_eq!(snapshot.shards_read().collect::<Vec<_>>(), vec![0, 63]);
+        assert!(state.finish_read_stats().is_none());
     }
 
     #[test]
