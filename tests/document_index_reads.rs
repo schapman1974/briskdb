@@ -1,17 +1,23 @@
 #![cfg(feature = "documents")]
 
-use std::time::Instant;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use briskdb::{
-    core::{Engine, RequestContext, Session},
+    core::{CancellationToken, Engine, EngineErrorKind, RequestContext, Session},
     document::{
-        BsonDocument, BsonValue, DocumentCollectionOptions, DocumentCommand,
+        BsonDocument, BsonValue, CanonicalBsonKey, DocumentCollectionOptions, DocumentCommand,
         DocumentContinueCursorRequest, DocumentCountRequest, DocumentCreateCollectionRequest,
         DocumentCreateIndexRequest, DocumentCursorId, DocumentDeleteRequest,
         DocumentDistinctRequest, DocumentDropIndexRequest, DocumentExecution, DocumentFilter,
-        DocumentFindRequest, DocumentIndexRequest, DocumentInsertRequest, DocumentMutationScope,
-        DocumentNamespace, DocumentReadOptions, DocumentRequest, DocumentRequestId, DocumentResult,
-        DocumentSort, DocumentUpdate, DocumentUpdateRequest, DocumentWriteOptions, encode_document,
+        DocumentFindOneAndDeleteRequest, DocumentFindOneAndReplaceRequest,
+        DocumentFindOneAndUpdateRequest, DocumentFindRequest, DocumentIndexRequest,
+        DocumentInsertRequest, DocumentMutationScope, DocumentNamespace, DocumentProjection,
+        DocumentReadOptions, DocumentReplaceRequest, DocumentRequest, DocumentRequestId,
+        DocumentResult, DocumentSort, DocumentUpdate, DocumentUpdateRequest, DocumentWriteOptions,
+        decode_document, encode_document,
     },
 };
 
@@ -470,6 +476,419 @@ async fn maintained_index_reads_equal_scans_after_single_and_many_mutations() {
     engine.shutdown().await.unwrap();
 }
 
+fn indexed_mutation(namespace: DocumentNamespace, phase: u8) -> DocumentCommand {
+    let filter = DocumentFilter::new(if phase < 5 {
+        doc([("a", BsonValue::Int32(1))])
+    } else {
+        doc([("a", BsonValue::Int32(77)), ("_id", BsonValue::Int32(1234))])
+    })
+    .unwrap();
+    let options = DocumentReadOptions::new()
+        .with_sort(DocumentSort::new(doc([("rank", BsonValue::Int32(-1))])).unwrap())
+        .with_projection(
+            DocumentProjection::new(doc([
+                ("_id", BsonValue::Int32(1)),
+                ("a", BsonValue::Int32(1)),
+                ("rank", BsonValue::Int32(1)),
+            ]))
+            .unwrap(),
+        );
+    let update = DocumentUpdateRequest::new(
+        namespace.clone(),
+        filter.clone(),
+        DocumentUpdate::new(doc([("$inc", obj([("rank", BsonValue::Int32(1))]))])).unwrap(),
+        if phase == 0 || phase == 6 {
+            DocumentMutationScope::Many
+        } else {
+            DocumentMutationScope::One
+        },
+        DocumentWriteOptions::new().with_upsert(phase >= 5),
+    );
+    match phase {
+        0 | 5 | 6 => DocumentCommand::Update(update),
+        1 | 2 => DocumentCommand::FindOneAndUpdate(
+            DocumentFindOneAndUpdateRequest::new(update, options).with_return_after(phase == 2),
+        ),
+        3 => DocumentCommand::FindOneAndReplace(DocumentFindOneAndReplaceRequest::new(
+            DocumentReplaceRequest::new(
+                namespace,
+                filter,
+                doc([("a", BsonValue::Int32(8)), ("rank", BsonValue::Int32(-5))]),
+                DocumentWriteOptions::new(),
+            )
+            .unwrap(),
+            options,
+        )),
+        4 => DocumentCommand::FindOneAndDelete(DocumentFindOneAndDeleteRequest::new(
+            namespace, filter, options,
+        )),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn indexed_find_modify_and_upserts_equal_scan_images_counts_and_postimages() {
+    for sparse in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::open(root.path(), 4).await.unwrap();
+        let session = engine.session();
+        for namespace in [ns("scan"), ns("indexed")] {
+            seed(&engine, &session, &namespace, 35).await;
+        }
+        build(
+            &engine,
+            &session,
+            &ns("indexed"),
+            DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))]))
+                .unwrap()
+                .with_sparse(sparse),
+        )
+        .await;
+        for phase in 0..7 {
+            let expected = call(&engine, &session, indexed_mutation(ns("scan"), phase))
+                .await
+                .into_parts()
+                .2;
+            let actual = call(&engine, &session, indexed_mutation(ns("indexed"), phase))
+                .await
+                .into_parts()
+                .2;
+            assert_eq!(actual, expected, "phase {phase}, sparse {sparse}");
+            assert_eq!(
+                find(
+                    &engine,
+                    &session,
+                    &ns("indexed"),
+                    &doc([]),
+                    DocumentReadOptions::new()
+                )
+                .await,
+                find(
+                    &engine,
+                    &session,
+                    &ns("scan"),
+                    &doc([]),
+                    DocumentReadOptions::new()
+                )
+                .await,
+                "phase {phase}, sparse {sparse}"
+            );
+        }
+        engine.shutdown().await.unwrap();
+        let engine = Engine::open(root.path(), 4).await.unwrap();
+        let session = engine.session();
+        assert_eq!(
+            find(
+                &engine,
+                &session,
+                &ns("indexed"),
+                &doc([]),
+                DocumentReadOptions::new()
+            )
+            .await,
+            find(
+                &engine,
+                &session,
+                &ns("scan"),
+                &doc([]),
+                DocumentReadOptions::new()
+            )
+            .await
+        );
+        engine.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn indexed_mutation_selection_does_not_decode_non_candidates() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    let namespace = ns("physical");
+    seed(&engine, &session, &namespace, 35).await;
+    build(
+        &engine,
+        &session,
+        &namespace,
+        DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))])).unwrap(),
+    )
+    .await;
+    let key = CanonicalBsonKey::encode(&BsonValue::Int32(0)).unwrap();
+    let mut restore = None;
+    for shard in 0..2 {
+        let connection =
+            rusqlite::Connection::open(root.path().join(format!("shards/{shard:04}.sqlite")))
+                .unwrap();
+        let rows: Vec<Vec<u8>> = connection
+            .prepare("SELECT document_checksum FROM briskdb_documents_v1 WHERE id_key = ?1")
+            .unwrap()
+            .query_map([key.as_bytes()], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        if let Some(checksum) = rows.into_iter().next() {
+            // Test-owned damage outside a == 1: a scan would fail before a
+            // write; indexed selection must not decode this unrelated record.
+            connection.execute("UPDATE briskdb_documents_v1 SET document_checksum = zeroblob(32) WHERE id_key = ?1", [key.as_bytes()]).unwrap();
+            restore = Some((connection, checksum));
+        }
+    }
+    assert!(restore.is_some());
+    for phase in 0..5 {
+        call(
+            &engine,
+            &session,
+            indexed_mutation(namespace.clone(), phase),
+        )
+        .await;
+    }
+    let filter = DocumentFilter::new(doc([("a", BsonValue::Int32(1))])).unwrap();
+    call(
+        &engine,
+        &session,
+        DocumentCommand::Replace(
+            DocumentReplaceRequest::new(
+                namespace.clone(),
+                filter.clone(),
+                doc([("a", BsonValue::Int32(1)), ("rank", BsonValue::Int32(99))]),
+                DocumentWriteOptions::new(),
+            )
+            .unwrap(),
+        ),
+    )
+    .await;
+    for scope in [DocumentMutationScope::One, DocumentMutationScope::Many] {
+        call(
+            &engine,
+            &session,
+            DocumentCommand::Delete(DocumentDeleteRequest::new(
+                namespace.clone(),
+                filter.clone(),
+                scope,
+                DocumentWriteOptions::new(),
+            )),
+        )
+        .await;
+    }
+    let (connection, checksum) = restore.unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE briskdb_documents_v1 SET document_checksum = ?1 WHERE id_key = ?2",
+                rusqlite::params![checksum, key.as_bytes()]
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    engine.shutdown().await.unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    assert!(
+        find(
+            &engine,
+            &session,
+            &namespace,
+            filter.document(),
+            DocumentReadOptions::new()
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        find(
+            &engine,
+            &session,
+            &namespace,
+            &doc([("_id", BsonValue::Int32(0))]),
+            DocumentReadOptions::new()
+        )
+        .await
+        .len(),
+        1
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn indexed_multi_update_rolls_back_the_failing_shard_and_preserves_prior_commits() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    let session = engine.session();
+    let namespace = ns("rollback");
+    seed(&engine, &session, &namespace, 35).await;
+    build(
+        &engine,
+        &session,
+        &namespace,
+        DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))])).unwrap(),
+    )
+    .await;
+    let second = rusqlite::Connection::open(root.path().join("shards/0001.sqlite")).unwrap();
+    let mut stored: Vec<BsonDocument> = second
+        .prepare("SELECT document_bson FROM briskdb_documents_v1 ORDER BY natural_order")
+        .unwrap()
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .map(|row| decode_document(&row.unwrap()).unwrap())
+        .collect();
+    let matcher =
+        briskdb::document::DocumentMatcher::compile(&doc([("a", BsonValue::Int32(1))])).unwrap();
+    stored.retain(|row| matcher.matches(row).unwrap());
+    assert!(stored.len() >= 2);
+    let last_id = stored.last().unwrap().get_first("_id").unwrap().clone();
+    call(
+        &engine,
+        &session,
+        DocumentCommand::Update(DocumentUpdateRequest::new(
+            namespace.clone(),
+            DocumentFilter::new(doc([("_id", last_id)])).unwrap(),
+            DocumentUpdate::new(doc([(
+                "$set",
+                obj([("rank", BsonValue::from("not a number"))]),
+            )]))
+            .unwrap(),
+            DocumentMutationScope::One,
+            DocumentWriteOptions::new(),
+        )),
+    )
+    .await;
+    let snapshot = |connection: &rusqlite::Connection| -> Vec<Vec<rusqlite::types::Value>> {
+        ["SELECT * FROM briskdb_documents_v1 ORDER BY collection_id, id_key",
+         "SELECT * FROM briskdb_document_index_entries_v1 ORDER BY collection_id, index_id, index_key, id_key"]
+            .into_iter().flat_map(|sql| {
+                let mut statement = connection.prepare(sql).unwrap();
+                let columns = statement.column_count();
+                statement.query_map([], |row| (0..columns).map(|i| row.get(i)).collect()).unwrap()
+                    .collect::<Result<Vec<_>, _>>().unwrap()
+            }).collect()
+    };
+    let before = snapshot(&second);
+    let first = rusqlite::Connection::open(root.path().join("shards/0000.sqlite")).unwrap();
+    let first_before = snapshot(&first);
+    let error = engine
+        .execute_document(
+            &session,
+            DocumentRequest::new(
+                DocumentRequestId::new([2; 16]).unwrap(),
+                RequestContext::new(),
+                indexed_mutation(namespace.clone(), 0),
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), EngineErrorKind::InvalidArgument);
+    assert_eq!(
+        snapshot(&second),
+        before,
+        "records and index entries on failing shard must roll back together"
+    );
+    assert_ne!(
+        snapshot(&first),
+        first_before,
+        "earlier shard commits remain visible"
+    );
+    drop(first);
+    drop(second);
+    engine.shutdown().await.unwrap();
+    let engine = Engine::open(root.path(), 2).await.unwrap();
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_multi_update_cancellation_preserves_prior_commits_and_releases_admission() {
+    for abort in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::open(root.path(), 2).await.unwrap();
+        let session = Arc::new(engine.session());
+        let namespace = ns("cancel");
+        seed(&engine, &session, &namespace, 35).await;
+        build(
+            &engine,
+            &session,
+            &namespace,
+            DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))])).unwrap(),
+        )
+        .await;
+        let snapshot = |connection: &rusqlite::Connection| -> Vec<Vec<u8>> {
+            connection
+                .prepare("SELECT document_bson FROM briskdb_documents_v1 ORDER BY natural_order")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let first = rusqlite::Connection::open(root.path().join("shards/0000.sqlite")).unwrap();
+        let mut second =
+            rusqlite::Connection::open(root.path().join("shards/0001.sqlite")).unwrap();
+        let blocker = second
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let before = snapshot(&blocker);
+        let first_before = snapshot(&first);
+        let cancellation = CancellationToken::new();
+        let context = RequestContext::new().with_cancellation_token(cancellation.clone());
+        let task_engine = engine.clone();
+        let task_session = Arc::clone(&session);
+        let command = indexed_mutation(namespace.clone(), 0);
+        let task = tokio::spawn(async move {
+            task_engine
+                .execute_document(
+                    &task_session,
+                    DocumentRequest::new(
+                        DocumentRequestId::new([3; 16]).unwrap(),
+                        context,
+                        command,
+                    ),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while snapshot(&first) == first_before {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let committed = snapshot(&first);
+        if abort {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            cancellation.cancel();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err()
+                    .kind(),
+                EngineErrorKind::Cancelled
+            );
+        }
+        assert_eq!(snapshot(&blocker), before);
+        blocker.rollback().unwrap();
+        // A fresh request waits for any detached worker cleanup and proves
+        // session/schema admission and the index remain usable.
+        find(
+            &engine,
+            &session,
+            &namespace,
+            &doc([("a", BsonValue::Int32(1))]),
+            DocumentReadOptions::new(),
+        )
+        .await;
+        assert_eq!(snapshot(&first), committed);
+        assert_eq!(snapshot(&second), before);
+        drop(first);
+        drop(second);
+        engine.shutdown().await.unwrap();
+        let engine = Engine::open(root.path(), 2).await.unwrap();
+        engine.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 #[ignore = "manual same-root equality candidate benchmark; timing is not a CI assertion"]
 async fn equality_candidate_benchmark() {
@@ -533,7 +952,131 @@ async fn equality_candidate_benchmark() {
                 "equality benchmark indexed={indexed} value={value} documents=1000 payload_bytes=4096 shards=4 iterations=10 elapsed_us={}",
                 started.elapsed().as_micros()
             );
+            let command = DocumentCommand::Update(DocumentUpdateRequest::new(
+                namespace.clone(),
+                DocumentFilter::new(doc([("a", BsonValue::Int32(value))])).unwrap(),
+                DocumentUpdate::new(doc([("$inc", obj([("counter", BsonValue::Int32(1))]))]))
+                    .unwrap(),
+                DocumentMutationScope::Many,
+                DocumentWriteOptions::new(),
+            ));
+            call(&engine, &session, command.clone()).await;
+            let started = Instant::now();
+            for _ in 0..10 {
+                let result = call(&engine, &session, command.clone())
+                    .await
+                    .into_parts()
+                    .2;
+                let DocumentResult::Update(result) = result else {
+                    panic!("update")
+                };
+                assert_eq!(
+                    (result.matched_count(), result.modified_count()),
+                    (expected, expected)
+                );
+            }
+            println!(
+                "mutation equality benchmark indexed={indexed} value={value} documents=1000 payload_bytes=4096 shards=4 iterations=10 elapsed_us={}",
+                started.elapsed().as_micros()
+            );
         }
     }
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn indexed_concurrent_find_modify_claims_each_matching_record_once() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
+    let session = engine.session();
+    let namespace = ns("claims");
+    seed(&engine, &session, &namespace, 35).await;
+    build(
+        &engine,
+        &session,
+        &namespace,
+        DocumentIndexRequest::new(doc([("a", BsonValue::Int32(1))])).unwrap(),
+    )
+    .await;
+    let query = doc([("a", BsonValue::Int32(1))]);
+    let expected = find(
+        &engine,
+        &session,
+        &namespace,
+        &query,
+        DocumentReadOptions::new(),
+    )
+    .await
+    .len();
+    let mut tasks = Vec::new();
+    for _ in 0..expected + 3 {
+        let engine = engine.clone();
+        let namespace = namespace.clone();
+        let query = query.clone();
+        tasks.push(tokio::spawn(async move {
+            call(
+                &engine,
+                &engine.session(),
+                DocumentCommand::FindOneAndUpdate(DocumentFindOneAndUpdateRequest::new(
+                    DocumentUpdateRequest::new(
+                        namespace,
+                        DocumentFilter::new(query).unwrap(),
+                        DocumentUpdate::new(doc([("$set", obj([("a", BsonValue::Int32(8))]))]))
+                            .unwrap(),
+                        DocumentMutationScope::One,
+                        DocumentWriteOptions::new(),
+                    ),
+                    DocumentReadOptions::new().with_sort(
+                        DocumentSort::new(doc([("rank", BsonValue::Int32(1))])).unwrap(),
+                    ),
+                )),
+            )
+            .await
+            .into_parts()
+            .2
+        }));
+    }
+    let mut ids = std::collections::HashSet::new();
+    for task in tasks {
+        match task.await.unwrap() {
+            DocumentResult::Document(Some(image)) => {
+                let Some(BsonValue::Int32(id)) = image.get_first("_id") else {
+                    panic!("id")
+                };
+                assert!(
+                    ids.insert(*id),
+                    "a claimed record must not be selected twice"
+                );
+            }
+            DocumentResult::Document(None) => (),
+            _ => panic!("before image"),
+        }
+    }
+    assert_eq!(ids.len(), expected);
+    assert!(
+        find(
+            &engine,
+            &session,
+            &namespace,
+            &query,
+            DocumentReadOptions::new()
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        find(
+            &engine,
+            &session,
+            &namespace,
+            &doc([("a", BsonValue::Int32(8))]),
+            DocumentReadOptions::new()
+        )
+        .await
+        .len(),
+        expected
+    );
+    engine.shutdown().await.unwrap();
+    let engine = Engine::open(root.path(), 4).await.unwrap();
     engine.shutdown().await.unwrap();
 }

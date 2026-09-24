@@ -545,6 +545,14 @@ tests compare filters, sorting, count/distinct, index drop/recreation between
 batches, write maintenance and reopened results. This does not close #174 or
 #178: uniqueness, broader candidate forms and plan diagnostics remain open.
 
+The same candidates now narrow mutation selection for one/many updates and
+deletes, replacements and sorted find-and-modify, including upsert rechecks.
+Full predicate/identity rechecks and per-shard transactions remain authoritative.
+Natural-order advancement avoids repeat updates when index entries change;
+rollback and cancellation preserve earlier commits without claiming atomicity
+across shards. Physical-selection tests, scan differentials and sync/async driver
+coverage verify the write path independently of read acceleration.
+
 Sessions, retryable writes, replication, change streams, and compression are
 not advertised. This is not full TinyMongo or MongoDB compatibility. Required
 real-driver CI also verifies BSON fidelity, ordered/unordered duplicate failures,

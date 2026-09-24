@@ -239,16 +239,21 @@ pub(super) fn next_match(
     cancellation: &CancellationToken,
     control: &OperationControl,
 ) -> EngineResult<Option<DocumentStorageRecord>> {
+    let mut check = || ensure_document_cpu_active(cancellation, control);
+    let probe = matcher
+        .map(|matcher| storage.document_equality_probe(collection_id, matcher, &mut check))
+        .transpose()?
+        .flatten();
     loop {
-        let mut check = || ensure_document_cpu_active(cancellation, control);
         check()?;
         let Some(record) = storage
-            .scan_document_shard_on_connection(
+            .scan_document_candidates_on_connection(
                 connection,
                 collection_id,
                 shard,
                 *after,
                 1,
+                probe.as_ref(),
                 cancellation,
             )?
             .pop()

@@ -724,6 +724,12 @@ requires an earlier dependency:
       fall back to scans. Source-locked comparisons cover 201,349 matcher
       evaluations with no excluded true matches. Broader predicates, planner
       diagnostics and secondary uniqueness remain open under #174/#178.
+      Equality candidates now also narrow update/delete, replacement and
+      find-and-modify selection, including sorted choices and upsert rechecks.
+      Natural-order frontiers prevent duplicate processing when indexed keys
+      change. Scan differentials, physical-selection proofs, exact record/entry
+      rollback, cancellation/abort, sync/async PyMongo and restart checks retain
+      the existing per-shard commit and recheck boundaries.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,
