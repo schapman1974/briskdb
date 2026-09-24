@@ -479,6 +479,12 @@ children before returning one error; a query failure cannot cancel a shared
 listener shutdown token. Point reads remain direct; frontier refills and sorted
 key-window scans remain sequential. See the [engine read boundaries](DOCUMENT_ENGINE.md).
 
+The native/legacy `count` path (also used by `estimated_document_count`) runs
+independent targeted shard counts through the same eight-child coordinator,
+then sums checked scalars before global skip/limit. Exact-ID counts remain
+single-owner reads. `count_documents` still uses the driver's aggregation
+pipeline; this does not replace its matching, pagination or grouping semantics.
+
 Rust hosts retaining a `MongoServer` can inspect `mongo.metrics()` without a
 network administration endpoint. The listener-local snapshot includes accepted,
 admitted/rejected, active/closed/peak connections, fatal transport/accept/task

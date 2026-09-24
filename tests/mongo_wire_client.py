@@ -1568,6 +1568,45 @@ def count_smoke(uri):
                     raise AssertionError("invalid count_documents options must fail eagerly")
 
 
+COUNT_CHECKPOINT_CASES = [
+    ({}, 37),
+    ({"query": {"group": 1}, "skip": 3}, 9),
+    ({"query": {"_id": {"$in": [1, 5, 9, 36, 999]}}}, 4),
+    ({"query": {"_id": {"$in": [1, 5, 9, 36, 999]}}, "skip": 1, "limit": 2}, 2),
+    ({"query": {"$or": [{"_id": 1}, {"_id": {"$in": [2, 9, 999]}}]}}, 3),
+    ({"query": {"_id": {"$in": [1, 5, 9]}, "group": 0}}, 1),
+    ({"query": {"_id": 5}}, 1),
+    ({"query": {"_id": 5}, "skip": 1}, 0),
+    ({"query": {"group": 100}}, 0),
+    ({"query": {"_id": {"$in": []}}}, 0),
+    ({"query": {"_id": {"$gte": 10, "$lt": 20}}}, 10),
+]
+
+
+def count_checkpoint_smoke(uri):
+    """The same fixed count answers before and after reopening the engine root."""
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        assert client.wire_count.items.estimated_document_count(maxTimeMS=10000) == 37
+        for arguments, expected in COUNT_CHECKPOINT_CASES:
+            assert client.wire_count.command("count", "items", maxTimeMS=10000, **arguments)["n"] == expected
+        assert client.wire_count.items.count_documents({"group": 1}, skip=3, limit=5) == 5
+        assert client.unwritten_count.items.estimated_document_count() == 0
+        # Counts must leave the same records readable; paging also exercises
+        # the shared real-driver harness's cursor lifecycle/drain contract.
+        assert [row["_id"] for row in client.wire_count.items.find().batch_size(5)] == list(range(37))
+
+
+async def async_count_checkpoint_smoke(uri):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        assert await client.wire_count.items.estimated_document_count(maxTimeMS=10000) == 37
+        for arguments, expected in COUNT_CHECKPOINT_CASES:
+            reply = await client.wire_count.command("count", "items", maxTimeMS=10000, **arguments)
+            assert reply["n"] == expected
+        assert await client.wire_count.items.count_documents({"group": 1}, skip=3, limit=5) == 5
+        assert await client.unwritten_count.items.estimated_document_count() == 0
+        assert [row["_id"] async for row in client.wire_count.items.find().batch_size(5)] == list(range(37))
+
+
 def aggregation_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=20000, maxPoolSize=3) as client:
         collection = client.wire_aggregate.items
@@ -3155,4 +3194,6 @@ if __name__ == "__main__":
         asyncio.run(asyncio.wait_for(async_operator_upsert_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_find_upsert_smoke(sys.argv[1]), timeout=20))
         asyncio.run(asyncio.wait_for(async_smoke(sys.argv[1]), timeout=20))
+    count_checkpoint_smoke(sys.argv[1])
+    asyncio.run(asyncio.wait_for(async_count_checkpoint_smoke(sys.argv[1]), timeout=20))
     print("PyMongo 4.17.0 discovery, insert batches, filtered/cursor reads, BSON, and rejection passed")

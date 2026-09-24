@@ -1,4 +1,4 @@
-//! Bounded initial natural-order frontiers. Every started child drains before
+//! Bounded initial natural-order frontiers and scalar shard counts. Every child drains before
 //! the owning document operation releases its schema/session/lifecycle guards.
 
 use std::{future::Future, sync::atomic::AtomicU64};
@@ -63,7 +63,7 @@ where
             Some(Err(error)) if first_error.is_none() => {
                 first_error = Some(EngineError::from_source(
                     EngineErrorKind::Internal,
-                    "document frontier task failed",
+                    "document read task failed",
                     error,
                 ));
                 children.cancel();
@@ -111,6 +111,77 @@ impl FrontierBudget {
 }
 
 impl Engine {
+    pub(super) async fn count_document_shards(
+        &self,
+        owner: ConnectionOwner,
+        collection_id: DocumentCollectionId,
+        route: &PreparedFilterRoute,
+        cancellation: CancellationToken,
+        deadline: Option<Instant>,
+    ) -> EngineResult<u64> {
+        let matcher = route.matcher().cloned();
+        let shards = route.shards(self.shard_count()).collect();
+        let engine = self.clone();
+        let results = coordinate(
+            shards,
+            cancellation,
+            self.inner.shutdown_cancel.clone(),
+            deadline,
+            move |shard, cancellation| {
+                let engine = engine.clone();
+                let matcher = matcher.clone();
+                async move {
+                    engine
+                        .run_document_shard(
+                            shard,
+                            owner,
+                            cancellation,
+                            deadline,
+                            move |storage, connection, cancellation| {
+                                if let Some(matcher) = matcher {
+                                    let mut after = None;
+                                    let mut count = 0_u64;
+                                    while let Some(record) = next_matching_document(
+                                        storage,
+                                        connection,
+                                        collection_id,
+                                        shard,
+                                        after,
+                                        Some(&matcher),
+                                        cancellation,
+                                        deadline,
+                                        None,
+                                    )? {
+                                        after = Some(record.natural_order());
+                                        count = count.checked_add(1).ok_or_else(|| {
+                                            limit_exceeded("document count overflowed")
+                                        })?;
+                                    }
+                                    Ok(count)
+                                } else {
+                                    storage.count_document_shard_on_connection(
+                                        connection,
+                                        collection_id,
+                                        shard,
+                                        cancellation,
+                                    )
+                                }
+                            },
+                        )
+                        .await
+                }
+            },
+        )
+        .await?;
+        // At most one scalar per physical shard; no document collection is
+        // retained. Global skip/limit applies only after this checked sum.
+        results.into_iter().try_fold(0_u64, |count, (_, next)| {
+            count
+                .checked_add(next)
+                .ok_or_else(|| limit_exceeded("document count exceeded the supported range"))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn initial_document_frontiers(
         &self,

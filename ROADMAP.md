@@ -871,8 +871,10 @@ requires an earlier dependency:
       merge preserve global pagination across empty/uneven and owner-pruned shards.
       Errors, panics and cancellation stop admission and drain children before
       operation guards release; peer cancellation never poisons caller/listener
-      tokens. Point reads remain direct; frontier refill and sorted-window work
-      remain sequential. Wider parallel sorted execution and fault/skew acceptance
+      tokens. Native/legacy counts now use the same bounded coordinator for
+      per-shard scalar totals, retaining full matching and owner pruning before
+      checked summation and global skip/limit. Point reads remain direct; frontier
+      refill and sorted-window work remain sequential. Wider parallel sorted execution and fault/skew acceptance
       remain open; no partial-page or new snapshot guarantee is introduced.
     - [ ] [#187](https://github.com/schapman1974/briskdb/issues/187) — Rust hosts
       can now inspect payload-free listener-local Mongo metrics: connection

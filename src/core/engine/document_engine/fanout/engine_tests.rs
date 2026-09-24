@@ -5,6 +5,8 @@ use crate::document::{
 };
 use std::time::Duration;
 
+mod counts;
+
 fn namespace() -> DocumentNamespace {
     DocumentNamespace::new("frontier", "items").unwrap()
 }
@@ -42,11 +44,19 @@ fn query(
     session: &Arc<Session>,
     context: RequestContext,
 ) -> tokio::task::JoinHandle<EngineResult<DocumentExecution>> {
+    query_command(engine, session, find(), context)
+}
+fn query_command(
+    engine: &Engine,
+    session: &Arc<Session>,
+    command: DocumentCommand,
+    context: RequestContext,
+) -> tokio::task::JoinHandle<EngineResult<DocumentExecution>> {
     let engine = engine.clone();
     let session = Arc::clone(session);
     tokio::spawn(async move {
         engine
-            .execute_document(&session, request(find(), context))
+            .execute_document(&session, request(command, context))
             .await
     })
 }
@@ -156,6 +166,13 @@ async fn real_document_frontiers_admit_two_bounded_waves_and_merge_empty_uneven_
 
 #[tokio::test]
 async fn real_frontier_failure_cancel_and_caller_abort_drain_without_poisoning_shared_controls() {
+    assert_failure_cleanup(find, assert_rows).await;
+}
+
+async fn assert_failure_cleanup(
+    command: fn() -> DocumentCommand,
+    assert_result: fn(DocumentExecution),
+) {
     let (_root, engine, session) = setup().await;
     let permits = block(&engine).await;
     let pools = engine.inner.connections.clone();
@@ -166,9 +183,10 @@ async fn real_frontier_failure_cancel_and_caller_abort_drain_without_poisoning_s
     });
     wait_for(&engine, |pool| pool.shards[0].queued == 1).await;
     let shared = CancellationToken::new();
-    let error = bounded(query(
+    let error = bounded(query_command(
         &engine,
         &session,
+        command(),
         RequestContext::new().with_cancellation_token(shared.clone()),
     ))
     .await
@@ -185,10 +203,11 @@ async fn real_frontier_failure_cancel_and_caller_abort_drain_without_poisoning_s
     queued.abort();
     assert!(bounded(queued).await.unwrap_err().is_cancelled());
     drop(permits);
-    assert_rows(
-        bounded(query(
+    assert_result(
+        bounded(query_command(
             &engine,
             &session,
+            command(),
             RequestContext::new().with_cancellation_token(shared),
         ))
         .await
@@ -199,9 +218,10 @@ async fn real_frontier_failure_cancel_and_caller_abort_drain_without_poisoning_s
     for abort in [false, true] {
         let permits = block(&engine).await;
         let parent = CancellationToken::new();
-        let task = query(
+        let task = query_command(
             &engine,
             &session,
+            command(),
             RequestContext::new().with_cancellation_token(parent.clone()),
         );
         wait_for(&engine, |pool| {
@@ -229,11 +249,16 @@ async fn real_frontier_failure_cancel_and_caller_abort_drain_without_poisoning_s
         })
         .await;
         drop(permits);
-        assert_rows(
-            bounded(query(&engine, &session, RequestContext::new()))
-                .await
-                .unwrap()
-                .unwrap(),
+        assert_result(
+            bounded(query_command(
+                &engine,
+                &session,
+                command(),
+                RequestContext::new(),
+            ))
+            .await
+            .unwrap()
+            .unwrap(),
         );
     }
     engine.shutdown().await.unwrap();
