@@ -590,7 +590,8 @@ requires an earlier dependency:
       equalities seed strict dotted object paths; overlapping equalities fail
       with code 54. Operators run before missing-ID generation, can provide an
       unbound ID, and retain literal zero timestamps. No advanced predicate
-      simplification or global snapshot/uniqueness is promised. Result/depth limits,
+      simplification or global snapshot is promised; global uniqueness requires a
+      Ready unique index. Result/depth limits,
       target-shard rechecks (all matches for many), and rollback-certified wire
       errors share the replacement path. 3,544 source-locked upsert executions
       cover common frozen behavior; independent tests cover strict inference,
@@ -636,7 +637,9 @@ requires an earlier dependency:
       cancellation/task-abort, and continued-session tests cover
       this boundary. Find-and-modify upserts now share the same synthesis and
       recheck path, with explicit inserted IDs and optional before/after images.
-      Secondary-index post-image validation remains open.
+      Ready secondary entries now follow the same record transaction, with
+      post-image validation and cross-shard Ready-unique enforcement. Bulk
+      final-image policy and broader corpus acceptance remain under #183/#186.
     - [ ] [#175](https://github.com/schapman1974/briskdb/issues/175) — filtered
       delete-one/many now use the shared matcher across Rust, native sync/async
       Python, and Mongo wire. Exact IDs stay single-shard; delete-one rechecks
@@ -661,7 +664,9 @@ requires an earlier dependency:
       inserted-ID metadata (including null), and combined ID/image preflight.
       Concurrent same-ID insertion/update images are atomic; native sync/async
       Python and wire replies preserve inserted-versus-matched distinctions.
-      Other operators and secondary-index validation remain open.
+      All eleven planned operators and secondary-index validation are implemented;
+      indexed selection, transactional entry maintenance and Ready-unique conflicts
+      share the same recheck path. Broader compatibility acceptance remains.
     - [ ] [#174](https://github.com/schapman1974/briskdb/issues/174) — shared
       index-definition validation now checks ordered distinct paths and numeric
       ascending/descending directions on controlled workers before catalog writes.
@@ -763,6 +768,14 @@ requires an earlier dependency:
       fall back to scans. Source-locked comparisons cover 201,349 matcher
       evaluations with no excluded true matches. Broader predicates, planner
       diagnostics remain open under #174/#178.
+      Necessary positive `$in` lists now derive bounded complete compound tuples:
+      at most 128 scalar members per list, 128 distinct tuples and 1 MiB of encoded
+      keys per probe. Existing equality probes keep priority. Bound SQL candidates
+      include non-unique fallback records and deduplicate multikey matches before
+      pagination; the full matcher still governs each read/mutation. Partial,
+      regex/unsupported, empty/oversized and possible sparse all-null probes retain
+      scans. Native scan differentials, typed candidate proofs, physical selection,
+      checksum, index churn and restart checks cover the extension.
       Equality candidates now also narrow update/delete, replacement and
       find-and-modify selection, including sorted choices and upsert rechecks.
       Natural-order frontiers prevent duplicate processing when indexed keys

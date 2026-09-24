@@ -51,7 +51,7 @@ struct CompiledIndex {
 pub(crate) struct DocumentIndexProbe {
     collection_id: DocumentCollectionId,
     index_id: DocumentIndexId,
-    key: Vec<u8>,
+    keys: Vec<Vec<u8>>,
 }
 
 impl DocumentIndexProbe {
@@ -61,8 +61,8 @@ impl DocumentIndexProbe {
     pub(crate) const fn index_id(&self) -> DocumentIndexId {
         self.index_id
     }
-    pub(crate) fn key(&self) -> &[u8] {
-        &self.key
+    pub(crate) fn keys(&self) -> &[Vec<u8>] {
+        &self.keys
     }
 }
 
@@ -193,9 +193,30 @@ impl DocumentIndexPreparation {
                 return Ok(Some(DocumentIndexProbe {
                     collection_id: self.collection_id,
                     index_id: index.id,
-                    key: key.to_bytes_with_check(&mut || budget.step())?,
+                    keys: vec![key.to_bytes_with_check(&mut || budget.step())?],
                 }));
             }
+        }
+        // Preserve the existing complete-equality preference across indexes.
+        // Only if none applies, consider bounded literal membership tuples.
+        for index in &self.indexes {
+            budget.step()?;
+            let Some(keys) = index
+                .generator
+                .membership_keys_with_budget(matcher, &mut budget)?
+            else {
+                continue;
+            };
+            let mut encoded = Vec::new();
+            encoded.try_reserve_exact(keys.len()).map_err(allocation)?;
+            for key in keys {
+                encoded.push(key.to_bytes_with_check(&mut || budget.step())?);
+            }
+            return Ok(Some(DocumentIndexProbe {
+                collection_id: self.collection_id,
+                index_id: index.id,
+                keys: encoded,
+            }));
         }
         budget.step()?;
         Ok(None)

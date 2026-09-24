@@ -21,6 +21,9 @@ use briskdb::{
     },
 };
 
+#[path = "document_index_reads/membership.rs"]
+mod membership;
+
 fn doc(entries: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocument {
     BsonDocument::from_entries(entries).unwrap()
 }
@@ -78,7 +81,7 @@ async fn nonunique_fallback_candidates_preserve_nested_bson_matches_and_reopen()
         ]),
         doc([("_id", BsonValue::Int32(11))]),
     ];
-    let queries = vec![
+    let mut queries = vec![
         doc([]),
         doc([("v", BsonValue::Int32(1))]),
         doc([("v", BsonValue::Boolean(true))]),
@@ -93,6 +96,16 @@ async fn nonunique_fallback_candidates_preserve_nested_bson_matches_and_reopen()
         doc([("v.score", obj([("$exists", BsonValue::Boolean(false))]))]),
         doc([("a", BsonValue::Int32(1)), ("b", BsonValue::Int32(2))]),
     ];
+    for field in ["v", "v.score"] {
+        queries.push(doc([(
+            field,
+            obj([(
+                "$in",
+                BsonValue::Array(vec![BsonValue::Int32(1), BsonValue::Int32(2)]),
+            )]),
+        )]));
+    }
+    queries.extend(membership::queries());
     let engine = Engine::open(root.path(), 4).await.unwrap();
     let session = engine.session();
     let mut expected = Vec::new();
@@ -371,6 +384,7 @@ fn queries() -> Vec<BsonDocument> {
         doc([("nested.x", BsonValue::Double(2.0))]),
         doc([("a", BsonValue::Int32(999))]),
     ]);
+    queries.extend(membership::queries());
     queries
 }
 

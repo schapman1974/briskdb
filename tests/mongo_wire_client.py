@@ -1929,6 +1929,62 @@ async def async_indexed_mutation_smoke(uri):
         assert [row async for row in collection.find({})] == [{"_id": 3, "a": 8, "counter": 1}]
 
 
+def membership_index_smoke(uri, reopened):
+    with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        collection = client.wire_membership.sync_items
+        query = {"a": {"$in": [Int64(1), 2, 1.0]}, "enabled": True}
+        if not reopened:
+            collection.insert_many([{"_id": i, "a": [i % 4, (i + 1) % 4, i % 4],
+                                     "enabled": i % 2 == 0, "rank": i, "hits": 0} for i in range(32)])
+            collection.create_index("a")
+            assert [row["_id"] for row in collection.find(query).batch_size(1)] == list(range(0, 32, 2))
+            result = collection.update_many(query, {"$inc": {"hits": 1}})
+            assert (result.matched_count, result.modified_count) == (16, 16)
+            assert collection.find_one_and_update(query, {"$inc": {"hits": 1}}, sort=[("rank", -1)],
+                                                 return_document=True)["hits"] == 2
+            assert collection.replace_one(dict(query, _id=2), {"a": [1, 2], "enabled": True,
+                                                                "rank": 2, "hits": 3}).modified_count == 1
+            assert collection.find_one_and_replace(dict(query, _id=4), {"a": [2, 1], "enabled": True,
+                                                                       "rank": 4, "hits": 4})["hits"] == 1
+            assert collection.delete_one(dict(query, _id=6)).deleted_count == 1
+            assert collection.find_one_and_delete(query, sort=[("_id", -1)])["_id"] == 30
+            assert collection.update_one({"_id": 100, "a": {"$in": [7, 8]}},
+                                         {"$set": {"a": 7, "enabled": False, "hits": 10}}, upsert=True).upserted_id == 100
+        expected = [i for i in range(0, 32, 2) if i not in (6, 30)]
+        rows = list(collection.find(query).sort("_id", 1).batch_size(1))
+        assert [row["_id"] for row in rows] == expected
+        assert [row["hits"] for row in rows] == [3 if i == 2 else 4 if i == 4 else 1 for i in expected]
+        assert [row["_id"] for row in collection.find(query).sort("rank", 1).skip(1).limit(3)] == [2, 4, 8]
+        assert collection.count_documents(query) == 14
+        assert sorted(collection.distinct("a", query)) == [0, 1, 2, 3]
+        assert collection.count_documents({}) == 31
+        assert collection.find_one({"_id": 100})["hits"] == 10
+
+
+async def async_membership_index_smoke(uri, reopened):
+    async with pymongo.AsyncMongoClient(uri, serverSelectionTimeoutMS=3000, socketTimeoutMS=3000) as client:
+        collection = client.wire_membership.async_items
+        query = {"a": {"$in": [Int64(1), 2, 1.0]}, "b": {"$in": [1, 2]}}
+        selected = [i for i in range(32) if i % 4 != 3 and i % 3 != 0]
+        if not reopened:
+            await collection.insert_many([{"_id": i, "a": [i % 4, (i + 1) % 4],
+                                            "b": i % 3, "hits": 0} for i in range(32)])
+            await collection.create_index([("a", 1), ("b", -1)])
+            assert [row["_id"] async for row in collection.find(query).batch_size(1)] == selected
+            result = await collection.update_many(query, {"$inc": {"hits": 1}})
+            assert (result.matched_count, result.modified_count) == (len(selected), len(selected))
+            assert (await collection.delete_one(query)).deleted_count == 1
+            assert (await collection.find_one_and_update(query, {"$inc": {"hits": 1}}, sort=[("_id", -1)],
+                                                         return_document=True))["hits"] == 2
+        expected = selected[1:]
+        rows = await collection.find(query).sort("_id", 1).batch_size(1).to_list()
+        assert [row["_id"] for row in rows] == expected
+        assert [row["hits"] for row in rows] == [2 if i == expected[-1] else 1 for i in expected]
+        assert await collection.count_documents(query) == len(expected)
+        assert sorted(await collection.distinct("b", query)) == [1, 2]
+        assert await collection.count_documents({}) == 31
+
+
 def unique_index_smoke(uri):
     with pymongo.MongoClient(uri, serverSelectionTimeoutMS=3000) as client:
         database = client.wire_unique
@@ -2789,6 +2845,8 @@ if __name__ == "__main__":
     asyncio.run(asyncio.wait_for(async_compression_smoke(sys.argv[1], reopened), timeout=20))
     id_in_routing_smoke(sys.argv[1], reopened)
     asyncio.run(asyncio.wait_for(async_id_in_routing_smoke(sys.argv[1], reopened), timeout=20))
+    membership_index_smoke(sys.argv[1], reopened)
+    asyncio.run(asyncio.wait_for(async_membership_index_smoke(sys.argv[1], reopened), timeout=20))
     index_metadata_smoke(sys.argv[1])
     asyncio.run(async_index_metadata_smoke(sys.argv[1]))
     if reopened:
