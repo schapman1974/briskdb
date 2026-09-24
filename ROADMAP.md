@@ -874,8 +874,14 @@ requires an earlier dependency:
       snapshots remain available after close without retaining engine resources.
       Native concurrency/unwind and real socket fixtures cover outcomes, cap
       rejection, malformed frames, response limits and listener-local reset.
-      Row/shard telemetry, exporters/tracing, readiness and broader fault/
-      soak acceptance remain open; no listener policy or timeout changes.
+      Rust hosts can separately opt in to read-work metrics: record calls,
+      examined documents, source matcher evaluations, output items, access-plan
+      counts and actual request/shard fanout, including zero-read buffered pages.
+      Fixed physical-ordinal counters expose request distribution, not per-shard
+      row/CPU skew. Off by default; enabled requests use bounded engine diagnostics
+      without wire fields. Failed engine work, legacy count and mutations are
+      excluded. Matched-row/per-shard work telemetry, exporters/tracing, readiness
+      and broader fault/soak acceptance remain open; no timeout changes.
     - [ ] [#167](https://github.com/schapman1974/briskdb/issues/167) — shared Rust
       BSON matcher now powers embedded and wire find/count/distinct/aggregate/delete. Includes dotted
       paths, missing/null behavior, array/logical/comparison operators, type/mod,

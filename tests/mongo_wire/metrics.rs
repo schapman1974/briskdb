@@ -9,6 +9,19 @@ pub(super) fn assert_driver_metrics_drained(snapshot: &MongoMetricsSnapshot) {
     assert_eq!(snapshot.cursors.active, 0);
     assert_eq!(snapshot.cursors.registered, snapshot.cursors.closed);
     assert!(snapshot.cursors.peak <= 32);
+    assert!(snapshot.read_metrics_enabled);
+    let reads = &snapshot.reads;
+    assert!(reads.executions > 0 && reads.storage_reads > 0);
+    assert_eq!(reads.fanout_buckets.iter().sum::<u64>(), reads.executions);
+    assert_eq!(reads.shard_requests.iter().sum::<u64>(), reads.shard_visits);
+    assert_eq!(
+        reads.point_plans
+            + reads.index_candidate_plans
+            + reads.scan_plans
+            + reads.unclassified_plans,
+        reads.executions
+    );
+    assert_eq!(reads.unclassified_plans, 0);
     for kind in [MongoCommandKind::Hello, MongoCommandKind::Find] {
         assert!(
             snapshot.command(kind).completed > 0,
@@ -22,7 +35,7 @@ pub(super) fn assert_driver_metrics_drained(snapshot: &MongoMetricsSnapshot) {
     }
 }
 
-fn doc(fields: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocument {
+pub(super) fn doc(fields: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocument {
     BsonDocument::from_entries(fields).unwrap()
 }
 

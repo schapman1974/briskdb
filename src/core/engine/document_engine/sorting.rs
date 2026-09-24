@@ -224,6 +224,7 @@ impl Engine {
                 let expected = position.clone();
                 let fetch_sorter = sorter.clone();
                 let fetch_matcher = matcher.clone();
+                let fetch_stats = state.read_stats.clone();
                 let record = self
                     .run_document_shard(
                         shard,
@@ -231,6 +232,9 @@ impl Engine {
                         cancellation.clone(),
                         deadline,
                         move |storage, connection, cancellation| {
+                            if let Some(stats) = &fetch_stats {
+                                stats.storage_read(shard);
+                            }
                             let record = storage
                                 .scan_document_shard_on_connection(
                                     connection,
@@ -242,6 +246,9 @@ impl Engine {
                                 )?
                                 .into_iter()
                                 .next();
+                            if let Some(stats) = &fetch_stats {
+                                stats.examine(u64::from(record.is_some()));
+                            }
                             if let Some(record) = &record {
                                 validate_point_record(
                                     record,
@@ -259,6 +266,9 @@ impl Engine {
                             else {
                                 return Ok(None);
                             };
+                            if let (Some(_), Some(stats)) = (&fetch_matcher, &fetch_stats) {
+                                stats.match_document();
+                            }
                             if !still_selected(
                                 record.document(),
                                 fetch_matcher.as_deref(),

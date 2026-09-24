@@ -12,8 +12,9 @@ mod wire;
 
 pub use listener::MongoServer;
 pub use metrics::{
-    MONGO_LATENCY_UPPER_BOUNDS_MICROS, MongoCommandKind, MongoCommandMetrics, MongoCursorMetrics,
-    MongoMetricsSnapshot, MongoTransportFailures,
+    MONGO_LATENCY_UPPER_BOUNDS_MICROS, MONGO_READ_SHARD_FANOUT_UPPER_BOUNDS, MongoCommandKind,
+    MongoCommandMetrics, MongoCursorMetrics, MongoMetricsSnapshot, MongoReadMetrics,
+    MongoTransportFailures,
 };
 pub use wire::{DocumentSequence, MAX_BOOTSTRAP_MESSAGE_BYTES, Request, decode_request};
 
