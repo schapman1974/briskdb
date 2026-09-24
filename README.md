@@ -36,6 +36,10 @@ tables through a local or remote server, using the same Python wheel.
 > [boundaries are explicit](#honest-alpha-boundaries), and measured results are
 > published even when they are not flattering.
 
+Current source/test version: **0.1.0-alpha.7** (Python: `0.1.0a7`), not yet
+published to PyPI. New PyMongo patching and remote `sqlite3` examples require
+this checkout or a supplied current testing wheel, not the older alpha.6 release.
+
 ## Why developers might care
 
 - **No SQLite fork.** Each shard is an ordinary SQLite WAL database that normal

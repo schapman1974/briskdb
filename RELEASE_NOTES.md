@@ -1,4 +1,43 @@
-# Unreleased
+# BriskDB 0.1.0-alpha.7 — Unreleased
+
+The Rust crate and Python wheel now identify this source/test build as
+`0.1.0-alpha.7` / `0.1.0a7`. This version bump does not publish a GitHub release
+or PyPI package. Use the current checkout or an explicitly supplied alpha.7
+wheel; the public alpha.6 artifacts do not contain all features described here.
+
+Highlights since alpha.6:
+
+- TinyMongo-style `briskdb.patch()` scopes and direct sync/async Mongo clients,
+  using pinned real PyMongo 4.17.0 over a private local listener and the shared
+  Rust engine. Temporary or persistent SQLite storage; no separate daemon.
+- The opt-in MongoDB subset now includes query filters, projections, sorting,
+  pagination, counts/distinct, CRUD/upserts, secondary indexes, and bounded
+  aggregation. This is not full MongoDB or TinyMongo parity; Mongo remains
+  unauthenticated and loopback-only.
+- The original read-only SQLite virtual-table addon lets standard Python
+  `sqlite3` query allowlisted BriskDB SQL tables through an explicitly enabled
+  authenticated connector. Host SQLite extension-loading support is required.
+- Index candidate reads, shard pruning, bounded parallel scans/counts, query
+  diagnostics, and listener metrics extend the shared document engine.
+
+Existing PostgreSQL TLS/SCRAM, HTTP, embedded SQL/Rust/Python, and same-host
+storage boundaries remain. SQL tables and BSON collections are separate data
+models. General cross-shard transactions, production hardening, full protocol
+parity, and MySQL support are not implied. Final remote/release gates remain
+required before publishing; local development validation is not a release gate.
+
+PostgreSQL still requires TLS and SCRAM-SHA-256 for remote access and supports
+bounded simple and parameterized text/binary extended queries, with
+single-shard transactions rather than general distributed transactions.
+
+The current source uses manifest version 21; the version-number bump itself
+does not change storage. There is no stable pre-1.0 on-disk compatibility promise.
+Before opening older data with this build, stop all owners and take a complete
+data-directory copy. In-place downgrade is unsupported. Use the
+[storage-format contract](docs/STORAGE_FORMAT.md) for exact supported migration
+paths and restore the complete backup if rollback is required.
+
+## Earlier changes in this development cycle
 
 Logical document database-name discovery now uses the shared engine through
 Rust, native sync/async Python `list_database_names`, and Mongo

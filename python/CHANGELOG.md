@@ -1,6 +1,16 @@
 # Python changelog
 
-## Unreleased
+## 0.1.0-alpha.7 — Unreleased
+
+Python distribution version: `0.1.0a7`. This source/test build is not yet a
+published PyPI release; install the checkout or an explicitly supplied wheel.
+
+- Added the read-only `attach_remote()` SQLite virtual-table addon for standard
+  Python `sqlite3`, with explicit server allowlists and bearer-token access.
+  Queries execute through host SQLite; extension loading is required.
+- Expanded the shared document engine's filtering, projections, sorted/paged
+  queries, CRUD/upserts, indexes and bounded aggregation. Query support is a
+  documented subset, not full MongoDB or TinyMongo parity.
 
 - Added TinyMongo-style `patch()` and real-PyMongo-backed local
   `MongoClient`/`AsyncMongoClient`, with an optional pinned `pymongo` extra.

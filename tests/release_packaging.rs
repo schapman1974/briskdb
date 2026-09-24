@@ -1,6 +1,6 @@
 #[test]
 fn alpha_release_contract_covers_every_native_archive_and_safety_boundary() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-alpha.6");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0-alpha.7");
 
     let workflow = include_str!("../.github/workflows/release.yml");
     for required in [
@@ -55,15 +55,14 @@ fn alpha_release_contract_covers_every_native_archive_and_safety_boundary() {
         "TLS and SCRAM-SHA-256",
         "bounded simple and parameterized text/binary extended queries",
         "single-shard transactions",
-        "native document API is limited",
-        "collection/index/insert/find/count/delete engine slice",
-        "`insert_one`",
-        "`find` and `count_documents`",
-        "`delete_one`",
+        "not full MongoDB or TinyMongo parity",
+        "Mongo remains unauthenticated and loopback-only",
+        "read-only SQLite virtual-table addon",
+        "`briskdb.patch()`",
+        "does not publish a GitHub release or PyPI package",
         "complete data-directory copy",
         "There is no stable pre-1.0 on-disk compatibility promise",
-        "manifest version 14",
-        "manifest versions 2 through 13",
+        "manifest version 21",
         "In-place downgrade is unsupported",
     ] {
         assert!(
