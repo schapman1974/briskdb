@@ -393,7 +393,6 @@ async fn diagnostics_distinct_and_aggregation_describe_their_actual_source_paths
         namespace.clone(),
         DocumentFilter::empty(),
         options(),
-        DocumentWriteOptions::new(),
     ));
     let error = engine
         .execute_document(
