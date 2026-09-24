@@ -225,7 +225,7 @@ jobs:
           real_pymongo_sync_async_discovery -- --ignored --exact
 
   mongo-odm:
-    name: Mongo real Beanie and MongoEngine applications
+    name: Mongo real ODM and Talk Python applications
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -266,15 +266,17 @@ jobs:
         run: |
           python scripts/mongo_parity.py verify-source --source-root .ci/tinymongo-odm-source
           python -m unittest discover -s tests -p 'test_mongo_odm_harness.py' -v
+          python -m unittest discover -s tests -p 'test_mongo_talkpython_harness.py' -v
 
-      - name: Require unchanged real ODM application bodies and restart
+      - name: Require unchanged real ODM and Talk Python bodies and restart
         env:
           BRISKDB_MONGO_ODM_PYTHON: python
           BRISKDB_MONGO_ODM_SOURCE_ROOT: .ci/tinymongo-odm-source
           BRISKDB_MONGO_ODM_REPORT_DIR: target/mongo-odm
+          BRISKDB_MONGO_TALKPYTHON_REPORT_DIR: target/mongo-talkpython
         run: >-
           cargo +1.85.0 test --locked --no-default-features --features mongo
-          --test mongo_odm -- --ignored --nocapture
+          --test mongo_odm -- --ignored --nocapture --test-threads=1
 
       - name: Upload real ODM application results
         if: always()
@@ -282,6 +284,17 @@ jobs:
         with:
           name: mongo-real-odm-results
           path: target/mongo-odm/*.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload unchanged Talk Python wire contracts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mongo-real-talkpython-results
+          path: |
+            target/mongo-talkpython/*.json
+            target/mongo-talkpython/*.xml
           if-no-files-found: warn
           retention-days: 14
 

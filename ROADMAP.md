@@ -530,8 +530,14 @@ requires an earlier dependency:
       exact executed-case checks, pinned dependencies, process deadlines and
       before/after-restart runs gate CI separately from the frozen command corpus.
       Persisted data and ODM-created index metadata are checked on reopen.
-      This covers the two baseline ODM fixtures, not broader application/ODM
-      feature matrices or user-supplied large applications.
+      The full unchanged Talk Python wire-target contract file now runs all
+      58 sync/async cases through its original fixtures and adapters, changing
+      only the connection URI. Exact identities/outcomes/target metadata and
+      source hashes gate both fresh and reopened engines; an independent BSON/
+      index sentinel verifies the same root because fixtures clean their own DBs.
+      Separate JSON/JUnit reports reject omissions, skips and stale successes.
+      These cover baseline ODM bodies and application-derived wire contracts,
+      not broader ODM features, full app deployments or user-supplied large apps.
     - [ ] Initial wire data slice for [#173](https://github.com/schapman1974/briskdb/issues/173),
       [#172](https://github.com/schapman1974/briskdb/issues/172), and
       [#180](https://github.com/schapman1974/briskdb/issues/180): single-document
