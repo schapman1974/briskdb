@@ -19,6 +19,14 @@ or TLS boundary, so each configured address must be loopback. A non-loopback
 data or administration address is rejected before the database opens or any
 listener binds.
 
+An independently enabled, loopback-only Mongo listener can join the same server
+when built with the non-default `mongo` feature. `--mongo-listen` /
+`BRISKDB_MONGO_LISTEN` defaults to `disabled`; see the
+[Mongo startup and lifecycle contract](MONGO_PARITY.md#current-wire-checkpoint).
+It shares database ownership and shutdown with HTTP/PostgreSQL, not their data
+model or security settings. A Mongo bind failure releases all passive sockets
+before the server begins accepting requests.
+
 The data and administration addresses must be distinct when a nonzero port is
 configured. The same loopback address with port zero is valid for both; each
 bind asks the operating system for a separate available port, and the returned

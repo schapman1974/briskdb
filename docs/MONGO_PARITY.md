@@ -74,6 +74,37 @@ BRISKDB_MONGO_ODM_SOURCE_ROOT=/path/to/locked/tinymongo \
 
 ## Current wire checkpoint
 
+The daemon accepts `--mongo-listen SOCKET_ADDR|disabled` and
+`BRISKDB_MONGO_LISTEN` (CLI takes precedence). Both default to `disabled`;
+activation requires building with `--features mongo`. For example:
+
+```bash
+cargo run --locked --features mongo --bin briskdb -- \
+  --data-dir ./briskdb-data --shards 4 --mongo-listen 127.0.0.1:27017
+```
+
+The daemon explicitly enables document support only when Mongo is requested.
+Numeric IPv4/IPv6 loopback addresses are accepted; port zero chooses an OS port
+reported in the readiness log. Non-loopback addresses and fixed-port collisions
+with the configured HTTP/admin/PostgreSQL listeners are rejected before opening
+the database. Builds without `mongo` reject activation before creating files.
+Every configured socket is bound before serving begins; a bind failure releases
+the sockets and closes the process-owned database. SIGINT/SIGTERM drains all
+listeners; an unexpected Mongo exit stops the common server and reports failure.
+Mongo has no authentication/TLS boundary yet: keep it local, including when
+PostgreSQL uses TLS/SCRAM. Do not publicly proxy the Mongo listener.
+
+Rust hosts using `listeners,mongo` can call
+`server::AttachedServer::start_with_mongo(&database, listener_config, address)`
+and obtain the actual address with `server.addresses().mongo()`. This requires
+an already-running, explicitly document-enabled database. Closing/dropping the
+attached server stops its listeners without closing that borrowed engine;
+`close().await` joins cleanup and can be retried after cancellation. The
+process-owned equivalent is `server::run_with_mongo(config, options, address)`
+(`server,mongo`). Existing `Config` / `ListenerConfig` literals, and existing
+entry points with Mongo disabled, remain source-compatible. This does not yet
+add a Mongo option to Python's `db.serve()`.
+
 The non-default `mongo` Cargo feature exposes `protocol::mongo::MongoServer`.
 The host explicitly starts it on a loopback address and closes it before
 closing the borrowed database. Data commands require opening `BriskDb` with

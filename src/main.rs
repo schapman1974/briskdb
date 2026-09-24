@@ -77,6 +77,15 @@ struct Args {
     )]
     postgres_listen: ListenerSetting,
 
+    /// Loopback Mongo TCP listener, or `disabled`; activation requires the `mongo` Cargo feature.
+    #[arg(
+        long,
+        env = "BRISKDB_MONGO_LISTEN",
+        default_value = "disabled",
+        value_name = "SOCKET_ADDR|disabled"
+    )]
+    mongo_listen: ListenerSetting,
+
     /// PEM certificate chain for TLS on the PostgreSQL listener.
     #[arg(long, env = "BRISKDB_POSTGRES_TLS_CERT", value_name = "PATH")]
     postgres_tls_cert: Option<PathBuf>,
@@ -194,6 +203,13 @@ impl Args {
     /// Keeping this conversion ahead of `server::run_with_engine_options`
     /// ensures invalid limits cannot bind a listener or create database files.
     fn into_server_parts(self) -> EngineResult<(Config, EngineOptions)> {
+        #[cfg(not(feature = "mongo"))]
+        if self.mongo_listen != ListenerSetting::Disabled {
+            return Err(EngineError::new(
+                EngineErrorKind::Unsupported,
+                "Mongo listener requires a build with the `mongo` Cargo feature",
+            ));
+        }
         let postgres_security = match (
             self.postgres_tls_cert,
             self.postgres_tls_key,
@@ -257,7 +273,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let (config, options) = Args::parse().into_server_parts()?;
+    let args = Args::parse();
+    #[cfg(feature = "mongo")]
+    let mongo_listen = args.mongo_listen.into_option();
+    let (config, options) = args.into_server_parts()?;
+    #[cfg(feature = "mongo")]
+    if let Some(address) = mongo_listen {
+        return server::run_with_mongo(config, options, address).await;
+    }
     server::run_with_engine_options(config, options).await
 }
 
@@ -279,6 +302,7 @@ mod tests {
             ListenerSetting::Address("127.0.0.1:7655".parse().unwrap())
         );
         assert_eq!(args.postgres_listen, ListenerSetting::Disabled);
+        assert_eq!(args.mongo_listen, ListenerSetting::Disabled);
         assert_eq!(args.postgres_tls_cert, None);
         assert_eq!(args.postgres_tls_key, None);
         assert_eq!(args.postgres_user, "briskdb");
@@ -308,6 +332,66 @@ mod tests {
         assert_eq!(args.shutdown_grace_ms, DEFAULT_SHUTDOWN_GRACE_MS);
         #[cfg(feature = "experimental-vtab")]
         assert!(!args.experimental_vtab_writes);
+    }
+
+    #[test]
+    fn mongo_cli_activation_is_explicit_and_feature_gated() {
+        for value in ["127.0.0.1:27017", "[::1]:27017", "127.0.0.1:0"] {
+            let args = Args::try_parse_from(["briskdb", "--mongo-listen", value]).unwrap();
+            assert_eq!(
+                args.mongo_listen,
+                ListenerSetting::Address(value.parse().unwrap())
+            );
+            #[cfg(feature = "mongo")]
+            assert!(args.into_server_parts().is_ok());
+            #[cfg(not(feature = "mongo"))]
+            assert!(
+                args.into_server_parts()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("`mongo` Cargo feature")
+            );
+        }
+        assert!(
+            Args::try_parse_from(["briskdb", "--mongo-listen", "disabled"])
+                .unwrap()
+                .into_server_parts()
+                .is_ok()
+        );
+        for value in ["", "localhost:27017", "127.0.0.1", "disabled ", "Disabled"] {
+            assert!(Args::try_parse_from(["briskdb", "--mongo-listen", value]).is_err());
+        }
+    }
+
+    #[test]
+    fn mongo_environment_and_explicit_cli_precedence_are_isolated_in_children() {
+        const MARKER: &str = "BRISKDB_MONGO_CLI_ENV_TEST_CHILD";
+        if std::env::var_os(MARKER).is_some() {
+            let args = Args::try_parse_from(["briskdb"]).unwrap();
+            assert_eq!(
+                args.mongo_listen,
+                ListenerSetting::Address("127.0.0.1:27017".parse().unwrap())
+            );
+            let args = Args::try_parse_from(["briskdb", "--mongo-listen", "disabled"]).unwrap();
+            assert_eq!(args.mongo_listen, ListenerSetting::Disabled);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::mongo_environment_and_explicit_cli_precedence_are_isolated_in_children",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .env("BRISKDB_MONGO_LISTEN", "127.0.0.1:27017")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

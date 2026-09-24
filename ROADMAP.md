@@ -499,8 +499,13 @@ requires an earlier dependency:
       Bootstrap budgets are 1 MiB messages, 512 KiB BSON documents, 4 MiB decoded
       heap per document, eight connections, bounded sequences/batches, and an
       absolute 15-second frame-read deadline. Shutdown joins connection/parser
-      work without closing the borrowed engine. CLI/common listener assembly,
-      negotiated compression and expanded resource/fuzz gates
+      work without closing the borrowed engine. Opt-in `--mongo-listen` /
+      `BRISKDB_MONGO_LISTEN`, `server::run_with_mongo`, and
+      `AttachedServer::start_with_mongo` now share the daemon/attached listener
+      lifecycle, with passive all-listener binding, fail-closed startup,
+      actual bound Mongo addresses, signal drain, and restart coverage. Existing
+      config struct shapes and disabled defaults remain unchanged. Negotiated
+      compression and expanded resource/fuzz gates
       remain; this is not a completed Mongo compatibility milestone.
     - [ ] [#170](https://github.com/schapman1974/briskdb/issues/170) and
       [#169](https://github.com/schapman1974/briskdb/issues/169) — standalone

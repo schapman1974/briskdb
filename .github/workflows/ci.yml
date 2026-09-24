@@ -279,6 +279,33 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  mongo-server:
+    name: Mongo daemon activation and lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85.0
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Restore daemon test build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mongo-server-1.85
+
+      - name: Test disabled defaults and feature-absent rejection
+        run: cargo +1.85.0 test --locked --bin briskdb --test mongo_server
+
+      - name: Test opted-in daemon commands, signal shutdown and restart
+        run: cargo +1.85.0 test --locked --features mongo --bin briskdb --test mongo_server
+
+      - name: Test owned and borrowed Mongo listener lifecycle
+        run: cargo +1.85.0 test --locked --features mongo --lib server::mongo::tests
+
   features:
     name: Features (${{ matrix.surface }}, Rust ${{ matrix.rust }})
     runs-on: ubuntu-24.04
