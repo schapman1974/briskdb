@@ -235,9 +235,13 @@ impl Engine {
             cancellation,
             deadline,
             move |storage, connection, cancellation, control| {
-                let transaction =
-                    Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
-                        .map_err(sqlite_error::statement)?;
+                let transaction = storage.begin_document_write(
+                    connection,
+                    collection_id,
+                    shard,
+                    cancellation,
+                    Some(control),
+                )?;
                 let outcome = (|| {
                     // Recheck the target shard under its write lock. Exact-ID
                     // concurrent upserts therefore update the winner, not a stale

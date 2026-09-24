@@ -162,6 +162,10 @@ impl DocumentIndexPreparation {
         self.indexes.is_empty()
     }
 
+    pub(crate) fn has_unique_secondary(&self) -> bool {
+        self.indexes.iter().any(|index| index.unique)
+    }
+
     pub(crate) fn equality_probe_with_check(
         &self,
         matcher: &DocumentMatcher,

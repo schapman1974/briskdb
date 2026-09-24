@@ -3,6 +3,7 @@
 mod upsert;
 
 use super::*;
+use crate::storage::DocumentWriteTransaction;
 use crate::{
     document::{
         BSON_MAX_NESTING_DEPTH, BsonCodecOptions, CanonicalBsonKey, DEFAULT_DOCUMENT_BATCH_SIZE,
@@ -13,7 +14,7 @@ use crate::{
     },
     sqlite_error,
 };
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::Connection;
 
 #[derive(PartialEq, Eq)]
 struct Candidate {
@@ -428,9 +429,13 @@ impl Engine {
                     cancellation,
                     deadline,
                     move |storage, connection, cancellation, control| {
-                        let transaction =
-                            Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
-                                .map_err(sqlite_error::statement)?;
+                        let transaction = storage.begin_document_write(
+                            connection,
+                            collection_id,
+                            shard,
+                            cancellation,
+                            Some(control),
+                        )?;
                         let record = storage.get_document_on_connection(
                             &transaction,
                             collection_id,
@@ -515,11 +520,13 @@ impl Engine {
                             cancellation.clone(),
                             deadline,
                             move |storage, connection, cancellation, control| {
-                                let transaction = Transaction::new_unchecked(
+                                let transaction = storage.begin_document_write(
                                     connection,
-                                    TransactionBehavior::Immediate,
-                                )
-                                .map_err(sqlite_error::statement)?;
+                                    collection_id,
+                                    shard,
+                                    cancellation,
+                                    Some(control),
+                                )?;
                                 // Reselect, not merely reread: another row may have
                                 // become the best match on this shard meanwhile.
                                 let current = select_candidate(
@@ -597,7 +604,7 @@ fn require_replacement_options(options: DocumentWriteOptions) -> EngineResult<()
 fn mutate_record(
     mutation: &Mutation,
     storage: &Storage,
-    transaction: &Transaction<'_>,
+    transaction: &DocumentWriteTransaction<'_>,
     record: Option<DocumentStorageRecord>,
     request_id: DocumentRequestId,
     plan: DocumentPlan,
@@ -669,7 +676,7 @@ fn mutate_record(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_record(
     storage: &Storage,
-    transaction: &Transaction<'_>,
+    transaction: &DocumentWriteTransaction<'_>,
     record: DocumentStorageRecord,
     updater: &DocumentUpdater,
     max_document_bytes: usize,
@@ -704,7 +711,7 @@ pub(super) fn update_record(
 #[allow(clippy::too_many_arguments)]
 fn replace_record(
     storage: &Storage,
-    transaction: &Transaction<'_>,
+    transaction: &DocumentWriteTransaction<'_>,
     record: Option<DocumentStorageRecord>,
     replacement: &BsonDocument,
     max_document_bytes: usize,
@@ -787,7 +794,7 @@ fn replace_record(
 #[allow(clippy::too_many_arguments)]
 fn write_post_image(
     storage: &Storage,
-    transaction: &Transaction<'_>,
+    transaction: &DocumentWriteTransaction<'_>,
     record: DocumentStorageRecord,
     post_image: BsonDocument,
     force_modified: bool,
@@ -913,7 +920,7 @@ fn select_candidate(
 #[allow(clippy::too_many_arguments)]
 fn return_and_delete(
     storage: &Storage,
-    transaction: &Transaction<'_>,
+    transaction: &DocumentWriteTransaction<'_>,
     record: Option<DocumentStorageRecord>,
     request_id: DocumentRequestId,
     plan: DocumentPlan,
@@ -1033,9 +1040,13 @@ mod tests {
                     };
                     let first = storage.prepare_document_write(&row(ids[0], 0))?;
                     let second = storage.prepare_document_write(&row(ids[1], 1))?;
-                    let transaction =
-                        Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
-                            .map_err(sqlite_error::statement)?;
+                    let transaction = storage.begin_document_write(
+                        connection,
+                        collection_id,
+                        0,
+                        cancellation,
+                        Some(control),
+                    )?;
                     storage.insert_prepared_document_on_connection(
                         &transaction,
                         collection_id,

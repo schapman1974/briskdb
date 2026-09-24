@@ -286,6 +286,21 @@ shard commits remain visible as before. Cancellation and task abort preserve
 that boundary and release admission after worker cleanup. This adds no unique
 constraint, global snapshot or cross-shard atomicity guarantee.
 
+Every record mutation now requires a root/collection/shard-bound
+`DocumentWriteTransaction`, including imports and upsert rechecks. As a
+prerequisite for secondary uniqueness, it can own a bounded collection-writer
+stripe acquired before `BEGIN IMMEDIATE`. Only the schema-admitted Ready index
+cache may request that fence: today's non-unique indexes and pending unique
+declarations do not acquire it. Unique activation and duplicate checks remain
+unsupported; this is transaction-lifetime infrastructure, not a new constraint.
+The blocking worker retains the fence until SQLite commits or rolls back, even
+if its async parent is abandoned. Unproven rollback degrades the root and retains
+the fence and degraded root lease until process exit. Cross-process stripes use
+at most 256 retained, owner-only lock files in a separate document-write namespace; stripe collisions
+only serialize unrelated collections. Contention is cancellable and bounded by
+the existing storage busy timeout. Record/index formats and shard-local commit
+boundaries are unchanged.
+
 `DocumentIndexKeyGenerator` generates ordered compound tuples with at most one final array field, removes
 duplicate array entries in encounter order, equates missing with null, and gives
 empty arrays a separate identity. Sparse compound membership requires any indexed

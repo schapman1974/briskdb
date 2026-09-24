@@ -160,10 +160,12 @@ fn shard_read_error(error: rusqlite::Error, diagnostic: &'static str) -> EngineE
 mod enabled {
     mod index_metadata;
     mod index_operations;
+    mod write_transaction;
     use std::{
         collections::{HashMap, HashSet},
         sync::Arc,
     };
+    pub(crate) use write_transaction::DocumentWriteTransaction;
 
     use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -1749,12 +1751,11 @@ mod enabled {
             cancellation: &CancellationToken,
         ) -> EngineResult<()> {
             let shard = prepared.shard();
-            let mut connection = self.open_unconfigured_shard(shard)?;
+            let connection = self.open_unconfigured_shard(shard)?;
             self.validate_unconfigured_shard(&connection, shard)?;
             require_schema(&connection)?;
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sqlite_error::storage)?;
+            let transaction =
+                self.begin_document_write(&connection, collection_id, shard, cancellation, None)?;
             self.insert_prepared_document_on_connection(
                 &transaction,
                 collection_id,
@@ -1776,14 +1777,14 @@ mod enabled {
         #[allow(clippy::too_many_arguments)]
         pub(crate) fn insert_prepared_document_on_connection(
             &self,
-            connection: &Transaction<'_>,
+            connection: &DocumentWriteTransaction<'_>,
             collection_id: DocumentCollectionId,
             natural_order: u64,
             shard: u16,
             prepared: &PreparedDocumentWrite,
             cancellation: &CancellationToken,
         ) -> EngineResult<()> {
-            require_write_transaction(connection)?;
+            connection.require_scope(self, collection_id, shard)?;
             ensure_document_operation_not_cancelled(cancellation, "before inserting document")?;
             self.validate_prepared_document_route(shard, prepared)?;
             require_schema(connection)?;
@@ -1838,7 +1839,7 @@ mod enabled {
         #[allow(clippy::too_many_arguments)]
         pub(crate) fn replace_document_on_connection(
             &self,
-            connection: &Transaction<'_>,
+            connection: &DocumentWriteTransaction<'_>,
             collection_id: DocumentCollectionId,
             shard: u16,
             id_key: &CanonicalBsonKey,
@@ -1846,7 +1847,7 @@ mod enabled {
             replacement: &PreparedDocumentWrite,
             cancellation: &CancellationToken,
         ) -> EngineResult<bool> {
-            require_write_transaction(connection)?;
+            connection.require_scope(self, collection_id, shard)?;
             ensure_document_operation_not_cancelled(cancellation, "before replacing document")?;
             self.validate_document_key_route(shard, id_key)?;
             if replacement.id_key != *id_key {
@@ -1929,13 +1930,13 @@ mod enabled {
         /// Delete one exact canonical `_id` within a caller-owned transaction.
         pub(crate) fn delete_document_on_connection(
             &self,
-            connection: &Transaction<'_>,
+            connection: &DocumentWriteTransaction<'_>,
             collection_id: DocumentCollectionId,
             shard: u16,
             id_key: &CanonicalBsonKey,
             cancellation: &CancellationToken,
         ) -> EngineResult<bool> {
-            require_write_transaction(connection)?;
+            connection.require_scope(self, collection_id, shard)?;
             ensure_document_operation_not_cancelled(cancellation, "before deleting document")?;
             self.validate_document_key_route(shard, id_key)?;
             require_schema(connection)?;
@@ -4201,9 +4202,15 @@ mod enabled {
                 let original = document([("_id", BsonValue::Int32(1))]);
                 storage.insert_document(collection.id(), &original).unwrap();
                 let prepared = storage.prepare_document_write(&original).unwrap();
-                let mut connection = storage.open_unconfigured_shard(prepared.shard()).unwrap();
-                let transaction = connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                let connection = storage.open_unconfigured_shard(prepared.shard()).unwrap();
+                let transaction = storage
+                    .begin_document_write(
+                        &connection,
+                        collection.id(),
+                        prepared.shard(),
+                        &CancellationToken::new(),
+                        None,
+                    )
                     .unwrap();
                 if automatic {
                     let error = transaction.execute_batch(
@@ -4284,12 +4291,18 @@ mod enabled {
             let natural_order = storage
                 .reserve_document_natural_orders_for_engine(collection.id(), 1, &cancellation)
                 .unwrap();
-            let mut connection = storage.open_unconfigured_shard(prepared.shard()).unwrap();
+            let connection = storage.open_unconfigured_shard(prepared.shard()).unwrap();
             storage
                 .validate_unconfigured_shard(&connection, prepared.shard())
                 .unwrap();
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
+            let transaction = storage
+                .begin_document_write(
+                    &connection,
+                    collection.id(),
+                    prepared.shard(),
+                    &cancellation,
+                    None,
+                )
                 .unwrap();
 
             storage
@@ -4440,12 +4453,12 @@ mod enabled {
                     &cancellation,
                 )
                 .unwrap();
-            let mut connection = storage.open_unconfigured_shard(shard).unwrap();
+            let connection = storage.open_unconfigured_shard(shard).unwrap();
             storage
                 .validate_unconfigured_shard(&connection, shard)
                 .unwrap();
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
+            let transaction = storage
+                .begin_document_write(&connection, collection.id(), shard, &cancellation, None)
                 .unwrap();
             for (offset, document) in prepared.iter().enumerate() {
                 storage
@@ -5842,7 +5855,8 @@ pub(super) use enabled::DocumentIndexPreparations;
 pub(super) use enabled::recover_or_validate;
 #[cfg(feature = "documents")]
 pub(crate) use enabled::{
-    DocumentStorageRecord, MAX_DOCUMENT_SHARD_SCAN_RECORDS, PreparedDocumentWrite,
+    DocumentStorageRecord, DocumentWriteTransaction, MAX_DOCUMENT_SHARD_SCAN_RECORDS,
+    PreparedDocumentWrite,
 };
 
 #[cfg(not(feature = "documents"))]

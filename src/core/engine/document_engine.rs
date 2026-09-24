@@ -631,6 +631,9 @@ impl Engine {
                                     // index maintenance must commit with this record,
                                     // while earlier successful inputs remain committed.
                                     match write_transaction(
+                                        storage,
+                                        collection_id,
+                                        shard,
                                         connection,
                                         cancellation,
                                         control,

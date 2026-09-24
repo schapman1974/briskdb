@@ -1,11 +1,12 @@
 //! Filtered deletion: bounded scans, natural-order selection, shard-local commits.
 
 use super::*;
+use crate::storage::DocumentWriteTransaction;
 use crate::{
     document::{CanonicalBsonKey, DocumentDeleteRequest, DocumentRequestId},
     sqlite_error,
 };
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::Connection;
 
 struct Candidate {
     shard: u16,
@@ -72,15 +73,23 @@ impl Engine {
                         cancellation,
                         deadline,
                         move |storage, connection, cancellation, control| {
-                            write_transaction(connection, cancellation, control, |transaction| {
-                                storage.delete_document_on_connection(
-                                    transaction,
-                                    collection_id,
-                                    shard,
-                                    &id_key,
-                                    cancellation,
-                                )
-                            })
+                            write_transaction(
+                                storage,
+                                collection_id,
+                                shard,
+                                connection,
+                                cancellation,
+                                control,
+                                |transaction| {
+                                    storage.delete_document_on_connection(
+                                        transaction,
+                                        collection_id,
+                                        shard,
+                                        &id_key,
+                                        cancellation,
+                                    )
+                                },
+                            )
                             .map_err(write_transaction::WriteTransactionError::into_engine_error)
                         },
                     )
@@ -98,11 +107,13 @@ impl Engine {
                             cancellation.clone(),
                             deadline,
                             move |storage, connection, cancellation, control| {
-                                let transaction = rusqlite::Transaction::new_unchecked(
+                                let transaction = storage.begin_document_write(
                                     connection,
-                                    TransactionBehavior::Immediate,
-                                )
-                                .map_err(sqlite_error::statement)?;
+                                    collection_id,
+                                    shard,
+                                    cancellation,
+                                    Some(control),
+                                )?;
                                 let mut after = None;
                                 let mut count = 0u64;
                                 while let Some(record) = next_match(
@@ -192,11 +203,13 @@ impl Engine {
                             cancellation.clone(),
                             deadline,
                             move |storage, connection, cancellation, control| {
-                                let transaction = rusqlite::Transaction::new_unchecked(
+                                let transaction = storage.begin_document_write(
                                     connection,
-                                    TransactionBehavior::Immediate,
-                                )
-                                .map_err(sqlite_error::statement)?;
+                                    collection_id,
+                                    candidate.shard,
+                                    cancellation,
+                                    Some(control),
+                                )?;
                                 let deleted = delete_candidate(
                                     storage,
                                     &transaction,
@@ -272,7 +285,7 @@ pub(super) fn next_match(
 
 fn delete_candidate(
     storage: &Storage,
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &DocumentWriteTransaction<'_>,
     collection_id: DocumentCollectionId,
     candidate: &Candidate,
     matcher: Option<&DocumentMatcher>,
@@ -364,11 +377,13 @@ mod tests {
                         natural_order: 1,
                         key: prepared.id_key().clone(),
                     };
-                    let transaction = rusqlite::Transaction::new_unchecked(
+                    let transaction = storage.begin_document_write(
                         connection,
-                        TransactionBehavior::Immediate,
-                    )
-                    .map_err(sqlite_error::statement)?;
+                        collection_id,
+                        shard,
+                        cancellation,
+                        Some(control),
+                    )?;
                     storage.insert_prepared_document_on_connection(
                         &transaction,
                         collection_id,

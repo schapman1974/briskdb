@@ -820,11 +820,13 @@ fn built_entries_follow_record_transactions_and_unindexed_changes() {
     build(&storage, "value").unwrap();
     let cancellation = CancellationToken::new();
     let (key, shard) = storage.prepare_document_id(&BsonValue::Int32(0)).unwrap();
-    let mut connection = storage.open_unconfigured_shard(shard).unwrap();
+    let connection = storage.open_unconfigured_shard(shard).unwrap();
     let before_records = snapshot(temp.path(), 2, "briskdb_documents_v1");
     let before_entries = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
     for commit in [false, true] {
-        let transaction = connection.transaction().unwrap();
+        let transaction = storage
+            .begin_document_write(&connection, collection, shard, &cancellation, None)
+            .unwrap();
         let record = storage
             .get_document_on_connection(&transaction, collection, shard, &key, &cancellation)
             .unwrap()
@@ -870,7 +872,9 @@ fn built_entries_follow_record_transactions_and_unindexed_changes() {
     let changed = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
     assert_ne!(changed, before_entries); // checksum changes even when the key does not
     for commit in [false, true] {
-        let transaction = connection.transaction().unwrap();
+        let transaction = storage
+            .begin_document_write(&connection, collection, shard, &cancellation, None)
+            .unwrap();
         assert!(
             storage
                 .delete_document_on_connection(&transaction, collection, shard, &key, &cancellation)
@@ -989,13 +993,21 @@ fn failed_index_write_rolls_back_the_record_and_all_prior_index_entries() {
     let order = storage
         .reserve_document_natural_orders_for_engine(collection, 1, &cancellation)
         .unwrap();
-    let mut connection = storage.open_unconfigured_shard(prepared.shard()).unwrap();
+    let connection = storage.open_unconfigured_shard(prepared.shard()).unwrap();
     let records = snapshot(temp.path(), 2, "briskdb_documents_v1");
     let entries = snapshot(temp.path(), 2, "briskdb_document_index_entries_v1");
     // A TEMP trigger injects failure into the second statement of one write;
     // it is not persisted schema and does not alter any production catalog.
     connection.execute_batch("CREATE TEMP TRIGGER fail_entry BEFORE INSERT ON briskdb_document_index_entries_v1 BEGIN SELECT RAISE(ABORT, 'injected entry failure'); END;").unwrap();
-    let transaction = connection.transaction().unwrap();
+    let transaction = storage
+        .begin_document_write(
+            &connection,
+            collection,
+            prepared.shard(),
+            &cancellation,
+            None,
+        )
+        .unwrap();
     assert!(
         storage
             .insert_prepared_document_on_connection(
