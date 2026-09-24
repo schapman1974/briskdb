@@ -9,11 +9,9 @@ use tokio::{
     sync::Semaphore,
     task::{JoinHandle, JoinSet},
 };
-use tokio_util::codec::{Decoder, Encoder};
+use tokio_util::codec::Decoder;
 
-use super::{
-    FrameCodec, MAX_BOOTSTRAP_MESSAGE_BYTES, Request, commands, decode_request, invalid, wire,
-};
+use super::{Request, commands, compression, decode_request, invalid, wire};
 use crate::{
     BriskDb, CancellationToken, EngineState,
     document::{BsonDocument, BsonValue},
@@ -148,7 +146,7 @@ async fn connection(
 ) -> io::Result<()> {
     let session = executor.session();
     let _cursors = executor.connection_cursors(session.id().get());
-    let mut codec = FrameCodec::with_max_message_bytes(MAX_BOOTSTRAP_MESSAGE_BYTES)?;
+    let mut codec = compression::TransportCodec::new()?;
     let mut source = BytesMut::with_capacity(8192);
     let mut response_id = 0i32;
     loop {
@@ -183,8 +181,12 @@ async fn connection(
             source.extend_from_slice(&chunk[..read]);
         };
         response_id = response_id.wrapping_add(1);
+        let compressed = frame.is_compressed();
         let (request, prepared) = tokio::task::spawn_blocking(move || {
-            let request = decode_request(frame)?;
+            let request = decode_request(frame.into_frame()?)?;
+            if compressed {
+                compression::validate_command(&request)?;
+            }
             let prepared = commands::prepare(&request);
             Ok::<_, io::Error>((request, prepared))
         })
@@ -199,6 +201,9 @@ async fn connection(
             Some(Err(error)) => error.document(),
             None => dispatch(&request),
         };
+        if compression::negotiated_zlib(&request, &body) {
+            codec.enable_zlib();
+        }
         let cursor_id = commands::reply_cursor_id(&body);
         let (result, rejected) = tokio::task::spawn_blocking(move || {
             if request.more_to_come {
@@ -208,7 +213,8 @@ async fn connection(
                 Ok(()) => (body, false),
                 Err(error) => (error.document(), true),
             };
-            wire::reply(&request, &body, response_id).map(|reply| (Some(reply), rejected))
+            let reply = wire::reply(&request, &body, response_id)?;
+            compression::encode_reply(reply, compressed).map(|reply| (Some(reply), rejected))
         })
         .await
         .map_err(|_| io::Error::other("Mongo parser task failed"))??;
@@ -220,9 +226,7 @@ async fn connection(
         if shutdown.is_cancelled() {
             return Ok(());
         }
-        if let Some(reply) = result {
-            let mut destination = BytesMut::new();
-            codec.encode(reply, &mut destination)?;
+        if let Some(destination) = result {
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return Ok(()),
@@ -311,10 +315,21 @@ fn dispatch(request: &Request) -> BsonDocument {
             ),
             (
                 "maxMessageSizeBytes",
-                BsonValue::Int32(MAX_BOOTSTRAP_MESSAGE_BYTES as i32),
+                BsonValue::Int32(if compression::offers_zlib(&request.body) {
+                    compression::ADVERTISED_ZLIB_MESSAGE_BYTES as i32
+                } else {
+                    wire::MAX_BOOTSTRAP_MESSAGE_BYTES as i32
+                }),
             ),
             ("maxWriteBatchSize", BsonValue::Int32(1000)),
-            ("compression", BsonValue::Array(Vec::new())),
+            (
+                "compression",
+                BsonValue::Array(if compression::offers_zlib(&request.body) {
+                    vec![BsonValue::from("zlib")]
+                } else {
+                    Vec::new()
+                }),
+            ),
         ])
     } else if command == "ping" {
         fields(&[("ok", BsonValue::Double(1.0))])
