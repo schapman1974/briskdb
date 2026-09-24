@@ -4151,6 +4151,9 @@ fn configure_journal_mode(connection: &Connection) -> EngineResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "documents")]
+    mod document_id_vectors;
+
     use std::{
         error::Error as _,
         process::Command,
