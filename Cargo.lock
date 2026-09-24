@@ -314,7 +314,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "briskdb"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "briskdb-python"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 dependencies = [
  "briskdb",
  "cc",
