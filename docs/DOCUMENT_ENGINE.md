@@ -247,17 +247,21 @@ implemented through `ListIndexMetadata` and Mongo `listIndexes`.
 
 Find (including sorted/paged reads), filtered count/distinct and mutation
 selection can use a current Ready index when every indexed
-path has a necessary supported scalar equality. Direct equality, `$eq` and
-positive `$and` clauses are recognized; the entire BSON matcher still verifies
+path has a necessary supported scalar equality or bounded literal `$in` list.
+Direct equality, `$eq` and positive `$and` clauses are recognized; the entire BSON matcher still verifies
 each candidate. Compound paths and scalar membership in final arrays reuse the
 same canonical BDIK keys as transactional write maintenance. Missing/null and
 numeric cohorts keep their BSON semantics; booleans remain distinct from numbers.
 
 Partial indexes are not selected. Sparse all-null tuples, incomplete compound
 equalities, array/object operands, ObjectId/date/nonfinite operands and queries
-with only alternatives, negations, ranges or membership tests fall back to scans.
-A sparse compound tuple is eligible when at least one necessary equality is
-nonnull. Optional probe preparation exceeding its work budget also falls back;
+with only alternatives, negations or ranges fall back to scans. Membership lists
+must be nonempty and contain at most 128 supported scalar literals each, with
+at most 128 distinct compound tuples and 1 MiB of encoded keys in total. Regex
+members and unsafe/oversized lists fall back. Numeric aliases are deduplicated;
+complete equality probes retain their existing preference across indexes.
+A sparse compound probe is eligible only when every possible tuple has at least
+one nonnull component. Optional probe preparation exceeding its work budget also falls back;
 cancellation and integrity errors are not swallowed. There is no index hint API.
 
 Storage selects from the root-shared Ready cache under the request's schema
@@ -269,6 +273,14 @@ natural-order frontier. This does not add a cross-request snapshot. Shard routin
 and the public `Point`/`Scatter` plan remain unchanged; access-method reasons and
 row counters, index-only reads, ordering/range pushdown and aggregation pushdown
 remain work under #178. No format migration is needed.
+
+Multi-key probes bind every encoded value (including the non-unique fallback
+marker) and deduplicate matching entries by the collection's unique natural-order
+identity before SQL pagination. A multikey document is returned or mutated once,
+even if several array elements match the list. The document-first join preserves
+the natural-order range and streams grouping without an all-candidate temporary
+sort, including after SQLite statistics are collected. Aggregation still receives its
+original unfiltered source rows; membership probes do not bypass its accounting.
 
 Required CI checks 1,087 source-locked probe groups (201,349 matcher evaluations,
 9,541 eligible matching candidates) without false negatives, plus native and

@@ -239,6 +239,69 @@ impl DocumentMatcher {
         Ok(None)
     }
 
+    /// Borrow one necessary positive literal membership list. Alternatives,
+    /// negations and regex members cannot establish a finite equality probe.
+    /// This does not simplify the matcher or flatten array-valued operands.
+    pub(crate) fn membership_for_index_path<'a>(
+        &'a self,
+        requested: &[String],
+        max_values: usize,
+        check: &mut dyn FnMut() -> EngineResult<()>,
+    ) -> EngineResult<Option<Vec<&'a BsonValue>>> {
+        for clause in &self.clauses {
+            check()?;
+            match clause {
+                Clause::Field {
+                    path, predicates, ..
+                } if path == requested => {
+                    for predicate in predicates {
+                        check()?;
+                        let Predicate::In {
+                            members,
+                            negative: false,
+                        } = predicate
+                        else {
+                            continue;
+                        };
+                        if members.is_empty() || members.len() > max_values {
+                            continue;
+                        }
+                        let mut values = Vec::new();
+                        values
+                            .try_reserve_exact(members.len())
+                            .map_err(|_| limit())?;
+                        for member in members {
+                            check()?;
+                            let Member::Literal(value) = member else {
+                                values.clear();
+                                break;
+                            };
+                            values.push(value);
+                        }
+                        if !values.is_empty() {
+                            return Ok(Some(values));
+                        }
+                    }
+                }
+                Clause::Logical {
+                    kind: Logical::And,
+                    children,
+                } => {
+                    for child in children {
+                        if let Some(values) =
+                            child.membership_for_index_path(requested, max_values, check)?
+                        {
+                            return Ok(Some(values));
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+        check()?;
+        Ok(None)
+    }
+
     /// Match caller-supplied BSON after structural size/depth validation.
     pub fn matches(&self, document: &BsonDocument) -> EngineResult<bool> {
         encode_document(document)

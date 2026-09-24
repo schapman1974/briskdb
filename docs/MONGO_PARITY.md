@@ -263,14 +263,15 @@ definition conflicts return 86, equivalent definitions with another name return
 `_id` requests are no-ops even when PyMongo supplies its default `_id_1` name.
 Duplicate unique builds/writes return 11000; unknown options (including
 collation and commit quorum), descending `_id` creation and document sequences are
-not supported. Ready indexes also provide conservative equality candidates.
+not supported. Ready indexes also provide conservative equality/membership candidates.
 Ready unique indexes enforce cross-shard ownership for inserts, replacements,
 updates and upserts. Missing/null, numeric aliases, multikey deduplication and
 sparse/partial membership use the shared canonical key generator. Enforcement
 survives reopening and ends with recoverable index removal. Bulk writes retain
 the existing per-input/per-shard commit boundary: they are not globally atomic,
 and an otherwise unique final bulk image can fail on a transient collision.
-Whole-post-image sharded TinyMongo parity remains #183.
+TinyMongo's memory and SQLite backends differ on transient unique collisions;
+the explicit bulk-policy decision remains tracked in #183.
 
 Mixed PyMongo `IndexModel` batches now accept selected TinyMongo-style reduced
 behavior: non-unique `"hashed"` components become ascending equality keys;
@@ -707,7 +708,19 @@ probes, preserve natural paging and still run the full matcher. Partial indexes,
 sparse all-null tuples and unsupported/incomplete shapes scan. Native/real-driver
 tests compare filters, sorting, count/distinct, index drop/recreation between
 batches, write maintenance and reopened results. This does not close #174 or
-#178: whole-bulk post-image parity, broader candidate forms and plan diagnostics remain open.
+#178: bulk-policy decisions, broader candidate forms and plan diagnostics remain open.
+
+Ready-index candidates also support necessary positive literal `$in` lists,
+including complete compound tuples and residual predicates under `$and`.
+Lists are limited to 128 scalar members, with at most 128 distinct candidate
+tuples and 1 MiB of encoded keys across the selected probe. Existing complete
+equality probes keep priority. Regex/array/object/unsupported members, empty or
+oversized lists, partial indexes and possible sparse all-null tuples fall back.
+Bound values and the existing non-unique fallback marker are checked through
+the full matcher. Multiple matching array entries are deduplicated before
+pagination, so reads and writes visit each logical record once. Independent
+candidate comparisons, scan differentials, physical-selection and checksum
+checks cover this extension without changing the frozen equality-probe oracle.
 
 The same candidates now narrow mutation selection for one/many updates and
 deletes, replacements and sorted find-and-modify, including upsert rechecks.

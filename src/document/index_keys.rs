@@ -12,6 +12,7 @@ use super::{
 use crate::core::{EngineError, EngineErrorKind, EngineResult};
 
 mod codec;
+mod membership;
 mod preparation;
 mod probe;
 pub use codec::{DOCUMENT_INDEX_KEY_ENCODING_VERSION, MAX_DOCUMENT_INDEX_KEY_BYTES};

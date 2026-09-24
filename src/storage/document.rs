@@ -158,6 +158,7 @@ fn shard_read_error(error: rusqlite::Error, diagnostic: &'static str) -> EngineE
 
 #[cfg(feature = "documents")]
 mod enabled {
+    mod candidate_sql;
     mod index_metadata;
     mod index_operations;
     mod unique;
@@ -2172,7 +2173,12 @@ mod enabled {
             let sqlite_limit =
                 i64::try_from(limit).expect("bounded document scan limit fits SQLite");
             require_schema(connection)?;
-            let sql = if probe.is_some() {
+            let membership_sql = probe
+                .filter(|probe| probe.keys().len() > 1)
+                .map(|probe| candidate_sql::membership(probe.keys().len()));
+            let sql = if let Some(sql) = membership_sql.as_deref() {
+                sql
+            } else if probe.is_some() {
                 // Keep natural-order pagination and let SQLite choose join
                 // order. Forcing an index-first join would repeatedly sort
                 // large equality groups for each one-record merge frontier.
@@ -2196,12 +2202,30 @@ mod enabled {
                 shard_read_error(error, "failed to prepare stored BSON document scan")
             })?;
             let mut rows = match probe {
+                Some(probe) if probe.keys().len() > 1 => {
+                    use rusqlite::types::{ToSqlOutput, ValueRef};
+                    // Borrow the existing encoded keys; do not make another
+                    // per-shard copy of a potentially large membership list.
+                    let values = [
+                        ValueRef::Integer(to_sqlite_id(collection_id)?),
+                        ValueRef::Integer(after_natural_order),
+                        ValueRef::Integer(sqlite_limit),
+                        ValueRef::Integer(probe.index_id().get() as i64),
+                    ]
+                    .into_iter()
+                    .chain(probe.keys().iter().map(|key| ValueRef::Blob(key)))
+                    .chain(std::iter::once(ValueRef::Blob(
+                        crate::document::NON_UNIQUE_FALLBACK_KEY,
+                    )))
+                    .map(ToSqlOutput::Borrowed);
+                    statement.query(rusqlite::params_from_iter(values))
+                }
                 Some(probe) => statement.query(params![
                     to_sqlite_id(collection_id)?,
                     after_natural_order,
                     sqlite_limit,
                     probe.index_id().get() as i64,
-                    probe.key(),
+                    &probe.keys()[0],
                     crate::document::NON_UNIQUE_FALLBACK_KEY,
                 ]),
                 None => statement.query(params![

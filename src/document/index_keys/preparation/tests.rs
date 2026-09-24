@@ -89,6 +89,51 @@ fn storage_preparation(unique: bool, fields: BsonDocument) -> DocumentIndexPrepa
 }
 
 #[test]
+fn membership_probe_deduplicates_aliases_and_keeps_existing_equality_index_preference() {
+    let metadata = collection([
+        secondary(2, keys()),
+        secondary(3, doc([("other", BsonValue::Int32(1))])),
+    ]);
+    let preparation = DocumentIndexPreparation::compile(&metadata).unwrap();
+    let list = BsonValue::Document(doc([(
+        "$in",
+        BsonValue::Array(vec![
+            BsonValue::Int32(1),
+            BsonValue::Double(1.0),
+            BsonValue::Int32(2),
+        ]),
+    )]));
+    let matcher = DocumentMatcher::compile(&doc([("v", list.clone())])).unwrap();
+    let probe = preparation
+        .equality_probe_with_check(&matcher, &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe.index_id().get(), 2);
+    assert_eq!(probe.keys().len(), 2);
+    let expected = [1, 2].map(|value| {
+        preparation
+            .prepare(&doc([("v", BsonValue::Int32(value))]))
+            .unwrap()
+            .indexes()[0]
+            .keys()[0]
+            .clone()
+    });
+    assert_eq!(probe.keys(), expected);
+    let matcher =
+        DocumentMatcher::compile(&doc([("v", list), ("other", BsonValue::Int32(3))])).unwrap();
+    let probe = preparation
+        .equality_probe_with_check(&matcher, &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        probe.index_id().get(),
+        3,
+        "an existing exact-equality index still wins"
+    );
+    assert_eq!(probe.keys().len(), 1);
+}
+
+#[test]
 fn nonunique_storage_fallback_is_separate_from_strict_and_unique_keys() {
     let ordinary = storage_preparation(false, keys());
     let unique = storage_preparation(true, keys());
