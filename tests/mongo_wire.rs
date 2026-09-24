@@ -783,6 +783,26 @@ async fn index_creation_rejects_duplicate_options_and_malformed_batches_before_n
                 ("background", BsonValue::Int32(1)),
             ])),
         ],
+        vec![
+            good(),
+            BsonValue::Document(doc(vec![
+                (
+                    "key",
+                    BsonValue::Document(doc(vec![("body", BsonValue::from("text"))])),
+                ),
+                ("unique", BsonValue::Boolean(true)),
+            ])),
+        ],
+        vec![
+            BsonValue::Document(doc(vec![(
+                "key",
+                BsonValue::Document(doc(vec![("body", BsonValue::from("text"))])),
+            )])),
+            BsonValue::Document(doc(vec![(
+                "key",
+                BsonValue::Document(doc(vec![("bad", BsonValue::Boolean(true))])),
+            )])),
+        ],
     ] {
         let body = doc(vec![
             ("createIndexes", BsonValue::from("absent")),
@@ -942,6 +962,102 @@ async fn mixed_index_model_replies_are_explicit_and_catalogs_describe_effective_
             ),
         ])
     );
+    drop(stream);
+    server.close().await.unwrap();
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn skipped_text_models_have_explicit_noop_counts_without_phantom_catalog_entries() {
+    fn doc(entries: impl IntoIterator<Item = (&'static str, BsonValue)>) -> BsonDocument {
+        BsonDocument::from_entries(entries).unwrap()
+    }
+    let (_root, database, mut server) = setup().await;
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let text = BsonValue::Document(doc([
+        (
+            "key",
+            BsonValue::Document(doc([
+                ("body", BsonValue::from("text")),
+                ("token", BsonValue::from("hashed")),
+            ])),
+        ),
+        ("background", BsonValue::Boolean(true)),
+        ("expireAfterSeconds", BsonValue::Int32(1)),
+    ]));
+    let command = |indexes| {
+        doc([
+            ("createIndexes", BsonValue::from("text_models")),
+            ("indexes", BsonValue::Array(indexes)),
+            ("$db", BsonValue::from("wire")),
+        ])
+    };
+    for _ in 0..2 {
+        let reply = send_command(&mut stream, &command(vec![text.clone()])).await;
+        assert_eq!(reply.get_first("ok"), Some(&BsonValue::Double(1.0)));
+        assert_eq!(
+            reply.get_first("numIndexesBefore"),
+            Some(&BsonValue::Int64(1))
+        );
+        assert_eq!(
+            reply.get_first("numIndexesAfter"),
+            Some(&BsonValue::Int64(1))
+        );
+        assert_eq!(
+            reply.get_first("briskdbIndexWarnings"),
+            Some(&BsonValue::Array(vec![BsonValue::Document(doc([
+                ("name", BsonValue::from("body_text_token_hashed")),
+                ("skipped", BsonValue::Boolean(true)),
+                (
+                    "reducedBehavior",
+                    BsonValue::Array(vec![BsonValue::from(
+                        "text: entire index is skipped; $text queries are not supported"
+                    )])
+                ),
+            ]))]))
+        );
+    }
+    let mixed = send_command(
+        &mut stream,
+        &command(vec![
+            text,
+            BsonValue::Document(doc([
+                (
+                    "key",
+                    BsonValue::Document(doc([("email", BsonValue::Int32(1))])),
+                ),
+                ("unique", BsonValue::Boolean(true)),
+            ])),
+        ]),
+    )
+    .await;
+    assert_eq!(
+        mixed.get_first("numIndexesBefore"),
+        Some(&BsonValue::Int64(1))
+    );
+    assert_eq!(
+        mixed.get_first("numIndexesAfter"),
+        Some(&BsonValue::Int64(2))
+    );
+    let listing = send_command(
+        &mut stream,
+        &doc([
+            ("listIndexes", BsonValue::from("text_models")),
+            ("$db", BsonValue::from("wire")),
+        ]),
+    )
+    .await;
+    let Some(BsonValue::Document(cursor)) = listing.get_first("cursor") else {
+        panic!("{listing:?}")
+    };
+    let Some(BsonValue::Array(rows)) = cursor.get_first("firstBatch") else {
+        panic!("{cursor:?}")
+    };
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| match row {
+        BsonValue::Document(row) => matches!(row.get_first("name"), Some(BsonValue::String(name)) if name == "_id_" || name == "email_1"),
+        _ => false,
+    }));
     drop(stream);
     server.close().await.unwrap();
     database.close().await.unwrap();

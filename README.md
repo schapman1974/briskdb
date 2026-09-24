@@ -465,7 +465,9 @@ more valuable than a star. Start with the
   retaining conservative candidates when a value has no ordinary equality key.
   Mixed PyMongo index models also accept non-unique hashed keys as equality
   indexes and TTL/background options with explicit reduced-behavior warnings;
-  **TTL does not expire data**. See [index compatibility](docs/MONGO_PARITY.md#current-wire-checkpoint).
+  **TTL does not expire data**. Non-unique text declarations are explicitly
+  skipped, not built; `$text` queries remain unsupported.
+  See [index compatibility](docs/MONGO_PARITY.md#current-wire-checkpoint).
   Partial indexes, sparse all-null queries and unsupported shapes retain scans.
   PyMongo `drop_index` / `drop_indexes` remove secondary indexes
   without deleting documents; `_id_` remains protected. Multi-document writes commit per shard,
